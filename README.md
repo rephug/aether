@@ -1,6 +1,48 @@
 # AETHER
 
-AETHER is a local code observer that extracts symbols, stores SIR annotations, serves hover via LSP, and exposes lookup tools through MCP.
+AETHER is a local-first code intelligence toolkit for Rust and TypeScript/JavaScript projects.
+
+It watches your workspace, extracts stable symbols, generates per-symbol SIR (Structured Intermediate Representation) summaries, stores everything in `.aether/`, and exposes results through:
+- LSP hover (editor UX)
+- MCP tools (agent UX, e.g. Claude Code)
+
+## What It Does
+
+- Watches file changes with debounce and incremental symbol diffing.
+- Extracts symbols via tree-sitter (`rs`, `ts`, `tsx`, `js`, `jsx`).
+- Computes stable symbol IDs so IDs survive line-shift edits.
+- Generates SIR for changed symbols using configurable inference providers.
+- Stores symbol metadata + SIR locally (`.aether/meta.sqlite` and `.aether/sir/*.json`).
+- Serves hover summaries through the AETHER LSP server.
+- Serves local lookup/explain tools through the AETHER MCP server.
+
+## What You Can Use It For
+
+- Onboard faster in unfamiliar codebases by hovering functions/classes for intent summaries.
+- Keep lightweight, continuously refreshed code intent docs without manual writing.
+- Give coding agents structured local context through MCP (status, lookup, explain, get_sir).
+- Inspect changed code behavior quickly during refactors and reviews.
+- Build local developer tooling on top of stable symbol IDs + local SIR storage.
+
+## Current Scope and Limits
+
+- Languages: Rust and TypeScript/JavaScript family only.
+- Focus: understanding and retrieval, not autonomous code edits.
+- Inference can run fully without cloud keys using `mock` provider.
+- No secrets are stored in this repo; use local env vars.
+
+## Architecture Overview
+
+Main crates:
+- `crates/aetherd`: observer/indexer daemon + CLI + LSP launch path
+- `crates/aether-parse`: tree-sitter extraction
+- `crates/aether-core`: symbol model, stable ID strategy, diffs
+- `crates/aether-sir`: SIR schema, validation, canonical JSON, hash
+- `crates/aether-store`: SQLite + local blob storage under `.aether/`
+- `crates/aether-infer`: provider trait + `mock`, `gemini`, `qwen3_local`
+- `crates/aether-lsp`: stdio LSP hover server
+- `crates/aether-mcp`: stdio MCP server exposing local AETHER tools
+- `crates/aether-config`: `.aether/config.toml` loader/defaults
 
 ## Quickstart (Build from Source)
 
@@ -8,31 +50,39 @@ AETHER is a local code observer that extracts symbols, stores SIR annotations, s
 cargo build -p aetherd -p aether-mcp
 ```
 
-Run indexing in your workspace:
+## Getting Started in 5 Minutes
+
+1. Build once:
+   - `cargo build -p aetherd -p aether-mcp`
+2. Index your current workspace:
+   - `cargo run -p aetherd -- --workspace . --print-sir`
+3. Start LSP with background indexing:
+   - `cargo run -p aetherd -- --workspace . --lsp --index`
+4. In VS Code extension dev host, hover a Rust/TS/JS symbol to see SIR.
+5. For Claude Code, register MCP:
+   - `claude mcp add --transport stdio --scope project aether -- ./target/debug/aether-mcp --workspace .`
+
+### Indexing and SIR generation
 
 ```bash
 cargo run -p aetherd -- --workspace . --print-sir
 ```
 
-`aetherd` also supports LSP + background indexing together:
+Useful debug flags:
+
+```bash
+cargo run -p aetherd -- --workspace . --print-events --print-sir
+```
+
+### Run LSP with background indexing
 
 ```bash
 cargo run -p aetherd -- --workspace . --lsp --index
 ```
 
-## Indexing
-
-Indexing parses files, diffs symbol changes, and stores symbol + SIR data in `.aether/`.
-
-Primary command:
-
-```bash
-cargo run -p aetherd -- --workspace . --print-sir
-```
-
 ## VS Code Extension
 
-The extension is in `vscode-extension/`.
+The extension lives in `vscode-extension/` and starts AETHER over stdio.
 
 ```bash
 cd vscode-extension
@@ -40,34 +90,86 @@ npm install
 npm run build
 ```
 
-Then press `F5` in VS Code to run the Extension Development Host.
+Then open `vscode-extension/` in VS Code and press `F5` to launch an Extension Development Host.
 
 ## MCP Server (Claude Code)
 
-Build the MCP binary:
+Build:
 
 ```bash
 cargo build -p aether-mcp
 ```
 
-Register it in Claude Code (project scope):
+Register in Claude Code (project scope):
 
 ```bash
 claude mcp add --transport stdio --scope project aether -- <path-to-aether-mcp> --workspace .
 ```
 
-Example binary path from this repo:
+Typical paths:
 - Linux/macOS: `./target/debug/aether-mcp`
 - Windows: `./target/debug/aether-mcp.exe`
 
-## API Keys and Environment Variables
+MCP tools exposed:
+- `aether_status`
+- `aether_symbol_lookup`
+- `aether_get_sir`
+- `aether_explain`
 
-- Do not put keys in the repository.
-- Set keys locally via environment variables only.
-- `GEMINI_API_KEY` is optional; if unset, AETHER can run with mock inference.
+## Configuration
+
+AETHER uses project-local config at:
+
+- `<workspace>/.aether/config.toml`
+
+If missing, it is created automatically.
+
+Current config schema:
+
+```toml
+[inference]
+provider = "auto" # auto | mock | gemini | qwen3_local
+# model = "..."
+# endpoint = "..."
+api_key_env = "GEMINI_API_KEY"
+```
+
+Provider behavior:
+- `auto`: if `api_key_env` is set -> `gemini`, else `mock`
+- `mock`: deterministic local summaries
+- `gemini`: requires API key env var
+- `qwen3_local`: local HTTP endpoint (default `http://127.0.0.1:11434`)
+
+CLI overrides (optional):
+
+```bash
+--inference-provider <auto|mock|gemini|qwen3_local>
+--inference-model <name>
+--inference-endpoint <url>
+--inference-api-key-env <ENV_VAR_NAME>
+```
+
+## Local Data Layout
+
+AETHER writes to `.aether/` under the workspace:
+- `.aether/config.toml`
+- `.aether/meta.sqlite`
+- `.aether/sir/<symbol_id>.json`
+
+## Security and Keys
+
+- Never commit API keys.
+- Keep `.env` local only.
+- Use env vars for secrets (`GEMINI_API_KEY`, or your configured `api_key_env`).
+- `mock` works without any key.
 
 ## Prebuilt Binaries
 
-Prebuilt binaries are published on GitHub Releases:
+GitHub Releases provides prebuilt binaries for Linux, macOS, and Windows:
 
-- https://github.com/OWNER/REPO/releases
+- https://github.com/rephug/aether/releases
+
+## Development CI/Release
+
+- CI runs `fmt`, `clippy`, and `test` on push/PR.
+- Tagging `v*.*.*` triggers cross-platform release builds and uploads binaries to GitHub Releases.
