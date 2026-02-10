@@ -1,0 +1,30 @@
+[package]
+name = "aetherd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "aetherd"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+aether-config = { path = "../aether-config" }
+aether-core = { path = "../aether-core" }
+aether-infer = { path = "../aether-infer" }
+aether-lsp = { path = "../aether-lsp" }
+aether-parse = { path = "../aether-parse" }
+aether-sir = { path = "../aether-sir" }
+aether-store = { path = "../aether-store" }
+anyhow.workspace = true
+clap.workspace = true
+notify.workspace = true
+serde_json.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower-lsp = "0.20"

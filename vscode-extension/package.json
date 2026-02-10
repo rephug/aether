@@ -1,0 +1,79 @@
+{
+  "name": "aether-vscode",
+  "displayName": "AETHER",
+  "description": "Minimal VS Code client for AETHER LSP hover",
+  "version": "0.0.1",
+  "publisher": "aether",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:rust",
+    "onLanguage:typescript",
+    "onLanguage:typescriptreact",
+    "onLanguage:javascript",
+    "onLanguage:javascriptreact",
+    "onCommand:aether.restartServer",
+    "onCommand:aether.selectInferenceProvider"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "aether.restartServer",
+        "title": "AETHER: Restart Server"
+      },
+      {
+        "command": "aether.selectInferenceProvider",
+        "title": "AETHER: Select Inference Provider"
+      }
+    ],
+    "configuration": {
+      "title": "AETHER",
+      "properties": {
+        "aether.inferenceProvider": {
+          "type": "string",
+          "enum": ["auto", "mock", "gemini", "qwen3_local"],
+          "default": "auto",
+          "description": "Inference provider used by aetherd."
+        },
+        "aether.inferenceModel": {
+          "type": "string",
+          "enum": [
+            "qwen3-embeddings-0.6B",
+            "qwen3-embeddings-4B",
+            "qwen3-embeddings-8B",
+            "gemini-2.0-flash"
+          ],
+          "default": "qwen3-embeddings-0.6B",
+          "description": "Model name passed to the selected provider."
+        },
+        "aether.inferenceEndpoint": {
+          "type": "string",
+          "default": "http://127.0.0.1:11434",
+          "description": "Local HTTP endpoint for qwen3_local provider."
+        },
+        "aether.geminiApiKeyEnv": {
+          "type": "string",
+          "default": "GEMINI_API_KEY",
+          "description": "Environment variable name containing Gemini API key."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "compile": "npm run build"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.6.3"
+  }
+}

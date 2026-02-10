@@ -1,0 +1,25 @@
+[package]
+name = "aether-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aether-core = { path = "../aether-core" }
+aether-parse = { path = "../aether-parse" }
+aether-sir = { path = "../aether-sir" }
+aether-store = { path = "../aether-store" }
+anyhow.workspace = true
+clap.workspace = true
+rmcp = { version = "0.14.0", features = ["transport-io"] }
+rusqlite.workspace = true
+schemars = "1.2"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+aetherd = { path = "../aetherd" }
+tempfile.workspace = true

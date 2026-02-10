@@ -1,0 +1,115 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-latest
+            platform: macos
+          - os: windows-latest
+            platform: windows
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Build release binaries
+        run: cargo build --release -p aetherd -p aether-mcp
+
+      - name: Package release assets (Linux/macOS)
+        if: matrix.platform != 'windows'
+        id: package_unix
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="${GITHUB_REF_NAME}"
+
+          if [ "${{ matrix.platform }}" = "linux" ]; then
+            STAGE_DIR="aether-${TAG}-linux-x64"
+            ASSET="aether-${TAG}-linux-x64.tar.gz"
+            mkdir -p "${STAGE_DIR}"
+            cp target/release/aetherd "${STAGE_DIR}/aetherd"
+            cp target/release/aether-mcp "${STAGE_DIR}/aether-mcp"
+            cp README.md "${STAGE_DIR}/README.md"
+            cp LICENSE "${STAGE_DIR}/LICENSE"
+            tar -czf "${ASSET}" "${STAGE_DIR}"
+          else
+            STAGE_DIR="aether-${TAG}-macos-x64"
+            ASSET="aether-${TAG}-macos-x64.zip"
+            mkdir -p "${STAGE_DIR}"
+            cp target/release/aetherd "${STAGE_DIR}/aetherd"
+            cp target/release/aether-mcp "${STAGE_DIR}/aether-mcp"
+            cp README.md "${STAGE_DIR}/README.md"
+            cp LICENSE "${STAGE_DIR}/LICENSE"
+            zip -r "${ASSET}" "${STAGE_DIR}"
+          fi
+
+          echo "asset=${ASSET}" >> "${GITHUB_OUTPUT}"
+
+      - name: Package release assets (Windows)
+        if: matrix.platform == 'windows'
+        id: package_windows
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $stageDir = "aether-$tag-windows-x64"
+          $asset = "aether-$tag-windows-x64.zip"
+
+          New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+
+          Copy-Item "target/release/aetherd.exe" "$stageDir/aetherd.exe"
+          Copy-Item "target/release/aether-mcp.exe" "$stageDir/aether-mcp.exe"
+          Copy-Item "README.md" "$stageDir/README.md"
+          Copy-Item "LICENSE" "$stageDir/LICENSE"
+
+          Compress-Archive -Path "$stageDir/*" -DestinationPath $asset -Force
+
+          "asset=$asset" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package_unix.outputs.asset || steps.package_windows.outputs.asset }}
+          path: ${{ steps.package_unix.outputs.asset || steps.package_windows.outputs.asset }}
+
+  publish:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

@@ -1,0 +1,16 @@
+[package]
+name = "aether-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aether-core = { path = "../aether-core" }
+aether-parse = { path = "../aether-parse" }
+aether-sir = { path = "../aether-sir" }
+aether-store = { path = "../aether-store" }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["io-std"] }
+tower-lsp = "0.20"

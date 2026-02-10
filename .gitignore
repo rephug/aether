@@ -1,0 +1,12 @@
+# Rust
+/target/
+
+# AETHER local runtime data
+/.aether/
+
+# Environment files
+**/.env
+
+# VS Code extension build outputs
+/vscode-extension/node_modules/
+/vscode-extension/dist/
