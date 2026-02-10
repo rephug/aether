@@ -1,32 +1,37 @@
-# docs/roadmap/phase_3_ghost.md
+# Phase 3: Ghost
 
-# Phase 3 — Ghost (Verification)
+## Purpose
+Verify patch safety before acceptance by running checks in isolated execution modes.
 
-## Goal
-Before marking an AI suggestion as “good”, verify it by running checks/tests in an isolated environment.
+## In scope
+- Verification orchestration in existing runtime paths (`crates/aetherd`, `crates/aether-config`)
+- Result reporting to `crates/aether-mcp` and optional `crates/aether-lsp`
+- Host, container, and optional microVM strategies
 
-## Stage 3.1 — Host-based verification (fastest to ship)
-- Run: syntax checks, formatters, typecheck, unit tests on host
-- Return: Verified ✅ or Failed ❌ with logs
-- No sandbox yet
+## Out of scope
+- Guaranteeing identical determinism across every OS/kernel setup
+- Replacing existing CI pipelines
 
-Pass criteria:
-- Patch can be applied to temp workspace and verified with deterministic outputs
+## Pass criteria
+1. Verification request produces clear pass/fail status with captured logs.
+2. Host and container modes can be selected/configured and tested.
+3. Optional microVM path degrades cleanly when unsupported.
+4. `cargo fmt --all --check`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace` pass.
 
-## Stage 3.2 — Container verification (Docker baseline)
-- Run verification in a container for reproducibility
-- No microVM assumptions
+## Exact Codex prompt(s)
+```text
+You are working in the repo root of https://github.com/rephug/aether.
 
-Pass criteria:
-- Same patch produces same result across machines (given same container image)
-
-## Stage 3.3 — MicroVM acceleration (optional)
-- Firecracker on Linux fast path
-- Hyper-V on Windows reliable baseline
-- Treat WSL2 + nested virt as optional, not guaranteed
-
-Pass criteria:
-- Snapshot/warm pool restores quickly AND remains stable over repeated runs
-
-Non-goals:
-- Shipping “universal determinism” on Windows
+1) Ensure working tree is clean. If not, stop and report dirty files.
+2) Create branch feature/phase-3-ghost-rollup off main.
+3) Create worktree ../aether-phase-3-ghost for that branch and switch into it.
+4) Implement Phase 3 by completing stage docs in this order:
+   - docs/roadmap/phase_3_stage_3_1_host_verification.md
+   - docs/roadmap/phase_3_stage_3_2_container_verification.md
+   - docs/roadmap/phase_3_stage_3_3_microvm_optional.md
+5) Run:
+   - cargo fmt --all --check
+   - cargo clippy --workspace -- -D warnings
+   - cargo test --workspace
+6) Commit with message: "Complete Phase 3 Ghost rollout".
+```

@@ -44,6 +44,10 @@ Main crates:
 - `crates/aether-mcp`: stdio MCP server exposing local AETHER tools
 - `crates/aether-config`: `.aether/config.toml` loader/defaults
 
+## Roadmap
+
+- `docs/roadmap/README.md`: phase/stage plan with scoped deliverables, pass criteria, and copy/paste Codex prompts.
+
 ## Quickstart (Build from Source)
 
 ```bash

@@ -1,63 +1,39 @@
-# docs/roadmap/phase_1_stage_3_2_robustness.md
+# Phase 1 - Stage 3.2: Robustness
 
-# Phase 1 — Stage 3.2: Robustness Polish (Stale SIR + Rate Limiting)
+## Purpose
+Make inference behavior resilient so AETHER keeps serving usable SIR under transient failures.
 
-## Goal
-Make AETHER resilient and “safe to leave running” by:
-1) Never deleting a previously-good SIR if inference fails
-2) Marking stale SIR state with enough info to debug
-3) Adding basic rate limiting/backoff so bursts don’t overwhelm the system
+## In scope
+- Failure/staleness metadata in `crates/aether-store`
+- Retry/backoff and throttling in `crates/aether-infer` and `crates/aetherd`
+- Stale-state surfacing in `crates/aether-mcp` and `crates/aether-lsp`
 
-## Non-goals
-- Cost policy / paywall / quotas
-- Sandbox / verification runtime
-- Any UI work beyond surfacing stale status via MCP/LSP responses
+## Out of scope
+- Cost management policy and quota systems
+- Verification runtime (Phase 3)
 
-## Required behavior
-### Stale SIR behavior
-If inference fails or times out for a symbol:
-- Keep the last-good SIR
-- Mark symbol metadata:
-  - sir_status = "stale"
-  - last_error = "<short error>"
-  - last_attempt_at = <timestamp>
+## Pass criteria
+1. Failed/timeout inference does not remove last good SIR.
+2. Stale metadata is stored and visible in MCP/LSP outputs.
+3. Successful regeneration clears stale status consistently.
+4. `cargo fmt --all --check`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace` pass.
 
-If inference later succeeds:
-- sir_status returns to "ok"
-- last_error cleared or preserved separately (either is fine; be consistent)
+## Exact Codex prompt(s)
+```text
+You are working in the repo root of https://github.com/rephug/aether.
 
-### Surface stale status
-- MCP responses for “get SIR” must include status + last_error if stale
-- LSP hover must show a warning banner if stale
-
-### Rate limiting/backoff
-- Add a basic in-process limiter (token bucket or semaphore + delay)
-- If provider errors look like rate limiting, add exponential backoff (bounded)
-
-## Revised pass criteria for this stage
-This stage passes if ALL are true:
-
-1) cargo fmt --check, cargo clippy -- -D warnings, cargo test pass
-2) Tests confirm:
-   - When inference is forced to fail, previous SIR remains accessible
-   - Metadata marks stale with last_error + last_attempt timestamp
-   - A later successful inference clears stale
-3) MCP/LSP outputs include stale status and warning text (verified via tests where feasible)
-4) No heavy dependencies added
-
-## Codex execution prompt
-
-### PROMPT 3 — polish: rate-limit safety + “stale SIR” behavior
-Paste into Codex:
-
-Add robustness polish for production-ish use:
-
-1) If inference fails or times out when generating SIR for a changed symbol, do NOT delete existing SIR.
-   - Mark the symbol metadata as "sir_status = stale" (or similar) with last_error + last_attempt timestamp.
-   - MCP/LSP should surface that status in responses.
-2) Add a basic rate limiter / backoff for inference provider calls (even for local providers).
-3) Add tests for the stale behavior (failure keeps old SIR and marks stale).
-
-Do not introduce heavy dependencies.
-cargo test must pass.
-Commit: "Robust inference failure handling and rate limiting"
+1) Ensure working tree is clean. If not, stop and report dirty files.
+2) Create branch feature/phase1-stage3-2-robustness off main.
+3) Create worktree ../aether-phase1-stage3-2-robustness for that branch and switch into it.
+4) Implement robustness in existing crates only:
+   - preserve last-good SIR on inference failure
+   - persist stale/error metadata in crates/aether-store
+   - add bounded retry/backoff in crates/aether-infer or orchestration in crates/aetherd
+   - surface stale status in crates/aether-mcp and crates/aether-lsp
+5) Add tests for stale retention, stale clearing, and output status fields.
+6) Run:
+   - cargo fmt --all --check
+   - cargo clippy --workspace -- -D warnings
+   - cargo test --workspace
+7) Commit with message: "Add stale-SIR handling and inference robustness".
+```
