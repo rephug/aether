@@ -26,6 +26,15 @@ pub struct SirMetaRecord {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolSearchResult {
+    pub symbol_id: String,
+    pub qualified_name: String,
+    pub file_path: String,
+    pub language: String,
+    pub kind: String,
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("io error: {0}")]
@@ -38,6 +47,11 @@ pub trait Store {
     fn upsert_symbol(&self, record: SymbolRecord) -> Result<(), StoreError>;
     fn mark_removed(&self, symbol_id: &str) -> Result<(), StoreError>;
     fn list_symbols_for_file(&self, file_path: &str) -> Result<Vec<SymbolRecord>, StoreError>;
+    fn search_symbols(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<SymbolSearchResult>, StoreError>;
 
     fn write_sir_blob(&self, symbol_id: &str, sir_json_string: &str) -> Result<(), StoreError>;
     fn read_sir_blob(&self, symbol_id: &str) -> Result<Option<String>, StoreError>;
@@ -140,6 +154,47 @@ impl Store for SqliteStore {
                 qualified_name: row.get(4)?,
                 signature_fingerprint: row.get(5)?,
                 last_seen_at: row.get(6)?,
+            })
+        })?;
+
+        let records = rows.collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    fn search_symbols(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<SymbolSearchResult>, StoreError> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let capped_limit = limit.clamp(1, 100) as i64;
+        let pattern = format!("%{query}%");
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, qualified_name, file_path, language, kind
+            FROM symbols
+            WHERE LOWER(id) LIKE LOWER(?1)
+               OR LOWER(qualified_name) LIKE LOWER(?1)
+               OR LOWER(file_path) LIKE LOWER(?1)
+               OR LOWER(language) LIKE LOWER(?1)
+               OR LOWER(kind) LIKE LOWER(?1)
+            ORDER BY qualified_name ASC, id ASC
+            LIMIT ?2
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![pattern, capped_limit], |row| {
+            Ok(SymbolSearchResult {
+                symbol_id: row.get(0)?,
+                qualified_name: row.get(1)?,
+                file_path: row.get(2)?,
+                language: row.get(3)?,
+                kind: row.get(4)?,
             })
         })?;
 
@@ -271,6 +326,18 @@ mod tests {
         }
     }
 
+    fn symbol_record_ts() -> SymbolRecord {
+        SymbolRecord {
+            id: "sym-2".to_owned(),
+            file_path: "src/app.ts".to_owned(),
+            language: "typescript".to_owned(),
+            kind: "function".to_owned(),
+            qualified_name: "web::render".to_owned(),
+            signature_fingerprint: "sig-c".to_owned(),
+            last_seen_at: 1_700_000_000,
+        }
+    }
+
     #[test]
     fn store_creates_layout_and_persists_data_without_duplicates() {
         let temp = tempdir().expect("tempdir");
@@ -343,5 +410,64 @@ mod tests {
             .list_symbols_for_file("src/lib.rs")
             .expect("list after delete");
         assert!(list.is_empty());
+    }
+
+    #[test]
+    fn search_symbols_matches_by_name_path_language_and_kind() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        store
+            .upsert_symbol(symbol_record())
+            .expect("upsert rust symbol");
+        store
+            .upsert_symbol(symbol_record_ts())
+            .expect("upsert ts symbol");
+
+        let by_name = store
+            .search_symbols("demo::run", 20)
+            .expect("search by name");
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name[0].symbol_id, "sym-1");
+
+        let by_path = store
+            .search_symbols("src/app.ts", 20)
+            .expect("search by path");
+        assert_eq!(by_path.len(), 1);
+        assert_eq!(by_path[0].symbol_id, "sym-2");
+
+        let by_language = store
+            .search_symbols("RUST", 20)
+            .expect("search by language");
+        assert_eq!(by_language.len(), 1);
+        assert_eq!(by_language[0].symbol_id, "sym-1");
+
+        let by_kind = store
+            .search_symbols("function", 20)
+            .expect("search by kind");
+        assert_eq!(by_kind.len(), 2);
+    }
+
+    #[test]
+    fn search_symbols_respects_empty_query_and_limit() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        let mut first = symbol_record();
+        first.qualified_name = "alpha::run".to_owned();
+        first.id = "sym-a".to_owned();
+        store.upsert_symbol(first).expect("upsert first symbol");
+
+        let mut second = symbol_record();
+        second.qualified_name = "beta::run".to_owned();
+        second.id = "sym-b".to_owned();
+        store.upsert_symbol(second).expect("upsert second symbol");
+
+        let empty = store.search_symbols("   ", 20).expect("search empty");
+        assert!(empty.is_empty());
+
+        let limited = store.search_symbols("::run", 1).expect("search with limit");
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].qualified_name, "alpha::run");
     }
 }

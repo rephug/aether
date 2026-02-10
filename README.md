@@ -13,6 +13,7 @@ It watches your workspace, extracts stable symbols, generates per-symbol SIR (St
 - Computes stable symbol IDs so IDs survive line-shift edits.
 - Generates SIR for changed symbols using configurable inference providers.
 - Stores symbol metadata + SIR locally (`.aether/meta.sqlite` and `.aether/sir/*.json`).
+- Searches local symbols by name/path/language from CLI and MCP.
 - Serves hover summaries through the AETHER LSP server.
 - Serves local lookup/explain tools through the AETHER MCP server.
 
@@ -84,6 +85,19 @@ cargo run -p aetherd -- --workspace . --print-events --print-sir
 cargo run -p aetherd -- --workspace . --lsp --index
 ```
 
+### Search symbols
+
+```bash
+cargo run -p aetherd -- --workspace . --search "alpha"
+```
+
+Output columns:
+- `symbol_id`
+- `qualified_name`
+- `file_path`
+- `language`
+- `kind`
+
 ## VS Code Extension
 
 The extension lives in `vscode-extension/` and starts AETHER over stdio.
@@ -117,6 +131,7 @@ Typical paths:
 MCP tools exposed:
 - `aether_status`
 - `aether_symbol_lookup`
+- `aether_search`
 - `aether_get_sir`
 - `aether_explain`
 
