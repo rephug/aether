@@ -145,12 +145,7 @@ fn visit_rust(
                     symbols,
                     language,
                     file_path,
-                    SymbolKind::Struct,
-                    &name,
-                    context,
-                    node_text(node, source),
-                    declaration_prefix(node, source),
-                    node,
+                    symbol_input(SymbolKind::Struct, &name, context, node, source),
                 );
                 context.push(name);
                 visit_children(
@@ -166,12 +161,7 @@ fn visit_rust(
                     symbols,
                     language,
                     file_path,
-                    SymbolKind::Enum,
-                    &name,
-                    context,
-                    node_text(node, source),
-                    declaration_prefix(node, source),
-                    node,
+                    symbol_input(SymbolKind::Enum, &name, context, node, source),
                 );
                 context.push(name);
                 visit_children(
@@ -187,12 +177,7 @@ fn visit_rust(
                     symbols,
                     language,
                     file_path,
-                    SymbolKind::Trait,
-                    &name,
-                    context,
-                    node_text(node, source),
-                    declaration_prefix(node, source),
-                    node,
+                    symbol_input(SymbolKind::Trait, &name, context, node, source),
                 );
                 context.push(name);
                 visit_children(
@@ -208,12 +193,7 @@ fn visit_rust(
                     symbols,
                     language,
                     file_path,
-                    SymbolKind::TypeAlias,
-                    &name,
-                    context,
-                    node_text(node, source),
-                    declaration_prefix(node, source),
-                    node,
+                    symbol_input(SymbolKind::TypeAlias, &name, context, node, source),
                 );
             }
         }
@@ -228,12 +208,7 @@ fn visit_rust(
                     symbols,
                     language,
                     file_path,
-                    symbol_kind,
-                    &name,
-                    context,
-                    node_text(node, source),
-                    declaration_prefix(node, source),
-                    node,
+                    symbol_input(symbol_kind, &name, context, node, source),
                 );
             }
         }
@@ -260,12 +235,7 @@ fn visit_typescript(
                     symbols,
                     language,
                     file_path,
-                    SymbolKind::Class,
-                    &name,
-                    context,
-                    node_text(node, source),
-                    declaration_prefix(node, source),
-                    node,
+                    symbol_input(SymbolKind::Class, &name, context, node, source),
                 );
                 context.push(name);
                 visit_children(
@@ -287,12 +257,7 @@ fn visit_typescript(
                     symbols,
                     language,
                     file_path,
-                    SymbolKind::Interface,
-                    &name,
-                    context,
-                    node_text(node, source),
-                    declaration_prefix(node, source),
-                    node,
+                    symbol_input(SymbolKind::Interface, &name, context, node, source),
                 );
                 context.push(name);
                 visit_children(
@@ -314,12 +279,7 @@ fn visit_typescript(
                     symbols,
                     language,
                     file_path,
-                    SymbolKind::Function,
-                    &name,
-                    context,
-                    node_text(node, source),
-                    declaration_prefix(node, source),
-                    node,
+                    symbol_input(SymbolKind::Function, &name, context, node, source),
                 );
             }
         }
@@ -329,12 +289,7 @@ fn visit_typescript(
                     symbols,
                     language,
                     file_path,
-                    SymbolKind::Method,
-                    &name,
-                    context,
-                    node_text(node, source),
-                    declaration_prefix(node, source),
-                    node,
+                    symbol_input(SymbolKind::Method, &name, context, node, source),
                 );
             }
         }
@@ -344,12 +299,7 @@ fn visit_typescript(
                     symbols,
                     language,
                     file_path,
-                    SymbolKind::TypeAlias,
-                    &name,
-                    context,
-                    node_text(node, source),
-                    declaration_prefix(node, source),
-                    node,
+                    symbol_input(SymbolKind::TypeAlias, &name, context, node, source),
                 );
             }
         }
@@ -367,40 +317,73 @@ fn visit_typescript(
     );
 }
 
+struct SymbolInput<'a> {
+    kind: SymbolKind,
+    name: &'a str,
+    context: &'a [String],
+    symbol_text: String,
+    signature_text: String,
+    range: SourceRange,
+}
+
+fn symbol_input<'a>(
+    kind: SymbolKind,
+    name: &'a str,
+    context: &'a [String],
+    node: Node<'_>,
+    source: &[u8],
+) -> SymbolInput<'a> {
+    SymbolInput {
+        kind,
+        name,
+        context,
+        symbol_text: node_text(node, source),
+        signature_text: declaration_prefix(node, source),
+        range: node_range(node),
+    }
+}
+
 fn push_symbol(
     output: &mut Vec<Symbol>,
     language: Language,
     file_path: &str,
-    kind: SymbolKind,
-    name: &str,
-    context: &[String],
-    symbol_text: String,
-    signature_text: String,
-    node: Node<'_>,
+    input: SymbolInput<'_>,
 ) {
-    if name.is_empty() {
+    if input.name.is_empty() {
         return;
     }
 
-    let qualified_name = qualify(context, name);
-    let sig_fingerprint = signature_fingerprint(&signature_text);
-    let id = stable_symbol_id(language, file_path, kind, &qualified_name, &sig_fingerprint);
+    let qualified_name = qualify(input.context, input.name);
+    let sig_fingerprint = signature_fingerprint(&input.signature_text);
+    let id = stable_symbol_id(
+        language,
+        file_path,
+        input.kind,
+        &qualified_name,
+        &sig_fingerprint,
+    );
 
     output.push(Symbol {
         id,
         language,
         file_path: file_path.to_owned(),
-        kind,
-        name: name.to_owned(),
+        kind: input.kind,
+        name: input.name.to_owned(),
         qualified_name,
         signature_fingerprint: sig_fingerprint,
-        content_hash: content_hash(&symbol_text),
-        range: SourceRange {
-            start: point_to_position(node.start_position()),
-            end: point_to_position(node.end_position()),
-        },
+        content_hash: content_hash(&input.symbol_text),
+        range: input.range,
     });
 }
+
+fn node_range(node: Node<'_>) -> SourceRange {
+    SourceRange {
+        start: point_to_position(node.start_position()),
+        end: point_to_position(node.end_position()),
+    }
+}
+
+type AstVisitor = fn(Node<'_>, &[u8], &str, Language, &mut Vec<String>, &mut Vec<Symbol>);
 
 fn visit_children(
     node: Node<'_>,
@@ -409,7 +392,7 @@ fn visit_children(
     language: Language,
     context: &mut Vec<String>,
     symbols: &mut Vec<Symbol>,
-    visitor: fn(Node<'_>, &[u8], &str, Language, &mut Vec<String>, &mut Vec<Symbol>),
+    visitor: AstVisitor,
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {

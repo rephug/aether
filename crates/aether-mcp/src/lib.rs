@@ -195,7 +195,7 @@ impl AetherMcpServer {
         }
 
         let limit = request.limit.unwrap_or(20).min(100) as i64;
-        let pattern = format!("%{}%", query);
+        let pattern = format!("%{query}%");
 
         let conn = self.open_sqlite_connection(&sqlite_path)?;
         let mut stmt = conn.prepare(
@@ -428,7 +428,7 @@ impl AetherMcpServer {
 
     fn verbose_log(&self, message: &str) {
         if self.verbose {
-            eprintln!("{}", message);
+            eprintln!("{message}");
         }
     }
 }
@@ -511,7 +511,7 @@ fn to_mcp_error(err: AetherMcpError) -> McpError {
 }
 
 fn count_table_rows(conn: &Connection, table_name: &str) -> Result<i64, AetherMcpError> {
-    let sql = format!("SELECT COUNT(*) FROM {}", table_name);
+    let sql = format!("SELECT COUNT(*) FROM {table_name}");
     match conn.query_row(&sql, [], |row| row.get::<_, i64>(0)) {
         Ok(count) => Ok(count),
         Err(err) if err.to_string().contains("no such table") => Ok(0),
