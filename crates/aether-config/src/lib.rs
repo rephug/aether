@@ -10,9 +10,10 @@ pub const DEFAULT_GEMINI_API_KEY_ENV: &str = "GEMINI_API_KEY";
 pub const DEFAULT_QWEN_ENDPOINT: &str = "http://127.0.0.1:11434";
 pub const DEFAULT_QWEN_MODEL: &str = "qwen3-embeddings-0.6B";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum InferenceProviderKind {
+    #[default]
     Auto,
     Mock,
     Gemini,
@@ -27,12 +28,6 @@ impl InferenceProviderKind {
             Self::Gemini => "gemini",
             Self::Qwen3Local => "qwen3_local",
         }
-    }
-}
-
-impl Default for InferenceProviderKind {
-    fn default() -> Self {
-        Self::Auto
     }
 }
 
