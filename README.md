@@ -283,3 +283,9 @@ GitHub Releases provides prebuilt binaries for Linux, macOS, and Windows:
   - `aarch64-pc-windows-msvc`
 - Asset naming: `aether-<tag>-<target>.tar.gz` (Linux/macOS) and `aether-<tag>-<target>.zip` (Windows).
 - Each packaged artifact includes `aetherd`, `aether-mcp`, `README.md`, and `LICENSE`, plus a published `SHA256SUMS.txt`.
+
+## Changelog
+
+- Notable changes are tracked in `CHANGELOG.md`.
+- Add entries under `## [Unreleased]` in each PR that changes behavior, packaging, or developer workflows.
+- At release time, move `Unreleased` entries into a versioned section (for example `## [0.2.0] - 2026-02-11`).
