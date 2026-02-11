@@ -1,9 +1,10 @@
 use std::fs;
 use std::sync::Arc;
 
-use aether_infer::{InferenceProvider, MockProvider, Qwen3LocalProvider};
+use aether_config::InferenceProviderKind;
+use aether_infer::{InferenceProvider, MockProvider, ProviderOverrides, Qwen3LocalProvider};
 use aether_sir::{SirAnnotation, validate_sir};
-use aether_store::{SqliteStore, Store};
+use aether_store::{SqliteStore, Store, SymbolEmbeddingRecord};
 use aetherd::observer::ObserverState;
 use aetherd::sir_pipeline::SirPipeline;
 use tempfile::tempdir;
@@ -133,6 +134,95 @@ fn step2_pipeline_generates_and_persists_sir_with_mock_provider()
         let sir: SirAnnotation = serde_json::from_str(&blob)?;
         validate_sir(&sir)?;
     }
+
+    Ok(())
+}
+
+#[test]
+fn step2_embeddings_refresh_when_hash_changes_and_delete_on_symbol_removal()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    fs::create_dir_all(workspace.join(".aether"))?;
+    fs::write(
+        workspace.join(".aether/config.toml"),
+        r#"[inference]
+provider = "mock"
+api_key_env = "GEMINI_API_KEY"
+
+[storage]
+mirror_sir_files = true
+
+[embeddings]
+enabled = true
+provider = "mock"
+"#,
+    )?;
+
+    fs::create_dir_all(workspace.join("src"))?;
+    let rust_file = workspace.join("src/lib.rs");
+    fs::write(&rust_file, "fn alpha() -> i32 { 1 }\n")?;
+
+    let mut observer = ObserverState::new(workspace.to_path_buf())?;
+    observer.seed_from_disk()?;
+
+    let store = SqliteStore::open(workspace)?;
+    let pipeline = SirPipeline::new(
+        workspace.to_path_buf(),
+        1,
+        ProviderOverrides {
+            provider: Some(InferenceProviderKind::Mock),
+            ..ProviderOverrides::default()
+        },
+    )?;
+
+    let mut sink = Vec::new();
+    for event in observer.initial_symbol_events() {
+        pipeline.process_event(&store, &event, false, &mut sink)?;
+    }
+
+    let symbol = store
+        .list_symbols_for_file("src/lib.rs")?
+        .into_iter()
+        .find(|record| record.qualified_name.ends_with("alpha"))
+        .expect("alpha symbol should exist");
+
+    let embedding_meta = store
+        .get_symbol_embedding_meta(&symbol.id)?
+        .expect("embedding metadata should exist");
+
+    store.upsert_symbol_embedding(SymbolEmbeddingRecord {
+        symbol_id: symbol.id.clone(),
+        sir_hash: "stale-hash".to_owned(),
+        provider: "mock".to_owned(),
+        model: "mock-64d".to_owned(),
+        embedding: vec![1.0, 0.0, 0.0],
+        updated_at: embedding_meta.updated_at.saturating_sub(1),
+    })?;
+
+    fs::write(&rust_file, "fn alpha() -> i32 { 2 }\n")?;
+    let update_event = observer
+        .process_path(&rust_file)?
+        .expect("expected update event");
+    pipeline.process_event(&store, &update_event, false, &mut sink)?;
+
+    let refreshed_meta = store
+        .get_symbol_embedding_meta(&symbol.id)?
+        .expect("embedding metadata after refresh");
+    assert_ne!(refreshed_meta.sir_hash, "stale-hash");
+    assert_eq!(refreshed_meta.provider, "mock");
+    assert_eq!(refreshed_meta.model, "mock-64d");
+    assert!(refreshed_meta.embedding_dim > 0);
+
+    fs::write(&rust_file, "")?;
+    let removal_event = observer
+        .process_path(&rust_file)?
+        .expect("expected removal event");
+    pipeline.process_event(&store, &removal_event, false, &mut sink)?;
+
+    let after_remove = store.get_symbol_embedding_meta(&symbol.id)?;
+    assert!(after_remove.is_none());
 
     Ok(())
 }

@@ -9,6 +9,7 @@ authors.workspace = true
 aether-config = { path = "../aether-config" }
 aether-core = { path = "../aether-core" }
 rusqlite.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

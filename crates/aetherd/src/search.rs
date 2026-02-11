@@ -1,25 +1,132 @@
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
-use aether_store::{SqliteStore, Store, SymbolSearchResult};
+use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
+use aether_store::{SemanticSearchResult, SqliteStore, Store, SymbolSearchResult};
 use anyhow::{Context, Result};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchMode {
+    #[default]
+    Lexical,
+    Semantic,
+    Hybrid,
+}
+
+impl SearchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lexical => "lexical",
+            Self::Semantic => "semantic",
+            Self::Hybrid => "hybrid",
+        }
+    }
+}
+
+impl std::str::FromStr for SearchMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "lexical" => Ok(Self::Lexical),
+            "semantic" => Ok(Self::Semantic),
+            "hybrid" => Ok(Self::Hybrid),
+            other => Err(format!(
+                "invalid search mode '{other}', expected one of: lexical, semantic, hybrid"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchResultRow {
+    pub symbol_id: String,
+    pub qualified_name: String,
+    pub file_path: String,
+    pub language: String,
+    pub kind: String,
+    pub semantic_score: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchExecution {
+    pub mode_used: SearchMode,
+    pub fallback_reason: Option<String>,
+    pub matches: Vec<SearchResultRow>,
+}
 
 pub fn run_search_once(
     workspace: &Path,
     query: &str,
     limit: u32,
+    mode: SearchMode,
     out: &mut dyn Write,
 ) -> Result<()> {
-    let store = SqliteStore::open(workspace).context("failed to initialize local store")?;
-    let matches = store
-        .search_symbols(query, limit)
-        .context("failed to search symbols")?;
-    write_search_results(&matches, out).context("failed to write search results")?;
+    let execution = execute_search(workspace, query, limit, mode)?;
+    if let Some(reason) = &execution.fallback_reason {
+        eprintln!("AETHER search fallback: {reason}");
+    }
+
+    write_search_results(&execution.matches, out).context("failed to write search results")?;
     Ok(())
 }
 
+pub fn execute_search(
+    workspace: &Path,
+    query: &str,
+    limit: u32,
+    mode: SearchMode,
+) -> Result<SearchExecution> {
+    let store = SqliteStore::open(workspace).context("failed to initialize local store")?;
+    let limit = limit.clamp(1, 100);
+
+    let lexical_matches = lexical_search(&store, query, limit)?;
+    match mode {
+        SearchMode::Lexical => Ok(SearchExecution {
+            mode_used: SearchMode::Lexical,
+            fallback_reason: None,
+            matches: lexical_matches,
+        }),
+        SearchMode::Semantic => {
+            let (semantic_matches, fallback_reason) =
+                semantic_search(workspace, &store, query, limit)?;
+            if semantic_matches.is_empty() {
+                return Ok(SearchExecution {
+                    mode_used: SearchMode::Lexical,
+                    fallback_reason,
+                    matches: lexical_matches,
+                });
+            }
+
+            Ok(SearchExecution {
+                mode_used: SearchMode::Semantic,
+                fallback_reason: None,
+                matches: semantic_matches,
+            })
+        }
+        SearchMode::Hybrid => {
+            let (semantic_matches, fallback_reason) =
+                semantic_search(workspace, &store, query, limit)?;
+            if semantic_matches.is_empty() {
+                return Ok(SearchExecution {
+                    mode_used: SearchMode::Lexical,
+                    fallback_reason,
+                    matches: lexical_matches,
+                });
+            }
+
+            Ok(SearchExecution {
+                mode_used: SearchMode::Hybrid,
+                fallback_reason: None,
+                matches: fuse_hybrid_results(&lexical_matches, &semantic_matches, limit),
+            })
+        }
+    }
+}
+
 pub fn write_search_results(
-    matches: &[SymbolSearchResult],
+    matches: &[SearchResultRow],
     out: &mut dyn Write,
 ) -> std::io::Result<()> {
     writeln!(out, "symbol_id\tqualified_name\tfile_path\tlanguage\tkind")?;
@@ -39,8 +146,142 @@ pub fn write_search_results(
     Ok(())
 }
 
+fn lexical_search(store: &SqliteStore, query: &str, limit: u32) -> Result<Vec<SearchResultRow>> {
+    let matches = store
+        .search_symbols(query, limit)
+        .context("failed to search symbols lexically")?;
+
+    Ok(matches.into_iter().map(SearchResultRow::from).collect())
+}
+
+fn semantic_search(
+    workspace: &Path,
+    store: &SqliteStore,
+    query: &str,
+    limit: u32,
+) -> Result<(Vec<SearchResultRow>, Option<String>)> {
+    let loaded =
+        load_embedding_provider_from_config(workspace, EmbeddingProviderOverrides::default())
+            .context("failed to load embedding provider")?;
+    let Some(loaded) = loaded else {
+        return Ok((
+            Vec::new(),
+            Some("embeddings are disabled in .aether/config.toml".to_owned()),
+        ));
+    };
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build runtime for semantic search")?;
+    let query_embedding = match runtime.block_on(loaded.provider.embed_text(query)) {
+        Ok(embedding) => embedding,
+        Err(err) => {
+            return Ok((Vec::new(), Some(format!("embedding provider error: {err}"))));
+        }
+    };
+
+    if query_embedding.is_empty() {
+        return Ok((
+            Vec::new(),
+            Some("embedding provider returned an empty query vector".to_owned()),
+        ));
+    }
+
+    let matches = store
+        .search_symbols_semantic(
+            &query_embedding,
+            &loaded.provider_name,
+            &loaded.model_name,
+            limit,
+        )
+        .context("failed to run semantic symbol search")?;
+    if matches.is_empty() {
+        return Ok((
+            Vec::new(),
+            Some("semantic index not ready for this embedding provider/model".to_owned()),
+        ));
+    }
+
+    Ok((
+        matches.into_iter().map(SearchResultRow::from).collect(),
+        None,
+    ))
+}
+
+fn fuse_hybrid_results(
+    lexical: &[SearchResultRow],
+    semantic: &[SearchResultRow],
+    limit: u32,
+) -> Vec<SearchResultRow> {
+    const RRF_K: f32 = 60.0;
+
+    let mut row_by_id: HashMap<String, SearchResultRow> = HashMap::new();
+    let mut score_by_id: HashMap<String, f32> = HashMap::new();
+
+    for (rank, row) in lexical.iter().enumerate() {
+        let id = row.symbol_id.clone();
+        row_by_id.entry(id.clone()).or_insert_with(|| row.clone());
+        *score_by_id.entry(id).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
+    }
+
+    for (rank, row) in semantic.iter().enumerate() {
+        let id = row.symbol_id.clone();
+        row_by_id
+            .entry(id.clone())
+            .and_modify(|existing| {
+                if existing.semantic_score.is_none() && row.semantic_score.is_some() {
+                    existing.semantic_score = row.semantic_score;
+                }
+            })
+            .or_insert_with(|| row.clone());
+        *score_by_id.entry(id).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
+    }
+
+    let mut ranked: Vec<(String, f32)> = score_by_id.into_iter().collect();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    ranked
+        .into_iter()
+        .take(limit as usize)
+        .filter_map(|(symbol_id, _)| row_by_id.remove(&symbol_id))
+        .collect()
+}
+
 fn normalize_search_field(value: &str) -> String {
     value.replace(['\t', '\n', '\r'], " ")
+}
+
+impl From<SymbolSearchResult> for SearchResultRow {
+    fn from(value: SymbolSearchResult) -> Self {
+        Self {
+            symbol_id: value.symbol_id,
+            qualified_name: value.qualified_name,
+            file_path: value.file_path,
+            language: value.language,
+            kind: value.kind,
+            semantic_score: None,
+        }
+    }
+}
+
+impl From<SemanticSearchResult> for SearchResultRow {
+    fn from(value: SemanticSearchResult) -> Self {
+        Self {
+            symbol_id: value.symbol_id,
+            qualified_name: value.qualified_name,
+            file_path: value.file_path,
+            language: value.language,
+            kind: value.kind,
+            semantic_score: Some(value.semantic_score),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -48,7 +289,7 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
 
-    use aether_infer::{InferenceProvider, MockProvider};
+    use aether_infer::{EmbeddingProvider, InferenceProvider, MockEmbeddingProvider, MockProvider};
     use tempfile::tempdir;
 
     use super::*;
@@ -59,12 +300,13 @@ mod tests {
     #[test]
     fn write_search_results_outputs_stable_header_and_columns() {
         let mut out = Vec::new();
-        let matches = vec![SymbolSearchResult {
+        let matches = vec![SearchResultRow {
             symbol_id: "sym-1".to_owned(),
             qualified_name: "demo::run".to_owned(),
             file_path: "src/lib.rs".to_owned(),
             language: "rust".to_owned(),
             kind: "function".to_owned(),
+            semantic_score: None,
         }];
 
         write_search_results(&matches, &mut out).expect("write output");
@@ -101,11 +343,113 @@ mod tests {
             .expect("upsert symbol");
 
         let mut out = Vec::new();
-        run_search_once(workspace, "alpha", 20, &mut out).expect("run search");
+        run_search_once(workspace, "alpha", 20, SearchMode::Lexical, &mut out).expect("run search");
 
         let rendered = String::from_utf8(out).expect("utf8 output");
         assert!(rendered.contains("symbol_id\tqualified_name\tfile_path\tlanguage\tkind"));
         assert!(rendered.contains("demo::alpha"));
+    }
+
+    #[test]
+    fn semantic_search_returns_expected_top_match_with_mock_embeddings() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_enabled_config(workspace);
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        store
+            .upsert_symbol(SymbolRecord {
+                id: "sym-auth".to_owned(),
+                file_path: "src/auth.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "demo::auth_token_refresh".to_owned(),
+                signature_fingerprint: "sig-auth".to_owned(),
+                last_seen_at: 1_700_000_000,
+            })
+            .expect("upsert auth symbol");
+        store
+            .upsert_symbol(SymbolRecord {
+                id: "sym-cache".to_owned(),
+                file_path: "src/cache.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "demo::cache_lookup".to_owned(),
+                signature_fingerprint: "sig-cache".to_owned(),
+                last_seen_at: 1_700_000_000,
+            })
+            .expect("upsert cache symbol");
+
+        let provider = MockEmbeddingProvider;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let auth_embedding = runtime
+            .block_on(provider.embed_text("oauth token refresh session auth"))
+            .expect("auth embedding");
+        let cache_embedding = runtime
+            .block_on(provider.embed_text("cache lookup memory hit"))
+            .expect("cache embedding");
+
+        store
+            .upsert_symbol_embedding(aether_store::SymbolEmbeddingRecord {
+                symbol_id: "sym-auth".to_owned(),
+                sir_hash: "hash-auth".to_owned(),
+                provider: "mock".to_owned(),
+                model: "mock-64d".to_owned(),
+                embedding: auth_embedding,
+                updated_at: 1_700_000_100,
+            })
+            .expect("upsert auth embedding");
+        store
+            .upsert_symbol_embedding(aether_store::SymbolEmbeddingRecord {
+                symbol_id: "sym-cache".to_owned(),
+                sir_hash: "hash-cache".to_owned(),
+                provider: "mock".to_owned(),
+                model: "mock-64d".to_owned(),
+                embedding: cache_embedding,
+                updated_at: 1_700_000_100,
+            })
+            .expect("upsert cache embedding");
+
+        let semantic = execute_search(workspace, "oauth refresh token", 10, SearchMode::Semantic)
+            .expect("semantic execution");
+        assert_eq!(semantic.mode_used, SearchMode::Semantic);
+        assert!(semantic.fallback_reason.is_none());
+        assert!(!semantic.matches.is_empty());
+        assert_eq!(semantic.matches[0].symbol_id, "sym-auth");
+
+        let hybrid = execute_search(workspace, "oauth refresh token", 10, SearchMode::Hybrid)
+            .expect("hybrid execution");
+        assert_eq!(hybrid.mode_used, SearchMode::Hybrid);
+        assert!(!hybrid.matches.is_empty());
+        assert_eq!(hybrid.matches[0].symbol_id, "sym-auth");
+    }
+
+    #[test]
+    fn semantic_search_falls_back_to_lexical_when_embeddings_disabled() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let store = SqliteStore::open(workspace).expect("open store");
+        store
+            .upsert_symbol(SymbolRecord {
+                id: "sym-1".to_owned(),
+                file_path: "src/lib.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "demo::fallback_alpha".to_owned(),
+                signature_fingerprint: "sig-a".to_owned(),
+                last_seen_at: 1_700_000_000,
+            })
+            .expect("upsert symbol");
+
+        let result = execute_search(workspace, "fallback_alpha", 10, SearchMode::Semantic)
+            .expect("semantic with fallback");
+        assert_eq!(result.mode_used, SearchMode::Lexical);
+        assert!(result.fallback_reason.is_some());
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].symbol_id, "sym-1");
     }
 
     #[test]
@@ -177,5 +521,24 @@ mod tests {
             .search_symbols("beta", 20)
             .expect("search beta after remove");
         assert!(beta_after_remove.is_empty());
+    }
+
+    fn write_embeddings_enabled_config(workspace: &Path) {
+        fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
+        fs::write(
+            workspace.join(".aether/config.toml"),
+            r#"[inference]
+provider = "mock"
+api_key_env = "GEMINI_API_KEY"
+
+[storage]
+mirror_sir_files = true
+
+[embeddings]
+enabled = true
+provider = "mock"
+"#,
+        )
+        .expect("write config");
     }
 }

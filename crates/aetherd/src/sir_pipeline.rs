@@ -6,10 +6,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aether_core::{Position, SourceRange, Symbol, SymbolChangeEvent};
 use aether_infer::{
-    InferenceProvider, ProviderOverrides, SirContext, load_provider_from_env_or_mock,
+    EmbeddingProvider, EmbeddingProviderOverrides, InferenceProvider, ProviderOverrides,
+    SirContext, load_embedding_provider_from_config, load_provider_from_env_or_mock,
 };
 use aether_sir::{SirAnnotation, canonicalize_sir_json, sir_hash};
-use aether_store::{SirMetaRecord, SqliteStore, Store, SymbolRecord};
+use aether_store::{SirMetaRecord, SqliteStore, Store, SymbolEmbeddingRecord, SymbolRecord};
 use anyhow::{Context, Result, anyhow};
 use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
@@ -29,6 +30,9 @@ pub struct SirPipeline {
     provider: Arc<dyn InferenceProvider>,
     provider_name: String,
     model_name: String,
+    embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
+    embedding_provider_name: Option<String>,
+    embedding_model_name: Option<String>,
     runtime: Runtime,
     sir_concurrency: usize,
 }
@@ -42,13 +46,27 @@ impl SirPipeline {
         let loaded = load_provider_from_env_or_mock(&workspace_root, provider_overrides)
             .context("failed to load inference provider")?;
         let provider = Arc::<dyn InferenceProvider>::from(loaded.provider);
+        let loaded_embedding = load_embedding_provider_from_config(
+            &workspace_root,
+            EmbeddingProviderOverrides::default(),
+        )
+        .context("failed to load embedding provider")?;
+        let (embedding_provider, embedding_identity) =
+            loaded_embedding.map_or((None, None), |loaded| {
+                (
+                    Some(Arc::<dyn EmbeddingProvider>::from(loaded.provider)),
+                    Some((loaded.provider_name, loaded.model_name)),
+                )
+            });
 
-        Self::new_with_provider(
+        Self::new_with_provider_and_embeddings(
             workspace_root,
             sir_concurrency,
             provider,
             loaded.provider_name,
             loaded.model_name,
+            embedding_provider,
+            embedding_identity,
         )
     }
 
@@ -59,18 +77,45 @@ impl SirPipeline {
         provider_name: impl Into<String>,
         model_name: impl Into<String>,
     ) -> Result<Self> {
+        Self::new_with_provider_and_embeddings(
+            workspace_root,
+            sir_concurrency,
+            provider,
+            provider_name,
+            model_name,
+            None,
+            None,
+        )
+    }
+
+    fn new_with_provider_and_embeddings(
+        workspace_root: PathBuf,
+        sir_concurrency: usize,
+        provider: Arc<dyn InferenceProvider>,
+        provider_name: impl Into<String>,
+        model_name: impl Into<String>,
+        embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
+        embedding_identity: Option<(String, String)>,
+    ) -> Result<Self> {
         let concurrency = sir_concurrency.max(1);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(concurrency)
             .enable_all()
             .build()
             .context("failed to build SIR async runtime")?;
+        let (embedding_provider_name, embedding_model_name) = embedding_identity
+            .map_or((None, None), |identity| {
+                (Some(identity.0), Some(identity.1))
+            });
 
         Ok(Self {
             workspace_root,
             provider,
             provider_name: provider_name.into(),
             model_name: model_name.into(),
+            embedding_provider,
+            embedding_provider_name,
+            embedding_model_name,
             runtime,
             sir_concurrency: concurrency,
         })
@@ -148,6 +193,20 @@ impl SirPipeline {
                             format!("failed to upsert SIR metadata for {}", generated.symbol.id)
                         })?;
 
+                    if let Err(err) = self.refresh_embedding_if_needed(
+                        store,
+                        &generated.symbol.id,
+                        &sir_hash_value,
+                        &canonical_json,
+                        print_sir,
+                        out,
+                    ) {
+                        eprintln!(
+                            "embedding refresh error for symbol {}: {err:#}",
+                            generated.symbol.id
+                        );
+                    }
+
                     if print_sir {
                         writeln!(
                             out,
@@ -215,6 +274,73 @@ impl SirPipeline {
                     }
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    fn refresh_embedding_if_needed(
+        &self,
+        store: &SqliteStore,
+        symbol_id: &str,
+        sir_hash_value: &str,
+        canonical_json: &str,
+        print_sir: bool,
+        out: &mut dyn Write,
+    ) -> Result<()> {
+        let Some(embedding_provider) = self.embedding_provider.as_ref() else {
+            return Ok(());
+        };
+
+        let provider_name = self
+            .embedding_provider_name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("mock");
+        let model_name = self
+            .embedding_model_name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("mock");
+
+        let existing_meta = store
+            .get_symbol_embedding_meta(symbol_id)
+            .with_context(|| format!("failed to read embedding metadata for {symbol_id}"))?;
+        if let Some(existing_meta) = existing_meta
+            && existing_meta.sir_hash == sir_hash_value
+            && existing_meta.provider == provider_name
+            && existing_meta.model == model_name
+        {
+            return Ok(());
+        }
+
+        let embedding = self
+            .runtime
+            .block_on(embedding_provider.embed_text(canonical_json))
+            .with_context(|| format!("failed to generate embedding for {symbol_id}"))?;
+
+        if embedding.is_empty() {
+            return Ok(());
+        }
+
+        let updated_at = unix_timestamp_secs();
+        store
+            .upsert_symbol_embedding(SymbolEmbeddingRecord {
+                symbol_id: symbol_id.to_owned(),
+                sir_hash: sir_hash_value.to_owned(),
+                provider: provider_name.to_owned(),
+                model: model_name.to_owned(),
+                embedding,
+                updated_at,
+            })
+            .with_context(|| format!("failed to store embedding for {symbol_id}"))?;
+
+        if print_sir {
+            writeln!(
+                out,
+                "EMBEDDING_STORED symbol_id={symbol_id} provider={provider_name} model={model_name}"
+            )
+            .context("failed to write embedding print line")?;
         }
 
         Ok(())

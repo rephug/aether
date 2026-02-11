@@ -7,6 +7,7 @@ authors.workspace = true
 
 [dependencies]
 aether-core = { path = "../aether-core" }
+aether-infer = { path = "../aether-infer" }
 aether-parse = { path = "../aether-parse" }
 aether-sir = { path = "../aether-sir" }
 aether-store = { path = "../aether-store" }

@@ -9,6 +9,7 @@ pub const CONFIG_FILE_NAME: &str = "config.toml";
 pub const DEFAULT_GEMINI_API_KEY_ENV: &str = "GEMINI_API_KEY";
 pub const DEFAULT_QWEN_ENDPOINT: &str = "http://127.0.0.1:11434";
 pub const DEFAULT_QWEN_MODEL: &str = "qwen3-embeddings-0.6B";
+pub const DEFAULT_QWEN_EMBEDDING_ENDPOINT: &str = "http://127.0.0.1:11434/api/embeddings";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -47,12 +48,45 @@ impl std::str::FromStr for InferenceProviderKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingProviderKind {
+    #[default]
+    Mock,
+    Qwen3Local,
+}
+
+impl EmbeddingProviderKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mock => "mock",
+            Self::Qwen3Local => "qwen3_local",
+        }
+    }
+}
+
+impl std::str::FromStr for EmbeddingProviderKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "mock" => Ok(Self::Mock),
+            "qwen3_local" => Ok(Self::Qwen3Local),
+            other => Err(format!(
+                "invalid embedding provider '{other}', expected one of: mock, qwen3_local"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AetherConfig {
     #[serde(default)]
     pub inference: InferenceConfig,
     #[serde(default)]
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub embeddings: EmbeddingsConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +122,29 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             mirror_sir_files: default_mirror_sir_files(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingsConfig {
+    #[serde(default = "default_embeddings_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub provider: EmbeddingProviderKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+}
+
+impl Default for EmbeddingsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_embeddings_enabled(),
+            provider: EmbeddingProviderKind::Mock,
+            model: None,
+            endpoint: None,
         }
     }
 }
@@ -149,6 +206,10 @@ fn default_mirror_sir_files() -> bool {
     true
 }
 
+fn default_embeddings_enabled() -> bool {
+    false
+}
+
 fn normalize_optional(input: Option<String>) -> Option<String> {
     input
         .map(|value| value.trim().to_owned())
@@ -158,6 +219,8 @@ fn normalize_optional(input: Option<String>) -> Option<String> {
 fn normalize_config(mut config: AetherConfig) -> AetherConfig {
     config.inference.model = normalize_optional(config.inference.model.take());
     config.inference.endpoint = normalize_optional(config.inference.endpoint.take());
+    config.embeddings.model = normalize_optional(config.embeddings.model.take());
+    config.embeddings.endpoint = normalize_optional(config.embeddings.endpoint.take());
 
     let api_key_env = config.inference.api_key_env.trim();
     if api_key_env.is_empty() {
@@ -187,6 +250,8 @@ mod tests {
         assert_eq!(config.inference.provider, InferenceProviderKind::Auto);
         assert_eq!(config.inference.api_key_env, DEFAULT_GEMINI_API_KEY_ENV);
         assert!(config.storage.mirror_sir_files);
+        assert!(!config.embeddings.enabled);
+        assert_eq!(config.embeddings.provider, EmbeddingProviderKind::Mock);
         assert!(config_path(workspace).exists());
 
         let content = fs::read_to_string(config_path(workspace)).expect("read config file");
@@ -194,10 +259,13 @@ mod tests {
         assert!(content.contains("provider = \"auto\""));
         assert!(content.contains("[storage]"));
         assert!(content.contains("mirror_sir_files = true"));
+        assert!(content.contains("[embeddings]"));
+        assert!(content.contains("enabled = false"));
+        assert!(content.contains("provider = \"mock\""));
     }
 
     #[test]
-    fn load_workspace_config_parses_inference_values() {
+    fn load_workspace_config_parses_inference_storage_and_embedding_values() {
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();
         fs::create_dir_all(aether_dir(workspace)).expect("create .aether");
@@ -211,6 +279,12 @@ api_key_env = "CUSTOM_GEMINI_KEY"
 
 [storage]
 mirror_sir_files = false
+
+[embeddings]
+enabled = true
+provider = "qwen3_local"
+model = "qwen3-embeddings-4B"
+endpoint = "http://127.0.0.1:11434/api/embeddings"
 "#;
         fs::write(config_path(workspace), raw).expect("write config");
 
@@ -227,5 +301,18 @@ mirror_sir_files = false
         );
         assert_eq!(config.inference.api_key_env, "CUSTOM_GEMINI_KEY");
         assert!(!config.storage.mirror_sir_files);
+        assert!(config.embeddings.enabled);
+        assert_eq!(
+            config.embeddings.provider,
+            EmbeddingProviderKind::Qwen3Local
+        );
+        assert_eq!(
+            config.embeddings.model.as_deref(),
+            Some("qwen3-embeddings-4B")
+        );
+        assert_eq!(
+            config.embeddings.endpoint.as_deref(),
+            Some("http://127.0.0.1:11434/api/embeddings")
+        );
     }
 }

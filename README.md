@@ -13,7 +13,8 @@ It watches your workspace, extracts stable symbols, generates per-symbol SIR (St
 - Computes stable symbol IDs so IDs survive line-shift edits.
 - Generates SIR for changed symbols using configurable inference providers.
 - Stores symbol metadata + canonical SIR in SQLite (`.aether/meta.sqlite`) with optional file mirrors under `.aether/sir/*.json`.
-- Searches local symbols by name/path/language from CLI and MCP.
+- Stores optional per-symbol embeddings in SQLite for semantic retrieval.
+- Searches local symbols by name/path/language from CLI and MCP, with optional semantic/hybrid ranking.
 - Serves hover summaries through the AETHER LSP server.
 - Serves local lookup/explain tools through the AETHER MCP server.
 
@@ -40,7 +41,7 @@ Main crates:
 - `crates/aether-core`: symbol model, stable ID strategy, diffs
 - `crates/aether-sir`: SIR schema, validation, canonical JSON, hash
 - `crates/aether-store`: SQLite canonical storage + optional local SIR mirror files under `.aether/`
-- `crates/aether-infer`: provider trait + `mock`, `gemini`, `qwen3_local`
+- `crates/aether-infer`: provider traits + `mock`, `gemini`, `qwen3_local` for SIR and embeddings
 - `crates/aether-lsp`: stdio LSP hover server
 - `crates/aether-mcp`: stdio MCP server exposing local AETHER tools
 - `crates/aether-config`: `.aether/config.toml` loader/defaults
@@ -89,6 +90,13 @@ cargo run -p aetherd -- --workspace . --lsp --index
 
 ```bash
 cargo run -p aetherd -- --workspace . --search "alpha"
+```
+
+Semantic/hybrid search modes:
+
+```bash
+cargo run -p aetherd -- --workspace . --search "alpha behavior" --search-mode semantic
+cargo run -p aetherd -- --workspace . --search "alpha behavior" --search-mode hybrid
 ```
 
 Output columns:
@@ -154,6 +162,12 @@ api_key_env = "GEMINI_API_KEY"
 
 [storage]
 mirror_sir_files = true # optional file mirrors under .aether/sir/
+
+[embeddings]
+enabled = false # optional semantic retrieval index
+provider = "mock" # mock | qwen3_local
+# model = "qwen3-embeddings-0.6B"
+# endpoint = "http://127.0.0.1:11434/api/embeddings"
 ```
 
 Provider behavior:
@@ -169,6 +183,7 @@ CLI overrides (optional):
 --inference-model <name>
 --inference-endpoint <url>
 --inference-api-key-env <ENV_VAR_NAME>
+--search-mode <lexical|semantic|hybrid>
 ```
 
 ## Local Data Layout

@@ -2,7 +2,7 @@ use std::fs;
 
 use aether_mcp::{
     AetherExplainRequest, AetherGetSirRequest, AetherMcpServer, AetherSearchRequest,
-    AetherSymbolLookupRequest,
+    AetherSymbolLookupRequest, SearchMode,
 };
 use aether_store::{SqliteStore, Store};
 use aetherd::indexer::{IndexerConfig, run_initial_index_once};
@@ -15,6 +15,21 @@ use tokio::runtime::Runtime;
 fn mcp_tool_handlers_work_with_local_store() -> Result<()> {
     let temp = tempdir()?;
     let workspace = temp.path();
+    fs::create_dir_all(workspace.join(".aether"))?;
+    fs::write(
+        workspace.join(".aether/config.toml"),
+        r#"[inference]
+provider = "mock"
+api_key_env = "GEMINI_API_KEY"
+
+[storage]
+mirror_sir_files = true
+
+[embeddings]
+enabled = true
+provider = "mock"
+"#,
+    )?;
 
     fs::create_dir_all(workspace.join("src"))?;
 
@@ -76,9 +91,12 @@ fn mcp_tool_handlers_work_with_local_store() -> Result<()> {
         .block_on(server.aether_search(Parameters(AetherSearchRequest {
             query: "app.ts".to_owned(),
             limit: Some(10),
+            mode: None,
         })))
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
+    assert_eq!(search.mode_used, SearchMode::Lexical);
+    assert_eq!(search.fallback_reason, None);
     assert!(!search.matches.is_empty());
     assert!(
         search
@@ -86,6 +104,19 @@ fn mcp_tool_handlers_work_with_local_store() -> Result<()> {
             .iter()
             .any(|item| item.file_path.contains("src/app.ts"))
     );
+
+    let semantic_search = rt
+        .block_on(server.aether_search(Parameters(AetherSearchRequest {
+            query: "alpha summary".to_owned(),
+            limit: Some(10),
+            mode: Some(SearchMode::Semantic),
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert_eq!(semantic_search.mode_used, SearchMode::Semantic);
+    assert_eq!(semantic_search.fallback_reason, None);
+    assert!(!semantic_search.matches.is_empty());
+    assert!(semantic_search.matches[0].semantic_score.is_some());
 
     let explain = rt
         .block_on(server.aether_explain(Parameters(AetherExplainRequest {

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use aether_config::{InferenceProviderKind, ensure_workspace_config};
 use aetherd::indexer::{IndexerConfig, run_indexing_loop};
-use aetherd::search::run_search_once;
+use aetherd::search::{SearchMode, run_search_once};
 use aetherd::sir_pipeline::DEFAULT_SIR_CONCURRENCY;
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -35,6 +35,9 @@ struct Cli {
 
     #[arg(long, default_value_t = 20)]
     search_limit: u32,
+
+    #[arg(long, default_value = "lexical", value_parser = parse_search_mode)]
+    search_mode: SearchMode,
 
     #[arg(long, default_value_t = DEFAULT_SIR_CONCURRENCY)]
     sir_concurrency: usize,
@@ -83,7 +86,13 @@ fn run(cli: Cli) -> Result<()> {
 
     if let Some(query) = cli.search.as_deref() {
         let mut out = std::io::stdout();
-        return run_search_once(&workspace, query, cli.search_limit.min(100), &mut out);
+        return run_search_once(
+            &workspace,
+            query,
+            cli.search_limit.min(100),
+            cli.search_mode,
+            &mut out,
+        );
     }
 
     let indexer_config = IndexerConfig {
@@ -122,5 +131,9 @@ fn run(cli: Cli) -> Result<()> {
 }
 
 fn parse_inference_provider(value: &str) -> Result<InferenceProviderKind, String> {
+    value.parse()
+}
+
+fn parse_search_mode(value: &str) -> Result<SearchMode, String> {
     value.parse()
 }
