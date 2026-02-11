@@ -17,7 +17,10 @@
     "onLanguage:javascript",
     "onLanguage:javascriptreact",
     "onCommand:aether.restartServer",
-    "onCommand:aether.selectInferenceProvider"
+    "onCommand:aether.selectInferenceProvider",
+    "onCommand:aether.indexOnce",
+    "onCommand:aether.searchSymbols",
+    "onCommand:aether.openSymbolResult"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -29,6 +32,18 @@
       {
         "command": "aether.selectInferenceProvider",
         "title": "AETHER: Select Inference Provider"
+      },
+      {
+        "command": "aether.indexOnce",
+        "title": "AETHER: Index Once"
+      },
+      {
+        "command": "aether.searchSymbols",
+        "title": "AETHER: Search Symbols"
+      },
+      {
+        "command": "aether.openSymbolResult",
+        "title": "AETHER: Open Symbol Result"
       }
     ],
     "configuration": {
@@ -60,13 +75,22 @@
           "type": "string",
           "default": "GEMINI_API_KEY",
           "description": "Environment variable name containing Gemini API key."
+        },
+        "aether.searchMode": {
+          "type": "string",
+          "enum": ["lexical", "semantic", "hybrid"],
+          "default": "lexical",
+          "description": "Search mode used by AETHER symbol search commands."
         }
       }
     }
   },
   "scripts": {
     "build": "tsc -p .",
-    "compile": "npm run build"
+    "compile": "npm run build",
+    "typecheck": "tsc -p . --noEmit",
+    "smoke": "node ./scripts/smoke.js",
+    "verify": "npm run build && npm run smoke"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
