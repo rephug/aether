@@ -1,9 +1,15 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aether_core::{SourceRange, Symbol, normalize_path, stable_symbol_id};
+pub use aether_core::SearchMode;
+use aether_core::{
+    HoverMarkdownSections, NO_SIR_MESSAGE, SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR,
+    SEARCH_FALLBACK_EMBEDDINGS_DISABLED, SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED,
+    SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY, SearchEnvelope, SourceRange,
+    format_hover_markdown_sections, normalize_path, stable_symbol_id, stale_warning_message,
+};
 use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
 use aether_parse::{SymbolExtractor, language_for_path};
 use aether_sir::{SirAnnotation, SirError, canonicalize_sir_json, sir_hash, validate_sir};
@@ -25,8 +31,7 @@ use thiserror::Error;
 pub const SERVER_NAME: &str = "aether";
 pub const SERVER_VERSION: &str = "0.1.0";
 pub const SERVER_DESCRIPTION: &str = "AETHER local symbol/SIR lookup from .aether store";
-pub const NO_SIR_MESSAGE: &str =
-    "AETHER: No SIR yet for this symbol. Run aetherd indexing and try again.";
+pub const MCP_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Error)]
 pub enum AetherMcpError {
@@ -48,6 +53,8 @@ pub enum AetherMcpError {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherStatusResponse {
+    pub schema_version: u32,
+    pub generated_at: i64,
     pub workspace: String,
     pub store_present: bool,
     pub sqlite_path: String,
@@ -74,6 +81,12 @@ pub struct AetherSymbolLookupMatch {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherSymbolLookupResponse {
+    pub query: String,
+    pub limit: u32,
+    pub mode_requested: SearchMode,
+    pub mode_used: SearchMode,
+    pub fallback_reason: Option<String>,
+    pub result_count: u32,
     pub matches: Vec<AetherSymbolLookupMatch>,
 }
 
@@ -86,18 +99,65 @@ pub struct AetherSearchRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherSearchResponse {
+    pub query: String,
+    pub limit: u32,
+    pub mode_requested: SearchMode,
     pub mode_used: SearchMode,
     pub fallback_reason: Option<String>,
+    pub result_count: u32,
     pub matches: Vec<AetherSymbolLookupMatch>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum SearchMode {
-    #[default]
-    Lexical,
-    Semantic,
-    Hybrid,
+impl AetherSymbolLookupResponse {
+    fn from_search_envelope(
+        query: String,
+        limit: u32,
+        envelope: SearchEnvelope<AetherSymbolLookupMatch>,
+    ) -> Self {
+        let SearchEnvelope {
+            mode_requested,
+            mode_used,
+            fallback_reason,
+            matches,
+        } = envelope;
+        let result_count = matches.len() as u32;
+
+        Self {
+            query,
+            limit,
+            mode_requested,
+            mode_used,
+            fallback_reason,
+            result_count,
+            matches,
+        }
+    }
+}
+
+impl AetherSearchResponse {
+    fn from_search_envelope(
+        query: String,
+        limit: u32,
+        envelope: SearchEnvelope<AetherSymbolLookupMatch>,
+    ) -> Self {
+        let SearchEnvelope {
+            mode_requested,
+            mode_used,
+            fallback_reason,
+            matches,
+        } = envelope;
+        let result_count = matches.len() as u32;
+
+        Self {
+            query,
+            limit,
+            mode_requested,
+            mode_used,
+            fallback_reason,
+            result_count,
+            matches,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -233,6 +293,8 @@ impl AetherMcpServer {
         };
 
         Ok(AetherStatusResponse {
+            schema_version: MCP_SCHEMA_VERSION,
+            generated_at: current_unix_timestamp(),
             workspace: normalize_path(&self.workspace.to_string_lossy()),
             store_present,
             sqlite_path: normalize_path(&sqlite_path.to_string_lossy()),
@@ -245,66 +307,89 @@ impl AetherMcpServer {
     pub fn aether_symbol_lookup_logic(
         &self,
         request: AetherSymbolLookupRequest,
-    ) -> Result<Vec<AetherSymbolLookupMatch>, AetherMcpError> {
-        self.lexical_search_matches(&request.query, request.limit)
+    ) -> Result<AetherSymbolLookupResponse, AetherMcpError> {
+        let limit = effective_limit(request.limit);
+        let matches = self.lexical_search_matches(&request.query, limit)?;
+        let envelope = SearchEnvelope {
+            mode_requested: SearchMode::Lexical,
+            mode_used: SearchMode::Lexical,
+            fallback_reason: None,
+            matches,
+        };
+
+        Ok(AetherSymbolLookupResponse::from_search_envelope(
+            request.query,
+            limit,
+            envelope,
+        ))
     }
 
     pub async fn aether_search_logic(
         &self,
         request: AetherSearchRequest,
     ) -> Result<AetherSearchResponse, AetherMcpError> {
-        let mode = request.mode.unwrap_or_default();
-        let lexical = self.lexical_search_matches(&request.query, request.limit)?;
+        let mode_requested = request.mode.unwrap_or_default();
+        let limit = effective_limit(request.limit);
+        let lexical = self.lexical_search_matches(&request.query, limit)?;
 
-        match mode {
-            SearchMode::Lexical => Ok(AetherSearchResponse {
+        let envelope = match mode_requested {
+            SearchMode::Lexical => SearchEnvelope {
+                mode_requested: SearchMode::Lexical,
                 mode_used: SearchMode::Lexical,
                 fallback_reason: None,
                 matches: lexical,
-            }),
+            },
             SearchMode::Semantic => {
-                let (semantic, fallback_reason) = self
-                    .semantic_search_matches(&request.query, request.limit)
-                    .await?;
+                let (semantic, fallback_reason) =
+                    self.semantic_search_matches(&request.query, limit).await?;
                 if semantic.is_empty() {
-                    return Ok(AetherSearchResponse {
+                    SearchEnvelope {
+                        mode_requested: SearchMode::Semantic,
                         mode_used: SearchMode::Lexical,
                         fallback_reason,
                         matches: lexical,
-                    });
+                    }
+                } else {
+                    SearchEnvelope {
+                        mode_requested: SearchMode::Semantic,
+                        mode_used: SearchMode::Semantic,
+                        fallback_reason: None,
+                        matches: semantic,
+                    }
                 }
-
-                Ok(AetherSearchResponse {
-                    mode_used: SearchMode::Semantic,
-                    fallback_reason: None,
-                    matches: semantic,
-                })
             }
             SearchMode::Hybrid => {
-                let (semantic, fallback_reason) = self
-                    .semantic_search_matches(&request.query, request.limit)
-                    .await?;
+                let (semantic, fallback_reason) =
+                    self.semantic_search_matches(&request.query, limit).await?;
                 if semantic.is_empty() {
-                    return Ok(AetherSearchResponse {
+                    SearchEnvelope {
+                        mode_requested: SearchMode::Hybrid,
                         mode_used: SearchMode::Lexical,
                         fallback_reason,
                         matches: lexical,
-                    });
+                    }
+                } else {
+                    SearchEnvelope {
+                        mode_requested: SearchMode::Hybrid,
+                        mode_used: SearchMode::Hybrid,
+                        fallback_reason: None,
+                        matches: fuse_hybrid_matches(&lexical, &semantic, limit),
+                    }
                 }
-
-                Ok(AetherSearchResponse {
-                    mode_used: SearchMode::Hybrid,
-                    fallback_reason: None,
-                    matches: fuse_hybrid_matches(&lexical, &semantic, request.limit.unwrap_or(20)),
-                })
             }
-        }
+        };
+
+        Ok(AetherSearchResponse::from_search_envelope(
+            request.query,
+            limit,
+            envelope,
+        ))
     }
 
     fn lexical_search_matches(
         &self,
         query: &str,
-        limit: Option<u32>,
+        limit: u32,
     ) -> Result<Vec<AetherSymbolLookupMatch>, AetherMcpError> {
         let sqlite_path = self.sqlite_path();
         if !sqlite_path.exists() {
@@ -312,7 +397,6 @@ impl AetherMcpServer {
         }
 
         let store = SqliteStore::open(&self.workspace)?;
-        let limit = limit.unwrap_or(20).clamp(1, 100);
         let matches = store.search_symbols(query, limit)?;
 
         Ok(matches
@@ -324,11 +408,14 @@ impl AetherMcpServer {
     async fn semantic_search_matches(
         &self,
         query: &str,
-        limit: Option<u32>,
+        limit: u32,
     ) -> Result<(Vec<AetherSymbolLookupMatch>, Option<String>), AetherMcpError> {
         let sqlite_path = self.sqlite_path();
         if !sqlite_path.exists() {
-            return Ok((Vec::new(), Some("local store not initialized".to_owned())));
+            return Ok((
+                Vec::new(),
+                Some(SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED.to_owned()),
+            ));
         }
 
         let loaded = load_embedding_provider_from_config(
@@ -338,7 +425,7 @@ impl AetherMcpServer {
         let Some(loaded) = loaded else {
             return Ok((
                 Vec::new(),
-                Some("embeddings are disabled in .aether/config.toml".to_owned()),
+                Some(SEARCH_FALLBACK_EMBEDDINGS_DISABLED.to_owned()),
             ));
         };
 
@@ -352,12 +439,11 @@ impl AetherMcpServer {
         if query_embedding.is_empty() {
             return Ok((
                 Vec::new(),
-                Some("embedding provider returned an empty query vector".to_owned()),
+                Some(SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR.to_owned()),
             ));
         }
 
         let store = SqliteStore::open(&self.workspace)?;
-        let limit = limit.unwrap_or(20).clamp(1, 100);
         let matches = store.search_symbols_semantic(
             &query_embedding,
             &loaded.provider_name,
@@ -367,7 +453,7 @@ impl AetherMcpServer {
         if matches.is_empty() {
             return Ok((
                 Vec::new(),
-                Some("semantic index not ready for this embedding provider/model".to_owned()),
+                Some(SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY.to_owned()),
             ));
         }
 
@@ -517,15 +603,34 @@ impl AetherMcpServer {
 
         let meta = self.read_sir_meta(&symbol_id)?;
         let (sir_status, last_error, last_attempt_at) = meta_status_fields(meta.as_ref());
+        let stale_warning = stale_warning_message(sir_status.as_deref(), last_error.as_deref());
         let sir = self.read_valid_sir_blob(&symbol_id)?;
 
         let (found, hover_markdown, sir) = match sir {
             Some(sir) => (
                 true,
-                format_hover_markdown(symbol, &sir),
+                format_hover_markdown_sections(
+                    &HoverMarkdownSections {
+                        symbol: symbol.qualified_name.clone(),
+                        intent: sir.intent.clone(),
+                        confidence: sir.confidence,
+                        inputs: sir.inputs.clone(),
+                        outputs: sir.outputs.clone(),
+                        side_effects: sir.side_effects.clone(),
+                        dependencies: sir.dependencies.clone(),
+                        error_modes: sir.error_modes.clone(),
+                    },
+                    stale_warning.as_deref(),
+                ),
                 Some(SirAnnotationView::from(sir)),
             ),
-            None => (false, NO_SIR_MESSAGE.to_owned(), None),
+            None => {
+                let markdown = match stale_warning {
+                    Some(warning) => format!("{warning}\n\n{NO_SIR_MESSAGE}"),
+                    None => NO_SIR_MESSAGE.to_owned(),
+                };
+                (false, markdown, None)
+            }
         };
 
         Ok(AetherExplainResponse {
@@ -640,7 +745,7 @@ impl AetherMcpServer {
     ) -> Result<Json<AetherSymbolLookupResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_symbol_lookup");
         self.aether_symbol_lookup_logic(request)
-            .map(|matches| Json(AetherSymbolLookupResponse { matches }))
+            .map(Json)
             .map_err(to_mcp_error)
     }
 
@@ -723,6 +828,17 @@ fn count_table_rows(conn: &Connection, table_name: &str) -> Result<i64, AetherMc
     }
 }
 
+fn effective_limit(limit: Option<u32>) -> u32 {
+    limit.unwrap_or(20).clamp(1, 100)
+}
+
+fn current_unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn position_in_range(range: SourceRange, line: usize, column: usize) -> bool {
     let pos = (line, column);
     let start = (range.start.line, range.start.column);
@@ -740,28 +856,6 @@ fn symbol_span_score(range: SourceRange) -> (usize, usize) {
     };
 
     (line_span, col_span)
-}
-
-fn list_or_none(items: &[String]) -> String {
-    if items.is_empty() {
-        "(none)".to_owned()
-    } else {
-        items.join(", ")
-    }
-}
-
-fn format_hover_markdown(symbol: &Symbol, sir: &SirAnnotation) -> String {
-    format!(
-        "{}\n\n**symbol:** {}\n**confidence:** {:.2}\n**inputs:** {}\n**outputs:** {}\n**side_effects:** {}\n**dependencies:** {}\n**error_modes:** {}",
-        sir.intent,
-        symbol.qualified_name,
-        sir.confidence,
-        list_or_none(&sir.inputs),
-        list_or_none(&sir.outputs),
-        list_or_none(&sir.side_effects),
-        list_or_none(&sir.dependencies),
-        list_or_none(&sir.error_modes),
-    )
 }
 
 fn meta_status_fields(
