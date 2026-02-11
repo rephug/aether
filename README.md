@@ -136,9 +136,19 @@ The extension lives in `vscode-extension/` and starts AETHER over stdio.
 cd vscode-extension
 npm install
 npm run build
+npm run smoke
 ```
 
 Then open `vscode-extension/` in VS Code and press `F5` to launch an Extension Development Host.
+
+Extension command palette actions:
+- `AETHER: Restart Server`
+- `AETHER: Select Inference Provider`
+- `AETHER: Index Once`
+- `AETHER: Search Symbols`
+- `AETHER: Open Symbol Result`
+
+The status bar item shows `AETHER: indexing` / `AETHER: idle` plus stale/error hints when observed.
 
 ## MCP Server (Claude Code)
 
