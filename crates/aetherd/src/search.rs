@@ -5,6 +5,7 @@ use std::path::Path;
 use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
 use aether_store::{SemanticSearchResult, SqliteStore, Store, SymbolSearchResult};
 use anyhow::{Context, Result};
+use serde_json::json;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SearchMode {
@@ -39,6 +40,36 @@ impl std::str::FromStr for SearchMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchOutputFormat {
+    #[default]
+    Table,
+    Json,
+}
+
+impl SearchOutputFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Json => "json",
+        }
+    }
+}
+
+impl std::str::FromStr for SearchOutputFormat {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "table" => Ok(Self::Table),
+            "json" => Ok(Self::Json),
+            other => Err(format!(
+                "invalid output format '{other}', expected one of: table, json"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResultRow {
     pub symbol_id: String,
@@ -51,6 +82,7 @@ pub struct SearchResultRow {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchExecution {
+    pub mode_requested: SearchMode,
     pub mode_used: SearchMode,
     pub fallback_reason: Option<String>,
     pub matches: Vec<SearchResultRow>,
@@ -61,6 +93,7 @@ pub fn run_search_once(
     query: &str,
     limit: u32,
     mode: SearchMode,
+    output_format: SearchOutputFormat,
     out: &mut dyn Write,
 ) -> Result<()> {
     let execution = execute_search(workspace, query, limit, mode)?;
@@ -68,7 +101,12 @@ pub fn run_search_once(
         eprintln!("AETHER search fallback: {reason}");
     }
 
-    write_search_results(&execution.matches, out).context("failed to write search results")?;
+    match output_format {
+        SearchOutputFormat::Table => write_search_results(&execution.matches, out)
+            .context("failed to write search results")?,
+        SearchOutputFormat::Json => write_search_results_json(&execution, out)
+            .context("failed to write search JSON output")?,
+    }
     Ok(())
 }
 
@@ -78,21 +116,24 @@ pub fn execute_search(
     limit: u32,
     mode: SearchMode,
 ) -> Result<SearchExecution> {
+    let store_present = workspace.join(".aether").join("meta.sqlite").exists();
     let store = SqliteStore::open(workspace).context("failed to initialize local store")?;
     let limit = limit.clamp(1, 100);
 
     let lexical_matches = lexical_search(&store, query, limit)?;
     match mode {
         SearchMode::Lexical => Ok(SearchExecution {
+            mode_requested: SearchMode::Lexical,
             mode_used: SearchMode::Lexical,
             fallback_reason: None,
             matches: lexical_matches,
         }),
         SearchMode::Semantic => {
             let (semantic_matches, fallback_reason) =
-                semantic_search(workspace, &store, query, limit)?;
+                semantic_search(workspace, &store, query, limit, store_present)?;
             if semantic_matches.is_empty() {
                 return Ok(SearchExecution {
+                    mode_requested: SearchMode::Semantic,
                     mode_used: SearchMode::Lexical,
                     fallback_reason,
                     matches: lexical_matches,
@@ -100,6 +141,7 @@ pub fn execute_search(
             }
 
             Ok(SearchExecution {
+                mode_requested: SearchMode::Semantic,
                 mode_used: SearchMode::Semantic,
                 fallback_reason: None,
                 matches: semantic_matches,
@@ -107,9 +149,10 @@ pub fn execute_search(
         }
         SearchMode::Hybrid => {
             let (semantic_matches, fallback_reason) =
-                semantic_search(workspace, &store, query, limit)?;
+                semantic_search(workspace, &store, query, limit, store_present)?;
             if semantic_matches.is_empty() {
                 return Ok(SearchExecution {
+                    mode_requested: SearchMode::Hybrid,
                     mode_used: SearchMode::Lexical,
                     fallback_reason,
                     matches: lexical_matches,
@@ -117,6 +160,7 @@ pub fn execute_search(
             }
 
             Ok(SearchExecution {
+                mode_requested: SearchMode::Hybrid,
                 mode_used: SearchMode::Hybrid,
                 fallback_reason: None,
                 matches: fuse_hybrid_results(&lexical_matches, &semantic_matches, limit),
@@ -146,6 +190,37 @@ pub fn write_search_results(
     Ok(())
 }
 
+pub fn write_search_results_json(
+    execution: &SearchExecution,
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
+    let matches = execution
+        .matches
+        .iter()
+        .map(|entry| {
+            json!({
+                "symbol_id": &entry.symbol_id,
+                "qualified_name": &entry.qualified_name,
+                "file_path": &entry.file_path,
+                "language": &entry.language,
+                "kind": &entry.kind,
+                "semantic_score": entry.semantic_score
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let payload = json!({
+        "mode_requested": execution.mode_requested.as_str(),
+        "mode_used": execution.mode_used.as_str(),
+        "fallback_reason": execution.fallback_reason.as_deref(),
+        "matches": matches,
+    });
+
+    serde_json::to_writer(&mut *out, &payload).map_err(std::io::Error::other)?;
+    writeln!(out)?;
+    Ok(())
+}
+
 fn lexical_search(store: &SqliteStore, query: &str, limit: u32) -> Result<Vec<SearchResultRow>> {
     let matches = store
         .search_symbols(query, limit)
@@ -159,7 +234,12 @@ fn semantic_search(
     store: &SqliteStore,
     query: &str,
     limit: u32,
+    store_present: bool,
 ) -> Result<(Vec<SearchResultRow>, Option<String>)> {
+    if !store_present {
+        return Ok((Vec::new(), Some("local store not initialized".to_owned())));
+    }
+
     let loaded =
         load_embedding_provider_from_config(workspace, EmbeddingProviderOverrides::default())
             .context("failed to load embedding provider")?;
@@ -343,11 +423,50 @@ mod tests {
             .expect("upsert symbol");
 
         let mut out = Vec::new();
-        run_search_once(workspace, "alpha", 20, SearchMode::Lexical, &mut out).expect("run search");
+        run_search_once(
+            workspace,
+            "alpha",
+            20,
+            SearchMode::Lexical,
+            SearchOutputFormat::Table,
+            &mut out,
+        )
+        .expect("run search");
 
         let rendered = String::from_utf8(out).expect("utf8 output");
         assert!(rendered.contains("symbol_id\tqualified_name\tfile_path\tlanguage\tkind"));
         assert!(rendered.contains("demo::alpha"));
+    }
+
+    #[test]
+    fn write_search_results_json_outputs_stable_shape() {
+        let mut out = Vec::new();
+        let execution = SearchExecution {
+            mode_requested: SearchMode::Hybrid,
+            mode_used: SearchMode::Lexical,
+            fallback_reason: Some("embeddings are disabled in .aether/config.toml".to_owned()),
+            matches: vec![SearchResultRow {
+                symbol_id: "sym-1".to_owned(),
+                qualified_name: "demo::run".to_owned(),
+                file_path: "src/lib.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                semantic_score: None,
+            }],
+        };
+
+        write_search_results_json(&execution, &mut out).expect("json output");
+        let rendered = String::from_utf8(out).expect("utf8 output");
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid json output");
+
+        assert_eq!(value["mode_requested"], "hybrid");
+        assert_eq!(value["mode_used"], "lexical");
+        assert_eq!(
+            value["fallback_reason"],
+            "embeddings are disabled in .aether/config.toml"
+        );
+        assert_eq!(value["matches"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["matches"][0]["symbol_id"], "sym-1");
     }
 
     #[test]
@@ -446,10 +565,27 @@ mod tests {
 
         let result = execute_search(workspace, "fallback_alpha", 10, SearchMode::Semantic)
             .expect("semantic with fallback");
+        assert_eq!(result.mode_requested, SearchMode::Semantic);
         assert_eq!(result.mode_used, SearchMode::Lexical);
         assert!(result.fallback_reason.is_some());
         assert_eq!(result.matches.len(), 1);
         assert_eq!(result.matches[0].symbol_id, "sym-1");
+    }
+
+    #[test]
+    fn semantic_search_falls_back_when_local_store_not_initialized() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+
+        let result = execute_search(workspace, "anything", 10, SearchMode::Semantic)
+            .expect("semantic with no store");
+        assert_eq!(result.mode_requested, SearchMode::Semantic);
+        assert_eq!(result.mode_used, SearchMode::Lexical);
+        assert_eq!(
+            result.fallback_reason.as_deref(),
+            Some("local store not initialized")
+        );
+        assert!(result.matches.is_empty());
     }
 
     #[test]

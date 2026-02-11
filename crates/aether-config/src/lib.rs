@@ -149,6 +149,12 @@ impl Default for EmbeddingsConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigWarning {
+    pub code: &'static str,
+    pub message: String,
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("io error: {0}")]
@@ -196,6 +202,85 @@ pub fn ensure_workspace_config(
     fs::write(path, content)?;
 
     Ok(config)
+}
+
+pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
+    let mut warnings = Vec::new();
+
+    if !config.embeddings.enabled {
+        if config.embeddings.model.is_some() {
+            warnings.push(ConfigWarning {
+                code: "embeddings_model_ignored",
+                message:
+                    "embeddings.model is set but embeddings.enabled=false; model will be ignored"
+                        .to_owned(),
+            });
+        }
+        if config.embeddings.endpoint.is_some() {
+            warnings.push(ConfigWarning {
+                code: "embeddings_endpoint_ignored",
+                message: "embeddings.endpoint is set but embeddings.enabled=false; endpoint will be ignored".to_owned(),
+            });
+        }
+    } else if matches!(config.embeddings.provider, EmbeddingProviderKind::Mock) {
+        if config.embeddings.model.is_some() {
+            warnings.push(ConfigWarning {
+                code: "embeddings_model_unused_for_mock",
+                message: "embeddings.provider=mock ignores embeddings.model".to_owned(),
+            });
+        }
+        if config.embeddings.endpoint.is_some() {
+            warnings.push(ConfigWarning {
+                code: "embeddings_endpoint_unused_for_mock",
+                message: "embeddings.provider=mock ignores embeddings.endpoint".to_owned(),
+            });
+        }
+    }
+
+    match config.inference.provider {
+        InferenceProviderKind::Auto => {
+            if config.inference.endpoint.is_some() {
+                warnings.push(ConfigWarning {
+                    code: "inference_endpoint_ignored_for_auto",
+                    message: "inference.endpoint is ignored when inference.provider=auto"
+                        .to_owned(),
+                });
+            }
+        }
+        InferenceProviderKind::Mock => {
+            if config.inference.model.is_some() {
+                warnings.push(ConfigWarning {
+                    code: "inference_model_ignored_for_mock",
+                    message: "inference.provider=mock ignores inference.model".to_owned(),
+                });
+            }
+            if config.inference.endpoint.is_some() {
+                warnings.push(ConfigWarning {
+                    code: "inference_endpoint_ignored_for_mock",
+                    message: "inference.provider=mock ignores inference.endpoint".to_owned(),
+                });
+            }
+        }
+        InferenceProviderKind::Gemini => {
+            if config.inference.endpoint.is_some() {
+                warnings.push(ConfigWarning {
+                    code: "inference_endpoint_ignored_for_gemini",
+                    message: "inference.provider=gemini ignores inference.endpoint".to_owned(),
+                });
+            }
+        }
+        InferenceProviderKind::Qwen3Local => {
+            if config.inference.api_key_env != DEFAULT_GEMINI_API_KEY_ENV {
+                warnings.push(ConfigWarning {
+                    code: "inference_api_key_env_ignored_for_qwen3_local",
+                    message: "inference.api_key_env is ignored when inference.provider=qwen3_local"
+                        .to_owned(),
+                });
+            }
+        }
+    }
+
+    warnings
 }
 
 fn default_api_key_env() -> String {
@@ -314,5 +399,78 @@ endpoint = "http://127.0.0.1:11434/api/embeddings"
             config.embeddings.endpoint.as_deref(),
             Some("http://127.0.0.1:11434/api/embeddings")
         );
+    }
+
+    #[test]
+    fn ensure_workspace_config_does_not_overwrite_existing_values() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(aether_dir(workspace)).expect("create .aether");
+
+        let raw = r#"
+[inference]
+provider = "mock"
+api_key_env = "CUSTOM_KEY"
+
+[storage]
+mirror_sir_files = false
+
+[embeddings]
+enabled = true
+provider = "qwen3_local"
+model = "qwen3-embeddings-4B"
+"#;
+        fs::write(config_path(workspace), raw).expect("write config");
+
+        let before = fs::read_to_string(config_path(workspace)).expect("read before");
+        let config = ensure_workspace_config(workspace).expect("ensure config");
+        let after = fs::read_to_string(config_path(workspace)).expect("read after");
+
+        assert_eq!(before, after);
+        assert_eq!(config.inference.provider, InferenceProviderKind::Mock);
+        assert_eq!(config.inference.api_key_env, "CUSTOM_KEY");
+        assert!(!config.storage.mirror_sir_files);
+        assert!(config.embeddings.enabled);
+        assert_eq!(
+            config.embeddings.provider,
+            EmbeddingProviderKind::Qwen3Local
+        );
+    }
+
+    #[test]
+    fn validate_config_reports_ignored_fields() {
+        let config = AetherConfig {
+            inference: InferenceConfig {
+                provider: InferenceProviderKind::Auto,
+                model: None,
+                endpoint: Some("http://127.0.0.1:11434".to_owned()),
+                api_key_env: DEFAULT_GEMINI_API_KEY_ENV.to_owned(),
+            },
+            storage: StorageConfig {
+                mirror_sir_files: true,
+            },
+            embeddings: EmbeddingsConfig {
+                enabled: false,
+                provider: EmbeddingProviderKind::Mock,
+                model: Some("mock-x".to_owned()),
+                endpoint: Some("http://127.0.0.1:11434/api/embeddings".to_owned()),
+            },
+        };
+
+        let warnings = validate_config(&config);
+        let codes = warnings
+            .iter()
+            .map(|warning| warning.code)
+            .collect::<Vec<_>>();
+
+        assert!(codes.contains(&"inference_endpoint_ignored_for_auto"));
+        assert!(codes.contains(&"embeddings_model_ignored"));
+        assert!(codes.contains(&"embeddings_endpoint_ignored"));
+    }
+
+    #[test]
+    fn validate_config_is_quiet_for_defaults() {
+        let warnings = validate_config(&AetherConfig::default());
+        assert!(warnings.is_empty());
     }
 }

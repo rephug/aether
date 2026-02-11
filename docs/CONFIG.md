@@ -77,6 +77,20 @@ No key is required for `mock` or `qwen3_local`.
 --inference-endpoint <url>
 --inference-api-key-env <ENV_VAR_NAME>
 --search-mode <lexical|semantic|hybrid>
+--output <table|json>   # applies to --search
 ```
 
-Override precedence is CLI > config file defaults.
+Override precedence is CLI > config file > built-in defaults.
+
+## Validation and Normalization
+
+- `aether-config` trims optional string values (`model`, `endpoint`) and drops empty strings.
+- Empty `inference.api_key_env` is normalized to `GEMINI_API_KEY`.
+- `ensure_workspace_config` creates missing config files but never overwrites an existing file.
+- `validate_config` returns non-fatal warnings for combinations that are valid TOML but ignored at runtime (for example: embeddings fields set while embeddings are disabled).
+
+## Search Mode Behavior
+
+- `--search-mode lexical` always uses lexical search.
+- `--search-mode semantic` and `--search-mode hybrid` fall back to lexical search when semantic prerequisites are unavailable.
+- Fallback reasons are explicit and exposed to both CLI and MCP responses.

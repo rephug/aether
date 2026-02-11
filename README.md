@@ -74,6 +74,12 @@ cargo build -p aetherd -p aether-mcp
 cargo run -p aetherd -- --workspace . --print-sir
 ```
 
+Run one deterministic indexing pass and exit:
+
+```bash
+cargo run -p aetherd -- --workspace . --index-once --print-sir
+```
+
 Useful debug flags:
 
 ```bash
@@ -98,6 +104,20 @@ Semantic/hybrid search modes:
 cargo run -p aetherd -- --workspace . --search "alpha behavior" --search-mode semantic
 cargo run -p aetherd -- --workspace . --search "alpha behavior" --search-mode hybrid
 ```
+
+When semantic/hybrid cannot run (for example embeddings are disabled), AETHER falls back to lexical search and prints the fallback reason to stderr.
+
+Stable JSON output for scripting:
+
+```bash
+cargo run -p aetherd -- --workspace . --search "alpha behavior" --search-mode hybrid --output json
+```
+
+JSON envelope fields:
+- `mode_requested`
+- `mode_used`
+- `fallback_reason`
+- `matches`
 
 Output columns:
 - `symbol_id`
@@ -184,7 +204,10 @@ CLI overrides (optional):
 --inference-endpoint <url>
 --inference-api-key-env <ENV_VAR_NAME>
 --search-mode <lexical|semantic|hybrid>
+--output <table|json>
 ```
+
+Override precedence is CLI > config file > built-in defaults.
 
 ## Local Data Layout
 

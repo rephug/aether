@@ -312,7 +312,8 @@ impl AetherMcpServer {
         }
 
         let store = SqliteStore::open(&self.workspace)?;
-        let matches = store.search_symbols(query, limit.unwrap_or(20).min(100))?;
+        let limit = limit.unwrap_or(20).clamp(1, 100);
+        let matches = store.search_symbols(query, limit)?;
 
         Ok(matches
             .into_iter()
@@ -356,11 +357,12 @@ impl AetherMcpServer {
         }
 
         let store = SqliteStore::open(&self.workspace)?;
+        let limit = limit.unwrap_or(20).clamp(1, 100);
         let matches = store.search_symbols_semantic(
             &query_embedding,
             &loaded.provider_name,
             &loaded.model_name,
-            limit.unwrap_or(20).min(100),
+            limit,
         )?;
         if matches.is_empty() {
             return Ok((
