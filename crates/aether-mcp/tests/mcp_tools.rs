@@ -3,7 +3,7 @@ use std::fs;
 use aether_core::{SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED, SearchMode};
 use aether_mcp::{
     AetherExplainRequest, AetherGetSirRequest, AetherMcpServer, AetherSearchRequest,
-    AetherSymbolLookupRequest, MCP_SCHEMA_VERSION,
+    AetherSymbolLookupRequest, AetherSymbolTimelineRequest, MCP_SCHEMA_VERSION,
 };
 use aether_store::{SqliteStore, Store};
 use aetherd::indexer::{IndexerConfig, run_initial_index_once};
@@ -288,6 +288,116 @@ provider = "mock"
     assert_eq!(response.mode_requested, SearchMode::Semantic);
     assert_eq!(response.result_count, 0);
     assert!(response.matches.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn mcp_symbol_timeline_returns_expected_commit_order_and_hashes() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    let store = SqliteStore::open(workspace)?;
+    store.record_sir_version_if_changed(
+        "sym-alpha",
+        "hash-a",
+        "mock",
+        "mock",
+        "{\"intent\":\"v1\"}",
+        1_700_100_100,
+        Some("1111111111111111111111111111111111111111"),
+    )?;
+    store.record_sir_version_if_changed(
+        "sym-alpha",
+        "hash-b",
+        "mock",
+        "mock",
+        "{\"intent\":\"v2\"}",
+        1_700_100_200,
+        Some("2222222222222222222222222222222222222222"),
+    )?;
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+
+    let response = rt
+        .block_on(
+            server.aether_symbol_timeline(Parameters(AetherSymbolTimelineRequest {
+                symbol_id: "sym-alpha".to_owned(),
+                limit: None,
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+
+    assert!(response.found);
+    assert_eq!(response.symbol_id, "sym-alpha");
+    assert_eq!(response.result_count, 2);
+    assert_eq!(response.timeline.len(), 2);
+    assert_eq!(response.timeline[0].version, 1);
+    assert_eq!(
+        response.timeline[0].commit_hash.as_deref(),
+        Some("1111111111111111111111111111111111111111")
+    );
+    assert_eq!(response.timeline[1].version, 2);
+    assert_eq!(
+        response.timeline[1].commit_hash.as_deref(),
+        Some("2222222222222222222222222222222222222222")
+    );
+
+    let limited = rt
+        .block_on(
+            server.aether_symbol_timeline(Parameters(AetherSymbolTimelineRequest {
+                symbol_id: "sym-alpha".to_owned(),
+                limit: Some(1),
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert_eq!(limited.result_count, 1);
+    assert_eq!(limited.timeline[0].version, 2);
+    assert_eq!(
+        limited.timeline[0].commit_hash.as_deref(),
+        Some("2222222222222222222222222222222222222222")
+    );
+
+    Ok(())
+}
+
+#[test]
+fn mcp_symbol_timeline_reports_null_commit_hash_when_unavailable() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    let store = SqliteStore::open(workspace)?;
+    store.record_sir_version_if_changed(
+        "sym-no-git",
+        "hash-a",
+        "mock",
+        "mock",
+        "{\"intent\":\"v1\"}",
+        1_700_200_100,
+        None,
+    )?;
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+
+    let response = rt
+        .block_on(
+            server.aether_symbol_timeline(Parameters(AetherSymbolTimelineRequest {
+                symbol_id: "sym-no-git".to_owned(),
+                limit: None,
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+
+    assert!(response.found);
+    assert_eq!(response.result_count, 1);
+    assert_eq!(response.timeline.len(), 1);
+    assert_eq!(response.timeline[0].version, 1);
+    assert_eq!(response.timeline[0].commit_hash, None);
 
     Ok(())
 }

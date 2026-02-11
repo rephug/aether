@@ -108,6 +108,31 @@ pub struct AetherSearchResponse {
     pub matches: Vec<AetherSymbolLookupMatch>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherSymbolTimelineRequest {
+    pub symbol_id: String,
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherSymbolTimelineEntry {
+    pub version: i64,
+    pub sir_hash: String,
+    pub provider: String,
+    pub model: String,
+    pub created_at: i64,
+    pub commit_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherSymbolTimelineResponse {
+    pub symbol_id: String,
+    pub limit: u32,
+    pub found: bool,
+    pub result_count: u32,
+    pub timeline: Vec<AetherSymbolTimelineEntry>,
+}
+
 impl AetherSymbolLookupResponse {
     fn from_search_envelope(
         query: String,
@@ -384,6 +409,61 @@ impl AetherMcpServer {
             limit,
             envelope,
         ))
+    }
+
+    pub fn aether_symbol_timeline_logic(
+        &self,
+        request: AetherSymbolTimelineRequest,
+    ) -> Result<AetherSymbolTimelineResponse, AetherMcpError> {
+        let symbol_id = request.symbol_id.trim();
+        let limit = effective_limit(request.limit);
+        if symbol_id.is_empty() {
+            return Ok(AetherSymbolTimelineResponse {
+                symbol_id: String::new(),
+                limit,
+                found: false,
+                result_count: 0,
+                timeline: Vec::new(),
+            });
+        }
+
+        if !self.sqlite_path().exists() {
+            return Ok(AetherSymbolTimelineResponse {
+                symbol_id: symbol_id.to_owned(),
+                limit,
+                found: false,
+                result_count: 0,
+                timeline: Vec::new(),
+            });
+        }
+
+        let store = SqliteStore::open(&self.workspace)?;
+        let mut history = store.list_sir_history(symbol_id)?;
+        if history.len() > limit as usize {
+            let split_idx = history.len().saturating_sub(limit as usize);
+            history = history.split_off(split_idx);
+        }
+
+        let timeline = history
+            .into_iter()
+            .map(|record| AetherSymbolTimelineEntry {
+                version: record.version,
+                sir_hash: record.sir_hash,
+                provider: record.provider,
+                model: record.model,
+                created_at: record.created_at,
+                commit_hash: record.commit_hash,
+            })
+            .collect::<Vec<_>>();
+        let result_count = timeline.len() as u32;
+
+        Ok(AetherSymbolTimelineResponse {
+            symbol_id: symbol_id.to_owned(),
+            limit,
+            found: result_count > 0,
+            result_count,
+            timeline,
+        })
     }
 
     fn lexical_search_matches(
@@ -760,6 +840,20 @@ impl AetherMcpServer {
         self.verbose_log("MCP tool called: aether_search");
         self.aether_search_logic(request)
             .await
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_symbol_timeline",
+        description = "Get ordered SIR timeline entries for a symbol"
+    )]
+    pub async fn aether_symbol_timeline(
+        &self,
+        Parameters(request): Parameters<AetherSymbolTimelineRequest>,
+    ) -> Result<Json<AetherSymbolTimelineResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_symbol_timeline");
+        self.aether_symbol_timeline_logic(request)
             .map(Json)
             .map_err(to_mcp_error)
     }

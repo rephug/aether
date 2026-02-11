@@ -173,6 +173,7 @@ MCP tools exposed:
 - `aether_status`
 - `aether_symbol_lookup`
 - `aether_search`
+- `aether_symbol_timeline`
 - `aether_get_sir`
 - `aether_explain`
 
@@ -202,6 +203,17 @@ Stable MCP response fields for scripting/agents:
   - `fallback_reason`
   - `result_count`
   - `matches`
+- `aether_symbol_timeline`:
+  - `symbol_id`
+  - `limit`
+  - `found`
+  - `result_count`
+  - `timeline[*].version`
+  - `timeline[*].sir_hash`
+  - `timeline[*].provider`
+  - `timeline[*].model`
+  - `timeline[*].created_at`
+  - `timeline[*].commit_hash` (nullable)
 
 Search fallback reasons are intentionally aligned between CLI and MCP.
 

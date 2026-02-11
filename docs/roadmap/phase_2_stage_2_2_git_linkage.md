@@ -18,6 +18,12 @@ Attach SIR history entries to relevant git commits so symbol timelines can answe
 3. Missing git data is handled explicitly (null/unknown), not as silent failure.
 4. `cargo fmt --all --check`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace` pass.
 
+## Implementation notes
+- Persist linkage in `sir_history.commit_hash` (`TEXT`, nullable). Null means git metadata unavailable at capture time.
+- Resolve commit hash from workspace `HEAD` in `aetherd` with `git rev-parse --verify HEAD`; failures/non-repo cases are non-fatal and stored as null.
+- Keep timeline retrieval deterministic with `ORDER BY version ASC`.
+- Expose timeline linkage through MCP tool `aether_symbol_timeline` with nullable `commit_hash`.
+
 ## Exact Codex prompt(s)
 ```text
 You are working in the repo root of https://github.com/rephug/aether.

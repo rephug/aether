@@ -1,4 +1,6 @@
 use std::fs;
+use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 
 use aether_config::InferenceProviderKind;
@@ -36,6 +38,35 @@ impl InferenceProvider for HashingMockProvider {
             confidence: 1.0,
         })
     }
+}
+
+fn run_git(workspace: &Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(workspace)
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git {:?} failed: {}", args, stderr.trim()).into());
+    }
+
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+fn init_git_repo(workspace: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    run_git(workspace, &["init"])?;
+    run_git(workspace, &["config", "user.name", "Aether Test"])?;
+    run_git(
+        workspace,
+        &["config", "user.email", "aether-test@example.com"],
+    )?;
+    Ok(())
+}
+
+fn commit_all(workspace: &Path, message: &str) -> Result<String, Box<dyn std::error::Error>> {
+    run_git(workspace, &["add", "."])?;
+    run_git(workspace, &["commit", "-m", message])?;
+    run_git(workspace, &["rev-parse", "--verify", "HEAD"])
 }
 
 #[test]
@@ -468,6 +499,115 @@ fn step2_sir_history_retrieval_persists_after_restart() -> Result<(), Box<dyn st
     let reopened = SqliteStore::open(workspace)?;
     let history_after_restart = reopened.list_sir_history(&symbol.id)?;
     assert_eq!(history_after_restart, history_before_restart);
+
+    Ok(())
+}
+
+#[test]
+fn step2_pipeline_links_sir_versions_to_git_commits() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    fs::create_dir_all(workspace.join("src"))?;
+    let rust_file = workspace.join("src/lib.rs");
+    fs::write(&rust_file, "fn alpha() -> i32 { 1 }\n")?;
+
+    init_git_repo(workspace)?;
+    let commit_v1 = commit_all(workspace, "initial alpha")?;
+
+    let mut observer = ObserverState::new(workspace.to_path_buf())?;
+    observer.seed_from_disk()?;
+
+    let store = SqliteStore::open(workspace)?;
+    let provider: Arc<dyn InferenceProvider> = Arc::new(HashingMockProvider);
+    let pipeline = SirPipeline::new_with_provider(
+        workspace.to_path_buf(),
+        1,
+        provider,
+        "hashing_mock",
+        "hashing_mock",
+    )?;
+
+    let mut sink = Vec::new();
+    for event in observer.initial_symbol_events() {
+        pipeline.process_event(&store, &event, false, &mut sink)?;
+    }
+
+    let symbol = store
+        .list_symbols_for_file("src/lib.rs")?
+        .into_iter()
+        .find(|record| record.qualified_name.ends_with("alpha"))
+        .expect("alpha symbol should exist");
+
+    let initial_history = store.list_sir_history(&symbol.id)?;
+    assert_eq!(initial_history.len(), 1);
+    assert_eq!(initial_history[0].version, 1);
+    assert_eq!(
+        initial_history[0].commit_hash.as_deref(),
+        Some(commit_v1.as_str())
+    );
+
+    fs::write(&rust_file, "fn alpha() -> i32 { 2 }\n")?;
+    let commit_v2 = commit_all(workspace, "update alpha")?;
+
+    let update_event = observer
+        .process_path(&rust_file)?
+        .expect("expected update event");
+    pipeline.process_event(&store, &update_event, false, &mut sink)?;
+
+    let history = store.list_sir_history(&symbol.id)?;
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].version, 1);
+    assert_eq!(history[1].version, 2);
+    assert_eq!(history[0].commit_hash.as_deref(), Some(commit_v1.as_str()));
+    assert_eq!(history[1].commit_hash.as_deref(), Some(commit_v2.as_str()));
+
+    Ok(())
+}
+
+#[test]
+fn step2_pipeline_records_null_commit_hash_when_git_is_unavailable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    fs::create_dir_all(workspace.join("src"))?;
+    let rust_file = workspace.join("src/lib.rs");
+    fs::write(&rust_file, "fn alpha() -> i32 { 1 }\n")?;
+
+    let mut observer = ObserverState::new(workspace.to_path_buf())?;
+    observer.seed_from_disk()?;
+
+    let store = SqliteStore::open(workspace)?;
+    let provider: Arc<dyn InferenceProvider> = Arc::new(HashingMockProvider);
+    let pipeline = SirPipeline::new_with_provider(
+        workspace.to_path_buf(),
+        1,
+        provider,
+        "hashing_mock",
+        "hashing_mock",
+    )?;
+
+    let mut sink = Vec::new();
+    for event in observer.initial_symbol_events() {
+        pipeline.process_event(&store, &event, false, &mut sink)?;
+    }
+
+    fs::write(&rust_file, "fn alpha() -> i32 { 2 }\n")?;
+    let update_event = observer
+        .process_path(&rust_file)?
+        .expect("expected update event");
+    pipeline.process_event(&store, &update_event, false, &mut sink)?;
+
+    let symbol = store
+        .list_symbols_for_file("src/lib.rs")?
+        .into_iter()
+        .find(|record| record.qualified_name.ends_with("alpha"))
+        .expect("alpha symbol should exist");
+    let history = store.list_sir_history(&symbol.id)?;
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].commit_hash, None);
+    assert_eq!(history[1].commit_hash, None);
 
     Ok(())
 }
