@@ -51,6 +51,8 @@ impl std::str::FromStr for InferenceProviderKind {
 pub struct AetherConfig {
     #[serde(default)]
     pub inference: InferenceConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +74,20 @@ impl Default for InferenceConfig {
             model: None,
             endpoint: None,
             api_key_env: default_api_key_env(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageConfig {
+    #[serde(default = "default_mirror_sir_files")]
+    pub mirror_sir_files: bool,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            mirror_sir_files: default_mirror_sir_files(),
         }
     }
 }
@@ -129,6 +145,10 @@ fn default_api_key_env() -> String {
     DEFAULT_GEMINI_API_KEY_ENV.to_owned()
 }
 
+fn default_mirror_sir_files() -> bool {
+    true
+}
+
 fn normalize_optional(input: Option<String>) -> Option<String> {
     input
         .map(|value| value.trim().to_owned())
@@ -166,11 +186,14 @@ mod tests {
 
         assert_eq!(config.inference.provider, InferenceProviderKind::Auto);
         assert_eq!(config.inference.api_key_env, DEFAULT_GEMINI_API_KEY_ENV);
+        assert!(config.storage.mirror_sir_files);
         assert!(config_path(workspace).exists());
 
         let content = fs::read_to_string(config_path(workspace)).expect("read config file");
         assert!(content.contains("[inference]"));
         assert!(content.contains("provider = \"auto\""));
+        assert!(content.contains("[storage]"));
+        assert!(content.contains("mirror_sir_files = true"));
     }
 
     #[test]
@@ -185,6 +208,9 @@ provider = "qwen3_local"
 model = "qwen3-embeddings-4B"
 endpoint = "http://127.0.0.1:11434"
 api_key_env = "CUSTOM_GEMINI_KEY"
+
+[storage]
+mirror_sir_files = false
 "#;
         fs::write(config_path(workspace), raw).expect("write config");
 
@@ -200,5 +226,6 @@ api_key_env = "CUSTOM_GEMINI_KEY"
             Some("http://127.0.0.1:11434")
         );
         assert_eq!(config.inference.api_key_env, "CUSTOM_GEMINI_KEY");
+        assert!(!config.storage.mirror_sir_files);
     }
 }

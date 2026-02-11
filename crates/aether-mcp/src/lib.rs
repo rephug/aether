@@ -295,6 +295,7 @@ impl AetherMcpServer {
         validate_sir(&sir)?;
 
         let canonical_json = canonicalize_sir_json(&sir);
+        // Stage-3 compatibility: keep serving SIR when metadata is stale or partially empty.
         let hash = meta
             .as_ref()
             .map(|record| record.sir_hash.clone())

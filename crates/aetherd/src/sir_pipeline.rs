@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -87,17 +87,6 @@ impl SirPipeline {
             store
                 .mark_removed(&symbol.id)
                 .with_context(|| format!("failed to mark symbol removed: {}", symbol.id))?;
-
-            let sir_blob_path = store.sir_dir().join(format!("{}.json", symbol.id));
-            match fs::remove_file(&sir_blob_path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(err).with_context(|| {
-                        format!("failed to remove SIR blob {}", sir_blob_path.display())
-                    });
-                }
-            }
         }
 
         let changed_symbols: Vec<Symbol> = event

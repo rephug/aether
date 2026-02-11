@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+aether-config = { path = "../aether-config" }
 aether-core = { path = "../aether-core" }
 rusqlite.workspace = true
 thiserror.workspace = true

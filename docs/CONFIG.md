@@ -14,6 +14,9 @@ provider = "auto" # auto | mock | gemini | qwen3_local
 # model = "..."
 # endpoint = "..."
 api_key_env = "GEMINI_API_KEY"
+
+[storage]
+mirror_sir_files = true # optional .aether/sir/*.json mirrors
 ```
 
 ## Inference Fields
@@ -31,6 +34,12 @@ api_key_env = "GEMINI_API_KEY"
 - `api_key_env`
   - Env var name for Gemini key
   - Default: `GEMINI_API_KEY`
+
+## Storage Fields
+
+- `mirror_sir_files`
+  - `true` (default): write `.aether/sir/<symbol_id>.json` mirror files after SQLite writes
+  - `false`: SQLite remains the only SIR persistence path
 
 ## Environment Variables
 

@@ -37,3 +37,8 @@ You are working in the repo root of https://github.com/rephug/aether.
    - cargo test --workspace
 7) Commit with message: "Add stale-SIR handling and inference robustness".
 ```
+
+## Compatibility Note For Stage 3.3
+Stage 3.3 changes canonical SIR JSON storage location to SQLite, but it does **not** change
+the meaning of Stage 3.2 metadata fields. Existing metadata remains valid and should not be
+rewritten during mirror-file backfill.

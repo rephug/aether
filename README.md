@@ -12,7 +12,7 @@ It watches your workspace, extracts stable symbols, generates per-symbol SIR (St
 - Extracts symbols via tree-sitter (`rs`, `ts`, `tsx`, `js`, `jsx`).
 - Computes stable symbol IDs so IDs survive line-shift edits.
 - Generates SIR for changed symbols using configurable inference providers.
-- Stores symbol metadata + SIR locally (`.aether/meta.sqlite` and `.aether/sir/*.json`).
+- Stores symbol metadata + canonical SIR in SQLite (`.aether/meta.sqlite`) with optional file mirrors under `.aether/sir/*.json`.
 - Searches local symbols by name/path/language from CLI and MCP.
 - Serves hover summaries through the AETHER LSP server.
 - Serves local lookup/explain tools through the AETHER MCP server.
@@ -39,7 +39,7 @@ Main crates:
 - `crates/aether-parse`: tree-sitter extraction
 - `crates/aether-core`: symbol model, stable ID strategy, diffs
 - `crates/aether-sir`: SIR schema, validation, canonical JSON, hash
-- `crates/aether-store`: SQLite + local blob storage under `.aether/`
+- `crates/aether-store`: SQLite canonical storage + optional local SIR mirror files under `.aether/`
 - `crates/aether-infer`: provider trait + `mock`, `gemini`, `qwen3_local`
 - `crates/aether-lsp`: stdio LSP hover server
 - `crates/aether-mcp`: stdio MCP server exposing local AETHER tools
@@ -151,6 +151,9 @@ provider = "auto" # auto | mock | gemini | qwen3_local
 # model = "..."
 # endpoint = "..."
 api_key_env = "GEMINI_API_KEY"
+
+[storage]
+mirror_sir_files = true # optional file mirrors under .aether/sir/
 ```
 
 Provider behavior:
@@ -173,7 +176,7 @@ CLI overrides (optional):
 AETHER writes to `.aether/` under the workspace:
 - `.aether/config.toml`
 - `.aether/meta.sqlite`
-- `.aether/sir/<symbol_id>.json`
+- `.aether/sir/<symbol_id>.json` (optional mirror files)
 
 ## Security and Keys
 
