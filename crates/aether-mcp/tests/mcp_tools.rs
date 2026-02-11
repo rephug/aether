@@ -105,6 +105,16 @@ provider = "mock"
             .any(|item| item.file_path.contains("src/app.ts"))
     );
 
+    let search_with_zero_limit = rt
+        .block_on(server.aether_search(Parameters(AetherSearchRequest {
+            query: "app.ts".to_owned(),
+            limit: Some(0),
+            mode: None,
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert!(!search_with_zero_limit.matches.is_empty());
+
     let semantic_search = rt
         .block_on(server.aether_search(Parameters(AetherSearchRequest {
             query: "alpha summary".to_owned(),
@@ -205,6 +215,48 @@ provider = "mock"
         .0;
     assert!(sir_without_mirror.found);
     assert!(!sir_without_mirror.sir_json.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn mcp_semantic_search_falls_back_when_store_not_initialized() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    fs::create_dir_all(workspace.join(".aether"))?;
+    fs::write(
+        workspace.join(".aether/config.toml"),
+        r#"[inference]
+provider = "mock"
+api_key_env = "GEMINI_API_KEY"
+
+[storage]
+mirror_sir_files = true
+
+[embeddings]
+enabled = true
+provider = "mock"
+"#,
+    )?;
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+
+    let response = rt
+        .block_on(server.aether_search(Parameters(AetherSearchRequest {
+            query: "alpha".to_owned(),
+            limit: Some(10),
+            mode: Some(SearchMode::Semantic),
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+
+    assert_eq!(response.mode_used, SearchMode::Lexical);
+    assert_eq!(
+        response.fallback_reason.as_deref(),
+        Some("local store not initialized")
+    );
+    assert!(response.matches.is_empty());
 
     Ok(())
 }

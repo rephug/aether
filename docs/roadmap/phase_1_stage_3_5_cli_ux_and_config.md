@@ -18,6 +18,16 @@ Make CLI flows predictable for humans and automation, with stable config behavio
 3. JSON output mode is stable for scripting.
 4. `cargo fmt --all --check`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace` pass.
 
+## Implementation Notes
+- `aetherd` exposes `--index-once` for deterministic one-shot indexing.
+- `aetherd --search` supports `--output table|json`; JSON output uses a stable envelope:
+  - `mode_requested`
+  - `mode_used`
+  - `fallback_reason`
+  - `matches`
+- Semantic/hybrid fallback reasons are aligned across CLI and MCP.
+- `aether-config` keeps schema backward compatibility and adds non-fatal `validate_config` warnings.
+
 ## Exact Codex prompt(s)
 ```text
 You are working in the repo root of https://github.com/rephug/aether.

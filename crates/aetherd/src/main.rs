@@ -2,9 +2,9 @@ use std::ffi::OsStr;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use aether_config::{InferenceProviderKind, ensure_workspace_config};
-use aetherd::indexer::{IndexerConfig, run_indexing_loop};
-use aetherd::search::{SearchMode, run_search_once};
+use aether_config::{InferenceProviderKind, ensure_workspace_config, validate_config};
+use aetherd::indexer::{IndexerConfig, run_indexing_loop, run_initial_index_once};
+use aetherd::search::{SearchMode, SearchOutputFormat, run_search_once};
 use aetherd::sir_pipeline::DEFAULT_SIR_CONCURRENCY;
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -12,32 +12,71 @@ use clap::Parser;
 #[derive(Debug, Parser)]
 #[command(author, version, about = "AETHER Observer daemon")]
 struct Cli {
-    #[arg(long, default_value = ".")]
+    #[arg(long, default_value = ".", help = "Workspace root to index/search")]
     workspace: PathBuf,
 
-    #[arg(long, default_value_t = 300)]
+    #[arg(
+        long,
+        default_value_t = 300,
+        help = "Debounce window for watcher events"
+    )]
     debounce_ms: u64,
 
-    #[arg(long)]
+    #[arg(long, help = "Print symbol-change events as JSON lines")]
     print_events: bool,
 
-    #[arg(long)]
+    #[arg(long, help = "Print SIR lifecycle lines as symbols are processed")]
     print_sir: bool,
 
-    #[arg(long)]
+    #[arg(long, help = "Run as stdio LSP server")]
     lsp: bool,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        requires = "lsp",
+        help = "Run background indexing while LSP is active"
+    )]
     index: bool,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        conflicts_with_all = ["lsp", "index", "index_once"],
+        help = "Run one-shot symbol search and exit"
+    )]
     search: Option<String>,
 
-    #[arg(long, default_value_t = 20)]
+    #[arg(
+        long,
+        default_value_t = 20,
+        requires = "search",
+        help = "Result limit for --search (clamped to 1..100)"
+    )]
     search_limit: u32,
 
-    #[arg(long, default_value = "lexical", value_parser = parse_search_mode)]
+    #[arg(
+        long,
+        default_value = "lexical",
+        value_parser = parse_search_mode,
+        requires = "search",
+        help = "Search mode: lexical, semantic, or hybrid. Semantic/hybrid fall back to lexical with a reason when unavailable"
+    )]
     search_mode: SearchMode,
+
+    #[arg(
+        long,
+        default_value = "table",
+        value_parser = parse_search_output_format,
+        requires = "search",
+        help = "Search output format: table or json"
+    )]
+    output: SearchOutputFormat,
+
+    #[arg(
+        long,
+        conflicts_with_all = ["search", "lsp", "index"],
+        help = "Run one full index pass and exit"
+    )]
+    index_once: bool,
 
     #[arg(long, default_value_t = DEFAULT_SIR_CONCURRENCY)]
     sir_concurrency: usize,
@@ -77,12 +116,18 @@ fn run(cli: Cli) -> Result<()> {
         )
     })?;
 
-    ensure_workspace_config(&workspace).with_context(|| {
+    let config = ensure_workspace_config(&workspace).with_context(|| {
         format!(
             "failed to load or create workspace config at {}",
             workspace.join(".aether/config.toml").display()
         )
     })?;
+    for warning in validate_config(&config) {
+        eprintln!(
+            "AETHER config warning [{}]: {}",
+            warning.code, warning.message
+        );
+    }
 
     if let Some(query) = cli.search.as_deref() {
         let mut out = std::io::stdout();
@@ -91,6 +136,7 @@ fn run(cli: Cli) -> Result<()> {
             query,
             cli.search_limit.min(100),
             cli.search_mode,
+            cli.output,
             &mut out,
         );
     }
@@ -127,6 +173,10 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
+    if cli.index_once {
+        return run_initial_index_once(&indexer_config);
+    }
+
     run_indexing_loop(indexer_config)
 }
 
@@ -135,5 +185,9 @@ fn parse_inference_provider(value: &str) -> Result<InferenceProviderKind, String
 }
 
 fn parse_search_mode(value: &str) -> Result<SearchMode, String> {
+    value.parse()
+}
+
+fn parse_search_output_format(value: &str) -> Result<SearchOutputFormat, String> {
     value.parse()
 }
