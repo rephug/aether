@@ -93,4 +93,6 @@ Override precedence is CLI > config file > built-in defaults.
 
 - `--search-mode lexical` always uses lexical search.
 - `--search-mode semantic` and `--search-mode hybrid` fall back to lexical search when semantic prerequisites are unavailable.
-- Fallback reasons are explicit and exposed to both CLI and MCP responses.
+- Fallback reasons are explicit and exposed to both CLI and MCP responses (shared stable strings).
+- CLI JSON responses include `mode_requested`, `mode_used`, `fallback_reason`, and `matches`.
+- MCP search responses include `query`, `limit`, `mode_requested`, `mode_used`, `fallback_reason`, `result_count`, and `matches`.

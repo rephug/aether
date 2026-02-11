@@ -18,6 +18,12 @@ Improve how AETHER presents stored intelligence to agents and editors.
 3. Unit/integration tests cover JSON shape and hover formatting.
 4. `cargo fmt --all --check`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace` pass.
 
+## Implementation notes
+- Keep MCP tool names stable (`aether_status`, `aether_symbol_lookup`, `aether_search`, `aether_get_sir`, `aether_explain`).
+- Evolve MCP response schemas additively; do not remove or rename existing fields in Stage 3.x.
+- Keep search fallback reasons consistent between CLI and MCP.
+- Prefer shared core helpers for search mode/envelope and hover markdown formatting to avoid MCP/LSP drift.
+
 ## Exact Codex prompt(s)
 ```text
 You are working in the repo root of https://github.com/rephug/aether.
