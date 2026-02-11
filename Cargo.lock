@@ -54,6 +54,7 @@ name = "aether-mcp"
 version = "0.1.0"
 dependencies = [
  "aether-core",
+ "aether-infer",
  "aether-parse",
  "aether-sir",
  "aether-store",
@@ -100,6 +101,7 @@ dependencies = [
  "aether-config",
  "aether-core",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]

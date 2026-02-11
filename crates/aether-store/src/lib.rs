@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use aether_config::load_workspace_config;
 use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::from_str as json_from_str;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +41,36 @@ pub struct SymbolSearchResult {
     pub kind: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SymbolEmbeddingRecord {
+    pub symbol_id: String,
+    pub sir_hash: String,
+    pub provider: String,
+    pub model: String,
+    pub embedding: Vec<f32>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolEmbeddingMetaRecord {
+    pub symbol_id: String,
+    pub sir_hash: String,
+    pub provider: String,
+    pub model: String,
+    pub embedding_dim: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemanticSearchResult {
+    pub symbol_id: String,
+    pub qualified_name: String,
+    pub file_path: String,
+    pub language: String,
+    pub kind: String,
+    pub semantic_score: f32,
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("io error: {0}")]
@@ -48,6 +79,8 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("config error: {0}")]
     Config(#[from] aether_config::ConfigError),
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 pub trait Store {
@@ -65,6 +98,20 @@ pub trait Store {
 
     fn upsert_sir_meta(&self, record: SirMetaRecord) -> Result<(), StoreError>;
     fn get_sir_meta(&self, symbol_id: &str) -> Result<Option<SirMetaRecord>, StoreError>;
+
+    fn upsert_symbol_embedding(&self, record: SymbolEmbeddingRecord) -> Result<(), StoreError>;
+    fn get_symbol_embedding_meta(
+        &self,
+        symbol_id: &str,
+    ) -> Result<Option<SymbolEmbeddingMetaRecord>, StoreError>;
+    fn delete_symbol_embedding(&self, symbol_id: &str) -> Result<(), StoreError>;
+    fn search_symbols_semantic(
+        &self,
+        query_embedding: &[f32],
+        provider: &str,
+        model: &str,
+        limit: u32,
+    ) -> Result<Vec<SemanticSearchResult>, StoreError>;
 }
 
 pub struct SqliteStore {
@@ -148,6 +195,33 @@ impl SqliteStore {
 
         Ok(json)
     }
+
+    fn get_symbol_search_result(
+        &self,
+        symbol_id: &str,
+    ) -> Result<Option<SymbolSearchResult>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, qualified_name, file_path, language, kind
+            FROM symbols
+            WHERE id = ?1
+            "#,
+        )?;
+
+        let record = stmt
+            .query_row(params![symbol_id], |row| {
+                Ok(SymbolSearchResult {
+                    symbol_id: row.get(0)?,
+                    qualified_name: row.get(1)?,
+                    file_path: row.get(2)?,
+                    language: row.get(3)?,
+                    kind: row.get(4)?,
+                })
+            })
+            .optional()?;
+
+        Ok(record)
+    }
 }
 
 impl Store for SqliteStore {
@@ -180,6 +254,10 @@ impl Store for SqliteStore {
     }
 
     fn mark_removed(&self, symbol_id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM sir_embeddings WHERE symbol_id = ?1",
+            params![symbol_id],
+        )?;
         self.conn
             .execute("DELETE FROM symbols WHERE id = ?1", params![symbol_id])?;
         self.conn
@@ -361,6 +439,163 @@ impl Store for SqliteStore {
 
         Ok(record)
     }
+
+    fn upsert_symbol_embedding(&self, record: SymbolEmbeddingRecord) -> Result<(), StoreError> {
+        let embedding_dim = record.embedding.len() as i64;
+        let embedding_json = serde_json::to_string(&record.embedding)?;
+
+        self.conn.execute(
+            r#"
+            INSERT INTO sir_embeddings (
+                symbol_id, sir_hash, provider, model, embedding_dim, embedding_json, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(symbol_id) DO UPDATE SET
+                sir_hash = excluded.sir_hash,
+                provider = excluded.provider,
+                model = excluded.model,
+                embedding_dim = excluded.embedding_dim,
+                embedding_json = excluded.embedding_json,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                record.symbol_id,
+                record.sir_hash,
+                record.provider,
+                record.model,
+                embedding_dim,
+                embedding_json,
+                record.updated_at,
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    fn get_symbol_embedding_meta(
+        &self,
+        symbol_id: &str,
+    ) -> Result<Option<SymbolEmbeddingMetaRecord>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT symbol_id, sir_hash, provider, model, embedding_dim, updated_at
+            FROM sir_embeddings
+            WHERE symbol_id = ?1
+            "#,
+        )?;
+
+        let record = stmt
+            .query_row(params![symbol_id], |row| {
+                Ok(SymbolEmbeddingMetaRecord {
+                    symbol_id: row.get(0)?,
+                    sir_hash: row.get(1)?,
+                    provider: row.get(2)?,
+                    model: row.get(3)?,
+                    embedding_dim: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            })
+            .optional()?;
+
+        Ok(record)
+    }
+
+    fn delete_symbol_embedding(&self, symbol_id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM sir_embeddings WHERE symbol_id = ?1",
+            params![symbol_id],
+        )?;
+        Ok(())
+    }
+
+    fn search_symbols_semantic(
+        &self,
+        query_embedding: &[f32],
+        provider: &str,
+        model: &str,
+        limit: u32,
+    ) -> Result<Vec<SemanticSearchResult>, StoreError> {
+        let provider = provider.trim();
+        let model = model.trim();
+        if query_embedding.is_empty() || provider.is_empty() || model.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let query_norm_sq = query_embedding
+            .iter()
+            .map(|value| value * value)
+            .fold(0.0f32, |acc, value| acc + value);
+        if query_norm_sq <= f32::EPSILON {
+            return Ok(Vec::new());
+        }
+        let query_norm = query_norm_sq.sqrt();
+        let capped_limit = limit.clamp(1, 100) as usize;
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT symbol_id, embedding_json
+            FROM sir_embeddings
+            WHERE provider = ?1
+              AND model = ?2
+              AND embedding_dim = ?3
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![provider, model, query_embedding.len() as i64],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+
+        let mut scored = Vec::new();
+        for row in rows {
+            let (symbol_id, embedding_json) = row?;
+            let embedding = json_from_str::<Vec<f32>>(&embedding_json)?;
+            if embedding.len() != query_embedding.len() {
+                continue;
+            }
+
+            let dot = embedding
+                .iter()
+                .zip(query_embedding.iter())
+                .map(|(left, right)| left * right)
+                .fold(0.0f32, |acc, value| acc + value);
+            let embedding_norm_sq = embedding
+                .iter()
+                .map(|value| value * value)
+                .fold(0.0f32, |acc, value| acc + value);
+            if embedding_norm_sq <= f32::EPSILON {
+                continue;
+            }
+
+            let score = dot / (embedding_norm_sq.sqrt() * query_norm);
+            scored.push((symbol_id, score));
+        }
+
+        scored.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+
+        let mut results = Vec::new();
+        for (symbol_id, score) in scored.into_iter().take(capped_limit) {
+            let Some(symbol) = self.get_symbol_search_result(&symbol_id)? else {
+                continue;
+            };
+
+            results.push(SemanticSearchResult {
+                symbol_id: symbol.symbol_id,
+                qualified_name: symbol.qualified_name,
+                file_path: symbol.file_path,
+                language: symbol.language,
+                kind: symbol.kind,
+                semantic_score: score,
+            });
+        }
+
+        Ok(results)
+    }
 }
 
 fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
@@ -385,6 +620,19 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
             updated_at INTEGER NOT NULL,
             sir_json TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS sir_embeddings (
+            symbol_id TEXT PRIMARY KEY,
+            sir_hash TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            embedding_dim INTEGER NOT NULL,
+            embedding_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sir_embeddings_provider_model_dim
+            ON sir_embeddings(provider, model, embedding_dim);
         "#,
     )?;
 
@@ -486,6 +734,21 @@ mod tests {
         }
     }
 
+    fn embedding_record(
+        symbol_id: &str,
+        sir_hash: &str,
+        embedding: Vec<f32>,
+    ) -> SymbolEmbeddingRecord {
+        SymbolEmbeddingRecord {
+            symbol_id: symbol_id.to_owned(),
+            sir_hash: sir_hash.to_owned(),
+            provider: "mock".to_owned(),
+            model: "mock-64d".to_owned(),
+            embedding,
+            updated_at: 1_700_000_500,
+        }
+    }
+
     #[test]
     fn store_creates_layout_and_persists_data_without_duplicates() {
         let temp = tempdir().expect("tempdir");
@@ -543,6 +806,41 @@ mod tests {
 
         let reopened_meta = reopened.get_sir_meta("sym-1").expect("meta after reopen");
         assert_eq!(reopened_meta, Some(sir_meta_record()));
+    }
+
+    #[test]
+    fn embedding_records_persist_and_search_semantic_ranks_expected_match() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        store
+            .upsert_symbol(symbol_record())
+            .expect("upsert first symbol");
+        let mut second = symbol_record_ts();
+        second.id = "sym-2".to_owned();
+        second.qualified_name = "demo::network_retry".to_owned();
+        store.upsert_symbol(second).expect("upsert second symbol");
+
+        store
+            .upsert_symbol_embedding(embedding_record("sym-1", "hash-a", vec![1.0, 0.0]))
+            .expect("upsert first embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-2", "hash-b", vec![0.0, 1.0]))
+            .expect("upsert second embedding");
+
+        let meta = store
+            .get_symbol_embedding_meta("sym-1")
+            .expect("read embedding meta")
+            .expect("embedding meta exists");
+        assert_eq!(meta.sir_hash, "hash-a");
+        assert_eq!(meta.embedding_dim, 2);
+
+        let semantic = store
+            .search_symbols_semantic(&[0.0, 1.0], "mock", "mock-64d", 5)
+            .expect("semantic search");
+        assert!(!semantic.is_empty());
+        assert_eq!(semantic[0].symbol_id, "sym-2");
+        assert!(semantic[0].semantic_score > semantic[1].semantic_score);
     }
 
     #[test]
@@ -651,6 +949,9 @@ mirror_sir_files = false
         store
             .write_sir_blob("sym-1", "{\"intent\":\"to-remove\"}")
             .expect("write sir before delete");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-1", "hash-remove", vec![1.0, 0.0]))
+            .expect("write embedding before delete");
         store.mark_removed("sym-1").expect("mark removed");
 
         let list = store
@@ -660,6 +961,11 @@ mirror_sir_files = false
 
         let sir = store.read_sir_blob("sym-1").expect("sir after delete");
         assert!(sir.is_none());
+
+        let embedding_meta = store
+            .get_symbol_embedding_meta("sym-1")
+            .expect("embedding metadata after delete");
+        assert!(embedding_meta.is_none());
     }
 
     #[test]
@@ -771,5 +1077,10 @@ mirror_sir_files = false
         assert_eq!(migrated.sir_status, "fresh");
         assert_eq!(migrated.last_error, None);
         assert_eq!(migrated.last_attempt_at, migrated.updated_at);
+
+        let embedding_lookup = store
+            .search_symbols_semantic(&[1.0, 0.0], "mock", "mock-64d", 10)
+            .expect("semantic search on migrated schema");
+        assert!(embedding_lookup.is_empty());
     }
 }

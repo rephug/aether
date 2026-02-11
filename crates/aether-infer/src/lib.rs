@@ -2,8 +2,8 @@ use std::env;
 use std::path::Path;
 
 use aether_config::{
-    DEFAULT_GEMINI_API_KEY_ENV, DEFAULT_QWEN_ENDPOINT, DEFAULT_QWEN_MODEL, InferenceProviderKind,
-    ensure_workspace_config,
+    DEFAULT_GEMINI_API_KEY_ENV, DEFAULT_QWEN_EMBEDDING_ENDPOINT, DEFAULT_QWEN_ENDPOINT,
+    DEFAULT_QWEN_MODEL, EmbeddingProviderKind, InferenceProviderKind, ensure_workspace_config,
 };
 use aether_sir::{SirAnnotation, validate_sir};
 use async_trait::async_trait;
@@ -14,6 +14,7 @@ pub const GEMINI_API_KEY_ENV: &str = DEFAULT_GEMINI_API_KEY_ENV;
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 const GEMINI_DEFAULT_MODEL: &str = "gemini-2.0-flash";
 const PARSE_VALIDATION_RETRIES: usize = 2;
+const MOCK_EMBEDDING_DIM: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SirContext {
@@ -30,8 +31,22 @@ pub struct ProviderOverrides {
     pub api_key_env: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EmbeddingProviderOverrides {
+    pub enabled: Option<bool>,
+    pub provider: Option<EmbeddingProviderKind>,
+    pub model: Option<String>,
+    pub endpoint: Option<String>,
+}
+
 pub struct LoadedProvider {
     pub provider: Box<dyn InferenceProvider>,
+    pub provider_name: String,
+    pub model_name: String,
+}
+
+pub struct LoadedEmbeddingProvider {
+    pub provider: Box<dyn EmbeddingProvider>,
     pub provider_name: String,
     pub model_name: String,
 }
@@ -52,6 +67,8 @@ pub enum InferError {
     Validation(#[from] aether_sir::SirError),
     #[error("failed to parse or validate SIR after retries: {0}")]
     ParseValidationExhausted(String),
+    #[error("invalid embedding response: {0}")]
+    InvalidEmbeddingResponse(String),
 }
 
 #[async_trait]
@@ -61,6 +78,11 @@ pub trait InferenceProvider: Send + Sync {
         symbol_text: &str,
         context: &SirContext,
     ) -> Result<SirAnnotation, InferError>;
+}
+
+#[async_trait]
+pub trait EmbeddingProvider: Send + Sync {
+    async fn embed_text(&self, text: &str) -> Result<Vec<f32>, InferError>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -85,6 +107,16 @@ impl InferenceProvider for MockProvider {
 
         validate_sir(&sir)?;
         Ok(sir)
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MockEmbeddingProvider;
+
+#[async_trait]
+impl EmbeddingProvider for MockEmbeddingProvider {
+    async fn embed_text(&self, text: &str) -> Result<Vec<f32>, InferError> {
+        Ok(mock_embedding_for_text(text))
     }
 }
 
@@ -228,6 +260,50 @@ impl InferenceProvider for Qwen3LocalProvider {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct Qwen3LocalEmbeddingProvider {
+    client: reqwest::Client,
+    endpoint: String,
+    model: String,
+}
+
+impl Qwen3LocalEmbeddingProvider {
+    pub fn new(endpoint: Option<String>, model: Option<String>) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            endpoint: normalize_optional(endpoint)
+                .unwrap_or_else(|| DEFAULT_QWEN_EMBEDDING_ENDPOINT.to_owned()),
+            model: normalize_optional(model).unwrap_or_else(|| DEFAULT_QWEN_MODEL.to_owned()),
+        }
+    }
+
+    async fn request_embedding(&self, text: &str) -> Result<Vec<f32>, InferError> {
+        let body = json!({
+            "model": self.model,
+            "prompt": text
+        });
+
+        let response_value: Value = self
+            .client
+            .post(&self.endpoint)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        extract_embedding_vector(&response_value)
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for Qwen3LocalEmbeddingProvider {
+    async fn embed_text(&self, text: &str) -> Result<Vec<f32>, InferError> {
+        self.request_embedding(text).await
+    }
+}
+
 pub fn load_provider_from_env_or_mock(
     workspace_root: impl AsRef<Path>,
     overrides: ProviderOverrides,
@@ -280,6 +356,39 @@ pub fn load_provider_from_env_or_mock(
             })
         }
     }
+}
+
+pub fn load_embedding_provider_from_config(
+    workspace_root: impl AsRef<Path>,
+    overrides: EmbeddingProviderOverrides,
+) -> Result<Option<LoadedEmbeddingProvider>, InferError> {
+    let config = ensure_workspace_config(workspace_root)?;
+    let selected_enabled = overrides.enabled.unwrap_or(config.embeddings.enabled);
+    if !selected_enabled {
+        return Ok(None);
+    }
+
+    let selected_provider = overrides.provider.unwrap_or(config.embeddings.provider);
+    let selected_model = first_non_empty(overrides.model, config.embeddings.model);
+    let selected_endpoint = first_non_empty(overrides.endpoint, config.embeddings.endpoint);
+
+    let loaded = match selected_provider {
+        EmbeddingProviderKind::Mock => LoadedEmbeddingProvider {
+            provider: Box::new(MockEmbeddingProvider),
+            provider_name: EmbeddingProviderKind::Mock.as_str().to_owned(),
+            model_name: format!("mock-{MOCK_EMBEDDING_DIM}d"),
+        },
+        EmbeddingProviderKind::Qwen3Local => {
+            let provider = Qwen3LocalEmbeddingProvider::new(selected_endpoint, selected_model);
+            LoadedEmbeddingProvider {
+                model_name: provider.model.clone(),
+                provider: Box::new(provider),
+                provider_name: EmbeddingProviderKind::Qwen3Local.as_str().to_owned(),
+            }
+        }
+    };
+
+    Ok(Some(loaded))
 }
 
 fn build_strict_json_prompt(symbol_text: &str, context: &SirContext) -> String {
@@ -363,6 +472,49 @@ fn extract_local_text_part(response: &Value) -> Result<String, InferError> {
     ))
 }
 
+fn extract_embedding_vector(response: &Value) -> Result<Vec<f32>, InferError> {
+    if let Some(vector) = value_to_embedding_vector(response) {
+        return Ok(vector);
+    }
+
+    let candidate_paths = [
+        "/embedding",
+        "/data/0/embedding",
+        "/embeddings/0/embedding",
+        "/vector",
+    ];
+
+    for path in candidate_paths {
+        if let Some(value) = response.pointer(path)
+            && let Some(vector) = value_to_embedding_vector(value)
+        {
+            return Ok(vector);
+        }
+    }
+
+    Err(InferError::InvalidEmbeddingResponse(
+        "missing embedding vector in local model response body".to_owned(),
+    ))
+}
+
+fn value_to_embedding_vector(value: &Value) -> Option<Vec<f32>> {
+    let values = value.as_array()?;
+    if values.is_empty() {
+        return None;
+    }
+
+    let mut embedding = Vec::with_capacity(values.len());
+    for item in values {
+        let number = item.as_f64()?;
+        if !number.is_finite() {
+            return None;
+        }
+        embedding.push(number as f32);
+    }
+
+    normalize_embedding(embedding)
+}
+
 fn value_to_candidate_json(value: &Value) -> Option<String> {
     if let Some(text) = value.as_str() {
         return Some(text.to_owned());
@@ -427,6 +579,57 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn mock_embedding_for_text(text: &str) -> Vec<f32> {
+    let mut embedding = vec![0.0f32; MOCK_EMBEDDING_DIM];
+    let mut saw_token = false;
+
+    for token in tokenize_for_embedding(text) {
+        saw_token = true;
+        let normalized = token.to_ascii_lowercase();
+        let hash = fnv1a_64(normalized.as_bytes());
+        let index = (hash as usize) % MOCK_EMBEDDING_DIM;
+        let sign = if ((hash >> 8) & 1) == 0 { 1.0 } else { -1.0 };
+        embedding[index] += sign;
+    }
+
+    if !saw_token {
+        return embedding;
+    }
+
+    normalize_embedding(embedding).unwrap_or_else(|| vec![0.0f32; MOCK_EMBEDDING_DIM])
+}
+
+fn tokenize_for_embedding(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn normalize_embedding(mut embedding: Vec<f32>) -> Option<Vec<f32>> {
+    let norm_sq = embedding
+        .iter()
+        .map(|value| value * value)
+        .fold(0.0f32, |acc, value| acc + value);
+    if norm_sq <= f32::EPSILON {
+        return None;
+    }
+
+    let norm = norm_sq.sqrt();
+    for value in &mut embedding {
+        *value /= norm;
+    }
+
+    Some(embedding)
+}
+
 fn resolve_gemini_model(model: Option<String>) -> String {
     let model = normalize_optional(model).unwrap_or_else(|| GEMINI_DEFAULT_MODEL.to_owned());
     if model.starts_with("qwen3-embeddings-") {
@@ -451,7 +654,7 @@ fn read_env_non_empty(name: &str) -> Option<String> {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use aether_config::{InferenceProviderKind, ensure_workspace_config};
+    use aether_config::{EmbeddingProviderKind, InferenceProviderKind, ensure_workspace_config};
     use tempfile::tempdir;
 
     use super::*;
@@ -479,6 +682,76 @@ mod tests {
         assert_eq!(sir.confidence, 1.0);
 
         validate_sir(&sir).expect("mock sir should validate");
+    }
+
+    #[tokio::test]
+    async fn mock_embedding_provider_is_deterministic_and_normalized() {
+        let provider = MockEmbeddingProvider;
+
+        let first = provider
+            .embed_text("Network retry logic with backoff")
+            .await
+            .expect("first embedding");
+        let second = provider
+            .embed_text("network RETRY logic with backoff")
+            .await
+            .expect("second embedding");
+
+        assert_eq!(first.len(), MOCK_EMBEDDING_DIM);
+        assert_eq!(first, second);
+
+        let norm_sq = first
+            .iter()
+            .map(|value| value * value)
+            .fold(0.0f32, |acc, value| acc + value);
+        assert!((norm_sq - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn load_embedding_provider_defaults_to_disabled() {
+        let temp = tempdir().expect("tempdir");
+        ensure_workspace_config(temp.path()).expect("ensure config");
+
+        let loaded =
+            load_embedding_provider_from_config(temp.path(), EmbeddingProviderOverrides::default())
+                .expect("load embedding provider");
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn load_embedding_provider_reads_enabled_qwen_settings() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        ensure_workspace_config(workspace).expect("ensure config");
+
+        std::fs::write(
+            workspace.join(".aether/config.toml"),
+            r#"[inference]
+provider = "auto"
+api_key_env = "GEMINI_API_KEY"
+
+[storage]
+mirror_sir_files = true
+
+[embeddings]
+enabled = true
+provider = "qwen3_local"
+model = "qwen3-embeddings-4B"
+endpoint = "http://127.0.0.1:11434/api/embeddings"
+"#,
+        )
+        .expect("write config");
+
+        let loaded =
+            load_embedding_provider_from_config(workspace, EmbeddingProviderOverrides::default())
+                .expect("load embedding provider")
+                .expect("embedding provider should be enabled");
+
+        assert_eq!(
+            loaded.provider_name,
+            EmbeddingProviderKind::Qwen3Local.as_str()
+        );
+        assert_eq!(loaded.model_name, "qwen3-embeddings-4B");
     }
 
     #[test]

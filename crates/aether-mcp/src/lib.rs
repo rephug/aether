@@ -1,11 +1,15 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use aether_core::{SourceRange, Symbol, normalize_path, stable_symbol_id};
+use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
 use aether_parse::{SymbolExtractor, language_for_path};
 use aether_sir::{SirAnnotation, SirError, canonicalize_sir_json, sir_hash, validate_sir};
-use aether_store::{SirMetaRecord, SqliteStore, Store, StoreError, SymbolSearchResult};
+use aether_store::{
+    SemanticSearchResult, SirMetaRecord, SqliteStore, Store, StoreError, SymbolSearchResult,
+};
 use anyhow::Result;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -32,6 +36,8 @@ pub enum AetherMcpError {
     Sqlite(#[from] rusqlite::Error),
     #[error("store error: {0}")]
     Store(#[from] StoreError),
+    #[error("inference error: {0}")]
+    Infer(#[from] aether_infer::InferError),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("sir validation error: {0}")]
@@ -63,6 +69,7 @@ pub struct AetherSymbolLookupMatch {
     pub file_path: String,
     pub language: String,
     pub kind: String,
+    pub semantic_score: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -74,11 +81,23 @@ pub struct AetherSymbolLookupResponse {
 pub struct AetherSearchRequest {
     pub query: String,
     pub limit: Option<u32>,
+    pub mode: Option<SearchMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherSearchResponse {
+    pub mode_used: SearchMode,
+    pub fallback_reason: Option<String>,
     pub matches: Vec<AetherSymbolLookupMatch>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchMode {
+    #[default]
+    Lexical,
+    Semantic,
+    Hybrid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -158,6 +177,20 @@ impl From<SymbolSearchResult> for AetherSymbolLookupMatch {
             file_path: value.file_path,
             language: value.language,
             kind: value.kind,
+            semantic_score: None,
+        }
+    }
+}
+
+impl From<SemanticSearchResult> for AetherSymbolLookupMatch {
+    fn from(value: SemanticSearchResult) -> Self {
+        Self {
+            symbol_id: value.symbol_id,
+            qualified_name: value.qualified_name,
+            file_path: value.file_path,
+            language: value.language,
+            kind: value.kind,
+            semantic_score: Some(value.semantic_score),
         }
     }
 }
@@ -213,17 +246,62 @@ impl AetherMcpServer {
         &self,
         request: AetherSymbolLookupRequest,
     ) -> Result<Vec<AetherSymbolLookupMatch>, AetherMcpError> {
-        self.search_matches(&request.query, request.limit)
+        self.lexical_search_matches(&request.query, request.limit)
     }
 
-    pub fn aether_search_logic(
+    pub async fn aether_search_logic(
         &self,
         request: AetherSearchRequest,
-    ) -> Result<Vec<AetherSymbolLookupMatch>, AetherMcpError> {
-        self.search_matches(&request.query, request.limit)
+    ) -> Result<AetherSearchResponse, AetherMcpError> {
+        let mode = request.mode.unwrap_or_default();
+        let lexical = self.lexical_search_matches(&request.query, request.limit)?;
+
+        match mode {
+            SearchMode::Lexical => Ok(AetherSearchResponse {
+                mode_used: SearchMode::Lexical,
+                fallback_reason: None,
+                matches: lexical,
+            }),
+            SearchMode::Semantic => {
+                let (semantic, fallback_reason) = self
+                    .semantic_search_matches(&request.query, request.limit)
+                    .await?;
+                if semantic.is_empty() {
+                    return Ok(AetherSearchResponse {
+                        mode_used: SearchMode::Lexical,
+                        fallback_reason,
+                        matches: lexical,
+                    });
+                }
+
+                Ok(AetherSearchResponse {
+                    mode_used: SearchMode::Semantic,
+                    fallback_reason: None,
+                    matches: semantic,
+                })
+            }
+            SearchMode::Hybrid => {
+                let (semantic, fallback_reason) = self
+                    .semantic_search_matches(&request.query, request.limit)
+                    .await?;
+                if semantic.is_empty() {
+                    return Ok(AetherSearchResponse {
+                        mode_used: SearchMode::Lexical,
+                        fallback_reason,
+                        matches: lexical,
+                    });
+                }
+
+                Ok(AetherSearchResponse {
+                    mode_used: SearchMode::Hybrid,
+                    fallback_reason: None,
+                    matches: fuse_hybrid_matches(&lexical, &semantic, request.limit.unwrap_or(20)),
+                })
+            }
+        }
     }
 
-    fn search_matches(
+    fn lexical_search_matches(
         &self,
         query: &str,
         limit: Option<u32>,
@@ -240,6 +318,64 @@ impl AetherMcpServer {
             .into_iter()
             .map(AetherSymbolLookupMatch::from)
             .collect())
+    }
+
+    async fn semantic_search_matches(
+        &self,
+        query: &str,
+        limit: Option<u32>,
+    ) -> Result<(Vec<AetherSymbolLookupMatch>, Option<String>), AetherMcpError> {
+        let sqlite_path = self.sqlite_path();
+        if !sqlite_path.exists() {
+            return Ok((Vec::new(), Some("local store not initialized".to_owned())));
+        }
+
+        let loaded = load_embedding_provider_from_config(
+            &self.workspace,
+            EmbeddingProviderOverrides::default(),
+        )?;
+        let Some(loaded) = loaded else {
+            return Ok((
+                Vec::new(),
+                Some("embeddings are disabled in .aether/config.toml".to_owned()),
+            ));
+        };
+
+        let query_embedding = match loaded.provider.embed_text(query).await {
+            Ok(embedding) => embedding,
+            Err(err) => {
+                return Ok((Vec::new(), Some(format!("embedding provider error: {err}"))));
+            }
+        };
+
+        if query_embedding.is_empty() {
+            return Ok((
+                Vec::new(),
+                Some("embedding provider returned an empty query vector".to_owned()),
+            ));
+        }
+
+        let store = SqliteStore::open(&self.workspace)?;
+        let matches = store.search_symbols_semantic(
+            &query_embedding,
+            &loaded.provider_name,
+            &loaded.model_name,
+            limit.unwrap_or(20).min(100),
+        )?;
+        if matches.is_empty() {
+            return Ok((
+                Vec::new(),
+                Some("semantic index not ready for this embedding provider/model".to_owned()),
+            ));
+        }
+
+        Ok((
+            matches
+                .into_iter()
+                .map(AetherSymbolLookupMatch::from)
+                .collect(),
+            None,
+        ))
     }
 
     pub fn aether_get_sir_logic(
@@ -516,7 +652,8 @@ impl AetherMcpServer {
     ) -> Result<Json<AetherSearchResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_search");
         self.aether_search_logic(request)
-            .map(|matches| Json(AetherSearchResponse { matches }))
+            .await
+            .map(Json)
             .map_err(to_mcp_error)
     }
 
@@ -641,4 +778,49 @@ fn meta_status_fields(
     let last_attempt_at = (meta.last_attempt_at > 0).then_some(meta.last_attempt_at);
 
     (sir_status, last_error, last_attempt_at)
+}
+
+fn fuse_hybrid_matches(
+    lexical: &[AetherSymbolLookupMatch],
+    semantic: &[AetherSymbolLookupMatch],
+    limit: u32,
+) -> Vec<AetherSymbolLookupMatch> {
+    const RRF_K: f32 = 60.0;
+
+    let mut by_id: HashMap<String, AetherSymbolLookupMatch> = HashMap::new();
+    let mut score_by_id: HashMap<String, f32> = HashMap::new();
+
+    for (rank, row) in lexical.iter().enumerate() {
+        let id = row.symbol_id.clone();
+        by_id.entry(id.clone()).or_insert_with(|| row.clone());
+        *score_by_id.entry(id).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
+    }
+
+    for (rank, row) in semantic.iter().enumerate() {
+        let id = row.symbol_id.clone();
+        by_id
+            .entry(id.clone())
+            .and_modify(|existing| {
+                if existing.semantic_score.is_none() && row.semantic_score.is_some() {
+                    existing.semantic_score = row.semantic_score;
+                }
+            })
+            .or_insert_with(|| row.clone());
+        *score_by_id.entry(id).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
+    }
+
+    let mut ranked: Vec<(String, f32)> = score_by_id.into_iter().collect();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    ranked
+        .into_iter()
+        .take(limit.clamp(1, 100) as usize)
+        .filter_map(|(symbol_id, _)| by_id.remove(&symbol_id))
+        .collect()
 }
