@@ -1,8 +1,9 @@
 use std::fs;
 
+use aether_core::{SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED, SearchMode};
 use aether_mcp::{
     AetherExplainRequest, AetherGetSirRequest, AetherMcpServer, AetherSearchRequest,
-    AetherSymbolLookupRequest, SearchMode,
+    AetherSymbolLookupRequest, MCP_SCHEMA_VERSION,
 };
 use aether_store::{SqliteStore, Store};
 use aetherd::indexer::{IndexerConfig, run_initial_index_once};
@@ -66,6 +67,8 @@ provider = "mock"
         .block_on(server.aether_status())
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
+    assert_eq!(status.schema_version, MCP_SCHEMA_VERSION);
+    assert!(status.generated_at > 0);
     assert!(status.store_present);
     assert!(status.symbol_count > 0);
     assert!(status.sir_count > 0);
@@ -79,7 +82,13 @@ provider = "mock"
         )
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
+    assert_eq!(lookup.query, "alpha");
+    assert_eq!(lookup.limit, 20);
+    assert_eq!(lookup.mode_requested, SearchMode::Lexical);
+    assert_eq!(lookup.mode_used, SearchMode::Lexical);
+    assert_eq!(lookup.fallback_reason, None);
     assert!(!lookup.matches.is_empty());
+    assert_eq!(lookup.result_count as usize, lookup.matches.len());
     assert!(
         lookup
             .matches
@@ -95,9 +104,13 @@ provider = "mock"
         })))
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
+    assert_eq!(search.query, "app.ts");
+    assert_eq!(search.limit, 10);
+    assert_eq!(search.mode_requested, SearchMode::Lexical);
     assert_eq!(search.mode_used, SearchMode::Lexical);
     assert_eq!(search.fallback_reason, None);
     assert!(!search.matches.is_empty());
+    assert_eq!(search.result_count as usize, search.matches.len());
     assert!(
         search
             .matches
@@ -113,7 +126,12 @@ provider = "mock"
         })))
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
+    assert_eq!(search_with_zero_limit.limit, 1);
     assert!(!search_with_zero_limit.matches.is_empty());
+    assert_eq!(
+        search_with_zero_limit.result_count as usize,
+        search_with_zero_limit.matches.len()
+    );
 
     let semantic_search = rt
         .block_on(server.aether_search(Parameters(AetherSearchRequest {
@@ -123,9 +141,14 @@ provider = "mock"
         })))
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
+    assert_eq!(semantic_search.mode_requested, SearchMode::Semantic);
     assert_eq!(semantic_search.mode_used, SearchMode::Semantic);
     assert_eq!(semantic_search.fallback_reason, None);
     assert!(!semantic_search.matches.is_empty());
+    assert_eq!(
+        semantic_search.result_count as usize,
+        semantic_search.matches.len()
+    );
     assert!(semantic_search.matches[0].semantic_score.is_some());
 
     let explain = rt
@@ -139,8 +162,9 @@ provider = "mock"
 
     assert!(explain.found);
     assert!(!explain.symbol_id.is_empty());
+    assert!(explain.hover_markdown.contains("### alpha"));
     assert!(explain.hover_markdown.contains("Mock summary for alpha"));
-    assert!(explain.hover_markdown.contains("confidence:"));
+    assert!(explain.hover_markdown.contains("**Confidence:**"));
     assert_eq!(explain.sir_status.as_deref(), Some("fresh"));
     assert_eq!(explain.last_error, None);
     assert!(explain.last_attempt_at.unwrap_or_default() > 0);
@@ -199,6 +223,11 @@ provider = "mock"
         stale_explain.last_error.as_deref(),
         Some("provider timeout")
     );
+    assert!(
+        stale_explain
+            .hover_markdown
+            .contains("> AETHER WARNING: SIR is stale. Last error: provider timeout")
+    );
     assert!(stale_explain.last_attempt_at.unwrap_or_default() > existing_meta.last_attempt_at);
 
     let sir_dir = workspace.join(".aether/sir");
@@ -254,8 +283,10 @@ provider = "mock"
     assert_eq!(response.mode_used, SearchMode::Lexical);
     assert_eq!(
         response.fallback_reason.as_deref(),
-        Some("local store not initialized")
+        Some(SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED)
     );
+    assert_eq!(response.mode_requested, SearchMode::Semantic);
+    assert_eq!(response.result_count, 0);
     assert!(response.matches.is_empty());
 
     Ok(())

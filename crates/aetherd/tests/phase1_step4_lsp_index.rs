@@ -54,14 +54,16 @@ fn lsp_index_mode_path_generates_sir_and_hover_reads_it() -> Result<(), Box<dyn 
             .expect("rust hover should resolve");
 
     assert!(rust_hover.contains("Mock summary for alpha"));
-    assert!(rust_hover.contains("confidence:"));
+    assert!(rust_hover.contains("**Confidence:**"));
+    assert!(rust_hover.contains("**Intent**"));
 
     let ts_hover =
         resolve_hover_markdown_for_path(workspace, &store, &ts_file, Position::new(1, 10))?
             .expect("ts hover should resolve");
 
     assert!(ts_hover.contains("Mock summary for delta"));
-    assert!(ts_hover.contains("confidence:"));
+    assert!(ts_hover.contains("**Confidence:**"));
+    assert!(ts_hover.contains("**Dependencies**"));
 
     Ok(())
 }

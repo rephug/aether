@@ -17,6 +17,7 @@ name = "aether-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "schemars",
  "serde",
  "thiserror",
 ]
@@ -44,6 +45,7 @@ dependencies = [
  "aether-sir",
  "aether-store",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tower-lsp",

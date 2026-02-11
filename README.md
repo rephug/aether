@@ -92,6 +92,8 @@ cargo run -p aetherd -- --workspace . --print-events --print-sir
 cargo run -p aetherd -- --workspace . --lsp --index
 ```
 
+LSP hover rendering is sectioned for readability (`Intent`, `Inputs`, `Outputs`, `Side Effects`, `Dependencies`, `Error Modes`) and includes a stale warning when the latest SIR metadata reports stale status.
+
 ### Search symbols
 
 ```bash
@@ -162,6 +164,35 @@ MCP tools exposed:
 - `aether_search`
 - `aether_get_sir`
 - `aether_explain`
+
+Stable MCP response fields for scripting/agents:
+- `aether_status`:
+  - `schema_version`
+  - `generated_at`
+  - `workspace`
+  - `store_present`
+  - `sqlite_path`
+  - `sir_dir`
+  - `symbol_count`
+  - `sir_count`
+- `aether_symbol_lookup`:
+  - `query`
+  - `limit`
+  - `mode_requested` (`lexical`)
+  - `mode_used` (`lexical`)
+  - `fallback_reason` (`null`)
+  - `result_count`
+  - `matches`
+- `aether_search`:
+  - `query`
+  - `limit`
+  - `mode_requested`
+  - `mode_used`
+  - `fallback_reason`
+  - `result_count`
+  - `matches`
+
+Search fallback reasons are intentionally aligned between CLI and MCP.
 
 ## Configuration
 
