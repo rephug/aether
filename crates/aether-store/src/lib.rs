@@ -33,6 +33,24 @@ pub struct SirMetaRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SirHistoryRecord {
+    pub symbol_id: String,
+    pub version: i64,
+    pub sir_hash: String,
+    pub provider: String,
+    pub model: String,
+    pub created_at: i64,
+    pub sir_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SirVersionWriteResult {
+    pub version: i64,
+    pub updated_at: i64,
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolSearchResult {
     pub symbol_id: String,
     pub qualified_name: String,
@@ -98,6 +116,16 @@ pub trait Store {
 
     fn upsert_sir_meta(&self, record: SirMetaRecord) -> Result<(), StoreError>;
     fn get_sir_meta(&self, symbol_id: &str) -> Result<Option<SirMetaRecord>, StoreError>;
+    fn list_sir_history(&self, symbol_id: &str) -> Result<Vec<SirHistoryRecord>, StoreError>;
+    fn record_sir_version_if_changed(
+        &self,
+        symbol_id: &str,
+        sir_hash: &str,
+        provider: &str,
+        model: &str,
+        sir_json: &str,
+        created_at: i64,
+    ) -> Result<SirVersionWriteResult, StoreError>;
 
     fn upsert_symbol_embedding(&self, record: SymbolEmbeddingRecord) -> Result<(), StoreError>;
     fn get_symbol_embedding_meta(
@@ -256,6 +284,10 @@ impl Store for SqliteStore {
     fn mark_removed(&self, symbol_id: &str) -> Result<(), StoreError> {
         self.conn.execute(
             "DELETE FROM sir_embeddings WHERE symbol_id = ?1",
+            params![symbol_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM sir_history WHERE symbol_id = ?1",
             params![symbol_id],
         )?;
         self.conn
@@ -440,6 +472,129 @@ impl Store for SqliteStore {
         Ok(record)
     }
 
+    fn list_sir_history(&self, symbol_id: &str) -> Result<Vec<SirHistoryRecord>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT symbol_id, version, sir_hash, provider, model, created_at, sir_json
+            FROM sir_history
+            WHERE symbol_id = ?1
+            ORDER BY version ASC
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![symbol_id], |row| {
+            Ok(SirHistoryRecord {
+                symbol_id: row.get(0)?,
+                version: row.get(1)?,
+                sir_hash: row.get(2)?,
+                provider: row.get(3)?,
+                model: row.get(4)?,
+                created_at: row.get(5)?,
+                sir_json: row.get(6)?,
+            })
+        })?;
+
+        let records = rows.collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    fn record_sir_version_if_changed(
+        &self,
+        symbol_id: &str,
+        sir_hash: &str,
+        provider: &str,
+        model: &str,
+        sir_json: &str,
+        created_at: i64,
+    ) -> Result<SirVersionWriteResult, StoreError> {
+        let created_at = created_at.max(0);
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+
+        let result = (|| -> Result<SirVersionWriteResult, StoreError> {
+            let mut latest_stmt = self.conn.prepare(
+                r#"
+                SELECT version, sir_hash, created_at
+                FROM sir_history
+                WHERE symbol_id = ?1
+                ORDER BY version DESC
+                LIMIT 1
+                "#,
+            )?;
+
+            let latest = latest_stmt
+                .query_row(params![symbol_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .optional()?;
+
+            if let Some((latest_version, latest_hash, latest_created_at)) = latest {
+                if latest_hash == sir_hash {
+                    return Ok(SirVersionWriteResult {
+                        version: latest_version,
+                        updated_at: latest_created_at,
+                        changed: false,
+                    });
+                }
+
+                let next_version = latest_version + 1;
+                self.conn.execute(
+                    r#"
+                    INSERT INTO sir_history (
+                        symbol_id, version, sir_hash, provider, model, created_at, sir_json
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    "#,
+                    params![
+                        symbol_id,
+                        next_version,
+                        sir_hash,
+                        provider,
+                        model,
+                        created_at,
+                        sir_json,
+                    ],
+                )?;
+
+                return Ok(SirVersionWriteResult {
+                    version: next_version,
+                    updated_at: created_at,
+                    changed: true,
+                });
+            }
+
+            self.conn.execute(
+                r#"
+                INSERT INTO sir_history (
+                    symbol_id, version, sir_hash, provider, model, created_at, sir_json
+                )
+                VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+                params![symbol_id, sir_hash, provider, model, created_at, sir_json],
+            )?;
+
+            Ok(SirVersionWriteResult {
+                version: 1,
+                updated_at: created_at,
+                changed: true,
+            })
+        })();
+
+        match result {
+            Ok(write_result) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(write_result)
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
     fn upsert_symbol_embedding(&self, record: SymbolEmbeddingRecord) -> Result<(), StoreError> {
         let embedding_dim = record.embedding.len() as i64;
         let embedding_json = serde_json::to_string(&record.embedding)?;
@@ -621,6 +776,23 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
             sir_json TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS sir_history (
+            symbol_id TEXT NOT NULL,
+            version INTEGER NOT NULL CHECK (version >= 1),
+            sir_hash TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            created_at INTEGER NOT NULL CHECK (created_at >= 0),
+            sir_json TEXT NOT NULL,
+            PRIMARY KEY (symbol_id, version)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sir_history_symbol_created_version
+            ON sir_history(symbol_id, created_at ASC, version ASC);
+
+        CREATE INDEX IF NOT EXISTS idx_sir_history_symbol_latest
+            ON sir_history(symbol_id, version DESC);
+
         CREATE TABLE IF NOT EXISTS sir_embeddings (
             symbol_id TEXT PRIMARY KEY,
             sir_hash TEXT NOT NULL,
@@ -650,6 +822,26 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
     )?;
     conn.execute(
         "UPDATE sir SET last_attempt_at = updated_at WHERE last_attempt_at = 0",
+        [],
+    )?;
+    conn.execute(
+        r#"
+        INSERT INTO sir_history (symbol_id, version, sir_hash, provider, model, created_at, sir_json)
+        SELECT
+            s.id,
+            CASE WHEN s.sir_version > 0 THEN s.sir_version ELSE 1 END,
+            s.sir_hash,
+            s.provider,
+            s.model,
+            CASE WHEN s.updated_at > 0 THEN s.updated_at ELSE unixepoch() END,
+            s.sir_json
+        FROM sir s
+        WHERE COALESCE(TRIM(s.sir_hash), '') <> ''
+          AND COALESCE(TRIM(s.sir_json), '') <> ''
+          AND NOT EXISTS (
+              SELECT 1 FROM sir_history h WHERE h.symbol_id = s.id
+          )
+        "#,
         [],
     )?;
 
@@ -908,6 +1100,70 @@ mod tests {
     }
 
     #[test]
+    fn sir_history_records_are_ordered_and_persist_after_reopen() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let store = SqliteStore::open(workspace).expect("open store");
+
+        let first = store
+            .record_sir_version_if_changed(
+                "sym-history",
+                "hash-1",
+                "mock",
+                "mock",
+                "{\"intent\":\"v1\"}",
+                1_700_222_100,
+            )
+            .expect("insert history v1");
+        assert!(first.changed);
+        assert_eq!(first.version, 1);
+
+        let duplicate = store
+            .record_sir_version_if_changed(
+                "sym-history",
+                "hash-1",
+                "mock",
+                "mock",
+                "{\"intent\":\"v1\"}",
+                1_700_222_101,
+            )
+            .expect("dedupe by hash");
+        assert!(!duplicate.changed);
+        assert_eq!(duplicate.version, 1);
+        assert_eq!(duplicate.updated_at, first.updated_at);
+
+        let second = store
+            .record_sir_version_if_changed(
+                "sym-history",
+                "hash-2",
+                "mock",
+                "mock",
+                "{\"intent\":\"v2\"}",
+                1_700_222_200,
+            )
+            .expect("insert history v2");
+        assert!(second.changed);
+        assert_eq!(second.version, 2);
+
+        let history = store
+            .list_sir_history("sym-history")
+            .expect("list ordered history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].version, 1);
+        assert_eq!(history[0].sir_hash, "hash-1");
+        assert_eq!(history[1].version, 2);
+        assert_eq!(history[1].sir_hash, "hash-2");
+
+        drop(store);
+
+        let reopened = SqliteStore::open(workspace).expect("reopen store");
+        let reopened_history = reopened
+            .list_sir_history("sym-history")
+            .expect("list history after reopen");
+        assert_eq!(reopened_history, history);
+    }
+
+    #[test]
     fn mirror_write_can_be_disabled_via_config() {
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();
@@ -952,6 +1208,16 @@ mirror_sir_files = false
         store
             .upsert_symbol_embedding(embedding_record("sym-1", "hash-remove", vec![1.0, 0.0]))
             .expect("write embedding before delete");
+        store
+            .record_sir_version_if_changed(
+                "sym-1",
+                "hash-remove",
+                "mock",
+                "mock",
+                "{\"intent\":\"to-remove\"}",
+                1_700_111_000,
+            )
+            .expect("insert history before delete");
         store.mark_removed("sym-1").expect("mark removed");
 
         let list = store
@@ -966,6 +1232,11 @@ mirror_sir_files = false
             .get_symbol_embedding_meta("sym-1")
             .expect("embedding metadata after delete");
         assert!(embedding_meta.is_none());
+
+        let history = store
+            .list_sir_history("sym-1")
+            .expect("history after delete");
+        assert!(history.is_empty());
     }
 
     #[test]
@@ -1028,6 +1299,67 @@ mirror_sir_files = false
     }
 
     #[test]
+    fn open_store_backfills_sir_history_from_existing_sir_rows() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let aether_dir = workspace.join(".aether");
+        let sir_dir = aether_dir.join("sir");
+        fs::create_dir_all(&sir_dir).expect("create legacy aether dirs");
+
+        let sqlite_path = aether_dir.join("meta.sqlite");
+        let conn = Connection::open(&sqlite_path).expect("open legacy sqlite");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS symbols (
+                id TEXT PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                language TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                qualified_name TEXT NOT NULL,
+                signature_fingerprint TEXT NOT NULL,
+                last_seen_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sir (
+                id TEXT PRIMARY KEY,
+                sir_hash TEXT NOT NULL,
+                sir_version INTEGER NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                sir_json TEXT
+            );
+            "#,
+        )
+        .expect("create legacy schema with sir_json");
+
+        conn.execute(
+            "INSERT INTO sir (id, sir_hash, sir_version, provider, model, updated_at, sir_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "legacy-history",
+                "legacy-hash",
+                3i64,
+                "mock",
+                "mock",
+                1_700_222_333i64,
+                "{\"intent\":\"legacy\"}"
+            ],
+        )
+        .expect("insert legacy sir row with json");
+        drop(conn);
+
+        let store = SqliteStore::open(workspace).expect("open migrated store");
+        let history = store
+            .list_sir_history("legacy-history")
+            .expect("load migrated history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].version, 3);
+        assert_eq!(history[0].sir_hash, "legacy-hash");
+        assert_eq!(history[0].sir_json, "{\"intent\":\"legacy\"}");
+        assert_eq!(history[0].created_at, 1_700_222_333);
+    }
+
+    #[test]
     fn open_store_migrates_legacy_sir_table_with_stale_defaults() {
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();
@@ -1077,6 +1409,12 @@ mirror_sir_files = false
         assert_eq!(migrated.sir_status, "fresh");
         assert_eq!(migrated.last_error, None);
         assert_eq!(migrated.last_attempt_at, migrated.updated_at);
+        assert!(
+            store
+                .list_sir_history("legacy-sym")
+                .expect("load history for legacy row without sir_json")
+                .is_empty()
+        );
 
         let embedding_lookup = store
             .search_symbols_semantic(&[1.0, 0.0], "mock", "mock-64d", 10)

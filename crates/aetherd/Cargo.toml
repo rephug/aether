@@ -26,5 +26,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 walkdir.workspace = true
 
 [dev-dependencies]
+async-trait = "0.1"
 tempfile.workspace = true
 tower-lsp = "0.20"

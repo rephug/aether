@@ -2,12 +2,41 @@ use std::fs;
 use std::sync::Arc;
 
 use aether_config::InferenceProviderKind;
-use aether_infer::{InferenceProvider, MockProvider, ProviderOverrides, Qwen3LocalProvider};
+use aether_infer::{
+    InferError, InferenceProvider, MockProvider, ProviderOverrides, Qwen3LocalProvider, SirContext,
+};
 use aether_sir::{SirAnnotation, validate_sir};
 use aether_store::{SqliteStore, Store, SymbolEmbeddingRecord};
 use aetherd::observer::ObserverState;
 use aetherd::sir_pipeline::SirPipeline;
 use tempfile::tempdir;
+
+#[derive(Debug, Clone, Copy)]
+struct HashingMockProvider;
+
+#[async_trait::async_trait]
+impl InferenceProvider for HashingMockProvider {
+    async fn generate_sir(
+        &self,
+        symbol_text: &str,
+        context: &SirContext,
+    ) -> Result<SirAnnotation, InferError> {
+        let normalized = symbol_text.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        Ok(SirAnnotation {
+            intent: format!(
+                "Hashing mock summary for {} :: {}",
+                context.qualified_name, normalized
+            ),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            side_effects: Vec::new(),
+            dependencies: Vec::new(),
+            error_modes: Vec::new(),
+            confidence: 1.0,
+        })
+    }
+}
 
 #[test]
 fn step2_pipeline_generates_and_persists_sir_with_mock_provider()
@@ -301,6 +330,144 @@ fn step2_pipeline_marks_stale_on_failure_and_clears_on_recovery()
     assert_eq!(recovered_meta.sir_status, "fresh");
     assert_eq!(recovered_meta.last_error, None);
     assert!(recovered_meta.last_attempt_at > 0);
+
+    Ok(())
+}
+
+#[test]
+fn step2_pipeline_creates_new_version_on_hash_change_without_duplicate_on_reindex()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    fs::create_dir_all(workspace.join("src"))?;
+    let rust_file = workspace.join("src/lib.rs");
+    fs::write(&rust_file, "fn alpha() -> i32 { 1 }\n")?;
+
+    let mut observer = ObserverState::new(workspace.to_path_buf())?;
+    observer.seed_from_disk()?;
+
+    let store = SqliteStore::open(workspace)?;
+    let provider: Arc<dyn InferenceProvider> = Arc::new(HashingMockProvider);
+    let pipeline = SirPipeline::new_with_provider(
+        workspace.to_path_buf(),
+        1,
+        provider,
+        "hashing_mock",
+        "hashing_mock",
+    )?;
+
+    let mut sink = Vec::new();
+    for event in observer.initial_symbol_events() {
+        pipeline.process_event(&store, &event, false, &mut sink)?;
+    }
+
+    let symbol = store
+        .list_symbols_for_file("src/lib.rs")?
+        .into_iter()
+        .find(|record| record.qualified_name.ends_with("alpha"))
+        .expect("alpha symbol should exist");
+    let initial_history = store.list_sir_history(&symbol.id)?;
+    assert_eq!(initial_history.len(), 1);
+    assert_eq!(initial_history[0].version, 1);
+
+    let initial_meta = store
+        .get_sir_meta(&symbol.id)?
+        .expect("initial metadata should exist");
+    assert_eq!(initial_meta.sir_version, 1);
+
+    let mut reindex_observer = ObserverState::new(workspace.to_path_buf())?;
+    reindex_observer.seed_from_disk()?;
+    for event in reindex_observer.initial_symbol_events() {
+        pipeline.process_event(&store, &event, false, &mut sink)?;
+    }
+
+    let history_after_reindex = store.list_sir_history(&symbol.id)?;
+    assert_eq!(history_after_reindex.len(), 1);
+    let meta_after_reindex = store
+        .get_sir_meta(&symbol.id)?
+        .expect("metadata after reindex should exist");
+    assert_eq!(meta_after_reindex.sir_version, 1);
+    assert_eq!(meta_after_reindex.updated_at, initial_meta.updated_at);
+    assert!(meta_after_reindex.last_attempt_at >= initial_meta.last_attempt_at);
+
+    fs::write(&rust_file, "fn alpha() -> i32 { 2 }\n")?;
+    let update_event = reindex_observer
+        .process_path(&rust_file)?
+        .expect("expected update event");
+    pipeline.process_event(&store, &update_event, false, &mut sink)?;
+
+    let history_after_update = store.list_sir_history(&symbol.id)?;
+    assert_eq!(history_after_update.len(), 2);
+    assert_eq!(history_after_update[0].version, 1);
+    assert_eq!(history_after_update[1].version, 2);
+    assert_ne!(
+        history_after_update[0].sir_hash,
+        history_after_update[1].sir_hash
+    );
+
+    let meta_after_update = store
+        .get_sir_meta(&symbol.id)?
+        .expect("metadata after update should exist");
+    assert_eq!(meta_after_update.sir_version, 2);
+    assert_eq!(
+        meta_after_update.updated_at,
+        history_after_update[1].created_at
+    );
+    assert!(meta_after_update.last_attempt_at >= meta_after_update.updated_at);
+
+    Ok(())
+}
+
+#[test]
+fn step2_sir_history_retrieval_persists_after_restart() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    fs::create_dir_all(workspace.join("src"))?;
+    let rust_file = workspace.join("src/lib.rs");
+    fs::write(&rust_file, "fn alpha() -> i32 { 1 }\n")?;
+
+    let mut observer = ObserverState::new(workspace.to_path_buf())?;
+    observer.seed_from_disk()?;
+
+    let store = SqliteStore::open(workspace)?;
+    let provider: Arc<dyn InferenceProvider> = Arc::new(HashingMockProvider);
+    let pipeline = SirPipeline::new_with_provider(
+        workspace.to_path_buf(),
+        1,
+        provider,
+        "hashing_mock",
+        "hashing_mock",
+    )?;
+
+    let mut sink = Vec::new();
+    for event in observer.initial_symbol_events() {
+        pipeline.process_event(&store, &event, false, &mut sink)?;
+    }
+
+    fs::write(&rust_file, "fn alpha() -> i32 { 2 }\n")?;
+    let update_event = observer
+        .process_path(&rust_file)?
+        .expect("expected update event");
+    pipeline.process_event(&store, &update_event, false, &mut sink)?;
+
+    let symbol = store
+        .list_symbols_for_file("src/lib.rs")?
+        .into_iter()
+        .find(|record| record.qualified_name.ends_with("alpha"))
+        .expect("alpha symbol should exist");
+
+    let history_before_restart = store.list_sir_history(&symbol.id)?;
+    assert_eq!(history_before_restart.len(), 2);
+    assert_eq!(history_before_restart[0].version, 1);
+    assert_eq!(history_before_restart[1].version, 2);
+
+    drop(store);
+
+    let reopened = SqliteStore::open(workspace)?;
+    let history_after_restart = reopened.list_sir_history(&symbol.id)?;
+    assert_eq!(history_after_restart, history_before_restart);
 
     Ok(())
 }

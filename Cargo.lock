@@ -120,6 +120,7 @@ dependencies = [
  "aether-sir",
  "aether-store",
  "anyhow",
+ "async-trait",
  "clap",
  "notify",
  "serde_json",

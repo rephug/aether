@@ -13,6 +13,7 @@ It watches your workspace, extracts stable symbols, generates per-symbol SIR (St
 - Computes stable symbol IDs so IDs survive line-shift edits.
 - Generates SIR for changed symbols using configurable inference providers.
 - Stores symbol metadata + canonical SIR in SQLite (`.aether/meta.sqlite`) with optional file mirrors under `.aether/sir/*.json`.
+- Stores per-symbol SIR version history in SQLite for chronological intent timelines.
 - Stores optional per-symbol embeddings in SQLite for semantic retrieval.
 - Searches local symbols by name/path/language from CLI and MCP, with optional semantic/hybrid ranking.
 - Serves hover summaries through the AETHER LSP server.
