@@ -5,7 +5,7 @@ use std::time::Duration;
 use aether_core::{SourceRange, Symbol, normalize_path, stable_symbol_id};
 use aether_parse::{SymbolExtractor, language_for_path};
 use aether_sir::{SirAnnotation, SirError, canonicalize_sir_json, sir_hash, validate_sir};
-use aether_store::{SqliteStore, Store, StoreError};
+use aether_store::{SqliteStore, Store, StoreError, SymbolSearchResult};
 use anyhow::Result;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -13,7 +13,7 @@ use rmcp::transport::stdio;
 use rmcp::{
     ErrorData as McpError, Json, ServerHandler, ServiceExt, tool, tool_handler, tool_router,
 };
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -67,6 +67,17 @@ pub struct AetherSymbolLookupMatch {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherSymbolLookupResponse {
+    pub matches: Vec<AetherSymbolLookupMatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherSearchRequest {
+    pub query: String,
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherSearchResponse {
     pub matches: Vec<AetherSymbolLookupMatch>,
 }
 
@@ -133,6 +144,18 @@ impl From<SirAnnotation> for SirAnnotationView {
     }
 }
 
+impl From<SymbolSearchResult> for AetherSymbolLookupMatch {
+    fn from(value: SymbolSearchResult) -> Self {
+        Self {
+            symbol_id: value.symbol_id,
+            qualified_name: value.qualified_name,
+            file_path: value.file_path,
+            language: value.language,
+            kind: value.kind,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AetherMcpServer {
     workspace: PathBuf,
@@ -184,43 +207,33 @@ impl AetherMcpServer {
         &self,
         request: AetherSymbolLookupRequest,
     ) -> Result<Vec<AetherSymbolLookupMatch>, AetherMcpError> {
-        let query = request.query.trim();
-        if query.is_empty() {
-            return Ok(Vec::new());
-        }
+        self.search_matches(&request.query, request.limit)
+    }
 
+    pub fn aether_search_logic(
+        &self,
+        request: AetherSearchRequest,
+    ) -> Result<Vec<AetherSymbolLookupMatch>, AetherMcpError> {
+        self.search_matches(&request.query, request.limit)
+    }
+
+    fn search_matches(
+        &self,
+        query: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<AetherSymbolLookupMatch>, AetherMcpError> {
         let sqlite_path = self.sqlite_path();
         if !sqlite_path.exists() {
             return Ok(Vec::new());
         }
 
-        let limit = request.limit.unwrap_or(20).min(100) as i64;
-        let pattern = format!("%{query}%");
+        let store = SqliteStore::open(&self.workspace)?;
+        let matches = store.search_symbols(query, limit.unwrap_or(20).min(100))?;
 
-        let conn = self.open_sqlite_connection(&sqlite_path)?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT id, qualified_name, file_path, language, kind
-            FROM symbols
-            WHERE LOWER(qualified_name) LIKE LOWER(?1)
-               OR LOWER(file_path) LIKE LOWER(?1)
-            ORDER BY qualified_name ASC, id ASC
-            LIMIT ?2
-            "#,
-        )?;
-
-        let rows = stmt.query_map(params![pattern, limit], |row| {
-            Ok(AetherSymbolLookupMatch {
-                symbol_id: row.get(0)?,
-                qualified_name: row.get(1)?,
-                file_path: row.get(2)?,
-                language: row.get(3)?,
-                kind: row.get(4)?,
-            })
-        })?;
-
-        let matches = rows.collect::<Result<Vec<_>, _>>()?;
-        Ok(matches)
+        Ok(matches
+            .into_iter()
+            .map(AetherSymbolLookupMatch::from)
+            .collect())
     }
 
     pub fn aether_get_sir_logic(
@@ -452,6 +465,20 @@ impl AetherMcpServer {
         self.verbose_log("MCP tool called: aether_symbol_lookup");
         self.aether_symbol_lookup_logic(request)
             .map(|matches| Json(AetherSymbolLookupResponse { matches }))
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_search",
+        description = "Search symbols by name, path, language, or kind"
+    )]
+    pub async fn aether_search(
+        &self,
+        Parameters(request): Parameters<AetherSearchRequest>,
+    ) -> Result<Json<AetherSearchResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_search");
+        self.aether_search_logic(request)
+            .map(|matches| Json(AetherSearchResponse { matches }))
             .map_err(to_mcp_error)
     }
 

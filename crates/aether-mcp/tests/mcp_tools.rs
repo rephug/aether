@@ -1,7 +1,8 @@
 use std::fs;
 
 use aether_mcp::{
-    AetherExplainRequest, AetherGetSirRequest, AetherMcpServer, AetherSymbolLookupRequest,
+    AetherExplainRequest, AetherGetSirRequest, AetherMcpServer, AetherSearchRequest,
+    AetherSymbolLookupRequest,
 };
 use aetherd::indexer::{IndexerConfig, run_initial_index_once};
 use anyhow::Result;
@@ -68,6 +69,21 @@ fn mcp_tool_handlers_work_with_local_store() -> Result<()> {
             .matches
             .iter()
             .any(|item| item.qualified_name.contains("alpha"))
+    );
+
+    let search = rt
+        .block_on(server.aether_search(Parameters(AetherSearchRequest {
+            query: "app.ts".to_owned(),
+            limit: Some(10),
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert!(!search.matches.is_empty());
+    assert!(
+        search
+            .matches
+            .iter()
+            .any(|item| item.file_path.contains("src/app.ts"))
     );
 
     let explain = rt
