@@ -169,25 +169,39 @@ impl SirPipeline {
                 SirGenerationOutcome::Success(generated) => {
                     let canonical_json = canonicalize_sir_json(&generated.sir);
                     let sir_hash_value = sir_hash(&generated.sir);
-                    let updated_at = unix_timestamp_secs();
-
-                    store
-                        .write_sir_blob(&generated.symbol.id, &canonical_json)
+                    let attempted_at = unix_timestamp_secs();
+                    let version_write = store
+                        .record_sir_version_if_changed(
+                            &generated.symbol.id,
+                            &sir_hash_value,
+                            &self.provider_name,
+                            &self.model_name,
+                            &canonical_json,
+                            attempted_at,
+                        )
                         .with_context(|| {
-                            format!("failed to write SIR blob for {}", generated.symbol.id)
+                            format!("failed to record SIR history for {}", generated.symbol.id)
                         })?;
+
+                    if version_write.changed {
+                        store
+                            .write_sir_blob(&generated.symbol.id, &canonical_json)
+                            .with_context(|| {
+                                format!("failed to write SIR blob for {}", generated.symbol.id)
+                            })?;
+                    }
 
                     store
                         .upsert_sir_meta(SirMetaRecord {
                             id: generated.symbol.id.clone(),
                             sir_hash: sir_hash_value.clone(),
-                            sir_version: 1,
+                            sir_version: version_write.version,
                             provider: self.provider_name.clone(),
                             model: self.model_name.clone(),
-                            updated_at,
+                            updated_at: version_write.updated_at,
                             sir_status: SIR_STATUS_FRESH.to_owned(),
                             last_error: None,
-                            last_attempt_at: updated_at,
+                            last_attempt_at: attempted_at,
                         })
                         .with_context(|| {
                             format!("failed to upsert SIR metadata for {}", generated.symbol.id)
