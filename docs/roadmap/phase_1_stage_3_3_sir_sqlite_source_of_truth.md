@@ -18,6 +18,12 @@ Make SQLite the primary SIR store so reads/writes are consistent and resilient.
 3. Optional file mirror remains compatible for debugging.
 4. `cargo fmt --all --check`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace` pass.
 
+## Implementation notes
+1. Write order is SQLite first, then optional file mirror (`[storage].mirror_sir_files = true`).
+2. Read order is SQLite first, then mirror fallback.
+3. On mirror fallback hit, read path backfills SQLite canonical JSON.
+4. Stage 3.2 metadata semantics remain unchanged during Stage 3.3 backfill.
+
 ## Exact Codex prompt(s)
 ```text
 You are working in the repo root of https://github.com/rephug/aether.

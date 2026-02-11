@@ -1,7 +1,9 @@
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use aether_config::load_workspace_config;
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
@@ -44,6 +46,8 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("config error: {0}")]
+    Config(#[from] aether_config::ConfigError),
 }
 
 pub trait Store {
@@ -67,11 +71,13 @@ pub struct SqliteStore {
     conn: Connection,
     aether_dir: PathBuf,
     sir_dir: PathBuf,
+    mirror_sir_files: bool,
 }
 
 impl SqliteStore {
     pub fn open(workspace_root: impl AsRef<Path>) -> Result<Self, StoreError> {
         let workspace_root = workspace_root.as_ref();
+        let config = load_workspace_config(workspace_root)?;
         let aether_dir = workspace_root.join(".aether");
         let sir_dir = aether_dir.join("sir");
         let sqlite_path = aether_dir.join("meta.sqlite");
@@ -87,6 +93,7 @@ impl SqliteStore {
             conn,
             aether_dir,
             sir_dir,
+            mirror_sir_files: config.storage.mirror_sir_files,
         })
     }
 
@@ -98,8 +105,48 @@ impl SqliteStore {
         &self.sir_dir
     }
 
+    pub fn mirror_sir_files_enabled(&self) -> bool {
+        self.mirror_sir_files
+    }
+
     fn sir_blob_path(&self, symbol_id: &str) -> PathBuf {
         self.sir_dir.join(format!("{symbol_id}.json"))
+    }
+
+    fn upsert_sir_json_only(
+        &self,
+        symbol_id: &str,
+        sir_json_string: &str,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            r#"
+            INSERT INTO sir (id, sir_hash, sir_version, provider, model, updated_at, sir_json)
+            VALUES (?1, '', 1, '', '', unixepoch(), ?2)
+            ON CONFLICT(id) DO UPDATE SET
+                sir_json = excluded.sir_json
+            "#,
+            params![symbol_id, sir_json_string],
+        )?;
+
+        Ok(())
+    }
+
+    fn read_sir_json_from_db(&self, symbol_id: &str) -> Result<Option<String>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT sir_json
+            FROM sir
+            WHERE id = ?1
+            "#,
+        )?;
+
+        let json = stmt
+            .query_row(params![symbol_id], |row| row.get::<_, Option<String>>(0))
+            .optional()?
+            .flatten()
+            .filter(|value| !value.trim().is_empty());
+
+        Ok(json)
     }
 }
 
@@ -135,6 +182,16 @@ impl Store for SqliteStore {
     fn mark_removed(&self, symbol_id: &str) -> Result<(), StoreError> {
         self.conn
             .execute("DELETE FROM symbols WHERE id = ?1", params![symbol_id])?;
+        self.conn
+            .execute("DELETE FROM sir WHERE id = ?1", params![symbol_id])?;
+
+        let path = self.sir_blob_path(symbol_id);
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+
         Ok(())
     }
 
@@ -206,12 +263,23 @@ impl Store for SqliteStore {
     }
 
     fn write_sir_blob(&self, symbol_id: &str, sir_json_string: &str) -> Result<(), StoreError> {
-        let path = self.sir_blob_path(symbol_id);
-        fs::write(path, sir_json_string)?;
+        self.upsert_sir_json_only(symbol_id, sir_json_string)?;
+
+        if self.mirror_sir_files {
+            let path = self.sir_blob_path(symbol_id);
+            if let Err(err) = fs::write(path, sir_json_string) {
+                eprintln!("aether-store: mirror write failed for symbol {symbol_id}: {err}");
+            }
+        }
+
         Ok(())
     }
 
     fn read_sir_blob(&self, symbol_id: &str) -> Result<Option<String>, StoreError> {
+        if let Some(json) = self.read_sir_json_from_db(symbol_id)? {
+            return Ok(Some(json));
+        }
+
         let path = self.sir_blob_path(symbol_id);
 
         if !path.exists() {
@@ -219,6 +287,7 @@ impl Store for SqliteStore {
         }
 
         let content = fs::read_to_string(path)?;
+        self.upsert_sir_json_only(symbol_id, &content)?;
         Ok(Some(content))
     }
 
@@ -313,10 +382,15 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
             sir_version INTEGER NOT NULL,
             provider TEXT NOT NULL,
             model TEXT NOT NULL,
-            updated_at INTEGER NOT NULL
+            updated_at INTEGER NOT NULL,
+            sir_json TEXT
         );
         "#,
     )?;
+
+    if !table_has_column(conn, "sir", "sir_json")? {
+        conn.execute("ALTER TABLE sir ADD COLUMN sir_json TEXT", [])?;
+    }
 
     ensure_sir_column(conn, "sir_status", "TEXT NOT NULL DEFAULT 'fresh'")?;
     ensure_sir_column(conn, "last_error", "TEXT")?;
@@ -368,6 +442,8 @@ fn table_has_column(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use tempfile::tempdir;
 
     use super::*;
@@ -418,6 +494,7 @@ mod tests {
         let store = SqliteStore::open(workspace).expect("open store");
         assert!(store.aether_dir().exists());
         assert!(store.sir_dir().exists());
+        assert!(store.mirror_sir_files_enabled());
         assert!(store.aether_dir().join("meta.sqlite").exists());
 
         let mut record = symbol_record();
@@ -469,6 +546,98 @@ mod tests {
     }
 
     #[test]
+    fn read_sir_blob_prefers_sqlite_when_mirror_is_missing() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let store = SqliteStore::open(workspace).expect("open store");
+
+        store
+            .write_sir_blob("sym-1", "{\"intent\":\"db-primary\"}")
+            .expect("write blob");
+
+        let mirror_path = workspace.join(".aether/sir/sym-1.json");
+        fs::remove_file(&mirror_path).expect("remove mirror");
+
+        let loaded = store.read_sir_blob("sym-1").expect("read from sqlite");
+        assert_eq!(loaded.as_deref(), Some("{\"intent\":\"db-primary\"}"));
+
+        drop(store);
+
+        let reopened = SqliteStore::open(workspace).expect("reopen store");
+        let reopened_loaded = reopened.read_sir_blob("sym-1").expect("read after reopen");
+        assert_eq!(
+            reopened_loaded.as_deref(),
+            Some("{\"intent\":\"db-primary\"}")
+        );
+    }
+
+    #[test]
+    fn read_sir_blob_backfills_sqlite_from_mirror_without_overwriting_meta() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let store = SqliteStore::open(workspace).expect("open store");
+
+        let meta = SirMetaRecord {
+            id: "sym-legacy".to_owned(),
+            sir_hash: "legacy-hash".to_owned(),
+            sir_version: 3,
+            provider: "legacy-provider".to_owned(),
+            model: "legacy-model".to_owned(),
+            updated_at: 1_700_111_222,
+        };
+        store
+            .upsert_sir_meta(meta.clone())
+            .expect("upsert legacy metadata");
+
+        let mirror_path = workspace.join(".aether/sir/sym-legacy.json");
+        fs::write(&mirror_path, "{\"intent\":\"from-mirror\"}").expect("write mirror");
+
+        let first_read = store.read_sir_blob("sym-legacy").expect("first read");
+        assert_eq!(first_read.as_deref(), Some("{\"intent\":\"from-mirror\"}"));
+
+        fs::remove_file(&mirror_path).expect("remove mirror");
+
+        let second_read = store.read_sir_blob("sym-legacy").expect("second read");
+        assert_eq!(second_read.as_deref(), Some("{\"intent\":\"from-mirror\"}"));
+
+        let meta_after = store
+            .get_sir_meta("sym-legacy")
+            .expect("read metadata after backfill");
+        assert_eq!(meta_after, Some(meta));
+    }
+
+    #[test]
+    fn mirror_write_can_be_disabled_via_config() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
+        fs::write(
+            workspace.join(".aether/config.toml"),
+            r#"[inference]
+provider = "auto"
+api_key_env = "GEMINI_API_KEY"
+
+[storage]
+mirror_sir_files = false
+"#,
+        )
+        .expect("write config");
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        assert!(!store.mirror_sir_files_enabled());
+
+        store
+            .write_sir_blob("sym-1", "{\"intent\":\"sqlite-only\"}")
+            .expect("write sqlite-only");
+
+        let mirror_path = workspace.join(".aether/sir/sym-1.json");
+        assert!(!mirror_path.exists());
+
+        let loaded = store.read_sir_blob("sym-1").expect("read sqlite-only");
+        assert_eq!(loaded.as_deref(), Some("{\"intent\":\"sqlite-only\"}"));
+    }
+
+    #[test]
     fn mark_removed_deletes_symbol_row() {
         let temp = tempdir().expect("tempdir");
         let store = SqliteStore::open(temp.path()).expect("open store");
@@ -476,12 +645,18 @@ mod tests {
         store
             .upsert_symbol(symbol_record())
             .expect("upsert symbol before delete");
+        store
+            .write_sir_blob("sym-1", "{\"intent\":\"to-remove\"}")
+            .expect("write sir before delete");
         store.mark_removed("sym-1").expect("mark removed");
 
         let list = store
             .list_symbols_for_file("src/lib.rs")
             .expect("list after delete");
         assert!(list.is_empty());
+
+        let sir = store.read_sir_blob("sym-1").expect("sir after delete");
+        assert!(sir.is_none());
     }
 
     #[test]

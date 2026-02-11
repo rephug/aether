@@ -160,5 +160,20 @@ fn mcp_tool_handlers_work_with_local_store() -> Result<()> {
     );
     assert!(stale_explain.last_attempt_at.unwrap_or_default() > existing_meta.last_attempt_at);
 
+    let sir_dir = workspace.join(".aether/sir");
+    for entry in fs::read_dir(&sir_dir)? {
+        let path = entry?.path();
+        fs::remove_file(path)?;
+    }
+
+    let sir_without_mirror = rt
+        .block_on(server.aether_get_sir(Parameters(AetherGetSirRequest {
+            symbol_id: explain.symbol_id.clone(),
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert!(sir_without_mirror.found);
+    assert!(!sir_without_mirror.sir_json.is_empty());
+
     Ok(())
 }

@@ -97,6 +97,7 @@ dependencies = [
 name = "aether-store"
 version = "0.1.0"
 dependencies = [
+ "aether-config",
  "aether-core",
  "rusqlite",
  "tempfile",

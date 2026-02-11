@@ -109,6 +109,31 @@ fn step2_pipeline_generates_and_persists_sir_with_mock_provider()
     let update_output = String::from_utf8(update_stdout)?;
     assert!(update_output.contains("SIR_STORED symbol_id="));
 
+    let sir_dir = workspace.join(".aether/sir");
+    for entry in fs::read_dir(&sir_dir)? {
+        let path = entry?.path();
+        fs::remove_file(path)?;
+    }
+
+    for symbol in &all_symbols {
+        let blob = store
+            .read_sir_blob(&symbol.id)?
+            .expect("db-first read should still succeed after mirror removal");
+        let sir: SirAnnotation = serde_json::from_str(&blob)?;
+        validate_sir(&sir)?;
+    }
+
+    drop(store);
+
+    let reopened_store = SqliteStore::open(workspace)?;
+    for symbol in &all_symbols {
+        let blob = reopened_store
+            .read_sir_blob(&symbol.id)?
+            .expect("reopened store should read canonical sqlite SIR");
+        let sir: SirAnnotation = serde_json::from_str(&blob)?;
+        validate_sir(&sir)?;
+    }
+
     Ok(())
 }
 
