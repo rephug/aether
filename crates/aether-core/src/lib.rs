@@ -1,8 +1,158 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub type SymbolId = String;
+pub const NO_SIR_MESSAGE: &str =
+    "AETHER: No SIR yet for this symbol. Run aetherd indexing and try again.";
+
+pub const SIR_STATUS_STALE: &str = "stale";
+pub const SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED: &str = "local store not initialized";
+pub const SEARCH_FALLBACK_EMBEDDINGS_DISABLED: &str =
+    "embeddings are disabled in .aether/config.toml";
+pub const SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR: &str =
+    "embedding provider returned an empty query vector";
+pub const SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY: &str =
+    "semantic index not ready for this embedding provider/model";
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Ord,
+    PartialOrd,
+    Default,
+    JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchMode {
+    #[default]
+    Lexical,
+    Semantic,
+    Hybrid,
+}
+
+impl SearchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lexical => "lexical",
+            Self::Semantic => "semantic",
+            Self::Hybrid => "hybrid",
+        }
+    }
+}
+
+impl FromStr for SearchMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "lexical" => Ok(Self::Lexical),
+            "semantic" => Ok(Self::Semantic),
+            "hybrid" => Ok(Self::Hybrid),
+            other => Err(format!(
+                "invalid search mode '{other}', expected one of: lexical, semantic, hybrid"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchEnvelope<T> {
+    pub mode_requested: SearchMode,
+    pub mode_used: SearchMode,
+    pub fallback_reason: Option<String>,
+    pub matches: Vec<T>,
+}
+
+impl<T> SearchEnvelope<T> {
+    pub fn result_count(&self) -> u32 {
+        self.matches.len() as u32
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HoverMarkdownSections {
+    pub symbol: String,
+    pub intent: String,
+    pub confidence: f32,
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+    pub side_effects: Vec<String>,
+    pub dependencies: Vec<String>,
+    pub error_modes: Vec<String>,
+}
+
+pub fn stale_warning_message(sir_status: Option<&str>, last_error: Option<&str>) -> Option<String> {
+    let status = sir_status?.trim();
+    if !status.eq_ignore_ascii_case(SIR_STATUS_STALE) {
+        return None;
+    }
+
+    let last_error = last_error
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(" Last error: {value}"))
+        .unwrap_or_default();
+
+    Some(format!("AETHER WARNING: SIR is stale.{last_error}"))
+}
+
+pub fn format_hover_markdown_sections(
+    sections: &HoverMarkdownSections,
+    stale_warning: Option<&str>,
+) -> String {
+    let mut blocks = Vec::with_capacity(8);
+    blocks.push(format!("### {}", sections.symbol));
+    blocks.push(format!("**Confidence:** {:.2}", sections.confidence));
+
+    if let Some(warning) = stale_warning {
+        blocks.push(format!("> {warning}"));
+    }
+
+    blocks.push(format!("**Intent**\n{}", sections.intent));
+    blocks.push(format!(
+        "**Inputs**\n{}",
+        format_hover_list(&sections.inputs)
+    ));
+    blocks.push(format!(
+        "**Outputs**\n{}",
+        format_hover_list(&sections.outputs)
+    ));
+    blocks.push(format!(
+        "**Side Effects**\n{}",
+        format_hover_list(&sections.side_effects)
+    ));
+    blocks.push(format!(
+        "**Dependencies**\n{}",
+        format_hover_list(&sections.dependencies)
+    ));
+    blocks.push(format!(
+        "**Error Modes**\n{}",
+        format_hover_list(&sections.error_modes)
+    ));
+
+    blocks.join("\n\n")
+}
+
+fn format_hover_list(items: &[String]) -> String {
+    if items.is_empty() {
+        "(none)".to_owned()
+    } else {
+        items
+            .iter()
+            .map(|item| format!("- {}", item.trim()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd)]
 #[serde(rename_all = "snake_case")]
@@ -267,5 +417,50 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["same"]
         );
+    }
+
+    #[test]
+    fn search_mode_parses_and_formats_consistently() {
+        assert_eq!(SearchMode::default(), SearchMode::Lexical);
+        assert_eq!("semantic".parse::<SearchMode>(), Ok(SearchMode::Semantic));
+        assert_eq!(SearchMode::Hybrid.as_str(), "hybrid");
+    }
+
+    #[test]
+    fn stale_warning_uses_error_when_available() {
+        let warning = stale_warning_message(Some("stale"), Some(" provider timeout "));
+        assert_eq!(
+            warning.as_deref(),
+            Some("AETHER WARNING: SIR is stale. Last error: provider timeout")
+        );
+    }
+
+    #[test]
+    fn stale_warning_ignores_non_stale_status() {
+        let warning = stale_warning_message(Some("fresh"), Some("timeout"));
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    fn hover_markdown_is_sectioned() {
+        let markdown = format_hover_markdown_sections(
+            &HoverMarkdownSections {
+                symbol: "demo::alpha".to_owned(),
+                intent: "Summarize alpha behavior".to_owned(),
+                confidence: 0.75,
+                inputs: vec!["x".to_owned()],
+                outputs: vec!["y".to_owned()],
+                side_effects: vec![],
+                dependencies: vec!["serde".to_owned()],
+                error_modes: vec![],
+            },
+            Some("AETHER WARNING: SIR is stale."),
+        );
+
+        assert!(markdown.contains("### demo::alpha"));
+        assert!(markdown.contains("**Confidence:** 0.75"));
+        assert!(markdown.contains("> AETHER WARNING: SIR is stale."));
+        assert!(markdown.contains("**Intent**"));
+        assert!(markdown.contains("**Side Effects**\n(none)"));
     }
 }
