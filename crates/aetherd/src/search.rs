@@ -2,43 +2,17 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
+use aether_core::{
+    SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR, SEARCH_FALLBACK_EMBEDDINGS_DISABLED,
+    SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED, SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY,
+    SearchEnvelope,
+};
 use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
 use aether_store::{SemanticSearchResult, SqliteStore, Store, SymbolSearchResult};
 use anyhow::{Context, Result};
 use serde_json::json;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SearchMode {
-    #[default]
-    Lexical,
-    Semantic,
-    Hybrid,
-}
-
-impl SearchMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Lexical => "lexical",
-            Self::Semantic => "semantic",
-            Self::Hybrid => "hybrid",
-        }
-    }
-}
-
-impl std::str::FromStr for SearchMode {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim() {
-            "lexical" => Ok(Self::Lexical),
-            "semantic" => Ok(Self::Semantic),
-            "hybrid" => Ok(Self::Hybrid),
-            other => Err(format!(
-                "invalid search mode '{other}', expected one of: lexical, semantic, hybrid"
-            )),
-        }
-    }
-}
+pub use aether_core::SearchMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SearchOutputFormat {
@@ -80,13 +54,7 @@ pub struct SearchResultRow {
     pub semantic_score: Option<f32>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct SearchExecution {
-    pub mode_requested: SearchMode,
-    pub mode_used: SearchMode,
-    pub fallback_reason: Option<String>,
-    pub matches: Vec<SearchResultRow>,
-}
+pub type SearchExecution = SearchEnvelope<SearchResultRow>;
 
 pub fn run_search_once(
     workspace: &Path,
@@ -237,7 +205,10 @@ fn semantic_search(
     store_present: bool,
 ) -> Result<(Vec<SearchResultRow>, Option<String>)> {
     if !store_present {
-        return Ok((Vec::new(), Some("local store not initialized".to_owned())));
+        return Ok((
+            Vec::new(),
+            Some(SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED.to_owned()),
+        ));
     }
 
     let loaded =
@@ -246,7 +217,7 @@ fn semantic_search(
     let Some(loaded) = loaded else {
         return Ok((
             Vec::new(),
-            Some("embeddings are disabled in .aether/config.toml".to_owned()),
+            Some(SEARCH_FALLBACK_EMBEDDINGS_DISABLED.to_owned()),
         ));
     };
 
@@ -264,7 +235,7 @@ fn semantic_search(
     if query_embedding.is_empty() {
         return Ok((
             Vec::new(),
-            Some("embedding provider returned an empty query vector".to_owned()),
+            Some(SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR.to_owned()),
         ));
     }
 
@@ -279,7 +250,7 @@ fn semantic_search(
     if matches.is_empty() {
         return Ok((
             Vec::new(),
-            Some("semantic index not ready for this embedding provider/model".to_owned()),
+            Some(SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY.to_owned()),
         ));
     }
 
