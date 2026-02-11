@@ -184,10 +184,8 @@ impl DebounceQueue {
 }
 
 pub fn relative_workspace_path(workspace: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        if let Ok(relative) = path.strip_prefix(workspace) {
-            return relative.to_path_buf();
-        }
+    if path.is_absolute() && let Ok(relative) = path.strip_prefix(workspace) {
+        return relative.to_path_buf();
     }
     path.to_path_buf()
 }
