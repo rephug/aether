@@ -272,5 +272,14 @@ GitHub Releases provides prebuilt binaries for Linux, macOS, and Windows:
 
 ## Development CI/Release
 
-- CI runs `fmt`, `clippy`, and `test` on push/PR.
-- Tagging `v*.*.*` triggers cross-platform release builds and uploads binaries to GitHub Releases.
+- CI (`.github/workflows/ci.yml`) runs on `push`, `pull_request`, and manual dispatch with required jobs: `fmt`, `clippy`, and `test`.
+- Release (`.github/workflows/release.yml`) runs on `v*.*.*` tags and manual dispatch with a required `tag` input (`vX.Y.Z`).
+- Release artifacts are built for these targets:
+  - `x86_64-unknown-linux-gnu`
+  - `aarch64-unknown-linux-gnu`
+  - `x86_64-apple-darwin`
+  - `aarch64-apple-darwin`
+  - `x86_64-pc-windows-msvc`
+  - `aarch64-pc-windows-msvc`
+- Asset naming: `aether-<tag>-<target>.tar.gz` (Linux/macOS) and `aether-<tag>-<target>.zip` (Windows).
+- Each packaged artifact includes `aetherd`, `aether-mcp`, `README.md`, and `LICENSE`, plus a published `SHA256SUMS.txt`.
