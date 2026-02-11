@@ -306,13 +306,12 @@ impl SirPipeline {
         let existing_meta = store
             .get_symbol_embedding_meta(symbol_id)
             .with_context(|| format!("failed to read embedding metadata for {symbol_id}"))?;
-        if let Some(existing_meta) = existing_meta {
-            if existing_meta.sir_hash == sir_hash_value
-                && existing_meta.provider == provider_name
-                && existing_meta.model == model_name
-            {
-                return Ok(());
-            }
+        if let Some(existing_meta) = existing_meta
+            && existing_meta.sir_hash == sir_hash_value
+            && existing_meta.provider == provider_name
+            && existing_meta.model == model_name
+        {
+            return Ok(());
         }
 
         let embedding = self
