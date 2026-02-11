@@ -24,6 +24,9 @@ pub struct SirMetaRecord {
     pub provider: String,
     pub model: String,
     pub updated_at: i64,
+    pub sir_status: String,
+    pub last_error: Option<String>,
+    pub last_attempt_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,14 +225,20 @@ impl Store for SqliteStore {
     fn upsert_sir_meta(&self, record: SirMetaRecord) -> Result<(), StoreError> {
         self.conn.execute(
             r#"
-            INSERT INTO sir (id, sir_hash, sir_version, provider, model, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            INSERT INTO sir (
+                id, sir_hash, sir_version, provider, model, updated_at,
+                sir_status, last_error, last_attempt_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             ON CONFLICT(id) DO UPDATE SET
                 sir_hash = excluded.sir_hash,
                 sir_version = excluded.sir_version,
                 provider = excluded.provider,
                 model = excluded.model,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                sir_status = excluded.sir_status,
+                last_error = excluded.last_error,
+                last_attempt_at = excluded.last_attempt_at
             "#,
             params![
                 record.id,
@@ -238,6 +247,9 @@ impl Store for SqliteStore {
                 record.provider,
                 record.model,
                 record.updated_at,
+                record.sir_status,
+                record.last_error,
+                record.last_attempt_at,
             ],
         )?;
 
@@ -247,7 +259,16 @@ impl Store for SqliteStore {
     fn get_sir_meta(&self, symbol_id: &str) -> Result<Option<SirMetaRecord>, StoreError> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT id, sir_hash, sir_version, provider, model, updated_at
+            SELECT
+                id,
+                sir_hash,
+                sir_version,
+                provider,
+                model,
+                updated_at,
+                sir_status,
+                last_error,
+                last_attempt_at
             FROM sir
             WHERE id = ?1
             "#,
@@ -262,6 +283,9 @@ impl Store for SqliteStore {
                     provider: row.get(3)?,
                     model: row.get(4)?,
                     updated_at: row.get(5)?,
+                    sir_status: row.get(6)?,
+                    last_error: row.get(7)?,
+                    last_attempt_at: row.get(8)?,
                 })
             })
             .optional()?;
@@ -294,7 +318,52 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         "#,
     )?;
 
+    ensure_sir_column(conn, "sir_status", "TEXT NOT NULL DEFAULT 'fresh'")?;
+    ensure_sir_column(conn, "last_error", "TEXT")?;
+    ensure_sir_column(conn, "last_attempt_at", "INTEGER NOT NULL DEFAULT 0")?;
+
+    conn.execute(
+        "UPDATE sir SET sir_status = 'fresh' WHERE COALESCE(TRIM(sir_status), '') = ''",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE sir SET last_attempt_at = updated_at WHERE last_attempt_at = 0",
+        [],
+    )?;
+
     Ok(())
+}
+
+fn ensure_sir_column(
+    conn: &Connection,
+    column_name: &str,
+    column_definition: &str,
+) -> Result<(), StoreError> {
+    if table_has_column(conn, "sir", column_name)? {
+        return Ok(());
+    }
+
+    let sql = format!("ALTER TABLE sir ADD COLUMN {column_name} {column_definition}");
+    conn.execute(&sql, [])?;
+    Ok(())
+}
+
+fn table_has_column(
+    conn: &Connection,
+    table_name: &str,
+    column_name: &str,
+) -> Result<bool, StoreError> {
+    let sql = format!("PRAGMA table_info({table_name})");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+
+    for row in rows {
+        if row?.eq_ignore_ascii_case(column_name) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -323,6 +392,9 @@ mod tests {
             provider: "none".to_owned(),
             model: "none".to_owned(),
             updated_at: 1_700_000_100,
+            sir_status: "fresh".to_owned(),
+            last_error: None,
+            last_attempt_at: 1_700_000_100,
         }
     }
 
@@ -469,5 +541,57 @@ mod tests {
         let limited = store.search_symbols("::run", 1).expect("search with limit");
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].qualified_name, "alpha::run");
+    }
+
+    #[test]
+    fn open_store_migrates_legacy_sir_table_with_stale_defaults() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let aether_dir = workspace.join(".aether");
+        let sir_dir = aether_dir.join("sir");
+        fs::create_dir_all(&sir_dir).expect("create legacy aether dirs");
+
+        let sqlite_path = aether_dir.join("meta.sqlite");
+        let conn = Connection::open(&sqlite_path).expect("open legacy sqlite");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS symbols (
+                id TEXT PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                language TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                qualified_name TEXT NOT NULL,
+                signature_fingerprint TEXT NOT NULL,
+                last_seen_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sir (
+                id TEXT PRIMARY KEY,
+                sir_hash TEXT NOT NULL,
+                sir_version INTEGER NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            "#,
+        )
+        .expect("create legacy schema");
+
+        conn.execute(
+            "INSERT INTO sir (id, sir_hash, sir_version, provider, model, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params!["legacy-sym", "legacy-hash", 1i64, "mock", "mock", 1_700_000_500i64],
+        )
+        .expect("insert legacy sir row");
+        drop(conn);
+
+        let store = SqliteStore::open(workspace).expect("open migrated store");
+        let migrated = store
+            .get_sir_meta("legacy-sym")
+            .expect("load migrated row")
+            .expect("row exists");
+
+        assert_eq!(migrated.sir_status, "fresh");
+        assert_eq!(migrated.last_error, None);
+        assert_eq!(migrated.last_attempt_at, migrated.updated_at);
     }
 }

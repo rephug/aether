@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use aether_core::{SourceRange, Symbol, normalize_path, stable_symbol_id};
 use aether_parse::{SymbolExtractor, language_for_path};
 use aether_sir::SirAnnotation;
-use aether_store::{SqliteStore, Store, StoreError};
+use aether_store::{SirMetaRecord, SqliteStore, Store, StoreError};
 use thiserror::Error;
 use tower_lsp::lsp_types::{
     Hover, HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
@@ -14,6 +14,7 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 pub const NO_SIR_MESSAGE: &str =
     "AETHER: No SIR yet for this symbol. Run aetherd indexing and try again.";
+const SIR_STATUS_STALE: &str = "stale";
 
 #[derive(Debug, Error)]
 pub enum HoverResolveError {
@@ -175,13 +176,27 @@ pub fn resolve_hover_markdown_for_path(
         &symbol.signature_fingerprint,
     );
 
+    let sir_meta = store.get_sir_meta(&symbol_id)?;
+    let stale_warning = stale_warning_prefix(sir_meta.as_ref());
+
     let sir_json = match store.read_sir_blob(&symbol_id)? {
         Some(json) => json,
-        None => return Ok(None),
+        None => {
+            if let Some(warning) = stale_warning {
+                return Ok(Some(format!("{warning}\n\n{NO_SIR_MESSAGE}")));
+            }
+
+            return Ok(None);
+        }
     };
 
     let sir: SirAnnotation = serde_json::from_str(&sir_json)?;
-    Ok(Some(format_hover_markdown(symbol, &sir)))
+    let mut markdown = format_hover_markdown(symbol, &sir);
+    if let Some(warning) = stale_warning {
+        markdown = format!("{warning}\n\n{markdown}");
+    }
+
+    Ok(Some(markdown))
 }
 
 fn workspace_relative_display_path(workspace_root: &Path, file_path: &Path) -> String {
@@ -231,6 +246,23 @@ fn list_or_none(items: &[String]) -> String {
     } else {
         items.join(", ")
     }
+}
+
+fn stale_warning_prefix(meta: Option<&SirMetaRecord>) -> Option<String> {
+    let meta = meta?;
+
+    if !meta.sir_status.eq_ignore_ascii_case(SIR_STATUS_STALE) {
+        return None;
+    }
+
+    let message = meta
+        .last_error
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("AETHER WARNING: SIR is stale. Last error: {}", value.trim()))
+        .unwrap_or_else(|| "AETHER WARNING: SIR is stale.".to_owned());
+
+    Some(message)
 }
 
 fn markdown_hover(value: String) -> Hover {
