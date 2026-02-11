@@ -5,7 +5,7 @@ use std::time::Duration;
 use aether_core::{SourceRange, Symbol, normalize_path, stable_symbol_id};
 use aether_parse::{SymbolExtractor, language_for_path};
 use aether_sir::{SirAnnotation, SirError, canonicalize_sir_json, sir_hash, validate_sir};
-use aether_store::{SqliteStore, Store, StoreError, SymbolSearchResult};
+use aether_store::{SirMetaRecord, SqliteStore, Store, StoreError, SymbolSearchResult};
 use anyhow::Result;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -93,6 +93,9 @@ pub struct AetherGetSirResponse {
     pub sir: Option<SirAnnotationView>,
     pub sir_json: String,
     pub sir_hash: String,
+    pub sir_status: Option<String>,
+    pub last_error: Option<String>,
+    pub last_attempt_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -117,6 +120,9 @@ pub struct AetherExplainResponse {
     pub qualified_name: String,
     pub hover_markdown: String,
     pub sir: Option<SirAnnotationView>,
+    pub sir_status: Option<String>,
+    pub last_error: Option<String>,
+    pub last_attempt_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -248,6 +254,9 @@ impl AetherMcpServer {
                 sir: None,
                 sir_json: String::new(),
                 sir_hash: String::new(),
+                sir_status: None,
+                last_error: None,
+                last_attempt_at: None,
             });
         }
 
@@ -258,10 +267,15 @@ impl AetherMcpServer {
                 sir: None,
                 sir_json: String::new(),
                 sir_hash: String::new(),
+                sir_status: None,
+                last_error: None,
+                last_attempt_at: None,
             });
         }
 
         let store = SqliteStore::open(&self.workspace)?;
+        let meta = store.get_sir_meta(symbol_id)?;
+        let (sir_status, last_error, last_attempt_at) = meta_status_fields(meta.as_ref());
         let sir_blob = store.read_sir_blob(symbol_id)?;
 
         let Some(sir_blob) = sir_blob else {
@@ -271,6 +285,9 @@ impl AetherMcpServer {
                 sir: None,
                 sir_json: String::new(),
                 sir_hash: String::new(),
+                sir_status,
+                last_error,
+                last_attempt_at,
             });
         };
 
@@ -278,9 +295,9 @@ impl AetherMcpServer {
         validate_sir(&sir)?;
 
         let canonical_json = canonicalize_sir_json(&sir);
-        let meta = store.get_sir_meta(symbol_id)?;
         let hash = meta
-            .map(|record| record.sir_hash)
+            .as_ref()
+            .map(|record| record.sir_hash.clone())
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| sir_hash(&sir));
 
@@ -290,6 +307,9 @@ impl AetherMcpServer {
             sir: Some(sir.into()),
             sir_json: canonical_json,
             sir_hash: hash,
+            sir_status,
+            last_error,
+            last_attempt_at,
         })
     }
 
@@ -342,6 +362,9 @@ impl AetherMcpServer {
                 qualified_name: String::new(),
                 hover_markdown: NO_SIR_MESSAGE.to_owned(),
                 sir: None,
+                sir_status: None,
+                last_error: None,
+                last_attempt_at: None,
             });
         };
 
@@ -353,6 +376,8 @@ impl AetherMcpServer {
             &symbol.signature_fingerprint,
         );
 
+        let meta = self.read_sir_meta(&symbol_id)?;
+        let (sir_status, last_error, last_attempt_at) = meta_status_fields(meta.as_ref());
         let sir = self.read_valid_sir_blob(&symbol_id)?;
 
         let (found, hover_markdown, sir) = match sir {
@@ -375,6 +400,9 @@ impl AetherMcpServer {
             qualified_name: symbol.qualified_name.clone(),
             hover_markdown,
             sir,
+            sir_status,
+            last_error,
+            last_attempt_at,
         })
     }
 
@@ -437,6 +465,15 @@ impl AetherMcpServer {
         let sir: SirAnnotation = serde_json::from_str(&blob)?;
         validate_sir(&sir)?;
         Ok(Some(sir))
+    }
+
+    fn read_sir_meta(&self, symbol_id: &str) -> Result<Option<SirMetaRecord>, AetherMcpError> {
+        if !self.sqlite_path().exists() {
+            return Ok(None);
+        }
+
+        let store = SqliteStore::open(&self.workspace)?;
+        store.get_sir_meta(symbol_id).map_err(Into::into)
     }
 
     fn verbose_log(&self, message: &str) {
@@ -585,4 +622,22 @@ fn format_hover_markdown(symbol: &Symbol, sir: &SirAnnotation) -> String {
         list_or_none(&sir.dependencies),
         list_or_none(&sir.error_modes),
     )
+}
+
+fn meta_status_fields(
+    meta: Option<&SirMetaRecord>,
+) -> (Option<String>, Option<String>, Option<i64>) {
+    let Some(meta) = meta else {
+        return (None, None, None);
+    };
+
+    let sir_status = (!meta.sir_status.trim().is_empty()).then(|| meta.sir_status.clone());
+    let last_error = meta
+        .last_error
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+        .cloned();
+    let last_attempt_at = (meta.last_attempt_at > 0).then_some(meta.last_attempt_at);
+
+    (sir_status, last_error, last_attempt_at)
 }
