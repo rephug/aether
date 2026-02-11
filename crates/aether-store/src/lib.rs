@@ -584,6 +584,9 @@ mod tests {
             provider: "legacy-provider".to_owned(),
             model: "legacy-model".to_owned(),
             updated_at: 1_700_111_222,
+            sir_status: "fresh".to_owned(),
+            last_error: None,
+            last_attempt_at: 1_700_111_222,
         };
         store
             .upsert_sir_meta(meta.clone())
