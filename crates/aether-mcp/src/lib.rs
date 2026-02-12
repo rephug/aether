@@ -117,6 +117,7 @@ pub struct AetherVerifyRequest {
     pub commands: Option<Vec<String>>,
     pub mode: Option<AetherVerifyMode>,
     pub fallback_to_host_on_unavailable: Option<bool>,
+    pub fallback_to_container_on_unavailable: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -133,6 +134,7 @@ pub struct AetherVerifyCommandResult {
 pub enum AetherVerifyMode {
     Host,
     Container,
+    Microvm,
 }
 
 impl From<AetherVerifyMode> for VerifyMode {
@@ -140,6 +142,7 @@ impl From<AetherVerifyMode> for VerifyMode {
         match value {
             AetherVerifyMode::Host => VerifyMode::Host,
             AetherVerifyMode::Container => VerifyMode::Container,
+            AetherVerifyMode::Microvm => VerifyMode::Microvm,
         }
     }
 }
@@ -619,6 +622,7 @@ impl AetherMcpServer {
                 commands: request.commands,
                 mode: request.mode.map(Into::into),
                 fallback_to_host_on_unavailable: request.fallback_to_host_on_unavailable,
+                fallback_to_container_on_unavailable: request.fallback_to_container_on_unavailable,
             },
         )
         .map_err(|err| AetherMcpError::Message(format!("failed to run verification: {err}")))?;
@@ -1117,7 +1121,7 @@ impl AetherMcpServer {
 
     #[tool(
         name = "aether_verify",
-        description = "Run allowlisted verification commands in host or container mode"
+        description = "Run allowlisted verification commands in host, container, or microvm mode"
     )]
     pub async fn aether_verify(
         &self,

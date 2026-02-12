@@ -13,6 +13,10 @@ pub const DEFAULT_QWEN_EMBEDDING_ENDPOINT: &str = "http://127.0.0.1:11434/api/em
 pub const DEFAULT_VERIFY_CONTAINER_RUNTIME: &str = "docker";
 pub const DEFAULT_VERIFY_CONTAINER_IMAGE: &str = "rust:1-bookworm";
 pub const DEFAULT_VERIFY_CONTAINER_WORKDIR: &str = "/workspace";
+pub const DEFAULT_VERIFY_MICROVM_RUNTIME: &str = "firecracker";
+pub const DEFAULT_VERIFY_MICROVM_WORKDIR: &str = "/workspace";
+pub const DEFAULT_VERIFY_MICROVM_VCPU_COUNT: u8 = 1;
+pub const DEFAULT_VERIFY_MICROVM_MEMORY_MIB: u32 = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -162,6 +166,8 @@ pub struct VerifyConfig {
     pub mode: VerifyMode,
     #[serde(default)]
     pub container: VerifyContainerConfig,
+    #[serde(default)]
+    pub microvm: VerifyMicrovmConfig,
 }
 
 impl Default for VerifyConfig {
@@ -170,6 +176,7 @@ impl Default for VerifyConfig {
             commands: default_verify_commands(),
             mode: VerifyMode::Host,
             container: VerifyContainerConfig::default(),
+            microvm: VerifyMicrovmConfig::default(),
         }
     }
 }
@@ -180,6 +187,7 @@ pub enum VerifyMode {
     #[default]
     Host,
     Container,
+    Microvm,
 }
 
 impl VerifyMode {
@@ -187,6 +195,7 @@ impl VerifyMode {
         match self {
             Self::Host => "host",
             Self::Container => "container",
+            Self::Microvm => "microvm",
         }
     }
 }
@@ -198,8 +207,9 @@ impl std::str::FromStr for VerifyMode {
         match value.trim() {
             "host" => Ok(Self::Host),
             "container" => Ok(Self::Container),
+            "microvm" => Ok(Self::Microvm),
             other => Err(format!(
-                "invalid verify mode '{other}', expected one of: host, container"
+                "invalid verify mode '{other}', expected one of: host, container, microvm"
             )),
         }
     }
@@ -223,6 +233,41 @@ impl Default for VerifyContainerConfig {
             runtime: default_verify_container_runtime(),
             image: default_verify_container_image(),
             workdir: default_verify_container_workdir(),
+            fallback_to_host_on_unavailable: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyMicrovmConfig {
+    #[serde(default = "default_verify_microvm_runtime")]
+    pub runtime: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rootfs_image: Option<String>,
+    #[serde(default = "default_verify_microvm_workdir")]
+    pub workdir: String,
+    #[serde(default = "default_verify_microvm_vcpu_count")]
+    pub vcpu_count: u8,
+    #[serde(default = "default_verify_microvm_memory_mib")]
+    pub memory_mib: u32,
+    #[serde(default)]
+    pub fallback_to_container_on_unavailable: bool,
+    #[serde(default)]
+    pub fallback_to_host_on_unavailable: bool,
+}
+
+impl Default for VerifyMicrovmConfig {
+    fn default() -> Self {
+        Self {
+            runtime: default_verify_microvm_runtime(),
+            kernel_image: None,
+            rootfs_image: None,
+            workdir: default_verify_microvm_workdir(),
+            vcpu_count: default_verify_microvm_vcpu_count(),
+            memory_mib: default_verify_microvm_memory_mib(),
+            fallback_to_container_on_unavailable: false,
             fallback_to_host_on_unavailable: false,
         }
     }
@@ -376,6 +421,26 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
         });
     }
 
+    let microvm_defaults = VerifyMicrovmConfig::default();
+    let microvm_settings_ignored =
+        config.verify.mode != VerifyMode::Microvm && config.verify.microvm != microvm_defaults;
+    if microvm_settings_ignored {
+        warnings.push(ConfigWarning {
+            code: "verify_microvm_settings_ignored_for_non_microvm",
+            message: "verify.microvm settings are ignored unless verify.mode=microvm".to_owned(),
+        });
+    }
+
+    if config.verify.mode == VerifyMode::Microvm
+        && (config.verify.microvm.kernel_image.is_none()
+            || config.verify.microvm.rootfs_image.is_none())
+    {
+        warnings.push(ConfigWarning {
+            code: "verify_microvm_assets_missing",
+            message: "verify.mode=microvm requires verify.microvm.kernel_image and verify.microvm.rootfs_image".to_owned(),
+        });
+    }
+
     warnings
 }
 
@@ -408,6 +473,22 @@ fn default_verify_container_image() -> String {
 
 fn default_verify_container_workdir() -> String {
     DEFAULT_VERIFY_CONTAINER_WORKDIR.to_owned()
+}
+
+fn default_verify_microvm_runtime() -> String {
+    DEFAULT_VERIFY_MICROVM_RUNTIME.to_owned()
+}
+
+fn default_verify_microvm_workdir() -> String {
+    DEFAULT_VERIFY_MICROVM_WORKDIR.to_owned()
+}
+
+fn default_verify_microvm_vcpu_count() -> u8 {
+    DEFAULT_VERIFY_MICROVM_VCPU_COUNT
+}
+
+fn default_verify_microvm_memory_mib() -> u32 {
+    DEFAULT_VERIFY_MICROVM_MEMORY_MIB
 }
 
 fn normalize_optional(input: Option<String>) -> Option<String> {
@@ -460,6 +541,24 @@ fn normalize_config(mut config: AetherConfig) -> AetherConfig {
         std::mem::take(&mut config.verify.container.workdir),
         default_verify_container_workdir(),
     );
+    config.verify.microvm.runtime = normalize_with_default(
+        std::mem::take(&mut config.verify.microvm.runtime),
+        default_verify_microvm_runtime(),
+    );
+    config.verify.microvm.kernel_image =
+        normalize_optional(config.verify.microvm.kernel_image.take());
+    config.verify.microvm.rootfs_image =
+        normalize_optional(config.verify.microvm.rootfs_image.take());
+    config.verify.microvm.workdir = normalize_with_default(
+        std::mem::take(&mut config.verify.microvm.workdir),
+        default_verify_microvm_workdir(),
+    );
+    if config.verify.microvm.vcpu_count == 0 {
+        config.verify.microvm.vcpu_count = default_verify_microvm_vcpu_count();
+    }
+    if config.verify.microvm.memory_mib == 0 {
+        config.verify.microvm.memory_mib = default_verify_microvm_memory_mib();
+    }
 
     let api_key_env = config.inference.api_key_env.trim();
     if api_key_env.is_empty() {
@@ -512,6 +611,26 @@ mod tests {
             DEFAULT_VERIFY_CONTAINER_WORKDIR
         );
         assert!(!config.verify.container.fallback_to_host_on_unavailable);
+        assert_eq!(
+            config.verify.microvm.runtime,
+            DEFAULT_VERIFY_MICROVM_RUNTIME
+        );
+        assert_eq!(config.verify.microvm.kernel_image, None);
+        assert_eq!(config.verify.microvm.rootfs_image, None);
+        assert_eq!(
+            config.verify.microvm.workdir,
+            DEFAULT_VERIFY_MICROVM_WORKDIR
+        );
+        assert_eq!(
+            config.verify.microvm.vcpu_count,
+            DEFAULT_VERIFY_MICROVM_VCPU_COUNT
+        );
+        assert_eq!(
+            config.verify.microvm.memory_mib,
+            DEFAULT_VERIFY_MICROVM_MEMORY_MIB
+        );
+        assert!(!config.verify.microvm.fallback_to_container_on_unavailable);
+        assert!(!config.verify.microvm.fallback_to_host_on_unavailable);
         assert!(config_path(workspace).exists());
 
         let content = fs::read_to_string(config_path(workspace)).expect("read config file");
@@ -529,6 +648,11 @@ mod tests {
         assert!(content.contains("runtime = \"docker\""));
         assert!(content.contains("image = \"rust:1-bookworm\""));
         assert!(content.contains("workdir = \"/workspace\""));
+        assert!(content.contains("[verify.microvm]"));
+        assert!(content.contains("runtime = \"firecracker\""));
+        assert!(content.contains("workdir = \"/workspace\""));
+        assert!(content.contains("vcpu_count = 1"));
+        assert!(content.contains("memory_mib = 1024"));
         assert!(content.contains("\"cargo test\""));
         assert!(content.contains("\"cargo clippy --workspace -- -D warnings\""));
     }
@@ -556,7 +680,7 @@ model = "qwen3-embeddings-4B"
 endpoint = "http://127.0.0.1:11434/api/embeddings"
 
 [verify]
-mode = "container"
+mode = "microvm"
 commands = [
     " cargo test ",
     "",
@@ -568,6 +692,16 @@ commands = [
 runtime = " docker "
 image = " rust:1-bookworm "
 workdir = " /workspace "
+fallback_to_host_on_unavailable = true
+
+[verify.microvm]
+runtime = " firecracker "
+kernel_image = " ./assets/vmlinux "
+rootfs_image = " ./assets/rootfs.ext4 "
+workdir = " /workspace "
+vcpu_count = 0
+memory_mib = 0
+fallback_to_container_on_unavailable = true
 fallback_to_host_on_unavailable = true
 "#;
         fs::write(config_path(workspace), raw).expect("write config");
@@ -605,11 +739,25 @@ fallback_to_host_on_unavailable = true
                 "cargo clippy --workspace -- -D warnings".to_owned()
             ]
         );
-        assert_eq!(config.verify.mode, VerifyMode::Container);
+        assert_eq!(config.verify.mode, VerifyMode::Microvm);
         assert_eq!(config.verify.container.runtime, "docker");
         assert_eq!(config.verify.container.image, "rust:1-bookworm");
         assert_eq!(config.verify.container.workdir, "/workspace");
         assert!(config.verify.container.fallback_to_host_on_unavailable);
+        assert_eq!(config.verify.microvm.runtime, "firecracker");
+        assert_eq!(
+            config.verify.microvm.kernel_image.as_deref(),
+            Some("./assets/vmlinux")
+        );
+        assert_eq!(
+            config.verify.microvm.rootfs_image.as_deref(),
+            Some("./assets/rootfs.ext4")
+        );
+        assert_eq!(config.verify.microvm.workdir, "/workspace");
+        assert_eq!(config.verify.microvm.vcpu_count, 1);
+        assert_eq!(config.verify.microvm.memory_mib, 1024);
+        assert!(config.verify.microvm.fallback_to_container_on_unavailable);
+        assert!(config.verify.microvm.fallback_to_host_on_unavailable);
     }
 
     #[test]
@@ -639,6 +787,15 @@ runtime = "docker"
 image = "rust:1-bookworm"
 workdir = "/workspace"
 fallback_to_host_on_unavailable = true
+[verify.microvm]
+runtime = "firecracker"
+kernel_image = "./kernel"
+rootfs_image = "./rootfs.ext4"
+workdir = "/workspace"
+vcpu_count = 2
+memory_mib = 2048
+fallback_to_container_on_unavailable = true
+fallback_to_host_on_unavailable = true
 "#;
         fs::write(config_path(workspace), raw).expect("write config");
 
@@ -658,6 +815,8 @@ fallback_to_host_on_unavailable = true
         assert_eq!(config.verify.commands, vec!["cargo --version".to_owned()]);
         assert_eq!(config.verify.mode, VerifyMode::Container);
         assert!(config.verify.container.fallback_to_host_on_unavailable);
+        assert!(config.verify.microvm.fallback_to_container_on_unavailable);
+        assert!(config.verify.microvm.fallback_to_host_on_unavailable);
     }
 
     #[test]
@@ -732,5 +891,36 @@ fallback_to_host_on_unavailable = true
             .collect::<Vec<_>>();
 
         assert!(codes.contains(&"verify_container_settings_ignored_for_host"));
+    }
+
+    #[test]
+    fn validate_config_warns_when_non_microvm_mode_ignores_microvm_settings() {
+        let mut config = AetherConfig::default();
+        config.verify.mode = VerifyMode::Host;
+        config.verify.microvm.runtime = "custom-runtime".to_owned();
+
+        let warnings = validate_config(&config);
+        let codes = warnings
+            .iter()
+            .map(|warning| warning.code)
+            .collect::<Vec<_>>();
+
+        assert!(codes.contains(&"verify_microvm_settings_ignored_for_non_microvm"));
+    }
+
+    #[test]
+    fn validate_config_warns_when_microvm_assets_missing() {
+        let mut config = AetherConfig::default();
+        config.verify.mode = VerifyMode::Microvm;
+        config.verify.microvm.kernel_image = Some("kernel".to_owned());
+        config.verify.microvm.rootfs_image = None;
+
+        let warnings = validate_config(&config);
+        let codes = warnings
+            .iter()
+            .map(|warning| warning.code)
+            .collect::<Vec<_>>();
+
+        assert!(codes.contains(&"verify_microvm_assets_missing"));
     }
 }
