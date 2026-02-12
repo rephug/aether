@@ -808,3 +808,140 @@ fn stage3_container_verification_falls_back_to_host_when_configured()
 
     Ok(())
 }
+
+#[test]
+fn stage3_microvm_verification_is_opt_in_and_preserves_host_default()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    let mut config = AetherConfig::default();
+    config.verify.commands = vec!["cargo --version".to_owned()];
+    config.verify.microvm.runtime = "definitely-missing-microvm-runtime".to_owned();
+    config.verify.microvm.kernel_image = Some("./vmlinux".to_owned());
+    config.verify.microvm.rootfs_image = Some("./rootfs.ext4".to_owned());
+
+    let result = run_verification(workspace, &config, VerificationRequest::default())?;
+
+    assert!(result.passed);
+    assert_eq!(result.mode, "host");
+    assert_eq!(result.mode_requested, "host");
+    assert_eq!(result.mode_used, "host");
+    assert_eq!(result.fallback_reason, None);
+    assert_eq!(result.command_results.len(), 1);
+    assert_eq!(result.command_results[0].exit_code, Some(0));
+
+    Ok(())
+}
+
+#[test]
+fn stage3_microvm_verification_reports_runtime_unavailable_without_fallback()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    std::fs::write(workspace.join("vmlinux"), "")?;
+    std::fs::write(workspace.join("rootfs.ext4"), "")?;
+
+    let mut config = AetherConfig::default();
+    config.verify.mode = VerifyMode::Microvm;
+    config.verify.commands = vec!["cargo --version".to_owned()];
+    config.verify.microvm.runtime = "definitely-missing-microvm-runtime".to_owned();
+    config.verify.microvm.kernel_image = Some("vmlinux".to_owned());
+    config.verify.microvm.rootfs_image = Some("rootfs.ext4".to_owned());
+    config.verify.microvm.fallback_to_container_on_unavailable = false;
+    config.verify.microvm.fallback_to_host_on_unavailable = false;
+
+    let result = run_verification(workspace, &config, VerificationRequest::default())?;
+
+    assert!(!result.passed);
+    assert_eq!(result.mode, "microvm");
+    assert_eq!(result.mode_requested, "microvm");
+    assert_eq!(result.mode_used, "microvm");
+    assert_eq!(result.fallback_reason, None);
+    assert!(result.command_results.is_empty());
+    assert!(
+        result
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("microvm runtime unavailable"))
+    );
+
+    Ok(())
+}
+
+#[test]
+fn stage3_microvm_verification_fallback_prefers_container_then_host()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    std::fs::write(workspace.join("vmlinux"), "")?;
+    std::fs::write(workspace.join("rootfs.ext4"), "")?;
+
+    let mut config = AetherConfig::default();
+    config.verify.mode = VerifyMode::Microvm;
+    config.verify.commands = vec!["cargo --version".to_owned()];
+    config.verify.container.runtime = "definitely-missing-container-runtime".to_owned();
+    config.verify.microvm.runtime = "definitely-missing-microvm-runtime".to_owned();
+    config.verify.microvm.kernel_image = Some("vmlinux".to_owned());
+    config.verify.microvm.rootfs_image = Some("rootfs.ext4".to_owned());
+    config.verify.microvm.fallback_to_container_on_unavailable = true;
+    config.verify.microvm.fallback_to_host_on_unavailable = true;
+
+    let result = run_verification(workspace, &config, VerificationRequest::default())?;
+
+    assert!(result.passed);
+    assert_eq!(result.mode, "host");
+    assert_eq!(result.mode_requested, "microvm");
+    assert_eq!(result.mode_used, "host");
+    assert_eq!(result.command_results.len(), 1);
+    assert_eq!(result.command_results[0].exit_code, Some(0));
+    assert!(
+        result
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("microvm runtime unavailable"))
+    );
+    assert!(
+        result
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("container runtime unavailable"))
+    );
+
+    Ok(())
+}
+
+#[test]
+fn stage3_microvm_verification_asset_failures_do_not_fallback()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    let mut config = AetherConfig::default();
+    config.verify.mode = VerifyMode::Microvm;
+    config.verify.commands = vec!["cargo --version".to_owned()];
+    config.verify.microvm.runtime = "definitely-missing-microvm-runtime".to_owned();
+    config.verify.microvm.kernel_image = None;
+    config.verify.microvm.rootfs_image = Some("rootfs.ext4".to_owned());
+    config.verify.microvm.fallback_to_container_on_unavailable = true;
+    config.verify.microvm.fallback_to_host_on_unavailable = true;
+
+    let result = run_verification(workspace, &config, VerificationRequest::default())?;
+
+    assert!(!result.passed);
+    assert_eq!(result.mode, "microvm");
+    assert_eq!(result.mode_requested, "microvm");
+    assert_eq!(result.mode_used, "microvm");
+    assert_eq!(result.fallback_reason, None);
+    assert!(result.command_results.is_empty());
+    assert_eq!(
+        result.error.as_deref(),
+        Some(
+            "microvm kernel_image is required; set verify.microvm.kernel_image or use host/container mode"
+        )
+    );
+
+    Ok(())
+}

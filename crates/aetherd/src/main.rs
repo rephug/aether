@@ -97,16 +97,23 @@ struct Cli {
         long,
         requires = "verify",
         value_parser = parse_verify_mode,
-        help = "Verification mode override: host or container"
+        help = "Verification mode override: host, container, or microvm"
     )]
     verify_mode: Option<VerifyMode>,
 
     #[arg(
         long,
         requires = "verify",
-        help = "Fall back to host mode when the container runtime is unavailable"
+        help = "Fall back to host mode when the selected verification runtime is unavailable"
     )]
     verify_fallback_host_on_unavailable: bool,
+
+    #[arg(
+        long,
+        requires = "verify",
+        help = "When verify mode is microvm, fall back to container mode if microvm runtime is unavailable"
+    )]
+    verify_fallback_container_on_unavailable: bool,
 
     #[arg(long, default_value_t = DEFAULT_SIR_CONCURRENCY)]
     sir_concurrency: usize,
@@ -181,6 +188,9 @@ fn run(cli: Cli) -> Result<()> {
                 mode: cli.verify_mode,
                 fallback_to_host_on_unavailable: cli
                     .verify_fallback_host_on_unavailable
+                    .then_some(true),
+                fallback_to_container_on_unavailable: cli
+                    .verify_fallback_container_on_unavailable
                     .then_some(true),
             },
         )

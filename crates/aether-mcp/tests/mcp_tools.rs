@@ -677,6 +677,7 @@ commands = ["cargo --version", "cargo --definitely-invalid-flag"]
             commands: Some(vec!["cargo --version".to_owned()]),
             mode: None,
             fallback_to_host_on_unavailable: None,
+            fallback_to_container_on_unavailable: None,
         })))
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
@@ -751,6 +752,7 @@ commands = ["cargo --version", "cargo --definitely-invalid-flag"]
             commands: None,
             mode: None,
             fallback_to_host_on_unavailable: None,
+            fallback_to_container_on_unavailable: None,
         })))
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
@@ -776,6 +778,7 @@ commands = ["cargo --version", "cargo --definitely-invalid-flag"]
             commands: Some(vec!["cargo --not-in-allowlist".to_owned()]),
             mode: None,
             fallback_to_host_on_unavailable: None,
+            fallback_to_container_on_unavailable: None,
         })))
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
@@ -818,6 +821,7 @@ fallback_to_host_on_unavailable = false
             commands: None,
             mode: None,
             fallback_to_host_on_unavailable: None,
+            fallback_to_container_on_unavailable: None,
         })))
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
@@ -839,6 +843,7 @@ fallback_to_host_on_unavailable = false
             commands: None,
             mode: Some(AetherVerifyMode::Container),
             fallback_to_host_on_unavailable: Some(true),
+            fallback_to_container_on_unavailable: None,
         })))
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
@@ -854,6 +859,89 @@ fallback_to_host_on_unavailable = false
             .fallback_reason
             .as_deref()
             .is_some_and(|message| message.contains("container runtime unavailable"))
+    );
+
+    Ok(())
+}
+
+#[test]
+fn mcp_verify_handles_unavailable_microvm_runtime_with_optional_fallback() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    fs::create_dir_all(workspace.join(".aether"))?;
+    fs::write(workspace.join("vmlinux"), "")?;
+    fs::write(workspace.join("rootfs.ext4"), "")?;
+    fs::write(
+        workspace.join(".aether/config.toml"),
+        r#"[verify]
+mode = "microvm"
+commands = ["cargo --version"]
+
+[verify.container]
+runtime = "definitely-missing-container-runtime"
+image = "rust:1-bookworm"
+workdir = "/workspace"
+fallback_to_host_on_unavailable = false
+
+[verify.microvm]
+runtime = "definitely-missing-microvm-runtime"
+kernel_image = "./vmlinux"
+rootfs_image = "./rootfs.ext4"
+workdir = "/workspace"
+vcpu_count = 1
+memory_mib = 1024
+fallback_to_container_on_unavailable = false
+fallback_to_host_on_unavailable = false
+"#,
+    )?;
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+
+    let no_fallback = rt
+        .block_on(server.aether_verify(Parameters(AetherVerifyRequest {
+            commands: None,
+            mode: None,
+            fallback_to_host_on_unavailable: None,
+            fallback_to_container_on_unavailable: None,
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert!(!no_fallback.passed);
+    assert_eq!(no_fallback.mode, "microvm");
+    assert_eq!(no_fallback.mode_requested, "microvm");
+    assert_eq!(no_fallback.mode_used, "microvm");
+    assert_eq!(no_fallback.fallback_reason, None);
+    assert!(no_fallback.results.is_empty());
+    assert!(
+        no_fallback
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("microvm runtime unavailable"))
+    );
+
+    let fallback_chain = rt
+        .block_on(server.aether_verify(Parameters(AetherVerifyRequest {
+            commands: None,
+            mode: Some(AetherVerifyMode::Microvm),
+            fallback_to_host_on_unavailable: Some(true),
+            fallback_to_container_on_unavailable: Some(true),
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert!(fallback_chain.passed);
+    assert_eq!(fallback_chain.mode, "host");
+    assert_eq!(fallback_chain.mode_requested, "microvm");
+    assert_eq!(fallback_chain.mode_used, "host");
+    assert_eq!(fallback_chain.result_count, 1);
+    assert_eq!(fallback_chain.results[0].command, "cargo --version");
+    assert_eq!(fallback_chain.results[0].exit_code, Some(0));
+    assert!(
+        fallback_chain
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|message| message.contains("microvm runtime unavailable"))
     );
 
     Ok(())
