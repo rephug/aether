@@ -87,6 +87,8 @@ pub struct AetherConfig {
     pub storage: StorageConfig,
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
+    #[serde(default)]
+    pub verify: VerifyConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +147,20 @@ impl Default for EmbeddingsConfig {
             provider: EmbeddingProviderKind::Mock,
             model: None,
             endpoint: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyConfig {
+    #[serde(default = "default_verify_commands")]
+    pub commands: Vec<String>,
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self {
+            commands: default_verify_commands(),
         }
     }
 }
@@ -280,6 +296,13 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
         }
     }
 
+    if config.verify.commands.is_empty() {
+        warnings.push(ConfigWarning {
+            code: "verify_commands_empty",
+            message: "verify.commands is empty; aetherd --verify and aether_verify will have no commands to run".to_owned(),
+        });
+    }
+
     warnings
 }
 
@@ -295,10 +318,34 @@ fn default_embeddings_enabled() -> bool {
     false
 }
 
+fn default_verify_commands() -> Vec<String> {
+    vec![
+        "cargo test".to_owned(),
+        "cargo clippy --workspace -- -D warnings".to_owned(),
+    ]
+}
+
 fn normalize_optional(input: Option<String>) -> Option<String> {
     input
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
+}
+
+fn normalize_commands(commands: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+
+    for raw in commands {
+        let value = raw.trim();
+        if value.is_empty() {
+            continue;
+        }
+
+        if !normalized.iter().any(|existing| existing == value) {
+            normalized.push(value.to_owned());
+        }
+    }
+
+    normalized
 }
 
 fn normalize_config(mut config: AetherConfig) -> AetherConfig {
@@ -306,6 +353,7 @@ fn normalize_config(mut config: AetherConfig) -> AetherConfig {
     config.inference.endpoint = normalize_optional(config.inference.endpoint.take());
     config.embeddings.model = normalize_optional(config.embeddings.model.take());
     config.embeddings.endpoint = normalize_optional(config.embeddings.endpoint.take());
+    config.verify.commands = normalize_commands(std::mem::take(&mut config.verify.commands));
 
     let api_key_env = config.inference.api_key_env.trim();
     if api_key_env.is_empty() {
@@ -337,6 +385,13 @@ mod tests {
         assert!(config.storage.mirror_sir_files);
         assert!(!config.embeddings.enabled);
         assert_eq!(config.embeddings.provider, EmbeddingProviderKind::Mock);
+        assert_eq!(
+            config.verify.commands,
+            vec![
+                "cargo test".to_owned(),
+                "cargo clippy --workspace -- -D warnings".to_owned()
+            ]
+        );
         assert!(config_path(workspace).exists());
 
         let content = fs::read_to_string(config_path(workspace)).expect("read config file");
@@ -347,6 +402,10 @@ mod tests {
         assert!(content.contains("[embeddings]"));
         assert!(content.contains("enabled = false"));
         assert!(content.contains("provider = \"mock\""));
+        assert!(content.contains("[verify]"));
+        assert!(content.contains("commands = ["));
+        assert!(content.contains("\"cargo test\""));
+        assert!(content.contains("\"cargo clippy --workspace -- -D warnings\""));
     }
 
     #[test]
@@ -370,6 +429,14 @@ enabled = true
 provider = "qwen3_local"
 model = "qwen3-embeddings-4B"
 endpoint = "http://127.0.0.1:11434/api/embeddings"
+
+[verify]
+commands = [
+    " cargo test ",
+    "",
+    "cargo clippy --workspace -- -D warnings",
+    "cargo test"
+]
 "#;
         fs::write(config_path(workspace), raw).expect("write config");
 
@@ -399,6 +466,13 @@ endpoint = "http://127.0.0.1:11434/api/embeddings"
             config.embeddings.endpoint.as_deref(),
             Some("http://127.0.0.1:11434/api/embeddings")
         );
+        assert_eq!(
+            config.verify.commands,
+            vec![
+                "cargo test".to_owned(),
+                "cargo clippy --workspace -- -D warnings".to_owned()
+            ]
+        );
     }
 
     #[test]
@@ -419,6 +493,9 @@ mirror_sir_files = false
 enabled = true
 provider = "qwen3_local"
 model = "qwen3-embeddings-4B"
+
+[verify]
+commands = ["cargo --version"]
 "#;
         fs::write(config_path(workspace), raw).expect("write config");
 
@@ -435,6 +512,7 @@ model = "qwen3-embeddings-4B"
             config.embeddings.provider,
             EmbeddingProviderKind::Qwen3Local
         );
+        assert_eq!(config.verify.commands, vec!["cargo --version".to_owned()]);
     }
 
     #[test]
@@ -455,6 +533,9 @@ model = "qwen3-embeddings-4B"
                 model: Some("mock-x".to_owned()),
                 endpoint: Some("http://127.0.0.1:11434/api/embeddings".to_owned()),
             },
+            verify: VerifyConfig {
+                commands: vec!["cargo test".to_owned()],
+            },
         };
 
         let warnings = validate_config(&config);
@@ -472,5 +553,23 @@ model = "qwen3-embeddings-4B"
     fn validate_config_is_quiet_for_defaults() {
         let warnings = validate_config(&AetherConfig::default());
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn validate_config_warns_when_verify_commands_empty() {
+        let config = AetherConfig {
+            verify: VerifyConfig {
+                commands: Vec::new(),
+            },
+            ..AetherConfig::default()
+        };
+
+        let warnings = validate_config(&config);
+        let codes = warnings
+            .iter()
+            .map(|warning| warning.code)
+            .collect::<Vec<_>>();
+
+        assert!(codes.contains(&"verify_commands_empty"));
     }
 }

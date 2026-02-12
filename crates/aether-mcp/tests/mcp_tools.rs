@@ -3,8 +3,8 @@ use std::fs;
 use aether_core::{SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED, SearchMode};
 use aether_mcp::{
     AetherExplainRequest, AetherGetSirRequest, AetherMcpServer, AetherSearchRequest,
-    AetherSymbolLookupRequest, AetherSymbolTimelineRequest, AetherWhyChangedReason,
-    AetherWhyChangedRequest, AetherWhySelectorMode, MCP_SCHEMA_VERSION,
+    AetherSymbolLookupRequest, AetherSymbolTimelineRequest, AetherVerifyRequest,
+    AetherWhyChangedReason, AetherWhyChangedRequest, AetherWhySelectorMode, MCP_SCHEMA_VERSION,
 };
 use aether_store::{SqliteStore, Store};
 use aetherd::indexer::{IndexerConfig, run_initial_index_once};
@@ -651,6 +651,126 @@ fn mcp_why_changed_supports_timestamp_selector_mode() -> Result<()> {
     assert_eq!(
         response.fields_modified,
         vec!["intent".to_owned(), "outputs".to_owned()]
+    );
+
+    Ok(())
+}
+
+#[test]
+fn mcp_verify_runs_allowlisted_subset_and_has_stable_response_shape() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    fs::create_dir_all(workspace.join(".aether"))?;
+    fs::write(
+        workspace.join(".aether/config.toml"),
+        r#"[verify]
+commands = ["cargo --version", "cargo --definitely-invalid-flag"]
+"#,
+    )?;
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+
+    let response = rt
+        .block_on(server.aether_verify(Parameters(AetherVerifyRequest {
+            commands: Some(vec!["cargo --version".to_owned()]),
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+
+    assert_eq!(response.schema_version, MCP_SCHEMA_VERSION);
+    assert_eq!(response.mode, "host");
+    assert_eq!(
+        response.allowlisted_commands,
+        vec![
+            "cargo --version".to_owned(),
+            "cargo --definitely-invalid-flag".to_owned()
+        ]
+    );
+    assert_eq!(
+        response.requested_commands,
+        vec!["cargo --version".to_owned()]
+    );
+    assert!(response.passed);
+    assert_eq!(response.error, None);
+    assert_eq!(response.result_count, 1);
+    assert_eq!(response.result_count as usize, response.results.len());
+    assert_eq!(response.results[0].command, "cargo --version");
+    assert_eq!(response.results[0].exit_code, Some(0));
+    assert!(response.results[0].passed);
+    assert!(response.results[0].stdout.contains("cargo"));
+
+    let as_json = serde_json::to_value(&response)?;
+    let object = as_json
+        .as_object()
+        .expect("verify response should serialize as object");
+    for key in [
+        "schema_version",
+        "workspace",
+        "mode",
+        "allowlisted_commands",
+        "requested_commands",
+        "passed",
+        "error",
+        "result_count",
+        "results",
+    ] {
+        assert!(object.contains_key(key), "missing key: {key}");
+    }
+
+    Ok(())
+}
+
+#[test]
+fn mcp_verify_reports_failure_status_output_and_allowlist_rejection() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    fs::create_dir_all(workspace.join(".aether"))?;
+    fs::write(
+        workspace.join(".aether/config.toml"),
+        r#"[verify]
+commands = ["cargo --version", "cargo --definitely-invalid-flag"]
+"#,
+    )?;
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+
+    let failure = rt
+        .block_on(server.aether_verify(Parameters(AetherVerifyRequest { commands: None })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert!(!failure.passed);
+    assert_eq!(failure.error, None);
+    assert_eq!(failure.result_count as usize, failure.results.len());
+    assert_eq!(failure.results.len(), 2);
+    assert_eq!(failure.results[0].command, "cargo --version");
+    assert_eq!(failure.results[0].exit_code, Some(0));
+    assert_eq!(
+        failure.results[1].command,
+        "cargo --definitely-invalid-flag"
+    );
+    assert_ne!(failure.results[1].exit_code, Some(0));
+    assert!(!failure.results[1].passed);
+    assert!(
+        !failure.results[1].stderr.trim().is_empty()
+            || !failure.results[1].stdout.trim().is_empty()
+    );
+
+    let rejected = rt
+        .block_on(server.aether_verify(Parameters(AetherVerifyRequest {
+            commands: Some(vec!["cargo --not-in-allowlist".to_owned()]),
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert!(!rejected.passed);
+    assert!(rejected.results.is_empty());
+    assert_eq!(rejected.result_count, 0);
+    assert_eq!(
+        rejected.error.as_deref(),
+        Some("requested command is not allowlisted: cargo --not-in-allowlist")
     );
 
     Ok(())

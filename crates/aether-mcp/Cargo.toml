@@ -6,7 +6,9 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+aether-config = { path = "../aether-config" }
 aether-core = { path = "../aether-core" }
+aetherd = { path = "../aetherd" }
 aether-infer = { path = "../aether-infer" }
 aether-parse = { path = "../aether-parse" }
 aether-sir = { path = "../aether-sir" }
@@ -22,5 +24,4 @@ thiserror.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [dev-dependencies]
-aetherd = { path = "../aetherd" }
 tempfile.workspace = true

@@ -6,6 +6,7 @@ use aether_config::{InferenceProviderKind, ensure_workspace_config, validate_con
 use aetherd::indexer::{IndexerConfig, run_indexing_loop, run_initial_index_once};
 use aetherd::search::{SearchMode, SearchOutputFormat, run_search_once};
 use aetherd::sir_pipeline::DEFAULT_SIR_CONCURRENCY;
+use aetherd::verification::{VerificationRequest, run_host_verification};
 use anyhow::{Context, Result};
 use clap::Parser;
 
@@ -40,7 +41,7 @@ struct Cli {
 
     #[arg(
         long,
-        conflicts_with_all = ["lsp", "index", "index_once"],
+        conflicts_with_all = ["lsp", "index", "index_once", "verify"],
         help = "Run one-shot symbol search and exit"
     )]
     search: Option<String>,
@@ -73,10 +74,24 @@ struct Cli {
 
     #[arg(
         long,
-        conflicts_with_all = ["search", "lsp", "index"],
+        conflicts_with_all = ["search", "lsp", "index", "verify"],
         help = "Run one full index pass and exit"
     )]
     index_once: bool,
+
+    #[arg(
+        long,
+        conflicts_with_all = ["search", "lsp", "index", "index_once"],
+        help = "Run host verification commands and exit"
+    )]
+    verify: bool,
+
+    #[arg(
+        long,
+        requires = "verify",
+        help = "Run only the provided allowlisted command"
+    )]
+    verify_command: Vec<String>,
 
     #[arg(long, default_value_t = DEFAULT_SIR_CONCURRENCY)]
     sir_concurrency: usize,
@@ -139,6 +154,51 @@ fn run(cli: Cli) -> Result<()> {
             cli.output,
             &mut out,
         );
+    }
+
+    if cli.verify {
+        let requested_commands = (!cli.verify_command.is_empty()).then_some(cli.verify_command);
+        let execution = run_host_verification(
+            &workspace,
+            &config,
+            VerificationRequest {
+                commands: requested_commands,
+            },
+        )
+        .context("host verification execution failed")?;
+
+        if let Some(error) = &execution.error {
+            eprintln!("VERIFY: {error}");
+        }
+
+        for result in &execution.command_results {
+            eprintln!("VERIFY: command: {}", result.command);
+
+            if !result.stdout.trim().is_empty() {
+                print!("{}", result.stdout);
+            }
+            if !result.stderr.trim().is_empty() {
+                eprint!("{}", result.stderr);
+            }
+
+            let exit = result
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".to_owned());
+            eprintln!("VERIFY: exit_code={exit} passed={}", result.passed);
+        }
+
+        if execution.passed {
+            return Ok(());
+        }
+
+        let exit_code = execution
+            .command_results
+            .last()
+            .and_then(|result| result.exit_code)
+            .filter(|code| *code > 0)
+            .unwrap_or(1);
+        std::process::exit(exit_code);
     }
 
     let indexer_config = IndexerConfig {

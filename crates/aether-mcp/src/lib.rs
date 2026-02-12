@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aether_config::load_workspace_config;
 pub use aether_core::SearchMode;
 use aether_core::{
     HoverMarkdownSections, NO_SIR_MESSAGE, SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR,
@@ -17,6 +18,7 @@ use aether_store::{
     SemanticSearchResult, SirHistorySelector, SirMetaRecord, SqliteStore, Store, StoreError,
     SymbolSearchResult,
 };
+use aetherd::verification::{VerificationRequest, run_host_verification};
 use anyhow::Result;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -108,6 +110,33 @@ pub struct AetherSearchResponse {
     pub fallback_reason: Option<String>,
     pub result_count: u32,
     pub matches: Vec<AetherSymbolLookupMatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherVerifyRequest {
+    pub commands: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherVerifyCommandResult {
+    pub command: String,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherVerifyResponse {
+    pub schema_version: u32,
+    pub workspace: String,
+    pub mode: String,
+    pub allowlisted_commands: Vec<String>,
+    pub requested_commands: Vec<String>,
+    pub passed: bool,
+    pub error: Option<String>,
+    pub result_count: u32,
+    pub results: Vec<AetherVerifyCommandResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -551,6 +580,51 @@ impl AetherMcpServer {
             found: result_count > 0,
             result_count,
             timeline,
+        })
+    }
+
+    pub fn aether_verify_logic(
+        &self,
+        request: AetherVerifyRequest,
+    ) -> Result<AetherVerifyResponse, AetherMcpError> {
+        let config = load_workspace_config(&self.workspace).map_err(|err| {
+            AetherMcpError::Message(format!("failed to load workspace config: {err}"))
+        })?;
+
+        let execution = run_host_verification(
+            &self.workspace,
+            &config,
+            VerificationRequest {
+                commands: request.commands,
+            },
+        )
+        .map_err(|err| {
+            AetherMcpError::Message(format!("failed to run host verification: {err}"))
+        })?;
+
+        let results = execution
+            .command_results
+            .into_iter()
+            .map(|item| AetherVerifyCommandResult {
+                command: item.command,
+                exit_code: item.exit_code,
+                stdout: item.stdout,
+                stderr: item.stderr,
+                passed: item.passed,
+            })
+            .collect::<Vec<_>>();
+        let result_count = results.len() as u32;
+
+        Ok(AetherVerifyResponse {
+            schema_version: MCP_SCHEMA_VERSION,
+            workspace: normalize_path(&self.workspace.to_string_lossy()),
+            mode: execution.mode,
+            allowlisted_commands: execution.allowlisted_commands,
+            requested_commands: execution.requested_commands,
+            passed: execution.passed,
+            error: execution.error,
+            result_count,
+            results,
         })
     }
 
@@ -1013,6 +1087,20 @@ impl AetherMcpServer {
         self.verbose_log("MCP tool called: aether_search");
         self.aether_search_logic(request)
             .await
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_verify",
+        description = "Run allowlisted host verification commands"
+    )]
+    pub async fn aether_verify(
+        &self,
+        Parameters(request): Parameters<AetherVerifyRequest>,
+    ) -> Result<Json<AetherVerifyResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_verify");
+        self.aether_verify_logic(request)
             .map(Json)
             .map_err(to_mcp_error)
     }

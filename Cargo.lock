@@ -55,6 +55,7 @@ dependencies = [
 name = "aether-mcp"
 version = "0.1.0"
 dependencies = [
+ "aether-config",
  "aether-core",
  "aether-infer",
  "aether-parse",
