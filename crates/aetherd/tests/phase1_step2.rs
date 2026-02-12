@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use aether_config::InferenceProviderKind;
+use aether_config::{AetherConfig, InferenceProviderKind, VerifyConfig};
 use aether_infer::{
     InferError, InferenceProvider, MockProvider, ProviderOverrides, Qwen3LocalProvider, SirContext,
 };
@@ -11,6 +11,7 @@ use aether_sir::{SirAnnotation, validate_sir};
 use aether_store::{SqliteStore, Store, SymbolEmbeddingRecord};
 use aetherd::observer::ObserverState;
 use aetherd::sir_pipeline::SirPipeline;
+use aetherd::verification::{VerificationRequest, run_host_verification};
 use tempfile::tempdir;
 
 #[derive(Debug, Clone, Copy)]
@@ -608,6 +609,103 @@ fn step2_pipeline_records_null_commit_hash_when_git_is_unavailable()
     assert_eq!(history.len(), 2);
     assert_eq!(history[0].commit_hash, None);
     assert_eq!(history[1].commit_hash, None);
+
+    Ok(())
+}
+
+#[test]
+fn stage3_host_verification_runs_allowlisted_command_and_captures_stdout()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    let config = AetherConfig {
+        verify: VerifyConfig {
+            commands: vec!["cargo --version".to_owned()],
+        },
+        ..AetherConfig::default()
+    };
+    let result = run_host_verification(workspace, &config, VerificationRequest::default())?;
+
+    assert_eq!(result.mode, "host");
+    assert!(result.passed);
+    assert_eq!(result.error, None);
+    assert_eq!(
+        result.allowlisted_commands,
+        vec!["cargo --version".to_owned()]
+    );
+    assert_eq!(
+        result.requested_commands,
+        vec!["cargo --version".to_owned()]
+    );
+    assert_eq!(result.command_results.len(), 1);
+
+    let command = &result.command_results[0];
+    assert_eq!(command.command, "cargo --version");
+    assert_eq!(command.exit_code, Some(0));
+    assert!(command.passed);
+    assert!(command.stdout.contains("cargo"));
+
+    Ok(())
+}
+
+#[test]
+fn stage3_host_verification_captures_failure_status_and_output()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    let config = AetherConfig {
+        verify: VerifyConfig {
+            commands: vec![
+                "cargo --definitely-invalid-flag".to_owned(),
+                "cargo --version".to_owned(),
+            ],
+        },
+        ..AetherConfig::default()
+    };
+    let result = run_host_verification(workspace, &config, VerificationRequest::default())?;
+
+    assert!(!result.passed);
+    assert_eq!(result.error, None);
+    assert_eq!(result.command_results.len(), 1);
+
+    let command = &result.command_results[0];
+    assert_eq!(command.command, "cargo --definitely-invalid-flag");
+    assert_ne!(command.exit_code, Some(0));
+    assert!(!command.passed);
+    assert!(!command.stderr.trim().is_empty() || !command.stdout.trim().is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn stage3_host_verification_rejects_commands_not_in_allowlist()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    let config = AetherConfig {
+        verify: VerifyConfig {
+            commands: vec!["cargo --version".to_owned()],
+        },
+        ..AetherConfig::default()
+    };
+    let result = run_host_verification(
+        workspace,
+        &config,
+        VerificationRequest {
+            commands: Some(vec!["cargo --not-in-allowlist".to_owned()]),
+        },
+    )?;
+
+    assert!(!result.passed);
+    assert!(result.command_results.is_empty());
+    assert_eq!(result.requested_commands, vec!["cargo --not-in-allowlist"]);
+    assert_eq!(
+        result.error.as_deref(),
+        Some("requested command is not allowlisted: cargo --not-in-allowlist")
+    );
 
     Ok(())
 }
