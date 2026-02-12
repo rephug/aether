@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aether_config::load_workspace_config;
+use aether_config::{VerifyMode, load_workspace_config};
 pub use aether_core::SearchMode;
 use aether_core::{
     HoverMarkdownSections, NO_SIR_MESSAGE, SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR,
@@ -18,7 +18,7 @@ use aether_store::{
     SemanticSearchResult, SirHistorySelector, SirMetaRecord, SqliteStore, Store, StoreError,
     SymbolSearchResult,
 };
-use aetherd::verification::{VerificationRequest, run_host_verification};
+use aetherd::verification::{VerificationRequest, run_verification};
 use anyhow::Result;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -115,6 +115,8 @@ pub struct AetherSearchResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherVerifyRequest {
     pub commands: Option<Vec<String>>,
+    pub mode: Option<AetherVerifyMode>,
+    pub fallback_to_host_on_unavailable: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -126,11 +128,30 @@ pub struct AetherVerifyCommandResult {
     pub passed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AetherVerifyMode {
+    Host,
+    Container,
+}
+
+impl From<AetherVerifyMode> for VerifyMode {
+    fn from(value: AetherVerifyMode) -> Self {
+        match value {
+            AetherVerifyMode::Host => VerifyMode::Host,
+            AetherVerifyMode::Container => VerifyMode::Container,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherVerifyResponse {
     pub schema_version: u32,
     pub workspace: String,
     pub mode: String,
+    pub mode_requested: String,
+    pub mode_used: String,
+    pub fallback_reason: Option<String>,
     pub allowlisted_commands: Vec<String>,
     pub requested_commands: Vec<String>,
     pub passed: bool,
@@ -591,16 +612,16 @@ impl AetherMcpServer {
             AetherMcpError::Message(format!("failed to load workspace config: {err}"))
         })?;
 
-        let execution = run_host_verification(
+        let execution = run_verification(
             &self.workspace,
             &config,
             VerificationRequest {
                 commands: request.commands,
+                mode: request.mode.map(Into::into),
+                fallback_to_host_on_unavailable: request.fallback_to_host_on_unavailable,
             },
         )
-        .map_err(|err| {
-            AetherMcpError::Message(format!("failed to run host verification: {err}"))
-        })?;
+        .map_err(|err| AetherMcpError::Message(format!("failed to run verification: {err}")))?;
 
         let results = execution
             .command_results
@@ -619,6 +640,9 @@ impl AetherMcpServer {
             schema_version: MCP_SCHEMA_VERSION,
             workspace: normalize_path(&self.workspace.to_string_lossy()),
             mode: execution.mode,
+            mode_requested: execution.mode_requested,
+            mode_used: execution.mode_used,
+            fallback_reason: execution.fallback_reason,
             allowlisted_commands: execution.allowlisted_commands,
             requested_commands: execution.requested_commands,
             passed: execution.passed,
@@ -1093,7 +1117,7 @@ impl AetherMcpServer {
 
     #[tool(
         name = "aether_verify",
-        description = "Run allowlisted host verification commands"
+        description = "Run allowlisted verification commands in host or container mode"
     )]
     pub async fn aether_verify(
         &self,

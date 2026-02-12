@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use aether_config::{AetherConfig, InferenceProviderKind, VerifyConfig};
+use aether_config::{AetherConfig, InferenceProviderKind, VerifyConfig, VerifyMode};
 use aether_infer::{
     InferError, InferenceProvider, MockProvider, ProviderOverrides, Qwen3LocalProvider, SirContext,
 };
@@ -11,7 +11,7 @@ use aether_sir::{SirAnnotation, validate_sir};
 use aether_store::{SqliteStore, Store, SymbolEmbeddingRecord};
 use aetherd::observer::ObserverState;
 use aetherd::sir_pipeline::SirPipeline;
-use aetherd::verification::{VerificationRequest, run_host_verification};
+use aetherd::verification::{VerificationRequest, run_host_verification, run_verification};
 use tempfile::tempdir;
 
 #[derive(Debug, Clone, Copy)]
@@ -622,12 +622,16 @@ fn stage3_host_verification_runs_allowlisted_command_and_captures_stdout()
     let config = AetherConfig {
         verify: VerifyConfig {
             commands: vec!["cargo --version".to_owned()],
+            ..VerifyConfig::default()
         },
         ..AetherConfig::default()
     };
     let result = run_host_verification(workspace, &config, VerificationRequest::default())?;
 
     assert_eq!(result.mode, "host");
+    assert_eq!(result.mode_requested, "host");
+    assert_eq!(result.mode_used, "host");
+    assert_eq!(result.fallback_reason, None);
     assert!(result.passed);
     assert_eq!(result.error, None);
     assert_eq!(
@@ -661,6 +665,7 @@ fn stage3_host_verification_captures_failure_status_and_output()
                 "cargo --definitely-invalid-flag".to_owned(),
                 "cargo --version".to_owned(),
             ],
+            ..VerifyConfig::default()
         },
         ..AetherConfig::default()
     };
@@ -688,6 +693,7 @@ fn stage3_host_verification_rejects_commands_not_in_allowlist()
     let config = AetherConfig {
         verify: VerifyConfig {
             commands: vec!["cargo --version".to_owned()],
+            ..VerifyConfig::default()
         },
         ..AetherConfig::default()
     };
@@ -696,6 +702,7 @@ fn stage3_host_verification_rejects_commands_not_in_allowlist()
         &config,
         VerificationRequest {
             commands: Some(vec!["cargo --not-in-allowlist".to_owned()]),
+            ..VerificationRequest::default()
         },
     )?;
 
@@ -705,6 +712,98 @@ fn stage3_host_verification_rejects_commands_not_in_allowlist()
     assert_eq!(
         result.error.as_deref(),
         Some("requested command is not allowlisted: cargo --not-in-allowlist")
+    );
+
+    Ok(())
+}
+
+#[test]
+fn stage3_container_verification_uses_requested_host_mode_override()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    let mut config = AetherConfig::default();
+    config.verify.mode = VerifyMode::Container;
+    config.verify.commands = vec!["cargo --version".to_owned()];
+    config.verify.container.runtime = "definitely-missing-container-runtime".to_owned();
+
+    let result = run_verification(
+        workspace,
+        &config,
+        VerificationRequest {
+            mode: Some(VerifyMode::Host),
+            ..VerificationRequest::default()
+        },
+    )?;
+
+    assert!(result.passed);
+    assert_eq!(result.mode, "host");
+    assert_eq!(result.mode_requested, "host");
+    assert_eq!(result.mode_used, "host");
+    assert_eq!(result.error, None);
+    assert_eq!(result.fallback_reason, None);
+    assert_eq!(result.command_results.len(), 1);
+    assert_eq!(result.command_results[0].exit_code, Some(0));
+
+    Ok(())
+}
+
+#[test]
+fn stage3_container_verification_reports_runtime_unavailable_without_fallback()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    let mut config = AetherConfig::default();
+    config.verify.mode = VerifyMode::Container;
+    config.verify.commands = vec!["cargo --version".to_owned()];
+    config.verify.container.runtime = "definitely-missing-container-runtime".to_owned();
+    config.verify.container.fallback_to_host_on_unavailable = false;
+
+    let result = run_verification(workspace, &config, VerificationRequest::default())?;
+
+    assert!(!result.passed);
+    assert_eq!(result.mode, "container");
+    assert_eq!(result.mode_requested, "container");
+    assert_eq!(result.mode_used, "container");
+    assert!(result.command_results.is_empty());
+    assert_eq!(result.fallback_reason, None);
+    assert!(
+        result
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("container runtime unavailable"))
+    );
+
+    Ok(())
+}
+
+#[test]
+fn stage3_container_verification_falls_back_to_host_when_configured()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    let mut config = AetherConfig::default();
+    config.verify.mode = VerifyMode::Container;
+    config.verify.commands = vec!["cargo --version".to_owned()];
+    config.verify.container.runtime = "definitely-missing-container-runtime".to_owned();
+    config.verify.container.fallback_to_host_on_unavailable = true;
+
+    let result = run_verification(workspace, &config, VerificationRequest::default())?;
+
+    assert!(result.passed);
+    assert_eq!(result.mode, "host");
+    assert_eq!(result.mode_requested, "container");
+    assert_eq!(result.mode_used, "host");
+    assert!(result.command_results.len() == 1);
+    assert_eq!(result.command_results[0].exit_code, Some(0));
+    assert!(
+        result
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("container runtime unavailable"))
     );
 
     Ok(())
