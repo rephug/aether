@@ -10,6 +10,9 @@ pub const DEFAULT_GEMINI_API_KEY_ENV: &str = "GEMINI_API_KEY";
 pub const DEFAULT_QWEN_ENDPOINT: &str = "http://127.0.0.1:11434";
 pub const DEFAULT_QWEN_MODEL: &str = "qwen3-embeddings-0.6B";
 pub const DEFAULT_QWEN_EMBEDDING_ENDPOINT: &str = "http://127.0.0.1:11434/api/embeddings";
+pub const DEFAULT_VERIFY_CONTAINER_RUNTIME: &str = "docker";
+pub const DEFAULT_VERIFY_CONTAINER_IMAGE: &str = "rust:1-bookworm";
+pub const DEFAULT_VERIFY_CONTAINER_WORKDIR: &str = "/workspace";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -155,12 +158,72 @@ impl Default for EmbeddingsConfig {
 pub struct VerifyConfig {
     #[serde(default = "default_verify_commands")]
     pub commands: Vec<String>,
+    #[serde(default)]
+    pub mode: VerifyMode,
+    #[serde(default)]
+    pub container: VerifyContainerConfig,
 }
 
 impl Default for VerifyConfig {
     fn default() -> Self {
         Self {
             commands: default_verify_commands(),
+            mode: VerifyMode::Host,
+            container: VerifyContainerConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyMode {
+    #[default]
+    Host,
+    Container,
+}
+
+impl VerifyMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Container => "container",
+        }
+    }
+}
+
+impl std::str::FromStr for VerifyMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "host" => Ok(Self::Host),
+            "container" => Ok(Self::Container),
+            other => Err(format!(
+                "invalid verify mode '{other}', expected one of: host, container"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyContainerConfig {
+    #[serde(default = "default_verify_container_runtime")]
+    pub runtime: String,
+    #[serde(default = "default_verify_container_image")]
+    pub image: String,
+    #[serde(default = "default_verify_container_workdir")]
+    pub workdir: String,
+    #[serde(default)]
+    pub fallback_to_host_on_unavailable: bool,
+}
+
+impl Default for VerifyContainerConfig {
+    fn default() -> Self {
+        Self {
+            runtime: default_verify_container_runtime(),
+            image: default_verify_container_image(),
+            workdir: default_verify_container_workdir(),
+            fallback_to_host_on_unavailable: false,
         }
     }
 }
@@ -303,6 +366,16 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
         });
     }
 
+    let container_defaults = VerifyContainerConfig::default();
+    let container_settings_ignored =
+        config.verify.mode == VerifyMode::Host && config.verify.container != container_defaults;
+    if container_settings_ignored {
+        warnings.push(ConfigWarning {
+            code: "verify_container_settings_ignored_for_host",
+            message: "verify.mode=host ignores verify.container settings".to_owned(),
+        });
+    }
+
     warnings
 }
 
@@ -325,10 +398,31 @@ fn default_verify_commands() -> Vec<String> {
     ]
 }
 
+fn default_verify_container_runtime() -> String {
+    DEFAULT_VERIFY_CONTAINER_RUNTIME.to_owned()
+}
+
+fn default_verify_container_image() -> String {
+    DEFAULT_VERIFY_CONTAINER_IMAGE.to_owned()
+}
+
+fn default_verify_container_workdir() -> String {
+    DEFAULT_VERIFY_CONTAINER_WORKDIR.to_owned()
+}
+
 fn normalize_optional(input: Option<String>) -> Option<String> {
     input
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
+}
+
+fn normalize_with_default(input: String, default: String) -> String {
+    let normalized = input.trim();
+    if normalized.is_empty() {
+        default
+    } else {
+        normalized.to_owned()
+    }
 }
 
 fn normalize_commands(commands: Vec<String>) -> Vec<String> {
@@ -354,6 +448,18 @@ fn normalize_config(mut config: AetherConfig) -> AetherConfig {
     config.embeddings.model = normalize_optional(config.embeddings.model.take());
     config.embeddings.endpoint = normalize_optional(config.embeddings.endpoint.take());
     config.verify.commands = normalize_commands(std::mem::take(&mut config.verify.commands));
+    config.verify.container.runtime = normalize_with_default(
+        std::mem::take(&mut config.verify.container.runtime),
+        default_verify_container_runtime(),
+    );
+    config.verify.container.image = normalize_with_default(
+        std::mem::take(&mut config.verify.container.image),
+        default_verify_container_image(),
+    );
+    config.verify.container.workdir = normalize_with_default(
+        std::mem::take(&mut config.verify.container.workdir),
+        default_verify_container_workdir(),
+    );
 
     let api_key_env = config.inference.api_key_env.trim();
     if api_key_env.is_empty() {
@@ -392,6 +498,20 @@ mod tests {
                 "cargo clippy --workspace -- -D warnings".to_owned()
             ]
         );
+        assert_eq!(config.verify.mode, VerifyMode::Host);
+        assert_eq!(
+            config.verify.container.runtime,
+            DEFAULT_VERIFY_CONTAINER_RUNTIME
+        );
+        assert_eq!(
+            config.verify.container.image,
+            DEFAULT_VERIFY_CONTAINER_IMAGE
+        );
+        assert_eq!(
+            config.verify.container.workdir,
+            DEFAULT_VERIFY_CONTAINER_WORKDIR
+        );
+        assert!(!config.verify.container.fallback_to_host_on_unavailable);
         assert!(config_path(workspace).exists());
 
         let content = fs::read_to_string(config_path(workspace)).expect("read config file");
@@ -404,6 +524,11 @@ mod tests {
         assert!(content.contains("provider = \"mock\""));
         assert!(content.contains("[verify]"));
         assert!(content.contains("commands = ["));
+        assert!(content.contains("mode = \"host\""));
+        assert!(content.contains("[verify.container]"));
+        assert!(content.contains("runtime = \"docker\""));
+        assert!(content.contains("image = \"rust:1-bookworm\""));
+        assert!(content.contains("workdir = \"/workspace\""));
         assert!(content.contains("\"cargo test\""));
         assert!(content.contains("\"cargo clippy --workspace -- -D warnings\""));
     }
@@ -431,12 +556,19 @@ model = "qwen3-embeddings-4B"
 endpoint = "http://127.0.0.1:11434/api/embeddings"
 
 [verify]
+mode = "container"
 commands = [
     " cargo test ",
     "",
     "cargo clippy --workspace -- -D warnings",
     "cargo test"
 ]
+
+[verify.container]
+runtime = " docker "
+image = " rust:1-bookworm "
+workdir = " /workspace "
+fallback_to_host_on_unavailable = true
 "#;
         fs::write(config_path(workspace), raw).expect("write config");
 
@@ -473,6 +605,11 @@ commands = [
                 "cargo clippy --workspace -- -D warnings".to_owned()
             ]
         );
+        assert_eq!(config.verify.mode, VerifyMode::Container);
+        assert_eq!(config.verify.container.runtime, "docker");
+        assert_eq!(config.verify.container.image, "rust:1-bookworm");
+        assert_eq!(config.verify.container.workdir, "/workspace");
+        assert!(config.verify.container.fallback_to_host_on_unavailable);
     }
 
     #[test]
@@ -495,7 +632,13 @@ provider = "qwen3_local"
 model = "qwen3-embeddings-4B"
 
 [verify]
+mode = "container"
 commands = ["cargo --version"]
+[verify.container]
+runtime = "docker"
+image = "rust:1-bookworm"
+workdir = "/workspace"
+fallback_to_host_on_unavailable = true
 "#;
         fs::write(config_path(workspace), raw).expect("write config");
 
@@ -513,6 +656,8 @@ commands = ["cargo --version"]
             EmbeddingProviderKind::Qwen3Local
         );
         assert_eq!(config.verify.commands, vec!["cargo --version".to_owned()]);
+        assert_eq!(config.verify.mode, VerifyMode::Container);
+        assert!(config.verify.container.fallback_to_host_on_unavailable);
     }
 
     #[test]
@@ -535,6 +680,7 @@ commands = ["cargo --version"]
             },
             verify: VerifyConfig {
                 commands: vec!["cargo test".to_owned()],
+                ..VerifyConfig::default()
             },
         };
 
@@ -560,6 +706,7 @@ commands = ["cargo --version"]
         let config = AetherConfig {
             verify: VerifyConfig {
                 commands: Vec::new(),
+                ..VerifyConfig::default()
             },
             ..AetherConfig::default()
         };
@@ -571,5 +718,19 @@ commands = ["cargo --version"]
             .collect::<Vec<_>>();
 
         assert!(codes.contains(&"verify_commands_empty"));
+    }
+
+    #[test]
+    fn validate_config_warns_when_host_mode_ignores_container_settings() {
+        let mut config = AetherConfig::default();
+        config.verify.container.image = "rust:latest".to_owned();
+
+        let warnings = validate_config(&config);
+        let codes = warnings
+            .iter()
+            .map(|warning| warning.code)
+            .collect::<Vec<_>>();
+
+        assert!(codes.contains(&"verify_container_settings_ignored_for_host"));
     }
 }

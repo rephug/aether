@@ -2,11 +2,11 @@ use std::ffi::OsStr;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use aether_config::{InferenceProviderKind, ensure_workspace_config, validate_config};
+use aether_config::{InferenceProviderKind, VerifyMode, ensure_workspace_config, validate_config};
 use aetherd::indexer::{IndexerConfig, run_indexing_loop, run_initial_index_once};
 use aetherd::search::{SearchMode, SearchOutputFormat, run_search_once};
 use aetherd::sir_pipeline::DEFAULT_SIR_CONCURRENCY;
-use aetherd::verification::{VerificationRequest, run_host_verification};
+use aetherd::verification::{VerificationRequest, run_verification};
 use anyhow::{Context, Result};
 use clap::Parser;
 
@@ -82,7 +82,7 @@ struct Cli {
     #[arg(
         long,
         conflicts_with_all = ["search", "lsp", "index", "index_once"],
-        help = "Run host verification commands and exit"
+        help = "Run verification commands and exit"
     )]
     verify: bool,
 
@@ -92,6 +92,21 @@ struct Cli {
         help = "Run only the provided allowlisted command"
     )]
     verify_command: Vec<String>,
+
+    #[arg(
+        long,
+        requires = "verify",
+        value_parser = parse_verify_mode,
+        help = "Verification mode override: host or container"
+    )]
+    verify_mode: Option<VerifyMode>,
+
+    #[arg(
+        long,
+        requires = "verify",
+        help = "Fall back to host mode when the container runtime is unavailable"
+    )]
+    verify_fallback_host_on_unavailable: bool,
 
     #[arg(long, default_value_t = DEFAULT_SIR_CONCURRENCY)]
     sir_concurrency: usize,
@@ -158,18 +173,30 @@ fn run(cli: Cli) -> Result<()> {
 
     if cli.verify {
         let requested_commands = (!cli.verify_command.is_empty()).then_some(cli.verify_command);
-        let execution = run_host_verification(
+        let execution = run_verification(
             &workspace,
             &config,
             VerificationRequest {
                 commands: requested_commands,
+                mode: cli.verify_mode,
+                fallback_to_host_on_unavailable: cli
+                    .verify_fallback_host_on_unavailable
+                    .then_some(true),
             },
         )
-        .context("host verification execution failed")?;
+        .context("verification execution failed")?;
 
         if let Some(error) = &execution.error {
             eprintln!("VERIFY: {error}");
         }
+        if let Some(reason) = &execution.fallback_reason {
+            eprintln!("VERIFY: fallback_reason={reason}");
+        }
+
+        eprintln!(
+            "VERIFY: mode_requested={} mode_used={}",
+            execution.mode_requested, execution.mode_used
+        );
 
         for result in &execution.command_results {
             eprintln!("VERIFY: command: {}", result.command);
@@ -249,5 +276,9 @@ fn parse_search_mode(value: &str) -> Result<SearchMode, String> {
 }
 
 fn parse_search_output_format(value: &str) -> Result<SearchOutputFormat, String> {
+    value.parse()
+}
+
+fn parse_verify_mode(value: &str) -> Result<VerifyMode, String> {
     value.parse()
 }

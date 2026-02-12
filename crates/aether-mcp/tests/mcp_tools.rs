@@ -3,7 +3,7 @@ use std::fs;
 use aether_core::{SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED, SearchMode};
 use aether_mcp::{
     AetherExplainRequest, AetherGetSirRequest, AetherMcpServer, AetherSearchRequest,
-    AetherSymbolLookupRequest, AetherSymbolTimelineRequest, AetherVerifyRequest,
+    AetherSymbolLookupRequest, AetherSymbolTimelineRequest, AetherVerifyMode, AetherVerifyRequest,
     AetherWhyChangedReason, AetherWhyChangedRequest, AetherWhySelectorMode, MCP_SCHEMA_VERSION,
 };
 use aether_store::{SqliteStore, Store};
@@ -675,12 +675,17 @@ commands = ["cargo --version", "cargo --definitely-invalid-flag"]
     let response = rt
         .block_on(server.aether_verify(Parameters(AetherVerifyRequest {
             commands: Some(vec!["cargo --version".to_owned()]),
+            mode: None,
+            fallback_to_host_on_unavailable: None,
         })))
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
 
     assert_eq!(response.schema_version, MCP_SCHEMA_VERSION);
     assert_eq!(response.mode, "host");
+    assert_eq!(response.mode_requested, "host");
+    assert_eq!(response.mode_used, "host");
+    assert_eq!(response.fallback_reason, None);
     assert_eq!(
         response.allowlisted_commands,
         vec![
@@ -709,6 +714,9 @@ commands = ["cargo --version", "cargo --definitely-invalid-flag"]
         "schema_version",
         "workspace",
         "mode",
+        "mode_requested",
+        "mode_used",
+        "fallback_reason",
         "allowlisted_commands",
         "requested_commands",
         "passed",
@@ -739,7 +747,11 @@ commands = ["cargo --version", "cargo --definitely-invalid-flag"]
     let rt = Runtime::new()?;
 
     let failure = rt
-        .block_on(server.aether_verify(Parameters(AetherVerifyRequest { commands: None })))
+        .block_on(server.aether_verify(Parameters(AetherVerifyRequest {
+            commands: None,
+            mode: None,
+            fallback_to_host_on_unavailable: None,
+        })))
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
     assert!(!failure.passed);
@@ -762,6 +774,8 @@ commands = ["cargo --version", "cargo --definitely-invalid-flag"]
     let rejected = rt
         .block_on(server.aether_verify(Parameters(AetherVerifyRequest {
             commands: Some(vec!["cargo --not-in-allowlist".to_owned()]),
+            mode: None,
+            fallback_to_host_on_unavailable: None,
         })))
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
@@ -771,6 +785,75 @@ commands = ["cargo --version", "cargo --definitely-invalid-flag"]
     assert_eq!(
         rejected.error.as_deref(),
         Some("requested command is not allowlisted: cargo --not-in-allowlist")
+    );
+
+    Ok(())
+}
+
+#[test]
+fn mcp_verify_handles_unavailable_container_runtime_with_optional_fallback() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    fs::create_dir_all(workspace.join(".aether"))?;
+    fs::write(
+        workspace.join(".aether/config.toml"),
+        r#"[verify]
+mode = "container"
+commands = ["cargo --version"]
+
+[verify.container]
+runtime = "definitely-missing-container-runtime"
+image = "rust:1-bookworm"
+workdir = "/workspace"
+fallback_to_host_on_unavailable = false
+"#,
+    )?;
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+
+    let no_fallback = rt
+        .block_on(server.aether_verify(Parameters(AetherVerifyRequest {
+            commands: None,
+            mode: None,
+            fallback_to_host_on_unavailable: None,
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert!(!no_fallback.passed);
+    assert_eq!(no_fallback.mode, "container");
+    assert_eq!(no_fallback.mode_requested, "container");
+    assert_eq!(no_fallback.mode_used, "container");
+    assert_eq!(no_fallback.fallback_reason, None);
+    assert!(no_fallback.results.is_empty());
+    assert!(
+        no_fallback
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("container runtime unavailable"))
+    );
+
+    let force_fallback = rt
+        .block_on(server.aether_verify(Parameters(AetherVerifyRequest {
+            commands: None,
+            mode: Some(AetherVerifyMode::Container),
+            fallback_to_host_on_unavailable: Some(true),
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert!(force_fallback.passed);
+    assert_eq!(force_fallback.mode, "host");
+    assert_eq!(force_fallback.mode_requested, "container");
+    assert_eq!(force_fallback.mode_used, "host");
+    assert_eq!(force_fallback.result_count, 1);
+    assert_eq!(force_fallback.results[0].command, "cargo --version");
+    assert_eq!(force_fallback.results[0].exit_code, Some(0));
+    assert!(
+        force_fallback
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|message| message.contains("container runtime unavailable"))
     );
 
     Ok(())
