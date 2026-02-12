@@ -403,7 +403,11 @@ impl Store for SqliteStore {
         if self.mirror_sir_files {
             let path = self.sir_blob_path(symbol_id);
             if let Err(err) = fs::write(path, sir_json_string) {
-                eprintln!("aether-store: mirror write failed for symbol {symbol_id}: {err}");
+                tracing::warn!(
+                    symbol_id = %symbol_id,
+                    error = %err,
+                    "aether-store mirror write failed"
+                );
             }
         }
 

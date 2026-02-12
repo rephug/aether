@@ -218,9 +218,10 @@ impl SirPipeline {
                         print_sir,
                         out,
                     ) {
-                        eprintln!(
-                            "embedding refresh error for symbol {}: {err:#}",
-                            generated.symbol.id
+                        tracing::warn!(
+                            symbol_id = %generated.symbol.id,
+                            error = %err,
+                            "embedding refresh error"
                         );
                     }
 

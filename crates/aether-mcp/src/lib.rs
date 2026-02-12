@@ -1077,7 +1077,7 @@ impl AetherMcpServer {
 
     fn verbose_log(&self, message: &str) {
         if self.verbose {
-            eprintln!("{message}");
+            tracing::debug!(message = %message, "aether-mcp verbose");
         }
     }
 }

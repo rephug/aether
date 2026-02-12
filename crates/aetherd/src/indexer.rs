@@ -61,7 +61,7 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
                 if let Err(err) =
                     enqueue_event_paths(&config.workspace, result, &mut debounce_queue)
                 {
-                    eprintln!("watch event error: {err:?}");
+                    tracing::warn!(error = ?err, "watch event error");
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -72,7 +72,7 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
 
         while let Ok(result) = rx.try_recv() {
             if let Err(err) = enqueue_event_paths(&config.workspace, result, &mut debounce_queue) {
-                eprintln!("watch event error: {err:?}");
+                tracing::warn!(error = ?err, "watch event error");
             }
         }
 
@@ -88,11 +88,19 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
                     if let Err(err) =
                         sir_pipeline.process_event(&store, &event, config.print_sir, &mut stdout)
                     {
-                        eprintln!("SIR pipeline error for {}: {err:#}", event.file_path);
+                        tracing::error!(
+                            file_path = %event.file_path,
+                            error = %err,
+                            "SIR pipeline error"
+                        );
                     }
                 }
                 Ok(None) => {}
-                Err(err) => eprintln!("process error for {}: {err:#}", path.display()),
+                Err(err) => tracing::error!(
+                    path = %path.display(),
+                    error = %err,
+                    "process error"
+                ),
             }
         }
     }
@@ -123,9 +131,10 @@ fn initialize_indexer(config: &IndexerConfig) -> Result<(ObserverState, SqliteSt
     for event in observer.initial_symbol_events() {
         if let Err(err) = sir_pipeline.process_event(&store, &event, config.print_sir, &mut stdout)
         {
-            eprintln!(
-                "initial SIR processing error for {}: {err:#}",
-                event.file_path
+            tracing::error!(
+                file_path = %event.file_path,
+                error = %err,
+                "initial SIR processing error"
             );
         }
     }
