@@ -14,7 +14,8 @@ use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_conf
 use aether_parse::{SymbolExtractor, language_for_path};
 use aether_sir::{SirAnnotation, SirError, canonicalize_sir_json, sir_hash, validate_sir};
 use aether_store::{
-    SemanticSearchResult, SirMetaRecord, SqliteStore, Store, StoreError, SymbolSearchResult,
+    SemanticSearchResult, SirHistorySelector, SirMetaRecord, SqliteStore, Store, StoreError,
+    SymbolSearchResult,
 };
 use anyhow::Result;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
@@ -26,6 +27,7 @@ use rmcp::{
 use rusqlite::Connection;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 pub const SERVER_NAME: &str = "aether";
@@ -131,6 +133,56 @@ pub struct AetherSymbolTimelineResponse {
     pub found: bool,
     pub result_count: u32,
     pub timeline: Vec<AetherSymbolTimelineEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AetherWhySelectorMode {
+    Auto,
+    Version,
+    Timestamp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AetherWhyChangedReason {
+    NoHistory,
+    SingleVersionOnly,
+    SelectorNotFound,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherWhyChangedRequest {
+    pub symbol_id: String,
+    pub from_version: Option<i64>,
+    pub to_version: Option<i64>,
+    pub from_created_at: Option<i64>,
+    pub to_created_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AetherWhySnapshot {
+    pub version: i64,
+    pub created_at: i64,
+    pub sir_hash: String,
+    pub provider: String,
+    pub model: String,
+    pub commit_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AetherWhyChangedResponse {
+    pub symbol_id: String,
+    pub found: bool,
+    pub reason: Option<AetherWhyChangedReason>,
+    pub selector_mode: AetherWhySelectorMode,
+    pub from: Option<AetherWhySnapshot>,
+    pub to: Option<AetherWhySnapshot>,
+    pub prior_summary: Option<String>,
+    pub current_summary: Option<String>,
+    pub fields_added: Vec<String>,
+    pub fields_removed: Vec<String>,
+    pub fields_modified: Vec<String>,
 }
 
 impl AetherSymbolLookupResponse {
@@ -276,6 +328,42 @@ impl From<SemanticSearchResult> for AetherSymbolLookupMatch {
             language: value.language,
             kind: value.kind,
             semantic_score: Some(value.semantic_score),
+        }
+    }
+}
+
+impl AetherWhySnapshot {
+    fn from_history_record(record: &aether_store::SirHistoryRecord) -> Self {
+        Self {
+            version: record.version,
+            created_at: record.created_at,
+            sir_hash: record.sir_hash.clone(),
+            provider: record.provider.clone(),
+            model: record.model.clone(),
+            commit_hash: record.commit_hash.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhySelector {
+    Auto,
+    Version {
+        from_version: i64,
+        to_version: i64,
+    },
+    Timestamp {
+        from_created_at: i64,
+        to_created_at: i64,
+    },
+}
+
+impl WhySelector {
+    fn mode(self) -> AetherWhySelectorMode {
+        match self {
+            Self::Auto => AetherWhySelectorMode::Auto,
+            Self::Version { .. } => AetherWhySelectorMode::Version,
+            Self::Timestamp { .. } => AetherWhySelectorMode::Timestamp,
         }
     }
 }
@@ -463,6 +551,91 @@ impl AetherMcpServer {
             found: result_count > 0,
             result_count,
             timeline,
+        })
+    }
+
+    pub fn aether_why_changed_logic(
+        &self,
+        request: AetherWhyChangedRequest,
+    ) -> Result<AetherWhyChangedResponse, AetherMcpError> {
+        let selector = parse_why_selector(&request)?;
+        let selector_mode = selector.mode();
+        let symbol_id = request.symbol_id.trim();
+
+        if symbol_id.is_empty() {
+            return Ok(empty_why_changed_response(
+                String::new(),
+                selector_mode,
+                AetherWhyChangedReason::NoHistory,
+            ));
+        }
+
+        if !self.sqlite_path().exists() {
+            return Ok(empty_why_changed_response(
+                symbol_id.to_owned(),
+                selector_mode,
+                AetherWhyChangedReason::NoHistory,
+            ));
+        }
+
+        let store = SqliteStore::open(&self.workspace)?;
+        let history = store.list_sir_history(symbol_id)?;
+        if history.is_empty() {
+            return Ok(empty_why_changed_response(
+                symbol_id.to_owned(),
+                selector_mode,
+                AetherWhyChangedReason::NoHistory,
+            ));
+        }
+
+        let pair = match selector {
+            WhySelector::Auto => store.latest_sir_history_pair(symbol_id)?,
+            WhySelector::Version {
+                from_version,
+                to_version,
+            } => store.resolve_sir_history_pair(
+                symbol_id,
+                SirHistorySelector::Version(from_version),
+                SirHistorySelector::Version(to_version),
+            )?,
+            WhySelector::Timestamp {
+                from_created_at,
+                to_created_at,
+            } => store.resolve_sir_history_pair(
+                symbol_id,
+                SirHistorySelector::CreatedAt(from_created_at),
+                SirHistorySelector::CreatedAt(to_created_at),
+            )?,
+        };
+
+        let Some(pair) = pair else {
+            return Ok(empty_why_changed_response(
+                symbol_id.to_owned(),
+                selector_mode,
+                AetherWhyChangedReason::SelectorNotFound,
+            ));
+        };
+
+        let from_fields = parse_sir_history_json_fields(&pair.from.sir_json)?;
+        let to_fields = parse_sir_history_json_fields(&pair.to.sir_json)?;
+        let (fields_added, fields_removed, fields_modified) =
+            diff_top_level_field_names(&from_fields, &to_fields);
+
+        let reason = (selector_mode == AetherWhySelectorMode::Auto && history.len() == 1)
+            .then_some(AetherWhyChangedReason::SingleVersionOnly);
+
+        Ok(AetherWhyChangedResponse {
+            symbol_id: symbol_id.to_owned(),
+            found: true,
+            reason,
+            selector_mode,
+            from: Some(AetherWhySnapshot::from_history_record(&pair.from)),
+            to: Some(AetherWhySnapshot::from_history_record(&pair.to)),
+            prior_summary: extract_intent_field(&from_fields),
+            current_summary: extract_intent_field(&to_fields),
+            fields_added,
+            fields_removed,
+            fields_modified,
         })
     }
 
@@ -858,6 +1031,20 @@ impl AetherMcpServer {
             .map_err(to_mcp_error)
     }
 
+    #[tool(
+        name = "aether_why_changed",
+        description = "Explain why a symbol changed between two SIR versions or timestamps"
+    )]
+    pub async fn aether_why_changed(
+        &self,
+        Parameters(request): Parameters<AetherWhyChangedRequest>,
+    ) -> Result<Json<AetherWhyChangedResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_why_changed");
+        self.aether_why_changed_logic(request)
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
     #[tool(name = "aether_get_sir", description = "Get SIR for a symbol ID")]
     pub async fn aether_get_sir(
         &self,
@@ -968,6 +1155,133 @@ fn meta_status_fields(
     let last_attempt_at = (meta.last_attempt_at > 0).then_some(meta.last_attempt_at);
 
     (sir_status, last_error, last_attempt_at)
+}
+
+fn parse_why_selector(request: &AetherWhyChangedRequest) -> Result<WhySelector, AetherMcpError> {
+    let has_any_version = request.from_version.is_some() || request.to_version.is_some();
+    let has_any_timestamp = request.from_created_at.is_some() || request.to_created_at.is_some();
+
+    if has_any_version && has_any_timestamp {
+        return Err(AetherMcpError::Message(
+            "provide either version selectors or timestamp selectors, not both".to_owned(),
+        ));
+    }
+
+    if has_any_version {
+        let from_version = request.from_version.ok_or_else(|| {
+            AetherMcpError::Message(
+                "from_version is required when using version selectors".to_owned(),
+            )
+        })?;
+        let to_version = request.to_version.ok_or_else(|| {
+            AetherMcpError::Message(
+                "to_version is required when using version selectors".to_owned(),
+            )
+        })?;
+        if from_version < 1 || to_version < 1 {
+            return Err(AetherMcpError::Message(
+                "version selectors must be >= 1".to_owned(),
+            ));
+        }
+
+        return Ok(WhySelector::Version {
+            from_version,
+            to_version,
+        });
+    }
+
+    if has_any_timestamp {
+        let from_created_at = request.from_created_at.ok_or_else(|| {
+            AetherMcpError::Message(
+                "from_created_at is required when using timestamp selectors".to_owned(),
+            )
+        })?;
+        let to_created_at = request.to_created_at.ok_or_else(|| {
+            AetherMcpError::Message(
+                "to_created_at is required when using timestamp selectors".to_owned(),
+            )
+        })?;
+        if from_created_at < 0 || to_created_at < 0 {
+            return Err(AetherMcpError::Message(
+                "timestamp selectors must be >= 0".to_owned(),
+            ));
+        }
+
+        return Ok(WhySelector::Timestamp {
+            from_created_at,
+            to_created_at,
+        });
+    }
+
+    Ok(WhySelector::Auto)
+}
+
+fn empty_why_changed_response(
+    symbol_id: String,
+    selector_mode: AetherWhySelectorMode,
+    reason: AetherWhyChangedReason,
+) -> AetherWhyChangedResponse {
+    AetherWhyChangedResponse {
+        symbol_id,
+        found: false,
+        reason: Some(reason),
+        selector_mode,
+        from: None,
+        to: None,
+        prior_summary: None,
+        current_summary: None,
+        fields_added: Vec::new(),
+        fields_removed: Vec::new(),
+        fields_modified: Vec::new(),
+    }
+}
+
+fn parse_sir_history_json_fields(
+    value: &str,
+) -> Result<serde_json::Map<String, Value>, AetherMcpError> {
+    let parsed: Value = serde_json::from_str(value)?;
+    let Value::Object(fields) = parsed else {
+        return Err(AetherMcpError::Message(
+            "sir_history row contains non-object sir_json".to_owned(),
+        ));
+    };
+    Ok(fields)
+}
+
+fn extract_intent_field(fields: &serde_json::Map<String, Value>) -> Option<String> {
+    fields
+        .get("intent")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn diff_top_level_field_names(
+    from: &serde_json::Map<String, Value>,
+    to: &serde_json::Map<String, Value>,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut fields_added = to
+        .keys()
+        .filter(|key| !from.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut fields_removed = from
+        .keys()
+        .filter(|key| !to.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut fields_modified = from
+        .iter()
+        .filter_map(|(key, from_value)| {
+            let to_value = to.get(key)?;
+            (from_value != to_value).then(|| key.clone())
+        })
+        .collect::<Vec<_>>();
+
+    fields_added.sort_unstable();
+    fields_removed.sort_unstable();
+    fields_modified.sort_unstable();
+
+    (fields_added, fields_removed, fields_modified)
 }
 
 fn fuse_hybrid_matches(

@@ -8,6 +8,7 @@ use aether_core::{
 use aether_parse::{SymbolExtractor, language_for_path};
 use aether_sir::SirAnnotation;
 use aether_store::{SqliteStore, Store, StoreError};
+use serde_json::Value;
 use thiserror::Error;
 use tower_lsp::lsp_types::{
     Hover, HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
@@ -195,7 +196,7 @@ pub fn resolve_hover_markdown_for_path(
     };
 
     let sir: SirAnnotation = serde_json::from_str(&sir_json)?;
-    let markdown = format_hover_markdown_sections(
+    let mut markdown = format_hover_markdown_sections(
         &HoverMarkdownSections {
             symbol: symbol.qualified_name.clone(),
             intent: sir.intent.clone(),
@@ -208,8 +209,90 @@ pub fn resolve_hover_markdown_for_path(
         },
         stale_warning.as_deref(),
     );
+    if let Some(why_hint) = compact_why_hint(store, &symbol_id)? {
+        markdown.push_str("\n\n");
+        markdown.push_str(&why_hint);
+    }
 
     Ok(Some(markdown))
+}
+
+fn compact_why_hint(store: &SqliteStore, symbol_id: &str) -> Result<Option<String>, StoreError> {
+    let history = store.list_sir_history(symbol_id)?;
+    if history.is_empty() {
+        return Ok(None);
+    }
+    if history.len() == 1 {
+        return Ok(Some(
+            "> AETHER WHY: only one recorded SIR version.".to_owned(),
+        ));
+    }
+
+    let to = history.last().expect("len checked above");
+    let from = &history[history.len() - 2];
+
+    let (added, removed, modified) = match (
+        parse_history_fields(&from.sir_json),
+        parse_history_fields(&to.sir_json),
+    ) {
+        (Some(from_fields), Some(to_fields)) => diff_top_level_fields(&from_fields, &to_fields),
+        _ => (Vec::new(), Vec::new(), Vec::new()),
+    };
+    let summary = format!(
+        "> AETHER WHY: latest v{} -> v{}; added: {}; removed: {}; modified: {}.",
+        from.version,
+        to.version,
+        format_compact_field_list(&added),
+        format_compact_field_list(&removed),
+        format_compact_field_list(&modified),
+    );
+
+    Ok(Some(summary))
+}
+
+fn parse_history_fields(value: &str) -> Option<serde_json::Map<String, Value>> {
+    let parsed: Value = serde_json::from_str(value).ok()?;
+    let Value::Object(fields) = parsed else {
+        return None;
+    };
+    Some(fields)
+}
+
+fn diff_top_level_fields(
+    from: &serde_json::Map<String, Value>,
+    to: &serde_json::Map<String, Value>,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut added = to
+        .keys()
+        .filter(|key| !from.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut removed = from
+        .keys()
+        .filter(|key| !to.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut modified = from
+        .iter()
+        .filter_map(|(key, from_value)| {
+            let to_value = to.get(key)?;
+            (from_value != to_value).then(|| key.clone())
+        })
+        .collect::<Vec<_>>();
+
+    added.sort_unstable();
+    removed.sort_unstable();
+    modified.sort_unstable();
+
+    (added, removed, modified)
+}
+
+fn format_compact_field_list(fields: &[String]) -> String {
+    if fields.is_empty() {
+        "none".to_owned()
+    } else {
+        fields.join(",")
+    }
 }
 
 fn workspace_relative_display_path(workspace_root: &Path, file_path: &Path) -> String {
@@ -389,6 +472,158 @@ mod tests {
 
         assert!(markdown.contains("> AETHER WARNING: SIR is stale."));
         assert!(markdown.contains("### alpha"));
+    }
+
+    #[test]
+    fn resolve_hover_includes_compact_why_hint_for_latest_transition() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let source_file = write_source_file(workspace);
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        let symbol_id = symbol_id_at(workspace, &source_file, Position::new(0, 4));
+
+        store
+            .write_sir_blob(
+                &symbol_id,
+                r#"{
+                    "intent":"v2",
+                    "inputs":["x"],
+                    "outputs":["z"],
+                    "side_effects":[],
+                    "dependencies":[],
+                    "error_modes":[],
+                    "confidence":0.90
+                }"#,
+            )
+            .expect("write sir blob");
+        store
+            .upsert_sir_meta(SirMetaRecord {
+                id: symbol_id.clone(),
+                sir_hash: "hash-v2".to_owned(),
+                sir_version: 2,
+                provider: "mock".to_owned(),
+                model: "mock".to_owned(),
+                updated_at: 1_700_700_200,
+                sir_status: "fresh".to_owned(),
+                last_error: None,
+                last_attempt_at: 1_700_700_200,
+            })
+            .expect("upsert sir meta");
+
+        store
+            .record_sir_version_if_changed(
+                &symbol_id,
+                "hash-v1",
+                "mock",
+                "mock",
+                r#"{
+                    "intent":"v1",
+                    "inputs":["x"],
+                    "outputs":["y"],
+                    "side_effects":[],
+                    "dependencies":[],
+                    "error_modes":[],
+                    "confidence":0.50
+                }"#,
+                1_700_700_100,
+                None,
+            )
+            .expect("insert history v1");
+        store
+            .record_sir_version_if_changed(
+                &symbol_id,
+                "hash-v2",
+                "mock",
+                "mock",
+                r#"{
+                    "intent":"v2",
+                    "inputs":["x"],
+                    "outputs":["z"],
+                    "side_effects":[],
+                    "dependencies":[],
+                    "error_modes":[],
+                    "confidence":0.90
+                }"#,
+                1_700_700_200,
+                None,
+            )
+            .expect("insert history v2");
+
+        let markdown =
+            resolve_hover_markdown_for_path(workspace, &store, &source_file, Position::new(0, 4))
+                .expect("resolve hover")
+                .expect("hover markdown");
+
+        assert!(markdown.contains("### alpha"));
+        assert!(markdown.contains("> AETHER WHY: latest v1 -> v2;"));
+        assert!(
+            markdown.contains("added: none; removed: none; modified: confidence,intent,outputs.")
+        );
+    }
+
+    #[test]
+    fn resolve_hover_reports_single_history_version_hint() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let source_file = write_source_file(workspace);
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        let symbol_id = symbol_id_at(workspace, &source_file, Position::new(0, 4));
+
+        store
+            .write_sir_blob(
+                &symbol_id,
+                r#"{
+                    "intent":"v1",
+                    "inputs":["x"],
+                    "outputs":["y"],
+                    "side_effects":[],
+                    "dependencies":[],
+                    "error_modes":[],
+                    "confidence":0.50
+                }"#,
+            )
+            .expect("write sir blob");
+        store
+            .upsert_sir_meta(SirMetaRecord {
+                id: symbol_id.clone(),
+                sir_hash: "hash-v1".to_owned(),
+                sir_version: 1,
+                provider: "mock".to_owned(),
+                model: "mock".to_owned(),
+                updated_at: 1_700_710_100,
+                sir_status: "fresh".to_owned(),
+                last_error: None,
+                last_attempt_at: 1_700_710_100,
+            })
+            .expect("upsert sir meta");
+        store
+            .record_sir_version_if_changed(
+                &symbol_id,
+                "hash-v1",
+                "mock",
+                "mock",
+                r#"{
+                    "intent":"v1",
+                    "inputs":["x"],
+                    "outputs":["y"],
+                    "side_effects":[],
+                    "dependencies":[],
+                    "error_modes":[],
+                    "confidence":0.50
+                }"#,
+                1_700_710_100,
+                None,
+            )
+            .expect("insert history v1");
+
+        let markdown =
+            resolve_hover_markdown_for_path(workspace, &store, &source_file, Position::new(0, 4))
+                .expect("resolve hover")
+                .expect("hover markdown");
+
+        assert!(markdown.contains("> AETHER WHY: only one recorded SIR version."));
     }
 
     fn write_source_file(workspace: &Path) -> std::path::PathBuf {
