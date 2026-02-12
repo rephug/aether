@@ -66,7 +66,7 @@ pub fn run_search_once(
 ) -> Result<()> {
     let execution = execute_search(workspace, query, limit, mode)?;
     if let Some(reason) = &execution.fallback_reason {
-        eprintln!("AETHER search fallback: {reason}");
+        tracing::warn!(fallback_reason = %reason, "AETHER search fallback");
     }
 
     match output_format {

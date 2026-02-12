@@ -17,6 +17,7 @@ pub const DEFAULT_VERIFY_MICROVM_RUNTIME: &str = "firecracker";
 pub const DEFAULT_VERIFY_MICROVM_WORKDIR: &str = "/workspace";
 pub const DEFAULT_VERIFY_MICROVM_VCPU_COUNT: u8 = 1;
 pub const DEFAULT_VERIFY_MICROVM_MEMORY_MIB: u32 = 1024;
+pub const DEFAULT_LOG_LEVEL: &str = "info";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -89,6 +90,8 @@ impl std::str::FromStr for EmbeddingProviderKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AetherConfig {
     #[serde(default)]
+    pub general: GeneralConfig,
+    #[serde(default)]
     pub inference: InferenceConfig,
     #[serde(default)]
     pub storage: StorageConfig,
@@ -96,6 +99,20 @@ pub struct AetherConfig {
     pub embeddings: EmbeddingsConfig,
     #[serde(default)]
     pub verify: VerifyConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneralConfig {
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+}
+
+impl Default for GeneralConfig {
+    fn default() -> Self {
+        Self {
+            log_level: default_log_level(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -448,6 +465,10 @@ fn default_api_key_env() -> String {
     DEFAULT_GEMINI_API_KEY_ENV.to_owned()
 }
 
+fn default_log_level() -> String {
+    DEFAULT_LOG_LEVEL.to_owned()
+}
+
 fn default_mirror_sir_files() -> bool {
     true
 }
@@ -524,6 +545,10 @@ fn normalize_commands(commands: Vec<String>) -> Vec<String> {
 }
 
 fn normalize_config(mut config: AetherConfig) -> AetherConfig {
+    config.general.log_level = normalize_with_default(
+        std::mem::take(&mut config.general.log_level),
+        default_log_level(),
+    );
     config.inference.model = normalize_optional(config.inference.model.take());
     config.inference.endpoint = normalize_optional(config.inference.endpoint.take());
     config.embeddings.model = normalize_optional(config.embeddings.model.take());
@@ -585,6 +610,7 @@ mod tests {
 
         let config = ensure_workspace_config(workspace).expect("ensure config");
 
+        assert_eq!(config.general.log_level, DEFAULT_LOG_LEVEL);
         assert_eq!(config.inference.provider, InferenceProviderKind::Auto);
         assert_eq!(config.inference.api_key_env, DEFAULT_GEMINI_API_KEY_ENV);
         assert!(config.storage.mirror_sir_files);
@@ -634,6 +660,8 @@ mod tests {
         assert!(config_path(workspace).exists());
 
         let content = fs::read_to_string(config_path(workspace)).expect("read config file");
+        assert!(content.contains("[general]"));
+        assert!(content.contains("log_level = \"info\""));
         assert!(content.contains("[inference]"));
         assert!(content.contains("provider = \"auto\""));
         assert!(content.contains("[storage]"));
@@ -664,6 +692,9 @@ mod tests {
         fs::create_dir_all(aether_dir(workspace)).expect("create .aether");
 
         let raw = r#"
+[general]
+log_level = " debug "
+
 [inference]
 provider = "qwen3_local"
 model = "qwen3-embeddings-4B"
@@ -708,6 +739,7 @@ fallback_to_host_on_unavailable = true
 
         let config = load_workspace_config(workspace).expect("load config");
 
+        assert_eq!(config.general.log_level, "debug");
         assert_eq!(config.inference.provider, InferenceProviderKind::Qwen3Local);
         assert_eq!(
             config.inference.model.as_deref(),
@@ -767,6 +799,9 @@ fallback_to_host_on_unavailable = true
         fs::create_dir_all(aether_dir(workspace)).expect("create .aether");
 
         let raw = r#"
+[general]
+log_level = ""
+
 [inference]
 provider = "mock"
 api_key_env = "CUSTOM_KEY"
@@ -804,6 +839,7 @@ fallback_to_host_on_unavailable = true
         let after = fs::read_to_string(config_path(workspace)).expect("read after");
 
         assert_eq!(before, after);
+        assert_eq!(config.general.log_level, DEFAULT_LOG_LEVEL);
         assert_eq!(config.inference.provider, InferenceProviderKind::Mock);
         assert_eq!(config.inference.api_key_env, "CUSTOM_KEY");
         assert!(!config.storage.mirror_sir_files);
@@ -822,6 +858,7 @@ fallback_to_host_on_unavailable = true
     #[test]
     fn validate_config_reports_ignored_fields() {
         let config = AetherConfig {
+            general: GeneralConfig::default(),
             inference: InferenceConfig {
                 provider: InferenceProviderKind::Auto,
                 model: None,
