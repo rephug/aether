@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -145,6 +146,7 @@ impl SirPipeline {
             return Ok(());
         }
 
+        let commit_hash = resolve_workspace_head_commit(&self.workspace_root);
         let now_ts = unix_timestamp_secs();
 
         for symbol in &changed_symbols {
@@ -178,6 +180,7 @@ impl SirPipeline {
                             &self.model_name,
                             &canonical_json,
                             attempted_at,
+                            commit_hash.as_deref(),
                         )
                         .with_context(|| {
                             format!("failed to record SIR history for {}", generated.symbol.id)
@@ -560,6 +563,32 @@ async fn generate_sir_with_retries(
 
 fn flatten_error_line(message: &str) -> String {
     message.lines().next().unwrap_or(message).to_owned()
+}
+
+fn resolve_workspace_head_commit(workspace_root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg("HEAD")
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let raw = String::from_utf8(output.stdout).ok()?;
+    let normalized = raw.trim().to_ascii_lowercase();
+    is_valid_commit_hash(&normalized).then_some(normalized)
+}
+
+fn is_valid_commit_hash(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn unix_timestamp_secs() -> i64 {

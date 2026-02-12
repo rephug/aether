@@ -41,6 +41,7 @@ pub struct SirHistoryRecord {
     pub model: String,
     pub created_at: i64,
     pub sir_json: String,
+    pub commit_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +118,7 @@ pub trait Store {
     fn upsert_sir_meta(&self, record: SirMetaRecord) -> Result<(), StoreError>;
     fn get_sir_meta(&self, symbol_id: &str) -> Result<Option<SirMetaRecord>, StoreError>;
     fn list_sir_history(&self, symbol_id: &str) -> Result<Vec<SirHistoryRecord>, StoreError>;
+    #[allow(clippy::too_many_arguments)]
     fn record_sir_version_if_changed(
         &self,
         symbol_id: &str,
@@ -125,6 +127,7 @@ pub trait Store {
         model: &str,
         sir_json: &str,
         created_at: i64,
+        commit_hash: Option<&str>,
     ) -> Result<SirVersionWriteResult, StoreError>;
 
     fn upsert_symbol_embedding(&self, record: SymbolEmbeddingRecord) -> Result<(), StoreError>;
@@ -475,7 +478,7 @@ impl Store for SqliteStore {
     fn list_sir_history(&self, symbol_id: &str) -> Result<Vec<SirHistoryRecord>, StoreError> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT symbol_id, version, sir_hash, provider, model, created_at, sir_json
+            SELECT symbol_id, version, sir_hash, provider, model, created_at, sir_json, commit_hash
             FROM sir_history
             WHERE symbol_id = ?1
             ORDER BY version ASC
@@ -491,6 +494,7 @@ impl Store for SqliteStore {
                 model: row.get(4)?,
                 created_at: row.get(5)?,
                 sir_json: row.get(6)?,
+                commit_hash: row.get(7)?,
             })
         })?;
 
@@ -498,6 +502,7 @@ impl Store for SqliteStore {
         Ok(records)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_sir_version_if_changed(
         &self,
         symbol_id: &str,
@@ -506,8 +511,10 @@ impl Store for SqliteStore {
         model: &str,
         sir_json: &str,
         created_at: i64,
+        commit_hash: Option<&str>,
     ) -> Result<SirVersionWriteResult, StoreError> {
         let created_at = created_at.max(0);
+        let commit_hash = normalize_commit_hash(commit_hash);
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
 
         let result = (|| -> Result<SirVersionWriteResult, StoreError> {
@@ -544,9 +551,9 @@ impl Store for SqliteStore {
                 self.conn.execute(
                     r#"
                     INSERT INTO sir_history (
-                        symbol_id, version, sir_hash, provider, model, created_at, sir_json
+                        symbol_id, version, sir_hash, provider, model, created_at, sir_json, commit_hash
                     )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                     "#,
                     params![
                         symbol_id,
@@ -556,6 +563,7 @@ impl Store for SqliteStore {
                         model,
                         created_at,
                         sir_json,
+                        commit_hash.as_deref(),
                     ],
                 )?;
 
@@ -569,11 +577,19 @@ impl Store for SqliteStore {
             self.conn.execute(
                 r#"
                 INSERT INTO sir_history (
-                    symbol_id, version, sir_hash, provider, model, created_at, sir_json
+                    symbol_id, version, sir_hash, provider, model, created_at, sir_json, commit_hash
                 )
-                VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6)
+                VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, ?7)
                 "#,
-                params![symbol_id, sir_hash, provider, model, created_at, sir_json],
+                params![
+                    symbol_id,
+                    sir_hash,
+                    provider,
+                    model,
+                    created_at,
+                    sir_json,
+                    commit_hash.as_deref(),
+                ],
             )?;
 
             Ok(SirVersionWriteResult {
@@ -784,6 +800,13 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
             model TEXT NOT NULL,
             created_at INTEGER NOT NULL CHECK (created_at >= 0),
             sir_json TEXT NOT NULL,
+            commit_hash TEXT CHECK (
+                commit_hash IS NULL
+                OR (
+                    LENGTH(commit_hash) = 40
+                    AND commit_hash NOT GLOB '*[^0-9a-f]*'
+                )
+            ),
             PRIMARY KEY (symbol_id, version)
         );
 
@@ -815,6 +838,7 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
     ensure_sir_column(conn, "sir_status", "TEXT NOT NULL DEFAULT 'fresh'")?;
     ensure_sir_column(conn, "last_error", "TEXT")?;
     ensure_sir_column(conn, "last_attempt_at", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_sir_history_column(conn, "commit_hash", "TEXT")?;
 
     conn.execute(
         "UPDATE sir SET sir_status = 'fresh' WHERE COALESCE(TRIM(sir_status), '') = ''",
@@ -826,7 +850,9 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
     )?;
     conn.execute(
         r#"
-        INSERT INTO sir_history (symbol_id, version, sir_hash, provider, model, created_at, sir_json)
+        INSERT INTO sir_history (
+            symbol_id, version, sir_hash, provider, model, created_at, sir_json, commit_hash
+        )
         SELECT
             s.id,
             CASE WHEN s.sir_version > 0 THEN s.sir_version ELSE 1 END,
@@ -834,7 +860,8 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
             s.provider,
             s.model,
             CASE WHEN s.updated_at > 0 THEN s.updated_at ELSE unixepoch() END,
-            s.sir_json
+            s.sir_json,
+            NULL
         FROM sir s
         WHERE COALESCE(TRIM(s.sir_hash), '') <> ''
           AND COALESCE(TRIM(s.sir_json), '') <> ''
@@ -862,6 +889,20 @@ fn ensure_sir_column(
     Ok(())
 }
 
+fn ensure_sir_history_column(
+    conn: &Connection,
+    column_name: &str,
+    column_definition: &str,
+) -> Result<(), StoreError> {
+    if table_has_column(conn, "sir_history", column_name)? {
+        return Ok(());
+    }
+
+    let sql = format!("ALTER TABLE sir_history ADD COLUMN {column_name} {column_definition}");
+    conn.execute(&sql, [])?;
+    Ok(())
+}
+
 fn table_has_column(
     conn: &Connection,
     table_name: &str,
@@ -878,6 +919,21 @@ fn table_has_column(
     }
 
     Ok(false)
+}
+
+fn normalize_commit_hash(commit_hash: Option<&str>) -> Option<String> {
+    let value = commit_hash?.trim();
+    if value.len() != 40 {
+        return None;
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+
+    Some(value.to_owned())
 }
 
 #[cfg(test)]
@@ -1113,6 +1169,7 @@ mod tests {
                 "mock",
                 "{\"intent\":\"v1\"}",
                 1_700_222_100,
+                Some("1111111111111111111111111111111111111111"),
             )
             .expect("insert history v1");
         assert!(first.changed);
@@ -1126,6 +1183,7 @@ mod tests {
                 "mock",
                 "{\"intent\":\"v1\"}",
                 1_700_222_101,
+                Some("1111111111111111111111111111111111111111"),
             )
             .expect("dedupe by hash");
         assert!(!duplicate.changed);
@@ -1140,6 +1198,7 @@ mod tests {
                 "mock",
                 "{\"intent\":\"v2\"}",
                 1_700_222_200,
+                Some("2222222222222222222222222222222222222222"),
             )
             .expect("insert history v2");
         assert!(second.changed);
@@ -1151,8 +1210,16 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].version, 1);
         assert_eq!(history[0].sir_hash, "hash-1");
+        assert_eq!(
+            history[0].commit_hash.as_deref(),
+            Some("1111111111111111111111111111111111111111")
+        );
         assert_eq!(history[1].version, 2);
         assert_eq!(history[1].sir_hash, "hash-2");
+        assert_eq!(
+            history[1].commit_hash.as_deref(),
+            Some("2222222222222222222222222222222222222222")
+        );
 
         drop(store);
 
@@ -1216,6 +1283,7 @@ mirror_sir_files = false
                 "mock",
                 "{\"intent\":\"to-remove\"}",
                 1_700_111_000,
+                None,
             )
             .expect("insert history before delete");
         store.mark_removed("sym-1").expect("mark removed");
@@ -1357,6 +1425,7 @@ mirror_sir_files = false
         assert_eq!(history[0].sir_hash, "legacy-hash");
         assert_eq!(history[0].sir_json, "{\"intent\":\"legacy\"}");
         assert_eq!(history[0].created_at, 1_700_222_333);
+        assert_eq!(history[0].commit_hash, None);
     }
 
     #[test]
