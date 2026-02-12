@@ -45,6 +45,18 @@ pub struct SirHistoryRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SirHistorySelector {
+    Version(i64),
+    CreatedAt(i64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SirHistoryResolvedPair {
+    pub from: SirHistoryRecord,
+    pub to: SirHistoryRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SirVersionWriteResult {
     pub version: i64,
     pub updated_at: i64,
@@ -118,6 +130,16 @@ pub trait Store {
     fn upsert_sir_meta(&self, record: SirMetaRecord) -> Result<(), StoreError>;
     fn get_sir_meta(&self, symbol_id: &str) -> Result<Option<SirMetaRecord>, StoreError>;
     fn list_sir_history(&self, symbol_id: &str) -> Result<Vec<SirHistoryRecord>, StoreError>;
+    fn latest_sir_history_pair(
+        &self,
+        symbol_id: &str,
+    ) -> Result<Option<SirHistoryResolvedPair>, StoreError>;
+    fn resolve_sir_history_pair(
+        &self,
+        symbol_id: &str,
+        from: SirHistorySelector,
+        to: SirHistorySelector,
+    ) -> Result<Option<SirHistoryResolvedPair>, StoreError>;
     #[allow(clippy::too_many_arguments)]
     fn record_sir_version_if_changed(
         &self,
@@ -500,6 +522,45 @@ impl Store for SqliteStore {
 
         let records = rows.collect::<Result<Vec<_>, _>>()?;
         Ok(records)
+    }
+
+    fn latest_sir_history_pair(
+        &self,
+        symbol_id: &str,
+    ) -> Result<Option<SirHistoryResolvedPair>, StoreError> {
+        let history = self.list_sir_history(symbol_id)?;
+        let Some(latest) = history.last().cloned() else {
+            return Ok(None);
+        };
+        let from = history
+            .get(history.len().saturating_sub(2))
+            .cloned()
+            .unwrap_or_else(|| latest.clone());
+
+        Ok(Some(SirHistoryResolvedPair { from, to: latest }))
+    }
+
+    fn resolve_sir_history_pair(
+        &self,
+        symbol_id: &str,
+        from: SirHistorySelector,
+        to: SirHistorySelector,
+    ) -> Result<Option<SirHistoryResolvedPair>, StoreError> {
+        let history = self.list_sir_history(symbol_id)?;
+        let from_idx = resolve_history_selector_index(&history, &from);
+        let to_idx = resolve_history_selector_index(&history, &to);
+
+        let (Some(from_idx), Some(to_idx)) = (from_idx, to_idx) else {
+            return Ok(None);
+        };
+        if from_idx > to_idx {
+            return Ok(None);
+        }
+
+        Ok(Some(SirHistoryResolvedPair {
+            from: history[from_idx].clone(),
+            to: history[to_idx].clone(),
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -936,6 +997,23 @@ fn normalize_commit_hash(commit_hash: Option<&str>) -> Option<String> {
     Some(value.to_owned())
 }
 
+fn resolve_history_selector_index(
+    history: &[SirHistoryRecord],
+    selector: &SirHistorySelector,
+) -> Option<usize> {
+    match selector {
+        SirHistorySelector::Version(version) => {
+            history.iter().position(|record| record.version == *version)
+        }
+        SirHistorySelector::CreatedAt(created_at) => history
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| record.created_at <= *created_at)
+            .map(|(idx, _)| idx)
+            .next_back(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1228,6 +1306,123 @@ mod tests {
             .list_sir_history("sym-history")
             .expect("list history after reopen");
         assert_eq!(reopened_history, history);
+    }
+
+    #[test]
+    fn resolve_sir_history_pair_supports_versions_and_timestamps() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let store = SqliteStore::open(workspace).expect("open store");
+
+        store
+            .record_sir_version_if_changed(
+                "sym-history",
+                "hash-1",
+                "mock",
+                "mock",
+                "{\"intent\":\"v1\"}",
+                1_700_300_100,
+                Some("1111111111111111111111111111111111111111"),
+            )
+            .expect("insert history v1");
+        store
+            .record_sir_version_if_changed(
+                "sym-history",
+                "hash-2",
+                "mock",
+                "mock",
+                "{\"intent\":\"v2\"}",
+                1_700_300_200,
+                Some("2222222222222222222222222222222222222222"),
+            )
+            .expect("insert history v2");
+
+        let by_version = store
+            .resolve_sir_history_pair(
+                "sym-history",
+                SirHistorySelector::Version(1),
+                SirHistorySelector::Version(2),
+            )
+            .expect("resolve by version")
+            .expect("pair should exist");
+        assert_eq!(by_version.from.version, 1);
+        assert_eq!(by_version.to.version, 2);
+        assert_eq!(
+            by_version.from.commit_hash.as_deref(),
+            Some("1111111111111111111111111111111111111111")
+        );
+        assert_eq!(
+            by_version.to.commit_hash.as_deref(),
+            Some("2222222222222222222222222222222222222222")
+        );
+
+        let by_timestamp = store
+            .resolve_sir_history_pair(
+                "sym-history",
+                SirHistorySelector::CreatedAt(1_700_300_150),
+                SirHistorySelector::CreatedAt(1_700_300_250),
+            )
+            .expect("resolve by timestamp")
+            .expect("timestamp pair should exist");
+        assert_eq!(by_timestamp.from.version, 1);
+        assert_eq!(by_timestamp.to.version, 2);
+
+        let unresolved = store
+            .resolve_sir_history_pair(
+                "sym-history",
+                SirHistorySelector::Version(2),
+                SirHistorySelector::Version(1),
+            )
+            .expect("resolve reversed pair");
+        assert!(unresolved.is_none());
+    }
+
+    #[test]
+    fn latest_sir_history_pair_handles_empty_single_and_multiple_history() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let store = SqliteStore::open(workspace).expect("open store");
+
+        let empty = store
+            .latest_sir_history_pair("missing")
+            .expect("query empty history");
+        assert!(empty.is_none());
+
+        store
+            .record_sir_version_if_changed(
+                "sym-latest",
+                "hash-1",
+                "mock",
+                "mock",
+                "{\"intent\":\"v1\"}",
+                1_700_310_100,
+                None,
+            )
+            .expect("insert single version");
+        let single = store
+            .latest_sir_history_pair("sym-latest")
+            .expect("query single history")
+            .expect("single pair");
+        assert_eq!(single.from.version, 1);
+        assert_eq!(single.to.version, 1);
+
+        store
+            .record_sir_version_if_changed(
+                "sym-latest",
+                "hash-2",
+                "mock",
+                "mock",
+                "{\"intent\":\"v2\"}",
+                1_700_310_200,
+                None,
+            )
+            .expect("insert second version");
+        let multiple = store
+            .latest_sir_history_pair("sym-latest")
+            .expect("query multiple history")
+            .expect("multiple pair");
+        assert_eq!(multiple.from.version, 1);
+        assert_eq!(multiple.to.version, 2);
     }
 
     #[test]
