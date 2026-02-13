@@ -1,11 +1,10 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aether_core::{Position, SourceRange, Symbol, SymbolChangeEvent};
+use aether_core::{GitContext, Position, SourceRange, Symbol, SymbolChangeEvent};
 use aether_infer::{
     EmbeddingProvider, EmbeddingProviderOverrides, InferenceProvider, ProviderOverrides,
     SirContext, load_embedding_provider_from_config, load_provider_from_env_or_mock,
@@ -577,29 +576,7 @@ fn flatten_error_line(message: &str) -> String {
 }
 
 fn resolve_workspace_head_commit(workspace_root: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(workspace_root)
-        .arg("rev-parse")
-        .arg("--verify")
-        .arg("HEAD")
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let raw = String::from_utf8(output.stdout).ok()?;
-    let normalized = raw.trim().to_ascii_lowercase();
-    is_valid_commit_hash(&normalized).then_some(normalized)
-}
-
-fn is_valid_commit_hash(value: &str) -> bool {
-    value.len() == 40
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    GitContext::open(workspace_root).and_then(|context| context.head_commit_hash())
 }
 
 fn unix_timestamp_secs() -> i64 {

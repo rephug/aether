@@ -4,6 +4,10 @@ use std::str::FromStr;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+pub mod git;
+
+pub use git::{BlameLine, CommitInfo, GitContext};
+
 pub type SymbolId = String;
 pub const NO_SIR_MESSAGE: &str =
     "AETHER: No SIR yet for this symbol. Run aetherd indexing and try again.";
