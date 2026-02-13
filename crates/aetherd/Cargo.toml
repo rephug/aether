@@ -28,6 +28,6 @@ tracing-subscriber.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]
-async-trait = "0.1"
+async-trait.workspace = true
 tempfile.workspace = true
 tower-lsp = "0.20"

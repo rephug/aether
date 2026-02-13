@@ -11,7 +11,10 @@ use aether_infer::{
     SirContext, load_embedding_provider_from_config, load_provider_from_env_or_mock,
 };
 use aether_sir::{SirAnnotation, canonicalize_sir_json, sir_hash};
-use aether_store::{SirMetaRecord, SqliteStore, Store, SymbolEmbeddingRecord, SymbolRecord};
+use aether_store::{
+    SirMetaRecord, SqliteStore, Store, SymbolEmbeddingRecord, SymbolRecord, VectorStore,
+    open_vector_store,
+};
 use anyhow::{Context, Result, anyhow};
 use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
@@ -34,6 +37,7 @@ pub struct SirPipeline {
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     embedding_provider_name: Option<String>,
     embedding_model_name: Option<String>,
+    vector_store: Arc<dyn VectorStore>,
     runtime: Runtime,
     sir_concurrency: usize,
 }
@@ -108,6 +112,9 @@ impl SirPipeline {
             .map_or((None, None), |identity| {
                 (Some(identity.0), Some(identity.1))
             });
+        let vector_store = runtime
+            .block_on(open_vector_store(&workspace_root))
+            .context("failed to initialize vector store")?;
 
         Ok(Self {
             workspace_root,
@@ -117,6 +124,7 @@ impl SirPipeline {
             embedding_provider,
             embedding_provider_name,
             embedding_model_name,
+            vector_store,
             runtime,
             sir_concurrency: concurrency,
         })
@@ -133,6 +141,9 @@ impl SirPipeline {
             store
                 .mark_removed(&symbol.id)
                 .with_context(|| format!("failed to mark symbol removed: {}", symbol.id))?;
+            self.runtime
+                .block_on(self.vector_store.delete_embedding(&symbol.id))
+                .with_context(|| format!("failed to remove vector embedding for {}", symbol.id))?;
         }
 
         let changed_symbols: Vec<Symbol> = event
@@ -211,7 +222,6 @@ impl SirPipeline {
                         })?;
 
                     if let Err(err) = self.refresh_embedding_if_needed(
-                        store,
                         &generated.symbol.id,
                         &sir_hash_value,
                         &canonical_json,
@@ -299,7 +309,6 @@ impl SirPipeline {
 
     fn refresh_embedding_if_needed(
         &self,
-        store: &SqliteStore,
         symbol_id: &str,
         sir_hash_value: &str,
         canonical_json: &str,
@@ -321,8 +330,9 @@ impl SirPipeline {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("mock");
 
-        let existing_meta = store
-            .get_symbol_embedding_meta(symbol_id)
+        let existing_meta = self
+            .runtime
+            .block_on(self.vector_store.get_embedding_meta(symbol_id))
             .with_context(|| format!("failed to read embedding metadata for {symbol_id}"))?;
         if let Some(existing_meta) = existing_meta
             && existing_meta.sir_hash == sir_hash_value
@@ -342,15 +352,15 @@ impl SirPipeline {
         }
 
         let updated_at = unix_timestamp_secs();
-        store
-            .upsert_symbol_embedding(SymbolEmbeddingRecord {
+        self.runtime
+            .block_on(self.vector_store.upsert_embedding(SymbolEmbeddingRecord {
                 symbol_id: symbol_id.to_owned(),
                 sir_hash: sir_hash_value.to_owned(),
                 provider: provider_name.to_owned(),
                 model: model_name.to_owned(),
                 embedding,
                 updated_at,
-            })
+            }))
             .with_context(|| format!("failed to store embedding for {symbol_id}"))?;
 
         if print_sir {

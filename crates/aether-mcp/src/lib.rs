@@ -15,8 +15,8 @@ use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_conf
 use aether_parse::{SymbolExtractor, language_for_path};
 use aether_sir::{SirAnnotation, SirError, canonicalize_sir_json, sir_hash, validate_sir};
 use aether_store::{
-    SemanticSearchResult, SirHistorySelector, SirMetaRecord, SqliteStore, Store, StoreError,
-    SymbolSearchResult,
+    SirHistorySelector, SirMetaRecord, SqliteStore, Store, StoreError, SymbolSearchResult,
+    open_vector_store,
 };
 use aetherd::verification::{VerificationRequest, run_verification};
 use anyhow::Result;
@@ -368,19 +368,6 @@ impl From<SymbolSearchResult> for AetherSymbolLookupMatch {
             language: value.language,
             kind: value.kind,
             semantic_score: None,
-        }
-    }
-}
-
-impl From<SemanticSearchResult> for AetherSymbolLookupMatch {
-    fn from(value: SemanticSearchResult) -> Self {
-        Self {
-            symbol_id: value.symbol_id,
-            qualified_name: value.qualified_name,
-            file_path: value.file_path,
-            language: value.language,
-            kind: value.kind,
-            semantic_score: Some(value.semantic_score),
         }
     }
 }
@@ -798,13 +785,38 @@ impl AetherMcpServer {
             ));
         }
 
+        let vector_store = open_vector_store(&self.workspace).await?;
+        let candidates = vector_store
+            .search_nearest(
+                &query_embedding,
+                &loaded.provider_name,
+                &loaded.model_name,
+                limit,
+            )
+            .await?;
+        if candidates.is_empty() {
+            return Ok((
+                Vec::new(),
+                Some(SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY.to_owned()),
+            ));
+        }
+
         let store = SqliteStore::open(&self.workspace)?;
-        let matches = store.search_symbols_semantic(
-            &query_embedding,
-            &loaded.provider_name,
-            &loaded.model_name,
-            limit,
-        )?;
+        let mut matches = Vec::new();
+        for candidate in candidates {
+            let Some(symbol) = store.get_symbol_search_result(&candidate.symbol_id)? else {
+                continue;
+            };
+
+            matches.push(AetherSymbolLookupMatch {
+                symbol_id: symbol.symbol_id,
+                qualified_name: symbol.qualified_name,
+                file_path: symbol.file_path,
+                language: symbol.language,
+                kind: symbol.kind,
+                semantic_score: Some(candidate.semantic_score),
+            });
+        }
         if matches.is_empty() {
             return Ok((
                 Vec::new(),
@@ -812,13 +824,7 @@ impl AetherMcpServer {
             ));
         }
 
-        Ok((
-            matches
-                .into_iter()
-                .map(AetherSymbolLookupMatch::from)
-                .collect(),
-            None,
-        ))
+        Ok((matches, None))
     }
 
     pub fn aether_get_sir_logic(

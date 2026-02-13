@@ -87,6 +87,37 @@ impl std::str::FromStr for EmbeddingProviderKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingVectorBackend {
+    #[default]
+    Lancedb,
+    Sqlite,
+}
+
+impl EmbeddingVectorBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lancedb => "lancedb",
+            Self::Sqlite => "sqlite",
+        }
+    }
+}
+
+impl std::str::FromStr for EmbeddingVectorBackend {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "lancedb" => Ok(Self::Lancedb),
+            "sqlite" => Ok(Self::Sqlite),
+            other => Err(format!(
+                "invalid vector backend '{other}', expected one of: lancedb, sqlite"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AetherConfig {
     #[serde(default)]
@@ -158,6 +189,8 @@ pub struct EmbeddingsConfig {
     pub enabled: bool,
     #[serde(default)]
     pub provider: EmbeddingProviderKind,
+    #[serde(default)]
+    pub vector_backend: EmbeddingVectorBackend,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -169,6 +202,7 @@ impl Default for EmbeddingsConfig {
         Self {
             enabled: default_embeddings_enabled(),
             provider: EmbeddingProviderKind::Mock,
+            vector_backend: EmbeddingVectorBackend::Lancedb,
             model: None,
             endpoint: None,
         }
@@ -669,6 +703,7 @@ mod tests {
         assert!(content.contains("[embeddings]"));
         assert!(content.contains("enabled = false"));
         assert!(content.contains("provider = \"mock\""));
+        assert!(content.contains("vector_backend = \"lancedb\""));
         assert!(content.contains("[verify]"));
         assert!(content.contains("commands = ["));
         assert!(content.contains("mode = \"host\""));
@@ -707,6 +742,7 @@ mirror_sir_files = false
 [embeddings]
 enabled = true
 provider = "qwen3_local"
+vector_backend = "sqlite"
 model = "qwen3-embeddings-4B"
 endpoint = "http://127.0.0.1:11434/api/embeddings"
 
@@ -755,6 +791,10 @@ fallback_to_host_on_unavailable = true
         assert_eq!(
             config.embeddings.provider,
             EmbeddingProviderKind::Qwen3Local
+        );
+        assert_eq!(
+            config.embeddings.vector_backend,
+            EmbeddingVectorBackend::Sqlite
         );
         assert_eq!(
             config.embeddings.model.as_deref(),
@@ -812,6 +852,7 @@ mirror_sir_files = false
 [embeddings]
 enabled = true
 provider = "qwen3_local"
+vector_backend = "sqlite"
 model = "qwen3-embeddings-4B"
 
 [verify]
@@ -848,6 +889,10 @@ fallback_to_host_on_unavailable = true
             config.embeddings.provider,
             EmbeddingProviderKind::Qwen3Local
         );
+        assert_eq!(
+            config.embeddings.vector_backend,
+            EmbeddingVectorBackend::Sqlite
+        );
         assert_eq!(config.verify.commands, vec!["cargo --version".to_owned()]);
         assert_eq!(config.verify.mode, VerifyMode::Container);
         assert!(config.verify.container.fallback_to_host_on_unavailable);
@@ -871,6 +916,7 @@ fallback_to_host_on_unavailable = true
             embeddings: EmbeddingsConfig {
                 enabled: false,
                 provider: EmbeddingProviderKind::Mock,
+                vector_backend: EmbeddingVectorBackend::Lancedb,
                 model: Some("mock-x".to_owned()),
                 endpoint: Some("http://127.0.0.1:11434/api/embeddings".to_owned()),
             },

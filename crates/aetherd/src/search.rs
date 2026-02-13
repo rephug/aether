@@ -8,7 +8,7 @@ use aether_core::{
     SearchEnvelope,
 };
 use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
-use aether_store::{SemanticSearchResult, SqliteStore, Store, SymbolSearchResult};
+use aether_store::{SqliteStore, Store, SymbolSearchResult, open_vector_store};
 use anyhow::{Context, Result};
 use serde_json::json;
 
@@ -239,13 +239,16 @@ fn semantic_search(
         ));
     }
 
-    let matches = store
-        .search_symbols_semantic(
+    let vector_store = runtime
+        .block_on(open_vector_store(workspace))
+        .context("failed to open vector store")?;
+    let matches = runtime
+        .block_on(vector_store.search_nearest(
             &query_embedding,
             &loaded.provider_name,
             &loaded.model_name,
             limit,
-        )
+        ))
         .context("failed to run semantic symbol search")?;
     if matches.is_empty() {
         return Ok((
@@ -254,10 +257,38 @@ fn semantic_search(
         ));
     }
 
-    Ok((
-        matches.into_iter().map(SearchResultRow::from).collect(),
-        None,
-    ))
+    let mut semantic_rows = Vec::new();
+    for candidate in matches {
+        let Some(symbol) = store
+            .get_symbol_search_result(&candidate.symbol_id)
+            .with_context(|| {
+                format!(
+                    "failed to resolve semantic search symbol {}",
+                    candidate.symbol_id
+                )
+            })?
+        else {
+            continue;
+        };
+
+        semantic_rows.push(SearchResultRow {
+            symbol_id: symbol.symbol_id,
+            qualified_name: symbol.qualified_name,
+            file_path: symbol.file_path,
+            language: symbol.language,
+            kind: symbol.kind,
+            semantic_score: Some(candidate.semantic_score),
+        });
+    }
+
+    if semantic_rows.is_empty() {
+        return Ok((
+            Vec::new(),
+            Some(SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY.to_owned()),
+        ));
+    }
+
+    Ok((semantic_rows, None))
 }
 
 fn fuse_hybrid_results(
@@ -322,19 +353,6 @@ impl From<SymbolSearchResult> for SearchResultRow {
     }
 }
 
-impl From<SemanticSearchResult> for SearchResultRow {
-    fn from(value: SemanticSearchResult) -> Self {
-        Self {
-            symbol_id: value.symbol_id,
-            qualified_name: value.qualified_name,
-            file_path: value.file_path,
-            language: value.language,
-            kind: value.kind,
-            semantic_score: Some(value.semantic_score),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -346,7 +364,7 @@ mod tests {
     use super::*;
     use crate::observer::ObserverState;
     use crate::sir_pipeline::SirPipeline;
-    use aether_store::SymbolRecord;
+    use aether_store::{SymbolEmbeddingRecord, SymbolRecord, open_vector_store};
 
     #[test]
     fn write_search_results_outputs_stable_header_and_columns() {
@@ -518,6 +536,245 @@ mod tests {
     }
 
     #[test]
+    fn lancedb_vector_store_round_trip_with_mock_embeddings() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_enabled_config_with_backend(workspace, "lancedb");
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        store
+            .upsert_symbol(SymbolRecord {
+                id: "sym-auth".to_owned(),
+                file_path: "src/auth.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "demo::auth_token_refresh".to_owned(),
+                signature_fingerprint: "sig-auth".to_owned(),
+                last_seen_at: 1_700_000_000,
+            })
+            .expect("upsert auth symbol");
+        store
+            .upsert_symbol(SymbolRecord {
+                id: "sym-cache".to_owned(),
+                file_path: "src/cache.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "demo::cache_lookup".to_owned(),
+                signature_fingerprint: "sig-cache".to_owned(),
+                last_seen_at: 1_700_000_000,
+            })
+            .expect("upsert cache symbol");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let vector_store = runtime
+            .block_on(open_vector_store(workspace))
+            .expect("open lancedb vector store");
+
+        runtime
+            .block_on(vector_store.upsert_embedding(SymbolEmbeddingRecord {
+                symbol_id: "sym-auth".to_owned(),
+                sir_hash: "hash-auth".to_owned(),
+                provider: "mock".to_owned(),
+                model: "mock-64d".to_owned(),
+                embedding: vec![1.0, 0.0],
+                updated_at: 1_700_000_200,
+            }))
+            .expect("upsert auth embedding");
+        runtime
+            .block_on(vector_store.upsert_embedding(SymbolEmbeddingRecord {
+                symbol_id: "sym-cache".to_owned(),
+                sir_hash: "hash-cache".to_owned(),
+                provider: "mock".to_owned(),
+                model: "mock-64d".to_owned(),
+                embedding: vec![0.0, 1.0],
+                updated_at: 1_700_000_201,
+            }))
+            .expect("upsert cache embedding");
+
+        let matches = runtime
+            .block_on(vector_store.search_nearest(&[1.0, 0.0], "mock", "mock-64d", 10))
+            .expect("search nearest");
+        assert!(!matches.is_empty());
+        assert_eq!(matches[0].symbol_id, "sym-auth");
+
+        let meta = runtime
+            .block_on(vector_store.get_embedding_meta("sym-auth"))
+            .expect("meta lookup")
+            .expect("meta exists");
+        assert_eq!(meta.embedding_dim, 2);
+        assert_eq!(meta.provider, "mock");
+        assert_eq!(meta.model, "mock-64d");
+    }
+
+    #[test]
+    fn lancedb_search_returns_expected_top_k_ordering() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_enabled_config_with_backend(workspace, "lancedb");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let vector_store = runtime
+            .block_on(open_vector_store(workspace))
+            .expect("open lancedb vector store");
+
+        for (symbol_id, embedding) in [
+            ("sym-1", vec![1.0, 0.0]),
+            ("sym-2", vec![0.9, 0.1]),
+            ("sym-3", vec![0.0, 1.0]),
+        ] {
+            runtime
+                .block_on(vector_store.upsert_embedding(SymbolEmbeddingRecord {
+                    symbol_id: symbol_id.to_owned(),
+                    sir_hash: format!("hash-{symbol_id}"),
+                    provider: "mock".to_owned(),
+                    model: "mock-64d".to_owned(),
+                    embedding,
+                    updated_at: 1_700_001_000,
+                }))
+                .expect("upsert embedding");
+        }
+
+        let matches = runtime
+            .block_on(vector_store.search_nearest(&[1.0, 0.0], "mock", "mock-64d", 2))
+            .expect("search nearest");
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].symbol_id, "sym-1");
+        assert_eq!(matches[1].symbol_id, "sym-2");
+    }
+
+    #[test]
+    fn lancedb_migrates_existing_sqlite_embeddings() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_enabled_config_with_backend(workspace, "lancedb");
+
+        let store = SqliteStore::open(workspace).expect("open sqlite store");
+        store
+            .upsert_symbol(SymbolRecord {
+                id: "sym-1".to_owned(),
+                file_path: "src/lib.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "demo::one".to_owned(),
+                signature_fingerprint: "sig-1".to_owned(),
+                last_seen_at: 1_700_000_000,
+            })
+            .expect("upsert first symbol");
+        store
+            .upsert_symbol(SymbolRecord {
+                id: "sym-2".to_owned(),
+                file_path: "src/lib.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "demo::two".to_owned(),
+                signature_fingerprint: "sig-2".to_owned(),
+                last_seen_at: 1_700_000_000,
+            })
+            .expect("upsert second symbol");
+        store
+            .upsert_symbol_embedding(SymbolEmbeddingRecord {
+                symbol_id: "sym-1".to_owned(),
+                sir_hash: "hash-1".to_owned(),
+                provider: "mock".to_owned(),
+                model: "mock-64d".to_owned(),
+                embedding: vec![1.0, 0.0],
+                updated_at: 1_700_000_100,
+            })
+            .expect("upsert sqlite embedding one");
+        store
+            .upsert_symbol_embedding(SymbolEmbeddingRecord {
+                symbol_id: "sym-2".to_owned(),
+                sir_hash: "hash-2".to_owned(),
+                provider: "mock".to_owned(),
+                model: "mock-64d".to_owned(),
+                embedding: vec![0.0, 1.0],
+                updated_at: 1_700_000_100,
+            })
+            .expect("upsert sqlite embedding two");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let vector_store = runtime
+            .block_on(open_vector_store(workspace))
+            .expect("open lancedb vector store");
+
+        let matches = runtime
+            .block_on(vector_store.search_nearest(&[1.0, 0.0], "mock", "mock-64d", 10))
+            .expect("search migrated embeddings");
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].symbol_id, "sym-1");
+
+        let first = runtime
+            .block_on(vector_store.get_embedding_meta("sym-1"))
+            .expect("get migrated meta")
+            .expect("migrated meta exists");
+        let second = runtime
+            .block_on(vector_store.get_embedding_meta("sym-2"))
+            .expect("get migrated meta")
+            .expect("migrated meta exists");
+        assert_eq!(first.sir_hash, "hash-1");
+        assert_eq!(second.sir_hash, "hash-2");
+    }
+
+    #[test]
+    fn vector_backend_toggle_between_sqlite_and_lancedb() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_enabled_config_with_backend(workspace, "sqlite");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let sqlite_backend = runtime
+            .block_on(open_vector_store(workspace))
+            .expect("open sqlite vector store");
+        SqliteStore::open(workspace)
+            .expect("open sqlite store")
+            .upsert_symbol(SymbolRecord {
+                id: "sym-toggle".to_owned(),
+                file_path: "src/lib.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "demo::toggle".to_owned(),
+                signature_fingerprint: "sig-toggle".to_owned(),
+                last_seen_at: 1_700_000_300,
+            })
+            .expect("upsert toggle symbol");
+        runtime
+            .block_on(sqlite_backend.upsert_embedding(SymbolEmbeddingRecord {
+                symbol_id: "sym-toggle".to_owned(),
+                sir_hash: "hash-toggle".to_owned(),
+                provider: "mock".to_owned(),
+                model: "mock-64d".to_owned(),
+                embedding: vec![1.0, 0.0],
+                updated_at: 1_700_000_300,
+            }))
+            .expect("upsert sqlite backend");
+        let sqlite_matches = runtime
+            .block_on(sqlite_backend.search_nearest(&[1.0, 0.0], "mock", "mock-64d", 5))
+            .expect("sqlite search");
+        assert_eq!(sqlite_matches[0].symbol_id, "sym-toggle");
+
+        write_embeddings_enabled_config_with_backend(workspace, "lancedb");
+        let lance_backend = runtime
+            .block_on(open_vector_store(workspace))
+            .expect("open lancedb vector store");
+        let lance_matches = runtime
+            .block_on(lance_backend.search_nearest(&[1.0, 0.0], "mock", "mock-64d", 5))
+            .expect("lancedb search");
+        assert_eq!(lance_matches[0].symbol_id, "sym-toggle");
+    }
+
+    #[test]
     fn semantic_search_falls_back_to_lexical_when_embeddings_disabled() {
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();
@@ -631,10 +888,15 @@ mod tests {
     }
 
     fn write_embeddings_enabled_config(workspace: &Path) {
+        write_embeddings_enabled_config_with_backend(workspace, "sqlite");
+    }
+
+    fn write_embeddings_enabled_config_with_backend(workspace: &Path, vector_backend: &str) {
         fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
         fs::write(
             workspace.join(".aether/config.toml"),
-            r#"[inference]
+            format!(
+                r#"[inference]
 provider = "mock"
 api_key_env = "GEMINI_API_KEY"
 
@@ -644,7 +906,9 @@ mirror_sir_files = true
 [embeddings]
 enabled = true
 provider = "mock"
-"#,
+vector_backend = "{vector_backend}"
+"#
+            ),
         )
         .expect("write config");
     }

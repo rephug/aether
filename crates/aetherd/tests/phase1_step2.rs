@@ -218,6 +218,7 @@ mirror_sir_files = true
 [embeddings]
 enabled = true
 provider = "mock"
+vector_backend = "sqlite"
 "#,
     )?;
 
