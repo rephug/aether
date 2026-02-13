@@ -453,6 +453,61 @@ fn step2_pipeline_creates_new_version_on_hash_change_without_duplicate_on_reinde
 }
 
 #[test]
+fn step2_reindex_replaces_old_dependency_edges() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    fs::create_dir_all(workspace.join("src"))?;
+    let rust_file = workspace.join("src/lib.rs");
+    fs::write(
+        &rust_file,
+        "fn beta() {}\nfn gamma() {}\nfn alpha() { beta(); }\n",
+    )?;
+
+    let mut observer = ObserverState::new(workspace.to_path_buf())?;
+    observer.seed_from_disk()?;
+
+    let store = SqliteStore::open(workspace)?;
+    let provider: Arc<dyn InferenceProvider> = Arc::new(MockProvider);
+    let pipeline =
+        SirPipeline::new_with_provider(workspace.to_path_buf(), 1, provider, "mock", "mock")?;
+
+    let mut sink = Vec::new();
+    for event in observer.initial_symbol_events() {
+        pipeline.process_event(&store, &event, false, &mut sink)?;
+    }
+
+    let alpha = store
+        .list_symbols_for_file("src/lib.rs")?
+        .into_iter()
+        .find(|symbol| symbol.qualified_name == "alpha")
+        .expect("alpha symbol should exist");
+
+    let beta_callers = store.get_callers("beta")?;
+    assert_eq!(beta_callers.len(), 1);
+    assert_eq!(beta_callers[0].source_id, alpha.id);
+
+    fs::write(
+        &rust_file,
+        "fn beta() {}\nfn gamma() {}\nfn alpha() { gamma(); }\n",
+    )?;
+
+    let event = observer
+        .process_path(&rust_file)?
+        .expect("expected update event");
+    pipeline.process_event(&store, &event, false, &mut sink)?;
+
+    let beta_callers_after = store.get_callers("beta")?;
+    assert!(beta_callers_after.is_empty());
+
+    let gamma_callers = store.get_callers("gamma")?;
+    assert_eq!(gamma_callers.len(), 1);
+    assert_eq!(gamma_callers[0].source_id, alpha.id);
+
+    Ok(())
+}
+
+#[test]
 fn step2_sir_history_retrieval_persists_after_restart() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;
     let workspace = temp.path();

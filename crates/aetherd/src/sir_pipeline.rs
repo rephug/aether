@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -9,6 +9,7 @@ use aether_infer::{
     EmbeddingProvider, EmbeddingProviderOverrides, InferenceProvider, ProviderOverrides,
     SirContext, load_embedding_provider_from_config, load_provider_from_env_or_mock,
 };
+use aether_parse::SymbolExtractor;
 use aether_sir::{SirAnnotation, canonicalize_sir_json, sir_hash};
 use aether_store::{
     SirMetaRecord, SqliteStore, Store, SymbolEmbeddingRecord, SymbolRecord, VectorStore,
@@ -144,6 +145,8 @@ impl SirPipeline {
                 .block_on(self.vector_store.delete_embedding(&symbol.id))
                 .with_context(|| format!("failed to remove vector embedding for {}", symbol.id))?;
         }
+
+        self.replace_edges_for_file(store, event)?;
 
         let changed_symbols: Vec<Symbol> = event
             .added
@@ -302,6 +305,37 @@ impl SirPipeline {
                 }
             }
         }
+
+        Ok(())
+    }
+
+    fn replace_edges_for_file(&self, store: &SqliteStore, event: &SymbolChangeEvent) -> Result<()> {
+        store
+            .delete_edges_for_file(&event.file_path)
+            .with_context(|| format!("failed to delete edges for file {}", event.file_path))?;
+
+        let full_path = self.workspace_root.join(&event.file_path);
+        let source = match fs::read_to_string(&full_path) {
+            Ok(source) => source,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to read source for edge extraction {}",
+                        full_path.display()
+                    )
+                });
+            }
+        };
+
+        let mut extractor = SymbolExtractor::new().context("failed to initialize parser")?;
+        let extracted = extractor
+            .extract_with_edges_from_source(event.language, &event.file_path, &source)
+            .with_context(|| format!("failed to extract edges from {}", event.file_path))?;
+
+        store
+            .upsert_edges(&extracted.edges)
+            .with_context(|| format!("failed to upsert edges for file {}", event.file_path))?;
 
         Ok(())
     }
