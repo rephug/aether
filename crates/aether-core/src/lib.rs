@@ -233,6 +233,30 @@ pub struct Symbol {
     pub range: SourceRange,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeKind {
+    Calls,
+    DependsOn,
+}
+
+impl EdgeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Calls => "calls",
+            Self::DependsOn => "depends_on",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolEdge {
+    pub source_id: String,
+    pub target_qualified_name: String,
+    pub edge_kind: EdgeKind,
+    pub file_path: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolChangeEvent {
     pub file_path: String,
@@ -281,6 +305,10 @@ pub fn stable_symbol_id(
 
 pub fn normalize_path(path: &str) -> String {
     path.replace('\\', "/")
+}
+
+pub fn file_source_id(file_path: &str) -> String {
+    format!("file::{}", normalize_path(file_path))
 }
 
 pub fn diff_symbols(

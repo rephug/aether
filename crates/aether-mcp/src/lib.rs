@@ -8,8 +8,9 @@ pub use aether_core::SearchMode;
 use aether_core::{
     HoverMarkdownSections, NO_SIR_MESSAGE, SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR,
     SEARCH_FALLBACK_EMBEDDINGS_DISABLED, SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED,
-    SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY, SearchEnvelope, SourceRange,
-    format_hover_markdown_sections, normalize_path, stable_symbol_id, stale_warning_message,
+    SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY, SearchEnvelope, SourceRange, SymbolEdge,
+    file_source_id, format_hover_markdown_sections, normalize_path, stable_symbol_id,
+    stale_warning_message,
 };
 use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
 use aether_parse::{SymbolExtractor, language_for_path};
@@ -92,6 +93,29 @@ pub struct AetherSymbolLookupResponse {
     pub fallback_reason: Option<String>,
     pub result_count: u32,
     pub matches: Vec<AetherSymbolLookupMatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherDependenciesRequest {
+    pub symbol_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherDependencyEdge {
+    pub source_id: String,
+    pub target_qualified_name: String,
+    pub edge_kind: String,
+    pub file_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherDependenciesResponse {
+    pub symbol_id: String,
+    pub found: bool,
+    pub caller_count: u32,
+    pub dependency_count: u32,
+    pub callers: Vec<AetherDependencyEdge>,
+    pub dependencies: Vec<AetherDependencyEdge>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -372,6 +396,17 @@ impl From<SymbolSearchResult> for AetherSymbolLookupMatch {
     }
 }
 
+impl From<SymbolEdge> for AetherDependencyEdge {
+    fn from(value: SymbolEdge) -> Self {
+        Self {
+            source_id: value.source_id,
+            target_qualified_name: value.target_qualified_name,
+            edge_kind: value.edge_kind.as_str().to_owned(),
+            file_path: value.file_path,
+        }
+    }
+}
+
 impl AetherWhySnapshot {
     fn from_history_record(record: &aether_store::SirHistoryRecord) -> Self {
         Self {
@@ -475,6 +510,66 @@ impl AetherMcpServer {
             limit,
             envelope,
         ))
+    }
+
+    pub fn aether_dependencies_logic(
+        &self,
+        request: AetherDependenciesRequest,
+    ) -> Result<AetherDependenciesResponse, AetherMcpError> {
+        let symbol_id = request.symbol_id.trim();
+        if symbol_id.is_empty() {
+            return Ok(AetherDependenciesResponse {
+                symbol_id: String::new(),
+                found: false,
+                caller_count: 0,
+                dependency_count: 0,
+                callers: Vec::new(),
+                dependencies: Vec::new(),
+            });
+        }
+
+        if !self.sqlite_path().exists() {
+            return Ok(AetherDependenciesResponse {
+                symbol_id: symbol_id.to_owned(),
+                found: false,
+                caller_count: 0,
+                dependency_count: 0,
+                callers: Vec::new(),
+                dependencies: Vec::new(),
+            });
+        }
+
+        let store = SqliteStore::open(&self.workspace)?;
+        let Some(symbol) = store.get_symbol_search_result(symbol_id)? else {
+            return Ok(AetherDependenciesResponse {
+                symbol_id: symbol_id.to_owned(),
+                found: false,
+                caller_count: 0,
+                dependency_count: 0,
+                callers: Vec::new(),
+                dependencies: Vec::new(),
+            });
+        };
+
+        let callers = store
+            .get_callers(&symbol.qualified_name)?
+            .into_iter()
+            .map(AetherDependencyEdge::from)
+            .collect::<Vec<_>>();
+        let dependencies = store
+            .get_dependencies(&file_source_id(&symbol.file_path))?
+            .into_iter()
+            .map(AetherDependencyEdge::from)
+            .collect::<Vec<_>>();
+
+        Ok(AetherDependenciesResponse {
+            symbol_id: symbol_id.to_owned(),
+            found: true,
+            caller_count: callers.len() as u32,
+            dependency_count: dependencies.len() as u32,
+            callers,
+            dependencies,
+        })
     }
 
     pub async fn aether_search_logic(
@@ -1106,6 +1201,20 @@ impl AetherMcpServer {
     ) -> Result<Json<AetherSymbolLookupResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_symbol_lookup");
         self.aether_symbol_lookup_logic(request)
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_dependencies",
+        description = "Get callers and file dependencies for a symbol"
+    )]
+    pub async fn aether_dependencies(
+        &self,
+        Parameters(request): Parameters<AetherDependenciesRequest>,
+    ) -> Result<Json<AetherDependenciesResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_dependencies");
+        self.aether_dependencies_logic(request)
             .map(Json)
             .map_err(to_mcp_error)
     }

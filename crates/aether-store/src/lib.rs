@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use aether_config::load_workspace_config;
+use aether_core::{EdgeKind, SymbolEdge};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::from_str as json_from_str;
 use thiserror::Error;
@@ -131,6 +132,10 @@ pub trait Store {
         query: &str,
         limit: u32,
     ) -> Result<Vec<SymbolSearchResult>, StoreError>;
+    fn upsert_edges(&self, edges: &[SymbolEdge]) -> Result<(), StoreError>;
+    fn get_callers(&self, target_qualified_name: &str) -> Result<Vec<SymbolEdge>, StoreError>;
+    fn get_dependencies(&self, source_id: &str) -> Result<Vec<SymbolEdge>, StoreError>;
+    fn delete_edges_for_file(&self, file_path: &str) -> Result<(), StoreError>;
 
     fn write_sir_blob(&self, symbol_id: &str, sir_json_string: &str) -> Result<(), StoreError>;
     fn read_sir_blob(&self, symbol_id: &str) -> Result<Option<String>, StoreError>;
@@ -403,6 +408,115 @@ impl Store for SqliteStore {
 
         let records = rows.collect::<Result<Vec<_>, _>>()?;
         Ok(records)
+    }
+
+    fn upsert_edges(&self, edges: &[SymbolEdge]) -> Result<(), StoreError> {
+        if edges.is_empty() {
+            return Ok(());
+        }
+
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+
+        let result = (|| -> Result<(), StoreError> {
+            let mut stmt = self.conn.prepare(
+                r#"
+                INSERT INTO symbol_edges (
+                    source_id, target_qualified_name, edge_kind, file_path
+                )
+                VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(source_id, target_qualified_name, edge_kind) DO UPDATE SET
+                    file_path = excluded.file_path
+                "#,
+            )?;
+
+            for edge in edges {
+                stmt.execute(params![
+                    edge.source_id,
+                    edge.target_qualified_name,
+                    edge.edge_kind.as_str(),
+                    edge.file_path,
+                ])?;
+            }
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
+    fn get_callers(&self, target_qualified_name: &str) -> Result<Vec<SymbolEdge>, StoreError> {
+        let target_qualified_name = target_qualified_name.trim();
+        if target_qualified_name.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT source_id, target_qualified_name, file_path
+            FROM symbol_edges
+            WHERE edge_kind = 'calls'
+              AND target_qualified_name = ?1
+            ORDER BY source_id ASC, target_qualified_name ASC, file_path ASC
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![target_qualified_name], |row| {
+            Ok(SymbolEdge {
+                source_id: row.get(0)?,
+                target_qualified_name: row.get(1)?,
+                edge_kind: EdgeKind::Calls,
+                file_path: row.get(2)?,
+            })
+        })?;
+
+        let records = rows.collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    fn get_dependencies(&self, source_id: &str) -> Result<Vec<SymbolEdge>, StoreError> {
+        let source_id = source_id.trim();
+        if source_id.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT source_id, target_qualified_name, file_path
+            FROM symbol_edges
+            WHERE edge_kind = 'depends_on'
+              AND source_id = ?1
+            ORDER BY source_id ASC, target_qualified_name ASC, file_path ASC
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![source_id], |row| {
+            Ok(SymbolEdge {
+                source_id: row.get(0)?,
+                target_qualified_name: row.get(1)?,
+                edge_kind: EdgeKind::DependsOn,
+                file_path: row.get(2)?,
+            })
+        })?;
+
+        let records = rows.collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    fn delete_edges_for_file(&self, file_path: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM symbol_edges WHERE file_path = ?1",
+            params![file_path],
+        )?;
+        Ok(())
     }
 
     fn write_sir_blob(&self, symbol_id: &str, sir_json_string: &str) -> Result<(), StoreError> {
@@ -901,6 +1015,20 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
 
         CREATE INDEX IF NOT EXISTS idx_sir_embeddings_provider_model_dim
             ON sir_embeddings(provider, model, embedding_dim);
+
+        CREATE TABLE IF NOT EXISTS symbol_edges (
+            source_id TEXT NOT NULL,
+            target_qualified_name TEXT NOT NULL,
+            edge_kind TEXT NOT NULL CHECK (edge_kind IN ('calls', 'depends_on')),
+            file_path TEXT NOT NULL,
+            PRIMARY KEY (source_id, target_qualified_name, edge_kind)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_edges_target
+            ON symbol_edges(target_qualified_name);
+
+        CREATE INDEX IF NOT EXISTS idx_edges_file
+            ON symbol_edges(file_path);
         "#,
     )?;
 
@@ -1087,6 +1215,24 @@ mod tests {
         }
     }
 
+    fn calls_edge(source_id: &str, target: &str, file_path: &str) -> SymbolEdge {
+        SymbolEdge {
+            source_id: source_id.to_owned(),
+            target_qualified_name: target.to_owned(),
+            edge_kind: EdgeKind::Calls,
+            file_path: file_path.to_owned(),
+        }
+    }
+
+    fn depends_edge(source_id: &str, target: &str, file_path: &str) -> SymbolEdge {
+        SymbolEdge {
+            source_id: source_id.to_owned(),
+            target_qualified_name: target.to_owned(),
+            edge_kind: EdgeKind::DependsOn,
+            file_path: file_path.to_owned(),
+        }
+    }
+
     #[test]
     fn store_creates_layout_and_persists_data_without_duplicates() {
         let temp = tempdir().expect("tempdir");
@@ -1179,6 +1325,43 @@ mod tests {
         assert!(!semantic.is_empty());
         assert_eq!(semantic[0].symbol_id, "sym-2");
         assert!(semantic[0].semantic_score > semantic[1].semantic_score);
+    }
+
+    #[test]
+    fn edge_records_can_be_upserted_queried_and_deleted_by_file() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        store
+            .upsert_edges(&[
+                calls_edge("sym-alpha", "beta", "src/lib.rs"),
+                depends_edge("file::src/app.ts", "./dep", "src/app.ts"),
+            ])
+            .expect("upsert edges");
+
+        let callers = store.get_callers("beta").expect("get callers");
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0], calls_edge("sym-alpha", "beta", "src/lib.rs"));
+
+        let deps = store
+            .get_dependencies("file::src/app.ts")
+            .expect("get dependencies");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(
+            deps[0],
+            depends_edge("file::src/app.ts", "./dep", "src/app.ts")
+        );
+
+        store
+            .delete_edges_for_file("src/lib.rs")
+            .expect("delete edges for file");
+        let callers_after_delete = store.get_callers("beta").expect("get callers after delete");
+        assert!(callers_after_delete.is_empty());
+
+        let deps_after_delete = store
+            .get_dependencies("file::src/app.ts")
+            .expect("get dependencies after delete");
+        assert_eq!(deps_after_delete.len(), 1);
     }
 
     #[test]

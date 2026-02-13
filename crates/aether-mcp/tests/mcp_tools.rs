@@ -2,9 +2,10 @@ use std::fs;
 
 use aether_core::{SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED, SearchMode};
 use aether_mcp::{
-    AetherExplainRequest, AetherGetSirRequest, AetherMcpServer, AetherSearchRequest,
-    AetherSymbolLookupRequest, AetherSymbolTimelineRequest, AetherVerifyMode, AetherVerifyRequest,
-    AetherWhyChangedReason, AetherWhyChangedRequest, AetherWhySelectorMode, MCP_SCHEMA_VERSION,
+    AetherDependenciesRequest, AetherExplainRequest, AetherGetSirRequest, AetherMcpServer,
+    AetherSearchRequest, AetherSymbolLookupRequest, AetherSymbolTimelineRequest, AetherVerifyMode,
+    AetherVerifyRequest, AetherWhyChangedReason, AetherWhyChangedRequest, AetherWhySelectorMode,
+    MCP_SCHEMA_VERSION,
 };
 use aether_store::{SqliteStore, Store};
 use aetherd::indexer::{IndexerConfig, run_initial_index_once};
@@ -246,6 +247,100 @@ vector_backend = "sqlite"
         .0;
     assert!(sir_without_mirror.found);
     assert!(!sir_without_mirror.sir_json.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn mcp_dependencies_returns_callers_and_dependencies() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    fs::create_dir_all(workspace.join(".aether"))?;
+    fs::write(
+        workspace.join(".aether/config.toml"),
+        r#"[inference]
+provider = "mock"
+api_key_env = "GEMINI_API_KEY"
+
+[storage]
+mirror_sir_files = true
+
+[embeddings]
+enabled = true
+provider = "mock"
+vector_backend = "sqlite"
+"#,
+    )?;
+
+    fs::create_dir_all(workspace.join("src"))?;
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "fn beta() -> i32 { 1 }\nfn alpha() -> i32 { beta() }\n",
+    )?;
+    fs::write(
+        workspace.join("src/app.ts"),
+        "import { dep } from \"./dep\";\nfunction client(): number { return dep(); }\n",
+    )?;
+
+    run_initial_index_once(&IndexerConfig {
+        workspace: workspace.to_path_buf(),
+        debounce_ms: 300,
+        print_events: false,
+        print_sir: false,
+        sir_concurrency: 2,
+        lifecycle_logs: false,
+        inference_provider: None,
+        inference_model: None,
+        inference_endpoint: None,
+        inference_api_key_env: None,
+    })?;
+
+    let store = SqliteStore::open(workspace)?;
+    let beta_id = store
+        .list_symbols_for_file("src/lib.rs")?
+        .into_iter()
+        .find(|symbol| symbol.qualified_name == "beta")
+        .expect("beta symbol should exist")
+        .id;
+    let client_id = store
+        .list_symbols_for_file("src/app.ts")?
+        .into_iter()
+        .find(|symbol| symbol.qualified_name == "client")
+        .expect("client symbol should exist")
+        .id;
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+
+    let beta_edges = rt
+        .block_on(
+            server
+                .aether_dependencies(Parameters(AetherDependenciesRequest { symbol_id: beta_id })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert!(beta_edges.found);
+    assert_eq!(beta_edges.caller_count, 1);
+    assert_eq!(beta_edges.callers.len(), 1);
+    assert_eq!(beta_edges.callers[0].target_qualified_name, "beta");
+    assert_eq!(beta_edges.callers[0].edge_kind, "calls");
+
+    let client_edges = rt
+        .block_on(
+            server.aether_dependencies(Parameters(AetherDependenciesRequest {
+                symbol_id: client_id,
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert!(client_edges.found);
+    assert!(client_edges.dependency_count >= 1);
+    assert!(
+        client_edges
+            .dependencies
+            .iter()
+            .any(|edge| edge.target_qualified_name == "./dep" && edge.edge_kind == "depends_on")
+    );
 
     Ok(())
 }
