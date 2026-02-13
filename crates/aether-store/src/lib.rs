@@ -8,6 +8,12 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::from_str as json_from_str;
 use thiserror::Error;
 
+mod vector;
+pub use vector::{
+    LanceVectorStore, SqliteVectorStore, VectorEmbeddingMetaRecord, VectorRecord,
+    VectorSearchResult, VectorStore, open_vector_store,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolRecord {
     pub id: String,
@@ -112,6 +118,8 @@ pub enum StoreError {
     Config(#[from] aether_config::ConfigError),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("lancedb error: {0}")]
+    LanceDb(String),
 }
 
 pub trait Store {
@@ -249,7 +257,7 @@ impl SqliteStore {
         Ok(json)
     }
 
-    fn get_symbol_search_result(
+    pub fn get_symbol_search_result(
         &self,
         symbol_id: &str,
     ) -> Result<Option<SymbolSearchResult>, StoreError> {

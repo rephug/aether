@@ -8,6 +8,12 @@ authors.workspace = true
 [dependencies]
 aether-config = { path = "../aether-config" }
 aether-core = { path = "../aether-core" }
+arrow-array = "56.2"
+arrow-schema = "56.2"
+async-trait.workspace = true
+futures = "0.3"
+lancedb.workspace = true
+lzma-sys.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
