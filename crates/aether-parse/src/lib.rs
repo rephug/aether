@@ -20,6 +20,20 @@ pub struct SymbolExtractor {
     tsx_parser: Parser,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustUsePrefix {
+    Crate,
+    Self_,
+    Super,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustUsePathAtCursor {
+    pub prefix: RustUsePrefix,
+    pub segments: Vec<String>,
+    pub cursor_segment_index: Option<usize>,
+}
+
 impl SymbolExtractor {
     pub fn new() -> Result<Self> {
         let mut rust_parser = Parser::new();
@@ -117,6 +131,58 @@ pub fn language_for_path(path: &Path) -> Option<Language> {
         "jsx" => Some(Language::Jsx),
         _ => None,
     }
+}
+
+pub fn rust_use_path_at_cursor(
+    source: &str,
+    cursor_line_0: usize,
+    cursor_col_0: usize,
+) -> Option<RustUsePathAtCursor> {
+    let mut parser = Parser::new();
+    parser.set_language(&rust_language()).ok()?;
+    let tree = parser.parse(source, None)?;
+    let root = tree.root_node();
+    let cursor = Point {
+        row: cursor_line_0,
+        column: cursor_col_0,
+    };
+    let mut node = root.named_descendant_for_point_range(cursor, cursor)?;
+    while node.kind() != "use_declaration" {
+        node = node.parent()?;
+    }
+
+    let scoped = find_smallest_scoped_identifier_at_point(node, cursor)?;
+    let mut segments = collect_scoped_identifier_segments(scoped, source.as_bytes());
+    if segments.len() < 2 {
+        return None;
+    }
+
+    let prefix = match segments[0].0.as_str() {
+        "crate" => RustUsePrefix::Crate,
+        "self" => RustUsePrefix::Self_,
+        "super" => RustUsePrefix::Super,
+        _ => return None,
+    };
+
+    let cursor_segment_index = segments
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find_map(|(index, (_, node))| point_in_node(*node, cursor).then_some(index - 1));
+    let tail = segments
+        .drain(1..)
+        .map(|(text, _)| text)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if tail.is_empty() {
+        return None;
+    }
+
+    Some(RustUsePathAtCursor {
+        prefix,
+        segments: tail,
+        cursor_segment_index,
+    })
 }
 
 struct ParseState<'a> {
@@ -459,6 +525,61 @@ fn named_child_text(node: Node<'_>, field_name: &str, source: &[u8]) -> Option<S
     }
 }
 
+fn point_in_node(node: Node<'_>, point: Point) -> bool {
+    let start = node.start_position();
+    let end = node.end_position();
+    (start.row, start.column) <= (point.row, point.column)
+        && (point.row, point.column) < (end.row, end.column)
+}
+
+fn find_smallest_scoped_identifier_at_point<'a>(node: Node<'a>, point: Point) -> Option<Node<'a>> {
+    let mut best: Option<Node<'a>> = None;
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "scoped_identifier" && point_in_node(current, point) {
+            best = match best {
+                Some(existing) if existing.byte_range().len() >= current.byte_range().len() => {
+                    Some(existing)
+                }
+                _ => Some(current),
+            };
+        }
+
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    best
+}
+
+fn collect_scoped_identifier_segments<'a>(
+    node: Node<'a>,
+    source: &[u8],
+) -> Vec<(String, Node<'a>)> {
+    match node.kind() {
+        "scoped_identifier" => {
+            let mut segments = Vec::new();
+            if let Some(path) = node.child_by_field_name("path") {
+                segments.extend(collect_scoped_identifier_segments(path, source));
+            }
+            if let Some(name) = node.child_by_field_name("name") {
+                segments.extend(collect_scoped_identifier_segments(name, source));
+            }
+            segments
+        }
+        "identifier" | "self" | "super" | "crate" => {
+            let text = node_text(node, source).trim().to_owned();
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![(text, node)]
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn declaration_prefix(node: Node<'_>, source: &[u8]) -> String {
     let start = node.start_byte();
     let end = node
@@ -667,5 +788,30 @@ function alpha() {
         assert_eq!(symbols_a.len(), 1);
         assert_eq!(symbols_b.len(), 1);
         assert_ne!(symbols_a[0].id, symbols_b[0].id);
+    }
+
+    #[test]
+    fn rust_use_path_at_cursor_extracts_crate_path_and_cursor_segment() {
+        let source = "use crate::config::loader;\n";
+        let loader_col = source.find("loader").expect("loader segment");
+        let path = rust_use_path_at_cursor(source, 0, loader_col).expect("rust use path");
+        assert_eq!(path.prefix, RustUsePrefix::Crate);
+        assert_eq!(
+            path.segments,
+            vec!["config".to_owned(), "loader".to_owned()]
+        );
+        assert_eq!(path.cursor_segment_index, Some(1));
+    }
+
+    #[test]
+    fn rust_use_path_at_cursor_returns_none_for_non_use_cursor() {
+        let source = "fn alpha() {}\n";
+        assert!(rust_use_path_at_cursor(source, 0, 3).is_none());
+    }
+
+    #[test]
+    fn rust_use_path_at_cursor_ignores_external_crate_imports() {
+        let source = "use serde::Deserialize;\n";
+        assert!(rust_use_path_at_cursor(source, 0, 8).is_none());
     }
 }
