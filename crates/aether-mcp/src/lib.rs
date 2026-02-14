@@ -6,14 +6,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aether_config::{VerifyMode, load_workspace_config};
 pub use aether_core::SearchMode;
 use aether_core::{
-    HoverMarkdownSections, NO_SIR_MESSAGE, SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR,
+    HoverMarkdownSections, Language, NO_SIR_MESSAGE, SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR,
     SEARCH_FALLBACK_EMBEDDINGS_DISABLED, SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED,
     SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY, SearchEnvelope, SourceRange,
     format_hover_markdown_sections, normalize_path, stable_symbol_id, stale_warning_message,
 };
 use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
 use aether_parse::{SymbolExtractor, language_for_path};
-use aether_sir::{SirAnnotation, SirError, canonicalize_sir_json, sir_hash, validate_sir};
+use aether_sir::{
+    FileSir, SirAnnotation, SirError, SirLevel, canonicalize_file_sir_json, canonicalize_sir_json,
+    file_sir_hash, sir_hash, synthetic_file_sir_id, synthetic_module_sir_id, validate_sir,
+};
 use aether_store::{
     SirHistorySelector, SirMetaRecord, SqliteStore, Store, StoreError, SymbolRecord,
     SymbolSearchResult, open_graph_store, open_vector_store,
@@ -324,19 +327,56 @@ impl AetherSearchResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherGetSirRequest {
-    pub symbol_id: String,
+    pub level: Option<SirLevelRequest>,
+    pub symbol_id: Option<String>,
+    pub file_path: Option<String>,
+    pub module_path: Option<String>,
+    pub language: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherGetSirResponse {
     pub found: bool,
+    pub level: SirLevelRequest,
     pub symbol_id: String,
     pub sir: Option<SirAnnotationView>,
+    pub rollup: Option<FileSirView>,
+    pub files_with_sir: Option<u32>,
+    pub files_total: Option<u32>,
     pub sir_json: String,
     pub sir_hash: String,
     pub sir_status: Option<String>,
     pub last_error: Option<String>,
     pub last_attempt_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SirLevelRequest {
+    #[default]
+    Leaf,
+    File,
+    Module,
+}
+
+impl From<SirLevelRequest> for SirLevel {
+    fn from(value: SirLevelRequest) -> Self {
+        match value {
+            SirLevelRequest::Leaf => SirLevel::Leaf,
+            SirLevelRequest::File => SirLevel::File,
+            SirLevelRequest::Module => SirLevel::Module,
+        }
+    }
+}
+
+impl From<SirLevel> for SirLevelRequest {
+    fn from(value: SirLevel) -> Self {
+        match value {
+            SirLevel::Leaf => SirLevelRequest::Leaf,
+            SirLevel::File => SirLevelRequest::File,
+            SirLevel::Module => SirLevelRequest::Module,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -377,8 +417,19 @@ pub struct SirAnnotationView {
     pub confidence: f32,
 }
 
-impl From<SirAnnotation> for SirAnnotationView {
-    fn from(value: SirAnnotation) -> Self {
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FileSirView {
+    pub intent: String,
+    pub exports: Vec<String>,
+    pub side_effects: Vec<String>,
+    pub dependencies: Vec<String>,
+    pub error_modes: Vec<String>,
+    pub symbol_count: usize,
+    pub confidence: f32,
+}
+
+impl From<aether_sir::SirAnnotation> for SirAnnotationView {
+    fn from(value: aether_sir::SirAnnotation) -> Self {
         Self {
             intent: value.intent,
             inputs: value.inputs,
@@ -386,6 +437,20 @@ impl From<SirAnnotation> for SirAnnotationView {
             side_effects: value.side_effects,
             dependencies: value.dependencies,
             error_modes: value.error_modes,
+            confidence: value.confidence,
+        }
+    }
+}
+
+impl From<FileSir> for FileSirView {
+    fn from(value: FileSir) -> Self {
+        Self {
+            intent: value.intent,
+            exports: value.exports,
+            side_effects: value.side_effects,
+            dependencies: value.dependencies,
+            error_modes: value.error_modes,
+            symbol_count: value.symbol_count,
             confidence: value.confidence,
         }
     }
@@ -1010,33 +1075,26 @@ impl AetherMcpServer {
 
     pub fn aether_get_sir_logic(
         &self,
-        symbol_id: &str,
+        request: AetherGetSirRequest,
     ) -> Result<AetherGetSirResponse, AetherMcpError> {
-        let symbol_id = symbol_id.trim();
-        if symbol_id.is_empty() {
-            return Ok(AetherGetSirResponse {
-                found: false,
-                symbol_id: String::new(),
-                sir: None,
-                sir_json: String::new(),
-                sir_hash: String::new(),
-                sir_status: None,
-                last_error: None,
-                last_attempt_at: None,
-            });
+        let level = request.level.unwrap_or_default();
+        match level {
+            SirLevelRequest::Leaf => self.aether_get_sir_leaf(&request),
+            SirLevelRequest::File => self.aether_get_sir_file(&request),
+            SirLevelRequest::Module => self.aether_get_sir_module(&request),
         }
+    }
 
+    fn aether_get_sir_leaf(
+        &self,
+        request: &AetherGetSirRequest,
+    ) -> Result<AetherGetSirResponse, AetherMcpError> {
+        let symbol_id = required_request_field(request.symbol_id.as_deref(), "symbol_id")?;
         if !self.sqlite_path().exists() {
-            return Ok(AetherGetSirResponse {
-                found: false,
-                symbol_id: symbol_id.to_owned(),
-                sir: None,
-                sir_json: String::new(),
-                sir_hash: String::new(),
-                sir_status: None,
-                last_error: None,
-                last_attempt_at: None,
-            });
+            return Ok(empty_get_sir_response(
+                SirLevel::Leaf.into(),
+                symbol_id.to_owned(),
+            ));
         }
 
         let store = SqliteStore::open(&self.workspace)?;
@@ -1047,8 +1105,12 @@ impl AetherMcpServer {
         let Some(sir_blob) = sir_blob else {
             return Ok(AetherGetSirResponse {
                 found: false,
+                level: SirLevel::Leaf.into(),
                 symbol_id: symbol_id.to_owned(),
                 sir: None,
+                rollup: None,
+                files_with_sir: None,
+                files_total: None,
                 sir_json: String::new(),
                 sir_hash: String::new(),
                 sir_status,
@@ -1061,7 +1123,6 @@ impl AetherMcpServer {
         validate_sir(&sir)?;
 
         let canonical_json = canonicalize_sir_json(&sir);
-        // Stage-3 compatibility: keep serving SIR when metadata is stale or partially empty.
         let hash = meta
             .as_ref()
             .map(|record| record.sir_hash.clone())
@@ -1070,13 +1131,270 @@ impl AetherMcpServer {
 
         Ok(AetherGetSirResponse {
             found: true,
+            level: SirLevel::Leaf.into(),
             symbol_id: symbol_id.to_owned(),
             sir: Some(sir.into()),
+            rollup: None,
+            files_with_sir: None,
+            files_total: None,
             sir_json: canonical_json,
             sir_hash: hash,
             sir_status,
             last_error,
             last_attempt_at,
+        })
+    }
+
+    fn aether_get_sir_file(
+        &self,
+        request: &AetherGetSirRequest,
+    ) -> Result<AetherGetSirResponse, AetherMcpError> {
+        let file_path = self
+            .normalize_workspace_relative_request_path(request.file_path.as_deref(), "file_path")?;
+        let language = language_for_path(Path::new(&file_path)).ok_or_else(|| {
+            AetherMcpError::Message(format!(
+                "unable to infer language for file path: {file_path}"
+            ))
+        })?;
+        let rollup_id = synthetic_file_sir_id(language.as_str(), &file_path);
+
+        if !self.sqlite_path().exists() {
+            return Ok(empty_get_sir_response(SirLevel::File.into(), rollup_id));
+        }
+
+        let store = SqliteStore::open(&self.workspace)?;
+        let meta = store.get_sir_meta(&rollup_id)?;
+        let (sir_status, last_error, last_attempt_at) = meta_status_fields(meta.as_ref());
+        let blob = store.read_sir_blob(&rollup_id)?;
+
+        let Some(blob) = blob else {
+            return Ok(AetherGetSirResponse {
+                found: false,
+                level: SirLevel::File.into(),
+                symbol_id: rollup_id,
+                sir: None,
+                rollup: None,
+                files_with_sir: None,
+                files_total: None,
+                sir_json: String::new(),
+                sir_hash: String::new(),
+                sir_status,
+                last_error,
+                last_attempt_at,
+            });
+        };
+
+        let file_sir: FileSir = serde_json::from_str(&blob)?;
+        let canonical_json = canonicalize_file_sir_json(&file_sir);
+        let hash = meta
+            .as_ref()
+            .map(|record| record.sir_hash.clone())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| file_sir_hash(&file_sir));
+
+        Ok(AetherGetSirResponse {
+            found: true,
+            level: SirLevel::File.into(),
+            symbol_id: rollup_id,
+            sir: None,
+            rollup: Some(file_sir.into()),
+            files_with_sir: None,
+            files_total: None,
+            sir_json: canonical_json,
+            sir_hash: hash,
+            sir_status,
+            last_error,
+            last_attempt_at,
+        })
+    }
+
+    fn aether_get_sir_module(
+        &self,
+        request: &AetherGetSirRequest,
+    ) -> Result<AetherGetSirResponse, AetherMcpError> {
+        let module_path = self.normalize_workspace_relative_request_path(
+            request.module_path.as_deref(),
+            "module_path",
+        )?;
+        let language = parse_language_field(request.language.as_deref())?;
+        let module_id = synthetic_module_sir_id(language.as_str(), &module_path);
+
+        if !self.sqlite_path().exists() {
+            return Ok(AetherGetSirResponse {
+                found: false,
+                level: SirLevel::Module.into(),
+                symbol_id: module_id,
+                sir: None,
+                rollup: None,
+                files_with_sir: Some(0),
+                files_total: Some(0),
+                sir_json: String::new(),
+                sir_hash: String::new(),
+                sir_status: None,
+                last_error: None,
+                last_attempt_at: None,
+            });
+        }
+
+        let store = SqliteStore::open(&self.workspace)?;
+        let coverage = self.generate_module_rollup_on_demand(&store, &module_path, language)?;
+        let meta = store.get_sir_meta(&coverage.module_id)?;
+        let (sir_status, last_error, last_attempt_at) = meta_status_fields(meta.as_ref());
+        let blob = store.read_sir_blob(&coverage.module_id)?;
+        let Some(blob) = blob else {
+            return Ok(AetherGetSirResponse {
+                found: false,
+                level: SirLevel::Module.into(),
+                symbol_id: coverage.module_id,
+                sir: None,
+                rollup: None,
+                files_with_sir: Some(coverage.files_with_sir),
+                files_total: Some(coverage.files_total),
+                sir_json: String::new(),
+                sir_hash: String::new(),
+                sir_status,
+                last_error,
+                last_attempt_at,
+            });
+        };
+
+        let module_sir: FileSir = serde_json::from_str(&blob)?;
+        let canonical_json = canonicalize_file_sir_json(&module_sir);
+        let hash = meta
+            .as_ref()
+            .map(|record| record.sir_hash.clone())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| file_sir_hash(&module_sir));
+
+        Ok(AetherGetSirResponse {
+            found: true,
+            level: SirLevel::Module.into(),
+            symbol_id: coverage.module_id,
+            sir: None,
+            rollup: Some(module_sir.into()),
+            files_with_sir: Some(coverage.files_with_sir),
+            files_total: Some(coverage.files_total),
+            sir_json: canonical_json,
+            sir_hash: hash,
+            sir_status,
+            last_error,
+            last_attempt_at,
+        })
+    }
+
+    fn normalize_workspace_relative_request_path(
+        &self,
+        raw: Option<&str>,
+        field_name: &str,
+    ) -> Result<String, AetherMcpError> {
+        let value = required_request_field(raw, field_name)?;
+        let path = PathBuf::from(value);
+        let normalized = if path.is_absolute() {
+            if !path.starts_with(&self.workspace) {
+                return Err(AetherMcpError::Message(format!(
+                    "{field_name} must be under workspace {}",
+                    self.workspace.display()
+                )));
+            }
+
+            let relative = path.strip_prefix(&self.workspace).map_err(|_| {
+                AetherMcpError::Message(format!(
+                    "{field_name} must be under workspace {}",
+                    self.workspace.display()
+                ))
+            })?;
+            normalize_path(&relative.to_string_lossy())
+        } else {
+            normalize_path(value)
+        };
+
+        let mut trimmed = normalized.trim().to_owned();
+        while trimmed.starts_with("./") {
+            trimmed = trimmed[2..].to_owned();
+        }
+        if trimmed != "/" {
+            trimmed = trimmed.trim_end_matches('/').to_owned();
+        }
+        if trimmed.is_empty() {
+            return Err(AetherMcpError::Message(format!(
+                "{field_name} must not be empty"
+            )));
+        }
+        Ok(trimmed)
+    }
+
+    fn generate_module_rollup_on_demand(
+        &self,
+        store: &SqliteStore,
+        module_path: &str,
+        language: Language,
+    ) -> Result<ModuleRollupCoverage, AetherMcpError> {
+        let module_id = synthetic_module_sir_id(language.as_str(), module_path);
+        let file_paths = store.list_module_file_paths(module_path, language.as_str())?;
+        let files_total = file_paths.len() as u32;
+
+        let mut file_rollups = Vec::new();
+        for file_path in file_paths {
+            let file_rollup_id = synthetic_file_sir_id(language.as_str(), &file_path);
+            let Some(file_blob) = store.read_sir_blob(&file_rollup_id)? else {
+                continue;
+            };
+            let parsed = serde_json::from_str::<FileSir>(&file_blob);
+            let Ok(file_sir) = parsed else {
+                tracing::warn!(
+                    file_path = %file_path,
+                    rollup_id = %file_rollup_id,
+                    "invalid file rollup JSON while building module rollup"
+                );
+                continue;
+            };
+            file_rollups.push((file_path, file_sir));
+        }
+
+        let files_with_sir = file_rollups.len() as u32;
+        if file_rollups.is_empty() {
+            store.mark_removed(&module_id)?;
+            return Ok(ModuleRollupCoverage {
+                module_id,
+                files_with_sir,
+                files_total,
+            });
+        }
+
+        let module_sir = aggregate_module_rollup(&file_rollups);
+        let canonical_json = canonicalize_file_sir_json(&module_sir);
+        let hash = file_sir_hash(&module_sir);
+        let attempted_at = current_unix_timestamp();
+        let version_write = store.record_sir_version_if_changed(
+            &module_id,
+            &hash,
+            "rollup",
+            "deterministic",
+            &canonical_json,
+            attempted_at,
+            None,
+        )?;
+
+        if version_write.changed {
+            store.write_sir_blob(&module_id, &canonical_json)?;
+        }
+
+        store.upsert_sir_meta(SirMetaRecord {
+            id: module_id.clone(),
+            sir_hash: hash,
+            sir_version: version_write.version,
+            provider: "rollup".to_owned(),
+            model: "deterministic".to_owned(),
+            updated_at: version_write.updated_at,
+            sir_status: "fresh".to_owned(),
+            last_error: None,
+            last_attempt_at: attempted_at,
+        })?;
+
+        Ok(ModuleRollupCoverage {
+            module_id,
+            files_with_sir,
+            files_total,
         })
     }
 
@@ -1376,13 +1694,16 @@ impl AetherMcpServer {
             .map_err(to_mcp_error)
     }
 
-    #[tool(name = "aether_get_sir", description = "Get SIR for a symbol ID")]
+    #[tool(
+        name = "aether_get_sir",
+        description = "Get SIR for leaf/file/module level"
+    )]
     pub async fn aether_get_sir(
         &self,
         Parameters(request): Parameters<AetherGetSirRequest>,
     ) -> Result<Json<AetherGetSirResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_get_sir");
-        self.aether_get_sir_logic(&request.symbol_id)
+        self.aether_get_sir_logic(request)
             .map(Json)
             .map_err(to_mcp_error)
     }
@@ -1438,6 +1759,114 @@ fn count_table_rows(conn: &Connection, table_name: &str) -> Result<i64, AetherMc
         Err(err) if err.to_string().contains("no such table") => Ok(0),
         Err(err) => Err(err.into()),
     }
+}
+
+#[derive(Debug, Clone)]
+struct ModuleRollupCoverage {
+    module_id: String,
+    files_with_sir: u32,
+    files_total: u32,
+}
+
+fn empty_get_sir_response(level: SirLevelRequest, symbol_id: String) -> AetherGetSirResponse {
+    let (files_with_sir, files_total) = if level == SirLevelRequest::Module {
+        (Some(0), Some(0))
+    } else {
+        (None, None)
+    };
+
+    AetherGetSirResponse {
+        found: false,
+        level,
+        symbol_id,
+        sir: None,
+        rollup: None,
+        files_with_sir,
+        files_total,
+        sir_json: String::new(),
+        sir_hash: String::new(),
+        sir_status: None,
+        last_error: None,
+        last_attempt_at: None,
+    }
+}
+
+fn required_request_field<'a>(
+    value: Option<&'a str>,
+    field_name: &str,
+) -> Result<&'a str, AetherMcpError> {
+    let value = value.unwrap_or("").trim();
+    if value.is_empty() {
+        return Err(AetherMcpError::Message(format!(
+            "{field_name} is required for this level"
+        )));
+    }
+
+    Ok(value)
+}
+
+fn parse_language_field(language: Option<&str>) -> Result<Language, AetherMcpError> {
+    let value = required_request_field(language, "language")?;
+    match value.to_ascii_lowercase().as_str() {
+        "rust" => Ok(Language::Rust),
+        "typescript" => Ok(Language::TypeScript),
+        "tsx" => Ok(Language::Tsx),
+        "javascript" => Ok(Language::JavaScript),
+        "jsx" => Ok(Language::Jsx),
+        _ => Err(AetherMcpError::Message(format!(
+            "unsupported language: {value}"
+        ))),
+    }
+}
+
+fn aggregate_module_rollup(file_rollups: &[(String, FileSir)]) -> FileSir {
+    let mut sorted_rollups = file_rollups.to_vec();
+    sorted_rollups.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut intents = Vec::new();
+    let mut exports = Vec::new();
+    let mut side_effects = Vec::new();
+    let mut dependencies = Vec::new();
+    let mut error_modes = Vec::new();
+    let mut symbol_count = 0usize;
+    let mut confidence = 1.0f32;
+
+    for (_, rollup) in &sorted_rollups {
+        let intent = rollup.intent.trim();
+        if !intent.is_empty() {
+            intents.push(intent.to_owned());
+        }
+        exports.extend(rollup.exports.clone());
+        side_effects.extend(rollup.side_effects.clone());
+        dependencies.extend(rollup.dependencies.clone());
+        error_modes.extend(rollup.error_modes.clone());
+        symbol_count += rollup.symbol_count;
+        confidence = confidence.min(rollup.confidence);
+    }
+
+    sort_and_dedup(&mut exports);
+    sort_and_dedup(&mut side_effects);
+    sort_and_dedup(&mut dependencies);
+    sort_and_dedup(&mut error_modes);
+
+    FileSir {
+        intent: if intents.is_empty() {
+            "No summarized intent available".to_owned()
+        } else {
+            intents.join("; ")
+        },
+        exports,
+        side_effects,
+        dependencies,
+        error_modes,
+        symbol_count,
+        confidence,
+    }
+}
+
+fn sort_and_dedup(values: &mut Vec<String>) {
+    values.sort();
+    values.dedup();
 }
 
 fn effective_limit(limit: Option<u32>) -> u32 {

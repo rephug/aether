@@ -7,7 +7,7 @@ use aether_config::{AetherConfig, InferenceProviderKind, VerifyConfig, VerifyMod
 use aether_infer::{
     InferError, InferenceProvider, MockProvider, ProviderOverrides, Qwen3LocalProvider, SirContext,
 };
-use aether_sir::{SirAnnotation, validate_sir};
+use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id, validate_sir};
 use aether_store::{SqliteStore, Store, SymbolEmbeddingRecord};
 use aetherd::observer::ObserverState;
 use aetherd::sir_pipeline::SirPipeline;
@@ -37,6 +37,47 @@ impl InferenceProvider for HashingMockProvider {
             dependencies: Vec::new(),
             error_modes: Vec::new(),
             confidence: 1.0,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RollupUnionMockProvider;
+
+#[async_trait::async_trait]
+impl InferenceProvider for RollupUnionMockProvider {
+    async fn generate_sir(
+        &self,
+        _symbol_text: &str,
+        context: &SirContext,
+    ) -> Result<SirAnnotation, InferError> {
+        let (intent, side_effects) = if context.qualified_name.ends_with("alpha") {
+            (
+                "Intent alpha".to_owned(),
+                vec!["fs.write".to_owned(), "network".to_owned()],
+            )
+        } else if context.qualified_name.ends_with("beta") {
+            (
+                "Intent beta".to_owned(),
+                vec!["db.query".to_owned(), "fs.write".to_owned()],
+            )
+        } else if context.qualified_name.ends_with("gamma") {
+            (
+                "Intent gamma".to_owned(),
+                vec!["cache.invalidate".to_owned(), "network".to_owned()],
+            )
+        } else {
+            (format!("Intent {}", context.qualified_name), Vec::new())
+        };
+
+        Ok(SirAnnotation {
+            intent,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            side_effects,
+            dependencies: Vec::new(),
+            error_modes: Vec::new(),
+            confidence: 0.9,
         })
     }
 }
@@ -195,6 +236,56 @@ fn step2_pipeline_generates_and_persists_sir_with_mock_provider()
         let sir: SirAnnotation = serde_json::from_str(&blob)?;
         validate_sir(&sir)?;
     }
+
+    Ok(())
+}
+
+#[test]
+fn step2_file_rollup_aggregates_side_effects_and_concatenates_intent_for_small_files()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    fs::create_dir_all(workspace.join("src"))?;
+    let rust_file = workspace.join("src/lib.rs");
+    fs::write(&rust_file, "fn alpha() {}\nfn beta() {}\nfn gamma() {}\n")?;
+
+    let mut observer = ObserverState::new(workspace.to_path_buf())?;
+    observer.seed_from_disk()?;
+
+    let store = SqliteStore::open(workspace)?;
+    let provider: Arc<dyn InferenceProvider> = Arc::new(RollupUnionMockProvider);
+    let pipeline =
+        SirPipeline::new_with_provider(workspace.to_path_buf(), 2, provider, "mock", "mock")?;
+
+    let mut sink = Vec::new();
+    for event in observer.initial_symbol_events() {
+        pipeline.process_event(&store, &event, false, &mut sink)?;
+    }
+
+    let file_rollup_id = synthetic_file_sir_id("rust", "src/lib.rs");
+    let file_blob = store
+        .read_sir_blob(&file_rollup_id)?
+        .expect("file rollup blob should exist");
+    let file_sir: FileSir = serde_json::from_str(&file_blob)?;
+
+    assert_eq!(
+        file_sir.side_effects,
+        vec![
+            "cache.invalidate".to_owned(),
+            "db.query".to_owned(),
+            "fs.write".to_owned(),
+            "network".to_owned(),
+        ]
+    );
+    assert_eq!(
+        file_sir.intent,
+        "Intent alpha; Intent beta; Intent gamma".to_owned()
+    );
+    assert_eq!(file_sir.symbol_count, 3);
+
+    let file_meta = store.get_sir_meta(&file_rollup_id)?;
+    assert!(file_meta.is_some());
 
     Ok(())
 }
