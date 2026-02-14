@@ -8,16 +8,15 @@ pub use aether_core::SearchMode;
 use aether_core::{
     HoverMarkdownSections, NO_SIR_MESSAGE, SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR,
     SEARCH_FALLBACK_EMBEDDINGS_DISABLED, SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED,
-    SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY, SearchEnvelope, SourceRange, SymbolEdge,
-    file_source_id, format_hover_markdown_sections, normalize_path, stable_symbol_id,
-    stale_warning_message,
+    SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY, SearchEnvelope, SourceRange,
+    format_hover_markdown_sections, normalize_path, stable_symbol_id, stale_warning_message,
 };
 use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
 use aether_parse::{SymbolExtractor, language_for_path};
 use aether_sir::{SirAnnotation, SirError, canonicalize_sir_json, sir_hash, validate_sir};
 use aether_store::{
-    SirHistorySelector, SirMetaRecord, SqliteStore, Store, StoreError, SymbolSearchResult,
-    open_vector_store,
+    SirHistorySelector, SirMetaRecord, SqliteStore, Store, StoreError, SymbolRecord,
+    SymbolSearchResult, open_graph_store, open_vector_store,
 };
 use aetherd::verification::{VerificationRequest, run_verification};
 use anyhow::Result;
@@ -101,21 +100,30 @@ pub struct AetherDependenciesRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct AetherDependencyEdge {
-    pub source_id: String,
-    pub target_qualified_name: String,
-    pub edge_kind: String,
-    pub file_path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherDependenciesResponse {
     pub symbol_id: String,
     pub found: bool,
     pub caller_count: u32,
     pub dependency_count: u32,
-    pub callers: Vec<AetherDependencyEdge>,
-    pub dependencies: Vec<AetherDependencyEdge>,
+    pub callers: Vec<AetherSymbolLookupMatch>,
+    pub dependencies: Vec<AetherSymbolLookupMatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherCallChainRequest {
+    pub symbol_id: Option<String>,
+    pub qualified_name: Option<String>,
+    pub max_depth: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherCallChainResponse {
+    pub found: bool,
+    pub symbol_id: String,
+    pub qualified_name: String,
+    pub max_depth: u32,
+    pub depth_count: u32,
+    pub levels: Vec<Vec<AetherSymbolLookupMatch>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -396,13 +404,15 @@ impl From<SymbolSearchResult> for AetherSymbolLookupMatch {
     }
 }
 
-impl From<SymbolEdge> for AetherDependencyEdge {
-    fn from(value: SymbolEdge) -> Self {
+impl From<SymbolRecord> for AetherSymbolLookupMatch {
+    fn from(value: SymbolRecord) -> Self {
         Self {
-            source_id: value.source_id,
-            target_qualified_name: value.target_qualified_name,
-            edge_kind: value.edge_kind.as_str().to_owned(),
+            symbol_id: value.id,
+            qualified_name: value.qualified_name,
             file_path: value.file_path,
+            language: value.language,
+            kind: value.kind,
+            semantic_score: None,
         }
     }
 }
@@ -540,7 +550,7 @@ impl AetherMcpServer {
         }
 
         let store = SqliteStore::open(&self.workspace)?;
-        let Some(symbol) = store.get_symbol_search_result(symbol_id)? else {
+        let Some(symbol) = store.get_symbol_record(symbol_id)? else {
             return Ok(AetherDependenciesResponse {
                 symbol_id: symbol_id.to_owned(),
                 found: false,
@@ -551,15 +561,16 @@ impl AetherMcpServer {
             });
         };
 
-        let callers = store
+        let graph_store = open_graph_store(&self.workspace)?;
+        let callers = graph_store
             .get_callers(&symbol.qualified_name)?
             .into_iter()
-            .map(AetherDependencyEdge::from)
+            .map(AetherSymbolLookupMatch::from)
             .collect::<Vec<_>>();
-        let dependencies = store
-            .get_dependencies(&file_source_id(&symbol.file_path))?
+        let dependencies = graph_store
+            .get_dependencies(&symbol.id)?
             .into_iter()
-            .map(AetherDependencyEdge::from)
+            .map(AetherSymbolLookupMatch::from)
             .collect::<Vec<_>>();
 
         Ok(AetherDependenciesResponse {
@@ -569,6 +580,81 @@ impl AetherMcpServer {
             dependency_count: dependencies.len() as u32,
             callers,
             dependencies,
+        })
+    }
+
+    pub fn aether_call_chain_logic(
+        &self,
+        request: AetherCallChainRequest,
+    ) -> Result<AetherCallChainResponse, AetherMcpError> {
+        let symbol_id_input = request.symbol_id.as_deref().unwrap_or("").trim().to_owned();
+        let qualified_name_input = request
+            .qualified_name
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        let max_depth = request.max_depth.unwrap_or(3).clamp(1, 10);
+
+        if symbol_id_input.is_empty() && qualified_name_input.is_empty() {
+            return Ok(AetherCallChainResponse {
+                found: false,
+                symbol_id: String::new(),
+                qualified_name: String::new(),
+                max_depth,
+                depth_count: 0,
+                levels: Vec::new(),
+            });
+        }
+
+        if !self.sqlite_path().exists() {
+            return Ok(AetherCallChainResponse {
+                found: false,
+                symbol_id: symbol_id_input,
+                qualified_name: qualified_name_input,
+                max_depth,
+                depth_count: 0,
+                levels: Vec::new(),
+            });
+        }
+
+        let store = SqliteStore::open(&self.workspace)?;
+        let mut start_symbol = None;
+        if !symbol_id_input.is_empty() {
+            start_symbol = store.get_symbol_record(&symbol_id_input)?;
+        }
+        if start_symbol.is_none() && !qualified_name_input.is_empty() {
+            start_symbol = store.get_symbol_by_qualified_name(&qualified_name_input)?;
+        }
+        let Some(start_symbol) = start_symbol else {
+            return Ok(AetherCallChainResponse {
+                found: false,
+                symbol_id: symbol_id_input,
+                qualified_name: qualified_name_input,
+                max_depth,
+                depth_count: 0,
+                levels: Vec::new(),
+            });
+        };
+
+        let graph_store = open_graph_store(&self.workspace)?;
+        let levels = graph_store
+            .get_call_chain(&start_symbol.id, max_depth)?
+            .into_iter()
+            .map(|rows| {
+                rows.into_iter()
+                    .map(AetherSymbolLookupMatch::from)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        Ok(AetherCallChainResponse {
+            found: true,
+            symbol_id: start_symbol.id,
+            qualified_name: start_symbol.qualified_name,
+            max_depth,
+            depth_count: levels.len() as u32,
+            levels,
         })
     }
 
@@ -1207,7 +1293,7 @@ impl AetherMcpServer {
 
     #[tool(
         name = "aether_dependencies",
-        description = "Get callers and file dependencies for a symbol"
+        description = "Get resolved callers and call dependencies for a symbol"
     )]
     pub async fn aether_dependencies(
         &self,
@@ -1215,6 +1301,20 @@ impl AetherMcpServer {
     ) -> Result<Json<AetherDependenciesResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_dependencies");
         self.aether_dependencies_logic(request)
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_call_chain",
+        description = "Get transitive call-chain levels for a symbol"
+    )]
+    pub async fn aether_call_chain(
+        &self,
+        Parameters(request): Parameters<AetherCallChainRequest>,
+    ) -> Result<Json<AetherCallChainResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_call_chain");
+        self.aether_call_chain_logic(request)
             .map(Json)
             .map_err(to_mcp_error)
     }

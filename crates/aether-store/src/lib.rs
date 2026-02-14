@@ -3,13 +3,17 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use aether_config::load_workspace_config;
+use aether_config::{GraphBackend, load_workspace_config};
 use aether_core::{EdgeKind, SymbolEdge};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::from_str as json_from_str;
 use thiserror::Error;
 
+mod graph_cozo;
+mod graph_sqlite;
 mod vector;
+pub use graph_cozo::CozoGraphStore;
+pub use graph_sqlite::SqliteGraphStore;
 pub use vector::{
     LanceVectorStore, SqliteVectorStore, VectorEmbeddingMetaRecord, VectorRecord,
     VectorSearchResult, VectorStore, open_vector_store,
@@ -109,6 +113,20 @@ pub struct SemanticSearchResult {
     pub semantic_score: f32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedEdge {
+    pub source_id: String,
+    pub target_id: String,
+    pub edge_kind: EdgeKind,
+    pub file_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphSyncStats {
+    pub resolved_edges: usize,
+    pub unresolved_edges: usize,
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("io error: {0}")]
@@ -119,6 +137,8 @@ pub enum StoreError {
     Config(#[from] aether_config::ConfigError),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("cozo error: {0}")]
+    Cozo(String),
     #[error("lancedb error: {0}")]
     LanceDb(String),
 }
@@ -178,6 +198,30 @@ pub trait Store {
         model: &str,
         limit: u32,
     ) -> Result<Vec<SemanticSearchResult>, StoreError>;
+}
+
+pub trait GraphStore: Send + Sync {
+    fn upsert_symbol_node(&self, symbol: &SymbolRecord) -> Result<(), StoreError>;
+    fn upsert_edge(&self, edge: &ResolvedEdge) -> Result<(), StoreError>;
+    fn get_callers(&self, qualified_name: &str) -> Result<Vec<SymbolRecord>, StoreError>;
+    fn get_dependencies(&self, symbol_id: &str) -> Result<Vec<SymbolRecord>, StoreError>;
+    fn get_call_chain(
+        &self,
+        symbol_id: &str,
+        depth: u32,
+    ) -> Result<Vec<Vec<SymbolRecord>>, StoreError>;
+    fn delete_edges_for_file(&self, file_path: &str) -> Result<(), StoreError>;
+}
+
+pub fn open_graph_store(
+    workspace_root: impl AsRef<Path>,
+) -> Result<Box<dyn GraphStore>, StoreError> {
+    let workspace_root = workspace_root.as_ref();
+    let config = load_workspace_config(workspace_root)?;
+    match config.storage.graph_backend {
+        GraphBackend::Cozo => Ok(Box::new(CozoGraphStore::open(workspace_root)?)),
+        GraphBackend::Sqlite => Ok(Box::new(SqliteGraphStore::open(workspace_root)?)),
+    }
 }
 
 pub struct SqliteStore {
@@ -287,6 +331,145 @@ impl SqliteStore {
             .optional()?;
 
         Ok(record)
+    }
+
+    pub fn get_symbol_record(&self, symbol_id: &str) -> Result<Option<SymbolRecord>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, file_path, language, kind, qualified_name, signature_fingerprint, last_seen_at
+            FROM symbols
+            WHERE id = ?1
+            "#,
+        )?;
+
+        let record = stmt
+            .query_row(params![symbol_id], |row| {
+                Ok(SymbolRecord {
+                    id: row.get(0)?,
+                    file_path: row.get(1)?,
+                    language: row.get(2)?,
+                    kind: row.get(3)?,
+                    qualified_name: row.get(4)?,
+                    signature_fingerprint: row.get(5)?,
+                    last_seen_at: row.get(6)?,
+                })
+            })
+            .optional()?;
+
+        Ok(record)
+    }
+
+    pub fn get_symbol_by_qualified_name(
+        &self,
+        qualified_name: &str,
+    ) -> Result<Option<SymbolRecord>, StoreError> {
+        let qualified_name = qualified_name.trim();
+        if qualified_name.is_empty() {
+            return Ok(None);
+        }
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, file_path, language, kind, qualified_name, signature_fingerprint, last_seen_at
+            FROM symbols
+            WHERE qualified_name = ?1
+            ORDER BY id ASC
+            LIMIT 1
+            "#,
+        )?;
+
+        let record = stmt
+            .query_row(params![qualified_name], |row| {
+                Ok(SymbolRecord {
+                    id: row.get(0)?,
+                    file_path: row.get(1)?,
+                    language: row.get(2)?,
+                    kind: row.get(3)?,
+                    qualified_name: row.get(4)?,
+                    signature_fingerprint: row.get(5)?,
+                    last_seen_at: row.get(6)?,
+                })
+            })
+            .optional()?;
+
+        Ok(record)
+    }
+
+    pub fn sync_graph_for_file(
+        &self,
+        graph_store: &dyn GraphStore,
+        file_path: &str,
+    ) -> Result<GraphSyncStats, StoreError> {
+        let file_path = file_path.trim();
+        if file_path.is_empty() {
+            return Ok(GraphSyncStats {
+                resolved_edges: 0,
+                unresolved_edges: 0,
+            });
+        }
+
+        graph_store.delete_edges_for_file(file_path)?;
+
+        let symbols = self.list_symbols_for_file(file_path)?;
+        for symbol in &symbols {
+            graph_store.upsert_symbol_node(symbol)?;
+        }
+
+        let mut unresolved_edges = 0usize;
+        let mut unresolved_stmt = self.conn.prepare(
+            r#"
+            SELECT e.source_id, e.target_qualified_name
+            FROM symbol_edges e
+            LEFT JOIN symbols s ON s.qualified_name = e.target_qualified_name
+            WHERE e.file_path = ?1
+              AND e.edge_kind = 'calls'
+              AND s.id IS NULL
+            ORDER BY e.source_id ASC, e.target_qualified_name ASC
+            "#,
+        )?;
+        let unresolved_rows = unresolved_stmt.query_map(params![file_path], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in unresolved_rows {
+            let (source_id, target_qualified_name) = row?;
+            unresolved_edges += 1;
+            tracing::debug!(
+                source_id = %source_id,
+                target_qualified_name = %target_qualified_name,
+                file_path = %file_path,
+                "unresolved call edge skipped during graph sync"
+            );
+        }
+
+        let mut resolved_stmt = self.conn.prepare(
+            r#"
+            SELECT e.source_id, s.id, e.file_path
+            FROM symbol_edges e
+            JOIN symbols s ON s.qualified_name = e.target_qualified_name
+            WHERE e.file_path = ?1
+              AND e.edge_kind = 'calls'
+            ORDER BY e.source_id ASC, s.id ASC
+            "#,
+        )?;
+        let resolved_rows = resolved_stmt.query_map(params![file_path], |row| {
+            Ok(ResolvedEdge {
+                source_id: row.get(0)?,
+                target_id: row.get(1)?,
+                edge_kind: EdgeKind::Calls,
+                file_path: row.get(2)?,
+            })
+        })?;
+
+        let mut resolved_edges = 0usize;
+        for edge in resolved_rows {
+            resolved_edges += 1;
+            graph_store.upsert_edge(&edge?)?;
+        }
+
+        Ok(GraphSyncStats {
+            resolved_edges,
+            unresolved_edges,
+        })
     }
 }
 
@@ -1362,6 +1545,107 @@ mod tests {
             .get_dependencies("file::src/app.ts")
             .expect("get dependencies after delete");
         assert_eq!(deps_after_delete.len(), 1);
+    }
+
+    #[test]
+    fn sync_graph_for_file_skips_unresolved_calls() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        let graph = CozoGraphStore::open(temp.path()).expect("open cozo graph store");
+
+        let alpha = SymbolRecord {
+            id: "sym-alpha".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            language: "rust".to_owned(),
+            kind: "function".to_owned(),
+            qualified_name: "alpha".to_owned(),
+            signature_fingerprint: "sig-alpha".to_owned(),
+            last_seen_at: 1_700_000_000,
+        };
+        store.upsert_symbol(alpha.clone()).expect("upsert symbol");
+        store
+            .upsert_edges(&[calls_edge(&alpha.id, "missing::target", "src/lib.rs")])
+            .expect("upsert unresolved edge");
+
+        let stats = store
+            .sync_graph_for_file(&graph, "src/lib.rs")
+            .expect("sync graph for file");
+        assert_eq!(stats.resolved_edges, 0);
+        assert_eq!(stats.unresolved_edges, 1);
+
+        let deps = graph
+            .get_dependencies(&alpha.id)
+            .expect("query dependencies");
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn graph_backend_config_toggle_switches_between_sqlite_and_cozo() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
+        fs::write(
+            workspace.join(".aether/config.toml"),
+            r#"[storage]
+mirror_sir_files = true
+graph_backend = "sqlite"
+"#,
+        )
+        .expect("write sqlite graph config");
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        let alpha = SymbolRecord {
+            id: "sym-alpha".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            language: "rust".to_owned(),
+            kind: "function".to_owned(),
+            qualified_name: "alpha".to_owned(),
+            signature_fingerprint: "sig-alpha".to_owned(),
+            last_seen_at: 1_700_000_000,
+        };
+        let beta = SymbolRecord {
+            id: "sym-beta".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            language: "rust".to_owned(),
+            kind: "function".to_owned(),
+            qualified_name: "beta".to_owned(),
+            signature_fingerprint: "sig-beta".to_owned(),
+            last_seen_at: 1_700_000_000,
+        };
+        store.upsert_symbol(alpha.clone()).expect("upsert alpha");
+        store.upsert_symbol(beta.clone()).expect("upsert beta");
+        store
+            .upsert_edges(&[calls_edge(&alpha.id, "beta", "src/lib.rs")])
+            .expect("upsert call edge");
+
+        let sqlite_graph = open_graph_store(workspace).expect("open sqlite graph backend");
+        let sqlite_deps = sqlite_graph
+            .get_dependencies(&alpha.id)
+            .expect("query sqlite backend");
+        assert_eq!(sqlite_deps.len(), 1);
+        assert_eq!(sqlite_deps[0].id, beta.id);
+
+        fs::write(
+            workspace.join(".aether/config.toml"),
+            r#"[storage]
+mirror_sir_files = true
+graph_backend = "cozo"
+"#,
+        )
+        .expect("write cozo graph config");
+
+        let cozo_graph = open_graph_store(workspace).expect("open cozo graph backend");
+        let stats = store
+            .sync_graph_for_file(cozo_graph.as_ref(), "src/lib.rs")
+            .expect("sync cozo graph");
+        assert_eq!(stats.resolved_edges, 1);
+        assert_eq!(stats.unresolved_edges, 0);
+
+        let cozo_deps = cozo_graph
+            .get_dependencies(&alpha.id)
+            .expect("query cozo backend");
+        assert_eq!(cozo_deps.len(), 1);
+        assert_eq!(cozo_deps[0].id, beta.id);
     }
 
     #[test]

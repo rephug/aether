@@ -25,6 +25,7 @@ async-trait = "0.1"
 anyhow = "1.0"
 blake3 = "1.5"
 clap = { version = "4.5", features = ["derive"] }
+cozo = { version = "0.7", default-features = false, features = ["storage-sled", "graph-algo"] }
 gix = { version = "0.76", default-features = false, features = ["max-performance-safe", "blame", "revision"] }
 lancedb = { version = "0.23", default-features = false }
 lzma-sys = { version = "*", features = ["static"] }

@@ -2,10 +2,10 @@ use std::fs;
 
 use aether_core::{SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED, SearchMode};
 use aether_mcp::{
-    AetherDependenciesRequest, AetherExplainRequest, AetherGetSirRequest, AetherMcpServer,
-    AetherSearchRequest, AetherSymbolLookupRequest, AetherSymbolTimelineRequest, AetherVerifyMode,
-    AetherVerifyRequest, AetherWhyChangedReason, AetherWhyChangedRequest, AetherWhySelectorMode,
-    MCP_SCHEMA_VERSION,
+    AetherCallChainRequest, AetherDependenciesRequest, AetherExplainRequest, AetherGetSirRequest,
+    AetherMcpServer, AetherSearchRequest, AetherSymbolLookupRequest, AetherSymbolTimelineRequest,
+    AetherVerifyMode, AetherVerifyRequest, AetherWhyChangedReason, AetherWhyChangedRequest,
+    AetherWhySelectorMode, MCP_SCHEMA_VERSION,
 };
 use aether_store::{SqliteStore, Store};
 use aetherd::indexer::{IndexerConfig, run_initial_index_once};
@@ -27,6 +27,7 @@ api_key_env = "GEMINI_API_KEY"
 
 [storage]
 mirror_sir_files = true
+graph_backend = "sqlite"
 
 [embeddings]
 enabled = true
@@ -264,6 +265,7 @@ api_key_env = "GEMINI_API_KEY"
 
 [storage]
 mirror_sir_files = true
+graph_backend = "sqlite"
 
 [embeddings]
 enabled = true
@@ -275,11 +277,7 @@ vector_backend = "sqlite"
     fs::create_dir_all(workspace.join("src"))?;
     fs::write(
         workspace.join("src/lib.rs"),
-        "fn beta() -> i32 { 1 }\nfn alpha() -> i32 { beta() }\n",
-    )?;
-    fs::write(
-        workspace.join("src/app.ts"),
-        "import { dep } from \"./dep\";\nfunction client(): number { return dep(); }\n",
+        "fn delta() -> i32 { 1 }\nfn gamma() -> i32 { delta() }\nfn beta() -> i32 { gamma() }\nfn alpha() -> i32 { beta() }\n",
     )?;
 
     run_initial_index_once(&IndexerConfig {
@@ -302,11 +300,11 @@ vector_backend = "sqlite"
         .find(|symbol| symbol.qualified_name == "beta")
         .expect("beta symbol should exist")
         .id;
-    let client_id = store
-        .list_symbols_for_file("src/app.ts")?
+    let alpha_id = store
+        .list_symbols_for_file("src/lib.rs")?
         .into_iter()
-        .find(|symbol| symbol.qualified_name == "client")
-        .expect("client symbol should exist")
+        .find(|symbol| symbol.qualified_name == "alpha")
+        .expect("alpha symbol should exist")
         .id;
 
     let server = AetherMcpServer::new(workspace, false)?;
@@ -322,25 +320,39 @@ vector_backend = "sqlite"
     assert!(beta_edges.found);
     assert_eq!(beta_edges.caller_count, 1);
     assert_eq!(beta_edges.callers.len(), 1);
-    assert_eq!(beta_edges.callers[0].target_qualified_name, "beta");
-    assert_eq!(beta_edges.callers[0].edge_kind, "calls");
+    assert_eq!(beta_edges.callers[0].qualified_name, "alpha");
 
-    let client_edges = rt
+    let alpha_edges = rt
         .block_on(
             server.aether_dependencies(Parameters(AetherDependenciesRequest {
-                symbol_id: client_id,
+                symbol_id: alpha_id.clone(),
             })),
         )
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
-    assert!(client_edges.found);
-    assert!(client_edges.dependency_count >= 1);
+    assert!(alpha_edges.found);
+    assert_eq!(alpha_edges.dependency_count, 1);
     assert!(
-        client_edges
+        alpha_edges
             .dependencies
             .iter()
-            .any(|edge| edge.target_qualified_name == "./dep" && edge.edge_kind == "depends_on")
+            .any(|edge| edge.qualified_name == "beta")
     );
+
+    let call_chain = rt
+        .block_on(server.aether_call_chain(Parameters(AetherCallChainRequest {
+            symbol_id: Some(alpha_id),
+            qualified_name: None,
+            max_depth: Some(3),
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert!(call_chain.found);
+    assert_eq!(call_chain.depth_count, 3);
+    assert_eq!(call_chain.levels.len(), 3);
+    assert_eq!(call_chain.levels[0][0].qualified_name, "beta");
+    assert_eq!(call_chain.levels[1][0].qualified_name, "gamma");
+    assert_eq!(call_chain.levels[2][0].qualified_name, "delta");
 
     Ok(())
 }
@@ -358,6 +370,7 @@ api_key_env = "GEMINI_API_KEY"
 
 [storage]
 mirror_sir_files = true
+graph_backend = "sqlite"
 
 [embeddings]
 enabled = true
