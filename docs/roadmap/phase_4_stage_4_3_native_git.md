@@ -77,6 +77,12 @@ pub struct BlameLine {
 
 ## Exact Codex prompt(s)
 ```text
+CRITICAL BUILD SETTINGS — use these for ALL cargo commands in this session:
+- CARGO_TARGET_DIR=/home/rephu/aether-target
+- CARGO_BUILD_JOBS=2
+- PROTOC=$(which protoc)
+- Do NOT use /tmp/ for any build artifacts — /tmp/ is RAM-backed (tmpfs) in WSL2.
+
 You are working in the repo root of https://github.com/rephug/aether.
 
 Read docs/roadmap/phase_4_stage_4_3_native_git.md for full spec.

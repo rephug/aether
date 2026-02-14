@@ -9,11 +9,11 @@ This guide explains how to use [OpenAI Codex CLI](https://developers.openai.com/
 ## Quick Start (30-second version)
 
 ```bash
-# 1. Open terminal in your aether repo root
-cd ~/code/aether
+# 1. Open WSL terminal and navigate to the repo
+cd /home/rephu/projects/aether
 
-# 2. Start Codex
-codex
+# 2. Start Codex with full permissions (network access needed for cargo)
+codex --full-auto
 
 # 3. Paste the prompt from the stage doc
 #    e.g., the "Exact Codex prompt(s)" block from phase_4_stage_4_1_lancedb_vector_backend.md
@@ -22,6 +22,82 @@ codex
 # 5. You review and push
 git -C ../aether-phase4-stage4-1-lancedb push -u origin feature/phase4-stage4-1-lancedb
 ```
+
+---
+
+## WSL2 Build Environment (CRITICAL)
+
+AETHER is developed in WSL2 on Windows. The following settings **must** be applied to prevent OOM crashes during compilation of heavy dependencies (LanceDB, CozoDB, gix).
+
+### .wslconfig (Windows side)
+
+Create or edit `C:\Users\rephu\.wslconfig`:
+
+```ini
+[wsl2]
+memory=8GB
+swap=8GB
+```
+
+Restart WSL after changes: `wsl --shutdown` from PowerShell, then `wsl`.
+
+### System dependencies (install once)
+
+```bash
+sudo apt-get update && sudo apt-get install -y protobuf-compiler liblzma-dev
+```
+
+### Required environment for ALL cargo commands
+
+Every Codex prompt in this project **must** include these build settings:
+
+```
+CRITICAL BUILD SETTINGS — use these for ALL cargo commands in this session:
+- CARGO_TARGET_DIR=/home/rephu/aether-target
+- CARGO_BUILD_JOBS=2
+- PROTOC=$(which protoc)
+- Do NOT use /tmp/ for any build artifacts — /tmp/ is RAM-backed (tmpfs) in WSL2.
+- Do NOT use paths under /mnt/ for build targets — the Windows filesystem (9P) is too slow.
+```
+
+**Why each setting matters:**
+
+| Setting | Purpose |
+|---------|---------|
+| `CARGO_TARGET_DIR=/home/rephu/aether-target` | Build artifacts on fast native Linux FS, not RAM or slow Windows drive |
+| `CARGO_BUILD_JOBS=2` | Limits peak RAM during compilation to prevent OOM |
+| `PROTOC=$(which protoc)` | LanceDB needs protoc for protobuf compilation |
+
+### Optional: Codex Skill for build settings
+
+Instead of prepending build settings to every prompt, create an AETHER build skill:
+
+```bash
+mkdir -p /home/rephu/projects/aether/.agents/skills/aether-build
+```
+
+Create `.agents/skills/aether-build/SKILL.md`:
+
+```markdown
+---
+name: aether-build
+description: "Build settings for AETHER project in WSL2. Use for any cargo build, test, clippy, or fmt commands."
+---
+
+# AETHER Build Configuration
+
+Always set these before running any cargo command:
+- CARGO_TARGET_DIR=/home/rephu/aether-target
+- CARGO_BUILD_JOBS=2
+- PROTOC=$(which protoc)
+
+NEVER use /tmp/ for build artifacts (RAM-backed in WSL2).
+NEVER use /mnt/ paths for build targets (slow 9P filesystem).
+
+System dependencies required: protobuf-compiler, liblzma-dev
+```
+
+Then reference it in prompts with `$aether-build` or let Codex pick it up implicitly.
 
 ---
 
@@ -42,17 +118,17 @@ feature/phase4-stage4-3-gix
 ```
 
 ### 3. Worktree
-Codex creates a git worktree at `../aether-<stage-name>` so your main checkout stays untouched. This means you can have multiple stages in progress simultaneously.
+Codex creates a git worktree at `../aether-<stage-name>` (relative to `/home/rephu/projects/aether`) so your main checkout stays untouched. This means you can have multiple stages in progress simultaneously.
 
 ### 4. Implement
 Codex reads the stage doc, cross-references the codebase, and writes code. It only modifies files within the stage's scope.
 
 ### 5. Test
-Codex runs the three validation gates:
+Codex runs the three validation gates with the required build environment:
 ```bash
-cargo fmt --all --check
-cargo clippy --workspace -- -D warnings
-cargo test --workspace
+CARGO_TARGET_DIR=/home/rephu/aether-target CARGO_BUILD_JOBS=2 PROTOC=$(which protoc) cargo fmt --all --check
+CARGO_TARGET_DIR=/home/rephu/aether-target CARGO_BUILD_JOBS=2 PROTOC=$(which protoc) cargo clippy --workspace -- -D warnings
+CARGO_TARGET_DIR=/home/rephu/aether-target CARGO_BUILD_JOBS=2 PROTOC=$(which protoc) cargo test --workspace
 ```
 
 ### 6. Commit
@@ -132,6 +208,13 @@ Codex reads `AGENTS.md` in your repo root as persistent context. Add this:
 Rust workspace with 9 crates under `crates/`.
 VS Code extension under `vscode-extension/`.
 
+## Build environment (WSL2)
+All cargo commands MUST use:
+- CARGO_TARGET_DIR=/home/rephu/aether-target
+- CARGO_BUILD_JOBS=2
+- PROTOC=$(which protoc)
+Do NOT use /tmp/ or /mnt/ paths for build targets.
+
 ## Validation gates (always run these before committing)
 - cargo fmt --all --check
 - cargo clippy --workspace -- -D warnings  
@@ -149,24 +232,13 @@ VS Code extension under `vscode-extension/`.
 - Modify VS Code extension unless the stage doc says to
 - Use unwrap() in library code (use anyhow/thiserror)
 - Add dependencies not listed in the stage doc
+- Use /tmp/ for CARGO_TARGET_DIR (RAM-backed, causes OOM)
 ```
 
 ### Codex permissions
-By default, Codex runs with network access disabled. For stages that need network access (4.1 LanceDB downloads during build, `cargo` fetching crates), enable it:
-
+For full-auto mode with network access (needed for cargo crate downloads):
 ```bash
-# Option 1: CLI flag (per-session)
-codex -c 'sandbox_workspace_write.network_access=true'
-
-# Option 2: Project config (persistent) — add to .codex/config.toml
-sandbox_mode = "workspace-write"
-[sandbox_workspace_write]
-network_access = true
-```
-
-For full-auto mode (no approval prompts on safe operations):
-```bash
-codex --full-auto --model gpt-5.3-codex
+codex --full-auto
 ```
 
 ---
@@ -187,7 +259,8 @@ A previous run created the branch. Either:
 ```bash
 # Delete and retry
 git branch -D feature/phase4-stage4-1-lancedb
-git worktree remove ../aether-phase4-stage4-1-lancedb
+git worktree remove ../aether-phase4-stage4-1-lancedb --force
+git worktree prune
 ```
 Or tell Codex to reuse it:
 ```
@@ -204,24 +277,21 @@ If tests fail after implementation:
 ### "LanceDB build fails" (Stage 4.1)
 LanceDB has a transitive dependency on `lzma-sys`. If the build fails:
 ```bash
-# Ubuntu/Debian
 sudo apt-get install liblzma-dev
-
-# macOS
-brew install xz
-
-# Or use static linking (already in the stage doc)
-# lzma-sys = { version = "*", features = ["static"] }
 ```
+
+### "WSL2 OOM crash" (Catastrophic failure / E_UNEXPECTED)
+WSL ran out of memory. From PowerShell:
+```powershell
+wsl --shutdown
+wsl
+```
+Then verify `.wslconfig` has `memory=8GB` and `swap=8GB`. Restart Codex — cached build artifacts in `/home/rephu/aether-target` mean it won't start from scratch.
 
 ### "CozoDB build fails" (Stage 4.5)
 CozoDB with the SQLite backend needs `libsqlite3`. If the build fails:
 ```bash
-# Ubuntu/Debian
 sudo apt-get install libsqlite3-dev
-
-# macOS (usually pre-installed, but if needed)
-brew install sqlite
 ```
 If it still fails, the stage doc has a fallback: SQLite-only edge resolution (recursive CTEs, no CozoDB).
 
@@ -231,6 +301,12 @@ If it still fails, the stage doc has a fallback: SQLite-only edge resolution (re
 
 ### Standard stage execution
 ```
+CRITICAL BUILD SETTINGS — use these for ALL cargo commands in this session:
+- CARGO_TARGET_DIR=/home/rephu/aether-target
+- CARGO_BUILD_JOBS=2
+- PROTOC=$(which protoc)
+- Do NOT use /tmp/ for any build artifacts.
+
 You are working in the repo root of https://github.com/rephug/aether.
 Read docs/roadmap/<stage_file>.md for the full specification.
 Follow the "Exact Codex prompt(s)" section exactly.
@@ -238,6 +314,11 @@ Follow the "Exact Codex prompt(s)" section exactly.
 
 ### Bug fix after a stage
 ```
+CRITICAL BUILD SETTINGS — use these for ALL cargo commands in this session:
+- CARGO_TARGET_DIR=/home/rephu/aether-target
+- CARGO_BUILD_JOBS=2
+- PROTOC=$(which protoc)
+
 In the worktree at ../aether-<stage>, there is a bug:
 [describe the bug]
 Fix it while keeping all pass criteria from docs/roadmap/<stage_file>.md.
@@ -286,6 +367,7 @@ gh pr create --base main --head feature/phase4-stage4-1-lancedb \
 git worktree remove ../aether-phase4-stage4-1-lancedb
 git worktree remove ../aether-phase4-stage4-2-tracing
 # ... etc
+git worktree prune
 ```
 
 ---

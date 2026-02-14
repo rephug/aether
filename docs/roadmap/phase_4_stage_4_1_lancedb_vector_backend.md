@@ -10,20 +10,30 @@ Replace the brute-force SQLite embedding search with LanceDB ANN indexing. Curre
 - Hybrid search uses Reciprocal Rank Fusion (RRF) between separate lexical and semantic passes
 
 ## Target implementation
-- Embeddings stored in LanceDB table at `.aether/vectors/`
+- Embeddings stored in LanceDB tables at `.aether/vectors/`
 - Search: LanceDB native ANN query with pre-built IVF-PQ index
-- SQLite `sir_embeddings` table removed (or kept as migration source)
+- SQLite `sir_embeddings` table retained for migration/rollback (NOT deleted)
 - `VectorStore` trait abstracts the backend for future swaps
+
+## Locked decisions (resolved during implementation)
+
+| Decision | Resolution | Rationale |
+|----------|-----------|-----------|
+| Embedding dimension handling | Per-dim table: one Lance table per (provider, model, dim) | Supports mixed dimensions safely; keeps FixedSizeList valid for ANN indexing |
+| Wiring scope | Aetherd + MCP: both semantic paths use VectorStore | Consistent search results regardless of interface (CLI vs MCP) |
+| Write policy | Metadata-based skip: add `get_embedding_meta` to VectorStore | Avoids redundant embedding API calls when SIR hash unchanged; preserves existing skip logic |
+| SQLite rows | Retained for rollback | Switch config back to `sqlite` backend without data loss |
 
 ## In scope
 - Add `lancedb = "0.23"` and `lzma-sys = { features = ["static"] }` to workspace deps
-- Create `VectorStore` trait in `crates/aether-store` with: `upsert_embedding`, `delete_embedding`, `search_nearest`, `rebuild_index`
-- Implement `LanceVectorStore` using LanceDB Rust SDK
+- Create `VectorStore` trait in `crates/aether-store` with: `upsert_embedding`, `delete_embedding`, `search_nearest`, `get_embedding_meta`
+- Implement `LanceVectorStore` using LanceDB Rust SDK with per-dim tables
 - Implement `SqliteVectorStore` (current behavior) as fallback
 - Config toggle: `[embeddings] vector_backend = "lancedb" | "sqlite"` (default: `"lancedb"`)
 - Migration path: on first run with `lancedb` backend, read existing `sir_embeddings` rows and write to LanceDB
 - Update `crates/aetherd/src/search.rs` to use the `VectorStore` trait
 - Update `crates/aetherd/src/sir_pipeline.rs` embedding writes to use the trait
+- Update `crates/aether-mcp/src/lib.rs` semantic search to use `VectorStore`
 - Store embeddings as `FixedSizeList<Float32>` not JSON strings
 
 ## Out of scope
@@ -33,10 +43,11 @@ Replace the brute-force SQLite embedding search with LanceDB ANN indexing. Curre
 
 ## Implementation notes
 
-### LanceDB table schema
+### LanceDB table schema (per-dim tables)
+Table naming: one table per `{provider}_{model}_{dim}` combination (sanitized).
 ```
-Table: sir_embeddings
-  symbol_id: Utf8 (primary key)
+Table: embeddings_{provider}_{model}_{dim}
+  symbol_id: Utf8 (primary key via upsert semantics)
   sir_hash: Utf8
   provider: Utf8
   model: Utf8
@@ -57,6 +68,12 @@ pub trait VectorStore: Send + Sync {
         model: &str,
         limit: u32,
     ) -> Result<Vec<VectorSearchResult>>;
+    async fn get_embedding_meta(
+        &self,
+        symbol_id: &str,
+        provider: &str,
+        model: &str,
+    ) -> Result<Option<VectorEmbeddingMetaRecord>>;
 }
 ```
 
@@ -64,8 +81,9 @@ pub trait VectorStore: Send + Sync {
 1. On startup, if config says `lancedb` but `.aether/vectors/` doesn't exist:
 2. Check if `sir_embeddings` table has rows
 3. If yes, batch-read all rows and write to LanceDB
-4. Log migration progress via tracing (or eprintln for now)
-5. Do NOT delete SQLite rows (allow rollback by switching config back)
+4. Use sentinel marker file in `.aether/vectors/` for idempotent first-run detection
+5. Log migration progress via tracing
+6. Do NOT delete SQLite rows (allow rollback by switching config back)
 
 ## Pass criteria
 1. `cargo test --workspace` passes with mock embedding provider using LanceDB backend.
@@ -77,6 +95,12 @@ pub trait VectorStore: Send + Sync {
 
 ## Exact Codex prompt(s)
 ```text
+CRITICAL BUILD SETTINGS — use these for ALL cargo commands in this session:
+- CARGO_TARGET_DIR=/home/rephu/aether-target
+- CARGO_BUILD_JOBS=2
+- PROTOC=$(which protoc)
+- Do NOT use /tmp/ for any build artifacts — /tmp/ is RAM-backed (tmpfs) in WSL2.
+
 You are working in the repo root of https://github.com/rephug/aether.
 
 Read these files for context first:
@@ -96,22 +120,28 @@ Read these files for context first:
    - arrow-array = "54"
    - arrow-schema = "54"
    - async-trait = "0.1"
-5) Create a VectorStore trait in crates/aether-store with upsert/delete/search methods.
+5) Create a VectorStore trait in crates/aether-store with upsert/delete/search/get_embedding_meta methods.
 6) Implement LanceVectorStore that stores embeddings in .aether/vectors/ using LanceDB.
+   - Use per-dimension tables: one table per (provider, model, dim) combination.
+   - FixedSizeList<Float32, DIM> for embeddings.
 7) Implement SqliteVectorStore wrapping the existing brute-force code.
 8) Add config field [embeddings] vector_backend = "lancedb" | "sqlite" (default lancedb).
 9) Update search.rs and sir_pipeline.rs to use VectorStore trait instead of direct SQLite calls.
-10) Add migration: on first lancedb run, copy existing sir_embeddings rows to LanceDB.
-11) Add tests:
+   - Preserve metadata-based skip logic via get_embedding_meta.
+10) Update crates/aether-mcp/src/lib.rs semantic search to use VectorStore.
+11) Add migration: on first lancedb run, copy existing sir_embeddings rows to LanceDB.
+    - Use sentinel marker file for idempotent detection.
+    - Do NOT delete SQLite rows.
+12) Add tests:
     - Mock embeddings round-trip through LanceDB backend
     - Search returns correct top-K ordering
     - Migration from SQLite to LanceDB preserves all records
     - Config toggle between backends
-12) Run:
+13) Run:
     - cargo fmt --all --check
     - cargo clippy --workspace -- -D warnings
     - cargo test --workspace
-13) Commit with message: "Add LanceDB vector backend with migration from SQLite".
+14) Commit with message: "Add LanceDB vector backend with migration from SQLite".
 ```
 
 ## Expected commit
