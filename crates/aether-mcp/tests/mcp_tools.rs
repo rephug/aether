@@ -5,8 +5,9 @@ use aether_mcp::{
     AetherCallChainRequest, AetherDependenciesRequest, AetherExplainRequest, AetherGetSirRequest,
     AetherMcpServer, AetherSearchRequest, AetherSymbolLookupRequest, AetherSymbolTimelineRequest,
     AetherVerifyMode, AetherVerifyRequest, AetherWhyChangedReason, AetherWhyChangedRequest,
-    AetherWhySelectorMode, MCP_SCHEMA_VERSION,
+    AetherWhySelectorMode, MCP_SCHEMA_VERSION, SirLevelRequest,
 };
+use aether_sir::{synthetic_file_sir_id, synthetic_module_sir_id};
 use aether_store::{SqliteStore, Store};
 use aetherd::indexer::{IndexerConfig, run_initial_index_once};
 use anyhow::Result;
@@ -175,12 +176,17 @@ vector_backend = "sqlite"
 
     let sir = rt
         .block_on(server.aether_get_sir(Parameters(AetherGetSirRequest {
-            symbol_id: explain.symbol_id.clone(),
+            level: None,
+            symbol_id: Some(explain.symbol_id.clone()),
+            file_path: None,
+            module_path: None,
+            language: None,
         })))
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
 
     assert!(sir.found);
+    assert_eq!(sir.level, SirLevelRequest::Leaf);
     let sir_annotation = sir.sir.expect("sir should be present");
     assert!(sir_annotation.intent.contains("Mock summary for"));
     assert_eq!(sir.sir_status.as_deref(), Some("fresh"));
@@ -205,7 +211,11 @@ vector_backend = "sqlite"
 
     let stale_sir = rt
         .block_on(server.aether_get_sir(Parameters(AetherGetSirRequest {
-            symbol_id: explain.symbol_id.clone(),
+            level: None,
+            symbol_id: Some(explain.symbol_id.clone()),
+            file_path: None,
+            module_path: None,
+            language: None,
         })))
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
@@ -242,12 +252,126 @@ vector_backend = "sqlite"
 
     let sir_without_mirror = rt
         .block_on(server.aether_get_sir(Parameters(AetherGetSirRequest {
-            symbol_id: explain.symbol_id.clone(),
+            level: None,
+            symbol_id: Some(explain.symbol_id.clone()),
+            file_path: None,
+            module_path: None,
+            language: None,
         })))
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
     assert!(sir_without_mirror.found);
     assert!(!sir_without_mirror.sir_json.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn mcp_get_sir_supports_level_requests_and_module_coverage() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    fs::create_dir_all(workspace.join(".aether"))?;
+    fs::write(
+        workspace.join(".aether/config.toml"),
+        r#"[inference]
+provider = "mock"
+api_key_env = "GEMINI_API_KEY"
+
+[storage]
+mirror_sir_files = true
+graph_backend = "sqlite"
+
+[embeddings]
+enabled = true
+provider = "mock"
+vector_backend = "sqlite"
+"#,
+    )?;
+
+    fs::create_dir_all(workspace.join("src/moda"))?;
+    fs::write(workspace.join("src/moda/a.rs"), "fn alpha() -> i32 { 1 }\n")?;
+    fs::write(workspace.join("src/moda/b.rs"), "fn beta() -> i32 { 2 }\n")?;
+
+    run_initial_index_once(&IndexerConfig {
+        workspace: workspace.to_path_buf(),
+        debounce_ms: 300,
+        print_events: false,
+        print_sir: false,
+        sir_concurrency: 2,
+        lifecycle_logs: false,
+        inference_provider: None,
+        inference_model: None,
+        inference_endpoint: None,
+        inference_api_key_env: None,
+    })?;
+
+    let store = SqliteStore::open(workspace)?;
+    let alpha_id = store
+        .list_symbols_for_file("src/moda/a.rs")?
+        .into_iter()
+        .find(|symbol| symbol.qualified_name == "alpha")
+        .expect("alpha symbol should exist")
+        .id;
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+
+    let leaf = rt
+        .block_on(server.aether_get_sir(Parameters(AetherGetSirRequest {
+            level: Some(SirLevelRequest::Leaf),
+            symbol_id: Some(alpha_id),
+            file_path: None,
+            module_path: None,
+            language: None,
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert!(leaf.found);
+    assert_eq!(leaf.level, SirLevelRequest::Leaf);
+    assert!(leaf.sir.is_some());
+    assert!(leaf.rollup.is_none());
+
+    let file = rt
+        .block_on(server.aether_get_sir(Parameters(AetherGetSirRequest {
+            level: Some(SirLevelRequest::File),
+            symbol_id: None,
+            file_path: Some("src/moda/a.rs".to_owned()),
+            module_path: None,
+            language: None,
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert!(file.found);
+    assert_eq!(file.level, SirLevelRequest::File);
+    assert!(file.sir.is_none());
+    assert!(file.rollup.is_some());
+
+    let module_id = synthetic_module_sir_id("rust", "src/moda");
+    let before = store.read_sir_blob(&module_id)?;
+    assert!(before.is_none());
+
+    let file_rollup_b = synthetic_file_sir_id("rust", "src/moda/b.rs");
+    store.mark_removed(&file_rollup_b)?;
+
+    let module = rt
+        .block_on(server.aether_get_sir(Parameters(AetherGetSirRequest {
+            level: Some(SirLevelRequest::Module),
+            symbol_id: None,
+            file_path: None,
+            module_path: Some("src/moda".to_owned()),
+            language: Some("rust".to_owned()),
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert!(module.found);
+    assert_eq!(module.level, SirLevelRequest::Module);
+    assert!(module.sir.is_none());
+    assert!(module.rollup.is_some());
+    assert_eq!(module.files_total, Some(2));
+    assert_eq!(module.files_with_sir, Some(1));
+
+    let after = store.read_sir_blob(&module_id)?;
+    assert!(after.is_some());
 
     Ok(())
 }

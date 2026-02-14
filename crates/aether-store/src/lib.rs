@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use aether_config::{GraphBackend, load_workspace_config};
-use aether_core::{EdgeKind, SymbolEdge};
+use aether_core::{EdgeKind, SymbolEdge, normalize_path};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::from_str as json_from_str;
 use thiserror::Error;
@@ -393,6 +393,36 @@ impl SqliteStore {
             .optional()?;
 
         Ok(record)
+    }
+
+    pub fn list_module_file_paths(
+        &self,
+        module_path: &str,
+        language: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let module_path = normalize_path(module_path.trim().trim_end_matches('/'));
+        let language = language.trim();
+        if module_path.is_empty() || language.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let like_pattern = format!("{module_path}/%");
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT DISTINCT file_path
+            FROM symbols
+            WHERE language = ?1
+              AND (file_path = ?2 OR file_path LIKE ?3)
+            ORDER BY file_path ASC
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![language, module_path, like_pattern], |row| {
+            row.get::<_, String>(0)
+        })?;
+
+        let records = rows.collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
     }
 
     pub fn sync_graph_for_file(

@@ -6,7 +6,7 @@ use aether_core::{
     normalize_path, stable_symbol_id, stale_warning_message,
 };
 use aether_parse::{SymbolExtractor, language_for_path};
-use aether_sir::SirAnnotation;
+use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
 use aether_store::{SqliteStore, Store, StoreError};
 use serde_json::Value;
 use thiserror::Error;
@@ -159,6 +159,17 @@ pub fn resolve_hover_markdown_for_path(
     let cursor_line = (position.line as usize) + 1;
     let cursor_column = (position.character as usize) + 1;
 
+    if let Some(markdown) = resolve_import_hover_markdown(
+        workspace_root,
+        store,
+        file_path,
+        &source,
+        cursor_line,
+        cursor_column,
+    )? {
+        return Ok(Some(markdown));
+    }
+
     let target_symbol = symbols
         .iter()
         .filter(|symbol| position_in_range(symbol.range, cursor_line, cursor_column))
@@ -215,6 +226,168 @@ pub fn resolve_hover_markdown_for_path(
     }
 
     Ok(Some(markdown))
+}
+
+fn resolve_import_hover_markdown(
+    workspace_root: &Path,
+    store: &SqliteStore,
+    source_file: &Path,
+    source: &str,
+    cursor_line: usize,
+    cursor_column: usize,
+) -> Result<Option<String>, HoverResolveError> {
+    let Some(line) = source.lines().nth(cursor_line.saturating_sub(1)) else {
+        return Ok(None);
+    };
+    if !line.contains("import") {
+        return Ok(None);
+    }
+
+    let Some(import_target) = extract_import_path_literal_at_cursor(line, cursor_column) else {
+        return Ok(None);
+    };
+    if !(import_target.starts_with("./") || import_target.starts_with("../")) {
+        return Ok(None);
+    }
+
+    let Some(resolved_import_path) = resolve_relative_import_target(source_file, &import_target)
+    else {
+        return Ok(None);
+    };
+    let resolved_import_path = resolved_import_path.canonicalize()?;
+    if !resolved_import_path.starts_with(workspace_root) {
+        return Ok(None);
+    }
+
+    let Some(language) = language_for_path(&resolved_import_path) else {
+        return Ok(None);
+    };
+    let relative_path = workspace_relative_display_path(workspace_root, &resolved_import_path);
+    let file_rollup_id = synthetic_file_sir_id(language.as_str(), &relative_path);
+
+    if let Some(rollup_blob) = store.read_sir_blob(&file_rollup_id)?
+        && let Ok(file_sir) = serde_json::from_str::<FileSir>(&rollup_blob)
+    {
+        return Ok(Some(format_file_rollup_markdown(&relative_path, &file_sir)));
+    }
+
+    let mut imported_symbols = store.list_symbols_for_file(&relative_path)?;
+    imported_symbols.sort_by(|left, right| left.qualified_name.cmp(&right.qualified_name));
+    let Some(first_symbol) = imported_symbols.first() else {
+        return Ok(None);
+    };
+    let Some(leaf_blob) = store.read_sir_blob(&first_symbol.id)? else {
+        return Ok(None);
+    };
+
+    let sir: SirAnnotation = serde_json::from_str(&leaf_blob)?;
+    Ok(Some(format_hover_markdown_sections(
+        &HoverMarkdownSections {
+            symbol: first_symbol.qualified_name.clone(),
+            intent: sir.intent,
+            confidence: sir.confidence,
+            inputs: sir.inputs,
+            outputs: sir.outputs,
+            side_effects: sir.side_effects,
+            dependencies: sir.dependencies,
+            error_modes: sir.error_modes,
+        },
+        None,
+    )))
+}
+
+fn extract_import_path_literal_at_cursor(line: &str, cursor_column: usize) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        let quote = bytes[index];
+        if quote != b'"' && quote != b'\'' {
+            index += 1;
+            continue;
+        }
+
+        let start = index + 1;
+        index += 1;
+        while index < bytes.len() && bytes[index] != quote {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+
+        let end = index;
+        let literal_start_col = start + 1;
+        let literal_end_col = end + 1;
+        if (literal_start_col..=literal_end_col).contains(&cursor_column) && start <= end {
+            let literal = line[start..end].trim();
+            if !literal.is_empty() {
+                return Some(literal.to_owned());
+            }
+        }
+
+        index += 1;
+    }
+
+    None
+}
+
+fn resolve_relative_import_target(source_file: &Path, import_target: &str) -> Option<PathBuf> {
+    let base_dir = source_file.parent()?;
+    let candidate = base_dir.join(import_target);
+
+    if candidate.extension().is_some() && candidate.is_file() {
+        return Some(candidate);
+    }
+
+    let mut candidates = Vec::new();
+    if candidate.extension().is_some() {
+        candidates.push(candidate.clone());
+    } else {
+        for ext in ["ts", "tsx", "js", "jsx"] {
+            candidates.push(candidate.with_extension(ext));
+        }
+        for index_file in ["index.ts", "index.tsx", "index.js", "index.jsx"] {
+            candidates.push(candidate.join(index_file));
+        }
+    }
+
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn format_file_rollup_markdown(file_path: &str, file_sir: &FileSir) -> String {
+    [
+        format!("### {file_path}"),
+        format!("**Confidence:** {:.2}", file_sir.confidence),
+        format!("**Symbol Count:** {}", file_sir.symbol_count),
+        format!("**Intent**\n{}", file_sir.intent),
+        format!("**Exports**\n{}", format_markdown_list(&file_sir.exports)),
+        format!(
+            "**Side Effects**\n{}",
+            format_markdown_list(&file_sir.side_effects)
+        ),
+        format!(
+            "**Dependencies**\n{}",
+            format_markdown_list(&file_sir.dependencies)
+        ),
+        format!(
+            "**Error Modes**\n{}",
+            format_markdown_list(&file_sir.error_modes)
+        ),
+    ]
+    .join("\n\n")
+}
+
+fn format_markdown_list(items: &[String]) -> String {
+    if items.is_empty() {
+        "(none)".to_owned()
+    } else {
+        items
+            .iter()
+            .map(|item| format!("- {}", item.trim()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 fn compact_why_hint(store: &SqliteStore, symbol_id: &str) -> Result<Option<String>, StoreError> {
@@ -341,7 +514,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use aether_store::{SirMetaRecord, Store};
+    use aether_store::{SirMetaRecord, Store, SymbolRecord};
     use tempfile::tempdir;
     use tower_lsp::lsp_types::Position;
 
@@ -624,6 +797,151 @@ mod tests {
                 .expect("hover markdown");
 
         assert!(markdown.contains("> AETHER WHY: only one recorded SIR version."));
+    }
+
+    #[test]
+    fn resolve_hover_on_typescript_import_returns_file_rollup_summary() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let src_dir = workspace.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+
+        let dep_file = src_dir.join("dep.ts");
+        fs::write(&dep_file, "export function dep(): number { return 1; }\n")
+            .expect("write dep source");
+        let app_file = src_dir.join("app.ts");
+        fs::write(
+            &app_file,
+            "import { dep } from \"./dep\";\nexport function run(): number { return dep(); }\n",
+        )
+        .expect("write app source");
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        let file_rollup_id = synthetic_file_sir_id("typescript", "src/dep.ts");
+        store
+            .write_sir_blob(
+                &file_rollup_id,
+                r#"{
+                    "intent":"Mock file summary for dep.ts",
+                    "exports":["dep"],
+                    "side_effects":["network"],
+                    "dependencies":["axios"],
+                    "error_modes":[],
+                    "symbol_count":1,
+                    "confidence":0.88
+                }"#,
+            )
+            .expect("write file rollup");
+        store
+            .upsert_sir_meta(SirMetaRecord {
+                id: file_rollup_id,
+                sir_hash: "hash-file".to_owned(),
+                sir_version: 1,
+                provider: "rollup".to_owned(),
+                model: "deterministic".to_owned(),
+                updated_at: 1_700_800_100,
+                sir_status: "fresh".to_owned(),
+                last_error: None,
+                last_attempt_at: 1_700_800_100,
+            })
+            .expect("upsert file rollup meta");
+
+        let first_line = fs::read_to_string(&app_file)
+            .expect("read app source")
+            .lines()
+            .next()
+            .expect("import line")
+            .to_owned();
+        let import_col = first_line.find("./dep").expect("import path");
+        let markdown = resolve_hover_markdown_for_path(
+            workspace,
+            &store,
+            &app_file,
+            Position::new(0, (import_col + 2) as u32),
+        )
+        .expect("resolve hover")
+        .expect("hover markdown");
+
+        assert!(markdown.contains("### src/dep.ts"));
+        assert!(markdown.contains("Mock file summary for dep.ts"));
+        assert!(markdown.contains("**Exports**"));
+    }
+
+    #[test]
+    fn resolve_hover_on_typescript_import_falls_back_to_leaf_sir_when_file_rollup_missing() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let src_dir = workspace.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+
+        let dep_file = src_dir.join("dep.ts");
+        fs::write(&dep_file, "export function dep(): number { return 1; }\n")
+            .expect("write dep source");
+        let app_file = src_dir.join("app.ts");
+        fs::write(
+            &app_file,
+            "import { dep } from \"./dep\";\nexport function run(): number { return dep(); }\n",
+        )
+        .expect("write app source");
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        store
+            .upsert_symbol(SymbolRecord {
+                id: "dep-symbol".to_owned(),
+                file_path: "src/dep.ts".to_owned(),
+                language: "typescript".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "dep".to_owned(),
+                signature_fingerprint: "sig-dep".to_owned(),
+                last_seen_at: 1_700_800_200,
+            })
+            .expect("upsert dep symbol");
+        store
+            .write_sir_blob(
+                "dep-symbol",
+                r#"{
+                    "intent":"Leaf summary for dep",
+                    "inputs":[],
+                    "outputs":["number"],
+                    "side_effects":[],
+                    "dependencies":[],
+                    "error_modes":[],
+                    "confidence":0.77
+                }"#,
+            )
+            .expect("write leaf sir");
+        store
+            .upsert_sir_meta(SirMetaRecord {
+                id: "dep-symbol".to_owned(),
+                sir_hash: "hash-leaf".to_owned(),
+                sir_version: 1,
+                provider: "mock".to_owned(),
+                model: "mock".to_owned(),
+                updated_at: 1_700_800_200,
+                sir_status: "fresh".to_owned(),
+                last_error: None,
+                last_attempt_at: 1_700_800_200,
+            })
+            .expect("upsert leaf meta");
+
+        let first_line = fs::read_to_string(&app_file)
+            .expect("read app source")
+            .lines()
+            .next()
+            .expect("import line")
+            .to_owned();
+        let import_col = first_line.find("./dep").expect("import path");
+        let markdown = resolve_hover_markdown_for_path(
+            workspace,
+            &store,
+            &app_file,
+            Position::new(0, (import_col + 2) as u32),
+        )
+        .expect("resolve hover")
+        .expect("hover markdown");
+
+        assert!(markdown.contains("### dep"));
+        assert!(markdown.contains("Leaf summary for dep"));
     }
 
     fn write_source_file(workspace: &Path) -> std::path::PathBuf {
