@@ -118,6 +118,37 @@ impl std::str::FromStr for EmbeddingVectorBackend {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphBackend {
+    #[default]
+    Cozo,
+    Sqlite,
+}
+
+impl GraphBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cozo => "cozo",
+            Self::Sqlite => "sqlite",
+        }
+    }
+}
+
+impl std::str::FromStr for GraphBackend {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "cozo" => Ok(Self::Cozo),
+            "sqlite" => Ok(Self::Sqlite),
+            other => Err(format!(
+                "invalid graph backend '{other}', expected one of: cozo, sqlite"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AetherConfig {
     #[serde(default)]
@@ -173,12 +204,15 @@ impl Default for InferenceConfig {
 pub struct StorageConfig {
     #[serde(default = "default_mirror_sir_files")]
     pub mirror_sir_files: bool,
+    #[serde(default)]
+    pub graph_backend: GraphBackend,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             mirror_sir_files: default_mirror_sir_files(),
+            graph_backend: default_graph_backend(),
         }
     }
 }
@@ -507,6 +541,10 @@ fn default_mirror_sir_files() -> bool {
     true
 }
 
+fn default_graph_backend() -> GraphBackend {
+    GraphBackend::Cozo
+}
+
 fn default_embeddings_enabled() -> bool {
     false
 }
@@ -648,6 +686,7 @@ mod tests {
         assert_eq!(config.inference.provider, InferenceProviderKind::Auto);
         assert_eq!(config.inference.api_key_env, DEFAULT_GEMINI_API_KEY_ENV);
         assert!(config.storage.mirror_sir_files);
+        assert_eq!(config.storage.graph_backend, GraphBackend::Cozo);
         assert!(!config.embeddings.enabled);
         assert_eq!(config.embeddings.provider, EmbeddingProviderKind::Mock);
         assert_eq!(
@@ -700,6 +739,7 @@ mod tests {
         assert!(content.contains("provider = \"auto\""));
         assert!(content.contains("[storage]"));
         assert!(content.contains("mirror_sir_files = true"));
+        assert!(content.contains("graph_backend = \"cozo\""));
         assert!(content.contains("[embeddings]"));
         assert!(content.contains("enabled = false"));
         assert!(content.contains("provider = \"mock\""));
@@ -738,6 +778,7 @@ api_key_env = "CUSTOM_GEMINI_KEY"
 
 [storage]
 mirror_sir_files = false
+graph_backend = "sqlite"
 
 [embeddings]
 enabled = true
@@ -787,6 +828,7 @@ fallback_to_host_on_unavailable = true
         );
         assert_eq!(config.inference.api_key_env, "CUSTOM_GEMINI_KEY");
         assert!(!config.storage.mirror_sir_files);
+        assert_eq!(config.storage.graph_backend, GraphBackend::Sqlite);
         assert!(config.embeddings.enabled);
         assert_eq!(
             config.embeddings.provider,
@@ -848,6 +890,7 @@ api_key_env = "CUSTOM_KEY"
 
 [storage]
 mirror_sir_files = false
+graph_backend = "sqlite"
 
 [embeddings]
 enabled = true
@@ -884,6 +927,7 @@ fallback_to_host_on_unavailable = true
         assert_eq!(config.inference.provider, InferenceProviderKind::Mock);
         assert_eq!(config.inference.api_key_env, "CUSTOM_KEY");
         assert!(!config.storage.mirror_sir_files);
+        assert_eq!(config.storage.graph_backend, GraphBackend::Sqlite);
         assert!(config.embeddings.enabled);
         assert_eq!(
             config.embeddings.provider,
@@ -912,6 +956,7 @@ fallback_to_host_on_unavailable = true
             },
             storage: StorageConfig {
                 mirror_sir_files: true,
+                graph_backend: GraphBackend::Cozo,
             },
             embeddings: EmbeddingsConfig {
                 enabled: false,

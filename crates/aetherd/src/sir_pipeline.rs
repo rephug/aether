@@ -13,7 +13,7 @@ use aether_parse::SymbolExtractor;
 use aether_sir::{SirAnnotation, canonicalize_sir_json, sir_hash};
 use aether_store::{
     SirMetaRecord, SqliteStore, Store, SymbolEmbeddingRecord, SymbolRecord, VectorStore,
-    open_vector_store,
+    open_graph_store, open_vector_store,
 };
 use anyhow::{Context, Result, anyhow};
 use tokio::runtime::Runtime;
@@ -316,8 +316,8 @@ impl SirPipeline {
 
         let full_path = self.workspace_root.join(&event.file_path);
         let source = match fs::read_to_string(&full_path) {
-            Ok(source) => source,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Ok(source) => Some(source),
+            Err(err) if err.kind() == ErrorKind::NotFound => None,
             Err(err) => {
                 return Err(err).with_context(|| {
                     format!(
@@ -328,14 +328,37 @@ impl SirPipeline {
             }
         };
 
-        let mut extractor = SymbolExtractor::new().context("failed to initialize parser")?;
-        let extracted = extractor
-            .extract_with_edges_from_source(event.language, &event.file_path, &source)
-            .with_context(|| format!("failed to extract edges from {}", event.file_path))?;
+        if let Some(source) = source {
+            let mut extractor = SymbolExtractor::new().context("failed to initialize parser")?;
+            let extracted = extractor
+                .extract_with_edges_from_source(event.language, &event.file_path, &source)
+                .with_context(|| format!("failed to extract edges from {}", event.file_path))?;
 
-        store
-            .upsert_edges(&extracted.edges)
-            .with_context(|| format!("failed to upsert edges for file {}", event.file_path))?;
+            store
+                .upsert_edges(&extracted.edges)
+                .with_context(|| format!("failed to upsert edges for file {}", event.file_path))?;
+        }
+
+        self.sync_graph_for_file(store, &event.file_path)?;
+
+        Ok(())
+    }
+
+    fn sync_graph_for_file(&self, store: &SqliteStore, file_path: &str) -> Result<()> {
+        let graph_store = open_graph_store(&self.workspace_root)
+            .context("failed to open configured graph store")?;
+        let stats = store
+            .sync_graph_for_file(graph_store.as_ref(), file_path)
+            .with_context(|| format!("failed to sync graph edges for file {file_path}"))?;
+
+        if stats.unresolved_edges > 0 {
+            tracing::debug!(
+                file_path = %file_path,
+                resolved_edges = stats.resolved_edges,
+                unresolved_edges = stats.unresolved_edges,
+                "graph sync skipped unresolved call edges"
+            );
+        }
 
         Ok(())
     }
