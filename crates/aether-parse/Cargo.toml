@@ -13,3 +13,4 @@ thiserror.workspace = true
 tree-sitter.workspace = true
 tree-sitter-rust.workspace = true
 tree-sitter-typescript.workspace = true
+streaming-iterator.workspace = true
