@@ -105,6 +105,7 @@ dependencies = [
  "aether-core",
  "anyhow",
  "blake3",
+ "streaming-iterator",
  "thiserror 2.0.18",
  "tree-sitter",
  "tree-sitter-rust",
