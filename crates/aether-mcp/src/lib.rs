@@ -1813,6 +1813,7 @@ fn parse_language_field(language: Option<&str>) -> Result<Language, AetherMcpErr
         "tsx" => Ok(Language::Tsx),
         "javascript" => Ok(Language::JavaScript),
         "jsx" => Ok(Language::Jsx),
+        "python" => Ok(Language::Python),
         _ => Err(AetherMcpError::Message(format!(
             "unsupported language: {value}"
         ))),

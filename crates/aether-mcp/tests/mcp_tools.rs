@@ -50,6 +50,11 @@ vector_backend = "sqlite"
         &ts_file,
         "function gamma(): number { return 1; }\nfunction delta(): number { return 2; }\n",
     )?;
+    let py_file = workspace.join("src/jobs.py");
+    fs::write(
+        &py_file,
+        "def compute_total(x: int, y: int) -> int:\n    return x + y\n",
+    )?;
 
     run_initial_index_once(&IndexerConfig {
         workspace: workspace.to_path_buf(),
@@ -121,6 +126,21 @@ vector_backend = "sqlite"
             .matches
             .iter()
             .any(|item| item.file_path.contains("src/app.ts"))
+    );
+
+    let python_search = rt
+        .block_on(server.aether_search(Parameters(AetherSearchRequest {
+            query: "compute_total".to_owned(),
+            limit: Some(10),
+            mode: None,
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert!(
+        python_search
+            .matches
+            .iter()
+            .any(|item| item.file_path.contains("src/jobs.py") && item.language == "python")
     );
 
     let search_with_zero_limit = rt

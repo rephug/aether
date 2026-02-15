@@ -166,6 +166,7 @@ pub enum Language {
     Tsx,
     JavaScript,
     Jsx,
+    Python,
 }
 
 impl Language {
@@ -176,6 +177,7 @@ impl Language {
             Self::Tsx => "tsx",
             Self::JavaScript => "javascript",
             Self::Jsx => "jsx",
+            Self::Python => "python",
         }
     }
 }
@@ -186,6 +188,7 @@ pub enum SymbolKind {
     Function,
     Method,
     Class,
+    Variable,
     Struct,
     Enum,
     Trait,
@@ -199,6 +202,7 @@ impl SymbolKind {
             Self::Function => "function",
             Self::Method => "method",
             Self::Class => "class",
+            Self::Variable => "variable",
             Self::Struct => "struct",
             Self::Enum => "enum",
             Self::Trait => "trait",

@@ -167,6 +167,7 @@ impl Default for LanguageRegistry {
 
 pub fn default_registry() -> LanguageRegistry {
     let mut registry = LanguageRegistry::new();
+    registry.register(languages::python::config());
     registry.register(languages::rust::config());
     registry.register(languages::typescript::config());
     registry.register(languages::typescript::tsx_js_config());

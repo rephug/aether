@@ -128,6 +128,7 @@ impl SymbolExtractor {
             Language::Rust => "rust",
             Language::TypeScript => "typescript",
             Language::Tsx | Language::JavaScript | Language::Jsx => "tsx_js",
+            Language::Python => "python",
         };
         self.registry.get_by_id(fallback_id)
     }
@@ -353,6 +354,7 @@ fn parse_symbol_kind(value: &str) -> Option<SymbolKind> {
         "function" => Some(SymbolKind::Function),
         "method" => Some(SymbolKind::Method),
         "class" => Some(SymbolKind::Class),
+        "variable" => Some(SymbolKind::Variable),
         "struct" => Some(SymbolKind::Struct),
         "enum" => Some(SymbolKind::Enum),
         "trait" => Some(SymbolKind::Trait),
@@ -367,6 +369,7 @@ fn symbol_kind_from_capture_name(capture_name: &str) -> Option<SymbolKind> {
         "function" => Some(SymbolKind::Function),
         "method" => Some(SymbolKind::Method),
         "class" => Some(SymbolKind::Class),
+        "variable" => Some(SymbolKind::Variable),
         "struct" => Some(SymbolKind::Struct),
         "enum" => Some(SymbolKind::Enum),
         "trait" => Some(SymbolKind::Trait),
@@ -410,6 +413,7 @@ pub fn language_for_path(path: &Path) -> Option<Language> {
         "tsx" => Some(Language::Tsx),
         "js" => Some(Language::JavaScript),
         "jsx" => Some(Language::Jsx),
+        "py" | "pyi" => Some(Language::Python),
         _ => None,
     }
 }
