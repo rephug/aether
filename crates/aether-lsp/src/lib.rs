@@ -2,10 +2,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use aether_core::{
-    HoverMarkdownSections, NO_SIR_MESSAGE, SourceRange, format_hover_markdown_sections,
+    HoverMarkdownSections, Language, NO_SIR_MESSAGE, SourceRange, format_hover_markdown_sections,
     normalize_path, stable_symbol_id, stale_warning_message,
 };
-use aether_parse::{SymbolExtractor, language_for_path};
+use aether_parse::{RustUsePrefix, SymbolExtractor, language_for_path, rust_use_path_at_cursor};
 use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
 use aether_store::{SqliteStore, Store, StoreError};
 use serde_json::Value;
@@ -236,6 +236,17 @@ fn resolve_import_hover_markdown(
     cursor_line: usize,
     cursor_column: usize,
 ) -> Result<Option<String>, HoverResolveError> {
+    if matches!(language_for_path(source_file), Some(Language::Rust)) {
+        return resolve_rust_import_hover_markdown(
+            workspace_root,
+            store,
+            source_file,
+            source,
+            cursor_line,
+            cursor_column,
+        );
+    }
+
     let Some(line) = source.lines().nth(cursor_line.saturating_sub(1)) else {
         return Ok(None);
     };
@@ -296,6 +307,49 @@ fn resolve_import_hover_markdown(
     )))
 }
 
+fn resolve_rust_import_hover_markdown(
+    workspace_root: &Path,
+    store: &SqliteStore,
+    source_file: &Path,
+    source: &str,
+    cursor_line: usize,
+    cursor_column: usize,
+) -> Result<Option<String>, HoverResolveError> {
+    let Some(use_path) = rust_use_path_at_cursor(
+        source,
+        cursor_line.saturating_sub(1),
+        cursor_column.saturating_sub(1),
+    ) else {
+        return Ok(None);
+    };
+    let Some((resolved_path, file_segment_index)) =
+        resolve_rust_use_target_file(source_file, use_path.prefix, &use_path.segments)
+    else {
+        return Ok(None);
+    };
+    if use_path
+        .cursor_segment_index
+        .is_some_and(|index| index > file_segment_index)
+    {
+        return Ok(None);
+    }
+
+    let resolved_path = resolved_path.canonicalize()?;
+    if !resolved_path.starts_with(workspace_root) {
+        return Ok(None);
+    }
+
+    let relative_path = workspace_relative_display_path(workspace_root, &resolved_path);
+    let file_rollup_id = synthetic_file_sir_id("rust", &relative_path);
+    if let Some(rollup_blob) = store.read_sir_blob(&file_rollup_id)?
+        && let Ok(file_sir) = serde_json::from_str::<FileSir>(&rollup_blob)
+    {
+        return Ok(Some(format_file_rollup_markdown(&relative_path, &file_sir)));
+    }
+
+    Ok(None)
+}
+
 fn extract_import_path_literal_at_cursor(line: &str, cursor_column: usize) -> Option<String> {
     let bytes = line.as_bytes();
     let mut index = 0usize;
@@ -353,6 +407,67 @@ fn resolve_relative_import_target(source_file: &Path, import_target: &str) -> Op
     }
 
     candidates.into_iter().find(|path| path.is_file())
+}
+
+fn resolve_rust_use_target_file(
+    source_file: &Path,
+    prefix: RustUsePrefix,
+    segments: &[String],
+) -> Option<(PathBuf, usize)> {
+    let mut base = match prefix {
+        RustUsePrefix::Crate => find_crate_src_root(source_file)?,
+        RustUsePrefix::Self_ => rust_self_base_dir(source_file)?,
+        RustUsePrefix::Super => rust_self_base_dir(source_file)?.parent()?.to_path_buf(),
+    };
+    if segments.is_empty() {
+        return None;
+    }
+
+    let mut resolved_file = None;
+    let mut resolved_segment_index = 0usize;
+
+    for (index, segment) in segments.iter().enumerate() {
+        let mod_candidate = base.join(segment).join("mod.rs");
+        let file_candidate = base.join(format!("{segment}.rs"));
+        let has_mod = mod_candidate.is_file();
+        let has_file = file_candidate.is_file();
+
+        if has_mod {
+            resolved_file = Some(mod_candidate);
+            resolved_segment_index = index;
+            base = base.join(segment);
+            continue;
+        }
+        if has_file {
+            resolved_file = Some(file_candidate);
+            resolved_segment_index = index;
+            break;
+        }
+        if resolved_file.is_some() {
+            break;
+        }
+        return None;
+    }
+
+    resolved_file.map(|path| (path, resolved_segment_index))
+}
+
+fn rust_self_base_dir(source_file: &Path) -> Option<PathBuf> {
+    Some(source_file.parent()?.to_path_buf())
+}
+
+fn find_crate_src_root(source_file: &Path) -> Option<PathBuf> {
+    for dir in source_file.ancestors() {
+        let cargo_toml = dir.join("Cargo.toml");
+        if cargo_toml.is_file() {
+            let src = dir.join("src");
+            if src.is_dir() {
+                return Some(src);
+            }
+            return None;
+        }
+    }
+    None
 }
 
 fn format_file_rollup_markdown(file_path: &str, file_sir: &FileSir) -> String {
@@ -944,6 +1059,232 @@ mod tests {
         assert!(markdown.contains("Leaf summary for dep"));
     }
 
+    #[test]
+    fn resolve_hover_on_rust_use_crate_loader_returns_file_rollup_summary() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_workspace_manifest(workspace);
+        let src_dir = workspace.join("src");
+        fs::create_dir_all(src_dir.join("config")).expect("create config dir");
+
+        let source_file = src_dir.join("lib.rs");
+        fs::write(
+            &source_file,
+            "use crate::config::loader;\nfn alpha() -> i32 { 1 }\n",
+        )
+        .expect("write source");
+        fs::write(
+            src_dir.join("config/loader.rs"),
+            "pub fn parse_toml() -> bool { true }\n",
+        )
+        .expect("write loader");
+        fs::write(src_dir.join("config/mod.rs"), "pub mod loader;\n").expect("write config mod");
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        write_file_rollup(
+            &store,
+            "rust",
+            "src/config/loader.rs",
+            "Loader rollup summary",
+        );
+
+        let import_line = fs::read_to_string(&source_file)
+            .expect("read source")
+            .lines()
+            .next()
+            .expect("import line")
+            .to_owned();
+        let col = import_line.find("config").expect("config segment");
+        let markdown = resolve_hover_markdown_for_path(
+            workspace,
+            &store,
+            &source_file,
+            Position::new(0, col as u32),
+        )
+        .expect("resolve hover")
+        .expect("hover markdown");
+
+        assert!(markdown.contains("### src/config/loader.rs"));
+        assert!(markdown.contains("Loader rollup summary"));
+    }
+
+    #[test]
+    fn resolve_hover_on_rust_use_crate_prefers_mod_rs_when_both_exist() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_workspace_manifest(workspace);
+        let src_dir = workspace.join("src");
+        fs::create_dir_all(src_dir.join("config")).expect("create config dir");
+
+        let source_file = src_dir.join("lib.rs");
+        fs::write(&source_file, "use crate::config;\n").expect("write source");
+        fs::write(src_dir.join("config.rs"), "pub fn from_file() {}\n").expect("write config.rs");
+        fs::write(src_dir.join("config/mod.rs"), "pub fn from_mod() {}\n").expect("write mod.rs");
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        write_file_rollup(&store, "rust", "src/config/mod.rs", "Config mod summary");
+
+        let import_line = fs::read_to_string(&source_file)
+            .expect("read source")
+            .lines()
+            .next()
+            .expect("import line")
+            .to_owned();
+        let col = import_line.find("config").expect("config segment");
+        let markdown = resolve_hover_markdown_for_path(
+            workspace,
+            &store,
+            &source_file,
+            Position::new(0, col as u32),
+        )
+        .expect("resolve hover")
+        .expect("hover markdown");
+
+        assert!(markdown.contains("### src/config/mod.rs"));
+        assert!(markdown.contains("Config mod summary"));
+    }
+
+    #[test]
+    fn resolve_hover_on_rust_use_super_resolves_parent_relative_file() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_workspace_manifest(workspace);
+        let src_dir = workspace.join("src");
+        fs::create_dir_all(src_dir.join("config")).expect("create config dir");
+
+        let source_file = src_dir.join("config/loader.rs");
+        fs::write(&source_file, "use super::utils;\n").expect("write source");
+        fs::write(src_dir.join("utils.rs"), "pub fn shared() {}\n").expect("write utils");
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        write_file_rollup(&store, "rust", "src/utils.rs", "Utils rollup summary");
+
+        let import_line = fs::read_to_string(&source_file)
+            .expect("read source")
+            .lines()
+            .next()
+            .expect("import line")
+            .to_owned();
+        let col = import_line.find("utils").expect("utils segment");
+        let markdown = resolve_hover_markdown_for_path(
+            workspace,
+            &store,
+            &source_file,
+            Position::new(0, col as u32),
+        )
+        .expect("resolve hover")
+        .expect("hover markdown");
+
+        assert!(markdown.contains("### src/utils.rs"));
+        assert!(markdown.contains("Utils rollup summary"));
+    }
+
+    #[test]
+    fn resolve_hover_on_rust_unresolvable_use_falls_through_without_error() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_workspace_manifest(workspace);
+        let src_dir = workspace.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+
+        let source_file = src_dir.join("lib.rs");
+        fs::write(&source_file, "use crate::nonexistent;\n").expect("write source");
+        let store = SqliteStore::open(workspace).expect("open store");
+
+        let import_line = fs::read_to_string(&source_file)
+            .expect("read source")
+            .lines()
+            .next()
+            .expect("import line")
+            .to_owned();
+        let col = import_line
+            .find("nonexistent")
+            .expect("nonexistent segment");
+        let markdown = resolve_hover_markdown_for_path(
+            workspace,
+            &store,
+            &source_file,
+            Position::new(0, col as u32),
+        )
+        .expect("resolve hover");
+
+        assert!(markdown.is_none());
+    }
+
+    #[test]
+    fn resolve_hover_on_rust_use_without_file_rollup_falls_back_to_leaf_hover() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_workspace_manifest(workspace);
+        let src_dir = workspace.join("src");
+        fs::create_dir_all(src_dir.join("config")).expect("create config dir");
+
+        let source_file = src_dir.join("lib.rs");
+        fs::write(
+            &source_file,
+            "use crate::config::loader;\nfn alpha(x: i32) -> i32 { x + 1 }\n",
+        )
+        .expect("write source");
+        fs::write(
+            src_dir.join("config/loader.rs"),
+            "pub fn parse_toml() -> bool { true }\n",
+        )
+        .expect("write loader");
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        let alpha_symbol_id = symbol_id_at(workspace, &source_file, Position::new(1, 4));
+        store
+            .write_sir_blob(
+                &alpha_symbol_id,
+                r#"{
+                    "intent":"Leaf summary for alpha",
+                    "inputs":["x"],
+                    "outputs":["i32"],
+                    "side_effects":[],
+                    "dependencies":[],
+                    "error_modes":[],
+                    "confidence":0.81
+                }"#,
+            )
+            .expect("write alpha sir");
+        store
+            .upsert_sir_meta(SirMetaRecord {
+                id: alpha_symbol_id,
+                sir_hash: "hash-alpha".to_owned(),
+                sir_version: 1,
+                provider: "mock".to_owned(),
+                model: "mock".to_owned(),
+                updated_at: 1_700_810_100,
+                sir_status: "fresh".to_owned(),
+                last_error: None,
+                last_attempt_at: 1_700_810_100,
+            })
+            .expect("upsert alpha meta");
+
+        let import_line = fs::read_to_string(&source_file)
+            .expect("read source")
+            .lines()
+            .next()
+            .expect("import line")
+            .to_owned();
+        let import_col = import_line.find("config").expect("config segment");
+        let import_markdown = resolve_hover_markdown_for_path(
+            workspace,
+            &store,
+            &source_file,
+            Position::new(0, import_col as u32),
+        )
+        .expect("resolve import hover");
+        assert!(import_markdown.is_none());
+
+        let leaf_markdown =
+            resolve_hover_markdown_for_path(workspace, &store, &source_file, Position::new(1, 4))
+                .expect("resolve leaf hover")
+                .expect("leaf hover markdown");
+        assert!(leaf_markdown.contains("### alpha"));
+        assert!(leaf_markdown.contains("Leaf summary for alpha"));
+    }
+
     fn write_source_file(workspace: &Path) -> std::path::PathBuf {
         let src_dir = workspace.join("src");
         fs::create_dir_all(&src_dir).expect("create src dir");
@@ -977,5 +1318,46 @@ mod tests {
             &symbol.qualified_name,
             &symbol.signature_fingerprint,
         )
+    }
+
+    fn write_workspace_manifest(workspace: &Path) {
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = \"hover-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write manifest");
+    }
+
+    fn write_file_rollup(store: &SqliteStore, language: &str, file_path: &str, intent: &str) {
+        let rollup_id = synthetic_file_sir_id(language, file_path);
+        store
+            .write_sir_blob(
+                &rollup_id,
+                &format!(
+                    r#"{{
+                        "intent":"{intent}",
+                        "exports":[],
+                        "side_effects":[],
+                        "dependencies":[],
+                        "error_modes":[],
+                        "symbol_count":1,
+                        "confidence":0.90
+                    }}"#
+                ),
+            )
+            .expect("write rollup");
+        store
+            .upsert_sir_meta(SirMetaRecord {
+                id: rollup_id,
+                sir_hash: "hash-rollup".to_owned(),
+                sir_version: 1,
+                provider: "rollup".to_owned(),
+                model: "deterministic".to_owned(),
+                updated_at: 1_700_800_100,
+                sir_status: "fresh".to_owned(),
+                last_error: None,
+                last_attempt_at: 1_700_800_100,
+            })
+            .expect("upsert rollup meta");
     }
 }
