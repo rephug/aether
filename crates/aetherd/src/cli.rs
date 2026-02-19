@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::path::PathBuf;
 
-use aether_config::{InferenceProviderKind, VerifyMode};
+use aether_config::{InferenceProviderKind, OLLAMA_DEFAULT_ENDPOINT, VerifyMode};
 use clap::{Args, Parser, Subcommand};
 
 use crate::init_agent::AgentPlatform;
@@ -52,10 +52,34 @@ pub struct InitAgentArgs {
     pub force: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct SetupLocalArgs {
+    #[arg(
+        long,
+        default_value = OLLAMA_DEFAULT_ENDPOINT,
+        help = "Ollama endpoint base URL"
+    )]
+    pub endpoint: String,
+
+    #[arg(long, help = "Model to use for local SIR generation")]
+    pub model: Option<String>,
+
+    #[arg(long, help = "Skip model pull even when model is missing")]
+    pub skip_pull: bool,
+
+    #[arg(
+        long,
+        help = "Skip writing provider/model settings to .aether/config.toml"
+    )]
+    pub skip_config: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Commands {
     /// Generate agent configuration files for AI coding agents
     InitAgent(InitAgentArgs),
+    /// Set up local Ollama inference for offline SIR generation
+    SetupLocal(SetupLocalArgs),
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -255,6 +279,7 @@ fn parse_log_format(value: &str) -> Result<LogFormat, String> {
 
 #[cfg(test)]
 mod tests {
+    use aether_config::OLLAMA_DEFAULT_ENDPOINT;
     use clap::Parser;
 
     use super::{Cli, Commands};
@@ -335,6 +360,52 @@ mod tests {
             Some(Commands::InitAgent(args)) => {
                 assert_eq!(args.platform, AgentPlatform::Claude);
                 assert!(args.force);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn setup_local_subcommand_parses_with_defaults() {
+        let cli = Cli::try_parse_from(["aetherd", "--workspace", ".", "setup-local"])
+            .expect("setup-local should parse");
+
+        match cli.command {
+            Some(Commands::SetupLocal(args)) => {
+                assert_eq!(args.endpoint, OLLAMA_DEFAULT_ENDPOINT);
+                assert_eq!(args.model, None);
+                assert!(!args.skip_pull);
+                assert!(!args.skip_config);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn setup_local_subcommand_parses_all_flags() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "setup-local",
+            "--endpoint",
+            "http://127.0.0.1:11435",
+            "--model",
+            "qwen2.5-coder:7b-instruct-q4_K_M",
+            "--skip-pull",
+            "--skip-config",
+        ])
+        .expect("setup-local with args should parse");
+
+        match cli.command {
+            Some(Commands::SetupLocal(args)) => {
+                assert_eq!(args.endpoint, "http://127.0.0.1:11435");
+                assert_eq!(
+                    args.model.as_deref(),
+                    Some("qwen2.5-coder:7b-instruct-q4_K_M")
+                );
+                assert!(args.skip_pull);
+                assert!(args.skip_config);
             }
             other => panic!("unexpected command: {other:?}"),
         }

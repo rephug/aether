@@ -243,6 +243,54 @@ Generated content is config-aware and reflects `.aether/config.toml` values such
 
 Re-run `aetherd --workspace . init-agent --force` after changing AETHER configuration to regenerate and overwrite existing agent files.
 
+## Local Inference (Offline Mode)
+
+Run AETHER with fully local SIR generation through Ollama.
+
+### Quick Setup
+
+```bash
+aetherd --workspace . setup-local
+```
+
+`setup-local` performs:
+- Ollama connectivity check (`/api/tags`)
+- model presence check and optional pull (`/api/pull`)
+- SIR generation smoke test against a small code snippet
+- config update to `inference.provider = "qwen3_local"`
+
+### Manual Setup
+
+1. Start Ollama locally (default endpoint: `http://127.0.0.1:11434`).
+2. Pull the recommended model:
+   - `ollama pull qwen2.5-coder:7b-instruct-q4_K_M`
+3. Update `.aether/config.toml`:
+
+```toml
+[inference]
+provider = "qwen3_local"
+model = "qwen2.5-coder:7b-instruct-q4_K_M"
+endpoint = "http://127.0.0.1:11434"
+```
+
+### Notes
+
+- `setup-local` supports:
+  - `--endpoint <url>`
+  - `--model <name>`
+  - `--skip-pull`
+  - `--skip-config`
+- Exit codes:
+  - `0` success
+  - `1` Ollama unreachable
+  - `2` model pull failed
+  - `3` SIR smoke test failed
+- Local SIR generation runs with low temperature (`0.1`) for deterministic JSON output.
+
+### Ollama Cloud Models
+
+Ollama cloud-hosted models work through the same local API endpoint with no AETHER code changes. To switch, keep provider as `qwen3_local` and set only the model name (for example, `qwen3-coder:480b-cloud`).
+
 ## Configuration
 
 AETHER uses project-local config at:
