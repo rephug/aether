@@ -44,8 +44,19 @@ jobs:
         run: cargo clippy --workspace -- -D warnings
 
   test:
-    name: test
+    name: test-${{ matrix.crate }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - aether-core
+          - aether-config
+          - aether-store
+          - aether-memory
+          - aether-analysis
+          - aether-mcp
+          - aetherd
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -57,15 +68,10 @@ jobs:
           sudo apt-get install -y protobuf-compiler mold clang
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
-      - name: Test per-crate
+        with:
+          key: ${{ matrix.crate }}
+      - name: Test
         env:
           PROTOC: /usr/bin/protoc
           CARGO_BUILD_JOBS: "2"
-        run: |
-          cargo test -p aether-core
-          cargo test -p aether-config
-          cargo test -p aether-store
-          cargo test -p aether-memory
-          cargo test -p aether-analysis
-          cargo test -p aether-mcp
-          cargo test -p aetherd
+        run: cargo test -p ${{ matrix.crate }}
