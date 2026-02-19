@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/aether-analysis",
     "crates/aetherd",
     "crates/aether-core",
     "crates/aether-config",

@@ -11,6 +11,7 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+aether-analysis = { path = "../aether-analysis" }
 aether-config = { path = "../aether-config" }
 aether-core = { path = "../aether-core" }
 aether-memory = { path = "../aether-memory" }

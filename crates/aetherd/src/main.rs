@@ -7,8 +7,11 @@ use aether_config::{
 use aether_infer::{download_candle_embedding_model, download_candle_reranker_model};
 use aetherd::calibrate::run_calibration_once;
 use aetherd::cli::{
-    Cli, Commands, InitAgentArgs, LogFormat, NotesArgs, RecallArgs, RememberArgs, SetupLocalArgs,
-    parse_cli,
+    BlastRadiusArgs, Cli, Commands, CouplingReportArgs, InitAgentArgs, LogFormat, MineCouplingArgs,
+    NotesArgs, RecallArgs, RememberArgs, SetupLocalArgs, parse_cli,
+};
+use aetherd::coupling::{
+    run_blast_radius_command, run_coupling_report_command, run_mine_coupling_command,
 };
 use aetherd::indexer::{IndexerConfig, run_indexing_loop, run_initial_index_once};
 use aetherd::init_agent::{InitAgentOptions, run_init_agent};
@@ -208,6 +211,9 @@ fn run_subcommand(workspace: &Path, command: Commands) -> Result<()> {
         Commands::Remember(args) => run_remember_note_command(workspace, args),
         Commands::Recall(args) => run_recall_note_command(workspace, args),
         Commands::Notes(args) => run_notes_list_command(workspace, args),
+        Commands::MineCoupling(args) => run_mine_coupling_subcommand(workspace, args),
+        Commands::BlastRadius(args) => run_blast_radius_subcommand(workspace, args),
+        Commands::CouplingReport(args) => run_coupling_report_subcommand(workspace, args),
     }
 }
 
@@ -273,6 +279,18 @@ fn run_recall_note_command(workspace: &Path, args: RecallArgs) -> Result<()> {
 
 fn run_notes_list_command(workspace: &Path, args: NotesArgs) -> Result<()> {
     run_notes_command(workspace, args).context("notes command failed")
+}
+
+fn run_mine_coupling_subcommand(workspace: &Path, args: MineCouplingArgs) -> Result<()> {
+    run_mine_coupling_command(workspace, args).context("mine-coupling command failed")
+}
+
+fn run_blast_radius_subcommand(workspace: &Path, args: BlastRadiusArgs) -> Result<()> {
+    run_blast_radius_command(workspace, args).context("blast-radius command failed")
+}
+
+fn run_coupling_report_subcommand(workspace: &Path, args: CouplingReportArgs) -> Result<()> {
+    run_coupling_report_command(workspace, args).context("coupling-report command failed")
 }
 
 fn init_tracing_subscriber(log_format: LogFormat, configured_log_level: &str) -> Result<()> {

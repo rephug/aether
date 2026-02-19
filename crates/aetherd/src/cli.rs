@@ -2,6 +2,7 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use aether_analysis::RiskLevel as CouplingRiskLevel;
 use aether_config::{InferenceProviderKind, OLLAMA_DEFAULT_ENDPOINT, VerifyMode};
 use clap::{Args, Parser, Subcommand};
 
@@ -135,6 +136,39 @@ pub struct NotesArgs {
     pub since: Option<Duration>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct MineCouplingArgs {
+    #[arg(
+        long,
+        help = "Maximum number of commits to scan for this run (defaults to config coupling.commit_window)"
+    )]
+    pub commits: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct BlastRadiusArgs {
+    #[arg(help = "Target file path")]
+    pub file: String,
+
+    #[arg(
+        long,
+        default_value = "medium",
+        value_parser = parse_coupling_risk_level,
+        help = "Minimum risk level to include: low, medium, high, critical"
+    )]
+    pub min_risk: CouplingRiskLevel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct CouplingReportArgs {
+    #[arg(
+        long,
+        default_value_t = 20,
+        help = "Number of top coupling pairs to return (clamped to 1..200)"
+    )]
+    pub top: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Commands {
     /// Generate agent configuration files for AI coding agents
@@ -147,6 +181,12 @@ pub enum Commands {
     Recall(RecallArgs),
     /// List recent project memory notes
     Notes(NotesArgs),
+    /// Mine temporal/static/semantic file coupling signals
+    MineCoupling(MineCouplingArgs),
+    /// Show coupled files and risk when changing one file
+    BlastRadius(BlastRadiusArgs),
+    /// Show highest-scoring coupling pairs
+    CouplingReport(CouplingReportArgs),
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -342,6 +382,18 @@ fn parse_verify_mode(value: &str) -> Result<VerifyMode, String> {
 
 fn parse_log_format(value: &str) -> Result<LogFormat, String> {
     value.parse()
+}
+
+fn parse_coupling_risk_level(value: &str) -> Result<CouplingRiskLevel, String> {
+    match value.trim() {
+        "low" => Ok(CouplingRiskLevel::Low),
+        "medium" => Ok(CouplingRiskLevel::Medium),
+        "high" => Ok(CouplingRiskLevel::High),
+        "critical" => Ok(CouplingRiskLevel::Critical),
+        other => Err(format!(
+            "invalid risk level '{other}', expected one of: low, medium, high, critical"
+        )),
+    }
 }
 
 fn parse_since_duration(value: &str) -> Result<Duration, String> {
@@ -581,6 +633,68 @@ mod tests {
             Some(Commands::Notes(args)) => {
                 assert_eq!(args.limit, 12);
                 assert_eq!(args.since, Some(Duration::from_secs(7 * 24 * 60 * 60)));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mine_coupling_subcommand_parses_optional_commit_window() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "mine-coupling",
+            "--commits",
+            "120",
+        ])
+        .expect("mine-coupling should parse");
+
+        match cli.command {
+            Some(Commands::MineCoupling(args)) => {
+                assert_eq!(args.commits, Some(120));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blast_radius_subcommand_parses_file_and_min_risk() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "blast-radius",
+            "crates/aether-store/src/lib.rs",
+            "--min-risk",
+            "high",
+        ])
+        .expect("blast-radius should parse");
+
+        match cli.command {
+            Some(Commands::BlastRadius(args)) => {
+                assert_eq!(args.file, "crates/aether-store/src/lib.rs");
+                assert_eq!(args.min_risk, aether_analysis::RiskLevel::High);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coupling_report_subcommand_parses_top() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "coupling-report",
+            "--top",
+            "15",
+        ])
+        .expect("coupling-report should parse");
+
+        match cli.command {
+            Some(Commands::CouplingReport(args)) => {
+                assert_eq!(args.top, 15);
             }
             other => panic!("unexpected command: {other:?}"),
         }

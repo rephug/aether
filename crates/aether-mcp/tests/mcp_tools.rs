@@ -4,11 +4,12 @@ use aether_core::{
     SEARCH_FALLBACK_EMBEDDINGS_DISABLED, SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED, SearchMode,
 };
 use aether_mcp::{
-    AetherCallChainRequest, AetherDependenciesRequest, AetherExplainRequest, AetherGetSirRequest,
-    AetherMcpServer, AetherRecallRequest, AetherRememberRequest, AetherSearchRequest,
-    AetherSymbolLookupRequest, AetherSymbolTimelineRequest, AetherVerifyMode, AetherVerifyRequest,
-    AetherWhyChangedReason, AetherWhyChangedRequest, AetherWhySelectorMode, MCP_SCHEMA_VERSION,
-    MEMORY_SCHEMA_VERSION, SirLevelRequest,
+    AetherBlastRadiusRequest, AetherCallChainRequest, AetherDependenciesRequest,
+    AetherExplainRequest, AetherGetSirRequest, AetherMcpServer, AetherRecallRequest,
+    AetherRememberRequest, AetherSearchRequest, AetherSymbolLookupRequest,
+    AetherSymbolTimelineRequest, AetherVerifyMode, AetherVerifyRequest, AetherWhyChangedReason,
+    AetherWhyChangedRequest, AetherWhySelectorMode, MCP_SCHEMA_VERSION, MEMORY_SCHEMA_VERSION,
+    SirLevelRequest,
 };
 use aether_sir::{synthetic_file_sir_id, synthetic_module_sir_id};
 use aether_store::{SqliteStore, Store};
@@ -1335,6 +1336,52 @@ fn mcp_memory_tool_response_schema_shapes_are_stable() -> Result<()> {
         "notes",
     ] {
         assert!(recall_obj.contains_key(key), "missing key: {key}");
+    }
+
+    Ok(())
+}
+
+#[test]
+fn mcp_blast_radius_response_schema_shape_is_stable() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    fs::create_dir_all(workspace.join(".aether"))?;
+    fs::write(
+        workspace.join(".aether/config.toml"),
+        r#"[storage]
+graph_backend = "sqlite"
+
+[embeddings]
+enabled = false
+provider = "mock"
+vector_backend = "sqlite"
+"#,
+    )?;
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+    let response = rt
+        .block_on(
+            server.aether_blast_radius(Parameters(AetherBlastRadiusRequest {
+                file: "src/lib.rs".to_owned(),
+                min_risk: None,
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+
+    let json = serde_json::to_value(&response)?;
+    let object = json
+        .as_object()
+        .expect("blast radius response should serialize as object");
+    for key in [
+        "schema_version",
+        "target_file",
+        "mining_state",
+        "coupled_files",
+        "test_guards",
+    ] {
+        assert!(object.contains_key(key), "missing key: {key}");
     }
 
     Ok(())

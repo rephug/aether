@@ -6,6 +6,7 @@ use std::time::Duration;
 use aether_config::{GraphBackend, load_workspace_config};
 use aether_core::{EdgeKind, SymbolEdge, normalize_path};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value as SqlValue};
+use serde::{Deserialize, Serialize};
 use serde_json::from_str as json_from_str;
 use thiserror::Error;
 
@@ -154,6 +155,30 @@ pub struct ProjectNoteSemanticSearchResult {
     pub semantic_score: f32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CouplingMiningStateRecord {
+    pub last_commit_hash: Option<String>,
+    pub last_mined_at: Option<i64>,
+    pub commits_scanned: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CouplingEdgeRecord {
+    pub file_a: String,
+    pub file_b: String,
+    pub co_change_count: i64,
+    pub total_commits_a: i64,
+    pub total_commits_b: i64,
+    pub git_coupling: f32,
+    pub static_signal: f32,
+    pub semantic_signal: f32,
+    pub fused_score: f32,
+    pub coupling_type: String,
+    pub last_co_change_commit: String,
+    pub last_co_change_at: i64,
+    pub mined_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThresholdCalibrationRecord {
     pub language: String,
@@ -285,6 +310,11 @@ pub trait Store {
         since_epoch_ms: Option<i64>,
         include_archived: bool,
     ) -> Result<Vec<ProjectNoteRecord>, StoreError>;
+    fn list_project_notes_for_file_ref(
+        &self,
+        file_path: &str,
+        limit: u32,
+    ) -> Result<Vec<ProjectNoteRecord>, StoreError>;
     fn search_project_notes_lexical(
         &self,
         query: &str,
@@ -309,6 +339,13 @@ pub trait Store {
         model: &str,
         limit: u32,
     ) -> Result<Vec<ProjectNoteSemanticSearchResult>, StoreError>;
+
+    fn get_coupling_mining_state(&self) -> Result<Option<CouplingMiningStateRecord>, StoreError>;
+    fn upsert_coupling_mining_state(
+        &self,
+        state: CouplingMiningStateRecord,
+    ) -> Result<(), StoreError>;
+    fn has_dependency_between_files(&self, file_a: &str, file_b: &str) -> Result<bool, StoreError>;
 }
 
 pub trait GraphStore: Send + Sync {
@@ -533,6 +570,70 @@ impl SqliteStore {
         })?;
 
         let records = rows.collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    pub fn list_symbol_embeddings_for_ids(
+        &self,
+        provider: &str,
+        model: &str,
+        symbol_ids: &[String],
+    ) -> Result<Vec<SymbolEmbeddingRecord>, StoreError> {
+        let provider = provider.trim();
+        let model = model.trim();
+        if provider.is_empty() || model.is_empty() || symbol_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = std::iter::repeat_n("?", symbol_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT symbol_id, sir_hash, provider, model, embedding_json, updated_at
+            FROM sir_embeddings
+            WHERE provider = ?1
+              AND model = ?2
+              AND symbol_id IN ({placeholders})
+            ORDER BY symbol_id ASC
+            "#
+        );
+
+        let mut params_vec: Vec<SqlValue> = vec![
+            SqlValue::Text(provider.to_owned()),
+            SqlValue::Text(model.to_owned()),
+        ];
+        params_vec.extend(symbol_ids.iter().cloned().map(SqlValue::Text));
+
+        let mut stmt = self.conn.prepare(sql.as_str())?;
+        let rows = stmt.query_map(params_from_iter(params_vec), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let (symbol_id, sir_hash, provider, model, embedding_json, updated_at) = row?;
+            let embedding = json_from_str::<Vec<f32>>(&embedding_json)?;
+            if embedding.is_empty() {
+                continue;
+            }
+            records.push(SymbolEmbeddingRecord {
+                symbol_id,
+                sir_hash,
+                provider,
+                model,
+                embedding,
+                updated_at,
+            });
+        }
+
         Ok(records)
     }
 
@@ -1578,6 +1679,46 @@ impl Store for SqliteStore {
         Ok(records)
     }
 
+    fn list_project_notes_for_file_ref(
+        &self,
+        file_path: &str,
+        limit: u32,
+    ) -> Result<Vec<ProjectNoteRecord>, StoreError> {
+        let file_path = file_path.trim();
+        if file_path.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT
+                note_id, content, content_hash, source_type, source_agent,
+                tags, entity_refs, file_refs, symbol_refs,
+                created_at, updated_at, access_count, last_accessed_at, is_archived
+            FROM project_notes
+            WHERE is_archived = 0
+              AND EXISTS (
+                  SELECT 1
+                  FROM json_each(project_notes.file_refs)
+                  WHERE json_each.value = ?1
+              )
+            ORDER BY updated_at DESC, note_id ASC
+            LIMIT ?2
+            "#,
+        )?;
+
+        let rows = stmt.query_map(
+            params![file_path, limit.clamp(1, 100)],
+            project_note_tuple_from_row,
+        )?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(project_note_from_tuple(row?)?);
+        }
+
+        Ok(records)
+    }
+
     fn search_project_notes_lexical(
         &self,
         query: &str,
@@ -1805,6 +1946,80 @@ impl Store for SqliteStore {
         });
         scored.truncate(capped_limit);
         Ok(scored)
+    }
+
+    fn get_coupling_mining_state(&self) -> Result<Option<CouplingMiningStateRecord>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT last_commit_hash, last_mined_at, commits_scanned
+            FROM coupling_mining_state
+            WHERE id = 1
+            LIMIT 1
+            "#,
+        )?;
+
+        stmt.query_row([], |row| {
+            Ok(CouplingMiningStateRecord {
+                last_commit_hash: row.get(0)?,
+                last_mined_at: row.get(1)?,
+                commits_scanned: row.get::<_, i64>(2)?.max(0),
+            })
+        })
+        .optional()
+        .map_err(Into::into)
+    }
+
+    fn upsert_coupling_mining_state(
+        &self,
+        state: CouplingMiningStateRecord,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            r#"
+            INSERT INTO coupling_mining_state (id, last_commit_hash, last_mined_at, commits_scanned)
+            VALUES (1, ?1, ?2, ?3)
+            ON CONFLICT(id) DO UPDATE SET
+                last_commit_hash = excluded.last_commit_hash,
+                last_mined_at = excluded.last_mined_at,
+                commits_scanned = excluded.commits_scanned
+            "#,
+            params![
+                state.last_commit_hash,
+                state.last_mined_at.map(|value| value.max(0)),
+                state.commits_scanned.max(0),
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    fn has_dependency_between_files(&self, file_a: &str, file_b: &str) -> Result<bool, StoreError> {
+        let file_a = file_a.trim();
+        let file_b = file_b.trim();
+        if file_a.is_empty() || file_b.is_empty() {
+            return Ok(false);
+        }
+
+        let exists = self.conn.query_row(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM symbol_edges e
+                JOIN symbols s_source ON s_source.id = e.source_id
+                JOIN symbols s_target ON s_target.qualified_name = e.target_qualified_name
+                WHERE e.edge_kind IN ('calls', 'depends_on')
+                  AND (
+                      (s_source.file_path = ?1 AND s_target.file_path = ?2)
+                      OR
+                      (s_source.file_path = ?2 AND s_target.file_path = ?1)
+                  )
+                LIMIT 1
+            )
+            "#,
+            params![file_a, file_b],
+            |row| row.get::<_, i64>(0),
+        )?;
+
+        Ok(exists != 0)
     }
 }
 
@@ -2083,6 +2298,13 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
 
         CREATE INDEX IF NOT EXISTS idx_edges_file
             ON symbol_edges(file_path);
+
+        CREATE TABLE IF NOT EXISTS coupling_mining_state (
+            id INTEGER PRIMARY KEY DEFAULT 1,
+            last_commit_hash TEXT,
+            last_mined_at INTEGER,
+            commits_scanned INTEGER NOT NULL DEFAULT 0
+        );
         "#,
     )?;
 
@@ -3183,5 +3405,90 @@ mirror_sir_files = false
             rows.iter()
                 .any(|row| row.symbol_id == "sym-py" && row.language == "python")
         );
+    }
+
+    #[test]
+    fn coupling_mining_state_round_trip_persists_latest_values() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        assert!(
+            store
+                .get_coupling_mining_state()
+                .expect("read empty state")
+                .is_none()
+        );
+
+        store
+            .upsert_coupling_mining_state(CouplingMiningStateRecord {
+                last_commit_hash: Some("abc123".to_owned()),
+                last_mined_at: Some(1_700_000_000_000),
+                commits_scanned: 42,
+            })
+            .expect("upsert state");
+        store
+            .upsert_coupling_mining_state(CouplingMiningStateRecord {
+                last_commit_hash: Some("def456".to_owned()),
+                last_mined_at: Some(1_700_000_100_000),
+                commits_scanned: 99,
+            })
+            .expect("upsert updated state");
+
+        let state = store
+            .get_coupling_mining_state()
+            .expect("read state")
+            .expect("state exists");
+        assert_eq!(state.last_commit_hash.as_deref(), Some("def456"));
+        assert_eq!(state.last_mined_at, Some(1_700_000_100_000));
+        assert_eq!(state.commits_scanned, 99);
+    }
+
+    #[test]
+    fn list_project_notes_for_file_ref_matches_exact_file_ref() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        store
+            .upsert_project_note(ProjectNoteRecord {
+                note_id: "note-a".to_owned(),
+                content: "Store contract for graph schema changes".to_owned(),
+                content_hash: "hash-a".to_owned(),
+                source_type: "manual".to_owned(),
+                source_agent: None,
+                tags: vec!["architecture".to_owned()],
+                entity_refs: Vec::new(),
+                file_refs: vec!["crates/aether-store/src/lib.rs".to_owned()],
+                symbol_refs: Vec::new(),
+                created_at: 1_700_000_000_000,
+                updated_at: 1_700_000_000_000,
+                access_count: 0,
+                last_accessed_at: None,
+                is_archived: false,
+            })
+            .expect("upsert matching note");
+        store
+            .upsert_project_note(ProjectNoteRecord {
+                note_id: "note-b".to_owned(),
+                content: "Unrelated file".to_owned(),
+                content_hash: "hash-b".to_owned(),
+                source_type: "manual".to_owned(),
+                source_agent: None,
+                tags: vec!["misc".to_owned()],
+                entity_refs: Vec::new(),
+                file_refs: vec!["src/main.rs".to_owned()],
+                symbol_refs: Vec::new(),
+                created_at: 1_700_000_000_001,
+                updated_at: 1_700_000_000_001,
+                access_count: 0,
+                last_accessed_at: None,
+                is_archived: false,
+            })
+            .expect("upsert non-matching note");
+
+        let matches = store
+            .list_project_notes_for_file_ref("crates/aether-store/src/lib.rs", 10)
+            .expect("query file ref");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].note_id, "note-a");
     }
 }
