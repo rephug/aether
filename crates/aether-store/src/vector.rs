@@ -15,10 +15,15 @@ use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use lancedb::{Connection as LanceConnection, DistanceType, Error as LanceError, connect};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::{SqliteStore, Store, StoreError, SymbolEmbeddingMetaRecord, SymbolEmbeddingRecord};
+use crate::{
+    ProjectNoteEmbeddingRecord, ProjectNoteSemanticSearchResult, SqliteStore, Store, StoreError,
+    SymbolEmbeddingMetaRecord, SymbolEmbeddingRecord,
+};
 
 const VECTOR_TABLE_PREFIX: &str = "sir_embeddings_";
+const PROJECT_NOTES_VECTOR_TABLE_PREFIX: &str = "project_notes_vectors_";
 const MIGRATION_MARKER_FILE: &str = ".sqlite_migrated_v1";
+const NOTES_MIGRATION_MARKER_FILE: &str = ".sqlite_project_notes_migrated_v1";
 
 pub type VectorRecord = SymbolEmbeddingRecord;
 pub type VectorEmbeddingMetaRecord = SymbolEmbeddingMetaRecord;
@@ -26,6 +31,23 @@ pub type VectorEmbeddingMetaRecord = SymbolEmbeddingMetaRecord;
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorSearchResult {
     pub symbol_id: String,
+    pub semantic_score: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectNoteVectorRecord {
+    pub note_id: String,
+    pub provider: String,
+    pub model: String,
+    pub embedding: Vec<f32>,
+    pub content: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectNoteVectorSearchResult {
+    pub note_id: String,
     pub semantic_score: f32,
 }
 
@@ -44,6 +66,18 @@ pub trait VectorStore: Send + Sync {
         model: &str,
         limit: u32,
     ) -> Result<Vec<VectorSearchResult>, StoreError>;
+    async fn upsert_project_note_embedding(
+        &self,
+        record: ProjectNoteVectorRecord,
+    ) -> Result<(), StoreError>;
+    async fn delete_project_note_embedding(&self, note_id: &str) -> Result<(), StoreError>;
+    async fn search_project_notes_nearest(
+        &self,
+        query_embedding: &[f32],
+        provider: &str,
+        model: &str,
+        limit: u32,
+    ) -> Result<Vec<ProjectNoteVectorSearchResult>, StoreError>;
 }
 
 pub async fn open_vector_store(
@@ -112,6 +146,48 @@ impl VectorStore for SqliteVectorStore {
             })
             .collect())
     }
+
+    async fn upsert_project_note_embedding(
+        &self,
+        record: ProjectNoteVectorRecord,
+    ) -> Result<(), StoreError> {
+        self.store()?
+            .upsert_project_note_embedding(ProjectNoteEmbeddingRecord {
+                note_id: record.note_id,
+                provider: record.provider,
+                model: record.model,
+                embedding: record.embedding,
+                content: record.content,
+                created_at: record.created_at,
+                updated_at: record.updated_at,
+            })
+    }
+
+    async fn delete_project_note_embedding(&self, note_id: &str) -> Result<(), StoreError> {
+        self.store()?.delete_project_note_embedding(note_id)
+    }
+
+    async fn search_project_notes_nearest(
+        &self,
+        query_embedding: &[f32],
+        provider: &str,
+        model: &str,
+        limit: u32,
+    ) -> Result<Vec<ProjectNoteVectorSearchResult>, StoreError> {
+        let matches =
+            self.store()?
+                .search_project_notes_semantic(query_embedding, provider, model, limit)?;
+
+        Ok(matches
+            .into_iter()
+            .map(
+                |row: ProjectNoteSemanticSearchResult| ProjectNoteVectorSearchResult {
+                    note_id: row.note_id,
+                    semantic_score: row.semantic_score,
+                },
+            )
+            .collect())
+    }
 }
 
 pub struct LanceVectorStore {
@@ -133,11 +209,16 @@ impl LanceVectorStore {
             vectors_dir,
         };
         store.migrate_from_sqlite_if_needed().await?;
+        store.migrate_project_notes_from_sqlite_if_needed().await?;
         Ok(store)
     }
 
     fn marker_path(&self) -> PathBuf {
         self.vectors_dir.join(MIGRATION_MARKER_FILE)
+    }
+
+    fn project_notes_marker_path(&self) -> PathBuf {
+        self.vectors_dir.join(NOTES_MIGRATION_MARKER_FILE)
     }
 
     fn sqlite_path(&self) -> PathBuf {
@@ -177,6 +258,32 @@ impl LanceVectorStore {
         Ok(())
     }
 
+    async fn migrate_project_notes_from_sqlite_if_needed(&self) -> Result<(), StoreError> {
+        if self.project_notes_marker_path().exists() {
+            return Ok(());
+        }
+
+        let records = load_sqlite_project_note_embedding_rows(&self.sqlite_path())?;
+        if records.is_empty() {
+            fs::write(self.project_notes_marker_path(), b"empty")?;
+            return Ok(());
+        }
+
+        tracing::info!(
+            count = records.len(),
+            "migrating SQLite project note embeddings into LanceDB"
+        );
+        let connection = self.connect().await?;
+        for record in records {
+            self.upsert_project_note_embedding_with_connection(&connection, &record)
+                .await?;
+        }
+
+        fs::write(self.project_notes_marker_path(), b"done")?;
+        tracing::info!("completed LanceDB project note vector migration");
+        Ok(())
+    }
+
     async fn upsert_embedding_with_connection(
         &self,
         connection: &LanceConnection,
@@ -210,6 +317,49 @@ impl LanceVectorStore {
         let (schema, batch) = single_record_batch(record)?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
         let mut merge = table.merge_insert(&["symbol_id"]);
+        merge
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        merge
+            .execute(Box::new(reader))
+            .await
+            .map_err(map_lancedb_err)?;
+        Ok(())
+    }
+
+    async fn upsert_project_note_embedding_with_connection(
+        &self,
+        connection: &LanceConnection,
+        record: &ProjectNoteVectorRecord,
+    ) -> Result<(), StoreError> {
+        let embedding_dim = record.embedding.len() as i32;
+        if embedding_dim <= 0 {
+            return Ok(());
+        }
+        let table_name = project_notes_table_name_for(
+            record.provider.as_str(),
+            record.model.as_str(),
+            embedding_dim,
+        );
+
+        let table = match connection.open_table(&table_name).execute().await {
+            Ok(table) => table,
+            Err(LanceError::TableNotFound { .. }) => {
+                let (schema, batch) = single_project_note_record_batch(record)?;
+                let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
+                connection
+                    .create_table(&table_name, Box::new(reader))
+                    .execute()
+                    .await
+                    .map_err(map_lancedb_err)?;
+                return Ok(());
+            }
+            Err(err) => return Err(map_lancedb_err(err)),
+        };
+
+        let (schema, batch) = single_project_note_record_batch(record)?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
+        let mut merge = table.merge_insert(&["note_id"]);
         merge
             .when_matched_update_all(None)
             .when_not_matched_insert_all();
@@ -396,6 +546,121 @@ impl VectorStore for LanceVectorStore {
         rows.truncate(limit);
         Ok(rows)
     }
+
+    async fn upsert_project_note_embedding(
+        &self,
+        record: ProjectNoteVectorRecord,
+    ) -> Result<(), StoreError> {
+        self.migrate_from_sqlite_if_needed().await?;
+        self.migrate_project_notes_from_sqlite_if_needed().await?;
+        let connection = self.connect().await?;
+        self.upsert_project_note_embedding_with_connection(&connection, &record)
+            .await
+    }
+
+    async fn delete_project_note_embedding(&self, note_id: &str) -> Result<(), StoreError> {
+        self.migrate_from_sqlite_if_needed().await?;
+        self.migrate_project_notes_from_sqlite_if_needed().await?;
+        let connection = self.connect().await?;
+        let predicate = format!("note_id = '{}'", escape_sql_string(note_id));
+
+        for name in connection
+            .table_names()
+            .execute()
+            .await
+            .map_err(map_lancedb_err)?
+            .into_iter()
+            .filter(|name| name.starts_with(PROJECT_NOTES_VECTOR_TABLE_PREFIX))
+        {
+            let Ok(table) = connection.open_table(&name).execute().await else {
+                continue;
+            };
+            table
+                .delete(predicate.as_str())
+                .await
+                .map_err(map_lancedb_err)?;
+        }
+
+        Ok(())
+    }
+
+    async fn search_project_notes_nearest(
+        &self,
+        query_embedding: &[f32],
+        provider: &str,
+        model: &str,
+        limit: u32,
+    ) -> Result<Vec<ProjectNoteVectorSearchResult>, StoreError> {
+        self.migrate_from_sqlite_if_needed().await?;
+        self.migrate_project_notes_from_sqlite_if_needed().await?;
+
+        let provider = provider.trim();
+        let model = model.trim();
+        if query_embedding.is_empty() || provider.is_empty() || model.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let limit = limit.clamp(1, 100) as usize;
+        let table_name =
+            project_notes_table_name_for(provider, model, query_embedding.len() as i32);
+        let connection = self.connect().await?;
+        let table = match connection.open_table(&table_name).execute().await {
+            Ok(table) => table,
+            Err(LanceError::TableNotFound { .. }) => return Ok(Vec::new()),
+            Err(err) => return Err(map_lancedb_err(err)),
+        };
+
+        let query = table
+            .query()
+            .select(Select::columns(&["note_id", "_distance"]))
+            .nearest_to(query_embedding)
+            .map_err(map_lancedb_err)?
+            .distance_type(DistanceType::Cosine)
+            .limit(limit);
+
+        let batches = query
+            .execute()
+            .await
+            .map_err(map_lancedb_err)?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(map_lancedb_err)?;
+
+        let mut rows = Vec::new();
+        for batch in batches {
+            let note_ids = batch
+                .column_by_name("note_id")
+                .ok_or_else(|| StoreError::LanceDb("missing note_id column".to_owned()))?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| StoreError::LanceDb("note_id column is not Utf8".to_owned()))?;
+            let distances = batch
+                .column_by_name("_distance")
+                .ok_or_else(|| StoreError::LanceDb("missing _distance column".to_owned()))?;
+
+            for idx in 0..batch.num_rows() {
+                if note_ids.is_null(idx) {
+                    continue;
+                }
+                let note_id = note_ids.value(idx).to_owned();
+                let distance = distance_at(distances, idx)?;
+                rows.push(ProjectNoteVectorSearchResult {
+                    note_id,
+                    semantic_score: 1.0 - distance,
+                });
+            }
+        }
+
+        rows.sort_by(|left, right| {
+            right
+                .semantic_score
+                .partial_cmp(&left.semantic_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.note_id.cmp(&right.note_id))
+        });
+        rows.truncate(limit);
+        Ok(rows)
+    }
 }
 
 fn map_lancedb_err(err: LanceError) -> StoreError {
@@ -416,6 +681,25 @@ fn vector_schema(embedding_dim: i32) -> SchemaRef {
             ),
             true,
         ),
+        Field::new("updated_at", DataType::Int64, false),
+    ]))
+}
+
+fn project_note_vector_schema(embedding_dim: i32) -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("note_id", DataType::Utf8, false),
+        Field::new("provider", DataType::Utf8, false),
+        Field::new("model", DataType::Utf8, false),
+        Field::new(
+            "embedding",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                embedding_dim,
+            ),
+            true,
+        ),
+        Field::new("content", DataType::Utf8, false),
+        Field::new("created_at", DataType::Int64, false),
         Field::new("updated_at", DataType::Int64, false),
     ]))
 }
@@ -454,6 +738,43 @@ fn single_record_batch(record: &VectorRecord) -> Result<(SchemaRef, RecordBatch)
     Ok((schema, batch))
 }
 
+fn single_project_note_record_batch(
+    record: &ProjectNoteVectorRecord,
+) -> Result<(SchemaRef, RecordBatch), StoreError> {
+    let embedding_dim = record.embedding.len() as i32;
+    if embedding_dim <= 0 {
+        return Err(StoreError::LanceDb(
+            "embedding cannot be empty for LanceDB upsert".to_owned(),
+        ));
+    }
+
+    let schema = project_note_vector_schema(embedding_dim);
+    let embedding = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+        std::iter::once(Some(
+            record
+                .embedding
+                .iter()
+                .copied()
+                .map(Some)
+                .collect::<Vec<Option<f32>>>(),
+        )),
+        embedding_dim,
+    );
+
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(vec![record.note_id.clone()])),
+        Arc::new(StringArray::from(vec![record.provider.clone()])),
+        Arc::new(StringArray::from(vec![record.model.clone()])),
+        Arc::new(embedding),
+        Arc::new(StringArray::from(vec![record.content.clone()])),
+        Arc::new(Int64Array::from(vec![record.created_at])),
+        Arc::new(Int64Array::from(vec![record.updated_at])),
+    ];
+    let batch = RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|err| StoreError::LanceDb(err.to_string()))?;
+    Ok((schema, batch))
+}
+
 fn embedding_dim_from_schema(schema: &Schema) -> Option<i32> {
     let field = schema.field_with_name("embedding").ok()?;
     match field.data_type() {
@@ -463,9 +784,22 @@ fn embedding_dim_from_schema(schema: &Schema) -> Option<i32> {
 }
 
 fn table_name_for(provider: &str, model: &str, embedding_dim: i32) -> String {
+    table_name_for_prefix(VECTOR_TABLE_PREFIX, provider, model, embedding_dim)
+}
+
+fn project_notes_table_name_for(provider: &str, model: &str, embedding_dim: i32) -> String {
+    table_name_for_prefix(
+        PROJECT_NOTES_VECTOR_TABLE_PREFIX,
+        provider,
+        model,
+        embedding_dim,
+    )
+}
+
+fn table_name_for_prefix(prefix: &str, provider: &str, model: &str, embedding_dim: i32) -> String {
     let provider = sanitize_for_table_name(provider);
     let model = sanitize_for_table_name(model);
-    format!("{VECTOR_TABLE_PREFIX}{embedding_dim}_{provider}_{model}")
+    format!("{prefix}{embedding_dim}_{provider}_{model}")
 }
 
 fn sanitize_for_table_name(value: &str) -> String {
@@ -539,6 +873,65 @@ fn load_sqlite_embedding_rows(sqlite_path: &Path) -> Result<Vec<VectorRecord>, S
             provider,
             model,
             embedding,
+            updated_at,
+        });
+    }
+
+    Ok(records)
+}
+
+fn load_sqlite_project_note_embedding_rows(
+    sqlite_path: &Path,
+) -> Result<Vec<ProjectNoteVectorRecord>, StoreError> {
+    if !sqlite_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let conn = Connection::open(sqlite_path)?;
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_notes_embeddings' LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+    if !exists {
+        return Ok(Vec::new());
+    }
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT note_id, provider, model, embedding_json, content, created_at, updated_at
+        FROM project_notes_embeddings
+        "#,
+    )?;
+    let rows = stmt.query_map(params![], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, i64>(6)?,
+        ))
+    })?;
+
+    let mut records = Vec::new();
+    for row in rows {
+        let (note_id, provider, model, embedding_json, content, created_at, updated_at) = row?;
+        let embedding = serde_json::from_str::<Vec<f32>>(&embedding_json)?;
+        if embedding.is_empty() {
+            continue;
+        }
+        records.push(ProjectNoteVectorRecord {
+            note_id,
+            provider,
+            model,
+            embedding,
+            content,
+            created_at,
             updated_at,
         });
     }

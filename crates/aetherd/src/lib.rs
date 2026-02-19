@@ -2,6 +2,7 @@ pub mod calibrate;
 pub mod cli;
 pub mod indexer;
 pub mod init_agent;
+pub mod memory;
 pub mod observer;
 pub mod quality;
 pub mod search;

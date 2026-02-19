@@ -13,6 +13,7 @@ test = false
 [dependencies]
 aether-config = { path = "../aether-config" }
 aether-core = { path = "../aether-core" }
+aether-memory = { path = "../aether-memory" }
 aether-infer = { path = "../aether-infer" }
 aether-lsp = { path = "../aether-lsp" }
 aether-parse = { path = "../aether-parse" }

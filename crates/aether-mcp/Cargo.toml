@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 aether-config = { path = "../aether-config" }
 aether-core = { path = "../aether-core" }
+aether-memory = { path = "../aether-memory" }
 aetherd = { path = "../aetherd" }
 aether-infer = { path = "../aether-infer" }
 aether-parse = { path = "../aether-parse" }

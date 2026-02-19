@@ -89,6 +89,7 @@ dependencies = [
  "aether-config",
  "aether-core",
  "aether-infer",
+ "aether-memory",
  "aether-parse",
  "aether-sir",
  "aether-store",
@@ -104,6 +105,19 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "aether-memory"
+version = "0.1.0"
+dependencies = [
+ "aether-config",
+ "aether-core",
+ "aether-store",
+ "blake3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -159,6 +173,7 @@ dependencies = [
  "aether-core",
  "aether-infer",
  "aether-lsp",
+ "aether-memory",
  "aether-parse",
  "aether-sir",
  "aether-store",

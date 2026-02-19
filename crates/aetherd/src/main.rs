@@ -6,9 +6,13 @@ use aether_config::{
 };
 use aether_infer::{download_candle_embedding_model, download_candle_reranker_model};
 use aetherd::calibrate::run_calibration_once;
-use aetherd::cli::{Cli, Commands, InitAgentArgs, LogFormat, SetupLocalArgs, parse_cli};
+use aetherd::cli::{
+    Cli, Commands, InitAgentArgs, LogFormat, NotesArgs, RecallArgs, RememberArgs, SetupLocalArgs,
+    parse_cli,
+};
 use aetherd::indexer::{IndexerConfig, run_indexing_loop, run_initial_index_once};
 use aetherd::init_agent::{InitAgentOptions, run_init_agent};
+use aetherd::memory::{run_notes_command, run_recall_command, run_remember_command};
 use aetherd::search::run_search_once;
 use aetherd::setup_local::{SetupLocalOptions, run_setup_local};
 use aetherd::verification::{VerificationRequest, run_verification};
@@ -201,6 +205,9 @@ fn run_subcommand(workspace: &Path, command: Commands) -> Result<()> {
     match command {
         Commands::InitAgent(args) => run_init_agent_command(workspace, args),
         Commands::SetupLocal(args) => run_setup_local_command(workspace, args),
+        Commands::Remember(args) => run_remember_note_command(workspace, args),
+        Commands::Recall(args) => run_recall_note_command(workspace, args),
+        Commands::Notes(args) => run_notes_list_command(workspace, args),
     }
 }
 
@@ -254,6 +261,18 @@ fn run_setup_local_command(workspace: &Path, args: SetupLocalArgs) -> Result<()>
     }
 
     Ok(())
+}
+
+fn run_remember_note_command(workspace: &Path, args: RememberArgs) -> Result<()> {
+    run_remember_command(workspace, args).context("remember command failed")
+}
+
+fn run_recall_note_command(workspace: &Path, args: RecallArgs) -> Result<()> {
+    run_recall_command(workspace, args).context("recall command failed")
+}
+
+fn run_notes_list_command(workspace: &Path, args: NotesArgs) -> Result<()> {
+    run_notes_command(workspace, args).context("notes command failed")
 }
 
 fn init_tracing_subscriber(log_format: LogFormat, configured_log_level: &str) -> Result<()> {

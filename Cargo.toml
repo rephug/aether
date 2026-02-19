@@ -3,6 +3,7 @@ members = [
     "crates/aetherd",
     "crates/aether-core",
     "crates/aether-config",
+    "crates/aether-memory",
     "crates/aether-parse",
     "crates/aether-sir",
     "crates/aether-store",
