@@ -5,20 +5,23 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aether_analysis::TestIntentAnalyzer;
 use aether_config::{SIR_QUALITY_FLOOR_CONFIDENCE, SIR_QUALITY_FLOOR_WINDOW};
-use aether_core::{GitContext, Language, Position, SourceRange, Symbol, SymbolChangeEvent};
+use aether_core::{
+    GitContext, Language, Position, SourceRange, Symbol, SymbolChangeEvent, content_hash,
+};
 use aether_infer::{
     EmbeddingProvider, EmbeddingProviderOverrides, InferenceProvider, ProviderOverrides,
     SirContext, load_embedding_provider_from_config, load_provider_from_env_or_mock,
 };
-use aether_parse::SymbolExtractor;
+use aether_parse::{SymbolExtractor, TestIntent};
 use aether_sir::{
     FileSir, SirAnnotation, canonicalize_file_sir_json, canonicalize_sir_json, file_sir_hash,
     sir_hash, synthetic_file_sir_id, validate_sir,
 };
 use aether_store::{
-    SirMetaRecord, SqliteStore, Store, SymbolEmbeddingRecord, SymbolRecord, VectorStore,
-    open_graph_store, open_vector_store,
+    SirMetaRecord, SqliteStore, Store, SymbolEmbeddingRecord, SymbolRecord, TestIntentRecord,
+    VectorStore, open_graph_store, open_vector_store,
 };
 use anyhow::{Context, Result, anyhow};
 use tokio::runtime::Runtime;
@@ -367,9 +370,37 @@ impl SirPipeline {
             store
                 .upsert_edges(&extracted.edges)
                 .with_context(|| format!("failed to upsert edges for file {}", event.file_path))?;
+
+            let now_ms = unix_timestamp_millis();
+            let test_intents = extracted
+                .test_intents
+                .into_iter()
+                .map(|intent| to_test_intent_record(intent, now_ms))
+                .collect::<Vec<_>>();
+            store
+                .replace_test_intents_for_file(event.file_path.as_str(), test_intents.as_slice())
+                .with_context(|| {
+                    format!("failed to upsert test intents for file {}", event.file_path)
+                })?;
+        } else {
+            store
+                .replace_test_intents_for_file(event.file_path.as_str(), &[])
+                .with_context(|| {
+                    format!("failed to clear test intents for file {}", event.file_path)
+                })?;
         }
 
         self.sync_graph_for_file(store, &event.file_path)?;
+        let test_intent_analyzer = TestIntentAnalyzer::new(&self.workspace_root)
+            .context("failed to initialize test intent analyzer")?;
+        let _ = test_intent_analyzer
+            .refresh_for_test_file(event.file_path.as_str())
+            .with_context(|| {
+                format!(
+                    "failed to refresh tested_by links for test file {}",
+                    event.file_path
+                )
+            })?;
 
         Ok(())
     }
@@ -912,4 +943,31 @@ fn unix_timestamp_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
+}
+
+fn unix_timestamp_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn to_test_intent_record(intent: TestIntent, now_ms: i64) -> TestIntentRecord {
+    let material = format!(
+        "{}\n{}\n{}",
+        intent.file_path.trim(),
+        intent.test_name.trim(),
+        intent.intent_text.trim(),
+    );
+    TestIntentRecord {
+        intent_id: content_hash(material.as_str()),
+        file_path: intent.file_path,
+        test_name: intent.test_name,
+        intent_text: intent.intent_text,
+        group_label: intent.group_label,
+        language: intent.language.as_str().to_owned(),
+        symbol_id: intent.symbol_id,
+        created_at: now_ms.max(0),
+        updated_at: now_ms.max(0),
+    }
 }

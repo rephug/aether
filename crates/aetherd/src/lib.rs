@@ -10,4 +10,5 @@ pub mod search;
 pub mod setup_local;
 pub mod sir_pipeline;
 pub mod templates;
+pub mod test_intents;
 pub mod verification;

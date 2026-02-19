@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use aether_config::{GraphBackend, load_workspace_config};
-use aether_core::{EdgeKind, SymbolEdge, normalize_path};
+use aether_core::{EdgeKind, SymbolEdge, content_hash, normalize_path};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value as SqlValue};
 use serde::{Deserialize, Serialize};
 use serde_json::from_str as json_from_str;
@@ -179,6 +179,28 @@ pub struct CouplingEdgeRecord {
     pub mined_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestIntentRecord {
+    pub intent_id: String,
+    pub file_path: String,
+    pub test_name: String,
+    pub intent_text: String,
+    pub group_label: Option<String>,
+    pub language: String,
+    pub symbol_id: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TestedByRecord {
+    pub target_file: String,
+    pub test_file: String,
+    pub intent_count: i64,
+    pub confidence: f32,
+    pub inference_method: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThresholdCalibrationRecord {
     pub language: String,
@@ -346,6 +368,19 @@ pub trait Store {
         state: CouplingMiningStateRecord,
     ) -> Result<(), StoreError>;
     fn has_dependency_between_files(&self, file_a: &str, file_b: &str) -> Result<bool, StoreError>;
+    fn replace_test_intents_for_file(
+        &self,
+        file_path: &str,
+        intents: &[TestIntentRecord],
+    ) -> Result<(), StoreError>;
+    fn list_test_intents_for_file(
+        &self,
+        file_path: &str,
+    ) -> Result<Vec<TestIntentRecord>, StoreError>;
+    fn list_test_intents_for_symbol(
+        &self,
+        symbol_id: &str,
+    ) -> Result<Vec<TestIntentRecord>, StoreError>;
 }
 
 pub trait GraphStore: Send + Sync {
@@ -2021,6 +2056,190 @@ impl Store for SqliteStore {
 
         Ok(exists != 0)
     }
+
+    fn replace_test_intents_for_file(
+        &self,
+        file_path: &str,
+        intents: &[TestIntentRecord],
+    ) -> Result<(), StoreError> {
+        let file_path = normalize_path(file_path.trim());
+        if file_path.is_empty() {
+            return Ok(());
+        }
+
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| -> Result<(), StoreError> {
+            self.conn.execute(
+                "DELETE FROM test_intents WHERE file_path = ?1",
+                params![file_path],
+            )?;
+
+            let mut stmt = self.conn.prepare(
+                r#"
+                INSERT INTO test_intents (
+                    intent_id, file_path, test_name, intent_text, group_label,
+                    language, symbol_id, created_at, updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+            )?;
+
+            for intent in intents {
+                let test_name = intent.test_name.trim();
+                let intent_text = intent.intent_text.trim();
+                if test_name.is_empty() || intent_text.is_empty() {
+                    continue;
+                }
+
+                let record_id = if intent.intent_id.trim().is_empty() {
+                    build_test_intent_id(file_path.as_str(), test_name, intent_text)
+                } else {
+                    intent.intent_id.trim().to_owned()
+                };
+
+                stmt.execute(params![
+                    record_id,
+                    file_path,
+                    test_name,
+                    intent_text,
+                    intent.group_label.as_deref(),
+                    intent.language.trim().to_ascii_lowercase(),
+                    intent.symbol_id.as_deref().map(str::trim),
+                    intent.created_at.max(0),
+                    intent.updated_at.max(0),
+                ])?;
+            }
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
+    fn list_test_intents_for_file(
+        &self,
+        file_path: &str,
+    ) -> Result<Vec<TestIntentRecord>, StoreError> {
+        let file_path = normalize_path(file_path.trim());
+        if file_path.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT
+                intent_id, file_path, test_name, intent_text, group_label,
+                language, symbol_id, created_at, updated_at
+            FROM test_intents
+            WHERE file_path = ?1
+            ORDER BY test_name ASC, intent_id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![file_path], test_intent_tuple_from_row)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(test_intent_from_tuple(row?)?);
+        }
+        Ok(records)
+    }
+
+    fn list_test_intents_for_symbol(
+        &self,
+        symbol_id: &str,
+    ) -> Result<Vec<TestIntentRecord>, StoreError> {
+        let symbol_id = symbol_id.trim();
+        if symbol_id.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT
+                intent_id, file_path, test_name, intent_text, group_label,
+                language, symbol_id, created_at, updated_at
+            FROM test_intents
+            WHERE symbol_id = ?1
+            ORDER BY file_path ASC, test_name ASC, intent_id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![symbol_id], test_intent_tuple_from_row)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(test_intent_from_tuple(row?)?);
+        }
+        Ok(records)
+    }
+}
+
+type TestIntentRowTuple = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    i64,
+    i64,
+);
+
+fn test_intent_tuple_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TestIntentRowTuple> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+    ))
+}
+
+fn test_intent_from_tuple(tuple: TestIntentRowTuple) -> Result<TestIntentRecord, StoreError> {
+    let (
+        intent_id,
+        file_path,
+        test_name,
+        intent_text,
+        group_label,
+        language,
+        symbol_id,
+        created_at,
+        updated_at,
+    ) = tuple;
+
+    Ok(TestIntentRecord {
+        intent_id,
+        file_path,
+        test_name,
+        intent_text,
+        group_label,
+        language,
+        symbol_id,
+        created_at,
+        updated_at,
+    })
+}
+
+fn build_test_intent_id(file_path: &str, test_name: &str, intent_text: &str) -> String {
+    let material = format!(
+        "{}\n{}\n{}",
+        normalize_path(file_path.trim()),
+        test_name.trim(),
+        intent_text.trim(),
+    );
+    content_hash(material.as_str())
 }
 
 type ProjectNoteRowTuple = (
@@ -2305,6 +2524,21 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
             last_mined_at INTEGER,
             commits_scanned INTEGER NOT NULL DEFAULT 0
         );
+
+        CREATE TABLE IF NOT EXISTS test_intents (
+            intent_id TEXT PRIMARY KEY,
+            file_path TEXT NOT NULL,
+            test_name TEXT NOT NULL,
+            intent_text TEXT NOT NULL,
+            group_label TEXT,
+            language TEXT NOT NULL,
+            symbol_id TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_test_intents_file
+            ON test_intents(file_path);
         "#,
     )?;
 
@@ -2512,6 +2746,25 @@ mod tests {
             access_count: 0,
             last_accessed_at: None,
             is_archived: false,
+        }
+    }
+
+    fn test_intent_record(
+        file_path: &str,
+        test_name: &str,
+        intent_text: &str,
+        symbol_id: Option<&str>,
+    ) -> TestIntentRecord {
+        TestIntentRecord {
+            intent_id: String::new(),
+            file_path: file_path.to_owned(),
+            test_name: test_name.to_owned(),
+            intent_text: intent_text.to_owned(),
+            group_label: None,
+            language: "rust".to_owned(),
+            symbol_id: symbol_id.map(|value| value.to_owned()),
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_100,
         }
     }
 
@@ -3441,6 +3694,61 @@ mirror_sir_files = false
         assert_eq!(state.last_commit_hash.as_deref(), Some("def456"));
         assert_eq!(state.last_mined_at, Some(1_700_000_100_000));
         assert_eq!(state.commits_scanned, 99);
+    }
+
+    #[test]
+    fn test_intents_round_trip_and_symbol_lookup_work() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        store
+            .replace_test_intents_for_file(
+                "tests/payment_test.rs",
+                &[
+                    test_intent_record(
+                        "tests/payment_test.rs",
+                        "test_handles_negative_balance",
+                        "handles negative balance",
+                        Some("sym-test-1"),
+                    ),
+                    test_intent_record(
+                        "tests/payment_test.rs",
+                        "test_returns_none_for_missing_symbol",
+                        "returns none for missing symbol",
+                        Some("sym-test-2"),
+                    ),
+                ],
+            )
+            .expect("upsert test intents");
+
+        let file_intents = store
+            .list_test_intents_for_file("tests/payment_test.rs")
+            .expect("list intents by file");
+        assert_eq!(file_intents.len(), 2);
+        assert!(
+            file_intents
+                .iter()
+                .any(|record| record.intent_text == "handles negative balance")
+        );
+
+        let symbol_intents = store
+            .list_test_intents_for_symbol("sym-test-2")
+            .expect("list intents by symbol");
+        assert_eq!(symbol_intents.len(), 1);
+        assert_eq!(
+            symbol_intents[0].intent_text,
+            "returns none for missing symbol"
+        );
+
+        store
+            .replace_test_intents_for_file("tests/payment_test.rs", &[])
+            .expect("clear intents");
+        assert!(
+            store
+                .list_test_intents_for_file("tests/payment_test.rs")
+                .expect("list after clear")
+                .is_empty()
+        );
     }
 
     #[test]

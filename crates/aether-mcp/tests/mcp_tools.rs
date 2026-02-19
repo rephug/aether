@@ -7,12 +7,12 @@ use aether_mcp::{
     AetherBlastRadiusRequest, AetherCallChainRequest, AetherDependenciesRequest,
     AetherExplainRequest, AetherGetSirRequest, AetherMcpServer, AetherRecallRequest,
     AetherRememberRequest, AetherSearchRequest, AetherSymbolLookupRequest,
-    AetherSymbolTimelineRequest, AetherVerifyMode, AetherVerifyRequest, AetherWhyChangedReason,
-    AetherWhyChangedRequest, AetherWhySelectorMode, MCP_SCHEMA_VERSION, MEMORY_SCHEMA_VERSION,
-    SirLevelRequest,
+    AetherSymbolTimelineRequest, AetherTestIntentsRequest, AetherVerifyMode, AetherVerifyRequest,
+    AetherWhyChangedReason, AetherWhyChangedRequest, AetherWhySelectorMode, MCP_SCHEMA_VERSION,
+    MEMORY_SCHEMA_VERSION, SirLevelRequest,
 };
 use aether_sir::{synthetic_file_sir_id, synthetic_module_sir_id};
-use aether_store::{SqliteStore, Store};
+use aether_store::{SqliteStore, Store, TestIntentRecord};
 use aetherd::indexer::{IndexerConfig, run_initial_index_once};
 use anyhow::Result;
 use rmcp::handler::server::wrapper::Parameters;
@@ -1383,6 +1383,102 @@ vector_backend = "sqlite"
     ] {
         assert!(object.contains_key(key), "missing key: {key}");
     }
+
+    Ok(())
+}
+
+#[test]
+fn mcp_test_intents_tool_and_blast_radius_return_test_guards() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    fs::create_dir_all(workspace.join(".aether"))?;
+    fs::write(
+        workspace.join(".aether/config.toml"),
+        r#"[storage]
+graph_backend = "cozo"
+
+[embeddings]
+enabled = false
+provider = "mock"
+vector_backend = "sqlite"
+"#,
+    )?;
+    fs::create_dir_all(workspace.join("src"))?;
+    fs::create_dir_all(workspace.join("tests"))?;
+    fs::write(workspace.join("src/payment.rs"), "fn charge() {}\n")?;
+    fs::write(
+        workspace.join("tests/payment_test.rs"),
+        "#[test]\nfn test_charge() {}\n",
+    )?;
+
+    let store = SqliteStore::open(workspace)?;
+    store.replace_test_intents_for_file(
+        "tests/payment_test.rs",
+        &[
+            TestIntentRecord {
+                intent_id: "intent-1".to_owned(),
+                file_path: "tests/payment_test.rs".to_owned(),
+                test_name: "test_charge".to_owned(),
+                intent_text: "charges correctly".to_owned(),
+                group_label: None,
+                language: "rust".to_owned(),
+                symbol_id: None,
+                created_at: 1_700_000_000_000,
+                updated_at: 1_700_000_000_000,
+            },
+            TestIntentRecord {
+                intent_id: "intent-2".to_owned(),
+                file_path: "tests/payment_test.rs".to_owned(),
+                test_name: "test_errors".to_owned(),
+                intent_text: "handles invalid input".to_owned(),
+                group_label: None,
+                language: "rust".to_owned(),
+                symbol_id: None,
+                created_at: 1_700_000_000_000,
+                updated_at: 1_700_000_000_000,
+            },
+        ],
+    )?;
+
+    drop(store);
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+
+    let intents = rt
+        .block_on(
+            server.aether_test_intents(Parameters(AetherTestIntentsRequest {
+                file: Some("tests/payment_test.rs".to_owned()),
+                symbol_id: None,
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert_eq!(intents.result_count, 2);
+    assert!(
+        intents
+            .intents
+            .iter()
+            .any(|entry| entry.intent_text == "charges correctly")
+    );
+
+    let blast = rt
+        .block_on(
+            server.aether_blast_radius(Parameters(AetherBlastRadiusRequest {
+                file: "src/payment.rs".to_owned(),
+                min_risk: None,
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert!(!blast.test_guards.is_empty());
+    assert_eq!(blast.test_guards[0].test_file, "tests/payment_test.rs");
+    assert!(
+        blast.test_guards[0]
+            .intents
+            .contains(&"charges correctly".to_owned())
+    );
+    assert_eq!(blast.test_guards[0].inference_method, "naming_convention");
 
     Ok(())
 }

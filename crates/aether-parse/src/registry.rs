@@ -5,6 +5,7 @@ use aether_core::{Language, Symbol, SymbolEdge};
 use tree_sitter::{Node, Query, QueryCapture};
 
 use crate::languages;
+use crate::parser::TestIntent;
 
 pub struct LanguageConfig {
     pub id: &'static str,
@@ -12,6 +13,7 @@ pub struct LanguageConfig {
     pub ts_language: tree_sitter::Language,
     pub symbol_query: Query,
     pub edge_query: Query,
+    pub test_intent_query: Option<Query>,
     pub module_markers: &'static [&'static str],
     pub hooks: Option<Box<dyn LanguageHooks>>,
 }
@@ -44,6 +46,17 @@ pub trait LanguageHooks: Send + Sync {
         _file_path: &str,
         _symbols: &[Symbol],
     ) -> Option<Vec<SymbolEdge>> {
+        None
+    }
+
+    fn map_test_intent(
+        &self,
+        _language: Language,
+        _captures: &QueryCaptures<'_, '_>,
+        _source: &[u8],
+        _file_path: &str,
+        _symbols: &[Symbol],
+    ) -> Option<Vec<TestIntent>> {
         None
     }
 

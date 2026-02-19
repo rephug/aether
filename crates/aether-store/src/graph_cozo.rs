@@ -4,7 +4,9 @@ use std::path::Path;
 
 use cozo::{DataValue, DbInstance, NamedRows, ScriptMutability};
 
-use super::{CouplingEdgeRecord, GraphStore, ResolvedEdge, StoreError, SymbolRecord};
+use super::{
+    CouplingEdgeRecord, GraphStore, ResolvedEdge, StoreError, SymbolRecord, TestedByRecord,
+};
 
 pub struct CozoGraphStore {
     db: DbInstance,
@@ -66,6 +68,17 @@ impl CozoGraphStore {
                 last_co_change_commit: String,
                 last_co_change_at: Int,
                 mined_at: Int
+            }
+            "#,
+        )?;
+        self.ensure_relation(
+            r#"
+            :create tested_by {
+                target_file: String,
+                test_file: String =>
+                intent_count: Int,
+                confidence: Float,
+                inference_method: String
             }
             "#,
         )?;
@@ -199,6 +212,39 @@ impl CozoGraphStore {
             mined_at: row[12]
                 .get_int()
                 .ok_or_else(|| StoreError::Cozo("invalid mined_at value".to_owned()))?,
+        })
+    }
+
+    fn row_to_tested_by(row: &[DataValue]) -> Result<TestedByRecord, StoreError> {
+        if row.len() < 5 {
+            return Err(StoreError::Cozo("invalid tested_by row shape".to_owned()));
+        }
+
+        let confidence = if let Some(value) = row[3].get_float() {
+            value as f32
+        } else if let Some(value) = row[3].get_int() {
+            value as f32
+        } else {
+            return Err(StoreError::Cozo("invalid confidence value".to_owned()));
+        };
+
+        Ok(TestedByRecord {
+            target_file: row[0]
+                .get_str()
+                .ok_or_else(|| StoreError::Cozo("invalid target_file value".to_owned()))?
+                .to_owned(),
+            test_file: row[1]
+                .get_str()
+                .ok_or_else(|| StoreError::Cozo("invalid test_file value".to_owned()))?
+                .to_owned(),
+            intent_count: row[2]
+                .get_int()
+                .ok_or_else(|| StoreError::Cozo("invalid intent_count value".to_owned()))?,
+            confidence,
+            inference_method: row[4]
+                .get_str()
+                .ok_or_else(|| StoreError::Cozo("invalid inference_method value".to_owned()))?
+                .to_owned(),
         })
     }
 
@@ -561,6 +607,137 @@ impl CozoGraphStore {
         });
         edges.truncate(limit.clamp(1, 200) as usize);
         Ok(edges)
+    }
+
+    pub fn replace_tested_by_for_test_file(
+        &self,
+        test_file: &str,
+        records: &[TestedByRecord],
+    ) -> Result<(), StoreError> {
+        let test_file = test_file.trim();
+        if test_file.is_empty() {
+            return Ok(());
+        }
+
+        let mut params = BTreeMap::new();
+        params.insert(
+            "test_file".to_owned(),
+            DataValue::from(test_file.to_owned()),
+        );
+        self.run_script(
+            r#"
+            ?[target_file, test_file] :=
+                *tested_by{
+                    target_file,
+                    test_file,
+                    intent_count,
+                    confidence,
+                    inference_method
+                },
+                test_file = $test_file
+            :rm tested_by { target_file, test_file }
+            "#,
+            params,
+            ScriptMutability::Mutable,
+        )?;
+
+        for record in records {
+            let mut params = BTreeMap::new();
+            params.insert(
+                "target_file".to_owned(),
+                DataValue::from(record.target_file.clone()),
+            );
+            params.insert(
+                "test_file".to_owned(),
+                DataValue::from(record.test_file.clone()),
+            );
+            params.insert(
+                "intent_count".to_owned(),
+                DataValue::from(record.intent_count.max(0)),
+            );
+            params.insert(
+                "confidence".to_owned(),
+                DataValue::from(record.confidence.clamp(0.0, 1.0) as f64),
+            );
+            params.insert(
+                "inference_method".to_owned(),
+                DataValue::from(record.inference_method.clone()),
+            );
+
+            self.run_script(
+                r#"
+                ?[target_file, test_file, intent_count, confidence, inference_method] <- [[
+                    $target_file,
+                    $test_file,
+                    $intent_count,
+                    $confidence,
+                    $inference_method
+                ]]
+                :put tested_by {
+                    target_file,
+                    test_file =>
+                    intent_count,
+                    confidence,
+                    inference_method
+                }
+                "#,
+                params,
+                ScriptMutability::Mutable,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    pub fn list_tested_by_for_target_file(
+        &self,
+        target_file: &str,
+    ) -> Result<Vec<TestedByRecord>, StoreError> {
+        let target_file = target_file.trim();
+        if target_file.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut params = BTreeMap::new();
+        params.insert(
+            "target_file".to_owned(),
+            DataValue::from(target_file.to_owned()),
+        );
+        let rows = self.run_script(
+            r#"
+            ?[
+                target_file,
+                test_file,
+                intent_count,
+                confidence,
+                inference_method
+            ] :=
+                *tested_by{
+                    target_file,
+                    test_file,
+                    intent_count,
+                    confidence,
+                    inference_method
+                },
+                target_file = $target_file
+            "#,
+            params,
+            ScriptMutability::Immutable,
+        )?;
+
+        let mut records = rows
+            .rows
+            .iter()
+            .map(|row| Self::row_to_tested_by(row.as_slice()))
+            .collect::<Result<Vec<_>, _>>()?;
+        records.sort_by(|left, right| {
+            right
+                .confidence
+                .partial_cmp(&left.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.test_file.cmp(&right.test_file))
+        });
+        Ok(records)
     }
 }
 
@@ -999,5 +1176,41 @@ mod tests {
             .expect("list neighbors");
         assert_eq!(neighbors.len(), 1);
         assert_eq!(neighbors[0].coupling_type, "multi");
+    }
+
+    #[test]
+    fn cozo_graph_stores_and_queries_tested_by_edges() {
+        let temp = tempdir().expect("tempdir");
+        let graph = CozoGraphStore::open(temp.path()).expect("open cozo graph store");
+
+        graph
+            .replace_tested_by_for_test_file(
+                "tests/payment_test.rs",
+                &[
+                    TestedByRecord {
+                        target_file: "src/payment.rs".to_owned(),
+                        test_file: "tests/payment_test.rs".to_owned(),
+                        intent_count: 3,
+                        confidence: 0.9,
+                        inference_method: "naming_convention".to_owned(),
+                    },
+                    TestedByRecord {
+                        target_file: "src/ledger.rs".to_owned(),
+                        test_file: "tests/payment_test.rs".to_owned(),
+                        intent_count: 1,
+                        confidence: 0.4,
+                        inference_method: "coupling_cross_reference".to_owned(),
+                    },
+                ],
+            )
+            .expect("replace tested_by edges");
+
+        let guards = graph
+            .list_tested_by_for_target_file("src/payment.rs")
+            .expect("list tested_by for target");
+        assert_eq!(guards.len(), 1);
+        assert_eq!(guards[0].test_file, "tests/payment_test.rs");
+        assert_eq!(guards[0].intent_count, 3);
+        assert_eq!(guards[0].inference_method, "naming_convention");
     }
 }

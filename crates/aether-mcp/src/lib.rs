@@ -3,7 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aether_analysis::{BlastRadiusRequest, CouplingAnalyzer, RiskLevel as CouplingRiskLevel};
+use aether_analysis::{
+    BlastRadiusRequest, CouplingAnalyzer, RiskLevel as CouplingRiskLevel, TestIntentAnalyzer,
+};
 use aether_config::{SearchRerankerKind, VerifyMode, load_workspace_config};
 pub use aether_core::SearchMode;
 use aether_core::{
@@ -289,7 +291,41 @@ pub struct AetherBlastRadiusResponse {
     pub target_file: String,
     pub mining_state: Option<AetherBlastRadiusMiningState>,
     pub coupled_files: Vec<AetherBlastRadiusCoupledFile>,
-    pub test_guards: Vec<String>,
+    pub test_guards: Vec<AetherBlastRadiusTestGuard>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherBlastRadiusTestGuard {
+    pub test_file: String,
+    pub intents: Vec<String>,
+    pub confidence: f32,
+    pub inference_method: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherTestIntentsRequest {
+    pub file: Option<String>,
+    pub symbol_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherTestIntentEntry {
+    pub intent_id: String,
+    pub file_path: String,
+    pub test_name: String,
+    pub intent_text: String,
+    pub group_label: Option<String>,
+    pub language: String,
+    pub symbol_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherTestIntentsResponse {
+    pub schema_version: String,
+    pub file: Option<String>,
+    pub symbol_id: Option<String>,
+    pub result_count: u32,
+    pub intents: Vec<AetherTestIntentEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1173,13 +1209,184 @@ impl AetherMcpServer {
             });
         }
 
+        let test_guards = match TestIntentAnalyzer::new(&self.workspace)
+            .and_then(|analyzer| analyzer.list_guards_for_target_file(blast.target_file.as_str()))
+        {
+            Ok(guards) => {
+                let mapped = guards
+                    .into_iter()
+                    .map(|guard| AetherBlastRadiusTestGuard {
+                        test_file: guard.test_file,
+                        intents: guard.intents,
+                        confidence: guard.confidence,
+                        inference_method: guard.inference_method,
+                    })
+                    .collect::<Vec<_>>();
+
+                if mapped.is_empty() {
+                    self.fallback_test_guards_from_naming(&store, blast.target_file.as_str())?
+                } else {
+                    mapped
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    target_file = %blast.target_file,
+                    "falling back to naming-based test guard inference"
+                );
+                self.fallback_test_guards_from_naming(&store, blast.target_file.as_str())?
+            }
+        };
+
         Ok(AetherBlastRadiusResponse {
             schema_version: MEMORY_SCHEMA_VERSION.to_owned(),
             target_file: blast.target_file,
             mining_state,
             coupled_files,
-            test_guards: Vec::new(),
+            test_guards,
         })
+    }
+
+    pub fn aether_test_intents_logic(
+        &self,
+        request: AetherTestIntentsRequest,
+    ) -> Result<AetherTestIntentsResponse, AetherMcpError> {
+        let file = request.file.map(|value| normalize_path(value.trim()));
+        let symbol_id = request
+            .symbol_id
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+
+        if file
+            .as_deref()
+            .map(|value| value.is_empty())
+            .unwrap_or(true)
+            && symbol_id.is_none()
+        {
+            return Ok(AetherTestIntentsResponse {
+                schema_version: MEMORY_SCHEMA_VERSION.to_owned(),
+                file,
+                symbol_id,
+                result_count: 0,
+                intents: Vec::new(),
+            });
+        }
+
+        let store = SqliteStore::open(&self.workspace)?;
+        let mut by_id = HashMap::<String, AetherTestIntentEntry>::new();
+
+        if let Some(file_path) = file.as_deref()
+            && !file_path.is_empty()
+        {
+            for intent in store.list_test_intents_for_file(file_path)? {
+                by_id.insert(
+                    intent.intent_id.clone(),
+                    AetherTestIntentEntry {
+                        intent_id: intent.intent_id,
+                        file_path: intent.file_path,
+                        test_name: intent.test_name,
+                        intent_text: intent.intent_text,
+                        group_label: intent.group_label,
+                        language: intent.language,
+                        symbol_id: intent.symbol_id,
+                    },
+                );
+            }
+        }
+
+        if let Some(symbol) = symbol_id.as_deref() {
+            for intent in store.list_test_intents_for_symbol(symbol)? {
+                by_id.insert(
+                    intent.intent_id.clone(),
+                    AetherTestIntentEntry {
+                        intent_id: intent.intent_id,
+                        file_path: intent.file_path,
+                        test_name: intent.test_name,
+                        intent_text: intent.intent_text,
+                        group_label: intent.group_label,
+                        language: intent.language,
+                        symbol_id: intent.symbol_id,
+                    },
+                );
+            }
+        }
+
+        let mut intents = by_id.into_values().collect::<Vec<_>>();
+        intents.sort_by(|left, right| {
+            left.file_path
+                .cmp(&right.file_path)
+                .then_with(|| left.test_name.cmp(&right.test_name))
+                .then_with(|| left.intent_id.cmp(&right.intent_id))
+        });
+
+        Ok(AetherTestIntentsResponse {
+            schema_version: MEMORY_SCHEMA_VERSION.to_owned(),
+            file,
+            symbol_id,
+            result_count: intents.len() as u32,
+            intents,
+        })
+    }
+
+    fn fallback_test_guards_from_naming(
+        &self,
+        store: &SqliteStore,
+        target_file: &str,
+    ) -> Result<Vec<AetherBlastRadiusTestGuard>, AetherMcpError> {
+        let target_file = normalize_path(target_file.trim());
+        if target_file.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut candidates = HashSet::new();
+        if let Some((root, tail)) = split_source_root(target_file.as_str()) {
+            let source_path = Path::new(tail.as_str());
+            let stem = source_path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            let ext = source_path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+
+            if !stem.is_empty() && !ext.is_empty() {
+                let root = if root.is_empty() {
+                    String::new()
+                } else {
+                    format!("{root}/")
+                };
+                candidates.insert(format!("{root}tests/{stem}_test.{ext}"));
+                candidates.insert(format!("{root}tests/{stem}_tests.{ext}"));
+                candidates.insert(format!("{root}src/{stem}.test.{ext}"));
+                candidates.insert(format!("{root}src/{stem}.spec.{ext}"));
+                candidates.insert(format!("{root}src/__tests__/{stem}.{ext}"));
+            }
+        }
+
+        let mut guards = Vec::new();
+        for candidate in candidates {
+            let intents = store
+                .list_test_intents_for_file(candidate.as_str())?
+                .into_iter()
+                .map(|intent| intent.intent_text)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if intents.is_empty() {
+                continue;
+            }
+            guards.push(AetherBlastRadiusTestGuard {
+                test_file: candidate,
+                intents,
+                confidence: 0.9,
+                inference_method: "naming_convention".to_owned(),
+            });
+        }
+
+        guards.sort_by(|left, right| left.test_file.cmp(&right.test_file));
+        Ok(guards)
     }
 
     pub fn aether_symbol_timeline_logic(
@@ -2249,6 +2456,20 @@ impl AetherMcpServer {
     }
 
     #[tool(
+        name = "aether_test_intents",
+        description = "Query extracted behavioral test intents for a file or symbol"
+    )]
+    pub async fn aether_test_intents(
+        &self,
+        Parameters(request): Parameters<AetherTestIntentsRequest>,
+    ) -> Result<Json<AetherTestIntentsResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_test_intents");
+        self.aether_test_intents_logic(request)
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
         name = "aether_verify",
         description = "Run allowlisted verification commands in host, container, or microvm mode"
     )]
@@ -2468,6 +2689,14 @@ fn sort_and_dedup(values: &mut Vec<String>) {
 
 fn effective_limit(limit: Option<u32>) -> u32 {
     limit.unwrap_or(20).clamp(1, 100)
+}
+
+fn split_source_root(path: &str) -> Option<(String, String)> {
+    if let Some(tail) = path.strip_prefix("src/") {
+        return Some((String::new(), tail.to_owned()));
+    }
+    let (root, tail) = path.split_once("/src/")?;
+    Some((root.to_owned(), tail.to_owned()))
 }
 
 fn current_unix_timestamp() -> i64 {
