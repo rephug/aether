@@ -190,6 +190,14 @@ pub struct AetherRememberResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherSessionNoteResponse {
+    pub schema_version: String,
+    pub note_id: String,
+    pub action: String,
+    pub source_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherRecallRequest {
     pub query: String,
     pub mode: Option<SearchMode>,
@@ -986,10 +994,11 @@ impl AetherMcpServer {
         ))
     }
 
-    pub async fn aether_remember_logic(
+    async fn remember_note_with_source_type(
         &self,
         request: AetherRememberRequest,
-    ) -> Result<AetherRememberResponse, AetherMcpError> {
+        source_type: MemoryNoteSourceType,
+    ) -> Result<aether_memory::RememberResult, AetherMcpError> {
         let memory = ProjectMemoryService::new(&self.workspace);
         let entity_refs = request
             .entity_refs
@@ -1003,7 +1012,7 @@ impl AetherMcpServer {
 
         let remember = memory.remember(MemoryRememberRequest {
             content: request.content,
-            source_type: MemoryNoteSourceType::Agent,
+            source_type,
             source_agent: Some("aether_mcp".to_owned()),
             tags: request.tags.unwrap_or_default(),
             entity_refs,
@@ -1056,6 +1065,17 @@ impl AetherMcpServer {
             }
         }
 
+        Ok(remember)
+    }
+
+    pub async fn aether_remember_logic(
+        &self,
+        request: AetherRememberRequest,
+    ) -> Result<AetherRememberResponse, AetherMcpError> {
+        let remember = self
+            .remember_note_with_source_type(request, MemoryNoteSourceType::Agent)
+            .await?;
+
         Ok(AetherRememberResponse {
             schema_version: MEMORY_SCHEMA_VERSION.to_owned(),
             note_id: remember.note.note_id,
@@ -1063,6 +1083,22 @@ impl AetherMcpServer {
             content_hash: remember.note.content_hash,
             tags: remember.note.tags,
             created_at: remember.note.created_at,
+        })
+    }
+
+    pub async fn aether_session_note_logic(
+        &self,
+        request: AetherRememberRequest,
+    ) -> Result<AetherSessionNoteResponse, AetherMcpError> {
+        let remember = self
+            .remember_note_with_source_type(request, MemoryNoteSourceType::Session)
+            .await?;
+
+        Ok(AetherSessionNoteResponse {
+            schema_version: MEMORY_SCHEMA_VERSION.to_owned(),
+            note_id: remember.note.note_id,
+            action: remember.action.as_str().to_owned(),
+            source_type: MemoryNoteSourceType::Session.as_str().to_owned(),
         })
     }
 
@@ -1184,6 +1220,16 @@ impl AetherMcpServer {
             });
 
         let store = SqliteStore::open(&self.workspace)?;
+        let target_symbol_ids = store
+            .list_symbols_for_file(blast.target_file.as_str())?
+            .into_iter()
+            .map(|symbol| symbol.id)
+            .collect::<Vec<_>>();
+        store.increment_symbol_access(
+            target_symbol_ids.as_slice(),
+            current_unix_timestamp_millis(),
+        )?;
+
         let mut coupled_files = Vec::with_capacity(blast.coupled_files.len());
         for entry in blast.coupled_files {
             let notes = store
@@ -1857,6 +1903,7 @@ impl AetherMcpServer {
         }
 
         let store = SqliteStore::open(&self.workspace)?;
+        store.increment_symbol_access(&[symbol_id.to_owned()], current_unix_timestamp_millis())?;
         let meta = store.get_sir_meta(symbol_id)?;
         let (sir_status, last_error, last_attempt_at) = meta_status_fields(meta.as_ref());
         let sir_blob = store.read_sir_blob(symbol_id)?;
@@ -2219,6 +2266,13 @@ impl AetherMcpServer {
             &symbol.qualified_name,
             &symbol.signature_fingerprint,
         );
+        if self.sqlite_path().exists() {
+            let store = SqliteStore::open(&self.workspace)?;
+            store.increment_symbol_access(
+                std::slice::from_ref(&symbol_id),
+                current_unix_timestamp_millis(),
+            )?;
+        }
 
         let meta = self.read_sir_meta(&symbol_id)?;
         let (sir_status, last_error, last_attempt_at) = meta_status_fields(meta.as_ref());
@@ -2421,6 +2475,21 @@ impl AetherMcpServer {
     ) -> Result<Json<AetherRememberResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_remember");
         self.aether_remember_logic(request)
+            .await
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_session_note",
+        description = "Capture an in-session project note with source_type=session"
+    )]
+    pub async fn aether_session_note(
+        &self,
+        Parameters(request): Parameters<AetherRememberRequest>,
+    ) -> Result<Json<AetherSessionNoteResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_session_note");
+        self.aether_session_note_logic(request)
             .await
             .map(Json)
             .map_err(to_mcp_error)
@@ -2703,6 +2772,13 @@ fn current_unix_timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn current_unix_timestamp_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
 }
 

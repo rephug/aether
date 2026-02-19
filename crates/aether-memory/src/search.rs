@@ -11,6 +11,7 @@ use aether_store::{Store, open_vector_store};
 
 const RRF_K: f32 = 60.0;
 const RECENCY_WINDOW_MS: f32 = 30.0 * 24.0 * 60.0 * 60.0 * 1000.0;
+const ACCESS_NORMALIZATION_BASE: f32 = 100.0;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticQuery {
@@ -260,12 +261,17 @@ fn hybrid_ranked(
 
 fn boosted_score(base: f32, note: &ProjectNote, now_ms: i64) -> f32 {
     let base = base.max(0.0);
-    let age_ms = (now_ms.saturating_sub(note.updated_at)).max(0) as f32;
-    let recency_factor = (1.0 - (age_ms / RECENCY_WINDOW_MS)).clamp(0.0, 1.0);
-    let recency_boost = 1.0 + (0.1 * recency_factor);
-    let access_boost = 1.0 + (0.05 * ((note.access_count.max(0) as f32 + 1.0).ln()));
+    let recency_factor = note
+        .last_accessed_at
+        .map(|last_accessed_at| {
+            let age_ms = (now_ms.saturating_sub(last_accessed_at)).max(0) as f32;
+            (1.0 - (age_ms / RECENCY_WINDOW_MS)).clamp(0.0, 1.0)
+        })
+        .unwrap_or(0.0);
+    let access_factor =
+        (note.access_count.max(0) as f32 + 1.0).ln() / ACCESS_NORMALIZATION_BASE.ln();
 
-    base * recency_boost * access_boost
+    base * (1.0 + (0.1 * recency_factor) + (0.05 * access_factor))
 }
 
 fn sort_scored_notes(entries: &mut [RecallScoredNote]) {
@@ -295,7 +301,13 @@ mod tests {
     use super::build_recall_from_candidates;
     use crate::ProjectNote;
 
-    fn note(note_id: &str, updated_at: i64, access_count: i64, tags: &[&str]) -> ProjectNote {
+    fn note(
+        note_id: &str,
+        updated_at: i64,
+        access_count: i64,
+        last_accessed_at: Option<i64>,
+        tags: &[&str],
+    ) -> ProjectNote {
         ProjectNote {
             note_id: note_id.to_owned(),
             content: format!("content-{note_id}"),
@@ -309,7 +321,7 @@ mod tests {
             created_at: updated_at,
             updated_at,
             access_count,
-            last_accessed_at: None,
+            last_accessed_at,
             is_archived: false,
         }
     }
@@ -317,9 +329,9 @@ mod tests {
     #[test]
     fn hybrid_ranking_prefers_rrf_overlap() {
         let now = 1_700_000_100_000;
-        let a = note("a", now, 0, &["architecture"]);
-        let b = note("b", now, 0, &["architecture"]);
-        let c = note("c", now, 0, &["architecture"]);
+        let a = note("a", now, 0, None, &["architecture"]);
+        let b = note("b", now, 0, None, &["architecture"]);
+        let c = note("c", now, 0, None, &["architecture"]);
 
         let result = build_recall_from_candidates(
             SearchMode::Hybrid,
@@ -341,8 +353,14 @@ mod tests {
     #[test]
     fn semantic_ranking_applies_recency_and_access_boosts() {
         let now = 1_700_000_200_000;
-        let stale = note("stale", now - (45 * 24 * 60 * 60 * 1000), 0, &[]);
-        let active = note("active", now - (2 * 24 * 60 * 60 * 1000), 10, &[]);
+        let stale = note("stale", now - (45 * 24 * 60 * 60 * 1000), 0, None, &[]);
+        let active = note(
+            "active",
+            now - (2 * 24 * 60 * 60 * 1000),
+            10,
+            Some(now - (2 * 24 * 60 * 60 * 1000)),
+            &[],
+        );
 
         let result = build_recall_from_candidates(
             SearchMode::Semantic,
@@ -359,9 +377,33 @@ mod tests {
     }
 
     #[test]
+    fn ranking_boost_changes_order_from_raw_score() {
+        let now = 1_700_000_300_000;
+        let stronger_raw = note("raw-stronger", now, 0, None, &[]);
+        let boosted = note("boosted", now, 100, Some(now), &[]);
+
+        let result = build_recall_from_candidates(
+            SearchMode::Semantic,
+            10,
+            now,
+            Vec::new(),
+            vec![(stronger_raw, 0.80), (boosted, 0.79)],
+            None,
+        );
+
+        let ids = result
+            .notes
+            .iter()
+            .map(|entry| entry.note.note_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(ids[0], "boosted");
+        assert_eq!(ids[1], "raw-stronger");
+    }
+
+    #[test]
     fn semantic_mode_falls_back_to_lexical_when_semantic_unavailable() {
         let now = 1_700_000_300_000;
-        let lexical = note("lexical", now, 0, &[]);
+        let lexical = note("lexical", now, 0, None, &[]);
 
         let result = build_recall_from_candidates(
             SearchMode::Semantic,

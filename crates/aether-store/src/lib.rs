@@ -1,7 +1,9 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use aether_config::{GraphBackend, load_workspace_config};
 use aether_core::{EdgeKind, SymbolEdge, content_hash, normalize_path};
@@ -19,6 +21,9 @@ pub use vector::{
     LanceVectorStore, ProjectNoteVectorRecord, ProjectNoteVectorSearchResult, SqliteVectorStore,
     VectorEmbeddingMetaRecord, VectorRecord, VectorSearchResult, VectorStore, open_vector_store,
 };
+
+const SYMBOL_ACCESS_COUNTER_MAX: i64 = i64::MAX;
+const SYMBOL_ACCESS_DEBOUNCE_SECONDS: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolRecord {
@@ -258,6 +263,16 @@ pub trait Store {
         query: &str,
         limit: u32,
     ) -> Result<Vec<SymbolSearchResult>, StoreError>;
+    fn increment_symbol_access(
+        &self,
+        symbol_ids: &[String],
+        accessed_at: i64,
+    ) -> Result<(), StoreError>;
+    fn increment_symbol_access_debounced(
+        &self,
+        symbol_ids: &[String],
+        accessed_at: i64,
+    ) -> Result<(), StoreError>;
     fn upsert_edges(&self, edges: &[SymbolEdge]) -> Result<(), StoreError>;
     fn get_callers(&self, target_qualified_name: &str) -> Result<Vec<SymbolEdge>, StoreError>;
     fn get_dependencies(&self, source_id: &str) -> Result<Vec<SymbolEdge>, StoreError>;
@@ -412,6 +427,7 @@ pub struct SqliteStore {
     aether_dir: PathBuf,
     sir_dir: PathBuf,
     mirror_sir_files: bool,
+    symbol_access_debounce: Mutex<HashMap<String, Instant>>,
 }
 
 impl SqliteStore {
@@ -434,6 +450,7 @@ impl SqliteStore {
             aether_dir,
             sir_dir,
             mirror_sir_files: config.storage.mirror_sir_files,
+            symbol_access_debounce: Mutex::new(HashMap::new()),
         })
     }
 
@@ -868,6 +885,101 @@ impl Store for SqliteStore {
 
         let records = rows.collect::<Result<Vec<_>, _>>()?;
         Ok(records)
+    }
+
+    fn increment_symbol_access(
+        &self,
+        symbol_ids: &[String],
+        accessed_at: i64,
+    ) -> Result<(), StoreError> {
+        if symbol_ids.is_empty() {
+            return Ok(());
+        }
+
+        let accessed_at = accessed_at.max(0);
+        let unique_ids = symbol_ids
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .collect::<HashSet<_>>();
+        if unique_ids.is_empty() {
+            return Ok(());
+        }
+
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| -> Result<(), StoreError> {
+            let mut stmt = self.conn.prepare(
+                r#"
+                UPDATE symbols
+                SET access_count = CASE
+                        WHEN access_count < ?2 THEN access_count + 1
+                        ELSE ?2
+                    END,
+                    last_accessed_at = ?3
+                WHERE id = ?1
+                "#,
+            )?;
+
+            for symbol_id in unique_ids {
+                stmt.execute(params![symbol_id, SYMBOL_ACCESS_COUNTER_MAX, accessed_at])?;
+            }
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
+    fn increment_symbol_access_debounced(
+        &self,
+        symbol_ids: &[String],
+        accessed_at: i64,
+    ) -> Result<(), StoreError> {
+        if symbol_ids.is_empty() {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        let debounce_window = Duration::from_secs(SYMBOL_ACCESS_DEBOUNCE_SECONDS);
+        let mut tracker = self.symbol_access_debounce.lock().map_err(|err| {
+            StoreError::Io(std::io::Error::other(format!(
+                "symbol access debounce lock poisoned: {err}"
+            )))
+        })?;
+
+        let mut symbol_ids_to_increment = Vec::new();
+        for symbol_id in symbol_ids {
+            let trimmed = symbol_id.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let should_increment = tracker
+                .get(trimmed)
+                .map(|last_accessed| {
+                    now.saturating_duration_since(*last_accessed) >= debounce_window
+                })
+                .unwrap_or(true);
+
+            if !should_increment {
+                continue;
+            }
+
+            tracker.insert(trimmed.to_owned(), now);
+            symbol_ids_to_increment.push(trimmed.to_owned());
+        }
+        drop(tracker);
+
+        self.increment_symbol_access(symbol_ids_to_increment.as_slice(), accessed_at)
     }
 
     fn upsert_edges(&self, edges: &[SymbolEdge]) -> Result<(), StoreError> {
@@ -2402,7 +2514,9 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
             kind TEXT NOT NULL,
             qualified_name TEXT NOT NULL,
             signature_fingerprint TEXT NOT NULL,
-            last_seen_at INTEGER NOT NULL
+            last_seen_at INTEGER NOT NULL,
+            access_count INTEGER NOT NULL DEFAULT 0,
+            last_accessed_at INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS sir (
@@ -2550,6 +2664,8 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
     ensure_sir_column(conn, "last_error", "TEXT")?;
     ensure_sir_column(conn, "last_attempt_at", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_sir_history_column(conn, "commit_hash", "TEXT")?;
+    ensure_symbols_column(conn, "access_count", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_symbols_column(conn, "last_accessed_at", "INTEGER")?;
 
     conn.execute(
         "UPDATE sir SET sir_status = 'fresh' WHERE COALESCE(TRIM(sir_status), '') = ''",
@@ -2610,6 +2726,20 @@ fn ensure_sir_history_column(
     }
 
     let sql = format!("ALTER TABLE sir_history ADD COLUMN {column_name} {column_definition}");
+    conn.execute(&sql, [])?;
+    Ok(())
+}
+
+fn ensure_symbols_column(
+    conn: &Connection,
+    column_name: &str,
+    column_definition: &str,
+) -> Result<(), StoreError> {
+    if table_has_column(conn, "symbols", column_name)? {
+        return Ok(());
+    }
+
+    let sql = format!("ALTER TABLE symbols ADD COLUMN {column_name} {column_definition}");
     conn.execute(&sql, [])?;
     Ok(())
 }
@@ -3411,6 +3541,57 @@ mirror_sir_files = false
     }
 
     #[test]
+    fn increment_symbol_access_updates_count_and_timestamp() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        store.upsert_symbol(symbol_record()).expect("upsert symbol");
+
+        store
+            .increment_symbol_access(&["sym-1".to_owned()], 1_700_100_000)
+            .expect("increment symbol access");
+
+        let mut stmt = store
+            .conn
+            .prepare("SELECT access_count, last_accessed_at FROM symbols WHERE id = ?1")
+            .expect("prepare symbol access lookup");
+        let access = stmt
+            .query_row(params!["sym-1"], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+            })
+            .expect("query access fields");
+
+        assert_eq!(access.0, 1);
+        assert_eq!(access.1, Some(1_700_100_000));
+    }
+
+    #[test]
+    fn increment_symbol_access_debounced_skips_duplicate_within_window() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        store.upsert_symbol(symbol_record()).expect("upsert symbol");
+
+        store
+            .increment_symbol_access_debounced(&["sym-1".to_owned()], 1_700_100_100)
+            .expect("first debounced increment");
+        store
+            .increment_symbol_access_debounced(&["sym-1".to_owned()], 1_700_100_101)
+            .expect("second debounced increment");
+
+        let mut stmt = store
+            .conn
+            .prepare("SELECT access_count, last_accessed_at FROM symbols WHERE id = ?1")
+            .expect("prepare symbol access lookup");
+        let access = stmt
+            .query_row(params!["sym-1"], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+            })
+            .expect("query access fields");
+
+        assert_eq!(access.0, 1);
+        assert_eq!(access.1, Some(1_700_100_100));
+    }
+
+    #[test]
     fn search_project_notes_lexical_matches_query_terms() {
         let temp = tempdir().expect("tempdir");
         let store = SqliteStore::open(temp.path()).expect("open store");
@@ -3555,6 +3736,61 @@ mirror_sir_files = false
             .search_symbols_semantic(&[1.0, 0.0], "mock", "mock-64d", 10)
             .expect("semantic search on migrated schema");
         assert!(embedding_lookup.is_empty());
+    }
+
+    #[test]
+    fn open_store_migrates_legacy_symbols_table_with_access_columns() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let aether_dir = workspace.join(".aether");
+        let sir_dir = aether_dir.join("sir");
+        fs::create_dir_all(&sir_dir).expect("create legacy aether dirs");
+
+        let sqlite_path = aether_dir.join("meta.sqlite");
+        let conn = Connection::open(&sqlite_path).expect("open legacy sqlite");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS symbols (
+                id TEXT PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                language TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                qualified_name TEXT NOT NULL,
+                signature_fingerprint TEXT NOT NULL,
+                last_seen_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sir (
+                id TEXT PRIMARY KEY,
+                sir_hash TEXT NOT NULL,
+                sir_version INTEGER NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                sir_json TEXT
+            );
+            "#,
+        )
+        .expect("create legacy schema");
+        conn.execute(
+            "INSERT INTO symbols (id, file_path, language, kind, qualified_name, signature_fingerprint, last_seen_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params!["legacy-sym", "src/lib.rs", "rust", "function", "demo::legacy", "sig", 1_700_000_000i64],
+        )
+        .expect("insert legacy symbol");
+        drop(conn);
+
+        let store = SqliteStore::open(workspace).expect("open migrated store");
+        let mut stmt = store
+            .conn
+            .prepare("SELECT access_count, last_accessed_at FROM symbols WHERE id = ?1")
+            .expect("prepare migrated symbol lookup");
+        let access = stmt
+            .query_row(params!["legacy-sym"], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+            })
+            .expect("query migrated symbol access fields");
+        assert_eq!(access.0, 0);
+        assert_eq!(access.1, None);
     }
 
     #[test]
