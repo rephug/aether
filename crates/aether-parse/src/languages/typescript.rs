@@ -1,8 +1,9 @@
 use aether_core::{EdgeKind, Language, Symbol, SymbolEdge, SymbolKind, file_source_id};
-use tree_sitter::Query;
+use tree_sitter::{Node, Query};
 
 use crate::parser::{
-    build_symbol, typescript_call_target, typescript_qualified_name, typescript_source_function_id,
+    TestIntent, build_symbol, normalize_intent_text, typescript_call_target,
+    typescript_qualified_name, typescript_source_function_id,
 };
 use crate::registry::{LanguageConfig, LanguageHooks, QueryCaptures};
 
@@ -18,6 +19,11 @@ pub fn config() -> LanguageConfig {
         include_str!("../queries/typescript_edges.scm"),
     )
     .expect("invalid typescript edge query");
+    let test_intent_query = Query::new(
+        &ts_language,
+        include_str!("../queries/typescript_test_intents.scm"),
+    )
+    .expect("invalid typescript test intent query");
 
     LanguageConfig {
         id: "typescript",
@@ -25,6 +31,7 @@ pub fn config() -> LanguageConfig {
         ts_language,
         symbol_query,
         edge_query,
+        test_intent_query: Some(test_intent_query),
         module_markers: &["package.json"],
         hooks: Some(Box::new(TypeScriptHooks)),
     }
@@ -42,6 +49,11 @@ pub fn tsx_js_config() -> LanguageConfig {
         include_str!("../queries/typescript_edges.scm"),
     )
     .expect("invalid typescript edge query");
+    let test_intent_query = Query::new(
+        &ts_language,
+        include_str!("../queries/typescript_test_intents.scm"),
+    )
+    .expect("invalid typescript test intent query");
 
     LanguageConfig {
         id: "tsx_js",
@@ -49,6 +61,7 @@ pub fn tsx_js_config() -> LanguageConfig {
         ts_language,
         symbol_query,
         edge_query,
+        test_intent_query: Some(test_intent_query),
         module_markers: &["package.json"],
         hooks: Some(Box::new(TypeScriptHooks)),
     }
@@ -135,4 +148,86 @@ impl LanguageHooks for TypeScriptHooks {
             _ => None,
         }
     }
+
+    fn map_test_intent(
+        &self,
+        language: Language,
+        captures: &QueryCaptures<'_, '_>,
+        source: &[u8],
+        file_path: &str,
+        _symbols: &[Symbol],
+    ) -> Option<Vec<TestIntent>> {
+        let node = captures.node_with_prefix("test.")?;
+        if node.kind() != "call_expression" {
+            return None;
+        }
+
+        let function = node.child_by_field_name("function")?;
+        let callee = call_name(function, source)?;
+        if !matches!(callee.as_str(), "it" | "test" | "describe") {
+            return None;
+        }
+
+        let label = first_string_argument(node, source)?;
+        let intent_text = normalize_intent_text(label.as_str());
+        if intent_text.is_empty() {
+            return None;
+        }
+
+        let group_label = if callee == "describe" {
+            None
+        } else {
+            nearest_describe_label(node, source)
+        };
+
+        Some(vec![TestIntent {
+            file_path: file_path.to_owned(),
+            test_name: callee,
+            intent_text,
+            group_label,
+            language,
+            symbol_id: None,
+        }])
+    }
+}
+
+fn call_name(function: Node<'_>, source: &[u8]) -> Option<String> {
+    match function.kind() {
+        "identifier" => Some(crate::parser::node_text(function, source)),
+        "member_expression" => function
+            .child_by_field_name("property")
+            .or_else(|| function.named_child(1))
+            .map(|node| crate::parser::node_text(node, source)),
+        _ => None,
+    }
+    .map(|value| value.trim().to_owned())
+    .filter(|value| !value.is_empty())
+}
+
+fn first_string_argument(call: Node<'_>, source: &[u8]) -> Option<String> {
+    let arguments = call.child_by_field_name("arguments")?;
+    let arg = arguments.named_child(0)?;
+    match arg.kind() {
+        "string" => Some(crate::parser::node_text(arg, source)),
+        "template_string" => arg
+            .named_child(0)
+            .filter(|node| node.kind() == "string_fragment")
+            .map(|node| crate::parser::node_text(node, source)),
+        _ => None,
+    }
+}
+
+fn nearest_describe_label(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "call_expression"
+            && let Some(function) = parent.child_by_field_name("function")
+            && call_name(function, source).as_deref() == Some("describe")
+        {
+            return first_string_argument(parent, source)
+                .map(|value| normalize_intent_text(&value));
+        }
+        current = parent.parent();
+    }
+    None
 }

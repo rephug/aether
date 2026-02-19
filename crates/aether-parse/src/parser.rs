@@ -16,6 +16,17 @@ use crate::registry::{LanguageConfig, LanguageRegistry, QueryCaptures, default_r
 pub struct ExtractedFile {
     pub symbols: Vec<Symbol>,
     pub edges: Vec<SymbolEdge>,
+    pub test_intents: Vec<TestIntent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestIntent {
+    pub file_path: String,
+    pub test_name: String,
+    pub intent_text: String,
+    pub group_label: Option<String>,
+    pub language: Language,
+    pub symbol_id: Option<String>,
 }
 
 pub struct SymbolExtractor {
@@ -162,7 +173,15 @@ fn extract_with_config(
     let mut edges = extract_edges(language, file_path, source_bytes, root, config, &symbols);
     sort_and_dedupe_edges(&mut edges);
 
-    Ok(ExtractedFile { symbols, edges })
+    let mut test_intents =
+        extract_test_intents(language, file_path, source_bytes, root, config, &symbols);
+    sort_and_dedupe_test_intents(&mut test_intents);
+
+    Ok(ExtractedFile {
+        symbols,
+        edges,
+        test_intents,
+    })
 }
 
 fn extract_symbols(
@@ -235,6 +254,38 @@ fn extract_edges(
     }
 
     edges
+}
+
+fn extract_test_intents(
+    language: Language,
+    file_path: &str,
+    source: &[u8],
+    root: Node<'_>,
+    config: &LanguageConfig,
+    symbols: &[Symbol],
+) -> Vec<TestIntent> {
+    let Some(query) = config.test_intent_query.as_ref() else {
+        return Vec::new();
+    };
+
+    let mut cursor = QueryCursor::new();
+    let mut intents = Vec::new();
+    let mut query_matches = cursor.matches(query, root, source);
+    while {
+        query_matches.advance();
+        query_matches.get().is_some()
+    } {
+        let matched = query_matches.get().expect("query match should exist");
+        let captures = QueryCaptures::new(query, matched.captures, matched.pattern_index);
+        if let Some(hooks) = config.hooks.as_ref()
+            && let Some(mapped) =
+                hooks.map_test_intent(language, &captures, source, file_path, symbols)
+        {
+            intents.extend(mapped);
+        }
+    }
+
+    intents
 }
 
 fn default_map_symbol(
@@ -576,6 +627,59 @@ pub(crate) fn sort_and_dedupe_edges(edges: &mut Vec<SymbolEdge>) {
     });
 }
 
+pub(crate) fn sort_and_dedupe_test_intents(intents: &mut Vec<TestIntent>) {
+    intents.sort_by(|left, right| {
+        left.file_path
+            .cmp(&right.file_path)
+            .then_with(|| left.test_name.cmp(&right.test_name))
+            .then_with(|| left.intent_text.cmp(&right.intent_text))
+            .then_with(|| left.group_label.cmp(&right.group_label))
+            .then_with(|| left.language.cmp(&right.language))
+            .then_with(|| left.symbol_id.cmp(&right.symbol_id))
+    });
+    intents.dedup_by(|left, right| {
+        left.file_path == right.file_path
+            && left.test_name == right.test_name
+            && left.intent_text == right.intent_text
+            && left.group_label == right.group_label
+            && left.language == right.language
+            && left.symbol_id == right.symbol_id
+    });
+}
+
+pub(crate) fn humanize_test_name(name: &str) -> String {
+    let normalized = name.trim();
+    if normalized.is_empty() {
+        return String::new();
+    }
+
+    let lowered = normalized.to_ascii_lowercase();
+    let without_prefix = if let Some(rest) = lowered.strip_prefix("test_") {
+        rest
+    } else if let Some(rest) = lowered.strip_prefix("test") {
+        rest.trim_start_matches('_')
+    } else {
+        lowered.as_str()
+    };
+
+    without_prefix
+        .replace(['_', '-'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub(crate) fn normalize_intent_text(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .replace('\n', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub(crate) fn typescript_call_target(node: Node<'_>, source: &[u8]) -> Option<String> {
     let callee = node
         .child_by_field_name("function")
@@ -906,6 +1010,85 @@ type UserId = string;
         assert!(names.contains(&"Greeter::greet".to_owned()));
         assert!(names.contains(&"User".to_owned()));
         assert!(names.contains(&"UserId".to_owned()));
+    }
+
+    #[test]
+    fn extracts_rust_test_intents_from_names_and_doc_comments() {
+        let source = r#"
+#[test]
+fn test_handles_negative_balance() {}
+
+/// returns none for missing symbol
+#[test]
+fn lookup_missing_symbol_returns_none() {}
+
+fn helper() {}
+"#;
+
+        let extracted = extract_with_edges(Language::Rust, "src/lib.rs", source);
+        let intents = extracted
+            .test_intents
+            .iter()
+            .map(|intent| intent.intent_text.clone())
+            .collect::<Vec<_>>();
+        assert!(intents.contains(&"handles negative balance".to_owned()));
+        assert!(intents.contains(&"returns none for missing symbol".to_owned()));
+        assert!(
+            extracted
+                .test_intents
+                .iter()
+                .all(|intent| intent.symbol_id.is_some())
+        );
+    }
+
+    #[test]
+    fn extracts_typescript_test_intents_from_it_test_and_describe() {
+        let source = r#"
+describe("PaymentService", () => {
+  it("handles negative balance", () => {});
+  test("returns none for missing symbol", () => {});
+});
+"#;
+
+        let extracted = extract_with_edges(Language::TypeScript, "src/payment.test.ts", source);
+        let intents = extracted
+            .test_intents
+            .iter()
+            .map(|intent| intent.intent_text.clone())
+            .collect::<Vec<_>>();
+        assert!(intents.contains(&"PaymentService".to_owned()));
+        assert!(intents.contains(&"handles negative balance".to_owned()));
+        assert!(intents.contains(&"returns none for missing symbol".to_owned()));
+        assert!(
+            extracted
+                .test_intents
+                .iter()
+                .any(|intent| intent.group_label.as_deref() == Some("PaymentService"))
+        );
+    }
+
+    #[test]
+    fn extracts_python_test_intents_from_names_and_docstrings() {
+        let source = r#"
+def test_handles_negative_balance():
+    """handles negative balance"""
+    assert True
+
+def test_returns_none_for_missing_symbol():
+    assert True
+
+def helper():
+    return 1
+"#;
+
+        let extracted = extract_with_edges(Language::Python, "tests/test_payments.py", source);
+        let intents = extracted
+            .test_intents
+            .iter()
+            .map(|intent| intent.intent_text.clone())
+            .collect::<Vec<_>>();
+        assert!(intents.contains(&"handles negative balance".to_owned()));
+        assert!(intents.contains(&"returns none for missing symbol".to_owned()));
     }
 
     #[test]

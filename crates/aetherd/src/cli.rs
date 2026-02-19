@@ -169,6 +169,12 @@ pub struct CouplingReportArgs {
     pub top: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct TestIntentsArgs {
+    #[arg(help = "Test file path to inspect extracted test intents")]
+    pub file: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Commands {
     /// Generate agent configuration files for AI coding agents
@@ -187,6 +193,8 @@ pub enum Commands {
     BlastRadius(BlastRadiusArgs),
     /// Show highest-scoring coupling pairs
     CouplingReport(CouplingReportArgs),
+    /// List extracted behavioral test intents for a test file
+    TestIntents(TestIntentsArgs),
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -695,6 +703,25 @@ mod tests {
         match cli.command {
             Some(Commands::CouplingReport(args)) => {
                 assert_eq!(args.top, 15);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_intents_subcommand_parses_file_argument() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "test-intents",
+            "tests/payment_test.rs",
+        ])
+        .expect("test-intents should parse");
+
+        match cli.command {
+            Some(Commands::TestIntents(args)) => {
+                assert_eq!(args.file, "tests/payment_test.rs");
             }
             other => panic!("unexpected command: {other:?}"),
         }

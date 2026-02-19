@@ -8,7 +8,7 @@ use aether_infer::{download_candle_embedding_model, download_candle_reranker_mod
 use aetherd::calibrate::run_calibration_once;
 use aetherd::cli::{
     BlastRadiusArgs, Cli, Commands, CouplingReportArgs, InitAgentArgs, LogFormat, MineCouplingArgs,
-    NotesArgs, RecallArgs, RememberArgs, SetupLocalArgs, parse_cli,
+    NotesArgs, RecallArgs, RememberArgs, SetupLocalArgs, TestIntentsArgs, parse_cli,
 };
 use aetherd::coupling::{
     run_blast_radius_command, run_coupling_report_command, run_mine_coupling_command,
@@ -18,6 +18,7 @@ use aetherd::init_agent::{InitAgentOptions, run_init_agent};
 use aetherd::memory::{run_notes_command, run_recall_command, run_remember_command};
 use aetherd::search::run_search_once;
 use aetherd::setup_local::{SetupLocalOptions, run_setup_local};
+use aetherd::test_intents::run_test_intents_command;
 use aetherd::verification::{VerificationRequest, run_verification};
 use anyhow::{Context, Result, anyhow};
 
@@ -214,6 +215,7 @@ fn run_subcommand(workspace: &Path, command: Commands) -> Result<()> {
         Commands::MineCoupling(args) => run_mine_coupling_subcommand(workspace, args),
         Commands::BlastRadius(args) => run_blast_radius_subcommand(workspace, args),
         Commands::CouplingReport(args) => run_coupling_report_subcommand(workspace, args),
+        Commands::TestIntents(args) => run_test_intents_subcommand(workspace, args),
     }
 }
 
@@ -291,6 +293,10 @@ fn run_blast_radius_subcommand(workspace: &Path, args: BlastRadiusArgs) -> Resul
 
 fn run_coupling_report_subcommand(workspace: &Path, args: CouplingReportArgs) -> Result<()> {
     run_coupling_report_command(workspace, args).context("coupling-report command failed")
+}
+
+fn run_test_intents_subcommand(workspace: &Path, args: TestIntentsArgs) -> Result<()> {
+    run_test_intents_command(workspace, args).context("test-intents command failed")
 }
 
 fn init_tracing_subscriber(log_format: LogFormat, configured_log_level: &str) -> Result<()> {

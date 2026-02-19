@@ -5,6 +5,7 @@ use aether_core::{
 };
 use tree_sitter::{Node, Query};
 
+use crate::parser::{TestIntent, humanize_test_name, normalize_intent_text};
 use crate::parser::{build_symbol, enclosing_function_symbol_id, named_child_text, node_text};
 use crate::registry::{LanguageConfig, LanguageHooks, QueryCaptures};
 
@@ -14,6 +15,11 @@ pub fn config() -> LanguageConfig {
         .expect("invalid python symbol query");
     let edge_query = Query::new(&ts_language, include_str!("../queries/python_edges.scm"))
         .expect("invalid python edge query");
+    let test_intent_query = Query::new(
+        &ts_language,
+        include_str!("../queries/python_test_intents.scm"),
+    )
+    .expect("invalid python test intent query");
 
     LanguageConfig {
         id: "python",
@@ -21,6 +27,7 @@ pub fn config() -> LanguageConfig {
         ts_language,
         symbol_query,
         edge_query,
+        test_intent_query: Some(test_intent_query),
         module_markers: &["__init__.py", "pyproject.toml", "setup.py", "setup.cfg"],
         hooks: Some(Box::new(PythonHooks)),
     }
@@ -116,6 +123,44 @@ impl LanguageHooks for PythonHooks {
             }
             _ => None,
         }
+    }
+
+    fn map_test_intent(
+        &self,
+        language: Language,
+        captures: &QueryCaptures<'_, '_>,
+        source: &[u8],
+        file_path: &str,
+        _symbols: &[Symbol],
+    ) -> Option<Vec<TestIntent>> {
+        let node = captures.node_with_prefix("test.")?;
+        if node.kind() != "function_definition" {
+            return None;
+        }
+
+        let test_name = named_child_text(node, "name", source)?;
+        if !test_name.starts_with("test_") {
+            return None;
+        }
+
+        let symbol_id = self
+            .map_function_symbol(language, file_path, source, node)
+            .map(|symbol| symbol.id);
+        let intent_text = python_docstring(node, source)
+            .unwrap_or_else(|| humanize_test_name(test_name.as_str()));
+        let intent_text = normalize_intent_text(intent_text.as_str());
+        if intent_text.is_empty() {
+            return None;
+        }
+
+        Some(vec![TestIntent {
+            file_path: file_path.to_owned(),
+            test_name,
+            intent_text,
+            group_label: None,
+            language,
+            symbol_id,
+        }])
     }
 
     fn is_module_root(&self, dir_path: &Path) -> Option<bool> {
@@ -338,6 +383,31 @@ fn python_import_targets(node: Node<'_>, source: &[u8], file_path: &str) -> Vec<
         "import_from_statement" => parse_import_from_statement(&text, file_path),
         _ => Vec::new(),
     }
+}
+
+fn python_docstring(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let body = node.child_by_field_name("body")?;
+    let first_statement = body.named_child(0)?;
+    if first_statement.kind() != "expression_statement" {
+        return None;
+    }
+    let literal = first_statement.named_child(0)?;
+    if literal.kind() != "string" {
+        return None;
+    }
+
+    let raw = node_text(literal, source);
+    let stripped = raw
+        .trim()
+        .trim_start_matches("r\"\"\"")
+        .trim_start_matches("u\"\"\"")
+        .trim_start_matches("f\"\"\"")
+        .trim_start_matches("\"\"\"")
+        .trim_start_matches("'''")
+        .trim_end_matches("\"\"\"")
+        .trim_end_matches("'''")
+        .trim();
+    (!stripped.is_empty()).then(|| stripped.to_owned())
 }
 
 fn parse_import_statement(text: &str) -> Vec<String> {
