@@ -19,6 +19,12 @@ pub const DEFAULT_VERIFY_MICROVM_WORKDIR: &str = "/workspace";
 pub const DEFAULT_VERIFY_MICROVM_VCPU_COUNT: u8 = 1;
 pub const DEFAULT_VERIFY_MICROVM_MEMORY_MIB: u32 = 1024;
 pub const DEFAULT_LOG_LEVEL: &str = "info";
+pub const DEFAULT_SEARCH_THRESHOLD_DEFAULT: f32 = 0.65;
+pub const DEFAULT_SEARCH_THRESHOLD_RUST: f32 = 0.70;
+pub const DEFAULT_SEARCH_THRESHOLD_TYPESCRIPT: f32 = 0.65;
+pub const DEFAULT_SEARCH_THRESHOLD_PYTHON: f32 = 0.60;
+pub const MIN_SEARCH_THRESHOLD: f32 = 0.3;
+pub const MAX_SEARCH_THRESHOLD: f32 = 0.95;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -187,7 +193,7 @@ impl std::str::FromStr for GraphBackend {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct AetherConfig {
     #[serde(default)]
     pub general: GeneralConfig,
@@ -300,12 +306,19 @@ impl Default for EmbeddingsConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchConfig {
     #[serde(default)]
     pub reranker: SearchRerankerKind,
     #[serde(default = "default_rerank_window")]
     pub rerank_window: u32,
+    #[serde(default)]
+    pub thresholds: SearchThresholdsConfig,
+    #[serde(
+        default,
+        skip_serializing_if = "SearchCalibratedThresholdsConfig::is_empty"
+    )]
+    pub calibrated_thresholds: SearchCalibratedThresholdsConfig,
     #[serde(default, skip_serializing_if = "SearchCandleConfig::is_empty")]
     pub candle: SearchCandleConfig,
 }
@@ -315,7 +328,95 @@ impl Default for SearchConfig {
         Self {
             reranker: SearchRerankerKind::None,
             rerank_window: default_rerank_window(),
+            thresholds: SearchThresholdsConfig::default(),
+            calibrated_thresholds: SearchCalibratedThresholdsConfig::default(),
             candle: SearchCandleConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchThresholdsConfig {
+    #[serde(default = "default_search_threshold_default")]
+    pub default: f32,
+    #[serde(default = "default_search_threshold_rust")]
+    pub rust: f32,
+    #[serde(default = "default_search_threshold_typescript")]
+    pub typescript: f32,
+    #[serde(default = "default_search_threshold_python")]
+    pub python: f32,
+}
+
+impl SearchThresholdsConfig {
+    pub fn value_for_language(&self, language: &str) -> f32 {
+        match normalize_threshold_language(language) {
+            "rust" => self.rust,
+            "typescript" => self.typescript,
+            "python" => self.python,
+            _ => self.default,
+        }
+    }
+
+    pub fn baseline_for_language(language: &str) -> f32 {
+        match normalize_threshold_language(language) {
+            "rust" => DEFAULT_SEARCH_THRESHOLD_RUST,
+            "typescript" => DEFAULT_SEARCH_THRESHOLD_TYPESCRIPT,
+            "python" => DEFAULT_SEARCH_THRESHOLD_PYTHON,
+            _ => DEFAULT_SEARCH_THRESHOLD_DEFAULT,
+        }
+    }
+
+    pub fn is_manual_override_for_language(&self, language: &str) -> bool {
+        (self.value_for_language(language) - Self::baseline_for_language(language)).abs() > 1e-6
+    }
+}
+
+impl Default for SearchThresholdsConfig {
+    fn default() -> Self {
+        Self {
+            default: default_search_threshold_default(),
+            rust: default_search_threshold_rust(),
+            typescript: default_search_threshold_typescript(),
+            python: default_search_threshold_python(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SearchCalibratedThresholdsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rust: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typescript: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python: Option<f32>,
+}
+
+impl SearchCalibratedThresholdsConfig {
+    pub fn is_empty(&self) -> bool {
+        self.default.is_none()
+            && self.rust.is_none()
+            && self.typescript.is_none()
+            && self.python.is_none()
+    }
+
+    pub fn value_for_language(&self, language: &str) -> Option<f32> {
+        match normalize_threshold_language(language) {
+            "rust" => self.rust,
+            "typescript" => self.typescript,
+            "python" => self.python,
+            _ => self.default,
+        }
+    }
+
+    pub fn set_for_language(&mut self, language: &str, value: Option<f32>) {
+        match normalize_threshold_language(language) {
+            "rust" => self.rust = value,
+            "typescript" => self.typescript = value,
+            "python" => self.python = value,
+            _ => self.default = value,
         }
     }
 }
@@ -516,10 +617,21 @@ pub fn ensure_workspace_config(
     }
 
     let config = AetherConfig::default();
-    let content = toml::to_string_pretty(&config)?;
-    fs::write(path, content)?;
+    save_workspace_config(workspace_root, &config)?;
 
     Ok(config)
+}
+
+pub fn save_workspace_config(
+    workspace_root: impl AsRef<Path>,
+    config: &AetherConfig,
+) -> Result<(), ConfigError> {
+    let workspace_root = workspace_root.as_ref();
+    fs::create_dir_all(aether_dir(workspace_root))?;
+    let normalized = normalize_config(config.clone());
+    let content = toml::to_string_pretty(&normalized)?;
+    fs::write(config_path(workspace_root), content)?;
+    Ok(())
 }
 
 pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
@@ -710,6 +822,22 @@ fn default_rerank_window() -> u32 {
     50
 }
 
+fn default_search_threshold_default() -> f32 {
+    DEFAULT_SEARCH_THRESHOLD_DEFAULT
+}
+
+fn default_search_threshold_rust() -> f32 {
+    DEFAULT_SEARCH_THRESHOLD_RUST
+}
+
+fn default_search_threshold_typescript() -> f32 {
+    DEFAULT_SEARCH_THRESHOLD_TYPESCRIPT
+}
+
+fn default_search_threshold_python() -> f32 {
+    DEFAULT_SEARCH_THRESHOLD_PYTHON
+}
+
 fn default_cohere_api_key_env() -> String {
     DEFAULT_COHERE_API_KEY_ENV.to_owned()
 }
@@ -781,6 +909,34 @@ fn normalize_commands(commands: Vec<String>) -> Vec<String> {
     normalized
 }
 
+fn normalize_threshold_language(language: &str) -> &str {
+    let normalized = language.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "rust" | "rs" => "rust",
+        "typescript" | "ts" | "tsx" | "javascript" | "js" => "typescript",
+        "python" | "py" => "python",
+        _ => "default",
+    }
+}
+
+fn normalize_threshold_value(value: f32, fallback: f32) -> f32 {
+    if !value.is_finite() {
+        return fallback;
+    }
+
+    value.clamp(MIN_SEARCH_THRESHOLD, MAX_SEARCH_THRESHOLD)
+}
+
+fn normalize_optional_threshold(value: Option<f32>) -> Option<f32> {
+    value.and_then(|inner| {
+        if !inner.is_finite() {
+            None
+        } else {
+            Some(inner.clamp(MIN_SEARCH_THRESHOLD, MAX_SEARCH_THRESHOLD))
+        }
+    })
+}
+
 fn normalize_config(mut config: AetherConfig) -> AetherConfig {
     config.general.log_level = normalize_with_default(
         std::mem::take(&mut config.general.log_level),
@@ -796,6 +952,30 @@ fn normalize_config(mut config: AetherConfig) -> AetherConfig {
     if config.search.rerank_window == 0 {
         config.search.rerank_window = default_rerank_window();
     }
+    config.search.thresholds.default = normalize_threshold_value(
+        config.search.thresholds.default,
+        default_search_threshold_default(),
+    );
+    config.search.thresholds.rust = normalize_threshold_value(
+        config.search.thresholds.rust,
+        default_search_threshold_rust(),
+    );
+    config.search.thresholds.typescript = normalize_threshold_value(
+        config.search.thresholds.typescript,
+        default_search_threshold_typescript(),
+    );
+    config.search.thresholds.python = normalize_threshold_value(
+        config.search.thresholds.python,
+        default_search_threshold_python(),
+    );
+    config.search.calibrated_thresholds.default =
+        normalize_optional_threshold(config.search.calibrated_thresholds.default.take());
+    config.search.calibrated_thresholds.rust =
+        normalize_optional_threshold(config.search.calibrated_thresholds.rust.take());
+    config.search.calibrated_thresholds.typescript =
+        normalize_optional_threshold(config.search.calibrated_thresholds.typescript.take());
+    config.search.calibrated_thresholds.python =
+        normalize_optional_threshold(config.search.calibrated_thresholds.python.take());
     config.verify.commands = normalize_commands(std::mem::take(&mut config.verify.commands));
     config.verify.container.runtime = normalize_with_default(
         std::mem::take(&mut config.verify.container.runtime),
@@ -870,6 +1050,20 @@ mod tests {
         assert_eq!(config.search.reranker, SearchRerankerKind::None);
         assert_eq!(config.search.rerank_window, 50);
         assert_eq!(
+            config.search.thresholds.default,
+            DEFAULT_SEARCH_THRESHOLD_DEFAULT
+        );
+        assert_eq!(config.search.thresholds.rust, DEFAULT_SEARCH_THRESHOLD_RUST);
+        assert_eq!(
+            config.search.thresholds.typescript,
+            DEFAULT_SEARCH_THRESHOLD_TYPESCRIPT
+        );
+        assert_eq!(
+            config.search.thresholds.python,
+            DEFAULT_SEARCH_THRESHOLD_PYTHON
+        );
+        assert!(config.search.calibrated_thresholds.is_empty());
+        assert_eq!(
             config.providers.cohere.api_key_env,
             DEFAULT_COHERE_API_KEY_ENV
         );
@@ -931,6 +1125,12 @@ mod tests {
         assert!(content.contains("[search]"));
         assert!(content.contains("reranker = \"none\""));
         assert!(content.contains("rerank_window = 50"));
+        assert!(content.contains("[search.thresholds]"));
+        assert!(content.contains("default = "));
+        assert!(content.contains("rust = "));
+        assert!(content.contains("typescript = "));
+        assert!(content.contains("python = "));
+        assert!(!content.contains("[search.calibrated_thresholds]"));
         assert!(content.contains("[providers.cohere]"));
         assert!(content.contains("api_key_env = \"COHERE_API_KEY\""));
         assert!(content.contains("[verify]"));
@@ -1047,6 +1247,19 @@ fallback_to_host_on_unavailable = true
         );
         assert_eq!(config.search.reranker, SearchRerankerKind::Cohere);
         assert_eq!(config.search.rerank_window, 50);
+        assert_eq!(
+            config.search.thresholds.default,
+            DEFAULT_SEARCH_THRESHOLD_DEFAULT
+        );
+        assert_eq!(config.search.thresholds.rust, DEFAULT_SEARCH_THRESHOLD_RUST);
+        assert_eq!(
+            config.search.thresholds.typescript,
+            DEFAULT_SEARCH_THRESHOLD_TYPESCRIPT
+        );
+        assert_eq!(
+            config.search.thresholds.python,
+            DEFAULT_SEARCH_THRESHOLD_PYTHON
+        );
         assert_eq!(
             config.search.candle.model_dir.as_deref(),
             Some(".aether/models")
@@ -1171,6 +1384,19 @@ fallback_to_host_on_unavailable = true
         );
         assert_eq!(config.search.reranker, SearchRerankerKind::None);
         assert_eq!(config.search.rerank_window, 50);
+        assert_eq!(
+            config.search.thresholds.default,
+            DEFAULT_SEARCH_THRESHOLD_DEFAULT
+        );
+        assert_eq!(config.search.thresholds.rust, DEFAULT_SEARCH_THRESHOLD_RUST);
+        assert_eq!(
+            config.search.thresholds.typescript,
+            DEFAULT_SEARCH_THRESHOLD_TYPESCRIPT
+        );
+        assert_eq!(
+            config.search.thresholds.python,
+            DEFAULT_SEARCH_THRESHOLD_PYTHON
+        );
         assert_eq!(
             config.providers.cohere.api_key_env,
             DEFAULT_COHERE_API_KEY_ENV
@@ -1318,5 +1544,65 @@ reranker = "{raw_value}"
             let config = load_workspace_config(workspace).expect("load config");
             assert_eq!(config.search.reranker, expected);
         }
+    }
+
+    #[test]
+    fn load_workspace_config_clamps_manual_and_calibrated_thresholds() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(aether_dir(workspace)).expect("create .aether");
+
+        let raw = r#"
+[search]
+reranker = "none"
+rerank_window = 50
+
+[search.thresholds]
+default = 1.2
+rust = 0.2
+typescript = 0.66
+python = -10.0
+
+[search.calibrated_thresholds]
+default = 0.1
+rust = 0.97
+typescript = 0.67
+"#;
+        fs::write(config_path(workspace), raw).expect("write config");
+
+        let config = load_workspace_config(workspace).expect("load config");
+        assert_eq!(config.search.thresholds.default, MAX_SEARCH_THRESHOLD);
+        assert_eq!(config.search.thresholds.rust, MIN_SEARCH_THRESHOLD);
+        assert_eq!(config.search.thresholds.typescript, 0.66);
+        assert_eq!(config.search.thresholds.python, MIN_SEARCH_THRESHOLD);
+        assert_eq!(
+            config.search.calibrated_thresholds.default,
+            Some(MIN_SEARCH_THRESHOLD)
+        );
+        assert_eq!(
+            config.search.calibrated_thresholds.rust,
+            Some(MAX_SEARCH_THRESHOLD)
+        );
+        assert_eq!(config.search.calibrated_thresholds.typescript, Some(0.67));
+        assert_eq!(config.search.calibrated_thresholds.python, None);
+    }
+
+    #[test]
+    fn save_workspace_config_writes_search_threshold_sections() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+
+        let mut config = AetherConfig::default();
+        config.search.thresholds.rust = 0.73;
+        config.search.calibrated_thresholds.rust = Some(0.71);
+
+        save_workspace_config(workspace, &config).expect("save config");
+        let stored = load_workspace_config(workspace).expect("load config");
+        assert_eq!(stored.search.thresholds.rust, 0.73);
+        assert_eq!(stored.search.calibrated_thresholds.rust, Some(0.71));
+
+        let rendered = fs::read_to_string(config_path(workspace)).expect("read config");
+        assert!(rendered.contains("[search.thresholds]"));
+        assert!(rendered.contains("[search.calibrated_thresholds]"));
     }
 }

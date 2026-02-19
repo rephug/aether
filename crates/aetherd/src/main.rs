@@ -7,6 +7,7 @@ use aether_config::{
     ensure_workspace_config, validate_config,
 };
 use aether_infer::{download_candle_embedding_model, download_candle_reranker_model};
+use aetherd::calibrate::run_calibration_once;
 use aetherd::indexer::{IndexerConfig, run_indexing_loop, run_initial_index_once};
 use aetherd::search::{SearchMode, SearchOutputFormat, run_search_once};
 use aetherd::sir_pipeline::DEFAULT_SIR_CONCURRENCY;
@@ -87,6 +88,21 @@ struct Cli {
         help = "Run one-shot symbol search and exit"
     )]
     search: Option<String>,
+
+    #[arg(
+        long,
+        requires = "workspace",
+        conflicts_with_all = [
+            "search",
+            "lsp",
+            "index",
+            "index_once",
+            "verify",
+            "download_models"
+        ],
+        help = "Calibrate per-language semantic thresholds from indexed embeddings and exit"
+    )]
+    calibrate: bool,
 
     #[arg(
         long,
@@ -243,6 +259,10 @@ fn run(cli: Cli) -> Result<()> {
         }
 
         return Ok(());
+    }
+
+    if cli.calibrate {
+        return run_calibration_once(&workspace).context("failed to calibrate search thresholds");
     }
 
     if let Some(query) = cli.search.as_deref() {
