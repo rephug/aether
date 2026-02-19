@@ -326,7 +326,7 @@ provider = "mock"
 vector_backend = "sqlite"
 
 [verify]
-commands = ["cargo test --workspace", "cargo clippy --workspace -- -D warnings"]
+commands = ["cargo fmt --all --check", "cargo clippy --workspace -- -D warnings", "cargo test --workspace"]
 mode = "host"
 "#
             ),

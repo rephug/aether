@@ -154,8 +154,9 @@ mod tests {
         TemplateContext {
             languages: vec!["Rust".to_owned(), "Python".to_owned()],
             verify_commands: vec![
-                "cargo test --workspace".to_owned(),
+                "cargo fmt --all --check".to_owned(),
                 "cargo clippy --workspace -- -D warnings".to_owned(),
+                "cargo test --workspace".to_owned(),
             ],
             embeddings_enabled: true,
             inference_provider: "mock".to_owned(),
@@ -171,6 +172,8 @@ mod tests {
         assert!(rendered.contains("## Agent Schema Version: 7"));
         assert!(rendered.contains("Rust, Python"));
         assert!(rendered.contains("semantic search is enabled"));
+        assert!(rendered.contains("cargo fmt --all --check"));
+        assert!(rendered.contains("cargo clippy --workspace -- -D warnings"));
         assert!(rendered.contains("cargo test --workspace"));
         assert!(rendered.contains("aether_get_sir"));
     }
