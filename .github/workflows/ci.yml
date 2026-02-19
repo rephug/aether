@@ -12,70 +12,66 @@ jobs:
   fmt:
     name: fmt
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
-
       - name: Check formatting
         run: cargo fmt --all --check
 
   clippy:
     name: clippy
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install protobuf compiler
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-
-      - name: Export PROTOC
-        run: echo "PROTOC=$(which protoc)" >> "$GITHUB_ENV"
-
+          sudo apt-get install -y protobuf-compiler mold clang
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
       - name: Lint
+        env:
+          PROTOC: /usr/bin/protoc
         run: cargo clippy --workspace -- -D warnings
 
   test:
-    name: test
+    name: test-${{ matrix.crate }}
     runs-on: ubuntu-latest
-
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - aether-core
+          - aether-config
+          - aether-store
+          - aether-memory
+          - aether-analysis
+          - aether-mcp
+          - aetherd
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install protobuf compiler
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-
-      - name: Export PROTOC
-        run: echo "PROTOC=$(which protoc)" >> "$GITHUB_ENV"
-
+          sudo apt-get install -y protobuf-compiler mold clang
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.crate }}
       - name: Test
-        run: cargo test --workspace
+        env:
+          PROTOC: /usr/bin/protoc
+          CARGO_BUILD_JOBS: "2"
+        run: cargo test -p ${{ matrix.crate }}

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -66,6 +67,12 @@ pub trait VectorStore: Send + Sync {
         model: &str,
         limit: u32,
     ) -> Result<Vec<VectorSearchResult>, StoreError>;
+    async fn list_embeddings_for_symbols(
+        &self,
+        provider: &str,
+        model: &str,
+        symbol_ids: &[String],
+    ) -> Result<Vec<VectorRecord>, StoreError>;
     async fn upsert_project_note_embedding(
         &self,
         record: ProjectNoteVectorRecord,
@@ -145,6 +152,16 @@ impl VectorStore for SqliteVectorStore {
                 semantic_score: row.semantic_score,
             })
             .collect())
+    }
+
+    async fn list_embeddings_for_symbols(
+        &self,
+        provider: &str,
+        model: &str,
+        symbol_ids: &[String],
+    ) -> Result<Vec<VectorRecord>, StoreError> {
+        self.store()?
+            .list_symbol_embeddings_for_ids(provider, model, symbol_ids)
     }
 
     async fn upsert_project_note_embedding(
@@ -545,6 +562,91 @@ impl VectorStore for LanceVectorStore {
         });
         rows.truncate(limit);
         Ok(rows)
+    }
+
+    async fn list_embeddings_for_symbols(
+        &self,
+        provider: &str,
+        model: &str,
+        symbol_ids: &[String],
+    ) -> Result<Vec<VectorRecord>, StoreError> {
+        self.migrate_from_sqlite_if_needed().await?;
+
+        let provider = provider.trim();
+        let model = model.trim();
+        if provider.is_empty() || model.is_empty() || symbol_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let provider = sanitize_for_table_name(provider);
+        let model = sanitize_for_table_name(model);
+        let suffix = format!("_{provider}_{model}");
+        let symbol_set = symbol_ids
+            .iter()
+            .map(|item| item.trim().to_owned())
+            .filter(|item| !item.is_empty())
+            .collect::<HashSet<_>>();
+        if symbol_set.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let connection = self.connect().await?;
+        let mut records = Vec::new();
+        for table_name in connection
+            .table_names()
+            .execute()
+            .await
+            .map_err(map_lancedb_err)?
+            .into_iter()
+            .filter(|name| name.starts_with(VECTOR_TABLE_PREFIX) && name.ends_with(&suffix))
+        {
+            let Ok(table) = connection.open_table(&table_name).execute().await else {
+                continue;
+            };
+
+            let batches = table
+                .query()
+                .select(Select::columns(&[
+                    "symbol_id",
+                    "sir_hash",
+                    "provider",
+                    "model",
+                    "embedding",
+                    "updated_at",
+                ]))
+                .execute()
+                .await
+                .map_err(map_lancedb_err)?
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(map_lancedb_err)?;
+
+            for batch in batches {
+                for row in 0..batch.num_rows() {
+                    let symbol_id = string_at(&batch, "symbol_id", row)?;
+                    if !symbol_set.contains(symbol_id.as_str()) {
+                        continue;
+                    }
+
+                    let embedding = embedding_at(&batch, "embedding", row)?;
+                    if embedding.is_empty() {
+                        continue;
+                    }
+
+                    records.push(VectorRecord {
+                        symbol_id,
+                        sir_hash: string_at(&batch, "sir_hash", row)?,
+                        provider: string_at(&batch, "provider", row)?,
+                        model: string_at(&batch, "model", row)?,
+                        embedding,
+                        updated_at: int64_at(&batch, "updated_at", row)?,
+                    });
+                }
+            }
+        }
+
+        records.sort_by(|left, right| left.symbol_id.cmp(&right.symbol_id));
+        Ok(records)
     }
 
     async fn upsert_project_note_embedding(
@@ -987,6 +1089,42 @@ fn int64_at(batch: &RecordBatch, column_name: &str, row: usize) -> Result<i64, S
         )));
     }
     Ok(array.value(row))
+}
+
+fn embedding_at(
+    batch: &RecordBatch,
+    column_name: &str,
+    row: usize,
+) -> Result<Vec<f32>, StoreError> {
+    let array = batch
+        .column_by_name(column_name)
+        .ok_or_else(|| StoreError::LanceDb(format!("missing column {column_name}")))?
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .ok_or_else(|| StoreError::LanceDb(format!("column {column_name} is not FixedSizeList")))?;
+
+    if array.is_null(row) {
+        return Ok(Vec::new());
+    }
+
+    let values = array.value(row);
+    let values = values
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .ok_or_else(|| {
+            StoreError::LanceDb(format!("column {column_name} values are not Float32"))
+        })?;
+
+    let mut embedding = Vec::with_capacity(values.len());
+    for idx in 0..values.len() {
+        if values.is_null(idx) {
+            return Err(StoreError::LanceDb(format!(
+                "column {column_name} has null embedding value"
+            )));
+        }
+        embedding.push(values.value(idx));
+    }
+    Ok(embedding)
 }
 
 fn escape_sql_string(value: &str) -> String {

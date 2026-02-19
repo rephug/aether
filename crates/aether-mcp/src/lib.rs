@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aether_analysis::{BlastRadiusRequest, CouplingAnalyzer, RiskLevel as CouplingRiskLevel};
 use aether_config::{SearchRerankerKind, VerifyMode, load_workspace_config};
 pub use aether_core::SearchMode;
 use aether_core::{
@@ -64,6 +65,8 @@ pub enum AetherMcpError {
     Json(#[from] serde_json::Error),
     #[error("memory error: {0}")]
     Memory(#[from] aether_memory::MemoryError),
+    #[error("analysis error: {0}")]
+    Analysis(#[from] aether_analysis::AnalysisError),
     #[error("sir validation error: {0}")]
     Sir(#[from] SirError),
     #[error("{0}")]
@@ -215,6 +218,78 @@ pub struct AetherRecallResponse {
     pub fallback_reason: Option<String>,
     pub result_count: u32,
     pub notes: Vec<AetherRecallNote>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AetherCouplingRiskLevel {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl From<AetherCouplingRiskLevel> for CouplingRiskLevel {
+    fn from(value: AetherCouplingRiskLevel) -> Self {
+        match value {
+            AetherCouplingRiskLevel::Low => CouplingRiskLevel::Low,
+            AetherCouplingRiskLevel::Medium => CouplingRiskLevel::Medium,
+            AetherCouplingRiskLevel::High => CouplingRiskLevel::High,
+            AetherCouplingRiskLevel::Critical => CouplingRiskLevel::Critical,
+        }
+    }
+}
+
+impl From<CouplingRiskLevel> for AetherCouplingRiskLevel {
+    fn from(value: CouplingRiskLevel) -> Self {
+        match value {
+            CouplingRiskLevel::Low => AetherCouplingRiskLevel::Low,
+            CouplingRiskLevel::Medium => AetherCouplingRiskLevel::Medium,
+            CouplingRiskLevel::High => AetherCouplingRiskLevel::High,
+            CouplingRiskLevel::Critical => AetherCouplingRiskLevel::Critical,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherBlastRadiusRequest {
+    pub file: String,
+    pub min_risk: Option<AetherCouplingRiskLevel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherBlastRadiusMiningState {
+    pub commits_scanned: i64,
+    pub last_mined_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherBlastRadiusSignals {
+    pub temporal: f32,
+    pub static_signal: f32,
+    pub semantic: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherBlastRadiusCoupledFile {
+    pub file: String,
+    pub risk_level: AetherCouplingRiskLevel,
+    pub fused_score: f32,
+    pub coupling_type: String,
+    pub signals: AetherBlastRadiusSignals,
+    pub co_change_count: i64,
+    pub total_commits: i64,
+    pub last_co_change: String,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherBlastRadiusResponse {
+    pub schema_version: String,
+    pub target_file: String,
+    pub mining_state: Option<AetherBlastRadiusMiningState>,
+    pub coupled_files: Vec<AetherBlastRadiusCoupledFile>,
+    pub test_guards: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1037,6 +1112,73 @@ impl AetherMcpServer {
             fallback_reason: result.fallback_reason,
             result_count,
             notes,
+        })
+    }
+
+    pub fn aether_blast_radius_logic(
+        &self,
+        request: AetherBlastRadiusRequest,
+    ) -> Result<AetherBlastRadiusResponse, AetherMcpError> {
+        let target_file = normalize_path(request.file.trim());
+        if target_file.is_empty() {
+            return Ok(AetherBlastRadiusResponse {
+                schema_version: MEMORY_SCHEMA_VERSION.to_owned(),
+                target_file,
+                mining_state: None,
+                coupled_files: Vec::new(),
+                test_guards: Vec::new(),
+            });
+        }
+
+        let analyzer = CouplingAnalyzer::new(&self.workspace)?;
+        let blast = analyzer.blast_radius(BlastRadiusRequest {
+            file_path: target_file.clone(),
+            min_risk: request
+                .min_risk
+                .unwrap_or(AetherCouplingRiskLevel::Medium)
+                .into(),
+            auto_mine: true,
+        })?;
+
+        let mining_state = blast
+            .mining_state
+            .map(|state| AetherBlastRadiusMiningState {
+                commits_scanned: state.commits_scanned,
+                last_mined_at: state.last_mined_at,
+            });
+
+        let store = SqliteStore::open(&self.workspace)?;
+        let mut coupled_files = Vec::with_capacity(blast.coupled_files.len());
+        for entry in blast.coupled_files {
+            let notes = store
+                .list_project_notes_for_file_ref(entry.file.as_str(), 5)?
+                .into_iter()
+                .map(|note| note.content)
+                .collect::<Vec<_>>();
+
+            coupled_files.push(AetherBlastRadiusCoupledFile {
+                file: entry.file,
+                risk_level: entry.risk_level.into(),
+                fused_score: entry.fused_score,
+                coupling_type: entry.coupling_type.as_str().to_owned(),
+                signals: AetherBlastRadiusSignals {
+                    temporal: entry.signals.temporal,
+                    static_signal: entry.signals.static_signal,
+                    semantic: entry.signals.semantic,
+                },
+                co_change_count: entry.co_change_count,
+                total_commits: entry.total_commits,
+                last_co_change: entry.last_co_change_commit,
+                notes,
+            });
+        }
+
+        Ok(AetherBlastRadiusResponse {
+            schema_version: MEMORY_SCHEMA_VERSION.to_owned(),
+            target_file: blast.target_file,
+            mining_state,
+            coupled_files,
+            test_guards: Vec::new(),
         })
     }
 
@@ -2088,6 +2230,20 @@ impl AetherMcpServer {
         self.verbose_log("MCP tool called: aether_recall");
         self.aether_recall_logic(request)
             .await
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_blast_radius",
+        description = "Analyze coupled files and risk levels for blast-radius impact"
+    )]
+    pub async fn aether_blast_radius(
+        &self,
+        Parameters(request): Parameters<AetherBlastRadiusRequest>,
+    ) -> Result<Json<AetherBlastRadiusResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_blast_radius");
+        self.aether_blast_radius_logic(request)
             .map(Json)
             .map_err(to_mcp_error)
     }

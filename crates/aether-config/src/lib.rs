@@ -214,6 +214,8 @@ pub struct AetherConfig {
     pub providers: ProvidersConfig,
     #[serde(default)]
     pub verify: VerifyConfig,
+    #[serde(default)]
+    pub coupling: CouplingConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -573,6 +575,32 @@ impl Default for VerifyMicrovmConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CouplingConfig {
+    #[serde(default = "default_coupling_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_coupling_commit_window")]
+    pub commit_window: u32,
+    #[serde(default = "default_coupling_min_co_change_count")]
+    pub min_co_change_count: u32,
+    #[serde(default = "default_coupling_exclude_patterns")]
+    pub exclude_patterns: Vec<String>,
+    #[serde(default = "default_coupling_bulk_commit_threshold")]
+    pub bulk_commit_threshold: u32,
+}
+
+impl Default for CouplingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_coupling_enabled(),
+            commit_window: default_coupling_commit_window(),
+            min_co_change_count: default_coupling_min_co_change_count(),
+            exclude_patterns: default_coupling_exclude_patterns(),
+            bulk_commit_threshold: default_coupling_bulk_commit_threshold(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigWarning {
     pub code: &'static str,
@@ -883,6 +911,30 @@ fn default_verify_microvm_memory_mib() -> u32 {
     DEFAULT_VERIFY_MICROVM_MEMORY_MIB
 }
 
+fn default_coupling_enabled() -> bool {
+    true
+}
+
+fn default_coupling_commit_window() -> u32 {
+    500
+}
+
+fn default_coupling_min_co_change_count() -> u32 {
+    3
+}
+
+fn default_coupling_exclude_patterns() -> Vec<String> {
+    vec![
+        "*.lock".to_owned(),
+        "*.generated.*".to_owned(),
+        ".gitignore".to_owned(),
+    ]
+}
+
+fn default_coupling_bulk_commit_threshold() -> u32 {
+    30
+}
+
 fn normalize_optional(input: Option<String>) -> Option<String> {
     input
         .map(|value| value.trim().to_owned())
@@ -941,6 +993,20 @@ fn normalize_optional_threshold(value: Option<f32>) -> Option<f32> {
             Some(inner.clamp(MIN_SEARCH_THRESHOLD, MAX_SEARCH_THRESHOLD))
         }
     })
+}
+
+fn normalize_patterns(patterns: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for raw in patterns {
+        let value = raw.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if !normalized.iter().any(|existing| existing == value) {
+            normalized.push(value.to_owned());
+        }
+    }
+    normalized
 }
 
 fn normalize_config(mut config: AetherConfig) -> AetherConfig {
@@ -1012,6 +1078,20 @@ fn normalize_config(mut config: AetherConfig) -> AetherConfig {
     }
     if config.verify.microvm.memory_mib == 0 {
         config.verify.microvm.memory_mib = default_verify_microvm_memory_mib();
+    }
+    if config.coupling.commit_window == 0 {
+        config.coupling.commit_window = default_coupling_commit_window();
+    }
+    if config.coupling.min_co_change_count == 0 {
+        config.coupling.min_co_change_count = default_coupling_min_co_change_count();
+    }
+    if config.coupling.bulk_commit_threshold == 0 {
+        config.coupling.bulk_commit_threshold = default_coupling_bulk_commit_threshold();
+    }
+    config.coupling.exclude_patterns =
+        normalize_patterns(std::mem::take(&mut config.coupling.exclude_patterns));
+    if config.coupling.exclude_patterns.is_empty() {
+        config.coupling.exclude_patterns = default_coupling_exclude_patterns();
     }
 
     let api_key_env = config.inference.api_key_env.trim();
@@ -1115,6 +1195,18 @@ mod tests {
         );
         assert!(!config.verify.microvm.fallback_to_container_on_unavailable);
         assert!(!config.verify.microvm.fallback_to_host_on_unavailable);
+        assert!(config.coupling.enabled);
+        assert_eq!(config.coupling.commit_window, 500);
+        assert_eq!(config.coupling.min_co_change_count, 3);
+        assert_eq!(config.coupling.bulk_commit_threshold, 30);
+        assert_eq!(
+            config.coupling.exclude_patterns,
+            vec![
+                "*.lock".to_owned(),
+                "*.generated.*".to_owned(),
+                ".gitignore".to_owned()
+            ]
+        );
         assert!(config_path(workspace).exists());
 
         let content = fs::read_to_string(config_path(workspace)).expect("read config file");
@@ -1152,6 +1244,11 @@ mod tests {
         assert!(content.contains("workdir = \"/workspace\""));
         assert!(content.contains("vcpu_count = 1"));
         assert!(content.contains("memory_mib = 1024"));
+        assert!(content.contains("[coupling]"));
+        assert!(content.contains("enabled = true"));
+        assert!(content.contains("commit_window = 500"));
+        assert!(content.contains("min_co_change_count = 3"));
+        assert!(content.contains("bulk_commit_threshold = 30"));
         assert!(content.contains("\"cargo fmt --all --check\""));
         assert!(content.contains("\"cargo clippy --workspace -- -D warnings\""));
         assert!(content.contains("\"cargo test --workspace\""));
@@ -1299,6 +1396,10 @@ fallback_to_host_on_unavailable = true
         assert_eq!(config.verify.microvm.memory_mib, 1024);
         assert!(config.verify.microvm.fallback_to_container_on_unavailable);
         assert!(config.verify.microvm.fallback_to_host_on_unavailable);
+        assert!(config.coupling.enabled);
+        assert_eq!(config.coupling.commit_window, 500);
+        assert_eq!(config.coupling.min_co_change_count, 3);
+        assert_eq!(config.coupling.bulk_commit_threshold, 30);
     }
 
     #[test]
@@ -1414,6 +1515,10 @@ fallback_to_host_on_unavailable = true
         assert!(config.verify.container.fallback_to_host_on_unavailable);
         assert!(config.verify.microvm.fallback_to_container_on_unavailable);
         assert!(config.verify.microvm.fallback_to_host_on_unavailable);
+        assert!(config.coupling.enabled);
+        assert_eq!(config.coupling.commit_window, 500);
+        assert_eq!(config.coupling.min_co_change_count, 3);
+        assert_eq!(config.coupling.bulk_commit_threshold, 30);
     }
 
     #[test]
@@ -1444,6 +1549,7 @@ fallback_to_host_on_unavailable = true
                 commands: vec!["cargo test".to_owned()],
                 ..VerifyConfig::default()
             },
+            coupling: CouplingConfig::default(),
         };
 
         let warnings = validate_config(&config);

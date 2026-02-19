@@ -1,5 +1,5 @@
 [package]
-name = "aether-store"
+name = "aether-analysis"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,18 +8,14 @@ authors.workspace = true
 [dependencies]
 aether-config = { path = "../aether-config" }
 aether-core = { path = "../aether-core" }
-arrow-array = "56.2"
-arrow-schema = "56.2"
-async-trait.workspace = true
-cozo.workspace = true
-futures = "0.3"
-lancedb.workspace = true
-lzma-sys.workspace = true
-rusqlite.workspace = true
+aether-infer = { path = "../aether-infer" }
+aether-memory = { path = "../aether-memory" }
+aether-store = { path = "../aether-store" }
+gix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tracing.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [dev-dependencies]
 tempfile.workspace = true

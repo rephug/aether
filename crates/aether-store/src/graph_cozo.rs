@@ -4,7 +4,7 @@ use std::path::Path;
 
 use cozo::{DataValue, DbInstance, NamedRows, ScriptMutability};
 
-use super::{GraphStore, ResolvedEdge, StoreError, SymbolRecord};
+use super::{CouplingEdgeRecord, GraphStore, ResolvedEdge, StoreError, SymbolRecord};
 
 pub struct CozoGraphStore {
     db: DbInstance,
@@ -47,6 +47,25 @@ impl CozoGraphStore {
                 target_id: String,
                 edge_kind: String =>
                 file_path: String
+            }
+            "#,
+        )?;
+        self.ensure_relation(
+            r#"
+            :create co_change_edges {
+                file_a: String,
+                file_b: String =>
+                co_change_count: Int,
+                total_commits_a: Int,
+                total_commits_b: Int,
+                git_coupling: Float,
+                static_signal: Float,
+                semantic_signal: Float,
+                fused_score: Float,
+                coupling_type: String,
+                last_co_change_commit: String,
+                last_co_change_at: Int,
+                mined_at: Int
             }
             "#,
         )?;
@@ -124,6 +143,424 @@ impl CozoGraphStore {
             .next()
             .filter(|name| !name.is_empty())
             .unwrap_or(qualified_name)
+    }
+
+    fn row_to_coupling_edge(row: &[DataValue]) -> Result<CouplingEdgeRecord, StoreError> {
+        if row.len() < 13 {
+            return Err(StoreError::Cozo(
+                "invalid co_change_edges row shape".to_owned(),
+            ));
+        }
+
+        let as_f32 = |index: usize, label: &str| -> Result<f32, StoreError> {
+            let value = &row[index];
+            if let Some(value) = value.get_float() {
+                return Ok(value as f32);
+            }
+            if let Some(value) = value.get_int() {
+                return Ok(value as f32);
+            }
+            Err(StoreError::Cozo(format!("invalid {label} value")))
+        };
+
+        Ok(CouplingEdgeRecord {
+            file_a: row[0]
+                .get_str()
+                .ok_or_else(|| StoreError::Cozo("invalid file_a value".to_owned()))?
+                .to_owned(),
+            file_b: row[1]
+                .get_str()
+                .ok_or_else(|| StoreError::Cozo("invalid file_b value".to_owned()))?
+                .to_owned(),
+            co_change_count: row[2]
+                .get_int()
+                .ok_or_else(|| StoreError::Cozo("invalid co_change_count value".to_owned()))?,
+            total_commits_a: row[3]
+                .get_int()
+                .ok_or_else(|| StoreError::Cozo("invalid total_commits_a value".to_owned()))?,
+            total_commits_b: row[4]
+                .get_int()
+                .ok_or_else(|| StoreError::Cozo("invalid total_commits_b value".to_owned()))?,
+            git_coupling: as_f32(5, "git_coupling")?,
+            static_signal: as_f32(6, "static_signal")?,
+            semantic_signal: as_f32(7, "semantic_signal")?,
+            fused_score: as_f32(8, "fused_score")?,
+            coupling_type: row[9]
+                .get_str()
+                .ok_or_else(|| StoreError::Cozo("invalid coupling_type value".to_owned()))?
+                .to_owned(),
+            last_co_change_commit: row[10]
+                .get_str()
+                .ok_or_else(|| StoreError::Cozo("invalid last_co_change_commit value".to_owned()))?
+                .to_owned(),
+            last_co_change_at: row[11]
+                .get_int()
+                .ok_or_else(|| StoreError::Cozo("invalid last_co_change_at value".to_owned()))?,
+            mined_at: row[12]
+                .get_int()
+                .ok_or_else(|| StoreError::Cozo("invalid mined_at value".to_owned()))?,
+        })
+    }
+
+    pub fn has_dependency_between_files(
+        &self,
+        file_a: &str,
+        file_b: &str,
+    ) -> Result<bool, StoreError> {
+        let file_a = file_a.trim();
+        let file_b = file_b.trim();
+        if file_a.is_empty() || file_b.is_empty() {
+            return Ok(false);
+        }
+
+        let mut params = BTreeMap::new();
+        params.insert("file_a".to_owned(), DataValue::from(file_a.to_owned()));
+        params.insert("file_b".to_owned(), DataValue::from(file_b.to_owned()));
+
+        let rows = self.run_script(
+            r#"
+            ?[source_id] :=
+                *edges{source_id, target_id},
+                *symbols{symbol_id: source_id, file_path: $file_a},
+                *symbols{symbol_id: target_id, file_path: $file_b}
+            ?[source_id] :=
+                *edges{source_id, target_id},
+                *symbols{symbol_id: source_id, file_path: $file_b},
+                *symbols{symbol_id: target_id, file_path: $file_a}
+
+            :limit 1
+            "#,
+            params,
+            ScriptMutability::Immutable,
+        )?;
+
+        Ok(!rows.rows.is_empty())
+    }
+
+    pub fn upsert_co_change_edges(&self, records: &[CouplingEdgeRecord]) -> Result<(), StoreError> {
+        for record in records {
+            let mut params = BTreeMap::new();
+            params.insert("file_a".to_owned(), DataValue::from(record.file_a.clone()));
+            params.insert("file_b".to_owned(), DataValue::from(record.file_b.clone()));
+            params.insert(
+                "co_change_count".to_owned(),
+                DataValue::from(record.co_change_count),
+            );
+            params.insert(
+                "total_commits_a".to_owned(),
+                DataValue::from(record.total_commits_a),
+            );
+            params.insert(
+                "total_commits_b".to_owned(),
+                DataValue::from(record.total_commits_b),
+            );
+            params.insert(
+                "git_coupling".to_owned(),
+                DataValue::from(record.git_coupling as f64),
+            );
+            params.insert(
+                "static_signal".to_owned(),
+                DataValue::from(record.static_signal as f64),
+            );
+            params.insert(
+                "semantic_signal".to_owned(),
+                DataValue::from(record.semantic_signal as f64),
+            );
+            params.insert(
+                "fused_score".to_owned(),
+                DataValue::from(record.fused_score as f64),
+            );
+            params.insert(
+                "coupling_type".to_owned(),
+                DataValue::from(record.coupling_type.clone()),
+            );
+            params.insert(
+                "last_co_change_commit".to_owned(),
+                DataValue::from(record.last_co_change_commit.clone()),
+            );
+            params.insert(
+                "last_co_change_at".to_owned(),
+                DataValue::from(record.last_co_change_at),
+            );
+            params.insert("mined_at".to_owned(), DataValue::from(record.mined_at));
+
+            self.run_script(
+                r#"
+                ?[
+                    file_a,
+                    file_b,
+                    co_change_count,
+                    total_commits_a,
+                    total_commits_b,
+                    git_coupling,
+                    static_signal,
+                    semantic_signal,
+                    fused_score,
+                    coupling_type,
+                    last_co_change_commit,
+                    last_co_change_at,
+                    mined_at
+                ] <- [[
+                    $file_a,
+                    $file_b,
+                    $co_change_count,
+                    $total_commits_a,
+                    $total_commits_b,
+                    $git_coupling,
+                    $static_signal,
+                    $semantic_signal,
+                    $fused_score,
+                    $coupling_type,
+                    $last_co_change_commit,
+                    $last_co_change_at,
+                    $mined_at
+                ]]
+                :put co_change_edges {
+                    file_a,
+                    file_b =>
+                    co_change_count,
+                    total_commits_a,
+                    total_commits_b,
+                    git_coupling,
+                    static_signal,
+                    semantic_signal,
+                    fused_score,
+                    coupling_type,
+                    last_co_change_commit,
+                    last_co_change_at,
+                    mined_at
+                }
+                "#,
+                params,
+                ScriptMutability::Mutable,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    pub fn get_co_change_edge(
+        &self,
+        file_a: &str,
+        file_b: &str,
+    ) -> Result<Option<CouplingEdgeRecord>, StoreError> {
+        let file_a = file_a.trim();
+        let file_b = file_b.trim();
+        if file_a.is_empty() || file_b.is_empty() {
+            return Ok(None);
+        }
+
+        let mut params = BTreeMap::new();
+        params.insert("file_a".to_owned(), DataValue::from(file_a.to_owned()));
+        params.insert("file_b".to_owned(), DataValue::from(file_b.to_owned()));
+        let rows = self.run_script(
+            r#"
+            ?[
+                file_a,
+                file_b,
+                co_change_count,
+                total_commits_a,
+                total_commits_b,
+                git_coupling,
+                static_signal,
+                semantic_signal,
+                fused_score,
+                coupling_type,
+                last_co_change_commit,
+                last_co_change_at,
+                mined_at
+            ] :=
+                *co_change_edges{
+                    file_a,
+                    file_b,
+                    co_change_count,
+                    total_commits_a,
+                    total_commits_b,
+                    git_coupling,
+                    static_signal,
+                    semantic_signal,
+                    fused_score,
+                    coupling_type,
+                    last_co_change_commit,
+                    last_co_change_at,
+                    mined_at
+                },
+                file_a = $file_a,
+                file_b = $file_b
+            :limit 1
+            "#,
+            params,
+            ScriptMutability::Immutable,
+        )?;
+
+        rows.rows
+            .first()
+            .map(|row| Self::row_to_coupling_edge(row.as_slice()))
+            .transpose()
+    }
+
+    pub fn list_co_change_edges_for_file(
+        &self,
+        file_path: &str,
+        min_fused_score: f32,
+    ) -> Result<Vec<CouplingEdgeRecord>, StoreError> {
+        let file_path = file_path.trim();
+        if file_path.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut params = BTreeMap::new();
+        params.insert(
+            "file_path".to_owned(),
+            DataValue::from(file_path.to_owned()),
+        );
+        params.insert(
+            "min_fused_score".to_owned(),
+            DataValue::from(min_fused_score as f64),
+        );
+        let rows = self.run_script(
+            r#"
+            ?[
+                file_a,
+                file_b,
+                co_change_count,
+                total_commits_a,
+                total_commits_b,
+                git_coupling,
+                static_signal,
+                semantic_signal,
+                fused_score,
+                coupling_type,
+                last_co_change_commit,
+                last_co_change_at,
+                mined_at
+            ] :=
+                *co_change_edges{
+                    file_a,
+                    file_b,
+                    co_change_count,
+                    total_commits_a,
+                    total_commits_b,
+                    git_coupling,
+                    static_signal,
+                    semantic_signal,
+                    fused_score,
+                    coupling_type,
+                    last_co_change_commit,
+                    last_co_change_at,
+                    mined_at
+                },
+                file_a = $file_path,
+                fused_score >= $min_fused_score
+            ?[
+                file_a,
+                file_b,
+                co_change_count,
+                total_commits_a,
+                total_commits_b,
+                git_coupling,
+                static_signal,
+                semantic_signal,
+                fused_score,
+                coupling_type,
+                last_co_change_commit,
+                last_co_change_at,
+                mined_at
+            ] :=
+                *co_change_edges{
+                    file_a,
+                    file_b,
+                    co_change_count,
+                    total_commits_a,
+                    total_commits_b,
+                    git_coupling,
+                    static_signal,
+                    semantic_signal,
+                    fused_score,
+                    coupling_type,
+                    last_co_change_commit,
+                    last_co_change_at,
+                    mined_at
+                },
+                file_b = $file_path,
+                fused_score >= $min_fused_score
+            "#,
+            params,
+            ScriptMutability::Immutable,
+        )?;
+
+        let mut edges = rows
+            .rows
+            .iter()
+            .map(|row| Self::row_to_coupling_edge(row.as_slice()))
+            .collect::<Result<Vec<_>, _>>()?;
+        edges.sort_by(|left, right| {
+            right
+                .fused_score
+                .partial_cmp(&left.fused_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.file_a.cmp(&right.file_a))
+                .then_with(|| left.file_b.cmp(&right.file_b))
+        });
+        Ok(edges)
+    }
+
+    pub fn list_top_co_change_edges(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<CouplingEdgeRecord>, StoreError> {
+        let rows = self.run_script(
+            r#"
+            ?[
+                file_a,
+                file_b,
+                co_change_count,
+                total_commits_a,
+                total_commits_b,
+                git_coupling,
+                static_signal,
+                semantic_signal,
+                fused_score,
+                coupling_type,
+                last_co_change_commit,
+                last_co_change_at,
+                mined_at
+            ] :=
+                *co_change_edges{
+                    file_a,
+                    file_b,
+                    co_change_count,
+                    total_commits_a,
+                    total_commits_b,
+                    git_coupling,
+                    static_signal,
+                    semantic_signal,
+                    fused_score,
+                    coupling_type,
+                    last_co_change_commit,
+                    last_co_change_at,
+                    mined_at
+                }
+            "#,
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+
+        let mut edges = rows
+            .rows
+            .iter()
+            .map(|row| Self::row_to_coupling_edge(row.as_slice()))
+            .collect::<Result<Vec<_>, _>>()?;
+        edges.sort_by(|left, right| {
+            right
+                .fused_score
+                .partial_cmp(&left.fused_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.file_a.cmp(&right.file_a))
+                .then_with(|| left.file_b.cmp(&right.file_b))
+        });
+        edges.truncate(limit.clamp(1, 200) as usize);
+        Ok(edges)
     }
 }
 
@@ -520,5 +957,47 @@ mod tests {
             .get_dependencies(&alpha.id)
             .expect("query dependencies after unresolved sync");
         assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn cozo_graph_stores_and_queries_co_change_edges() {
+        let temp = tempdir().expect("tempdir");
+        let graph = CozoGraphStore::open(temp.path()).expect("open cozo graph store");
+
+        graph
+            .upsert_co_change_edges(&[CouplingEdgeRecord {
+                file_a: "src/a.rs".to_owned(),
+                file_b: "src/b.rs".to_owned(),
+                co_change_count: 4,
+                total_commits_a: 6,
+                total_commits_b: 7,
+                git_coupling: 4.0 / 7.0,
+                static_signal: 1.0,
+                semantic_signal: 0.7,
+                fused_score: 0.5,
+                coupling_type: "multi".to_owned(),
+                last_co_change_commit: "abc123".to_owned(),
+                last_co_change_at: 1_700_000_000,
+                mined_at: 1_700_000_100,
+            }])
+            .expect("upsert co change edge");
+
+        let top = graph
+            .list_top_co_change_edges(10)
+            .expect("list top co change edges");
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].file_a, "src/a.rs");
+        assert_eq!(top[0].file_b, "src/b.rs");
+
+        let direct = graph
+            .get_co_change_edge("src/a.rs", "src/b.rs")
+            .expect("get direct co change edge");
+        assert!(direct.is_some());
+
+        let neighbors = graph
+            .list_co_change_edges_for_file("src/a.rs", 0.2)
+            .expect("list neighbors");
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].coupling_type, "multi");
     }
 }
