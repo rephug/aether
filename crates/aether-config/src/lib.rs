@@ -10,6 +10,7 @@ pub const DEFAULT_GEMINI_API_KEY_ENV: &str = "GEMINI_API_KEY";
 pub const DEFAULT_QWEN_ENDPOINT: &str = "http://127.0.0.1:11434";
 pub const DEFAULT_QWEN_MODEL: &str = "qwen3-embeddings-0.6B";
 pub const DEFAULT_QWEN_EMBEDDING_ENDPOINT: &str = "http://127.0.0.1:11434/api/embeddings";
+pub const DEFAULT_COHERE_API_KEY_ENV: &str = "COHERE_API_KEY";
 pub const DEFAULT_VERIFY_CONTAINER_RUNTIME: &str = "docker";
 pub const DEFAULT_VERIFY_CONTAINER_IMAGE: &str = "rust:1-bookworm";
 pub const DEFAULT_VERIFY_CONTAINER_WORKDIR: &str = "/workspace";
@@ -92,6 +93,40 @@ impl std::str::FromStr for EmbeddingProviderKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum SearchRerankerKind {
+    #[default]
+    None,
+    Candle,
+    Cohere,
+}
+
+impl SearchRerankerKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Candle => "candle",
+            Self::Cohere => "cohere",
+        }
+    }
+}
+
+impl std::str::FromStr for SearchRerankerKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "none" => Ok(Self::None),
+            "candle" => Ok(Self::Candle),
+            "cohere" => Ok(Self::Cohere),
+            other => Err(format!(
+                "invalid search reranker '{other}', expected one of: none, candle, cohere"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum EmbeddingVectorBackend {
     #[default]
     Lancedb,
@@ -162,6 +197,10 @@ pub struct AetherConfig {
     pub storage: StorageConfig,
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
+    #[serde(default)]
+    pub search: SearchConfig,
+    #[serde(default)]
+    pub providers: ProvidersConfig,
     #[serde(default)]
     pub verify: VerifyConfig,
 }
@@ -257,6 +296,58 @@ impl Default for EmbeddingsConfig {
             model: None,
             endpoint: None,
             candle: CandleEmbeddingsConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchConfig {
+    #[serde(default)]
+    pub reranker: SearchRerankerKind,
+    #[serde(default = "default_rerank_window")]
+    pub rerank_window: u32,
+    #[serde(default, skip_serializing_if = "SearchCandleConfig::is_empty")]
+    pub candle: SearchCandleConfig,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            reranker: SearchRerankerKind::None,
+            rerank_window: default_rerank_window(),
+            candle: SearchCandleConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SearchCandleConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_dir: Option<String>,
+}
+
+impl SearchCandleConfig {
+    fn is_empty(&self) -> bool {
+        self.model_dir.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ProvidersConfig {
+    #[serde(default)]
+    pub cohere: CohereProviderConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CohereProviderConfig {
+    #[serde(default = "default_cohere_api_key_env")]
+    pub api_key_env: String,
+}
+
+impl Default for CohereProviderConfig {
+    fn default() -> Self {
+        Self {
+            api_key_env: default_cohere_api_key_env(),
         }
     }
 }
@@ -486,6 +577,32 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
         });
     }
 
+    if matches!(config.search.reranker, SearchRerankerKind::None)
+        && config.search.candle.model_dir.is_some()
+    {
+        warnings.push(ConfigWarning {
+            code: "search_candle_model_dir_unused_for_none",
+            message: "search.reranker=none ignores search.candle.model_dir".to_owned(),
+        });
+    } else if matches!(config.search.reranker, SearchRerankerKind::Cohere)
+        && config.search.candle.model_dir.is_some()
+    {
+        warnings.push(ConfigWarning {
+            code: "search_candle_model_dir_unused_for_cohere",
+            message: "search.reranker=cohere ignores search.candle.model_dir".to_owned(),
+        });
+    }
+
+    if !matches!(config.search.reranker, SearchRerankerKind::Cohere)
+        && config.providers.cohere.api_key_env != DEFAULT_COHERE_API_KEY_ENV
+    {
+        warnings.push(ConfigWarning {
+            code: "providers_cohere_api_key_env_ignored",
+            message: "providers.cohere.api_key_env is ignored unless search.reranker=cohere"
+                .to_owned(),
+        });
+    }
+
     match config.inference.provider {
         InferenceProviderKind::Auto => {
             if config.inference.endpoint.is_some() {
@@ -589,6 +706,14 @@ fn default_embeddings_enabled() -> bool {
     false
 }
 
+fn default_rerank_window() -> u32 {
+    50
+}
+
+fn default_cohere_api_key_env() -> String {
+    DEFAULT_COHERE_API_KEY_ENV.to_owned()
+}
+
 fn default_verify_commands() -> Vec<String> {
     vec![
         "cargo test".to_owned(),
@@ -667,6 +792,10 @@ fn normalize_config(mut config: AetherConfig) -> AetherConfig {
     config.embeddings.endpoint = normalize_optional(config.embeddings.endpoint.take());
     config.embeddings.candle.model_dir =
         normalize_optional(config.embeddings.candle.model_dir.take());
+    config.search.candle.model_dir = normalize_optional(config.search.candle.model_dir.take());
+    if config.search.rerank_window == 0 {
+        config.search.rerank_window = default_rerank_window();
+    }
     config.verify.commands = normalize_commands(std::mem::take(&mut config.verify.commands));
     config.verify.container.runtime = normalize_with_default(
         std::mem::take(&mut config.verify.container.runtime),
@@ -706,6 +835,13 @@ fn normalize_config(mut config: AetherConfig) -> AetherConfig {
         config.inference.api_key_env = api_key_env.to_owned();
     }
 
+    let cohere_api_key_env = config.providers.cohere.api_key_env.trim();
+    if cohere_api_key_env.is_empty() {
+        config.providers.cohere.api_key_env = default_cohere_api_key_env();
+    } else {
+        config.providers.cohere.api_key_env = cohere_api_key_env.to_owned();
+    }
+
     config
 }
 
@@ -731,6 +867,12 @@ mod tests {
         assert_eq!(config.storage.graph_backend, GraphBackend::Cozo);
         assert!(!config.embeddings.enabled);
         assert_eq!(config.embeddings.provider, EmbeddingProviderKind::Mock);
+        assert_eq!(config.search.reranker, SearchRerankerKind::None);
+        assert_eq!(config.search.rerank_window, 50);
+        assert_eq!(
+            config.providers.cohere.api_key_env,
+            DEFAULT_COHERE_API_KEY_ENV
+        );
         assert_eq!(
             config.verify.commands,
             vec![
@@ -786,6 +928,11 @@ mod tests {
         assert!(content.contains("enabled = false"));
         assert!(content.contains("provider = \"mock\""));
         assert!(content.contains("vector_backend = \"lancedb\""));
+        assert!(content.contains("[search]"));
+        assert!(content.contains("reranker = \"none\""));
+        assert!(content.contains("rerank_window = 50"));
+        assert!(content.contains("[providers.cohere]"));
+        assert!(content.contains("api_key_env = \"COHERE_API_KEY\""));
         assert!(content.contains("[verify]"));
         assert!(content.contains("commands = ["));
         assert!(content.contains("mode = \"host\""));
@@ -828,6 +975,16 @@ provider = "qwen3_local"
 vector_backend = "sqlite"
 model = "qwen3-embeddings-4B"
 endpoint = "http://127.0.0.1:11434/api/embeddings"
+
+[search]
+reranker = "cohere"
+rerank_window = 0
+
+[search.candle]
+model_dir = " .aether/models "
+
+[providers.cohere]
+api_key_env = " CUSTOM_COHERE_KEY "
 
 [verify]
 mode = "microvm"
@@ -888,6 +1045,13 @@ fallback_to_host_on_unavailable = true
             config.embeddings.endpoint.as_deref(),
             Some("http://127.0.0.1:11434/api/embeddings")
         );
+        assert_eq!(config.search.reranker, SearchRerankerKind::Cohere);
+        assert_eq!(config.search.rerank_window, 50);
+        assert_eq!(
+            config.search.candle.model_dir.as_deref(),
+            Some(".aether/models")
+        );
+        assert_eq!(config.providers.cohere.api_key_env, "CUSTOM_COHERE_KEY");
         assert_eq!(
             config.verify.commands,
             vec![
@@ -1005,6 +1169,12 @@ fallback_to_host_on_unavailable = true
             config.embeddings.vector_backend,
             EmbeddingVectorBackend::Sqlite
         );
+        assert_eq!(config.search.reranker, SearchRerankerKind::None);
+        assert_eq!(config.search.rerank_window, 50);
+        assert_eq!(
+            config.providers.cohere.api_key_env,
+            DEFAULT_COHERE_API_KEY_ENV
+        );
         assert_eq!(config.verify.commands, vec!["cargo --version".to_owned()]);
         assert_eq!(config.verify.mode, VerifyMode::Container);
         assert!(config.verify.container.fallback_to_host_on_unavailable);
@@ -1034,6 +1204,8 @@ fallback_to_host_on_unavailable = true
                 endpoint: Some("http://127.0.0.1:11434/api/embeddings".to_owned()),
                 candle: CandleEmbeddingsConfig::default(),
             },
+            search: SearchConfig::default(),
+            providers: ProvidersConfig::default(),
             verify: VerifyConfig {
                 commands: vec!["cargo test".to_owned()],
                 ..VerifyConfig::default()
@@ -1119,5 +1291,32 @@ fallback_to_host_on_unavailable = true
             .collect::<Vec<_>>();
 
         assert!(codes.contains(&"verify_microvm_assets_missing"));
+    }
+
+    #[test]
+    fn load_workspace_config_parses_all_search_reranker_values() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(aether_dir(workspace)).expect("create .aether");
+
+        for (raw_value, expected) in [
+            ("none", SearchRerankerKind::None),
+            ("candle", SearchRerankerKind::Candle),
+            ("cohere", SearchRerankerKind::Cohere),
+        ] {
+            fs::write(
+                config_path(workspace),
+                format!(
+                    r#"
+[search]
+reranker = "{raw_value}"
+"#
+                ),
+            )
+            .expect("write config");
+
+            let config = load_workspace_config(workspace).expect("load config");
+            assert_eq!(config.search.reranker, expected);
+        }
     }
 }

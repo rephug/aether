@@ -1,16 +1,20 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
+use aether_config::{SearchRerankerKind, ensure_workspace_config};
 use aether_core::{
     SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR, SEARCH_FALLBACK_EMBEDDINGS_DISABLED,
     SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED, SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY,
     SearchEnvelope,
 };
-use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
+use aether_infer::{
+    EmbeddingProviderOverrides, RerankCandidate, RerankerProvider, RerankerProviderOverrides,
+    load_embedding_provider_from_config, load_reranker_provider_from_config,
+};
 use aether_store::{SqliteStore, Store, SymbolSearchResult, open_vector_store};
 use anyhow::{Context, Result};
-use serde_json::json;
+use serde_json::{Value, json};
 
 pub use aether_core::SearchMode;
 
@@ -127,11 +131,30 @@ pub fn execute_search(
                 });
             }
 
+            let search_config = ensure_workspace_config(workspace)
+                .context("failed to load workspace config for hybrid search")?
+                .search;
+            let fuse_limit = if matches!(search_config.reranker, SearchRerankerKind::None) {
+                limit
+            } else {
+                search_config.rerank_window.max(limit).clamp(1, 200)
+            };
+            let fused = fuse_hybrid_results(&lexical_matches, &semantic_matches, fuse_limit);
+            let matches = maybe_rerank_hybrid_results(
+                workspace,
+                &store,
+                query,
+                limit,
+                fused,
+                search_config.reranker,
+                search_config.rerank_window,
+            )?;
+
             Ok(SearchExecution {
                 mode_requested: SearchMode::Hybrid,
                 mode_used: SearchMode::Hybrid,
                 fallback_reason: None,
-                matches: fuse_hybrid_results(&lexical_matches, &semantic_matches, limit),
+                matches,
             })
         }
     }
@@ -291,6 +314,177 @@ fn semantic_search(
     Ok((semantic_rows, None))
 }
 
+fn maybe_rerank_hybrid_results(
+    workspace: &Path,
+    store: &SqliteStore,
+    query: &str,
+    limit: u32,
+    fused_results: Vec<SearchResultRow>,
+    reranker_kind: SearchRerankerKind,
+    rerank_window: u32,
+) -> Result<Vec<SearchResultRow>> {
+    if fused_results.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if matches!(reranker_kind, SearchRerankerKind::None) {
+        return Ok(fused_results
+            .into_iter()
+            .take(limit.clamp(1, 100) as usize)
+            .collect());
+    }
+
+    let loaded =
+        match load_reranker_provider_from_config(workspace, RerankerProviderOverrides::default())
+            .context("failed to load reranker provider")
+        {
+            Ok(Some(loaded)) => loaded,
+            Ok(None) => {
+                return Ok(fused_results
+                    .into_iter()
+                    .take(limit.clamp(1, 100) as usize)
+                    .collect());
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "reranker unavailable, falling back to RRF results");
+                return Ok(fused_results
+                    .into_iter()
+                    .take(limit.clamp(1, 100) as usize)
+                    .collect());
+            }
+        };
+
+    match rerank_rows_with_provider(
+        store,
+        query,
+        &fused_results,
+        limit,
+        rerank_window,
+        loaded.provider.as_ref(),
+    ) {
+        Ok(rows) => Ok(rows),
+        Err(err) => {
+            tracing::warn!(
+                provider = %loaded.provider_name,
+                error = %err,
+                "reranker failed, falling back to RRF results"
+            );
+            Ok(fused_results
+                .into_iter()
+                .take(limit.clamp(1, 100) as usize)
+                .collect())
+        }
+    }
+}
+
+fn rerank_rows_with_provider(
+    store: &SqliteStore,
+    query: &str,
+    fused_results: &[SearchResultRow],
+    limit: u32,
+    rerank_window: u32,
+    provider: &dyn RerankerProvider,
+) -> Result<Vec<SearchResultRow>> {
+    let limit = limit.clamp(1, 100) as usize;
+    if fused_results.is_empty() || limit == 0 || query.trim().is_empty() {
+        return Ok(fused_results.iter().take(limit).cloned().collect());
+    }
+
+    let window = rerank_window.max(limit as u32).clamp(1, 200) as usize;
+    let candidate_rows = fused_results
+        .iter()
+        .take(window.min(fused_results.len()))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if candidate_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut rerank_candidates = Vec::with_capacity(candidate_rows.len());
+    for row in &candidate_rows {
+        rerank_candidates.push(RerankCandidate {
+            id: row.symbol_id.clone(),
+            text: rerank_candidate_text(store, row)?,
+        });
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build runtime for reranker")?;
+    let reranked = runtime
+        .block_on(provider.rerank(query, &rerank_candidates, limit))
+        .context("reranker request failed")?;
+
+    let mut resolved = Vec::with_capacity(limit.min(candidate_rows.len()));
+    let mut used = HashSet::new();
+
+    for result in &reranked {
+        if let Some(row) = candidate_rows.get(result.original_rank)
+            && row.symbol_id == result.id
+            && used.insert(row.symbol_id.clone())
+        {
+            resolved.push(row.clone());
+            if resolved.len() >= limit {
+                break;
+            }
+            continue;
+        }
+
+        if let Some(row) = candidate_rows
+            .iter()
+            .find(|row| row.symbol_id == result.id && !used.contains(&row.symbol_id))
+        {
+            used.insert(row.symbol_id.clone());
+            resolved.push(row.clone());
+            if resolved.len() >= limit {
+                break;
+            }
+        }
+    }
+
+    for row in fused_results {
+        if resolved.len() >= limit {
+            break;
+        }
+        if used.insert(row.symbol_id.clone()) {
+            resolved.push(row.clone());
+        }
+    }
+
+    Ok(resolved)
+}
+
+fn rerank_candidate_text(store: &SqliteStore, row: &SearchResultRow) -> Result<String> {
+    let fallback = format!(
+        "qualified_name: {}\nkind: {}\nfile_path: {}",
+        row.qualified_name, row.kind, row.file_path
+    );
+
+    let Some(blob) = store
+        .read_sir_blob(&row.symbol_id)
+        .with_context(|| format!("failed to load SIR blob for {}", row.symbol_id))?
+    else {
+        return Ok(fallback);
+    };
+
+    let Ok(value) = serde_json::from_str::<Value>(&blob) else {
+        return Ok(fallback);
+    };
+
+    let Some(intent) = value
+        .get("intent")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(fallback);
+    };
+
+    Ok(format!("{intent}\n{fallback}"))
+}
+
 fn fuse_hybrid_results(
     lexical: &[SearchResultRow],
     semantic: &[SearchResultRow],
@@ -355,10 +549,14 @@ impl From<SymbolSearchResult> for SearchResultRow {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
     use std::sync::Arc;
 
-    use aether_infer::{EmbeddingProvider, InferenceProvider, MockEmbeddingProvider, MockProvider};
+    use aether_infer::{
+        EmbeddingProvider, InferenceProvider, MockEmbeddingProvider, MockProvider,
+        MockRerankerProvider,
+    };
     use tempfile::tempdir;
 
     use super::*;
@@ -533,6 +731,118 @@ mod tests {
         assert_eq!(hybrid.mode_used, SearchMode::Hybrid);
         assert!(!hybrid.matches.is_empty());
         assert_eq!(hybrid.matches[0].symbol_id, "sym-auth");
+    }
+
+    #[test]
+    fn hybrid_pipeline_with_reranker_none_matches_rrf_output() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let store = SqliteStore::open(workspace).expect("open store");
+        let lexical = vec![
+            SearchResultRow {
+                symbol_id: "sym-a".to_owned(),
+                qualified_name: "demo::alpha".to_owned(),
+                file_path: "src/a.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                semantic_score: None,
+            },
+            SearchResultRow {
+                symbol_id: "sym-b".to_owned(),
+                qualified_name: "demo::beta".to_owned(),
+                file_path: "src/b.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                semantic_score: None,
+            },
+        ];
+        let semantic = vec![
+            SearchResultRow {
+                symbol_id: "sym-b".to_owned(),
+                qualified_name: "demo::beta".to_owned(),
+                file_path: "src/b.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                semantic_score: Some(0.9),
+            },
+            SearchResultRow {
+                symbol_id: "sym-c".to_owned(),
+                qualified_name: "demo::gamma".to_owned(),
+                file_path: "src/c.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                semantic_score: Some(0.6),
+            },
+        ];
+
+        let fused = fuse_hybrid_results(&lexical, &semantic, 10);
+        let without_reranker = maybe_rerank_hybrid_results(
+            workspace,
+            &store,
+            "alpha beta",
+            10,
+            fused.clone(),
+            SearchRerankerKind::None,
+            50,
+        )
+        .expect("reranker none branch");
+
+        assert_eq!(without_reranker, fused);
+    }
+
+    #[test]
+    fn mock_reranker_reorders_fused_candidates() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let store = SqliteStore::open(workspace).expect("open store");
+        store
+            .write_sir_blob("sym-a", r#"{"intent":"auth refresh token flow"}"#)
+            .expect("write sir blob a");
+        store
+            .write_sir_blob("sym-b", r#"{"intent":"cache lookup"}"#)
+            .expect("write sir blob b");
+        store
+            .write_sir_blob("sym-c", r#"{"intent":"http middleware"}"#)
+            .expect("write sir blob c");
+
+        let fused = vec![
+            SearchResultRow {
+                symbol_id: "sym-a".to_owned(),
+                qualified_name: "demo::alpha".to_owned(),
+                file_path: "src/a.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                semantic_score: Some(0.4),
+            },
+            SearchResultRow {
+                symbol_id: "sym-b".to_owned(),
+                qualified_name: "demo::beta".to_owned(),
+                file_path: "src/b.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                semantic_score: Some(0.3),
+            },
+            SearchResultRow {
+                symbol_id: "sym-c".to_owned(),
+                qualified_name: "demo::gamma".to_owned(),
+                file_path: "src/c.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                semantic_score: Some(0.2),
+            },
+        ];
+
+        let provider = MockRerankerProvider::new(HashMap::from([
+            ("sym-b".to_owned(), 0.95),
+            ("sym-a".to_owned(), 0.60),
+            ("sym-c".to_owned(), 0.10),
+        ]));
+        let reranked = rerank_rows_with_provider(&store, "token refresh", &fused, 3, 50, &provider)
+            .expect("rerank rows with mock provider");
+
+        assert_eq!(reranked[0].symbol_id, "sym-b");
+        assert_eq!(reranked[1].symbol_id, "sym-a");
+        assert_eq!(reranked[2].symbol_id, "sym-c");
     }
 
     #[test]
