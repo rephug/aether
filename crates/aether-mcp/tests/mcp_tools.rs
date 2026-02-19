@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::Path;
 
 use aether_core::{
     SEARCH_FALLBACK_EMBEDDINGS_DISABLED, SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED, SearchMode,
@@ -16,8 +17,19 @@ use aether_store::{SqliteStore, Store, TestIntentRecord};
 use aetherd::indexer::{IndexerConfig, run_initial_index_once};
 use anyhow::Result;
 use rmcp::handler::server::wrapper::Parameters;
+use rusqlite::Connection;
 use tempfile::tempdir;
 use tokio::runtime::Runtime;
+
+fn symbol_access_count(workspace: &Path, symbol_id: &str) -> Result<i64> {
+    let conn = Connection::open(workspace.join(".aether/meta.sqlite"))?;
+    let count = conn.query_row(
+        "SELECT access_count FROM symbols WHERE id = ?1",
+        rusqlite::params![symbol_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(count)
+}
 
 #[test]
 fn mcp_tool_handlers_work_with_local_store() -> Result<()> {
@@ -216,6 +228,7 @@ vector_backend = "sqlite"
     assert_eq!(sir.sir_status.as_deref(), Some("fresh"));
     assert_eq!(sir.last_error, None);
     assert!(sir.last_attempt_at.unwrap_or_default() > 0);
+    assert!(symbol_access_count(workspace, &explain.symbol_id)? >= 2);
 
     let store = SqliteStore::open(workspace)?;
     let existing_meta = store
@@ -1277,6 +1290,28 @@ vector_backend = "sqlite"
         vec!["architecture".to_owned(), "database".to_owned()]
     );
 
+    let session_note = rt
+        .block_on(
+            server.aether_session_note(Parameters(AetherRememberRequest {
+                content: "Refactoring payment flow to reduce batch memory usage.".to_owned(),
+                tags: Some(vec!["session".to_owned(), "refactor".to_owned()]),
+                entity_refs: None,
+                file_refs: Some(vec!["src/payments/processor.rs".to_owned()]),
+                symbol_refs: Some(vec!["sym-payment".to_owned()]),
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert_eq!(session_note.schema_version, MEMORY_SCHEMA_VERSION);
+    assert_eq!(session_note.action, "created");
+    assert_eq!(session_note.source_type, "session");
+
+    let store = SqliteStore::open(workspace)?;
+    let stored_session_note = store
+        .get_project_note(session_note.note_id.as_str())?
+        .expect("session note should be persisted");
+    assert_eq!(stored_session_note.source_type, "session");
+
     Ok(())
 }
 
@@ -1310,6 +1345,26 @@ fn mcp_memory_tool_response_schema_shapes_are_stable() -> Result<()> {
         "created_at",
     ] {
         assert!(remember_obj.contains_key(key), "missing key: {key}");
+    }
+
+    let session_note = rt
+        .block_on(
+            server.aether_session_note(Parameters(AetherRememberRequest {
+                content: "Session note content".to_owned(),
+                tags: Some(vec!["session".to_owned()]),
+                entity_refs: None,
+                file_refs: None,
+                symbol_refs: None,
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    let session_note_json = serde_json::to_value(&session_note)?;
+    let session_note_obj = session_note_json
+        .as_object()
+        .expect("session note response should serialize as object");
+    for key in ["schema_version", "note_id", "action", "source_type"] {
+        assert!(session_note_obj.contains_key(key), "missing key: {key}");
     }
 
     let recall = rt

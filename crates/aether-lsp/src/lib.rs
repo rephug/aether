@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use aether_core::{
     HoverMarkdownSections, Language, NO_SIR_MESSAGE, SourceRange, format_hover_markdown_sections,
@@ -186,6 +187,10 @@ pub fn resolve_hover_markdown_for_path(
         &symbol.qualified_name,
         &symbol.signature_fingerprint,
     );
+    store.increment_symbol_access_debounced(
+        std::slice::from_ref(&symbol_id),
+        current_unix_timestamp_millis(),
+    )?;
 
     let sir_meta = store.get_sir_meta(&symbol_id)?;
     let stale_warning = stale_warning_message(
@@ -608,6 +613,13 @@ fn symbol_span_score(range: SourceRange) -> (usize, usize) {
     };
 
     (line_span, col_span)
+}
+
+fn current_unix_timestamp_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn markdown_hover(value: String) -> Hover {
