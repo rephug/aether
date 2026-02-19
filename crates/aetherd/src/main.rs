@@ -6,10 +6,11 @@ use aether_config::{
 };
 use aether_infer::{download_candle_embedding_model, download_candle_reranker_model};
 use aetherd::calibrate::run_calibration_once;
-use aetherd::cli::{Cli, Commands, InitAgentArgs, LogFormat, parse_cli};
+use aetherd::cli::{Cli, Commands, InitAgentArgs, LogFormat, SetupLocalArgs, parse_cli};
 use aetherd::indexer::{IndexerConfig, run_indexing_loop, run_initial_index_once};
 use aetherd::init_agent::{InitAgentOptions, run_init_agent};
 use aetherd::search::run_search_once;
+use aetherd::setup_local::{SetupLocalOptions, run_setup_local};
 use aetherd::verification::{VerificationRequest, run_verification};
 use anyhow::{Context, Result, anyhow};
 
@@ -199,6 +200,7 @@ fn run(cli: Cli) -> Result<()> {
 fn run_subcommand(workspace: &Path, command: Commands) -> Result<()> {
     match command {
         Commands::InitAgent(args) => run_init_agent_command(workspace, args),
+        Commands::SetupLocal(args) => run_setup_local_command(workspace, args),
     }
 }
 
@@ -230,6 +232,25 @@ fn run_init_agent_command(workspace: &Path, args: InitAgentArgs) -> Result<()> {
             );
         }
         std::process::exit(2);
+    }
+
+    Ok(())
+}
+
+fn run_setup_local_command(workspace: &Path, args: SetupLocalArgs) -> Result<()> {
+    let exit_code = run_setup_local(
+        workspace,
+        SetupLocalOptions {
+            endpoint: args.endpoint,
+            model: args.model,
+            skip_pull: args.skip_pull,
+            skip_config: args.skip_config,
+        },
+    )
+    .context("setup-local failed")?;
+
+    if exit_code.code() != 0 {
+        std::process::exit(exit_code.code());
     }
 
     Ok(())

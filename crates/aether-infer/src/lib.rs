@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use aether_config::{
     AETHER_DIR_NAME, DEFAULT_COHERE_API_KEY_ENV, DEFAULT_GEMINI_API_KEY_ENV,
     DEFAULT_QWEN_EMBEDDING_ENDPOINT, DEFAULT_QWEN_ENDPOINT, DEFAULT_QWEN_MODEL,
-    EmbeddingProviderKind, InferenceProviderKind, SearchRerankerKind, ensure_workspace_config,
+    EmbeddingProviderKind, InferenceProviderKind, OLLAMA_SIR_TEMPERATURE, SearchRerankerKind,
+    ensure_workspace_config,
 };
 use aether_sir::{SirAnnotation, validate_sir};
 use async_trait::async_trait;
@@ -24,6 +25,7 @@ const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta"
 const GEMINI_DEFAULT_MODEL: &str = "gemini-2.0-flash";
 const PARSE_VALIDATION_RETRIES: usize = 2;
 const MOCK_EMBEDDING_DIM: usize = 64;
+const OLLAMA_PULL_SUCCESS_STATUS: &str = "success";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SirContext {
@@ -72,6 +74,14 @@ pub struct LoadedRerankerProvider {
     pub provider: Box<dyn RerankerProvider>,
     pub provider_name: String,
     pub model_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OllamaPullProgress {
+    pub status: String,
+    pub completed: Option<u64>,
+    pub total: Option<u64>,
+    pub done: bool,
 }
 
 #[derive(Debug, Error)]
@@ -257,21 +267,15 @@ impl Qwen3LocalProvider {
         }
     }
 
-    async fn request_candidate_json(
+    async fn request_candidate_json_with_prompt(
         &self,
-        symbol_text: &str,
-        context: &SirContext,
+        prompt: String,
     ) -> Result<String, InferError> {
-        let body = json!({
-            "model": self.model,
-            "prompt": build_strict_json_prompt(symbol_text, context),
-            "stream": false,
-            "format": "json"
-        });
+        let body = build_ollama_generate_body(&self.model, &prompt);
 
         let response_value: Value = self
             .client
-            .post(&self.endpoint)
+            .post(ollama_generate_endpoint(&self.endpoint))
             .json(&body)
             .send()
             .await?
@@ -280,6 +284,15 @@ impl Qwen3LocalProvider {
             .await?;
 
         extract_local_text_part(&response_value)
+    }
+
+    async fn request_candidate_json(
+        &self,
+        symbol_text: &str,
+        context: &SirContext,
+    ) -> Result<String, InferError> {
+        self.request_candidate_json_with_prompt(build_strict_json_prompt(symbol_text, context))
+            .await
     }
 }
 
@@ -290,9 +303,15 @@ impl InferenceProvider for Qwen3LocalProvider {
         symbol_text: &str,
         context: &SirContext,
     ) -> Result<SirAnnotation, InferError> {
-        run_sir_parse_validation_retries(PARSE_VALIDATION_RETRIES, || async {
-            self.request_candidate_json(symbol_text, context).await
-        })
+        let original_prompt = build_strict_json_prompt(symbol_text, context);
+        run_sir_parse_validation_retries_with_feedback(
+            PARSE_VALIDATION_RETRIES,
+            || async { self.request_candidate_json(symbol_text, context).await },
+            |previous_output, error| {
+                let prompt = build_retry_prompt(&original_prompt, &error, &previous_output);
+                async move { self.request_candidate_json_with_prompt(prompt).await }
+            },
+        )
         .await
     }
 }
@@ -339,6 +358,91 @@ impl EmbeddingProvider for Qwen3LocalEmbeddingProvider {
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>, InferError> {
         self.request_embedding(text).await
     }
+}
+
+pub fn normalize_ollama_endpoint(endpoint: &str) -> String {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return DEFAULT_QWEN_ENDPOINT.to_owned();
+    }
+
+    let known_suffixes = ["/api/generate", "/api/tags", "/api/pull", "/api/embeddings"];
+
+    for suffix in known_suffixes {
+        if let Some(stripped) = trimmed.strip_suffix(suffix) {
+            let normalized = stripped.trim_end_matches('/');
+            if normalized.is_empty() {
+                return DEFAULT_QWEN_ENDPOINT.to_owned();
+            }
+            return normalized.to_owned();
+        }
+    }
+
+    trimmed.to_owned()
+}
+
+pub fn ollama_generate_endpoint(endpoint: &str) -> String {
+    format!("{}/api/generate", normalize_ollama_endpoint(endpoint))
+}
+
+pub fn ollama_tags_endpoint(endpoint: &str) -> String {
+    format!("{}/api/tags", normalize_ollama_endpoint(endpoint))
+}
+
+pub fn ollama_pull_endpoint(endpoint: &str) -> String {
+    format!("{}/api/pull", normalize_ollama_endpoint(endpoint))
+}
+
+pub async fn fetch_ollama_tags(endpoint: &str) -> Result<Value, InferError> {
+    let response_value = reqwest::Client::new()
+        .get(ollama_tags_endpoint(endpoint))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(response_value)
+}
+
+pub async fn pull_ollama_model_with_progress<F>(
+    endpoint: &str,
+    model: &str,
+    mut on_progress: F,
+) -> Result<(), InferError>
+where
+    F: FnMut(OllamaPullProgress),
+{
+    let mut response = reqwest::Client::new()
+        .post(ollama_pull_endpoint(endpoint))
+        .json(&json!({
+            "model": model,
+            "stream": true
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let mut buffered = String::new();
+    while let Some(chunk) = response.chunk().await? {
+        buffered.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(idx) = buffered.find('\n') {
+            let line = buffered[..idx].trim().to_owned();
+            buffered = buffered[idx + 1..].to_owned();
+            if line.is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line)?;
+            on_progress(parse_pull_progress(&value));
+        }
+    }
+
+    let trailing = buffered.trim();
+    if !trailing.is_empty() {
+        let value: Value = serde_json::from_str(trailing)?;
+        on_progress(parse_pull_progress(&value));
+    }
+
+    Ok(())
 }
 
 pub fn load_provider_from_env_or_mock(
@@ -538,6 +642,43 @@ Do not add any extra keys.\n\nContext:\n- language: {}\n- file_path: {}\n- quali
     )
 }
 
+fn build_retry_prompt(original_prompt: &str, error: &str, previous_output: &str) -> String {
+    format!(
+        "{original_prompt}\n\nYour previous response was invalid. Error: {error}. Previous output: {previous_output}. Please respond again with STRICT JSON only, fixing the error above."
+    )
+}
+
+fn build_ollama_generate_body(model: &str, prompt: &str) -> Value {
+    json!({
+        "model": model,
+        "prompt": prompt,
+        "stream": false,
+        "format": "json",
+        "options": {
+            "temperature": OLLAMA_SIR_TEMPERATURE
+        }
+    })
+}
+
+fn parse_pull_progress(value: &Value) -> OllamaPullProgress {
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let completed = value.get("completed").and_then(Value::as_u64);
+    let total = value.get("total").and_then(Value::as_u64);
+    let done = value.get("done").and_then(Value::as_bool).unwrap_or(false)
+        || status.eq_ignore_ascii_case(OLLAMA_PULL_SUCCESS_STATUS);
+
+    OllamaPullProgress {
+        status,
+        completed,
+        total,
+        done,
+    }
+}
+
 async fn run_sir_parse_validation_retries<F, Fut>(
     retries: usize,
     mut candidate_json_loader: F,
@@ -558,6 +699,49 @@ where
                 if attempt == retries {
                     break;
                 }
+            }
+        }
+    }
+
+    Err(InferError::ParseValidationExhausted(last_error))
+}
+
+async fn run_sir_parse_validation_retries_with_feedback<F, Fut, G, Gfut>(
+    retries: usize,
+    mut candidate_json_loader: F,
+    mut feedback_json_loader: G,
+) -> Result<SirAnnotation, InferError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<String, InferError>>,
+    G: FnMut(String, String) -> Gfut,
+    Gfut: std::future::Future<Output = Result<String, InferError>>,
+{
+    let mut last_error = String::from("unknown parse/validation failure");
+    let mut last_output = String::new();
+    let mut retry_with_feedback = false;
+
+    for attempt in 0..=retries {
+        let mut attempted_feedback = false;
+        let candidate_json = if retry_with_feedback && !last_output.is_empty() {
+            attempted_feedback = true;
+            match feedback_json_loader(last_output.clone(), last_error.clone()).await {
+                Ok(candidate) => candidate,
+                Err(_) => candidate_json_loader().await?,
+            }
+        } else {
+            candidate_json_loader().await?
+        };
+
+        match parse_and_validate_sir(&candidate_json) {
+            Ok(sir) => return Ok(sir),
+            Err(message) => {
+                last_error = message;
+                last_output = candidate_json;
+                if attempt == retries {
+                    break;
+                }
+                retry_with_feedback = !attempted_feedback;
             }
         }
     }
@@ -789,6 +973,8 @@ fn read_env_non_empty(name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use aether_config::{
@@ -844,6 +1030,68 @@ mod tests {
             .map(|value| value * value)
             .fold(0.0f32, |acc, value| acc + value);
         assert!((norm_sq - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn qwen3_local_generate_body_sets_temperature_in_options() {
+        let body = build_ollama_generate_body("qwen2.5-coder:7b", "return strict json");
+        assert_eq!(
+            body.pointer("/options/temperature"),
+            Some(&json!(OLLAMA_SIR_TEMPERATURE))
+        );
+        assert_eq!(body.pointer("/temperature"), None);
+    }
+
+    #[tokio::test]
+    async fn retry_with_feedback_uses_error_context_on_second_attempt() {
+        let valid_json = Arc::new(
+            r#"{"intent":"valid","inputs":[],"outputs":[],"side_effects":[],"dependencies":[],"error_modes":[],"confidence":0.9}"#
+                .to_owned(),
+        );
+        let scratch_calls = Arc::new(AtomicUsize::new(0));
+        let feedback_inputs = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+
+        let result = run_sir_parse_validation_retries_with_feedback(
+            2,
+            {
+                let valid_json = valid_json.clone();
+                let scratch_calls = scratch_calls.clone();
+                move || {
+                    let valid_json = valid_json.clone();
+                    let scratch_calls = scratch_calls.clone();
+                    async move {
+                        if scratch_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            Ok("not json".to_owned())
+                        } else {
+                            Ok(valid_json.as_ref().clone())
+                        }
+                    }
+                }
+            },
+            {
+                let feedback_inputs = feedback_inputs.clone();
+                let valid_json = valid_json.clone();
+                move |previous_output: String, error: String| {
+                    let feedback_inputs = feedback_inputs.clone();
+                    let valid_json = valid_json.clone();
+                    async move {
+                        let mut guard = feedback_inputs.lock().expect("feedback lock");
+                        guard.push((previous_output, error));
+                        Ok(valid_json.as_ref().clone())
+                    }
+                }
+            },
+        )
+        .await
+        .expect("retry should succeed");
+
+        assert_eq!(result.intent, "valid");
+        assert_eq!(scratch_calls.load(Ordering::SeqCst), 1);
+
+        let captured = feedback_inputs.lock().expect("feedback lock");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].0, "not json");
+        assert!(captured[0].1.contains("json parse error"));
     }
 
     #[test]

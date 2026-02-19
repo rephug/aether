@@ -2,8 +2,10 @@ use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aether_config::{SIR_QUALITY_FLOOR_CONFIDENCE, SIR_QUALITY_FLOOR_WINDOW};
 use aether_core::{GitContext, Language, Position, SourceRange, Symbol, SymbolChangeEvent};
 use aether_infer::{
     EmbeddingProvider, EmbeddingProviderOverrides, InferenceProvider, ProviderOverrides,
@@ -24,6 +26,8 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 
+use crate::quality::SirQualityMonitor;
+
 pub const DEFAULT_SIR_CONCURRENCY: usize = 2;
 const SIR_STATUS_FRESH: &str = "fresh";
 const SIR_STATUS_STALE: &str = "stale";
@@ -43,6 +47,7 @@ pub struct SirPipeline {
     vector_store: Arc<dyn VectorStore>,
     runtime: Runtime,
     sir_concurrency: usize,
+    quality_monitor: Mutex<SirQualityMonitor>,
 }
 
 impl SirPipeline {
@@ -130,6 +135,10 @@ impl SirPipeline {
             vector_store,
             runtime,
             sir_concurrency: concurrency,
+            quality_monitor: Mutex::new(SirQualityMonitor::new(
+                SIR_QUALITY_FLOOR_WINDOW,
+                SIR_QUALITY_FLOOR_CONFIDENCE,
+            )),
         })
     }
 
@@ -181,6 +190,18 @@ impl SirPipeline {
             for result in results {
                 match result {
                     SirGenerationOutcome::Success(generated) => {
+                        match self.quality_monitor.lock() {
+                            Ok(mut monitor) => {
+                                monitor.record(generated.sir.confidence);
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    "failed to lock SIR quality monitor"
+                                );
+                            }
+                        }
+
                         let canonical_json = canonicalize_sir_json(&generated.sir);
                         let sir_hash_value = sir_hash(&generated.sir);
                         let attempted_at = unix_timestamp_secs();
