@@ -113,6 +113,24 @@ pub struct SemanticSearchResult {
     pub semantic_score: f32,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThresholdCalibrationRecord {
+    pub language: String,
+    pub threshold: f32,
+    pub sample_size: i64,
+    pub provider: String,
+    pub model: String,
+    pub calibrated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CalibrationEmbeddingRecord {
+    pub symbol_id: String,
+    pub file_path: String,
+    pub language: String,
+    pub embedding: Vec<f32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedEdge {
     pub source_id: String,
@@ -198,6 +216,20 @@ pub trait Store {
         model: &str,
         limit: u32,
     ) -> Result<Vec<SemanticSearchResult>, StoreError>;
+    fn upsert_threshold_calibration(
+        &self,
+        record: ThresholdCalibrationRecord,
+    ) -> Result<(), StoreError>;
+    fn get_threshold_calibration(
+        &self,
+        language: &str,
+    ) -> Result<Option<ThresholdCalibrationRecord>, StoreError>;
+    fn list_threshold_calibrations(&self) -> Result<Vec<ThresholdCalibrationRecord>, StoreError>;
+    fn list_embeddings_for_provider_model(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Result<Vec<CalibrationEmbeddingRecord>, StoreError>;
 }
 
 pub trait GraphStore: Send + Sync {
@@ -1167,6 +1199,144 @@ impl Store for SqliteStore {
 
         Ok(results)
     }
+
+    fn upsert_threshold_calibration(
+        &self,
+        record: ThresholdCalibrationRecord,
+    ) -> Result<(), StoreError> {
+        let language = record.language.trim().to_ascii_lowercase();
+        if language.is_empty() {
+            return Ok(());
+        }
+
+        self.conn.execute(
+            r#"
+            INSERT INTO threshold_calibration (
+                language, threshold, sample_size, provider, model, calibrated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(language) DO UPDATE SET
+                threshold = excluded.threshold,
+                sample_size = excluded.sample_size,
+                provider = excluded.provider,
+                model = excluded.model,
+                calibrated_at = excluded.calibrated_at
+            "#,
+            params![
+                language,
+                record.threshold,
+                record.sample_size,
+                record.provider,
+                record.model,
+                record.calibrated_at
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    fn get_threshold_calibration(
+        &self,
+        language: &str,
+    ) -> Result<Option<ThresholdCalibrationRecord>, StoreError> {
+        let language = language.trim().to_ascii_lowercase();
+        if language.is_empty() {
+            return Ok(None);
+        }
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT language, threshold, sample_size, provider, model, calibrated_at
+            FROM threshold_calibration
+            WHERE language = ?1
+            "#,
+        )?;
+
+        let record = stmt
+            .query_row(params![language], |row| {
+                Ok(ThresholdCalibrationRecord {
+                    language: row.get(0)?,
+                    threshold: row.get(1)?,
+                    sample_size: row.get(2)?,
+                    provider: row.get(3)?,
+                    model: row.get(4)?,
+                    calibrated_at: row.get(5)?,
+                })
+            })
+            .optional()?;
+
+        Ok(record)
+    }
+
+    fn list_threshold_calibrations(&self) -> Result<Vec<ThresholdCalibrationRecord>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT language, threshold, sample_size, provider, model, calibrated_at
+            FROM threshold_calibration
+            ORDER BY language ASC
+            "#,
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok(ThresholdCalibrationRecord {
+                language: row.get(0)?,
+                threshold: row.get(1)?,
+                sample_size: row.get(2)?,
+                provider: row.get(3)?,
+                model: row.get(4)?,
+                calibrated_at: row.get(5)?,
+            })
+        })?;
+
+        let records = rows.collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    fn list_embeddings_for_provider_model(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Result<Vec<CalibrationEmbeddingRecord>, StoreError> {
+        let provider = provider.trim();
+        let model = model.trim();
+        if provider.is_empty() || model.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT e.symbol_id, s.file_path, s.language, e.embedding_json
+            FROM sir_embeddings e
+            JOIN symbols s ON s.id = e.symbol_id
+            WHERE e.provider = ?1
+              AND e.model = ?2
+            ORDER BY s.language ASC, s.file_path ASC, e.symbol_id ASC
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![provider, model], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let (symbol_id, file_path, language, embedding_json) = row?;
+            let embedding = json_from_str::<Vec<f32>>(&embedding_json)?;
+            records.push(CalibrationEmbeddingRecord {
+                symbol_id,
+                file_path,
+                language: language.trim().to_ascii_lowercase(),
+                embedding,
+            });
+        }
+
+        Ok(records)
+    }
 }
 
 fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
@@ -1228,6 +1398,18 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
 
         CREATE INDEX IF NOT EXISTS idx_sir_embeddings_provider_model_dim
             ON sir_embeddings(provider, model, embedding_dim);
+
+        CREATE TABLE IF NOT EXISTS threshold_calibration (
+            language TEXT PRIMARY KEY,
+            threshold REAL NOT NULL,
+            sample_size INTEGER NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            calibrated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_threshold_calibration_provider_model
+            ON threshold_calibration(provider, model);
 
         CREATE TABLE IF NOT EXISTS symbol_edges (
             source_id TEXT NOT NULL,
@@ -2193,5 +2375,108 @@ mirror_sir_files = false
             .search_symbols_semantic(&[1.0, 0.0], "mock", "mock-64d", 10)
             .expect("semantic search on migrated schema");
         assert!(embedding_lookup.is_empty());
+    }
+
+    #[test]
+    fn threshold_calibration_round_trip_persists_latest_value() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        store
+            .upsert_threshold_calibration(ThresholdCalibrationRecord {
+                language: "rust".to_owned(),
+                threshold: 0.72,
+                sample_size: 123,
+                provider: "mock".to_owned(),
+                model: "mock-64d".to_owned(),
+                calibrated_at: "2026-02-19T00:00:00Z".to_owned(),
+            })
+            .expect("upsert threshold");
+        store
+            .upsert_threshold_calibration(ThresholdCalibrationRecord {
+                language: "rust".to_owned(),
+                threshold: 0.74,
+                sample_size: 456,
+                provider: "mock".to_owned(),
+                model: "mock-64d".to_owned(),
+                calibrated_at: "2026-02-19T00:01:00Z".to_owned(),
+            })
+            .expect("upsert threshold update");
+
+        let rust = store
+            .get_threshold_calibration("rust")
+            .expect("get threshold")
+            .expect("threshold exists");
+        assert_eq!(rust.threshold, 0.74);
+        assert_eq!(rust.sample_size, 456);
+        assert_eq!(rust.provider, "mock");
+
+        let all = store
+            .list_threshold_calibrations()
+            .expect("list threshold calibrations");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].language, "rust");
+    }
+
+    #[test]
+    fn list_embeddings_for_provider_model_returns_language_context() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        store
+            .upsert_symbol(SymbolRecord {
+                id: "sym-rust".to_owned(),
+                file_path: "src/lib.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "demo::run".to_owned(),
+                signature_fingerprint: "sig-rust".to_owned(),
+                last_seen_at: 1_700_000_000,
+            })
+            .expect("upsert rust symbol");
+        store
+            .upsert_symbol(SymbolRecord {
+                id: "sym-py".to_owned(),
+                file_path: "src/jobs.py".to_owned(),
+                language: "python".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "jobs.run".to_owned(),
+                signature_fingerprint: "sig-py".to_owned(),
+                last_seen_at: 1_700_000_000,
+            })
+            .expect("upsert python symbol");
+        store
+            .upsert_symbol_embedding(SymbolEmbeddingRecord {
+                symbol_id: "sym-rust".to_owned(),
+                sir_hash: "hash-rust".to_owned(),
+                provider: "mock".to_owned(),
+                model: "mock-64d".to_owned(),
+                embedding: vec![1.0, 0.0],
+                updated_at: 1_700_000_100,
+            })
+            .expect("upsert rust embedding");
+        store
+            .upsert_symbol_embedding(SymbolEmbeddingRecord {
+                symbol_id: "sym-py".to_owned(),
+                sir_hash: "hash-py".to_owned(),
+                provider: "mock".to_owned(),
+                model: "mock-64d".to_owned(),
+                embedding: vec![0.0, 1.0],
+                updated_at: 1_700_000_101,
+            })
+            .expect("upsert python embedding");
+
+        let rows = store
+            .list_embeddings_for_provider_model("mock", "mock-64d")
+            .expect("list embeddings");
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .any(|row| row.symbol_id == "sym-rust" && row.language == "rust")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.symbol_id == "sym-py" && row.language == "python")
+        );
     }
 }

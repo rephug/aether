@@ -2,7 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
-use aether_config::{SearchRerankerKind, ensure_workspace_config};
+use aether_config::{
+    AetherConfig, SearchCalibratedThresholdsConfig, SearchRerankerKind, SearchThresholdsConfig,
+    ensure_workspace_config,
+};
 use aether_core::{
     SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR, SEARCH_FALLBACK_EMBEDDINGS_DISABLED,
     SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED, SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY,
@@ -12,7 +15,9 @@ use aether_infer::{
     EmbeddingProviderOverrides, RerankCandidate, RerankerProvider, RerankerProviderOverrides,
     load_embedding_provider_from_config, load_reranker_provider_from_config,
 };
-use aether_store::{SqliteStore, Store, SymbolSearchResult, open_vector_store};
+use aether_store::{
+    SqliteStore, Store, SymbolSearchResult, ThresholdCalibrationRecord, open_vector_store,
+};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
@@ -90,9 +95,12 @@ pub fn execute_search(
 ) -> Result<SearchExecution> {
     let store_present = workspace.join(".aether").join("meta.sqlite").exists();
     let store = SqliteStore::open(workspace).context("failed to initialize local store")?;
+    let config =
+        ensure_workspace_config(workspace).context("failed to load workspace config for search")?;
     let limit = limit.clamp(1, 100);
+    let (normalized_query, language_hint) = extract_language_hint_from_query(query);
 
-    let lexical_matches = lexical_search(&store, query, limit)?;
+    let lexical_matches = lexical_search(&store, &normalized_query, limit)?;
     match mode {
         SearchMode::Lexical => Ok(SearchExecution {
             mode_requested: SearchMode::Lexical,
@@ -101,8 +109,15 @@ pub fn execute_search(
             matches: lexical_matches,
         }),
         SearchMode::Semantic => {
-            let (semantic_matches, fallback_reason) =
-                semantic_search(workspace, &store, query, limit, store_present)?;
+            let (semantic_matches, fallback_reason) = semantic_search(
+                workspace,
+                &store,
+                &normalized_query,
+                language_hint.as_deref(),
+                limit,
+                store_present,
+                &config,
+            )?;
             if semantic_matches.is_empty() {
                 return Ok(SearchExecution {
                     mode_requested: SearchMode::Semantic,
@@ -120,8 +135,15 @@ pub fn execute_search(
             })
         }
         SearchMode::Hybrid => {
-            let (semantic_matches, fallback_reason) =
-                semantic_search(workspace, &store, query, limit, store_present)?;
+            let (semantic_matches, fallback_reason) = semantic_search(
+                workspace,
+                &store,
+                &normalized_query,
+                language_hint.as_deref(),
+                limit,
+                store_present,
+                &config,
+            )?;
             if semantic_matches.is_empty() {
                 return Ok(SearchExecution {
                     mode_requested: SearchMode::Hybrid,
@@ -131,9 +153,7 @@ pub fn execute_search(
                 });
             }
 
-            let search_config = ensure_workspace_config(workspace)
-                .context("failed to load workspace config for hybrid search")?
-                .search;
+            let search_config = config.search.clone();
             let fuse_limit = if matches!(search_config.reranker, SearchRerankerKind::None) {
                 limit
             } else {
@@ -143,7 +163,7 @@ pub fn execute_search(
             let matches = maybe_rerank_hybrid_results(
                 workspace,
                 &store,
-                query,
+                &normalized_query,
                 limit,
                 fused,
                 search_config.reranker,
@@ -224,8 +244,10 @@ fn semantic_search(
     workspace: &Path,
     store: &SqliteStore,
     query: &str,
+    query_language_hint: Option<&str>,
     limit: u32,
     store_present: bool,
+    config: &AetherConfig,
 ) -> Result<(Vec<SearchResultRow>, Option<String>)> {
     if !store_present {
         return Ok((
@@ -243,6 +265,18 @@ fn semantic_search(
             Some(SEARCH_FALLBACK_EMBEDDINGS_DISABLED.to_owned()),
         ));
     };
+
+    let calibration_by_language = store
+        .list_threshold_calibrations()
+        .context("failed to load threshold calibration metadata")?
+        .into_iter()
+        .map(|record| {
+            (
+                normalize_threshold_language(&record.language).to_owned(),
+                record,
+            )
+        })
+        .collect::<HashMap<_, _>>();
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -281,6 +315,16 @@ fn semantic_search(
     }
 
     let mut semantic_rows = Vec::new();
+    let mut mismatched_languages = HashSet::new();
+    let mut threshold_context = ThresholdResolutionContext {
+        query_language_hint,
+        thresholds: &config.search.thresholds,
+        calibrated_thresholds: &config.search.calibrated_thresholds,
+        calibration_by_language: &calibration_by_language,
+        current_provider: &loaded.provider_name,
+        current_model: &loaded.model_name,
+        mismatched_languages: &mut mismatched_languages,
+    };
     for candidate in matches {
         let Some(symbol) = store
             .get_symbol_search_result(&candidate.symbol_id)
@@ -294,6 +338,11 @@ fn semantic_search(
             continue;
         };
 
+        let threshold = resolve_effective_threshold(&symbol.language, &mut threshold_context);
+        if candidate.semantic_score < threshold {
+            continue;
+        }
+
         semantic_rows.push(SearchResultRow {
             symbol_id: symbol.symbol_id,
             qualified_name: symbol.qualified_name,
@@ -304,14 +353,114 @@ fn semantic_search(
         });
     }
 
+    if !mismatched_languages.is_empty() {
+        let mut languages = mismatched_languages.into_iter().collect::<Vec<_>>();
+        languages.sort();
+
+        for language in languages {
+            if let Some(calibrated) = calibration_by_language.get(language.as_str()) {
+                tracing::warn!(
+                    language = %language,
+                    calibrated_provider = %calibrated.provider,
+                    calibrated_model = %calibrated.model,
+                    current_provider = %loaded.provider_name,
+                    current_model = %loaded.model_name,
+                    "embedding provider/model differs from threshold calibration metadata; using defaults"
+                );
+            }
+        }
+    }
+
     if semantic_rows.is_empty() {
         return Ok((
             Vec::new(),
-            Some(SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY.to_owned()),
+            Some("semantic matches below configured similarity thresholds".to_owned()),
         ));
     }
 
     Ok((semantic_rows, None))
+}
+
+fn extract_language_hint_from_query(query: &str) -> (String, Option<String>) {
+    let mut hint = None;
+    let mut retained_tokens = Vec::new();
+
+    for token in query.split_whitespace() {
+        if hint.is_none() {
+            let lower = token.to_ascii_lowercase();
+            let maybe_hint = lower
+                .strip_prefix("lang:")
+                .or_else(|| lower.strip_prefix("language:"))
+                .map(|value| {
+                    value
+                        .trim_matches(|ch: char| {
+                            !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+                        })
+                        .to_owned()
+                });
+
+            if let Some(value) = maybe_hint
+                && !value.is_empty()
+            {
+                hint = Some(normalize_threshold_language(&value).to_owned());
+                continue;
+            }
+        }
+
+        retained_tokens.push(token);
+    }
+
+    (retained_tokens.join(" ").trim().to_owned(), hint)
+}
+
+struct ThresholdResolutionContext<'a> {
+    query_language_hint: Option<&'a str>,
+    thresholds: &'a SearchThresholdsConfig,
+    calibrated_thresholds: &'a SearchCalibratedThresholdsConfig,
+    calibration_by_language: &'a HashMap<String, ThresholdCalibrationRecord>,
+    current_provider: &'a str,
+    current_model: &'a str,
+    mismatched_languages: &'a mut HashSet<String>,
+}
+
+fn resolve_effective_threshold(
+    candidate_language: &str,
+    context: &mut ThresholdResolutionContext<'_>,
+) -> f32 {
+    let target_language = context.query_language_hint.unwrap_or(candidate_language);
+    let normalized = normalize_threshold_language(target_language);
+
+    if context
+        .thresholds
+        .is_manual_override_for_language(normalized)
+    {
+        return context.thresholds.value_for_language(normalized);
+    }
+
+    if let Some(calibration) = context.calibration_by_language.get(normalized) {
+        if calibration.provider.trim() == context.current_provider
+            && calibration.model.trim() == context.current_model
+        {
+            if let Some(configured) = context.calibrated_thresholds.value_for_language(normalized) {
+                return configured;
+            }
+            return calibration.threshold;
+        }
+
+        context.mismatched_languages.insert(normalized.to_owned());
+    }
+
+    context.thresholds.value_for_language(normalized)
+}
+
+fn normalize_threshold_language(language: &str) -> &'static str {
+    let normalized = language.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "rust" | "rs" => "rust",
+        "typescript" | "ts" | "tsx" | "javascript" | "js" => "typescript",
+        "python" | "py" => "python",
+        _ => "default",
+    }
 }
 
 fn maybe_rerank_hybrid_results(
@@ -549,7 +698,7 @@ impl From<SymbolSearchResult> for SearchResultRow {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::sync::Arc;
 
@@ -562,7 +711,9 @@ mod tests {
     use super::*;
     use crate::observer::ObserverState;
     use crate::sir_pipeline::SirPipeline;
-    use aether_store::{SymbolEmbeddingRecord, SymbolRecord, open_vector_store};
+    use aether_store::{
+        SymbolEmbeddingRecord, SymbolRecord, ThresholdCalibrationRecord, open_vector_store,
+    };
 
     #[test]
     fn write_search_results_outputs_stable_header_and_columns() {
@@ -660,7 +811,16 @@ mod tests {
     fn semantic_search_returns_expected_top_match_with_mock_embeddings() {
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();
-        write_embeddings_enabled_config(workspace);
+        write_embeddings_enabled_config_with_thresholds(
+            workspace,
+            "sqlite",
+            SearchThresholdsConfig {
+                default: 0.65,
+                rust: 0.50,
+                typescript: 0.65,
+                python: 0.60,
+            },
+        );
 
         let store = SqliteStore::open(workspace).expect("open store");
         store
@@ -731,6 +891,220 @@ mod tests {
         assert_eq!(hybrid.mode_used, SearchMode::Hybrid);
         assert!(!hybrid.matches.is_empty());
         assert_eq!(hybrid.matches[0].symbol_id, "sym-auth");
+    }
+
+    #[test]
+    fn semantic_search_respects_per_language_thresholds() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_enabled_config_with_thresholds(
+            workspace,
+            "sqlite",
+            SearchThresholdsConfig {
+                default: 0.65,
+                rust: 0.95,
+                typescript: 0.65,
+                python: 0.40,
+            },
+        );
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        store
+            .upsert_symbol(SymbolRecord {
+                id: "sym-rust".to_owned(),
+                file_path: "src/auth.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "demo::auth_token_refresh".to_owned(),
+                signature_fingerprint: "sig-rust".to_owned(),
+                last_seen_at: 1_700_000_000,
+            })
+            .expect("upsert rust symbol");
+        store
+            .upsert_symbol(SymbolRecord {
+                id: "sym-python".to_owned(),
+                file_path: "src/jobs.py".to_owned(),
+                language: "python".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "jobs.refresh_token".to_owned(),
+                signature_fingerprint: "sig-python".to_owned(),
+                last_seen_at: 1_700_000_000,
+            })
+            .expect("upsert python symbol");
+
+        let provider = MockEmbeddingProvider;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let rust_embedding = runtime
+            .block_on(provider.embed_text("oauth token refresh session auth"))
+            .expect("rust embedding");
+        let python_embedding = runtime
+            .block_on(provider.embed_text("oauth refresh token"))
+            .expect("python embedding");
+
+        store
+            .upsert_symbol_embedding(SymbolEmbeddingRecord {
+                symbol_id: "sym-rust".to_owned(),
+                sir_hash: "hash-rust".to_owned(),
+                provider: "mock".to_owned(),
+                model: "mock-64d".to_owned(),
+                embedding: rust_embedding,
+                updated_at: 1_700_000_100,
+            })
+            .expect("upsert rust embedding");
+        store
+            .upsert_symbol_embedding(SymbolEmbeddingRecord {
+                symbol_id: "sym-python".to_owned(),
+                sir_hash: "hash-python".to_owned(),
+                provider: "mock".to_owned(),
+                model: "mock-64d".to_owned(),
+                embedding: python_embedding,
+                updated_at: 1_700_000_101,
+            })
+            .expect("upsert python embedding");
+
+        let result = execute_search(workspace, "oauth refresh token", 10, SearchMode::Semantic)
+            .expect("semantic search");
+        assert_eq!(result.mode_used, SearchMode::Semantic);
+        assert!(!result.matches.is_empty());
+        assert!(
+            result
+                .matches
+                .iter()
+                .all(|row| row.language == "python" || row.language == "default")
+        );
+        assert!(
+            result
+                .matches
+                .iter()
+                .any(|row| row.symbol_id == "sym-python")
+        );
+    }
+
+    #[test]
+    fn threshold_precedence_manual_overrides_calibrated_and_default() {
+        let mut mismatched = HashSet::new();
+        let mut thresholds = SearchThresholdsConfig::default();
+        thresholds.rust = 0.83;
+        let calibrated_thresholds = SearchCalibratedThresholdsConfig {
+            rust: Some(0.61),
+            ..SearchCalibratedThresholdsConfig::default()
+        };
+
+        let mut calibration = HashMap::new();
+        calibration.insert(
+            "rust".to_owned(),
+            ThresholdCalibrationRecord {
+                language: "rust".to_owned(),
+                threshold: 0.61,
+                sample_size: 100,
+                provider: "mock".to_owned(),
+                model: "mock-64d".to_owned(),
+                calibrated_at: "1700000000".to_owned(),
+            },
+        );
+
+        let mut context = ThresholdResolutionContext {
+            query_language_hint: None,
+            thresholds: &thresholds,
+            calibrated_thresholds: &calibrated_thresholds,
+            calibration_by_language: &calibration,
+            current_provider: "mock",
+            current_model: "mock-64d",
+            mismatched_languages: &mut mismatched,
+        };
+
+        let resolved = resolve_effective_threshold("rust", &mut context);
+        assert_eq!(resolved, 0.83);
+        assert!(mismatched.is_empty());
+    }
+
+    #[test]
+    fn threshold_precedence_uses_calibrated_before_default_when_no_manual_override() {
+        let mut mismatched = HashSet::new();
+        let thresholds = SearchThresholdsConfig::default();
+        let calibrated_thresholds = SearchCalibratedThresholdsConfig {
+            rust: Some(0.62),
+            ..SearchCalibratedThresholdsConfig::default()
+        };
+
+        let mut calibration = HashMap::new();
+        calibration.insert(
+            "rust".to_owned(),
+            ThresholdCalibrationRecord {
+                language: "rust".to_owned(),
+                threshold: 0.64,
+                sample_size: 100,
+                provider: "mock".to_owned(),
+                model: "mock-64d".to_owned(),
+                calibrated_at: "1700000000".to_owned(),
+            },
+        );
+
+        let mut context = ThresholdResolutionContext {
+            query_language_hint: None,
+            thresholds: &thresholds,
+            calibrated_thresholds: &calibrated_thresholds,
+            calibration_by_language: &calibration,
+            current_provider: "mock",
+            current_model: "mock-64d",
+            mismatched_languages: &mut mismatched,
+        };
+
+        let resolved = resolve_effective_threshold("rust", &mut context);
+        assert_eq!(resolved, 0.62);
+        assert!(mismatched.is_empty());
+    }
+
+    #[test]
+    fn provider_mismatch_uses_default_and_marks_warning() {
+        let mut mismatched = HashSet::new();
+        let thresholds = SearchThresholdsConfig::default();
+        let calibrated_thresholds = SearchCalibratedThresholdsConfig {
+            rust: Some(0.62),
+            ..SearchCalibratedThresholdsConfig::default()
+        };
+
+        let mut calibration = HashMap::new();
+        calibration.insert(
+            "rust".to_owned(),
+            ThresholdCalibrationRecord {
+                language: "rust".to_owned(),
+                threshold: 0.62,
+                sample_size: 100,
+                provider: "qwen3_local".to_owned(),
+                model: "qwen3-embeddings-0.6B".to_owned(),
+                calibrated_at: "1700000000".to_owned(),
+            },
+        );
+
+        let mut context = ThresholdResolutionContext {
+            query_language_hint: None,
+            thresholds: &thresholds,
+            calibrated_thresholds: &calibrated_thresholds,
+            calibration_by_language: &calibration,
+            current_provider: "mock",
+            current_model: "mock-64d",
+            mismatched_languages: &mut mismatched,
+        };
+
+        let resolved = resolve_effective_threshold("rust", &mut context);
+        assert_eq!(resolved, thresholds.rust);
+        assert!(mismatched.contains("rust"));
+    }
+
+    #[test]
+    fn extract_language_hint_from_query_strips_hint_tokens() {
+        let (query, hint) = extract_language_hint_from_query("lang:rust oauth refresh token");
+        assert_eq!(query, "oauth refresh token");
+        assert_eq!(hint.as_deref(), Some("rust"));
+
+        let (query, hint) =
+            extract_language_hint_from_query("find symbols language:python token handling");
+        assert_eq!(query, "find symbols token handling");
+        assert_eq!(hint.as_deref(), Some("python"));
     }
 
     #[test]
@@ -1202,6 +1576,18 @@ mod tests {
     }
 
     fn write_embeddings_enabled_config_with_backend(workspace: &Path, vector_backend: &str) {
+        write_embeddings_enabled_config_with_thresholds(
+            workspace,
+            vector_backend,
+            SearchThresholdsConfig::default(),
+        );
+    }
+
+    fn write_embeddings_enabled_config_with_thresholds(
+        workspace: &Path,
+        vector_backend: &str,
+        thresholds: SearchThresholdsConfig,
+    ) {
         fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
         fs::write(
             workspace.join(".aether/config.toml"),
@@ -1217,7 +1603,14 @@ mirror_sir_files = true
 enabled = true
 provider = "mock"
 vector_backend = "{vector_backend}"
-"#
+
+[search.thresholds]
+default = {}
+rust = {}
+typescript = {}
+python = {}
+"#,
+                thresholds.default, thresholds.rust, thresholds.typescript, thresholds.python
             ),
         )
         .expect("write config");
