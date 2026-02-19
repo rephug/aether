@@ -1,6 +1,9 @@
 pub mod calibrate;
+pub mod cli;
 pub mod indexer;
+pub mod init_agent;
 pub mod observer;
 pub mod search;
 pub mod sir_pipeline;
+pub mod templates;
 pub mod verification;

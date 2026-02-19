@@ -1,220 +1,21 @@
-use std::ffi::OsStr;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::Path;
 
 use aether_config::{
-    DEFAULT_LOG_LEVEL, InferenceProviderKind, SearchRerankerKind, VerifyMode,
-    ensure_workspace_config, validate_config,
+    DEFAULT_LOG_LEVEL, SearchRerankerKind, ensure_workspace_config, validate_config,
 };
 use aether_infer::{download_candle_embedding_model, download_candle_reranker_model};
 use aetherd::calibrate::run_calibration_once;
+use aetherd::cli::{Cli, Commands, InitAgentArgs, LogFormat, parse_cli};
 use aetherd::indexer::{IndexerConfig, run_indexing_loop, run_initial_index_once};
-use aetherd::search::{SearchMode, SearchOutputFormat, run_search_once};
-use aetherd::sir_pipeline::DEFAULT_SIR_CONCURRENCY;
+use aetherd::init_agent::{InitAgentOptions, run_init_agent};
+use aetherd::search::run_search_once;
 use aetherd::verification::{VerificationRequest, run_verification};
 use anyhow::{Context, Result, anyhow};
-use clap::Parser;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum LogFormat {
-    #[default]
-    Human,
-    Json,
-}
-
-impl LogFormat {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Human => "human",
-            Self::Json => "json",
-        }
-    }
-}
-
-impl std::str::FromStr for LogFormat {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim() {
-            "human" => Ok(Self::Human),
-            "json" => Ok(Self::Json),
-            other => Err(format!(
-                "invalid log format '{other}', expected one of: human, json"
-            )),
-        }
-    }
-}
-
-#[derive(Debug, Parser)]
-#[command(author, version, about = "AETHER Observer daemon")]
-struct Cli {
-    #[arg(long, default_value = ".", help = "Workspace root to index/search")]
-    workspace: PathBuf,
-
-    #[arg(
-        long,
-        default_value_t = 300,
-        help = "Debounce window for watcher events"
-    )]
-    debounce_ms: u64,
-
-    #[arg(long, help = "Print symbol-change events as JSON lines")]
-    print_events: bool,
-
-    #[arg(long, help = "Print SIR lifecycle lines as symbols are processed")]
-    print_sir: bool,
-
-    #[arg(
-        long,
-        default_value = "human",
-        value_parser = parse_log_format,
-        help = "Log format: human or json"
-    )]
-    log_format: LogFormat,
-
-    #[arg(long, help = "Run as stdio LSP server")]
-    lsp: bool,
-
-    #[arg(
-        long,
-        requires = "lsp",
-        help = "Run background indexing while LSP is active"
-    )]
-    index: bool,
-
-    #[arg(
-        long,
-        conflicts_with_all = ["lsp", "index", "index_once", "verify"],
-        help = "Run one-shot symbol search and exit"
-    )]
-    search: Option<String>,
-
-    #[arg(
-        long,
-        requires = "workspace",
-        conflicts_with_all = [
-            "search",
-            "lsp",
-            "index",
-            "index_once",
-            "verify",
-            "download_models"
-        ],
-        help = "Calibrate per-language semantic thresholds from indexed embeddings and exit"
-    )]
-    calibrate: bool,
-
-    #[arg(
-        long,
-        default_value_t = 20,
-        requires = "search",
-        help = "Result limit for --search (clamped to 1..100)"
-    )]
-    search_limit: u32,
-
-    #[arg(
-        long,
-        default_value = "lexical",
-        value_parser = parse_search_mode,
-        requires = "search",
-        help = "Search mode: lexical, semantic, or hybrid. Semantic/hybrid fall back to lexical with a reason when unavailable"
-    )]
-    search_mode: SearchMode,
-
-    #[arg(
-        long,
-        default_value = "table",
-        value_parser = parse_search_output_format,
-        requires = "search",
-        help = "Search output format: table or json"
-    )]
-    output: SearchOutputFormat,
-
-    #[arg(
-        long,
-        conflicts_with_all = ["search", "lsp", "index", "verify"],
-        help = "Run one full index pass and exit"
-    )]
-    index_once: bool,
-
-    #[arg(
-        long,
-        conflicts_with_all = ["search", "lsp", "index", "index_once"],
-        help = "Run verification commands and exit"
-    )]
-    verify: bool,
-
-    #[arg(
-        long,
-        conflicts_with_all = ["search", "lsp", "index", "index_once", "verify"],
-        help = "Download local model files required for Candle embeddings and any configured Candle reranker, then exit"
-    )]
-    download_models: bool,
-
-    #[arg(
-        long,
-        requires = "download_models",
-        help = "Override model cache directory for --download-models"
-    )]
-    model_dir: Option<PathBuf>,
-
-    #[arg(
-        long,
-        requires = "verify",
-        help = "Run only the provided allowlisted command"
-    )]
-    verify_command: Vec<String>,
-
-    #[arg(
-        long,
-        requires = "verify",
-        value_parser = parse_verify_mode,
-        help = "Verification mode override: host, container, or microvm"
-    )]
-    verify_mode: Option<VerifyMode>,
-
-    #[arg(
-        long,
-        requires = "verify",
-        help = "Fall back to host mode when the selected verification runtime is unavailable"
-    )]
-    verify_fallback_host_on_unavailable: bool,
-
-    #[arg(
-        long,
-        requires = "verify",
-        help = "When verify mode is microvm, fall back to container mode if microvm runtime is unavailable"
-    )]
-    verify_fallback_container_on_unavailable: bool,
-
-    #[arg(long, default_value_t = DEFAULT_SIR_CONCURRENCY)]
-    sir_concurrency: usize,
-
-    #[arg(long, value_parser = parse_inference_provider)]
-    inference_provider: Option<InferenceProviderKind>,
-
-    #[arg(long)]
-    inference_model: Option<String>,
-
-    #[arg(long)]
-    inference_endpoint: Option<String>,
-
-    #[arg(long)]
-    inference_api_key_env: Option<String>,
-}
 
 fn main() -> Result<()> {
     let cli = parse_cli();
     run(cli)
-}
-
-fn parse_cli() -> Cli {
-    let mut args: Vec<_> = std::env::args_os().collect();
-    if args.get(1).is_some_and(|arg| arg == OsStr::new("--")) {
-        args.remove(1);
-    }
-
-    Cli::parse_from(args)
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -224,6 +25,10 @@ fn run(cli: Cli) -> Result<()> {
             cli.workspace.display()
         )
     })?;
+
+    if let Some(command) = cli.command.clone() {
+        return run_subcommand(&workspace, command);
+    }
 
     let config = ensure_workspace_config(&workspace).with_context(|| {
         format!(
@@ -391,24 +196,43 @@ fn run(cli: Cli) -> Result<()> {
     run_indexing_loop(indexer_config)
 }
 
-fn parse_inference_provider(value: &str) -> Result<InferenceProviderKind, String> {
-    value.parse()
+fn run_subcommand(workspace: &Path, command: Commands) -> Result<()> {
+    match command {
+        Commands::InitAgent(args) => run_init_agent_command(workspace, args),
+    }
 }
 
-fn parse_search_mode(value: &str) -> Result<SearchMode, String> {
-    value.parse()
-}
+fn run_init_agent_command(workspace: &Path, args: InitAgentArgs) -> Result<()> {
+    let outcome = run_init_agent(
+        workspace,
+        InitAgentOptions {
+            platform: args.platform,
+            force: args.force,
+        },
+    )
+    .context("failed to generate agent integration files")?;
 
-fn parse_search_output_format(value: &str) -> Result<SearchOutputFormat, String> {
-    value.parse()
-}
+    if outcome.used_default_config {
+        eprintln!(
+            "warning: missing .aether/config.toml, generated templates using default config values"
+        );
+    }
 
-fn parse_verify_mode(value: &str) -> Result<VerifyMode, String> {
-    value.parse()
-}
+    for path in &outcome.written_files {
+        eprintln!("generated {}", path.display());
+    }
 
-fn parse_log_format(value: &str) -> Result<LogFormat, String> {
-    value.parse()
+    if outcome.exit_code() == 2 {
+        for path in &outcome.skipped_existing_files {
+            eprintln!(
+                "skipped existing {} (re-run with --force to overwrite)",
+                path.display()
+            );
+        }
+        std::process::exit(2);
+    }
+
+    Ok(())
 }
 
 fn init_tracing_subscriber(log_format: LogFormat, configured_log_level: &str) -> Result<()> {
