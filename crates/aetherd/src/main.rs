@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use aether_config::{
     DEFAULT_LOG_LEVEL, InferenceProviderKind, VerifyMode, ensure_workspace_config, validate_config,
 };
+use aether_infer::download_candle_embedding_model;
 use aetherd::indexer::{IndexerConfig, run_indexing_loop, run_initial_index_once};
 use aetherd::search::{SearchMode, SearchOutputFormat, run_search_once};
 use aetherd::sir_pipeline::DEFAULT_SIR_CONCURRENCY;
@@ -128,6 +129,20 @@ struct Cli {
 
     #[arg(
         long,
+        conflicts_with_all = ["search", "lsp", "index", "index_once", "verify"],
+        help = "Download local model files required for Candle embeddings and exit"
+    )]
+    download_models: bool,
+
+    #[arg(
+        long,
+        requires = "download_models",
+        help = "Override model cache directory for --download-models"
+    )]
+    model_dir: Option<PathBuf>,
+
+    #[arg(
+        long,
         requires = "verify",
         help = "Run only the provided allowlisted command"
     )]
@@ -207,6 +222,16 @@ fn run(cli: Cli) -> Result<()> {
             message = %warning.message,
             "AETHER config warning"
         );
+    }
+
+    if cli.download_models {
+        let model_root = download_candle_embedding_model(&workspace, cli.model_dir)
+            .context("failed to download Candle embedding model files")?;
+        tracing::info!(
+            model_root = %model_root.display(),
+            "downloaded Candle embedding model files"
+        );
+        return Ok(());
     }
 
     if let Some(query) = cli.search.as_deref() {

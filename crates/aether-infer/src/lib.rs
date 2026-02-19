@@ -1,14 +1,18 @@
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aether_config::{
-    DEFAULT_GEMINI_API_KEY_ENV, DEFAULT_QWEN_EMBEDDING_ENDPOINT, DEFAULT_QWEN_ENDPOINT,
-    DEFAULT_QWEN_MODEL, EmbeddingProviderKind, InferenceProviderKind, ensure_workspace_config,
+    AETHER_DIR_NAME, DEFAULT_GEMINI_API_KEY_ENV, DEFAULT_QWEN_EMBEDDING_ENDPOINT,
+    DEFAULT_QWEN_ENDPOINT, DEFAULT_QWEN_MODEL, EmbeddingProviderKind, InferenceProviderKind,
+    ensure_workspace_config,
 };
 use aether_sir::{SirAnnotation, validate_sir};
 use async_trait::async_trait;
+use embedding::candle::CandleEmbeddingProvider;
 use serde_json::{Value, json};
 use thiserror::Error;
+
+mod embedding;
 
 pub const GEMINI_API_KEY_ENV: &str = DEFAULT_GEMINI_API_KEY_ENV;
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -37,6 +41,7 @@ pub struct EmbeddingProviderOverrides {
     pub provider: Option<EmbeddingProviderKind>,
     pub model: Option<String>,
     pub endpoint: Option<String>,
+    pub candle_model_dir: Option<String>,
 }
 
 pub struct LoadedProvider {
@@ -61,6 +66,14 @@ pub enum InferError {
     Request(#[from] reqwest::Error),
     #[error("response decoding failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("io failed: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("hf-hub request failed: {0}")]
+    HfHub(#[from] hf_hub::api::sync::ApiError),
+    #[error("candle model operation failed: {0}")]
+    Candle(#[from] candle_core::Error),
+    #[error("tokenizer operation failed: {0}")]
+    Tokenizer(String),
     #[error("invalid model response: {0}")]
     InvalidResponse(String),
     #[error("SIR validation failed: {0}")]
@@ -69,6 +82,10 @@ pub enum InferError {
     ParseValidationExhausted(String),
     #[error("invalid embedding response: {0}")]
     InvalidEmbeddingResponse(String),
+    #[error("{0}")]
+    ModelUnavailable(String),
+    #[error("failed to lock shared resource: {0}")]
+    LockPoisoned(String),
 }
 
 #[async_trait]
@@ -362,6 +379,7 @@ pub fn load_embedding_provider_from_config(
     workspace_root: impl AsRef<Path>,
     overrides: EmbeddingProviderOverrides,
 ) -> Result<Option<LoadedEmbeddingProvider>, InferError> {
+    let workspace_root = workspace_root.as_ref();
     let config = ensure_workspace_config(workspace_root)?;
     let selected_enabled = overrides.enabled.unwrap_or(config.embeddings.enabled);
     if !selected_enabled {
@@ -369,8 +387,13 @@ pub fn load_embedding_provider_from_config(
     }
 
     let selected_provider = overrides.provider.unwrap_or(config.embeddings.provider);
-    let selected_model = first_non_empty(overrides.model, config.embeddings.model);
-    let selected_endpoint = first_non_empty(overrides.endpoint, config.embeddings.endpoint);
+    let selected_model = first_non_empty(overrides.model, config.embeddings.model.clone());
+    let selected_endpoint = first_non_empty(overrides.endpoint, config.embeddings.endpoint.clone());
+    let selected_candle_model_dir = first_non_empty(
+        overrides.candle_model_dir,
+        config.embeddings.candle.model_dir.clone(),
+    )
+    .map(PathBuf::from);
 
     let loaded = match selected_provider {
         EmbeddingProviderKind::Mock => LoadedEmbeddingProvider {
@@ -386,9 +409,43 @@ pub fn load_embedding_provider_from_config(
                 provider_name: EmbeddingProviderKind::Qwen3Local.as_str().to_owned(),
             }
         }
+        EmbeddingProviderKind::Candle => {
+            let model_dir = resolve_candle_model_dir(workspace_root, selected_candle_model_dir);
+            let provider = CandleEmbeddingProvider::new(model_dir);
+            let model_name = provider.model_name().to_owned();
+            let provider_name = provider.provider_name().to_owned();
+            LoadedEmbeddingProvider {
+                model_name,
+                provider: Box::new(provider),
+                provider_name,
+            }
+        }
     };
 
     Ok(Some(loaded))
+}
+
+pub fn download_candle_embedding_model(
+    workspace_root: impl AsRef<Path>,
+    model_dir_override: Option<PathBuf>,
+) -> Result<PathBuf, InferError> {
+    let workspace_root = workspace_root.as_ref();
+    let config = ensure_workspace_config(workspace_root)?;
+    let configured_model_dir =
+        model_dir_override.or_else(|| config.embeddings.candle.model_dir.map(PathBuf::from));
+    let model_dir = resolve_candle_model_dir(workspace_root, configured_model_dir);
+
+    let provider = CandleEmbeddingProvider::new(model_dir);
+    provider.ensure_model_downloaded()
+}
+
+fn resolve_candle_model_dir(workspace_root: &Path, model_dir: Option<PathBuf>) -> PathBuf {
+    let configured = model_dir.unwrap_or_else(|| PathBuf::from(AETHER_DIR_NAME).join("models"));
+    if configured.is_absolute() {
+        configured
+    } else {
+        workspace_root.join(configured)
+    }
 }
 
 fn build_strict_json_prompt(symbol_text: &str, context: &SirContext) -> String {
@@ -752,6 +809,33 @@ endpoint = "http://127.0.0.1:11434/api/embeddings"
             EmbeddingProviderKind::Qwen3Local.as_str()
         );
         assert_eq!(loaded.model_name, "qwen3-embeddings-4B");
+    }
+
+    #[test]
+    fn load_embedding_provider_reads_enabled_candle_settings() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        ensure_workspace_config(workspace).expect("ensure config");
+
+        std::fs::write(
+            workspace.join(".aether/config.toml"),
+            r#"[embeddings]
+enabled = true
+provider = "candle"
+
+[embeddings.candle]
+model_dir = ".aether/models"
+"#,
+        )
+        .expect("write config");
+
+        let loaded =
+            load_embedding_provider_from_config(workspace, EmbeddingProviderOverrides::default())
+                .expect("load embedding provider")
+                .expect("embedding provider should be enabled");
+
+        assert_eq!(loaded.provider_name, EmbeddingProviderKind::Candle.as_str());
+        assert_eq!(loaded.model_name, "qwen3-embedding-0.6b");
     }
 
     #[test]
