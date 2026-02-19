@@ -62,6 +62,7 @@ pub enum EmbeddingProviderKind {
     #[default]
     Mock,
     Qwen3Local,
+    Candle,
 }
 
 impl EmbeddingProviderKind {
@@ -69,6 +70,7 @@ impl EmbeddingProviderKind {
         match self {
             Self::Mock => "mock",
             Self::Qwen3Local => "qwen3_local",
+            Self::Candle => "candle",
         }
     }
 }
@@ -80,8 +82,9 @@ impl std::str::FromStr for EmbeddingProviderKind {
         match value.trim() {
             "mock" => Ok(Self::Mock),
             "qwen3_local" => Ok(Self::Qwen3Local),
+            "candle" => Ok(Self::Candle),
             other => Err(format!(
-                "invalid embedding provider '{other}', expected one of: mock, qwen3_local"
+                "invalid embedding provider '{other}', expected one of: mock, qwen3_local, candle"
             )),
         }
     }
@@ -229,6 +232,20 @@ pub struct EmbeddingsConfig {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "CandleEmbeddingsConfig::is_empty")]
+    pub candle: CandleEmbeddingsConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CandleEmbeddingsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_dir: Option<String>,
+}
+
+impl CandleEmbeddingsConfig {
+    fn is_empty(&self) -> bool {
+        self.model_dir.is_none()
+    }
 }
 
 impl Default for EmbeddingsConfig {
@@ -239,6 +256,7 @@ impl Default for EmbeddingsConfig {
             vector_backend: EmbeddingVectorBackend::Lancedb,
             model: None,
             endpoint: None,
+            candle: CandleEmbeddingsConfig::default(),
         }
     }
 }
@@ -431,6 +449,12 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
                 message: "embeddings.endpoint is set but embeddings.enabled=false; endpoint will be ignored".to_owned(),
             });
         }
+        if config.embeddings.candle.model_dir.is_some() {
+            warnings.push(ConfigWarning {
+                code: "embeddings_candle_model_dir_ignored",
+                message: "embeddings.candle.model_dir is set but embeddings.enabled=false; model_dir will be ignored".to_owned(),
+            });
+        }
     } else if matches!(config.embeddings.provider, EmbeddingProviderKind::Mock) {
         if config.embeddings.model.is_some() {
             warnings.push(ConfigWarning {
@@ -444,6 +468,22 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
                 message: "embeddings.provider=mock ignores embeddings.endpoint".to_owned(),
             });
         }
+        if config.embeddings.candle.model_dir.is_some() {
+            warnings.push(ConfigWarning {
+                code: "embeddings_candle_model_dir_unused_for_mock",
+                message: "embeddings.provider=mock ignores embeddings.candle.model_dir".to_owned(),
+            });
+        }
+    } else if matches!(
+        config.embeddings.provider,
+        EmbeddingProviderKind::Qwen3Local
+    ) && config.embeddings.candle.model_dir.is_some()
+    {
+        warnings.push(ConfigWarning {
+            code: "embeddings_candle_model_dir_unused_for_qwen3_local",
+            message: "embeddings.provider=qwen3_local ignores embeddings.candle.model_dir"
+                .to_owned(),
+        });
     }
 
     match config.inference.provider {
@@ -625,6 +665,8 @@ fn normalize_config(mut config: AetherConfig) -> AetherConfig {
     config.inference.endpoint = normalize_optional(config.inference.endpoint.take());
     config.embeddings.model = normalize_optional(config.embeddings.model.take());
     config.embeddings.endpoint = normalize_optional(config.embeddings.endpoint.take());
+    config.embeddings.candle.model_dir =
+        normalize_optional(config.embeddings.candle.model_dir.take());
     config.verify.commands = normalize_commands(std::mem::take(&mut config.verify.commands));
     config.verify.container.runtime = normalize_with_default(
         std::mem::take(&mut config.verify.container.runtime),
@@ -875,6 +917,32 @@ fallback_to_host_on_unavailable = true
     }
 
     #[test]
+    fn load_workspace_config_parses_candle_embedding_provider() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(aether_dir(workspace)).expect("create .aether");
+
+        let raw = r#"
+[embeddings]
+enabled = true
+provider = "candle"
+vector_backend = "lancedb"
+
+[embeddings.candle]
+model_dir = " .aether/models "
+"#;
+        fs::write(config_path(workspace), raw).expect("write config");
+
+        let config = load_workspace_config(workspace).expect("load config");
+        assert!(config.embeddings.enabled);
+        assert_eq!(config.embeddings.provider, EmbeddingProviderKind::Candle);
+        assert_eq!(
+            config.embeddings.candle.model_dir.as_deref(),
+            Some(".aether/models")
+        );
+    }
+
+    #[test]
     fn ensure_workspace_config_does_not_overwrite_existing_values() {
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();
@@ -964,6 +1032,7 @@ fallback_to_host_on_unavailable = true
                 vector_backend: EmbeddingVectorBackend::Lancedb,
                 model: Some("mock-x".to_owned()),
                 endpoint: Some("http://127.0.0.1:11434/api/embeddings".to_owned()),
+                candle: CandleEmbeddingsConfig::default(),
             },
             verify: VerifyConfig {
                 commands: vec!["cargo test".to_owned()],

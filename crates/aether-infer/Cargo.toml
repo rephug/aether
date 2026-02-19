@@ -9,9 +9,17 @@ authors.workspace = true
 aether-config = { path = "../aether-config" }
 aether-sir = { path = "../aether-sir" }
 async-trait = "0.1"
+candle-core.workspace = true
+candle-nn.workspace = true
+candle-transformers.workspace = true
+hf-hub.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sha2.workspace = true
+serde.workspace = true
 serde_json = "1.0"
 thiserror = "2.0"
+tokenizers.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
