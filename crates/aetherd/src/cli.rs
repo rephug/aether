@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use aether_config::{InferenceProviderKind, OLLAMA_DEFAULT_ENDPOINT, VerifyMode};
 use clap::{Args, Parser, Subcommand};
@@ -74,12 +75,78 @@ pub struct SetupLocalArgs {
     pub skip_config: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct RememberArgs {
+    #[arg(help = "Note content to store")]
+    pub content: String,
+
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "TAG",
+        help = "Optional comma-separated tags"
+    )]
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct RecallArgs {
+    #[arg(help = "Query text for note recall")]
+    pub query: String,
+
+    #[arg(
+        long,
+        default_value = "hybrid",
+        value_parser = parse_search_mode,
+        help = "Recall mode: lexical, semantic, or hybrid"
+    )]
+    pub mode: SearchMode,
+
+    #[arg(
+        long,
+        default_value_t = 5,
+        help = "Result limit for recall (clamped to 1..100)"
+    )]
+    pub limit: u32,
+
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "TAG",
+        help = "Optional comma-separated tag filter"
+    )]
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct NotesArgs {
+    #[arg(
+        long,
+        default_value_t = 10,
+        help = "Number of recent notes to list (clamped to 1..100)"
+    )]
+    pub limit: u32,
+
+    #[arg(
+        long,
+        value_parser = parse_since_duration,
+        help = "Include only notes updated within <n><unit>, where unit is d|h|m|s (example: 7d)"
+    )]
+    pub since: Option<Duration>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Commands {
     /// Generate agent configuration files for AI coding agents
     InitAgent(InitAgentArgs),
     /// Set up local Ollama inference for offline SIR generation
     SetupLocal(SetupLocalArgs),
+    /// Store a project memory note
+    Remember(RememberArgs),
+    /// Search project memory notes
+    Recall(RecallArgs),
+    /// List recent project memory notes
+    Notes(NotesArgs),
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -277,12 +344,44 @@ fn parse_log_format(value: &str) -> Result<LogFormat, String> {
     value.parse()
 }
 
+fn parse_since_duration(value: &str) -> Result<Duration, String> {
+    let trimmed = value.trim().to_ascii_lowercase();
+    if trimmed.len() < 2 {
+        return Err("invalid duration, expected format <n><unit> like 7d or 12h".to_owned());
+    }
+
+    let unit = trimmed
+        .chars()
+        .last()
+        .ok_or_else(|| "invalid duration".to_owned())?;
+    let amount_str = &trimmed[..trimmed.len() - 1];
+    let amount = amount_str
+        .parse::<u64>()
+        .map_err(|_| format!("invalid duration value '{amount_str}'"))?;
+
+    let seconds = match unit {
+        'd' => amount.saturating_mul(24 * 60 * 60),
+        'h' => amount.saturating_mul(60 * 60),
+        'm' => amount.saturating_mul(60),
+        's' => amount,
+        _ => {
+            return Err(format!(
+                "invalid duration unit '{unit}', expected one of: d, h, m, s"
+            ));
+        }
+    };
+
+    Ok(Duration::from_secs(seconds))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use aether_config::OLLAMA_DEFAULT_ENDPOINT;
     use clap::Parser;
 
-    use super::{Cli, Commands};
+    use super::{Cli, Commands, parse_since_duration};
     use crate::init_agent::AgentPlatform;
 
     #[test]
@@ -409,5 +508,87 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn remember_subcommand_parses_content_and_tags() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "remember",
+            "Document rationale",
+            "--tags",
+            "architecture,decision",
+        ])
+        .expect("remember should parse");
+
+        match cli.command {
+            Some(Commands::Remember(args)) => {
+                assert_eq!(args.content, "Document rationale");
+                assert_eq!(
+                    args.tags,
+                    vec!["architecture".to_owned(), "decision".to_owned()]
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recall_subcommand_parses_mode_limit_and_tags() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "recall",
+            "graph decision",
+            "--mode",
+            "semantic",
+            "--limit",
+            "7",
+            "--tags",
+            "architecture",
+        ])
+        .expect("recall should parse");
+
+        match cli.command {
+            Some(Commands::Recall(args)) => {
+                assert_eq!(args.query, "graph decision");
+                assert_eq!(args.mode.as_str(), "semantic");
+                assert_eq!(args.limit, 7);
+                assert_eq!(args.tags, vec!["architecture".to_owned()]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notes_subcommand_parses_limit_and_since() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "notes",
+            "--limit",
+            "12",
+            "--since",
+            "7d",
+        ])
+        .expect("notes should parse");
+
+        match cli.command {
+            Some(Commands::Notes(args)) => {
+                assert_eq!(args.limit, 12);
+                assert_eq!(args.since, Some(Duration::from_secs(7 * 24 * 60 * 60)));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_since_duration_rejects_invalid_unit() {
+        let err = parse_since_duration("7w").expect_err("expected error");
+        assert!(err.contains("invalid duration unit"));
     }
 }

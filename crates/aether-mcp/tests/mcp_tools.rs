@@ -1,11 +1,14 @@
 use std::fs;
 
-use aether_core::{SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED, SearchMode};
+use aether_core::{
+    SEARCH_FALLBACK_EMBEDDINGS_DISABLED, SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED, SearchMode,
+};
 use aether_mcp::{
     AetherCallChainRequest, AetherDependenciesRequest, AetherExplainRequest, AetherGetSirRequest,
-    AetherMcpServer, AetherSearchRequest, AetherSymbolLookupRequest, AetherSymbolTimelineRequest,
-    AetherVerifyMode, AetherVerifyRequest, AetherWhyChangedReason, AetherWhyChangedRequest,
-    AetherWhySelectorMode, MCP_SCHEMA_VERSION, SirLevelRequest,
+    AetherMcpServer, AetherRecallRequest, AetherRememberRequest, AetherSearchRequest,
+    AetherSymbolLookupRequest, AetherSymbolTimelineRequest, AetherVerifyMode, AetherVerifyRequest,
+    AetherWhyChangedReason, AetherWhyChangedRequest, AetherWhySelectorMode, MCP_SCHEMA_VERSION,
+    MEMORY_SCHEMA_VERSION, SirLevelRequest,
 };
 use aether_sir::{synthetic_file_sir_id, synthetic_module_sir_id};
 use aether_store::{SqliteStore, Store};
@@ -1197,6 +1200,142 @@ fallback_to_host_on_unavailable = false
             .as_deref()
             .is_some_and(|message| message.contains("microvm runtime unavailable"))
     );
+
+    Ok(())
+}
+
+#[test]
+fn mcp_memory_tools_dedup_and_recall_fallback_work() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    fs::create_dir_all(workspace.join(".aether"))?;
+    fs::write(
+        workspace.join(".aether/config.toml"),
+        r#"[embeddings]
+enabled = false
+provider = "mock"
+vector_backend = "sqlite"
+"#,
+    )?;
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+
+    let first = rt
+        .block_on(server.aether_remember(Parameters(AetherRememberRequest {
+            content: "We selected sqlite for deterministic local persistence.".to_owned(),
+            tags: Some(vec!["architecture".to_owned()]),
+            entity_refs: None,
+            file_refs: Some(vec!["crates/aether-store/src/lib.rs".to_owned()]),
+            symbol_refs: None,
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert_eq!(first.schema_version, MEMORY_SCHEMA_VERSION);
+    assert_eq!(first.action, "created");
+    assert_eq!(first.tags, vec!["architecture".to_owned()]);
+
+    let second = rt
+        .block_on(server.aether_remember(Parameters(AetherRememberRequest {
+            content: "We selected sqlite for deterministic local persistence.".to_owned(),
+            tags: Some(vec!["database".to_owned()]),
+            entity_refs: None,
+            file_refs: None,
+            symbol_refs: None,
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert_eq!(second.note_id, first.note_id);
+    assert_eq!(second.action, "updated_existing");
+    assert_eq!(
+        second.tags,
+        vec!["architecture".to_owned(), "database".to_owned()]
+    );
+
+    let recall = rt
+        .block_on(server.aether_recall(Parameters(AetherRecallRequest {
+            query: "why sqlite".to_owned(),
+            mode: Some(SearchMode::Semantic),
+            limit: Some(5),
+            include_archived: Some(false),
+            tags_filter: Some(vec!["architecture".to_owned()]),
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert_eq!(recall.schema_version, MEMORY_SCHEMA_VERSION);
+    assert_eq!(recall.mode_requested, SearchMode::Semantic);
+    assert_eq!(recall.mode_used, SearchMode::Lexical);
+    assert_eq!(
+        recall.fallback_reason.as_deref(),
+        Some(SEARCH_FALLBACK_EMBEDDINGS_DISABLED)
+    );
+    assert_eq!(recall.result_count, 1);
+    assert_eq!(recall.notes[0].note_id, first.note_id);
+    assert_eq!(
+        recall.notes[0].tags,
+        vec!["architecture".to_owned(), "database".to_owned()]
+    );
+
+    Ok(())
+}
+
+#[test]
+fn mcp_memory_tool_response_schema_shapes_are_stable() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+
+    let remember = rt
+        .block_on(server.aether_remember(Parameters(AetherRememberRequest {
+            content: "Design rationale note".to_owned(),
+            tags: Some(vec!["design".to_owned()]),
+            entity_refs: None,
+            file_refs: None,
+            symbol_refs: None,
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    let remember_json = serde_json::to_value(&remember)?;
+    let remember_obj = remember_json
+        .as_object()
+        .expect("remember response should serialize as object");
+    for key in [
+        "schema_version",
+        "note_id",
+        "action",
+        "content_hash",
+        "tags",
+        "created_at",
+    ] {
+        assert!(remember_obj.contains_key(key), "missing key: {key}");
+    }
+
+    let recall = rt
+        .block_on(server.aether_recall(Parameters(AetherRecallRequest {
+            query: "design".to_owned(),
+            mode: Some(SearchMode::Lexical),
+            limit: Some(5),
+            include_archived: Some(false),
+            tags_filter: None,
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    let recall_json = serde_json::to_value(&recall)?;
+    let recall_obj = recall_json
+        .as_object()
+        .expect("recall response should serialize as object");
+    for key in [
+        "schema_version",
+        "query",
+        "mode_requested",
+        "mode_used",
+        "fallback_reason",
+        "result_count",
+        "notes",
+    ] {
+        assert!(recall_obj.contains_key(key), "missing key: {key}");
+    }
 
     Ok(())
 }

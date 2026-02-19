@@ -15,6 +15,12 @@ use aether_infer::{
     EmbeddingProviderOverrides, RerankCandidate, RerankerProvider, RerankerProviderOverrides,
     load_embedding_provider_from_config, load_reranker_provider_from_config,
 };
+use aether_memory::{
+    EntityRef as MemoryEntityRef, NoteEmbeddingRequest as MemoryNoteEmbeddingRequest,
+    NoteSourceType as MemoryNoteSourceType, ProjectMemoryService,
+    RecallRequest as MemoryRecallRequest, RememberRequest as MemoryRememberRequest,
+    SemanticQuery as MemorySemanticQuery, truncate_content_for_embedding,
+};
 use aether_parse::{SymbolExtractor, language_for_path};
 use aether_sir::{
     FileSir, SirAnnotation, SirError, SirLevel, canonicalize_file_sir_json, canonicalize_sir_json,
@@ -42,6 +48,7 @@ pub const SERVER_NAME: &str = "aether";
 pub const SERVER_VERSION: &str = "0.1.0";
 pub const SERVER_DESCRIPTION: &str = "AETHER local symbol/SIR lookup from .aether store";
 pub const MCP_SCHEMA_VERSION: u32 = 1;
+pub const MEMORY_SCHEMA_VERSION: &str = "1.0";
 
 #[derive(Debug, Error)]
 pub enum AetherMcpError {
@@ -55,6 +62,8 @@ pub enum AetherMcpError {
     Infer(#[from] aether_infer::InferError),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("memory error: {0}")]
+    Memory(#[from] aether_memory::MemoryError),
     #[error("sir validation error: {0}")]
     Sir(#[from] SirError),
     #[error("{0}")]
@@ -148,6 +157,64 @@ pub struct AetherSearchResponse {
     pub fallback_reason: Option<String>,
     pub result_count: u32,
     pub matches: Vec<AetherSymbolLookupMatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherMemoryEntityRef {
+    pub kind: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherRememberRequest {
+    pub content: String,
+    pub tags: Option<Vec<String>>,
+    pub entity_refs: Option<Vec<AetherMemoryEntityRef>>,
+    pub file_refs: Option<Vec<String>>,
+    pub symbol_refs: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherRememberResponse {
+    pub schema_version: String,
+    pub note_id: String,
+    pub action: String,
+    pub content_hash: String,
+    pub tags: Vec<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherRecallRequest {
+    pub query: String,
+    pub mode: Option<SearchMode>,
+    pub limit: Option<u32>,
+    pub include_archived: Option<bool>,
+    pub tags_filter: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherRecallNote {
+    pub note_id: String,
+    pub content: String,
+    pub tags: Vec<String>,
+    pub file_refs: Vec<String>,
+    pub symbol_refs: Vec<String>,
+    pub source_type: String,
+    pub created_at: i64,
+    pub access_count: i64,
+    pub relevance_score: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherRecallResponse {
+    pub schema_version: String,
+    pub query: String,
+    pub mode_requested: SearchMode,
+    pub mode_used: SearchMode,
+    pub fallback_reason: Option<String>,
+    pub result_count: u32,
+    pub notes: Vec<AetherRecallNote>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -806,6 +873,171 @@ impl AetherMcpServer {
             limit,
             envelope,
         ))
+    }
+
+    pub async fn aether_remember_logic(
+        &self,
+        request: AetherRememberRequest,
+    ) -> Result<AetherRememberResponse, AetherMcpError> {
+        let memory = ProjectMemoryService::new(&self.workspace);
+        let entity_refs = request
+            .entity_refs
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entity| MemoryEntityRef {
+                kind: entity.kind,
+                id: entity.id,
+            })
+            .collect::<Vec<_>>();
+
+        let remember = memory.remember(MemoryRememberRequest {
+            content: request.content,
+            source_type: MemoryNoteSourceType::Agent,
+            source_agent: Some("aether_mcp".to_owned()),
+            tags: request.tags.unwrap_or_default(),
+            entity_refs,
+            file_refs: request.file_refs.unwrap_or_default(),
+            symbol_refs: request.symbol_refs.unwrap_or_default(),
+            now_ms: None,
+        })?;
+
+        if remember.action == aether_memory::RememberAction::Created {
+            match load_embedding_provider_from_config(
+                &self.workspace,
+                EmbeddingProviderOverrides::default(),
+            ) {
+                Ok(Some(loaded)) => {
+                    let content = truncate_content_for_embedding(remember.note.content.as_str());
+                    match loaded.provider.embed_text(content.as_str()).await {
+                        Ok(embedding) if !embedding.is_empty() => {
+                            if let Err(err) = memory
+                                .upsert_note_embedding(MemoryNoteEmbeddingRequest {
+                                    note_id: remember.note.note_id.clone(),
+                                    provider: loaded.provider_name,
+                                    model: loaded.model_name,
+                                    embedding,
+                                    content: remember.note.content.clone(),
+                                    created_at: remember.note.created_at,
+                                    updated_at: Some(remember.note.updated_at),
+                                })
+                                .await
+                            {
+                                tracing::warn!(
+                                    error = %err,
+                                    "failed to persist note embedding after remember"
+                                );
+                            }
+                        }
+                        Ok(_) => tracing::warn!(
+                            "embedding provider returned empty vector while indexing project note"
+                        ),
+                        Err(err) => tracing::warn!(
+                            error = %err,
+                            "embedding provider error while indexing project note"
+                        ),
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    "failed to load embedding provider for project note indexing"
+                ),
+            }
+        }
+
+        Ok(AetherRememberResponse {
+            schema_version: MEMORY_SCHEMA_VERSION.to_owned(),
+            note_id: remember.note.note_id,
+            action: remember.action.as_str().to_owned(),
+            content_hash: remember.note.content_hash,
+            tags: remember.note.tags,
+            created_at: remember.note.created_at,
+        })
+    }
+
+    pub async fn aether_recall_logic(
+        &self,
+        request: AetherRecallRequest,
+    ) -> Result<AetherRecallResponse, AetherMcpError> {
+        let mode = request.mode.unwrap_or(SearchMode::Hybrid);
+        let limit = request.limit.unwrap_or(5).clamp(1, 100);
+
+        let mut semantic_query = None;
+        let mut semantic_fallback_reason = None;
+        if !matches!(mode, SearchMode::Lexical) {
+            match load_embedding_provider_from_config(
+                &self.workspace,
+                EmbeddingProviderOverrides::default(),
+            ) {
+                Ok(Some(loaded)) => {
+                    match loaded.provider.embed_text(request.query.as_str()).await {
+                        Ok(embedding) if !embedding.is_empty() => {
+                            semantic_query = Some(MemorySemanticQuery {
+                                provider: loaded.provider_name,
+                                model: loaded.model_name,
+                                embedding,
+                            });
+                        }
+                        Ok(_) => {
+                            semantic_fallback_reason =
+                                Some(SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR.to_owned())
+                        }
+                        Err(err) => {
+                            semantic_fallback_reason =
+                                Some(format!("embedding provider error: {err}"))
+                        }
+                    }
+                }
+                Ok(None) => {
+                    semantic_fallback_reason = Some(SEARCH_FALLBACK_EMBEDDINGS_DISABLED.to_owned())
+                }
+                Err(err) => {
+                    semantic_fallback_reason =
+                        Some(format!("failed to load embedding provider: {err}"))
+                }
+            }
+        }
+
+        let memory = ProjectMemoryService::new(&self.workspace);
+        let result = memory
+            .recall(MemoryRecallRequest {
+                query: request.query.clone(),
+                mode,
+                limit,
+                include_archived: request.include_archived.unwrap_or(false),
+                tags_filter: request.tags_filter.unwrap_or_default(),
+                now_ms: None,
+                semantic: semantic_query,
+                semantic_fallback_reason,
+            })
+            .await?;
+
+        let notes = result
+            .notes
+            .into_iter()
+            .map(|entry| AetherRecallNote {
+                note_id: entry.note.note_id,
+                content: entry.note.content,
+                tags: entry.note.tags,
+                file_refs: entry.note.file_refs,
+                symbol_refs: entry.note.symbol_refs,
+                source_type: entry.note.source_type,
+                created_at: entry.note.created_at,
+                access_count: entry.note.access_count,
+                relevance_score: entry.relevance_score,
+            })
+            .collect::<Vec<_>>();
+        let result_count = notes.len() as u32;
+
+        Ok(AetherRecallResponse {
+            schema_version: MEMORY_SCHEMA_VERSION.to_owned(),
+            query: request.query,
+            mode_requested: result.mode_requested,
+            mode_used: result.mode_used,
+            fallback_reason: result.fallback_reason,
+            result_count,
+            notes,
+        })
     }
 
     pub fn aether_symbol_timeline_logic(
@@ -1825,6 +2057,36 @@ impl AetherMcpServer {
     ) -> Result<Json<AetherSearchResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_search");
         self.aether_search_logic(request)
+            .await
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_remember",
+        description = "Store project memory note content with deterministic deduplication"
+    )]
+    pub async fn aether_remember(
+        &self,
+        Parameters(request): Parameters<AetherRememberRequest>,
+    ) -> Result<Json<AetherRememberResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_remember");
+        self.aether_remember_logic(request)
+            .await
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_recall",
+        description = "Recall project memory notes using lexical, semantic, or hybrid retrieval"
+    )]
+    pub async fn aether_recall(
+        &self,
+        Parameters(request): Parameters<AetherRecallRequest>,
+    ) -> Result<Json<AetherRecallResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_recall");
+        self.aether_recall_logic(request)
             .await
             .map(Json)
             .map_err(to_mcp_error)

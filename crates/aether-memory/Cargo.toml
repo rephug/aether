@@ -1,0 +1,15 @@
+[package]
+name = "aether-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aether-core = { path = "../aether-core" }
+aether-store = { path = "../aether-store" }
+aether-config = { path = "../aether-config" }
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+thiserror.workspace = true

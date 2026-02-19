@@ -849,8 +849,9 @@ fn default_cohere_api_key_env() -> String {
 
 fn default_verify_commands() -> Vec<String> {
     vec![
-        "cargo test".to_owned(),
+        "cargo fmt --all --check".to_owned(),
         "cargo clippy --workspace -- -D warnings".to_owned(),
+        "cargo test --workspace".to_owned(),
     ]
 }
 
@@ -1075,8 +1076,9 @@ mod tests {
         assert_eq!(
             config.verify.commands,
             vec![
-                "cargo test".to_owned(),
-                "cargo clippy --workspace -- -D warnings".to_owned()
+                "cargo fmt --all --check".to_owned(),
+                "cargo clippy --workspace -- -D warnings".to_owned(),
+                "cargo test --workspace".to_owned()
             ]
         );
         assert_eq!(config.verify.mode, VerifyMode::Host);
@@ -1150,8 +1152,9 @@ mod tests {
         assert!(content.contains("workdir = \"/workspace\""));
         assert!(content.contains("vcpu_count = 1"));
         assert!(content.contains("memory_mib = 1024"));
-        assert!(content.contains("\"cargo test\""));
+        assert!(content.contains("\"cargo fmt --all --check\""));
         assert!(content.contains("\"cargo clippy --workspace -- -D warnings\""));
+        assert!(content.contains("\"cargo test --workspace\""));
     }
 
     #[test]
@@ -1274,7 +1277,7 @@ fallback_to_host_on_unavailable = true
             config.verify.commands,
             vec![
                 "cargo test".to_owned(),
-                "cargo clippy --workspace -- -D warnings".to_owned()
+                "cargo clippy --workspace -- -D warnings".to_owned(),
             ]
         );
         assert_eq!(config.verify.mode, VerifyMode::Microvm);
