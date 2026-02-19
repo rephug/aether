@@ -8,10 +8,11 @@ Tune vector search gating per language so that semantic search returns relevant 
 - The threshold is the same for all languages, all providers, all embedding dimensions
 - No per-language or per-provider calibration exists
 - Hybrid search RRF fusion doesn't use thresholds directly but the semantic candidate set is gated by the threshold
+- CLI uses flags (`--download-models`, `--workspace`, `--lsp`, `--search`, etc.), NOT subcommands
 
 ## Target implementation
 - Per-language similarity thresholds stored in config and calibrated at index time
-- A `calibrate` command computes optimal thresholds by analyzing the embedding distribution of the indexed codebase
+- A `--calibrate` flag computes optimal thresholds by analyzing the embedding distribution of the indexed codebase
 - Config allows manual override per language
 - Thresholds auto-adjust when switching embedding providers (since different models produce different similarity distributions)
 
@@ -29,10 +30,10 @@ Tune vector search gating per language so that semantic search returns relevant 
   - Compute pairwise cosine similarity distribution
   - Set threshold at a percentile that separates "same-module" pairs from "cross-module" pairs
   - Store calibrated thresholds in `.aether/config.toml` (user can override)
-- Add `aether calibrate` CLI command:
+- Add `--calibrate` CLI flag to `aetherd`:
   ```bash
   # Calibrate thresholds for the current codebase
-  aether calibrate
+  aetherd --workspace . --calibrate
 
   # Output:
   # Calibrated thresholds:
@@ -60,10 +61,11 @@ Tune vector search gating per language so that semantic search returns relevant 
 - Invalidate calibration when embedding provider changes (different model = different distribution)
 
 ## Out of scope
-- Automatic re-calibration (user must run `aether calibrate` manually or after provider switch)
+- Automatic re-calibration (user must run `--calibrate` manually or after provider switch)
 - Per-symbol or per-file thresholds (too granular)
 - Calibration for reranker scores (reranker produces absolute relevance scores, not similarity)
 - Threshold tuning for lexical search (lexical search doesn't use similarity scores)
+- CLI refactor to subcommands (flag-based CLI preserved)
 
 ## Implementation notes
 
@@ -98,7 +100,7 @@ When the embedding provider changes (e.g., `gemini` → `candle`), existing thre
 
 The `threshold_calibration` table stores which provider/model was used. On provider change:
 1. Log warning: "Embedding provider changed from X to Y. Thresholds may be inaccurate."
-2. Use default thresholds until user runs `aether calibrate`
+2. Use default thresholds until user runs `aetherd --workspace . --calibrate`
 3. Or auto-calibrate if enough embeddings exist in the new provider's vector table
 
 ### Search flow with thresholds
@@ -132,16 +134,16 @@ If searching across all languages (no hint):
 | Scenario | Behavior |
 |----------|----------|
 | Fewer than 20 symbols for a language | Use default threshold, skip calibration for that language |
-| No embeddings exist yet (new project) | Use default thresholds, suggest running `aether calibrate` after indexing |
+| No embeddings exist yet (new project) | Use default thresholds, suggest running `--calibrate` after indexing |
 | Embedding provider changed | Warn and use defaults until re-calibration |
 | User manually sets threshold in config | Manual value takes precedence over calibration |
 | Mixed-language search query | Use minimum threshold across all languages, post-filter |
 | Calibration produces extreme value (<0.3 or >0.95) | Clamp to [0.3, 0.95] range |
-| `aether calibrate` run with no indexed symbols | Report "no symbols to calibrate" and exit |
+| `--calibrate` run with no indexed symbols | Report "no symbols to calibrate" and exit |
 
 ## Pass criteria
 1. Per-language thresholds are configurable in `[search.thresholds]`.
-2. `aether calibrate` computes thresholds from the indexed codebase and writes to config.
+2. `aetherd --workspace . --calibrate` computes thresholds from the indexed codebase and writes to config.
 3. Semantic search uses per-language thresholds (not a single global threshold).
 4. Threshold calibration records which provider/model was used.
 5. Changing embedding provider triggers a threshold invalidation warning.
@@ -164,14 +166,19 @@ CRITICAL BUILD SETTINGS — use these for ALL cargo commands in this session:
 - PROTOC=$(which protoc)
 - Do NOT use /tmp/ for any build artifacts — /tmp/ is RAM-backed (tmpfs) in WSL2.
 
+NOTE: The current CLI uses flags (--workspace, --lsp, --search, --download-models, etc.), NOT subcommands.
+Add --calibrate as a flag, not a subcommand. Do not refactor the CLI parser.
+
 You are working in the repo root of https://github.com/rephug/aether.
 
 Read these files for context first:
 - docs/roadmap/phase_5_stage_5_5_adaptive_thresholds.md (this file)
 - crates/aetherd/src/search.rs (search pipeline, where thresholds are applied)
+- crates/aetherd/src/main.rs (CLI flags — add --calibrate here)
 - crates/aether-store/src/vector.rs (VectorStore trait, search_nearest method)
 - crates/aether-config/src/lib.rs (config schema)
 - crates/aether-store/src/lib.rs (Store trait, SQLite schema)
+- crates/aether-infer/src/lib.rs (embedding provider info for calibration metadata)
 
 1) Ensure working tree is clean. If not, stop and report dirty files.
 2) Create branch feature/phase5-stage5-5-adaptive-thresholds off main.
@@ -187,7 +194,7 @@ Read these files for context first:
    - Calculate optimal threshold per language
    - Clamp to [0.3, 0.95]
    - Store in threshold_calibration table and write to config
-7) Add `aether calibrate` CLI subcommand.
+7) Add --calibrate flag to aetherd CLI (requires --workspace, conflicts with --search/--lsp/--index/--download-models).
 8) Update semantic search in search.rs to use per-language thresholds:
    - Get language hint from query context
    - Apply appropriate threshold before returning results
