@@ -2,17 +2,22 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use aether_config::{
-    AETHER_DIR_NAME, DEFAULT_GEMINI_API_KEY_ENV, DEFAULT_QWEN_EMBEDDING_ENDPOINT,
-    DEFAULT_QWEN_ENDPOINT, DEFAULT_QWEN_MODEL, EmbeddingProviderKind, InferenceProviderKind,
-    ensure_workspace_config,
+    AETHER_DIR_NAME, DEFAULT_COHERE_API_KEY_ENV, DEFAULT_GEMINI_API_KEY_ENV,
+    DEFAULT_QWEN_EMBEDDING_ENDPOINT, DEFAULT_QWEN_ENDPOINT, DEFAULT_QWEN_MODEL,
+    EmbeddingProviderKind, InferenceProviderKind, SearchRerankerKind, ensure_workspace_config,
 };
 use aether_sir::{SirAnnotation, validate_sir};
 use async_trait::async_trait;
 use embedding::candle::CandleEmbeddingProvider;
+use reranker::candle::CandleRerankerProvider;
+use reranker::cohere::CohereRerankerProvider;
 use serde_json::{Value, json};
 use thiserror::Error;
 
 mod embedding;
+mod reranker;
+
+pub use reranker::{MockRerankerProvider, RerankCandidate, RerankResult, RerankerProvider};
 
 pub const GEMINI_API_KEY_ENV: &str = DEFAULT_GEMINI_API_KEY_ENV;
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -44,6 +49,13 @@ pub struct EmbeddingProviderOverrides {
     pub candle_model_dir: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RerankerProviderOverrides {
+    pub provider: Option<SearchRerankerKind>,
+    pub candle_model_dir: Option<String>,
+    pub cohere_api_key_env: Option<String>,
+}
+
 pub struct LoadedProvider {
     pub provider: Box<dyn InferenceProvider>,
     pub provider_name: String,
@@ -56,10 +68,18 @@ pub struct LoadedEmbeddingProvider {
     pub model_name: String,
 }
 
+pub struct LoadedRerankerProvider {
+    pub provider: Box<dyn RerankerProvider>,
+    pub provider_name: String,
+    pub model_name: String,
+}
+
 #[derive(Debug, Error)]
 pub enum InferError {
     #[error("missing Gemini API key in {0}")]
     MissingApiKey(String),
+    #[error("missing Cohere API key in {0}")]
+    MissingCohereApiKey(String),
     #[error("config load failed: {0}")]
     Config(#[from] aether_config::ConfigError),
     #[error("request failed: {0}")]
@@ -425,6 +445,51 @@ pub fn load_embedding_provider_from_config(
     Ok(Some(loaded))
 }
 
+pub fn load_reranker_provider_from_config(
+    workspace_root: impl AsRef<Path>,
+    overrides: RerankerProviderOverrides,
+) -> Result<Option<LoadedRerankerProvider>, InferError> {
+    let workspace_root = workspace_root.as_ref();
+    let config = ensure_workspace_config(workspace_root)?;
+    let selected_provider = overrides.provider.unwrap_or(config.search.reranker);
+    let selected_candle_model_dir = first_non_empty(
+        overrides.candle_model_dir,
+        first_non_empty(
+            config.search.candle.model_dir.clone(),
+            config.embeddings.candle.model_dir.clone(),
+        ),
+    )
+    .map(PathBuf::from);
+    let selected_cohere_api_key_env = first_non_empty(
+        overrides.cohere_api_key_env,
+        Some(config.providers.cohere.api_key_env.clone()),
+    )
+    .unwrap_or_else(|| DEFAULT_COHERE_API_KEY_ENV.to_owned());
+
+    let loaded = match selected_provider {
+        SearchRerankerKind::None => return Ok(None),
+        SearchRerankerKind::Candle => {
+            let model_dir = resolve_candle_model_dir(workspace_root, selected_candle_model_dir);
+            let provider = CandleRerankerProvider::new(model_dir);
+            LoadedRerankerProvider {
+                model_name: provider.model_name().to_owned(),
+                provider_name: provider.provider_name().to_owned(),
+                provider: Box::new(provider),
+            }
+        }
+        SearchRerankerKind::Cohere => {
+            let provider = CohereRerankerProvider::from_env(&selected_cohere_api_key_env)?;
+            LoadedRerankerProvider {
+                model_name: provider.model_name().to_owned(),
+                provider_name: provider.provider_name().to_owned(),
+                provider: Box::new(provider),
+            }
+        }
+    };
+
+    Ok(Some(loaded))
+}
+
 pub fn download_candle_embedding_model(
     workspace_root: impl AsRef<Path>,
     model_dir_override: Option<PathBuf>,
@@ -436,6 +501,21 @@ pub fn download_candle_embedding_model(
     let model_dir = resolve_candle_model_dir(workspace_root, configured_model_dir);
 
     let provider = CandleEmbeddingProvider::new(model_dir);
+    provider.ensure_model_downloaded()
+}
+
+pub fn download_candle_reranker_model(
+    workspace_root: impl AsRef<Path>,
+    model_dir_override: Option<PathBuf>,
+) -> Result<PathBuf, InferError> {
+    let workspace_root = workspace_root.as_ref();
+    let config = ensure_workspace_config(workspace_root)?;
+    let configured_model_dir = model_dir_override
+        .or_else(|| config.search.candle.model_dir.map(PathBuf::from))
+        .or_else(|| config.embeddings.candle.model_dir.map(PathBuf::from));
+    let model_dir = resolve_candle_model_dir(workspace_root, configured_model_dir);
+
+    let provider = CandleRerankerProvider::new(model_dir);
     provider.ensure_model_downloaded()
 }
 
@@ -711,7 +791,9 @@ fn read_env_non_empty(name: &str) -> Option<String> {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use aether_config::{EmbeddingProviderKind, InferenceProviderKind, ensure_workspace_config};
+    use aether_config::{
+        EmbeddingProviderKind, InferenceProviderKind, SearchRerankerKind, ensure_workspace_config,
+    };
     use tempfile::tempdir;
 
     use super::*;
@@ -885,6 +967,84 @@ model_dir = ".aether/models"
         // SAFETY: cleanup of test-scoped environment variable.
         unsafe {
             env::remove_var(env_name);
+        }
+    }
+
+    #[test]
+    fn load_reranker_provider_defaults_to_none() {
+        let temp = tempdir().expect("tempdir");
+        ensure_workspace_config(temp.path()).expect("ensure config");
+
+        let loaded =
+            load_reranker_provider_from_config(temp.path(), RerankerProviderOverrides::default())
+                .expect("load reranker provider");
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn load_reranker_provider_reads_enabled_candle_settings() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        ensure_workspace_config(workspace).expect("ensure config");
+
+        std::fs::write(
+            workspace.join(".aether/config.toml"),
+            r#"[search]
+reranker = "candle"
+
+[search.candle]
+model_dir = ".aether/models"
+"#,
+        )
+        .expect("write config");
+
+        let loaded =
+            load_reranker_provider_from_config(workspace, RerankerProviderOverrides::default())
+                .expect("load reranker provider")
+                .expect("reranker provider should be enabled");
+
+        assert_eq!(loaded.provider_name, SearchRerankerKind::Candle.as_str());
+        assert_eq!(loaded.model_name, "qwen3-reranker-0.6b");
+    }
+
+    #[test]
+    fn load_reranker_provider_requires_cohere_api_key() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        ensure_workspace_config(workspace).expect("ensure config");
+
+        std::fs::write(
+            workspace.join(".aether/config.toml"),
+            r#"[search]
+reranker = "cohere"
+"#,
+        )
+        .expect("write config");
+
+        let env_name = format!(
+            "AETHER_TEST_COHERE_KEY_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        );
+        // SAFETY: test-scoped environment variable with unique name.
+        unsafe {
+            env::remove_var(&env_name);
+        }
+
+        let result = load_reranker_provider_from_config(
+            workspace,
+            RerankerProviderOverrides {
+                cohere_api_key_env: Some(env_name.clone()),
+                ..RerankerProviderOverrides::default()
+            },
+        );
+
+        match result {
+            Err(InferError::MissingCohereApiKey(var)) => assert_eq!(var, env_name),
+            _ => panic!("expected missing cohere key error"),
         }
     }
 }

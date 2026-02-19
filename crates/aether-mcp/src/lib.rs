@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aether_config::{VerifyMode, load_workspace_config};
+use aether_config::{SearchRerankerKind, VerifyMode, load_workspace_config};
 pub use aether_core::SearchMode;
 use aether_core::{
     HoverMarkdownSections, Language, NO_SIR_MESSAGE, SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR,
@@ -11,7 +11,10 @@ use aether_core::{
     SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY, SearchEnvelope, SourceRange,
     format_hover_markdown_sections, normalize_path, stable_symbol_id, stale_warning_message,
 };
-use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
+use aether_infer::{
+    EmbeddingProviderOverrides, RerankCandidate, RerankerProvider, RerankerProviderOverrides,
+    load_embedding_provider_from_config, load_reranker_provider_from_config,
+};
 use aether_parse::{SymbolExtractor, language_for_path};
 use aether_sir::{
     FileSir, SirAnnotation, SirError, SirLevel, canonicalize_file_sir_json, canonicalize_sir_json,
@@ -730,6 +733,11 @@ impl AetherMcpServer {
         let mode_requested = request.mode.unwrap_or_default();
         let limit = effective_limit(request.limit);
         let lexical = self.lexical_search_matches(&request.query, limit)?;
+        let search_config = load_workspace_config(&self.workspace).map_err(|err| {
+            AetherMcpError::Message(format!("failed to load workspace config: {err}"))
+        })?;
+        let reranker_kind = search_config.search.reranker;
+        let rerank_window = search_config.search.rerank_window;
 
         let envelope = match mode_requested {
             SearchMode::Lexical => SearchEnvelope {
@@ -768,11 +776,26 @@ impl AetherMcpServer {
                         matches: lexical,
                     }
                 } else {
+                    let fuse_limit = if matches!(reranker_kind, SearchRerankerKind::None) {
+                        limit
+                    } else {
+                        rerank_window.max(limit).clamp(1, 200)
+                    };
+                    let fused = fuse_hybrid_matches(&lexical, &semantic, fuse_limit);
+                    let matches = self
+                        .maybe_rerank_hybrid_matches(
+                            &request.query,
+                            limit,
+                            fused,
+                            reranker_kind,
+                            rerank_window,
+                        )
+                        .await?;
                     SearchEnvelope {
                         mode_requested: SearchMode::Hybrid,
                         mode_used: SearchMode::Hybrid,
                         fallback_reason: None,
-                        matches: fuse_hybrid_matches(&lexical, &semantic, limit),
+                        matches,
                     }
                 }
             }
@@ -1071,6 +1094,161 @@ impl AetherMcpServer {
         }
 
         Ok((matches, None))
+    }
+
+    async fn maybe_rerank_hybrid_matches(
+        &self,
+        query: &str,
+        limit: u32,
+        fused_matches: Vec<AetherSymbolLookupMatch>,
+        reranker_kind: SearchRerankerKind,
+        rerank_window: u32,
+    ) -> Result<Vec<AetherSymbolLookupMatch>, AetherMcpError> {
+        if fused_matches.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let limit = limit.clamp(1, 100) as usize;
+        if matches!(reranker_kind, SearchRerankerKind::None) {
+            return Ok(fused_matches.into_iter().take(limit).collect());
+        }
+
+        let fallback = fused_matches
+            .iter()
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        let loaded = match load_reranker_provider_from_config(
+            &self.workspace,
+            RerankerProviderOverrides::default(),
+        ) {
+            Ok(Some(loaded)) => loaded,
+            Ok(None) => return Ok(fallback),
+            Err(err) => {
+                tracing::warn!(error = %err, "reranker unavailable, falling back to RRF matches");
+                return Ok(fallback);
+            }
+        };
+
+        match self
+            .rerank_matches_with_provider(
+                query,
+                limit,
+                rerank_window,
+                &fused_matches,
+                loaded.provider.as_ref(),
+            )
+            .await
+        {
+            Ok(matches) => Ok(matches),
+            Err(err) => {
+                tracing::warn!(
+                    provider = %loaded.provider_name,
+                    error = %err,
+                    "reranker failed, falling back to RRF matches"
+                );
+                Ok(fallback)
+            }
+        }
+    }
+
+    async fn rerank_matches_with_provider(
+        &self,
+        query: &str,
+        limit: usize,
+        rerank_window: u32,
+        fused_matches: &[AetherSymbolLookupMatch],
+        provider: &dyn RerankerProvider,
+    ) -> Result<Vec<AetherSymbolLookupMatch>, AetherMcpError> {
+        if fused_matches.is_empty() || query.trim().is_empty() || limit == 0 {
+            return Ok(fused_matches.iter().take(limit).cloned().collect());
+        }
+
+        let store = SqliteStore::open(&self.workspace)?;
+        let window = rerank_window.max(limit as u32).clamp(1, 200) as usize;
+        let candidate_matches = fused_matches
+            .iter()
+            .take(window.min(fused_matches.len()))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut rerank_candidates = Vec::with_capacity(candidate_matches.len());
+        for candidate in &candidate_matches {
+            rerank_candidates.push(RerankCandidate {
+                id: candidate.symbol_id.clone(),
+                text: self.rerank_candidate_text(&store, candidate)?,
+            });
+        }
+
+        let reranked = provider.rerank(query, &rerank_candidates, limit).await?;
+
+        let mut resolved = Vec::with_capacity(limit.min(candidate_matches.len()));
+        let mut used = HashSet::new();
+
+        for result in &reranked {
+            if let Some(row) = candidate_matches.get(result.original_rank)
+                && row.symbol_id == result.id
+                && used.insert(row.symbol_id.clone())
+            {
+                resolved.push(row.clone());
+                if resolved.len() >= limit {
+                    break;
+                }
+                continue;
+            }
+
+            if let Some(row) = candidate_matches
+                .iter()
+                .find(|row| row.symbol_id == result.id && !used.contains(&row.symbol_id))
+            {
+                used.insert(row.symbol_id.clone());
+                resolved.push(row.clone());
+                if resolved.len() >= limit {
+                    break;
+                }
+            }
+        }
+
+        for row in fused_matches {
+            if resolved.len() >= limit {
+                break;
+            }
+            if used.insert(row.symbol_id.clone()) {
+                resolved.push(row.clone());
+            }
+        }
+
+        Ok(resolved)
+    }
+
+    fn rerank_candidate_text(
+        &self,
+        store: &SqliteStore,
+        row: &AetherSymbolLookupMatch,
+    ) -> Result<String, AetherMcpError> {
+        let fallback = format!(
+            "qualified_name: {}\nkind: {}\nfile_path: {}",
+            row.qualified_name, row.kind, row.file_path
+        );
+
+        let Some(blob) = store.read_sir_blob(&row.symbol_id)? else {
+            return Ok(fallback);
+        };
+
+        let Ok(value) = serde_json::from_str::<Value>(&blob) else {
+            return Ok(fallback);
+        };
+
+        let Some(intent) = value
+            .get("intent")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(fallback);
+        };
+
+        Ok(format!("{intent}\n{fallback}"))
     }
 
     pub fn aether_get_sir_logic(
