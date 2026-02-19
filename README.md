@@ -217,6 +217,32 @@ Stable MCP response fields for scripting/agents:
 
 Search fallback reasons are intentionally aligned between CLI and MCP.
 
+## Agent Integration
+
+AETHER can generate configuration files that teach AI coding agents how to use your project-local code intelligence.
+
+### Quick Setup
+
+```bash
+# Generate agent config files for all supported platforms
+aetherd --workspace . init-agent
+
+# Generate for a specific platform only
+aetherd --workspace . init-agent --platform claude
+```
+
+Generated files:
+- `CLAUDE.md` for Claude Code guidance
+- `.agents/skills/aether-context/SKILL.md` for the AETHER skill workflow
+- `.codex-instructions` for OpenAI Codex CLI guidance
+- `.cursor/rules` for Cursor guidance
+
+Generated content is config-aware and reflects `.aether/config.toml` values such as verify commands, search capability, and provider configuration.
+
+### Updating After Config Changes
+
+Re-run `aetherd --workspace . init-agent --force` after changing AETHER configuration to regenerate and overwrite existing agent files.
+
 ## Configuration
 
 AETHER uses project-local config at:

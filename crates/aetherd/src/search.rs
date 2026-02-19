@@ -1571,10 +1571,6 @@ mod tests {
         assert!(beta_after_remove.is_empty());
     }
 
-    fn write_embeddings_enabled_config(workspace: &Path) {
-        write_embeddings_enabled_config_with_backend(workspace, "sqlite");
-    }
-
     fn write_embeddings_enabled_config_with_backend(workspace: &Path, vector_backend: &str) {
         write_embeddings_enabled_config_with_thresholds(
             workspace,
