@@ -1198,10 +1198,10 @@ fn parse_window_spec(value: &str) -> WindowSpec {
             return WindowSpec::SinceCommit(commit);
         }
     }
-    if let Some(days) = trimmed.strip_suffix('d') {
-        if let Ok(days) = days.trim().parse::<u32>() {
-            return WindowSpec::Days(days.max(1));
-        }
+    if let Some(days) = trimmed.strip_suffix('d')
+        && let Ok(days) = days.trim().parse::<u32>()
+    {
+        return WindowSpec::Days(days.max(1));
     }
     let first_token = trimmed.split_whitespace().next().unwrap_or_default();
     let commits = first_token.parse::<u32>().unwrap_or(100).max(1);
@@ -1241,12 +1241,12 @@ fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
 
 fn field_string(value: &Value, keys: &[&str]) -> String {
     for key in keys {
-        if let Some(field) = value.get(*key) {
-            if let Some(text) = field.as_str() {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    return trimmed.to_owned();
-                }
+        if let Some(field) = value.get(*key)
+            && let Some(text) = field.as_str()
+        {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_owned();
             }
         }
     }
