@@ -499,6 +499,70 @@ pub fn load_provider_from_env_or_mock(
     }
 }
 
+pub async fn summarize_text_with_config(
+    workspace_root: impl AsRef<Path>,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<Option<String>, InferError> {
+    let workspace_root = workspace_root.as_ref();
+    let config = ensure_workspace_config(workspace_root)?;
+    let selected_provider = config.inference.provider;
+    let selected_model = config.inference.model;
+    let selected_endpoint = config.inference.endpoint;
+    let selected_api_key_env = config.inference.api_key_env;
+    let system_prompt = system_prompt.trim();
+    let user_prompt = user_prompt.trim();
+    if system_prompt.is_empty() || user_prompt.is_empty() {
+        return Ok(None);
+    }
+
+    match selected_provider {
+        InferenceProviderKind::Mock => Ok(None),
+        InferenceProviderKind::Auto => {
+            let Some(api_key) = read_env_non_empty(selected_api_key_env.as_str()) else {
+                return Ok(None);
+            };
+            let model = resolve_gemini_model(selected_model);
+            let summary = request_gemini_summary(
+                api_key.as_str(),
+                model.as_str(),
+                system_prompt,
+                user_prompt,
+            )
+            .await?;
+            Ok(clean_summary(summary))
+        }
+        InferenceProviderKind::Gemini => {
+            let Some(api_key) = read_env_non_empty(selected_api_key_env.as_str()) else {
+                return Ok(None);
+            };
+            let model = resolve_gemini_model(selected_model);
+            let summary = request_gemini_summary(
+                api_key.as_str(),
+                model.as_str(),
+                system_prompt,
+                user_prompt,
+            )
+            .await?;
+            Ok(clean_summary(summary))
+        }
+        InferenceProviderKind::Qwen3Local => {
+            let endpoint = normalize_optional(selected_endpoint)
+                .unwrap_or_else(|| DEFAULT_QWEN_ENDPOINT.to_owned());
+            let model =
+                normalize_optional(selected_model).unwrap_or_else(|| DEFAULT_QWEN_MODEL.to_owned());
+            let summary = request_qwen_summary(
+                endpoint.as_str(),
+                model.as_str(),
+                system_prompt,
+                user_prompt,
+            )
+            .await?;
+            Ok(clean_summary(summary))
+        }
+    }
+}
+
 pub fn load_embedding_provider_from_config(
     workspace_root: impl AsRef<Path>,
     overrides: EmbeddingProviderOverrides,
@@ -660,6 +724,17 @@ fn build_ollama_generate_body(model: &str, prompt: &str) -> Value {
     })
 }
 
+fn build_ollama_text_generate_body(model: &str, prompt: &str) -> Value {
+    json!({
+        "model": model,
+        "prompt": prompt,
+        "stream": false,
+        "options": {
+            "temperature": OLLAMA_SIR_TEMPERATURE
+        }
+    })
+}
+
 fn parse_pull_progress(value: &Value) -> OllamaPullProgress {
     let status = value
         .get("status")
@@ -791,6 +866,71 @@ fn extract_local_text_part(response: &Value) -> Result<String, InferError> {
     Err(InferError::InvalidResponse(
         "missing local model text/JSON response body".to_owned(),
     ))
+}
+
+async fn request_gemini_summary(
+    api_key: &str,
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<String, InferError> {
+    let endpoint = format!("{GEMINI_API_BASE}/models/{model}:generateContent?key={api_key}");
+    let body = json!({
+        "systemInstruction": {
+            "parts": [{"text": system_prompt}]
+        },
+        "contents": [
+            {
+                "parts": [{"text": user_prompt}]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.1
+        }
+    });
+    let response_value: Value = reqwest::Client::new()
+        .post(endpoint)
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(extract_gemini_text_part(&response_value)?.to_owned())
+}
+
+async fn request_qwen_summary(
+    endpoint: &str,
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<String, InferError> {
+    let prompt = format!(
+        "System instruction:\n{system_prompt}\n\nUser prompt:\n{user_prompt}\n\nReturn exactly one concise sentence."
+    );
+    let body = build_ollama_text_generate_body(model, prompt.as_str());
+    let response_value: Value = reqwest::Client::new()
+        .post(ollama_generate_endpoint(endpoint))
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    extract_local_text_part(&response_value)
+}
+
+fn clean_summary(text: String) -> Option<String> {
+    let normalized = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_owned();
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(normalized)
 }
 
 fn extract_embedding_vector(response: &Value) -> Result<Vec<f32>, InferError> {

@@ -205,7 +205,79 @@ pub struct TestIntentsArgs {
     pub file: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommunitiesFormat {
+    Table,
+    Json,
+}
+
+impl CommunitiesFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Json => "json",
+        }
+    }
+}
+
+impl std::str::FromStr for CommunitiesFormat {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "table" => Ok(Self::Table),
+            "json" => Ok(Self::Json),
+            other => Err(format!(
+                "invalid communities format '{other}', expected one of: table, json"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Args)]
+pub struct DriftReportArgs {
+    #[arg(
+        long,
+        default_value = "100 commits",
+        help = "Analysis window (examples: '50 commits', '30d', 'since:a1b2c3d')"
+    )]
+    pub window: String,
+
+    #[arg(
+        long = "min-drift",
+        default_value_t = 0.15,
+        help = "Minimum semantic drift magnitude to include (0.0..1.0)"
+    )]
+    pub min_drift: f32,
+
+    #[arg(
+        long,
+        help = "Include acknowledged drift findings in the report output"
+    )]
+    pub include_acknowledged: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct DriftAckArgs {
+    #[arg(help = "Drift result identifier to acknowledge")]
+    pub result_id: String,
+
+    #[arg(long, help = "Acknowledgement note to store in project memory")]
+    pub note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct CommunitiesArgs {
+    #[arg(
+        long,
+        default_value = "table",
+        value_parser = parse_communities_format,
+        help = "Output format: table or json"
+    )]
+    pub format: CommunitiesFormat,
+}
+
+#[derive(Debug, Clone, PartialEq, Subcommand)]
 pub enum Commands {
     /// Generate agent configuration files for AI coding agents
     InitAgent(InitAgentArgs),
@@ -227,6 +299,12 @@ pub enum Commands {
     CouplingReport(CouplingReportArgs),
     /// List extracted behavioral test intents for a test file
     TestIntents(TestIntentsArgs),
+    /// Run semantic/boundary/structural drift analysis
+    DriftReport(DriftReportArgs),
+    /// Acknowledge a drift result and store a project note
+    DriftAck(DriftAckArgs),
+    /// Show current community assignments from dependency graph
+    Communities(CommunitiesArgs),
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -434,6 +512,10 @@ fn parse_coupling_risk_level(value: &str) -> Result<CouplingRiskLevel, String> {
             "invalid risk level '{other}', expected one of: low, medium, high, critical"
         )),
     }
+}
+
+fn parse_communities_format(value: &str) -> Result<CommunitiesFormat, String> {
+    value.parse()
 }
 
 fn parse_since_duration(value: &str) -> Result<Duration, String> {
@@ -779,6 +861,73 @@ mod tests {
         match cli.command {
             Some(Commands::TestIntents(args)) => {
                 assert_eq!(args.file, "tests/payment_test.rs");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_report_subcommand_parses_window_and_threshold() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "drift-report",
+            "--window",
+            "50 commits",
+            "--min-drift",
+            "0.2",
+            "--include-acknowledged",
+        ])
+        .expect("drift-report should parse");
+
+        match cli.command {
+            Some(Commands::DriftReport(args)) => {
+                assert_eq!(args.window, "50 commits");
+                assert!((args.min_drift - 0.2).abs() < f32::EPSILON);
+                assert!(args.include_acknowledged);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_ack_subcommand_parses_result_and_note() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "drift-ack",
+            "drift-123",
+            "--note",
+            "Intentional change",
+        ])
+        .expect("drift-ack should parse");
+
+        match cli.command {
+            Some(Commands::DriftAck(args)) => {
+                assert_eq!(args.result_id, "drift-123");
+                assert_eq!(args.note, "Intentional change");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn communities_subcommand_parses_format() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "communities",
+            "--format",
+            "table",
+        ])
+        .expect("communities should parse");
+
+        match cli.command {
+            Some(Commands::Communities(args)) => {
+                assert_eq!(args.format.as_str(), "table");
             }
             other => panic!("unexpected command: {other:?}"),
         }

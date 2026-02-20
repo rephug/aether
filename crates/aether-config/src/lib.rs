@@ -30,6 +30,9 @@ pub const DEFAULT_SEARCH_THRESHOLD_TYPESCRIPT: f32 = 0.65;
 pub const DEFAULT_SEARCH_THRESHOLD_PYTHON: f32 = 0.60;
 pub const MIN_SEARCH_THRESHOLD: f32 = 0.3;
 pub const MAX_SEARCH_THRESHOLD: f32 = 0.95;
+pub const DEFAULT_DRIFT_THRESHOLD: f32 = 0.85;
+pub const DEFAULT_DRIFT_ANALYSIS_WINDOW: &str = "100 commits";
+pub const DEFAULT_DRIFT_HUB_PERCENTILE: u32 = 95;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -216,6 +219,8 @@ pub struct AetherConfig {
     pub verify: VerifyConfig,
     #[serde(default)]
     pub coupling: CouplingConfig,
+    #[serde(default)]
+    pub drift: DriftConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -601,6 +606,32 @@ impl Default for CouplingConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DriftConfig {
+    #[serde(default = "default_drift_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_drift_threshold")]
+    pub drift_threshold: f32,
+    #[serde(default = "default_drift_analysis_window")]
+    pub analysis_window: String,
+    #[serde(default = "default_drift_auto_analyze")]
+    pub auto_analyze: bool,
+    #[serde(default = "default_drift_hub_percentile")]
+    pub hub_percentile: u32,
+}
+
+impl Default for DriftConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_drift_enabled(),
+            drift_threshold: default_drift_threshold(),
+            analysis_window: default_drift_analysis_window(),
+            auto_analyze: default_drift_auto_analyze(),
+            hub_percentile: default_drift_hub_percentile(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigWarning {
     pub code: &'static str,
@@ -935,6 +966,26 @@ fn default_coupling_bulk_commit_threshold() -> u32 {
     30
 }
 
+fn default_drift_enabled() -> bool {
+    true
+}
+
+fn default_drift_threshold() -> f32 {
+    DEFAULT_DRIFT_THRESHOLD
+}
+
+fn default_drift_analysis_window() -> String {
+    DEFAULT_DRIFT_ANALYSIS_WINDOW.to_owned()
+}
+
+fn default_drift_auto_analyze() -> bool {
+    false
+}
+
+fn default_drift_hub_percentile() -> u32 {
+    DEFAULT_DRIFT_HUB_PERCENTILE
+}
+
 fn normalize_optional(input: Option<String>) -> Option<String> {
     input
         .map(|value| value.trim().to_owned())
@@ -1093,6 +1144,16 @@ fn normalize_config(mut config: AetherConfig) -> AetherConfig {
     if config.coupling.exclude_patterns.is_empty() {
         config.coupling.exclude_patterns = default_coupling_exclude_patterns();
     }
+    config.drift.analysis_window = normalize_with_default(
+        std::mem::take(&mut config.drift.analysis_window),
+        default_drift_analysis_window(),
+    );
+    if !config.drift.drift_threshold.is_finite() {
+        config.drift.drift_threshold = default_drift_threshold();
+    } else {
+        config.drift.drift_threshold = config.drift.drift_threshold.clamp(0.0, 1.0);
+    }
+    config.drift.hub_percentile = config.drift.hub_percentile.clamp(1, 100);
 
     let api_key_env = config.inference.api_key_env.trim();
     if api_key_env.is_empty() {
@@ -1207,6 +1268,14 @@ mod tests {
                 ".gitignore".to_owned()
             ]
         );
+        assert!(config.drift.enabled);
+        assert_eq!(config.drift.drift_threshold, DEFAULT_DRIFT_THRESHOLD);
+        assert_eq!(
+            config.drift.analysis_window,
+            DEFAULT_DRIFT_ANALYSIS_WINDOW.to_owned()
+        );
+        assert!(!config.drift.auto_analyze);
+        assert_eq!(config.drift.hub_percentile, DEFAULT_DRIFT_HUB_PERCENTILE);
         assert!(config_path(workspace).exists());
 
         let content = fs::read_to_string(config_path(workspace)).expect("read config file");
@@ -1249,6 +1318,11 @@ mod tests {
         assert!(content.contains("commit_window = 500"));
         assert!(content.contains("min_co_change_count = 3"));
         assert!(content.contains("bulk_commit_threshold = 30"));
+        assert!(content.contains("[drift]"));
+        assert!(content.contains("drift_threshold = 0.85"));
+        assert!(content.contains("analysis_window = \"100 commits\""));
+        assert!(content.contains("auto_analyze = false"));
+        assert!(content.contains("hub_percentile = 95"));
         assert!(content.contains("\"cargo fmt --all --check\""));
         assert!(content.contains("\"cargo clippy --workspace -- -D warnings\""));
         assert!(content.contains("\"cargo test --workspace\""));
@@ -1315,6 +1389,13 @@ vcpu_count = 0
 memory_mib = 0
 fallback_to_container_on_unavailable = true
 fallback_to_host_on_unavailable = true
+
+[drift]
+enabled = false
+drift_threshold = 0.9
+analysis_window = " 50 commits "
+auto_analyze = true
+hub_percentile = 0
 "#;
         fs::write(config_path(workspace), raw).expect("write config");
 
@@ -1400,6 +1481,11 @@ fallback_to_host_on_unavailable = true
         assert_eq!(config.coupling.commit_window, 500);
         assert_eq!(config.coupling.min_co_change_count, 3);
         assert_eq!(config.coupling.bulk_commit_threshold, 30);
+        assert!(!config.drift.enabled);
+        assert_eq!(config.drift.drift_threshold, 0.9);
+        assert_eq!(config.drift.analysis_window, "50 commits");
+        assert!(config.drift.auto_analyze);
+        assert_eq!(config.drift.hub_percentile, 1);
     }
 
     #[test]
@@ -1519,6 +1605,11 @@ fallback_to_host_on_unavailable = true
         assert_eq!(config.coupling.commit_window, 500);
         assert_eq!(config.coupling.min_co_change_count, 3);
         assert_eq!(config.coupling.bulk_commit_threshold, 30);
+        assert!(config.drift.enabled);
+        assert_eq!(config.drift.drift_threshold, DEFAULT_DRIFT_THRESHOLD);
+        assert_eq!(config.drift.analysis_window, DEFAULT_DRIFT_ANALYSIS_WINDOW);
+        assert!(!config.drift.auto_analyze);
+        assert_eq!(config.drift.hub_percentile, DEFAULT_DRIFT_HUB_PERCENTILE);
     }
 
     #[test]
@@ -1550,6 +1641,7 @@ fallback_to_host_on_unavailable = true
                 ..VerifyConfig::default()
             },
             coupling: CouplingConfig::default(),
+            drift: DriftConfig::default(),
         };
 
         let warnings = validate_config(&config);
