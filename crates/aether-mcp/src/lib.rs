@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aether_analysis::{
-    AcknowledgeDriftRequest as AnalysisAcknowledgeDriftRequest, BlastRadiusRequest,
+    AcknowledgeDriftRequest as AnalysisAcknowledgeDriftRequest, BlastRadiusRequest, CausalAnalyzer,
     CouplingAnalyzer, DriftAnalyzer, DriftInclude as AnalysisDriftInclude,
     DriftReportRequest as AnalysisDriftReportRequest, RiskLevel as CouplingRiskLevel,
-    TestIntentAnalyzer,
+    TestIntentAnalyzer, TraceCauseRequest as AnalysisTraceCauseRequest,
 };
 use aether_config::{SearchRerankerKind, VerifyMode, load_workspace_config};
 pub use aether_core::SearchMode;
@@ -537,6 +537,81 @@ pub struct AetherAcknowledgeDriftResponse {
     pub acknowledged: u32,
     pub note_created: bool,
     pub note_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherTraceCauseRequest {
+    pub symbol: Option<String>,
+    pub symbol_id: Option<String>,
+    pub file: Option<String>,
+    pub lookback: Option<String>,
+    pub max_depth: Option<u32>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherTraceCauseTarget {
+    pub symbol_id: String,
+    pub symbol_name: String,
+    pub file: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherTraceCauseAnalysisWindow {
+    pub lookback: String,
+    pub max_depth: u32,
+    pub upstream_symbols_scanned: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherTraceCauseSirDiff {
+    pub purpose_changed: bool,
+    pub purpose_before: String,
+    pub purpose_after: String,
+    pub edge_cases_added: Vec<String>,
+    pub edge_cases_removed: Vec<String>,
+    pub dependencies_added: Vec<String>,
+    pub dependencies_removed: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherTraceCauseChange {
+    pub commit: String,
+    pub author: String,
+    pub date: String,
+    pub change_magnitude: f32,
+    pub sir_diff: AetherTraceCauseSirDiff,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherTraceCauseCoupling {
+    pub fused_score: f32,
+    pub coupling_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherTraceCauseEntry {
+    pub rank: u32,
+    pub causal_score: f32,
+    pub symbol_id: String,
+    pub symbol_name: String,
+    pub file: String,
+    pub dependency_path: Vec<String>,
+    pub depth: u32,
+    pub change: AetherTraceCauseChange,
+    pub coupling: AetherTraceCauseCoupling,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherTraceCauseResponse {
+    pub schema_version: String,
+    pub target: AetherTraceCauseTarget,
+    pub analysis_window: AetherTraceCauseAnalysisWindow,
+    pub causal_chain: Vec<AetherTraceCauseEntry>,
+    pub no_change_upstream: u32,
+    pub skipped_missing_history: u32,
+    pub embedding_fallback_count: u32,
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1766,6 +1841,71 @@ impl AetherMcpServer {
         })
     }
 
+    pub fn aether_trace_cause_logic(
+        &self,
+        request: AetherTraceCauseRequest,
+    ) -> Result<AetherTraceCauseResponse, AetherMcpError> {
+        let store = SqliteStore::open(&self.workspace)?;
+        let target_symbol = self.resolve_trace_cause_symbol(&store, &request)?;
+        let analyzer = CausalAnalyzer::new(&self.workspace)?;
+        let result = analyzer.trace_cause(AnalysisTraceCauseRequest {
+            target_symbol_id: target_symbol.id,
+            lookback: request.lookback,
+            max_depth: request.max_depth,
+            limit: request.limit,
+        })?;
+
+        Ok(AetherTraceCauseResponse {
+            schema_version: result.schema_version,
+            target: AetherTraceCauseTarget {
+                symbol_id: result.target.symbol_id,
+                symbol_name: result.target.symbol_name,
+                file: result.target.file,
+            },
+            analysis_window: AetherTraceCauseAnalysisWindow {
+                lookback: result.analysis_window.lookback,
+                max_depth: result.analysis_window.max_depth,
+                upstream_symbols_scanned: result.analysis_window.upstream_symbols_scanned,
+            },
+            causal_chain: result
+                .causal_chain
+                .into_iter()
+                .map(|entry| AetherTraceCauseEntry {
+                    rank: entry.rank,
+                    causal_score: entry.causal_score,
+                    symbol_id: entry.symbol_id,
+                    symbol_name: entry.symbol_name,
+                    file: entry.file,
+                    dependency_path: entry.dependency_path,
+                    depth: entry.depth,
+                    change: AetherTraceCauseChange {
+                        commit: entry.change.commit,
+                        author: entry.change.author,
+                        date: entry.change.date,
+                        change_magnitude: entry.change.change_magnitude,
+                        sir_diff: AetherTraceCauseSirDiff {
+                            purpose_changed: entry.change.sir_diff.purpose_changed,
+                            purpose_before: entry.change.sir_diff.purpose_before,
+                            purpose_after: entry.change.sir_diff.purpose_after,
+                            edge_cases_added: entry.change.sir_diff.edge_cases_added,
+                            edge_cases_removed: entry.change.sir_diff.edge_cases_removed,
+                            dependencies_added: entry.change.sir_diff.dependencies_added,
+                            dependencies_removed: entry.change.sir_diff.dependencies_removed,
+                        },
+                    },
+                    coupling: AetherTraceCauseCoupling {
+                        fused_score: entry.coupling.fused_score,
+                        coupling_type: entry.coupling.coupling_type,
+                    },
+                })
+                .collect(),
+            no_change_upstream: result.no_change_upstream,
+            skipped_missing_history: result.skipped_missing_history,
+            embedding_fallback_count: result.embedding_fallback_count,
+            notes: result.notes,
+        })
+    }
+
     pub fn aether_acknowledge_drift_logic(
         &self,
         request: AetherAcknowledgeDriftRequest,
@@ -1781,6 +1921,45 @@ impl AetherMcpServer {
             note_created: result.note_created,
             note_id: result.note_id,
         })
+    }
+
+    fn resolve_trace_cause_symbol(
+        &self,
+        store: &SqliteStore,
+        request: &AetherTraceCauseRequest,
+    ) -> Result<SymbolRecord, AetherMcpError> {
+        let symbol_not_found =
+            || AetherMcpError::Message("symbol not found, try aether_search to find it".to_owned());
+        if let Some(symbol_id) = request.symbol_id.as_deref().map(str::trim)
+            && !symbol_id.is_empty()
+        {
+            return store
+                .get_symbol_record(symbol_id)?
+                .ok_or_else(symbol_not_found);
+        }
+
+        let symbol = request.symbol.as_deref().map(str::trim).unwrap_or_default();
+        let file = request
+            .file
+            .as_deref()
+            .map(normalize_path)
+            .unwrap_or_default();
+        if symbol.is_empty() || file.is_empty() {
+            return Err(AetherMcpError::Message(
+                "provide either symbol_id, or symbol + file".to_owned(),
+            ));
+        }
+
+        let mut matches = store
+            .list_symbols_for_file(file.as_str())?
+            .into_iter()
+            .filter(|candidate| {
+                candidate.qualified_name == symbol
+                    || symbol_leaf_name(candidate.qualified_name.as_str()) == symbol
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| left.id.cmp(&right.id));
+        matches.into_iter().next().ok_or_else(symbol_not_found)
     }
 
     fn fallback_test_guards_from_naming(
@@ -2976,6 +3155,20 @@ impl AetherMcpServer {
     }
 
     #[tool(
+        name = "aether_trace_cause",
+        description = "Trace likely upstream semantic causes of a downstream breakage"
+    )]
+    pub async fn aether_trace_cause(
+        &self,
+        Parameters(request): Parameters<AetherTraceCauseRequest>,
+    ) -> Result<Json<AetherTraceCauseResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_trace_cause");
+        self.aether_trace_cause_logic(request)
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
         name = "aether_acknowledge_drift",
         description = "Acknowledge drift findings and create a project note"
     )]
@@ -3091,15 +3284,16 @@ fn to_mcp_error(err: AetherMcpError) -> McpError {
 
 #[cfg(test)]
 mod tests {
+    use aether_core::EdgeKind;
     use aether_store::{
-        CouplingEdgeRecord, CozoGraphStore, DriftResultRecord, ProjectNoteRecord, SqliteStore,
-        Store, SymbolRecord, TestIntentRecord,
+        CouplingEdgeRecord, CozoGraphStore, DriftResultRecord, GraphStore, ProjectNoteRecord,
+        ResolvedEdge, SqliteStore, Store, SymbolRecord, TestIntentRecord,
     };
     use tempfile::tempdir;
 
     use super::{
         AetherAcknowledgeDriftRequest, AetherAskKind, AetherAskRequest, AetherDriftReportRequest,
-        AetherMcpServer,
+        AetherMcpServer, AetherTraceCauseRequest,
     };
 
     #[tokio::test]
@@ -3277,6 +3471,100 @@ hub_percentile = 95
         assert_eq!(rows.len(), 1);
         assert!(rows[0].is_acknowledged);
     }
+
+    #[test]
+    fn aether_trace_cause_logic_resolves_symbol_name_and_file() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        std::fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
+        std::fs::write(
+            workspace.join(".aether/config.toml"),
+            r#"[storage]
+graph_backend = "cozo"
+
+[embeddings]
+enabled = false
+provider = "mock"
+vector_backend = "sqlite"
+
+[inference]
+provider = "mock"
+api_key_env = "GEMINI_API_KEY"
+"#,
+        )
+        .expect("write config");
+
+        let server = AetherMcpServer::new(workspace, false).expect("new mcp server");
+        let store = SqliteStore::open(workspace).expect("open store");
+        let graph = CozoGraphStore::open(workspace).expect("open graph");
+
+        let sym_a = SymbolRecord {
+            id: "sym-a".to_owned(),
+            file_path: "src/a.rs".to_owned(),
+            language: "rust".to_owned(),
+            kind: "function".to_owned(),
+            qualified_name: "a".to_owned(),
+            signature_fingerprint: "sig-a".to_owned(),
+            last_seen_at: 1_700_000_000,
+        };
+        let sym_b = SymbolRecord {
+            id: "sym-b".to_owned(),
+            file_path: "src/b.rs".to_owned(),
+            language: "rust".to_owned(),
+            kind: "function".to_owned(),
+            qualified_name: "b".to_owned(),
+            signature_fingerprint: "sig-b".to_owned(),
+            last_seen_at: 1_700_000_001,
+        };
+        store.upsert_symbol(sym_a.clone()).expect("upsert a");
+        store.upsert_symbol(sym_b.clone()).expect("upsert b");
+        graph.upsert_symbol_node(&sym_a).expect("sync a");
+        graph.upsert_symbol_node(&sym_b).expect("sync b");
+        graph
+            .upsert_edge(&ResolvedEdge {
+                source_id: sym_a.id.clone(),
+                target_id: sym_b.id.clone(),
+                edge_kind: EdgeKind::Calls,
+                file_path: "src/a.rs".to_owned(),
+            })
+            .expect("upsert edge");
+        store
+            .record_sir_version_if_changed(
+                "sym-b",
+                "hash-b1",
+                "mock",
+                "mock",
+                r#"{"purpose":"old","edge_cases":[],"dependencies":[]}"#,
+                1_700_000_100_000,
+                None,
+            )
+            .expect("insert b history 1");
+        store
+            .record_sir_version_if_changed(
+                "sym-b",
+                "hash-b2",
+                "mock",
+                "mock",
+                r#"{"purpose":"new","edge_cases":["edge"],"dependencies":["db"]}"#,
+                1_700_000_200_000,
+                None,
+            )
+            .expect("insert b history 2");
+
+        drop(graph);
+        let response = server
+            .aether_trace_cause_logic(AetherTraceCauseRequest {
+                symbol: Some("a".to_owned()),
+                symbol_id: None,
+                file: Some("src/a.rs".to_owned()),
+                lookback: Some("30d".to_owned()),
+                max_depth: Some(3),
+                limit: Some(3),
+            })
+            .expect("trace cause");
+        assert_eq!(response.schema_version, "1.0");
+        assert_eq!(response.target.symbol_id, "sym-a");
+    }
 }
 
 fn count_table_rows(conn: &Connection, table_name: &str) -> Result<i64, AetherMcpError> {
@@ -3399,6 +3687,14 @@ fn sort_and_dedup(values: &mut Vec<String>) {
 
 fn effective_limit(limit: Option<u32>) -> u32 {
     limit.unwrap_or(20).clamp(1, 100)
+}
+
+fn symbol_leaf_name(qualified_name: &str) -> &str {
+    qualified_name
+        .rsplit("::")
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(qualified_name)
 }
 
 fn split_source_root(path: &str) -> Option<(String, String)> {

@@ -1,7 +1,12 @@
+mod causal;
 mod coupling;
 mod drift;
 mod test_intents;
 
+pub use causal::{
+    CausalAnalyzer, CausalChainChange, CausalChainCoupling, CausalChainEntry, CausalChainSirDiff,
+    TraceCauseAnalysisWindow, TraceCauseRequest, TraceCauseResult, TraceCauseTarget,
+};
 pub use coupling::{
     AnalysisError, BlastRadiusEntry, BlastRadiusRequest, BlastRadiusResult, CouplingAnalyzer,
     CouplingEdge, CouplingMiningOutcome, CouplingType, MineCouplingRequest, RiskLevel,

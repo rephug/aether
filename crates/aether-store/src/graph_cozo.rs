@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
 
@@ -6,6 +6,7 @@ use cozo::{DataValue, DbInstance, NamedRows, ScriptMutability};
 
 use super::{
     CouplingEdgeRecord, GraphStore, ResolvedEdge, StoreError, SymbolRecord, TestedByRecord,
+    UpstreamDependencyEdgeRecord, UpstreamDependencyNodeRecord, UpstreamDependencyTraversal,
 };
 
 pub struct CozoGraphStore {
@@ -747,6 +748,107 @@ impl CozoGraphStore {
         )?;
 
         Ok(!rows.rows.is_empty())
+    }
+
+    pub fn list_upstream_dependency_traversal(
+        &self,
+        target_symbol_id: &str,
+        max_depth: u32,
+    ) -> Result<UpstreamDependencyTraversal, StoreError> {
+        let target_symbol_id = target_symbol_id.trim();
+        if target_symbol_id.is_empty() || max_depth == 0 {
+            return Ok(UpstreamDependencyTraversal::default());
+        }
+
+        let mut params = BTreeMap::new();
+        params.insert(
+            "start".to_owned(),
+            DataValue::from(target_symbol_id.to_owned()),
+        );
+        params.insert("max_depth".to_owned(), DataValue::from(max_depth as i64));
+
+        let rows = self.run_script(
+            r#"
+            dep_edges[source, target] :=
+                *edges{source_id: source, target_id: target, edge_kind: "calls"}
+            dep_edges[source, target] :=
+                *edges{source_id: source, target_id: target, edge_kind: "depends_on"}
+
+            reachable[source, target, depth] :=
+                dep_edges[$start, target],
+                source = $start,
+                depth = 1
+            reachable[source, target, depth] :=
+                reachable[_, mid, prev_depth],
+                prev_depth < $max_depth,
+                dep_edges[mid, target],
+                source = mid,
+                depth = prev_depth + 1
+
+            ?[source_id, target_id, depth] := reachable[source_id, target_id, depth]
+            :order depth, source_id, target_id
+            "#,
+            params,
+            ScriptMutability::Immutable,
+        )?;
+
+        let mut seen_edges = BTreeSet::new();
+        let mut edges = Vec::new();
+        let mut min_depth_by_symbol = HashMap::<String, u32>::new();
+
+        for row in rows.rows {
+            if row.len() < 3 {
+                return Err(StoreError::Cozo(
+                    "invalid upstream traversal row shape".to_owned(),
+                ));
+            }
+            let source_id = row[0]
+                .get_str()
+                .ok_or_else(|| StoreError::Cozo("invalid upstream source_id value".to_owned()))?
+                .to_owned();
+            let target_id = row[1]
+                .get_str()
+                .ok_or_else(|| StoreError::Cozo("invalid upstream target_id value".to_owned()))?
+                .to_owned();
+            let depth = row[2]
+                .get_int()
+                .ok_or_else(|| StoreError::Cozo("invalid upstream depth value".to_owned()))?;
+            if depth <= 0 {
+                continue;
+            }
+            let depth = depth as u32;
+            if !seen_edges.insert((source_id.clone(), target_id.clone(), depth)) {
+                continue;
+            }
+
+            edges.push(UpstreamDependencyEdgeRecord {
+                source_id,
+                target_id: target_id.clone(),
+                depth,
+            });
+            min_depth_by_symbol
+                .entry(target_id)
+                .and_modify(|current| *current = (*current).min(depth))
+                .or_insert(depth);
+        }
+
+        let mut nodes = min_depth_by_symbol
+            .into_iter()
+            .map(|(symbol_id, depth)| UpstreamDependencyNodeRecord { symbol_id, depth })
+            .collect::<Vec<_>>();
+        nodes.sort_by(|left, right| {
+            left.depth
+                .cmp(&right.depth)
+                .then_with(|| left.symbol_id.cmp(&right.symbol_id))
+        });
+        edges.sort_by(|left, right| {
+            left.depth
+                .cmp(&right.depth)
+                .then_with(|| left.source_id.cmp(&right.source_id))
+                .then_with(|| left.target_id.cmp(&right.target_id))
+        });
+
+        Ok(UpstreamDependencyTraversal { nodes, edges })
     }
 
     pub fn upsert_co_change_edges(&self, records: &[CouplingEdgeRecord]) -> Result<(), StoreError> {
@@ -1768,5 +1870,101 @@ mod tests {
             .list_connected_components()
             .expect("connected components");
         assert!(!connected.is_empty());
+    }
+
+    #[test]
+    fn cozo_graph_upstream_traversal_returns_nodes_edges_and_depths() {
+        let temp = tempdir().expect("tempdir");
+        let graph = CozoGraphStore::open(temp.path()).expect("open cozo graph store");
+
+        let alpha = symbol("sym-alpha", "alpha");
+        let beta = symbol("sym-beta", "beta");
+        let gamma = symbol("sym-gamma", "gamma");
+        let delta = symbol("sym-delta", "delta");
+        for row in [&alpha, &beta, &gamma, &delta] {
+            graph.upsert_symbol_node(row).expect("upsert symbol");
+        }
+        for edge in [
+            ResolvedEdge {
+                source_id: alpha.id.clone(),
+                target_id: beta.id.clone(),
+                edge_kind: EdgeKind::Calls,
+                file_path: "src/lib.rs".to_owned(),
+            },
+            ResolvedEdge {
+                source_id: beta.id.clone(),
+                target_id: gamma.id.clone(),
+                edge_kind: EdgeKind::DependsOn,
+                file_path: "src/lib.rs".to_owned(),
+            },
+            ResolvedEdge {
+                source_id: beta.id.clone(),
+                target_id: delta.id.clone(),
+                edge_kind: EdgeKind::Calls,
+                file_path: "src/lib.rs".to_owned(),
+            },
+        ] {
+            graph.upsert_edge(&edge).expect("upsert edge");
+        }
+
+        let traversal = graph
+            .list_upstream_dependency_traversal(&alpha.id, 3)
+            .expect("upstream traversal");
+        let by_id = traversal
+            .nodes
+            .iter()
+            .map(|node| (node.symbol_id.clone(), node.depth))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(by_id.get(beta.id.as_str()).copied(), Some(1));
+        assert_eq!(by_id.get(gamma.id.as_str()).copied(), Some(2));
+        assert_eq!(by_id.get(delta.id.as_str()).copied(), Some(2));
+
+        assert!(traversal.edges.iter().any(|edge| {
+            edge.source_id == alpha.id && edge.target_id == beta.id && edge.depth == 1
+        }));
+        assert!(traversal.edges.iter().any(|edge| {
+            edge.source_id == beta.id && edge.target_id == gamma.id && edge.depth == 2
+        }));
+    }
+
+    #[test]
+    fn cozo_graph_upstream_traversal_respects_depth_limit_with_cycles() {
+        let temp = tempdir().expect("tempdir");
+        let graph = CozoGraphStore::open(temp.path()).expect("open cozo graph store");
+
+        let alpha = symbol("sym-alpha", "alpha");
+        let beta = symbol("sym-beta", "beta");
+        let gamma = symbol("sym-gamma", "gamma");
+        for row in [&alpha, &beta, &gamma] {
+            graph.upsert_symbol_node(row).expect("upsert symbol");
+        }
+        for edge in [
+            ResolvedEdge {
+                source_id: alpha.id.clone(),
+                target_id: beta.id.clone(),
+                edge_kind: EdgeKind::Calls,
+                file_path: "src/lib.rs".to_owned(),
+            },
+            ResolvedEdge {
+                source_id: beta.id.clone(),
+                target_id: gamma.id.clone(),
+                edge_kind: EdgeKind::Calls,
+                file_path: "src/lib.rs".to_owned(),
+            },
+            ResolvedEdge {
+                source_id: gamma.id.clone(),
+                target_id: beta.id.clone(),
+                edge_kind: EdgeKind::DependsOn,
+                file_path: "src/lib.rs".to_owned(),
+            },
+        ] {
+            graph.upsert_edge(&edge).expect("upsert edge");
+        }
+
+        let traversal = graph
+            .list_upstream_dependency_traversal(&alpha.id, 3)
+            .expect("upstream traversal");
+        assert!(traversal.nodes.iter().all(|node| node.depth <= 3));
+        assert!(traversal.edges.iter().all(|edge| edge.depth <= 3));
     }
 }

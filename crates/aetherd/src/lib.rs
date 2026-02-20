@@ -1,4 +1,5 @@
 pub mod calibrate;
+pub mod causal;
 pub mod cli;
 pub mod coupling;
 pub mod drift;
