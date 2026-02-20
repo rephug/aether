@@ -169,6 +169,40 @@ pub struct CouplingMiningStateRecord {
     pub commits_scanned: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriftAnalysisStateRecord {
+    pub last_analysis_commit: Option<String>,
+    pub last_analysis_at: Option<i64>,
+    pub symbols_analyzed: i64,
+    pub drift_detected: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DriftResultRecord {
+    pub result_id: String,
+    pub symbol_id: String,
+    pub file_path: String,
+    pub symbol_name: String,
+    pub drift_type: String,
+    pub drift_magnitude: Option<f32>,
+    pub current_sir_hash: Option<String>,
+    pub baseline_sir_hash: Option<String>,
+    pub commit_range_start: Option<String>,
+    pub commit_range_end: Option<String>,
+    pub drift_summary: Option<String>,
+    pub detail_json: String,
+    pub detected_at: i64,
+    pub is_acknowledged: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommunitySnapshotRecord {
+    pub snapshot_id: String,
+    pub symbol_id: String,
+    pub community_id: i64,
+    pub captured_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CouplingEdgeRecord {
     pub file_a: String,
@@ -184,6 +218,13 @@ pub struct CouplingEdgeRecord {
     pub last_co_change_commit: String,
     pub last_co_change_at: i64,
     pub mined_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SirHistoryBaselineSelector {
+    Version(i64),
+    CreatedAt(i64),
+    CommitHash(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -384,6 +425,33 @@ pub trait Store {
         &self,
         state: CouplingMiningStateRecord,
     ) -> Result<(), StoreError>;
+    fn get_drift_analysis_state(&self) -> Result<Option<DriftAnalysisStateRecord>, StoreError>;
+    fn upsert_drift_analysis_state(
+        &self,
+        state: DriftAnalysisStateRecord,
+    ) -> Result<(), StoreError>;
+    fn upsert_drift_results(&self, records: &[DriftResultRecord]) -> Result<(), StoreError>;
+    fn list_drift_results(
+        &self,
+        include_acknowledged: bool,
+    ) -> Result<Vec<DriftResultRecord>, StoreError>;
+    fn list_drift_results_by_ids(
+        &self,
+        result_ids: &[String],
+    ) -> Result<Vec<DriftResultRecord>, StoreError>;
+    fn acknowledge_drift_results(&self, result_ids: &[String]) -> Result<u32, StoreError>;
+    fn replace_community_snapshot(
+        &self,
+        snapshot_id: &str,
+        captured_at: i64,
+        assignments: &[CommunitySnapshotRecord],
+    ) -> Result<(), StoreError>;
+    fn list_latest_community_snapshot(&self) -> Result<Vec<CommunitySnapshotRecord>, StoreError>;
+    fn resolve_sir_baseline_by_selector(
+        &self,
+        symbol_id: &str,
+        selector: SirHistoryBaselineSelector,
+    ) -> Result<Option<SirHistoryRecord>, StoreError>;
     fn has_dependency_between_files(&self, file_a: &str, file_b: &str) -> Result<bool, StoreError>;
     fn replace_test_intents_for_file(
         &self,
@@ -2150,6 +2218,429 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    fn get_drift_analysis_state(&self) -> Result<Option<DriftAnalysisStateRecord>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT last_analysis_commit, last_analysis_at, symbols_analyzed, drift_detected
+            FROM drift_analysis_state
+            WHERE id = 1
+            LIMIT 1
+            "#,
+        )?;
+
+        stmt.query_row([], |row| {
+            Ok(DriftAnalysisStateRecord {
+                last_analysis_commit: row.get(0)?,
+                last_analysis_at: row.get(1)?,
+                symbols_analyzed: row.get::<_, i64>(2)?.max(0),
+                drift_detected: row.get::<_, i64>(3)?.max(0),
+            })
+        })
+        .optional()
+        .map_err(Into::into)
+    }
+
+    fn upsert_drift_analysis_state(
+        &self,
+        state: DriftAnalysisStateRecord,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            r#"
+            INSERT INTO drift_analysis_state (
+                id, last_analysis_commit, last_analysis_at, symbols_analyzed, drift_detected
+            )
+            VALUES (1, ?1, ?2, ?3, ?4)
+            ON CONFLICT(id) DO UPDATE SET
+                last_analysis_commit = excluded.last_analysis_commit,
+                last_analysis_at = excluded.last_analysis_at,
+                symbols_analyzed = excluded.symbols_analyzed,
+                drift_detected = excluded.drift_detected
+            "#,
+            params![
+                state
+                    .last_analysis_commit
+                    .map(|value| value.trim().to_ascii_lowercase()),
+                state.last_analysis_at.map(|value| value.max(0)),
+                state.symbols_analyzed.max(0),
+                state.drift_detected.max(0),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn upsert_drift_results(&self, records: &[DriftResultRecord]) -> Result<(), StoreError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| -> Result<(), StoreError> {
+            let mut stmt = self.conn.prepare(
+                r#"
+                INSERT INTO drift_results (
+                    result_id, symbol_id, file_path, symbol_name, drift_type, drift_magnitude,
+                    current_sir_hash, baseline_sir_hash, commit_range_start, commit_range_end,
+                    drift_summary, detail_json, detected_at, is_acknowledged
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                ON CONFLICT(result_id) DO UPDATE SET
+                    symbol_id = excluded.symbol_id,
+                    file_path = excluded.file_path,
+                    symbol_name = excluded.symbol_name,
+                    drift_type = excluded.drift_type,
+                    drift_magnitude = excluded.drift_magnitude,
+                    current_sir_hash = excluded.current_sir_hash,
+                    baseline_sir_hash = excluded.baseline_sir_hash,
+                    commit_range_start = excluded.commit_range_start,
+                    commit_range_end = excluded.commit_range_end,
+                    drift_summary = excluded.drift_summary,
+                    detail_json = excluded.detail_json,
+                    detected_at = excluded.detected_at,
+                    is_acknowledged = CASE
+                        WHEN drift_results.is_acknowledged = 1 THEN 1
+                        ELSE excluded.is_acknowledged
+                    END
+                "#,
+            )?;
+
+            for record in records {
+                if record.result_id.trim().is_empty()
+                    || record.symbol_id.trim().is_empty()
+                    || record.file_path.trim().is_empty()
+                    || record.symbol_name.trim().is_empty()
+                    || record.drift_type.trim().is_empty()
+                    || record.detail_json.trim().is_empty()
+                {
+                    continue;
+                }
+                stmt.execute(params![
+                    record.result_id.trim(),
+                    record.symbol_id.trim(),
+                    normalize_path(record.file_path.trim()),
+                    record.symbol_name.trim(),
+                    record.drift_type.trim(),
+                    record.drift_magnitude,
+                    record.current_sir_hash.as_deref().map(str::trim),
+                    record.baseline_sir_hash.as_deref().map(str::trim),
+                    record.commit_range_start.as_deref().map(str::trim),
+                    record.commit_range_end.as_deref().map(str::trim),
+                    record
+                        .drift_summary
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty()),
+                    record.detail_json.trim(),
+                    record.detected_at.max(0),
+                    if record.is_acknowledged { 1 } else { 0 },
+                ])?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
+    fn list_drift_results(
+        &self,
+        include_acknowledged: bool,
+    ) -> Result<Vec<DriftResultRecord>, StoreError> {
+        let sql = if include_acknowledged {
+            r#"
+            SELECT
+                result_id, symbol_id, file_path, symbol_name, drift_type, drift_magnitude,
+                current_sir_hash, baseline_sir_hash, commit_range_start, commit_range_end,
+                drift_summary, detail_json, detected_at, is_acknowledged
+            FROM drift_results
+            ORDER BY detected_at DESC, result_id ASC
+            "#
+        } else {
+            r#"
+            SELECT
+                result_id, symbol_id, file_path, symbol_name, drift_type, drift_magnitude,
+                current_sir_hash, baseline_sir_hash, commit_range_start, commit_range_end,
+                drift_summary, detail_json, detected_at, is_acknowledged
+            FROM drift_results
+            WHERE is_acknowledged = 0
+            ORDER BY detected_at DESC, result_id ASC
+            "#
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], drift_result_from_row)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row?);
+        }
+        Ok(records)
+    }
+
+    fn list_drift_results_by_ids(
+        &self,
+        result_ids: &[String],
+    ) -> Result<Vec<DriftResultRecord>, StoreError> {
+        let normalized = result_ids
+            .iter()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        if normalized.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = std::iter::repeat_n("?", normalized.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT
+                result_id, symbol_id, file_path, symbol_name, drift_type, drift_magnitude,
+                current_sir_hash, baseline_sir_hash, commit_range_start, commit_range_end,
+                drift_summary, detail_json, detected_at, is_acknowledged
+            FROM drift_results
+            WHERE result_id IN ({placeholders})
+            ORDER BY detected_at DESC, result_id ASC
+            "#
+        );
+
+        let params_vec = normalized
+            .into_iter()
+            .map(SqlValue::Text)
+            .collect::<Vec<_>>();
+        let mut stmt = self.conn.prepare(sql.as_str())?;
+        let rows = stmt.query_map(params_from_iter(params_vec), drift_result_from_row)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row?);
+        }
+        Ok(records)
+    }
+
+    fn acknowledge_drift_results(&self, result_ids: &[String]) -> Result<u32, StoreError> {
+        let normalized = result_ids
+            .iter()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        if normalized.is_empty() {
+            return Ok(0);
+        }
+
+        let placeholders = std::iter::repeat_n("?", normalized.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "UPDATE drift_results SET is_acknowledged = 1 WHERE result_id IN ({placeholders})"
+        );
+        let params_vec = normalized
+            .into_iter()
+            .map(SqlValue::Text)
+            .collect::<Vec<_>>();
+        let changed = self
+            .conn
+            .execute(sql.as_str(), params_from_iter(params_vec))?;
+        Ok(changed as u32)
+    }
+
+    fn replace_community_snapshot(
+        &self,
+        snapshot_id: &str,
+        captured_at: i64,
+        assignments: &[CommunitySnapshotRecord],
+    ) -> Result<(), StoreError> {
+        let snapshot_id = snapshot_id.trim().to_ascii_lowercase();
+        if snapshot_id.is_empty() {
+            return Ok(());
+        }
+
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| -> Result<(), StoreError> {
+            self.conn.execute(
+                "DELETE FROM community_snapshot WHERE snapshot_id = ?1",
+                params![snapshot_id],
+            )?;
+
+            let mut stmt = self.conn.prepare(
+                r#"
+                INSERT INTO community_snapshot (snapshot_id, symbol_id, community_id, captured_at)
+                VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(snapshot_id, symbol_id) DO UPDATE SET
+                    community_id = excluded.community_id,
+                    captured_at = excluded.captured_at
+                "#,
+            )?;
+            for assignment in assignments {
+                let symbol_id = assignment.symbol_id.trim();
+                if symbol_id.is_empty() {
+                    continue;
+                }
+                stmt.execute(params![
+                    snapshot_id,
+                    symbol_id,
+                    assignment.community_id,
+                    captured_at.max(0),
+                ])?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
+    fn list_latest_community_snapshot(&self) -> Result<Vec<CommunitySnapshotRecord>, StoreError> {
+        let latest_snapshot_id = self
+            .conn
+            .query_row(
+                r#"
+                SELECT snapshot_id
+                FROM community_snapshot
+                ORDER BY captured_at DESC, snapshot_id DESC
+                LIMIT 1
+                "#,
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(snapshot_id) = latest_snapshot_id else {
+            return Ok(Vec::new());
+        };
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT snapshot_id, symbol_id, community_id, captured_at
+            FROM community_snapshot
+            WHERE snapshot_id = ?1
+            ORDER BY symbol_id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![snapshot_id], |row| {
+            Ok(CommunitySnapshotRecord {
+                snapshot_id: row.get(0)?,
+                symbol_id: row.get(1)?,
+                community_id: row.get(2)?,
+                captured_at: row.get(3)?,
+            })
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row?);
+        }
+        Ok(records)
+    }
+
+    fn resolve_sir_baseline_by_selector(
+        &self,
+        symbol_id: &str,
+        selector: SirHistoryBaselineSelector,
+    ) -> Result<Option<SirHistoryRecord>, StoreError> {
+        let symbol_id = symbol_id.trim();
+        if symbol_id.is_empty() {
+            return Ok(None);
+        }
+
+        let sql = match selector {
+            SirHistoryBaselineSelector::Version(_) => {
+                r#"
+                SELECT symbol_id, version, sir_hash, provider, model, created_at, sir_json, commit_hash
+                FROM sir_history
+                WHERE symbol_id = ?1
+                  AND version = ?2
+                LIMIT 1
+                "#
+            }
+            SirHistoryBaselineSelector::CreatedAt(_) => {
+                r#"
+                SELECT symbol_id, version, sir_hash, provider, model, created_at, sir_json, commit_hash
+                FROM sir_history
+                WHERE symbol_id = ?1
+                  AND created_at <= ?2
+                ORDER BY created_at DESC, version DESC
+                LIMIT 1
+                "#
+            }
+            SirHistoryBaselineSelector::CommitHash(_) => {
+                r#"
+                SELECT symbol_id, version, sir_hash, provider, model, created_at, sir_json, commit_hash
+                FROM sir_history
+                WHERE symbol_id = ?1
+                  AND commit_hash IS NOT NULL
+                  AND LOWER(commit_hash) LIKE ?2
+                ORDER BY created_at DESC, version DESC
+                LIMIT 1
+                "#
+            }
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let record = match selector {
+            SirHistoryBaselineSelector::Version(version) => stmt
+                .query_row(params![symbol_id, version], |row| {
+                    Ok(SirHistoryRecord {
+                        symbol_id: row.get(0)?,
+                        version: row.get(1)?,
+                        sir_hash: row.get(2)?,
+                        provider: row.get(3)?,
+                        model: row.get(4)?,
+                        created_at: row.get(5)?,
+                        sir_json: row.get(6)?,
+                        commit_hash: row.get(7)?,
+                    })
+                })
+                .optional()?,
+            SirHistoryBaselineSelector::CreatedAt(created_at) => stmt
+                .query_row(params![symbol_id, created_at.max(0)], |row| {
+                    Ok(SirHistoryRecord {
+                        symbol_id: row.get(0)?,
+                        version: row.get(1)?,
+                        sir_hash: row.get(2)?,
+                        provider: row.get(3)?,
+                        model: row.get(4)?,
+                        created_at: row.get(5)?,
+                        sir_json: row.get(6)?,
+                        commit_hash: row.get(7)?,
+                    })
+                })
+                .optional()?,
+            SirHistoryBaselineSelector::CommitHash(commit_hash) => {
+                let prefix = normalize_commit_hash_for_like(commit_hash.as_str());
+                if prefix.is_empty() {
+                    return Ok(None);
+                }
+                stmt.query_row(params![symbol_id, format!("{prefix}%")], |row| {
+                    Ok(SirHistoryRecord {
+                        symbol_id: row.get(0)?,
+                        version: row.get(1)?,
+                        sir_hash: row.get(2)?,
+                        provider: row.get(3)?,
+                        model: row.get(4)?,
+                        created_at: row.get(5)?,
+                        sir_json: row.get(6)?,
+                        commit_hash: row.get(7)?,
+                    })
+                })
+                .optional()?
+            }
+        };
+
+        Ok(record)
+    }
+
     fn has_dependency_between_files(&self, file_a: &str, file_b: &str) -> Result<bool, StoreError> {
         let file_a = file_a.trim();
         let file_b = file_b.trim();
@@ -2417,6 +2908,25 @@ fn build_test_intent_id(file_path: &str, test_name: &str, intent_text: &str) -> 
         intent_text.trim(),
     );
     content_hash(material.as_str())
+}
+
+fn drift_result_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DriftResultRecord> {
+    Ok(DriftResultRecord {
+        result_id: row.get(0)?,
+        symbol_id: row.get(1)?,
+        file_path: row.get(2)?,
+        symbol_name: row.get(3)?,
+        drift_type: row.get(4)?,
+        drift_magnitude: row.get(5)?,
+        current_sir_hash: row.get(6)?,
+        baseline_sir_hash: row.get(7)?,
+        commit_range_start: row.get(8)?,
+        commit_range_end: row.get(9)?,
+        drift_summary: row.get(10)?,
+        detail_json: row.get(11)?,
+        detected_at: row.get(12)?,
+        is_acknowledged: row.get::<_, i64>(13)? != 0,
+    })
 }
 
 type ProjectNoteRowTuple = (
@@ -2704,6 +3214,51 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
             commits_scanned INTEGER NOT NULL DEFAULT 0
         );
 
+        CREATE TABLE IF NOT EXISTS drift_analysis_state (
+            id INTEGER PRIMARY KEY DEFAULT 1,
+            last_analysis_commit TEXT,
+            last_analysis_at INTEGER,
+            symbols_analyzed INTEGER NOT NULL DEFAULT 0,
+            drift_detected INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS drift_results (
+            result_id TEXT PRIMARY KEY,
+            symbol_id TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            symbol_name TEXT NOT NULL,
+            drift_type TEXT NOT NULL,
+            drift_magnitude REAL,
+            current_sir_hash TEXT,
+            baseline_sir_hash TEXT,
+            commit_range_start TEXT,
+            commit_range_end TEXT,
+            drift_summary TEXT,
+            detail_json TEXT NOT NULL,
+            detected_at INTEGER NOT NULL,
+            is_acknowledged INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_drift_results_type
+            ON drift_results(drift_type);
+        CREATE INDEX IF NOT EXISTS idx_drift_results_file
+            ON drift_results(file_path);
+        CREATE INDEX IF NOT EXISTS idx_drift_results_ack
+            ON drift_results(is_acknowledged);
+
+        CREATE TABLE IF NOT EXISTS community_snapshot (
+            snapshot_id TEXT NOT NULL,
+            symbol_id TEXT NOT NULL,
+            community_id INTEGER NOT NULL,
+            captured_at INTEGER NOT NULL,
+            PRIMARY KEY (snapshot_id, symbol_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_community_snapshot_symbol
+            ON community_snapshot(symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_community_snapshot_captured
+            ON community_snapshot(captured_at);
+
         CREATE TABLE IF NOT EXISTS test_intents (
             intent_id TEXT PRIMARY KEY,
             file_path TEXT NOT NULL,
@@ -2840,6 +3395,15 @@ fn normalize_commit_hash(commit_hash: Option<&str>) -> Option<String> {
     }
 
     Some(value.to_owned())
+}
+
+fn normalize_commit_hash_for_like(commit_hash: &str) -> String {
+    commit_hash
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .take_while(|ch| ch.is_ascii_hexdigit())
+        .collect()
 }
 
 fn resolve_history_selector_index(
@@ -3995,6 +4559,215 @@ mirror_sir_files = false
         assert_eq!(state.last_commit_hash.as_deref(), Some("def456"));
         assert_eq!(state.last_mined_at, Some(1_700_000_100_000));
         assert_eq!(state.commits_scanned, 99);
+    }
+
+    #[test]
+    fn drift_state_and_results_round_trip_and_acknowledge() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        assert!(
+            store
+                .get_drift_analysis_state()
+                .expect("read empty drift state")
+                .is_none()
+        );
+
+        store
+            .upsert_drift_analysis_state(DriftAnalysisStateRecord {
+                last_analysis_commit: Some("1111111111111111111111111111111111111111".to_owned()),
+                last_analysis_at: Some(1_700_000_000_000),
+                symbols_analyzed: 10,
+                drift_detected: 2,
+            })
+            .expect("upsert drift state");
+
+        let state = store
+            .get_drift_analysis_state()
+            .expect("read drift state")
+            .expect("drift state exists");
+        assert_eq!(
+            state.last_analysis_commit.as_deref(),
+            Some("1111111111111111111111111111111111111111")
+        );
+        assert_eq!(state.symbols_analyzed, 10);
+        assert_eq!(state.drift_detected, 2);
+
+        store
+            .upsert_drift_results(&[
+                DriftResultRecord {
+                    result_id: "drift-1".to_owned(),
+                    symbol_id: "sym-a".to_owned(),
+                    file_path: "src/a.rs".to_owned(),
+                    symbol_name: "a".to_owned(),
+                    drift_type: "semantic".to_owned(),
+                    drift_magnitude: Some(0.4),
+                    current_sir_hash: Some("hash-a2".to_owned()),
+                    baseline_sir_hash: Some("hash-a1".to_owned()),
+                    commit_range_start: Some("aaaa".to_owned()),
+                    commit_range_end: Some("bbbb".to_owned()),
+                    drift_summary: Some("purpose changed".to_owned()),
+                    detail_json: "{\"kind\":\"semantic\"}".to_owned(),
+                    detected_at: 1_700_000_000_100,
+                    is_acknowledged: false,
+                },
+                DriftResultRecord {
+                    result_id: "drift-2".to_owned(),
+                    symbol_id: "sym-b".to_owned(),
+                    file_path: "src/b.rs".to_owned(),
+                    symbol_name: "b".to_owned(),
+                    drift_type: "boundary_violation".to_owned(),
+                    drift_magnitude: None,
+                    current_sir_hash: None,
+                    baseline_sir_hash: None,
+                    commit_range_start: Some("aaaa".to_owned()),
+                    commit_range_end: Some("bbbb".to_owned()),
+                    drift_summary: None,
+                    detail_json: "{\"kind\":\"boundary\"}".to_owned(),
+                    detected_at: 1_700_000_000_101,
+                    is_acknowledged: false,
+                },
+            ])
+            .expect("upsert drift results");
+
+        let results = store
+            .list_drift_results(false)
+            .expect("list unacknowledged results");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].result_id, "drift-2");
+
+        let acknowledged = store
+            .acknowledge_drift_results(&["drift-1".to_owned()])
+            .expect("acknowledge drift result");
+        assert_eq!(acknowledged, 1);
+
+        let active = store
+            .list_drift_results(false)
+            .expect("list filtered results");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].result_id, "drift-2");
+
+        let with_ack = store
+            .list_drift_results(true)
+            .expect("list all drift results");
+        assert_eq!(with_ack.len(), 2);
+        assert!(
+            with_ack
+                .iter()
+                .any(|record| record.result_id == "drift-1" && record.is_acknowledged)
+        );
+    }
+
+    #[test]
+    fn community_snapshot_replacement_and_latest_lookup_work() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        assert!(
+            store
+                .list_latest_community_snapshot()
+                .expect("list empty snapshot")
+                .is_empty()
+        );
+
+        store
+            .replace_community_snapshot(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                1_700_000_000_000,
+                &[
+                    CommunitySnapshotRecord {
+                        snapshot_id: "ignored".to_owned(),
+                        symbol_id: "sym-a".to_owned(),
+                        community_id: 1,
+                        captured_at: 0,
+                    },
+                    CommunitySnapshotRecord {
+                        snapshot_id: "ignored".to_owned(),
+                        symbol_id: "sym-b".to_owned(),
+                        community_id: 2,
+                        captured_at: 0,
+                    },
+                ],
+            )
+            .expect("insert first snapshot");
+        store
+            .replace_community_snapshot(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                1_700_000_000_100,
+                &[CommunitySnapshotRecord {
+                    snapshot_id: "ignored".to_owned(),
+                    symbol_id: "sym-a".to_owned(),
+                    community_id: 3,
+                    captured_at: 0,
+                }],
+            )
+            .expect("insert second snapshot");
+
+        let latest = store
+            .list_latest_community_snapshot()
+            .expect("list latest community snapshot");
+        assert_eq!(latest.len(), 1);
+        assert_eq!(
+            latest[0].snapshot_id,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        assert_eq!(latest[0].community_id, 3);
+    }
+
+    #[test]
+    fn resolve_sir_baseline_by_selector_supports_versions_timestamps_and_commits() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        store
+            .record_sir_version_if_changed(
+                "sym-baseline",
+                "hash-1",
+                "mock",
+                "mock",
+                "{\"intent\":\"v1\"}",
+                1_700_000_000_000,
+                Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .expect("insert baseline v1");
+        store
+            .record_sir_version_if_changed(
+                "sym-baseline",
+                "hash-2",
+                "mock",
+                "mock",
+                "{\"intent\":\"v2\"}",
+                1_700_000_000_100,
+                Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            )
+            .expect("insert baseline v2");
+
+        let by_version = store
+            .resolve_sir_baseline_by_selector(
+                "sym-baseline",
+                SirHistoryBaselineSelector::Version(1),
+            )
+            .expect("resolve by version")
+            .expect("version baseline exists");
+        assert_eq!(by_version.version, 1);
+
+        let by_time = store
+            .resolve_sir_baseline_by_selector(
+                "sym-baseline",
+                SirHistoryBaselineSelector::CreatedAt(1_700_000_000_050),
+            )
+            .expect("resolve by timestamp")
+            .expect("timestamp baseline exists");
+        assert_eq!(by_time.version, 1);
+
+        let by_commit = store
+            .resolve_sir_baseline_by_selector(
+                "sym-baseline",
+                SirHistoryBaselineSelector::CommitHash("bbbb".to_owned()),
+            )
+            .expect("resolve by commit hash")
+            .expect("commit baseline exists");
+        assert_eq!(by_commit.version, 2);
     }
 
     #[test]

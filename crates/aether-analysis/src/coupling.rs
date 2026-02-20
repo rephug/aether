@@ -22,6 +22,10 @@ pub enum AnalysisError {
     Store(#[from] StoreError),
     #[error("inference error: {0}")]
     Infer(#[from] aether_infer::InferError),
+    #[error("memory error: {0}")]
+    Memory(#[from] aether_memory::MemoryError),
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("git error: {0}")]

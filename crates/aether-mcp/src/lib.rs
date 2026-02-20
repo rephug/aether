@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aether_analysis::{
-    BlastRadiusRequest, CouplingAnalyzer, RiskLevel as CouplingRiskLevel, TestIntentAnalyzer,
+    AcknowledgeDriftRequest as AnalysisAcknowledgeDriftRequest, BlastRadiusRequest,
+    CouplingAnalyzer, DriftAnalyzer, DriftInclude as AnalysisDriftInclude,
+    DriftReportRequest as AnalysisDriftReportRequest, RiskLevel as CouplingRiskLevel,
+    TestIntentAnalyzer,
 };
 use aether_config::{SearchRerankerKind, VerifyMode, load_workspace_config};
 pub use aether_core::SearchMode;
@@ -395,6 +398,145 @@ pub struct AetherTestIntentsResponse {
     pub symbol_id: Option<String>,
     pub result_count: u32,
     pub intents: Vec<AetherTestIntentEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AetherDriftInclude {
+    Semantic,
+    Boundary,
+    Structural,
+}
+
+impl From<AetherDriftInclude> for AnalysisDriftInclude {
+    fn from(value: AetherDriftInclude) -> Self {
+        match value {
+            AetherDriftInclude::Semantic => AnalysisDriftInclude::Semantic,
+            AetherDriftInclude::Boundary => AnalysisDriftInclude::Boundary,
+            AetherDriftInclude::Structural => AnalysisDriftInclude::Structural,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherDriftReportRequest {
+    pub window: Option<String>,
+    pub include: Option<Vec<AetherDriftInclude>>,
+    pub min_drift_magnitude: Option<f32>,
+    pub include_acknowledged: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherDriftReportWindow {
+    pub from_commit: String,
+    pub to_commit: String,
+    pub commit_count: u32,
+    pub analyzed_at: i64,
+    pub limited_history: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherDriftSummary {
+    pub symbols_analyzed: u32,
+    pub semantic_drifts: u32,
+    pub boundary_violations: u32,
+    pub emerging_hubs: u32,
+    pub new_cycles: u32,
+    pub orphaned_subgraphs: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherDriftTestCoverage {
+    pub has_tests: bool,
+    pub test_count: u32,
+    pub intents: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherSemanticDriftEntry {
+    pub result_id: String,
+    pub symbol_id: String,
+    pub symbol_name: String,
+    pub file: String,
+    pub drift_magnitude: f32,
+    pub similarity: f32,
+    pub drift_summary: String,
+    pub commit_range: [String; 2],
+    pub test_coverage: AetherDriftTestCoverage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherBoundaryViolationEntry {
+    pub result_id: String,
+    pub source_symbol: String,
+    pub source_file: String,
+    pub source_community: i64,
+    pub target_symbol: String,
+    pub target_file: String,
+    pub target_community: i64,
+    pub edge_type: String,
+    pub first_seen_commit: String,
+    pub informational: bool,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherEmergingHubEntry {
+    pub result_id: String,
+    pub symbol_id: String,
+    pub symbol_name: String,
+    pub file: String,
+    pub current_pagerank: f32,
+    pub previous_pagerank: f32,
+    pub dependents_count: u32,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherNewCycleEntry {
+    pub result_id: String,
+    pub symbols: Vec<String>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherOrphanedSubgraphEntry {
+    pub result_id: String,
+    pub symbols: Vec<String>,
+    pub files: Vec<String>,
+    pub total_symbols: u32,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct AetherStructuralAnomalies {
+    pub emerging_hubs: Vec<AetherEmergingHubEntry>,
+    pub new_cycles: Vec<AetherNewCycleEntry>,
+    pub orphaned_subgraphs: Vec<AetherOrphanedSubgraphEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherDriftReportResponse {
+    pub schema_version: String,
+    pub analysis_window: AetherDriftReportWindow,
+    pub summary: AetherDriftSummary,
+    pub semantic_drift: Vec<AetherSemanticDriftEntry>,
+    pub boundary_violations: Vec<AetherBoundaryViolationEntry>,
+    pub structural_anomalies: AetherStructuralAnomalies,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherAcknowledgeDriftRequest {
+    pub result_ids: Vec<String>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherAcknowledgeDriftResponse {
+    pub schema_version: String,
+    pub acknowledged: u32,
+    pub note_created: bool,
+    pub note_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1512,6 +1654,132 @@ impl AetherMcpServer {
             symbol_id,
             result_count: intents.len() as u32,
             intents,
+        })
+    }
+
+    pub fn aether_drift_report_logic(
+        &self,
+        request: AetherDriftReportRequest,
+    ) -> Result<AetherDriftReportResponse, AetherMcpError> {
+        let analyzer = DriftAnalyzer::new(&self.workspace)?;
+        let report = analyzer.report(AnalysisDriftReportRequest {
+            window: request.window,
+            include: request
+                .include
+                .map(|items| items.into_iter().map(Into::into).collect()),
+            min_drift_magnitude: request.min_drift_magnitude,
+            include_acknowledged: request.include_acknowledged,
+        })?;
+
+        Ok(AetherDriftReportResponse {
+            schema_version: report.schema_version,
+            analysis_window: AetherDriftReportWindow {
+                from_commit: report.analysis_window.from_commit,
+                to_commit: report.analysis_window.to_commit,
+                commit_count: report.analysis_window.commit_count,
+                analyzed_at: report.analysis_window.analyzed_at,
+                limited_history: report.analysis_window.limited_history,
+            },
+            summary: AetherDriftSummary {
+                symbols_analyzed: report.summary.symbols_analyzed,
+                semantic_drifts: report.summary.semantic_drifts,
+                boundary_violations: report.summary.boundary_violations,
+                emerging_hubs: report.summary.emerging_hubs,
+                new_cycles: report.summary.new_cycles,
+                orphaned_subgraphs: report.summary.orphaned_subgraphs,
+            },
+            semantic_drift: report
+                .semantic_drift
+                .into_iter()
+                .map(|entry| AetherSemanticDriftEntry {
+                    result_id: entry.result_id,
+                    symbol_id: entry.symbol_id,
+                    symbol_name: entry.symbol_name,
+                    file: entry.file,
+                    drift_magnitude: entry.drift_magnitude,
+                    similarity: entry.similarity,
+                    drift_summary: entry.drift_summary,
+                    commit_range: entry.commit_range,
+                    test_coverage: AetherDriftTestCoverage {
+                        has_tests: entry.test_coverage.has_tests,
+                        test_count: entry.test_coverage.test_count,
+                        intents: entry.test_coverage.intents,
+                    },
+                })
+                .collect(),
+            boundary_violations: report
+                .boundary_violations
+                .into_iter()
+                .map(|entry| AetherBoundaryViolationEntry {
+                    result_id: entry.result_id,
+                    source_symbol: entry.source_symbol,
+                    source_file: entry.source_file,
+                    source_community: entry.source_community,
+                    target_symbol: entry.target_symbol,
+                    target_file: entry.target_file,
+                    target_community: entry.target_community,
+                    edge_type: entry.edge_type,
+                    first_seen_commit: entry.first_seen_commit,
+                    informational: entry.informational,
+                    note: entry.note,
+                })
+                .collect(),
+            structural_anomalies: AetherStructuralAnomalies {
+                emerging_hubs: report
+                    .structural_anomalies
+                    .emerging_hubs
+                    .into_iter()
+                    .map(|entry| AetherEmergingHubEntry {
+                        result_id: entry.result_id,
+                        symbol_id: entry.symbol_id,
+                        symbol_name: entry.symbol_name,
+                        file: entry.file,
+                        current_pagerank: entry.current_pagerank,
+                        previous_pagerank: entry.previous_pagerank,
+                        dependents_count: entry.dependents_count,
+                        note: entry.note,
+                    })
+                    .collect(),
+                new_cycles: report
+                    .structural_anomalies
+                    .new_cycles
+                    .into_iter()
+                    .map(|entry| AetherNewCycleEntry {
+                        result_id: entry.result_id,
+                        symbols: entry.symbols,
+                        note: entry.note,
+                    })
+                    .collect(),
+                orphaned_subgraphs: report
+                    .structural_anomalies
+                    .orphaned_subgraphs
+                    .into_iter()
+                    .map(|entry| AetherOrphanedSubgraphEntry {
+                        result_id: entry.result_id,
+                        symbols: entry.symbols,
+                        files: entry.files,
+                        total_symbols: entry.total_symbols,
+                        note: entry.note,
+                    })
+                    .collect(),
+            },
+        })
+    }
+
+    pub fn aether_acknowledge_drift_logic(
+        &self,
+        request: AetherAcknowledgeDriftRequest,
+    ) -> Result<AetherAcknowledgeDriftResponse, AetherMcpError> {
+        let analyzer = DriftAnalyzer::new(&self.workspace)?;
+        let result = analyzer.acknowledge_drift(AnalysisAcknowledgeDriftRequest {
+            result_ids: request.result_ids,
+            note: request.note,
+        })?;
+        Ok(AetherAcknowledgeDriftResponse {
+            schema_version: result.schema_version,
+            acknowledged: result.acknowledged,
+            note_created: result.note_created,
+            note_id: result.note_id,
         })
     }
 
@@ -2694,6 +2962,34 @@ impl AetherMcpServer {
     }
 
     #[tool(
+        name = "aether_drift_report",
+        description = "Run semantic drift analysis with boundary and structural anomaly detection"
+    )]
+    pub async fn aether_drift_report(
+        &self,
+        Parameters(request): Parameters<AetherDriftReportRequest>,
+    ) -> Result<Json<AetherDriftReportResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_drift_report");
+        self.aether_drift_report_logic(request)
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_acknowledge_drift",
+        description = "Acknowledge drift findings and create a project note"
+    )]
+    pub async fn aether_acknowledge_drift(
+        &self,
+        Parameters(request): Parameters<AetherAcknowledgeDriftRequest>,
+    ) -> Result<Json<AetherAcknowledgeDriftResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_acknowledge_drift");
+        self.aether_acknowledge_drift_logic(request)
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
         name = "aether_verify",
         description = "Run allowlisted verification commands in host, container, or microvm mode"
     )]
@@ -2796,12 +3092,15 @@ fn to_mcp_error(err: AetherMcpError) -> McpError {
 #[cfg(test)]
 mod tests {
     use aether_store::{
-        CouplingEdgeRecord, CozoGraphStore, ProjectNoteRecord, SqliteStore, Store, SymbolRecord,
-        TestIntentRecord,
+        CouplingEdgeRecord, CozoGraphStore, DriftResultRecord, ProjectNoteRecord, SqliteStore,
+        Store, SymbolRecord, TestIntentRecord,
     };
     use tempfile::tempdir;
 
-    use super::{AetherAskKind, AetherAskRequest, AetherMcpServer};
+    use super::{
+        AetherAcknowledgeDriftRequest, AetherAskKind, AetherAskRequest, AetherDriftReportRequest,
+        AetherMcpServer,
+    };
 
     #[tokio::test]
     async fn aether_ask_returns_mixed_result_types() {
@@ -2908,6 +3207,75 @@ mod tests {
         assert!(kinds.contains(&AetherAskKind::Note));
         assert!(kinds.contains(&AetherAskKind::TestGuard));
         assert!(response.result_count >= 3);
+    }
+
+    #[test]
+    fn aether_drift_report_logic_returns_schema() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        std::fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
+        std::fs::write(
+            workspace.join(".aether/config.toml"),
+            r#"[drift]
+enabled = true
+drift_threshold = 0.85
+analysis_window = "10 commits"
+auto_analyze = false
+hub_percentile = 95
+"#,
+        )
+        .expect("write config");
+
+        let server = AetherMcpServer::new(workspace, false).expect("new mcp server");
+        let response = server
+            .aether_drift_report_logic(AetherDriftReportRequest {
+                window: Some("1 commits".to_owned()),
+                include: None,
+                min_drift_magnitude: Some(0.0),
+                include_acknowledged: Some(false),
+            })
+            .expect("drift report");
+        assert_eq!(response.schema_version, "1.0");
+    }
+
+    #[test]
+    fn aether_acknowledge_drift_logic_marks_rows() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let server = AetherMcpServer::new(workspace, false).expect("new mcp server");
+        let store = SqliteStore::open(workspace).expect("open store");
+        store
+            .upsert_drift_results(&[DriftResultRecord {
+                result_id: "drift-mcp-1".to_owned(),
+                symbol_id: "sym-a".to_owned(),
+                file_path: "src/a.rs".to_owned(),
+                symbol_name: "a".to_owned(),
+                drift_type: "semantic".to_owned(),
+                drift_magnitude: Some(0.5),
+                current_sir_hash: None,
+                baseline_sir_hash: None,
+                commit_range_start: Some(String::new()),
+                commit_range_end: Some(String::new()),
+                drift_summary: Some("changed".to_owned()),
+                detail_json: "{}".to_owned(),
+                detected_at: 1_700_000_000_000,
+                is_acknowledged: false,
+            }])
+            .expect("seed drift row");
+
+        let response = server
+            .aether_acknowledge_drift_logic(AetherAcknowledgeDriftRequest {
+                result_ids: vec!["drift-mcp-1".to_owned()],
+                note: "intentional".to_owned(),
+            })
+            .expect("ack drift");
+        assert_eq!(response.acknowledged, 1);
+
+        let rows = store
+            .list_drift_results_by_ids(&["drift-mcp-1".to_owned()])
+            .expect("list rows");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].is_acknowledged);
     }
 }
 

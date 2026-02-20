@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
 
@@ -11,6 +11,8 @@ use super::{
 pub struct CozoGraphStore {
     db: DbInstance,
 }
+
+pub type CrossCommunityEdge = (String, String, String, i64, i64);
 
 impl CozoGraphStore {
     pub fn open(workspace_root: impl AsRef<Path>) -> Result<Self, StoreError> {
@@ -246,6 +248,470 @@ impl CozoGraphStore {
                 .ok_or_else(|| StoreError::Cozo("invalid inference_method value".to_owned()))?
                 .to_owned(),
         })
+    }
+
+    fn list_dependency_edges_raw(&self) -> Result<Vec<(String, String, String)>, StoreError> {
+        let rows = self.run_script(
+            r#"
+            ?[source_id, target_id, edge_kind] :=
+                *edges{source_id, target_id, edge_kind, file_path}
+            "#,
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+
+        let mut edges = Vec::new();
+        for row in rows.rows {
+            if row.len() < 3 {
+                return Err(StoreError::Cozo("invalid edge row shape".to_owned()));
+            }
+            let source_id = row[0]
+                .get_str()
+                .ok_or_else(|| StoreError::Cozo("invalid edge source_id value".to_owned()))?
+                .to_owned();
+            let target_id = row[1]
+                .get_str()
+                .ok_or_else(|| StoreError::Cozo("invalid edge target_id value".to_owned()))?
+                .to_owned();
+            let edge_kind = row[2]
+                .get_str()
+                .ok_or_else(|| StoreError::Cozo("invalid edge_kind value".to_owned()))?
+                .to_owned();
+
+            if !matches!(edge_kind.as_str(), "calls" | "depends_on") {
+                continue;
+            }
+
+            edges.push((source_id, target_id, edge_kind));
+        }
+        Ok(edges)
+    }
+
+    fn try_louvain_from_cozo(&self) -> Result<Vec<(String, i64)>, StoreError> {
+        let rows = self.run_script(
+            r#"
+            dep_edges[source, target] :=
+                *edges{source_id: source, target_id: target, edge_kind},
+                edge_kind = "calls"
+            dep_edges[source, target] :=
+                *edges{source_id: source, target_id: target, edge_kind},
+                edge_kind = "depends_on"
+
+            ?[node, community] := community_detection_louvain(*dep_edges[], node, community)
+            :order node
+            "#,
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+
+        let mut assignments = Vec::new();
+        for row in rows.rows {
+            if row.len() < 2 {
+                return Err(StoreError::Cozo("invalid louvain row shape".to_owned()));
+            }
+            let node = row[0]
+                .get_str()
+                .ok_or_else(|| StoreError::Cozo("invalid louvain node value".to_owned()))?
+                .to_owned();
+            let community = data_value_to_i64(&row[1])
+                .ok_or_else(|| StoreError::Cozo("invalid louvain community_id value".to_owned()))?;
+            assignments.push((node, community));
+        }
+        Ok(assignments)
+    }
+
+    fn try_pagerank_from_cozo(&self) -> Result<Vec<(String, f32)>, StoreError> {
+        let rows = self.run_script(
+            r#"
+            dep_edges[source, target] :=
+                *edges{source_id: source, target_id: target, edge_kind},
+                edge_kind = "calls"
+            dep_edges[source, target] :=
+                *edges{source_id: source, target_id: target, edge_kind},
+                edge_kind = "depends_on"
+
+            ?[node, rank] := pagerank(*dep_edges[], node, rank)
+            :order node
+            "#,
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+
+        let mut scores = Vec::new();
+        for row in rows.rows {
+            if row.len() < 2 {
+                return Err(StoreError::Cozo("invalid pagerank row shape".to_owned()));
+            }
+            let node = row[0]
+                .get_str()
+                .ok_or_else(|| StoreError::Cozo("invalid pagerank node value".to_owned()))?
+                .to_owned();
+            let rank = if let Some(value) = row[1].get_float() {
+                value as f32
+            } else if let Some(value) = row[1].get_int() {
+                value as f32
+            } else {
+                return Err(StoreError::Cozo("invalid pagerank value".to_owned()));
+            };
+            scores.push((node, rank));
+        }
+        Ok(scores)
+    }
+
+    fn try_scc_from_cozo(&self) -> Result<Vec<Vec<String>>, StoreError> {
+        let rows = self.run_script(
+            r#"
+            dep_edges[source, target] :=
+                *edges{source_id: source, target_id: target, edge_kind},
+                edge_kind = "calls"
+            dep_edges[source, target] :=
+                *edges{source_id: source, target_id: target, edge_kind},
+                edge_kind = "depends_on"
+
+            ?[node, component] := strongly_connected_components(*dep_edges[], node, component)
+            :order component, node
+            "#,
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+
+        let mut grouped = BTreeMap::<i64, Vec<String>>::new();
+        for row in rows.rows {
+            if row.len() < 2 {
+                return Err(StoreError::Cozo("invalid scc row shape".to_owned()));
+            }
+            let node = row[0]
+                .get_str()
+                .ok_or_else(|| StoreError::Cozo("invalid scc node value".to_owned()))?
+                .to_owned();
+            let component = data_value_to_i64(&row[1])
+                .ok_or_else(|| StoreError::Cozo("invalid scc component value".to_owned()))?;
+            grouped.entry(component).or_default().push(node);
+        }
+        Ok(grouped.into_values().collect())
+    }
+
+    fn try_connected_components_from_cozo(&self) -> Result<Vec<Vec<String>>, StoreError> {
+        let rows = self.run_script(
+            r#"
+            dep_edges[source, target] :=
+                *edges{source_id: source, target_id: target, edge_kind},
+                edge_kind = "calls"
+            dep_edges[source, target] :=
+                *edges{source_id: source, target_id: target, edge_kind},
+                edge_kind = "depends_on"
+
+            ?[node, component] := connected_components(*dep_edges[], node, component)
+            :order component, node
+            "#,
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+
+        let mut grouped = BTreeMap::<i64, Vec<String>>::new();
+        for row in rows.rows {
+            if row.len() < 2 {
+                return Err(StoreError::Cozo(
+                    "invalid connected components row shape".to_owned(),
+                ));
+            }
+            let node = row[0]
+                .get_str()
+                .ok_or_else(|| StoreError::Cozo("invalid component node value".to_owned()))?
+                .to_owned();
+            let component = data_value_to_i64(&row[1])
+                .ok_or_else(|| StoreError::Cozo("invalid connected component value".to_owned()))?;
+            grouped.entry(component).or_default().push(node);
+        }
+        Ok(grouped.into_values().collect())
+    }
+
+    pub fn list_louvain_communities(&self) -> Result<Vec<(String, i64)>, StoreError> {
+        match self.try_louvain_from_cozo() {
+            Ok(mut records) => {
+                records.sort_by(|left, right| left.0.cmp(&right.0));
+                Ok(records)
+            }
+            Err(_) => {
+                let components = self.list_connected_components_fallback()?;
+                let mut assignments = Vec::new();
+                for (index, component) in components.into_iter().enumerate() {
+                    for node in component {
+                        assignments.push((node, index as i64 + 1));
+                    }
+                }
+                assignments.sort_by(|left, right| left.0.cmp(&right.0));
+                Ok(assignments)
+            }
+        }
+    }
+
+    pub fn list_cross_community_edges(
+        &self,
+        community_by_symbol: &HashMap<String, i64>,
+    ) -> Result<Vec<CrossCommunityEdge>, StoreError> {
+        if community_by_symbol.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let edges = self.list_dependency_edges_raw()?;
+        let mut records = Vec::new();
+        for (source_id, target_id, edge_kind) in edges {
+            let Some(source_community) = community_by_symbol.get(source_id.as_str()) else {
+                continue;
+            };
+            let Some(target_community) = community_by_symbol.get(target_id.as_str()) else {
+                continue;
+            };
+            if source_community == target_community {
+                continue;
+            }
+            records.push((
+                source_id,
+                target_id,
+                edge_kind,
+                *source_community,
+                *target_community,
+            ));
+        }
+        records.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
+        Ok(records)
+    }
+
+    pub fn list_pagerank(&self) -> Result<Vec<(String, f32)>, StoreError> {
+        match self.try_pagerank_from_cozo() {
+            Ok(mut records) => {
+                records.sort_by(|left, right| {
+                    right
+                        .1
+                        .partial_cmp(&left.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| left.0.cmp(&right.0))
+                });
+                Ok(records)
+            }
+            Err(_) => self.list_pagerank_fallback(),
+        }
+    }
+
+    pub fn list_strongly_connected_components(&self) -> Result<Vec<Vec<String>>, StoreError> {
+        match self.try_scc_from_cozo() {
+            Ok(mut records) => {
+                for component in &mut records {
+                    component.sort();
+                }
+                records.sort_by(|left, right| {
+                    right
+                        .len()
+                        .cmp(&left.len())
+                        .then_with(|| left.join(",").cmp(&right.join(",")))
+                });
+                Ok(records)
+            }
+            Err(_) => self.list_scc_fallback(),
+        }
+    }
+
+    pub fn list_connected_components(&self) -> Result<Vec<Vec<String>>, StoreError> {
+        match self.try_connected_components_from_cozo() {
+            Ok(mut records) => {
+                for component in &mut records {
+                    component.sort();
+                }
+                records.sort_by(|left, right| {
+                    right
+                        .len()
+                        .cmp(&left.len())
+                        .then_with(|| left.join(",").cmp(&right.join(",")))
+                });
+                Ok(records)
+            }
+            Err(_) => self.list_connected_components_fallback(),
+        }
+    }
+
+    fn list_connected_components_fallback(&self) -> Result<Vec<Vec<String>>, StoreError> {
+        let edges = self.list_dependency_edges_raw()?;
+        if edges.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut adjacency = HashMap::<String, Vec<String>>::new();
+        for (source, target, _) in &edges {
+            adjacency
+                .entry(source.clone())
+                .or_default()
+                .push(target.clone());
+            adjacency
+                .entry(target.clone())
+                .or_default()
+                .push(source.clone());
+        }
+
+        let mut visited = HashSet::new();
+        let mut components = Vec::new();
+        let mut nodes = adjacency.keys().cloned().collect::<Vec<_>>();
+        nodes.sort();
+        for node in nodes {
+            if !visited.insert(node.clone()) {
+                continue;
+            }
+            let mut queue = VecDeque::new();
+            queue.push_back(node.clone());
+            let mut component = vec![node];
+            while let Some(current) = queue.pop_front() {
+                if let Some(neighbors) = adjacency.get(current.as_str()) {
+                    for neighbor in neighbors {
+                        if visited.insert(neighbor.clone()) {
+                            queue.push_back(neighbor.clone());
+                            component.push(neighbor.clone());
+                        }
+                    }
+                }
+            }
+            component.sort();
+            component.dedup();
+            components.push(component);
+        }
+
+        components.sort_by(|left, right| {
+            right
+                .len()
+                .cmp(&left.len())
+                .then_with(|| left.join(",").cmp(&right.join(",")))
+        });
+        Ok(components)
+    }
+
+    fn list_pagerank_fallback(&self) -> Result<Vec<(String, f32)>, StoreError> {
+        let edges = self.list_dependency_edges_raw()?;
+        if edges.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut nodes = HashSet::new();
+        let mut incoming = HashMap::<String, Vec<String>>::new();
+        let mut out_degree = HashMap::<String, usize>::new();
+        for (source, target, _) in edges {
+            nodes.insert(source.clone());
+            nodes.insert(target.clone());
+            incoming.entry(target).or_default().push(source.clone());
+            *out_degree.entry(source).or_insert(0) += 1;
+        }
+        let mut nodes = nodes.into_iter().collect::<Vec<_>>();
+        nodes.sort();
+        let node_count = nodes.len();
+        if node_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let damping = 0.85f32;
+        let node_count_f = node_count as f32;
+        let mut rank = nodes
+            .iter()
+            .map(|node| (node.clone(), 1.0f32 / node_count_f))
+            .collect::<HashMap<_, _>>();
+        for _ in 0..25 {
+            let dangling_sum = nodes
+                .iter()
+                .filter(|node| out_degree.get((*node).as_str()).copied().unwrap_or(0) == 0)
+                .map(|node| rank.get(node.as_str()).copied().unwrap_or(0.0))
+                .sum::<f32>();
+            let mut next = HashMap::new();
+            for node in &nodes {
+                let incoming_sum = incoming
+                    .get(node.as_str())
+                    .into_iter()
+                    .flatten()
+                    .map(|source| {
+                        let source_rank = rank.get(source.as_str()).copied().unwrap_or(0.0);
+                        let degree = out_degree.get(source.as_str()).copied().unwrap_or(0).max(1);
+                        source_rank / degree as f32
+                    })
+                    .sum::<f32>();
+                let value = ((1.0 - damping) / node_count_f)
+                    + damping * (incoming_sum + dangling_sum / node_count_f);
+                next.insert(node.clone(), value);
+            }
+            rank = next;
+        }
+
+        let mut scored = rank.into_iter().collect::<Vec<_>>();
+        scored.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        Ok(scored)
+    }
+
+    fn list_scc_fallback(&self) -> Result<Vec<Vec<String>>, StoreError> {
+        let edges = self.list_dependency_edges_raw()?;
+        if edges.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut adjacency = HashMap::<String, Vec<String>>::new();
+        let mut reverse = HashMap::<String, Vec<String>>::new();
+        let mut nodes = HashSet::new();
+        for (source, target, _) in edges {
+            nodes.insert(source.clone());
+            nodes.insert(target.clone());
+            adjacency
+                .entry(source.clone())
+                .or_default()
+                .push(target.clone());
+            reverse.entry(target).or_default().push(source);
+        }
+        let mut nodes = nodes.into_iter().collect::<Vec<_>>();
+        nodes.sort();
+
+        let mut visited = HashSet::<String>::new();
+        let mut order = Vec::<String>::new();
+        for node in &nodes {
+            if visited.contains(node.as_str()) {
+                continue;
+            }
+            dfs_postorder(node, &adjacency, &mut visited, &mut order);
+        }
+
+        let mut assigned = HashSet::<String>::new();
+        let mut components = Vec::<Vec<String>>::new();
+        while let Some(node) = order.pop() {
+            if assigned.contains(node.as_str()) {
+                continue;
+            }
+            let mut stack = vec![node.clone()];
+            let mut component = Vec::new();
+            assigned.insert(node);
+            while let Some(current) = stack.pop() {
+                component.push(current.clone());
+                if let Some(neighbors) = reverse.get(current.as_str()) {
+                    for neighbor in neighbors {
+                        if assigned.insert(neighbor.clone()) {
+                            stack.push(neighbor.clone());
+                        }
+                    }
+                }
+            }
+            component.sort();
+            components.push(component);
+        }
+
+        components.sort_by(|left, right| {
+            right
+                .len()
+                .cmp(&left.len())
+                .then_with(|| left.join(",").cmp(&right.join(",")))
+        });
+        Ok(components)
     }
 
     pub fn has_dependency_between_files(
@@ -1042,6 +1508,39 @@ impl GraphStore for CozoGraphStore {
     }
 }
 
+fn data_value_to_i64(value: &DataValue) -> Option<i64> {
+    if let Some(raw) = value.get_int() {
+        return Some(raw);
+    }
+    value.get_float().map(|raw| raw as i64)
+}
+
+fn dfs_postorder(
+    start: &str,
+    adjacency: &HashMap<String, Vec<String>>,
+    visited: &mut HashSet<String>,
+    order: &mut Vec<String>,
+) {
+    let mut stack = vec![(start.to_owned(), false)];
+    while let Some((node, expanded)) = stack.pop() {
+        if expanded {
+            order.push(node);
+            continue;
+        }
+        if !visited.insert(node.clone()) {
+            continue;
+        }
+        stack.push((node.clone(), true));
+        if let Some(neighbors) = adjacency.get(node.as_str()) {
+            for neighbor in neighbors {
+                if !visited.contains(neighbor.as_str()) {
+                    stack.push((neighbor.clone(), false));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
@@ -1212,5 +1711,62 @@ mod tests {
         assert_eq!(guards[0].test_file, "tests/payment_test.rs");
         assert_eq!(guards[0].intent_count, 3);
         assert_eq!(guards[0].inference_method, "naming_convention");
+    }
+
+    #[test]
+    fn cozo_graph_graph_algorithms_return_expected_shapes() {
+        let temp = tempdir().expect("tempdir");
+        let graph = CozoGraphStore::open(temp.path()).expect("open cozo graph store");
+
+        let alpha = symbol("sym-alpha", "alpha");
+        let beta = symbol("sym-beta", "beta");
+        let gamma = symbol("sym-gamma", "gamma");
+        for row in [&alpha, &beta, &gamma] {
+            graph.upsert_symbol_node(row).expect("upsert symbol");
+        }
+        for edge in [
+            ResolvedEdge {
+                source_id: alpha.id.clone(),
+                target_id: beta.id.clone(),
+                edge_kind: EdgeKind::Calls,
+                file_path: "src/lib.rs".to_owned(),
+            },
+            ResolvedEdge {
+                source_id: beta.id.clone(),
+                target_id: alpha.id.clone(),
+                edge_kind: EdgeKind::Calls,
+                file_path: "src/lib.rs".to_owned(),
+            },
+            ResolvedEdge {
+                source_id: gamma.id.clone(),
+                target_id: beta.id.clone(),
+                edge_kind: EdgeKind::DependsOn,
+                file_path: "src/lib.rs".to_owned(),
+            },
+        ] {
+            graph.upsert_edge(&edge).expect("upsert edge");
+        }
+
+        let communities = graph
+            .list_louvain_communities()
+            .expect("louvain communities");
+        assert!(!communities.is_empty());
+
+        let pagerank = graph.list_pagerank().expect("pagerank");
+        assert!(!pagerank.is_empty());
+
+        let scc = graph
+            .list_strongly_connected_components()
+            .expect("scc components");
+        assert!(!scc.is_empty());
+        assert!(
+            scc.iter()
+                .any(|component| { component.contains(&alpha.id) && component.contains(&beta.id) })
+        );
+
+        let connected = graph
+            .list_connected_components()
+            .expect("connected components");
+        assert!(!connected.is_empty());
     }
 }
