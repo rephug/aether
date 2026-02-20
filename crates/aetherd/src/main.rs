@@ -6,10 +6,11 @@ use aether_config::{
 };
 use aether_infer::{download_candle_embedding_model, download_candle_reranker_model};
 use aetherd::calibrate::run_calibration_once;
+use aetherd::causal::run_trace_cause_command;
 use aetherd::cli::{
     AskArgs, BlastRadiusArgs, Cli, Commands, CommunitiesArgs, CouplingReportArgs, DriftAckArgs,
     DriftReportArgs, InitAgentArgs, LogFormat, MineCouplingArgs, NotesArgs, RecallArgs,
-    RememberArgs, SetupLocalArgs, TestIntentsArgs, parse_cli,
+    RememberArgs, SetupLocalArgs, TestIntentsArgs, TraceCauseArgs, parse_cli,
 };
 use aetherd::coupling::{
     run_blast_radius_command, run_coupling_report_command, run_mine_coupling_command,
@@ -224,6 +225,7 @@ fn run_subcommand(workspace: &Path, command: Commands) -> Result<()> {
         Commands::DriftReport(args) => run_drift_report_subcommand(workspace, args),
         Commands::DriftAck(args) => run_drift_ack_subcommand(workspace, args),
         Commands::Communities(args) => run_communities_subcommand(workspace, args),
+        Commands::TraceCause(args) => run_trace_cause_subcommand(workspace, args),
     }
 }
 
@@ -321,6 +323,10 @@ fn run_drift_ack_subcommand(workspace: &Path, args: DriftAckArgs) -> Result<()> 
 
 fn run_communities_subcommand(workspace: &Path, args: CommunitiesArgs) -> Result<()> {
     run_communities_command(workspace, args).context("communities command failed")
+}
+
+fn run_trace_cause_subcommand(workspace: &Path, args: TraceCauseArgs) -> Result<()> {
+    run_trace_cause_command(workspace, args).context("trace-cause command failed")
 }
 
 fn init_tracing_subscriber(log_format: LogFormat, configured_log_level: &str) -> Result<()> {

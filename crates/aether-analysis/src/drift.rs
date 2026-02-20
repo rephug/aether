@@ -1221,7 +1221,7 @@ fn normalize_rename_path(path: &str) -> String {
     value.to_owned()
 }
 
-fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
+pub(crate) fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
     if left.is_empty() || right.is_empty() || left.len() != right.len() {
         return 0.0;
     }
@@ -1277,13 +1277,18 @@ fn field_strings(value: &Value, keys: &[&str]) -> Vec<String> {
     Vec::new()
 }
 
-fn build_structured_sir_diff(before_json: &str, after_json: &str) -> Result<Value, AnalysisError> {
+pub(crate) fn build_structured_sir_diff(
+    before_json: &str,
+    after_json: &str,
+) -> Result<Value, AnalysisError> {
     let before = serde_json::from_str::<Value>(before_json)?;
     let after = serde_json::from_str::<Value>(after_json)?;
     let before_purpose = field_string(&before, &["purpose", "intent"]);
     let after_purpose = field_string(&after, &["purpose", "intent"]);
     let before_edge_cases = field_strings(&before, &["edge_cases", "error_modes"]);
     let after_edge_cases = field_strings(&after, &["edge_cases", "error_modes"]);
+    let before_dependencies = field_strings(&before, &["dependencies", "constraints"]);
+    let after_dependencies = field_strings(&after, &["dependencies", "constraints"]);
     let before_constraints = field_strings(&before, &["constraints"]);
     let after_constraints = field_strings(&after, &["constraints"]);
 
@@ -1295,6 +1300,16 @@ fn build_structured_sir_diff(before_json: &str, after_json: &str) -> Result<Valu
     let edge_cases_removed = before_edge_cases
         .iter()
         .filter(|item| !after_edge_cases.contains(item))
+        .cloned()
+        .collect::<Vec<_>>();
+    let dependencies_added = after_dependencies
+        .iter()
+        .filter(|item| !before_dependencies.contains(item))
+        .cloned()
+        .collect::<Vec<_>>();
+    let dependencies_removed = before_dependencies
+        .iter()
+        .filter(|item| !after_dependencies.contains(item))
         .cloned()
         .collect::<Vec<_>>();
     let constraints_added = after_constraints
@@ -1320,6 +1335,13 @@ fn build_structured_sir_diff(before_json: &str, after_json: &str) -> Result<Valu
             "added": edge_cases_added,
             "removed": edge_cases_removed,
             "changed": before_edge_cases != after_edge_cases,
+        },
+        "dependencies": {
+            "before": before_dependencies,
+            "after": after_dependencies,
+            "added": dependencies_added,
+            "removed": dependencies_removed,
+            "changed": before_dependencies != after_dependencies,
         },
         "constraints": {
             "before": before_constraints,
@@ -1376,6 +1398,40 @@ fn mechanical_diff_summary(structured_diff: &Value) -> String {
     if !edge_removed.is_empty() {
         parts.push(format!("edge_cases removed: {}", edge_removed.join(", ")));
     }
+    let dependencies_added = structured_diff
+        .pointer("/dependencies/added")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !dependencies_added.is_empty() {
+        parts.push(format!(
+            "dependencies added: {}",
+            dependencies_added.join(", ")
+        ));
+    }
+    let dependencies_removed = structured_diff
+        .pointer("/dependencies/removed")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !dependencies_removed.is_empty() {
+        parts.push(format!(
+            "dependencies removed: {}",
+            dependencies_removed.join(", ")
+        ));
+    }
     let constraints_added = structured_diff
         .pointer("/constraints/added")
         .and_then(Value::as_array)
@@ -1416,6 +1472,52 @@ fn mechanical_diff_summary(structured_diff: &Value) -> String {
     } else {
         parts.join("; ")
     }
+}
+
+pub(crate) fn structural_change_magnitude_from_diff(structured_diff: &Value) -> f32 {
+    let purpose_changed = structured_diff
+        .pointer("/purpose/changed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let edge_delta = structured_diff
+        .pointer("/edge_cases/added")
+        .and_then(Value::as_array)
+        .map(|items| items.len())
+        .unwrap_or(0)
+        + structured_diff
+            .pointer("/edge_cases/removed")
+            .and_then(Value::as_array)
+            .map(|items| items.len())
+            .unwrap_or(0);
+    let dependency_delta = structured_diff
+        .pointer("/dependencies/added")
+        .and_then(Value::as_array)
+        .map(|items| items.len())
+        .unwrap_or(0)
+        + structured_diff
+            .pointer("/dependencies/removed")
+            .and_then(Value::as_array)
+            .map(|items| items.len())
+            .unwrap_or(0);
+    let constraints_delta = structured_diff
+        .pointer("/constraints/added")
+        .and_then(Value::as_array)
+        .map(|items| items.len())
+        .unwrap_or(0)
+        + structured_diff
+            .pointer("/constraints/removed")
+            .and_then(Value::as_array)
+            .map(|items| items.len())
+            .unwrap_or(0);
+
+    let mut score = 0.0f32;
+    if purpose_changed {
+        score += 0.4;
+    }
+    score += 0.25 * (edge_delta as f32).min(4.0) / 4.0;
+    score += 0.25 * (dependency_delta as f32).min(4.0) / 4.0;
+    score += 0.10 * (constraints_delta as f32).min(4.0) / 4.0;
+    score.clamp(0.0, 1.0)
 }
 
 fn semantic_entry_from_record(

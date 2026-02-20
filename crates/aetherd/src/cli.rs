@@ -277,6 +277,49 @@ pub struct CommunitiesArgs {
     pub format: CommunitiesFormat,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct TraceCauseArgs {
+    #[arg(
+        help = "Target symbol name (required unless --symbol-id is provided)",
+        required_unless_present = "symbol_id"
+    )]
+    pub symbol_name: Option<String>,
+
+    #[arg(
+        long,
+        help = "Direct symbol identifier (bypasses name+file resolution)"
+    )]
+    pub symbol_id: Option<String>,
+
+    #[arg(
+        long,
+        help = "File path containing the target symbol name",
+        required_unless_present = "symbol_id"
+    )]
+    pub file: Option<String>,
+
+    #[arg(
+        long,
+        default_value = "20 commits",
+        help = "Lookback window (examples: '20 commits', '14d', 'since:a1b2c3d')"
+    )]
+    pub lookback: String,
+
+    #[arg(
+        long = "depth",
+        default_value_t = 5,
+        help = "Maximum upstream traversal depth (clamped to 1..10)"
+    )]
+    pub depth: u32,
+
+    #[arg(
+        long,
+        default_value_t = 5,
+        help = "Maximum causal candidates to return (clamped to 1..50)"
+    )]
+    pub limit: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Subcommand)]
 pub enum Commands {
     /// Generate agent configuration files for AI coding agents
@@ -305,6 +348,8 @@ pub enum Commands {
     DriftAck(DriftAckArgs),
     /// Show current community assignments from dependency graph
     Communities(CommunitiesArgs),
+    /// Trace likely upstream semantic causes for a target symbol
+    TraceCause(TraceCauseArgs),
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -928,6 +973,63 @@ mod tests {
         match cli.command {
             Some(Commands::Communities(args)) => {
                 assert_eq!(args.format.as_str(), "table");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trace_cause_subcommand_parses_symbol_name_and_file() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "trace-cause",
+            "process_payment",
+            "--file",
+            "src/payments/processor.rs",
+            "--lookback",
+            "20 commits",
+            "--depth",
+            "4",
+            "--limit",
+            "6",
+        ])
+        .expect("trace-cause should parse");
+
+        match cli.command {
+            Some(Commands::TraceCause(args)) => {
+                assert_eq!(args.symbol_name.as_deref(), Some("process_payment"));
+                assert_eq!(args.file.as_deref(), Some("src/payments/processor.rs"));
+                assert_eq!(args.symbol_id, None);
+                assert_eq!(args.lookback, "20 commits");
+                assert_eq!(args.depth, 4);
+                assert_eq!(args.limit, 6);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trace_cause_subcommand_parses_symbol_id_mode() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "trace-cause",
+            "--symbol-id",
+            "sym-123",
+            "--depth",
+            "3",
+        ])
+        .expect("trace-cause symbol-id mode should parse");
+
+        match cli.command {
+            Some(Commands::TraceCause(args)) => {
+                assert_eq!(args.symbol_id.as_deref(), Some("sym-123"));
+                assert_eq!(args.symbol_name, None);
+                assert_eq!(args.file, None);
+                assert_eq!(args.depth, 3);
             }
             other => panic!("unexpected command: {other:?}"),
         }
