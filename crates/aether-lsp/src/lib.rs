@@ -8,7 +8,7 @@ use aether_core::{
 };
 use aether_parse::{RustUsePrefix, SymbolExtractor, language_for_path, rust_use_path_at_cursor};
 use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
-use aether_store::{SqliteStore, Store, StoreError};
+use aether_store::{CouplingEdgeRecord, CozoGraphStore, SqliteStore, Store, StoreError};
 use serde_json::Value;
 use thiserror::Error;
 use tower_lsp::lsp_types::{
@@ -228,6 +228,18 @@ pub fn resolve_hover_markdown_for_path(
     if let Some(why_hint) = compact_why_hint(store, &symbol_id)? {
         markdown.push_str("\n\n");
         markdown.push_str(&why_hint);
+    }
+
+    let context_lines = collect_project_context_lines(
+        workspace_root,
+        store,
+        symbol.file_path.as_str(),
+        symbol_id.as_str(),
+        current_unix_timestamp_millis(),
+    )?;
+    if !context_lines.is_empty() {
+        markdown.push_str("\n\n---\n");
+        markdown.push_str(context_lines.join("\n").as_str());
     }
 
     Ok(Some(markdown))
@@ -543,6 +555,172 @@ fn compact_why_hint(store: &SqliteStore, symbol_id: &str) -> Result<Option<Strin
     Ok(Some(summary))
 }
 
+fn collect_project_context_lines(
+    workspace_root: &Path,
+    store: &SqliteStore,
+    file_path: &str,
+    symbol_id: &str,
+    now_ms: i64,
+) -> Result<Vec<String>, HoverResolveError> {
+    let mut lines = Vec::new();
+
+    if let Some(line) = top_project_note_line(store, file_path, symbol_id, now_ms)? {
+        lines.push(line);
+    }
+    if let Some(line) = top_coupling_line(workspace_root, file_path)? {
+        lines.push(line);
+    }
+    let test_lines = top_test_intent_lines(store, file_path, symbol_id)?;
+    lines.extend(test_lines);
+
+    Ok(lines)
+}
+
+fn top_project_note_line(
+    store: &SqliteStore,
+    file_path: &str,
+    symbol_id: &str,
+    now_ms: i64,
+) -> Result<Option<String>, HoverResolveError> {
+    let notes = store.list_project_notes_for_file_ref(file_path, 20)?;
+    if notes.is_empty() {
+        return Ok(None);
+    }
+
+    let selected = notes
+        .iter()
+        .find(|note| note.symbol_refs.iter().any(|value| value == symbol_id))
+        .unwrap_or(&notes[0]);
+
+    let age = format_relative_age(now_ms, selected.updated_at);
+    let snippet = compact_text(selected.content.as_str(), 110);
+    Ok(Some(format!("📝 \"{snippet}\" ({age})")))
+}
+
+fn top_coupling_line(
+    workspace_root: &Path,
+    file_path: &str,
+) -> Result<Option<String>, HoverResolveError> {
+    let cozo = match CozoGraphStore::open(workspace_root) {
+        Ok(store) => store,
+        Err(_) => return Ok(None),
+    };
+
+    let mut edges = match cozo.list_co_change_edges_for_file(file_path, 0.0) {
+        Ok(edges) => edges,
+        Err(_) => return Ok(None),
+    };
+    if edges.is_empty() {
+        return Ok(None);
+    }
+    edges.sort_by(|left, right| {
+        right
+            .fused_score
+            .partial_cmp(&left.fused_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.file_a.cmp(&right.file_a))
+            .then_with(|| left.file_b.cmp(&right.file_b))
+    });
+
+    let top = &edges[0];
+    let coupled_file = coupled_file_for_edge(file_path, top);
+    if coupled_file.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(format!(
+        "⚠️ Co-changes with {} ({:.0}%, {})",
+        coupled_file,
+        (top.git_coupling.clamp(0.0, 1.0) * 100.0),
+        risk_label(top.fused_score)
+    )))
+}
+
+fn top_test_intent_lines(
+    store: &SqliteStore,
+    file_path: &str,
+    symbol_id: &str,
+) -> Result<Vec<String>, HoverResolveError> {
+    let mut intents = store.list_test_intents_for_symbol(symbol_id)?;
+    if intents.is_empty() {
+        intents = store.list_test_intents_for_file(file_path)?;
+    }
+
+    let mut lines = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+    for intent in intents {
+        if lines.len() >= 3 {
+            break;
+        }
+        if !seen.insert(intent.intent_id.clone()) {
+            continue;
+        }
+        lines.push(format!(
+            "🧪 {}",
+            compact_text(intent.intent_text.as_str(), 110)
+        ));
+    }
+    Ok(lines)
+}
+
+fn coupled_file_for_edge(file_path: &str, edge: &CouplingEdgeRecord) -> String {
+    if edge.file_a == file_path {
+        return edge.file_b.clone();
+    }
+    if edge.file_b == file_path {
+        return edge.file_a.clone();
+    }
+    String::new()
+}
+
+fn risk_label(score: f32) -> &'static str {
+    if score >= 0.7 {
+        return "Critical";
+    }
+    if score >= 0.4 {
+        return "High";
+    }
+    if score >= 0.2 {
+        return "Medium";
+    }
+    "Low"
+}
+
+fn format_relative_age(now_ms: i64, ts_ms: i64) -> String {
+    let age_ms = now_ms.saturating_sub(ts_ms).max(0);
+    const MINUTE_MS: i64 = 60 * 1000;
+    const HOUR_MS: i64 = 60 * MINUTE_MS;
+    const DAY_MS: i64 = 24 * HOUR_MS;
+
+    if age_ms < HOUR_MS {
+        let minutes = (age_ms / MINUTE_MS).max(1);
+        return format!("{minutes}m ago");
+    }
+    if age_ms < DAY_MS {
+        return format!("{}h ago", (age_ms / HOUR_MS).max(1));
+    }
+    format!("{}d ago", (age_ms / DAY_MS).max(1))
+}
+
+fn compact_text(value: &str, limit: usize) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() <= limit {
+        return trimmed.to_owned();
+    }
+
+    let mut end = limit;
+    while !trimmed.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+        if end == 0 {
+            break;
+        }
+    }
+    if end == 0 {
+        return String::new();
+    }
+    format!("{}...", &trimmed[..end])
+}
+
 fn parse_history_fields(value: &str) -> Option<serde_json::Map<String, Value>> {
     let parsed: Value = serde_json::from_str(value).ok()?;
     let Value::Object(fields) = parsed else {
@@ -641,7 +819,10 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use aether_store::{SirMetaRecord, Store, SymbolRecord};
+    use aether_store::{
+        CouplingEdgeRecord, CozoGraphStore, ProjectNoteRecord, SirMetaRecord, Store, SymbolRecord,
+        TestIntentRecord,
+    };
     use tempfile::tempdir;
     use tower_lsp::lsp_types::Position;
 
@@ -924,6 +1105,197 @@ mod tests {
                 .expect("hover markdown");
 
         assert!(markdown.contains("> AETHER WHY: only one recorded SIR version."));
+    }
+
+    #[test]
+    fn resolve_hover_enriches_with_project_context_when_available() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let source_file = write_source_file(workspace);
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        let symbol_id = symbol_id_at(workspace, &source_file, Position::new(0, 4));
+
+        store
+            .write_sir_blob(
+                &symbol_id,
+                r#"{
+                    "intent":"Processes payments with retry",
+                    "inputs":["x"],
+                    "outputs":["y"],
+                    "side_effects":[],
+                    "dependencies":[],
+                    "error_modes":[],
+                    "confidence":0.92
+                }"#,
+            )
+            .expect("write sir blob");
+        store
+            .upsert_sir_meta(SirMetaRecord {
+                id: symbol_id.clone(),
+                sir_hash: "hash-context".to_owned(),
+                sir_version: 1,
+                provider: "mock".to_owned(),
+                model: "mock".to_owned(),
+                updated_at: 1_700_000_000,
+                sir_status: "fresh".to_owned(),
+                last_error: None,
+                last_attempt_at: 1_700_000_000,
+            })
+            .expect("upsert sir meta");
+
+        store
+            .upsert_project_note(ProjectNoteRecord {
+                note_id: "note-context".to_owned(),
+                content: "Refactored payment retries to cap timeout budget".to_owned(),
+                content_hash: "hash-note-context".to_owned(),
+                source_type: "session".to_owned(),
+                source_agent: None,
+                tags: vec!["refactor".to_owned()],
+                entity_refs: Vec::new(),
+                file_refs: vec!["src/lib.rs".to_owned()],
+                symbol_refs: vec![symbol_id.clone()],
+                created_at: 1_700_000_000_000,
+                updated_at: 1_700_000_000_000,
+                access_count: 0,
+                last_accessed_at: None,
+                is_archived: false,
+            })
+            .expect("insert context note");
+
+        store
+            .replace_test_intents_for_file(
+                "src/lib.rs",
+                &[
+                    TestIntentRecord {
+                        intent_id: "intent-1".to_owned(),
+                        file_path: "src/lib.rs".to_owned(),
+                        test_name: "test_retry_1".to_owned(),
+                        intent_text: "retries on timeout".to_owned(),
+                        group_label: None,
+                        language: "rust".to_owned(),
+                        symbol_id: Some(symbol_id.clone()),
+                        created_at: 1_700_000_000_000,
+                        updated_at: 1_700_000_000_100,
+                    },
+                    TestIntentRecord {
+                        intent_id: "intent-2".to_owned(),
+                        file_path: "src/lib.rs".to_owned(),
+                        test_name: "test_retry_2".to_owned(),
+                        intent_text: "logs retry attempts".to_owned(),
+                        group_label: None,
+                        language: "rust".to_owned(),
+                        symbol_id: Some(symbol_id.clone()),
+                        created_at: 1_700_000_000_000,
+                        updated_at: 1_700_000_000_100,
+                    },
+                    TestIntentRecord {
+                        intent_id: "intent-3".to_owned(),
+                        file_path: "src/lib.rs".to_owned(),
+                        test_name: "test_retry_3".to_owned(),
+                        intent_text: "guards negative balance".to_owned(),
+                        group_label: None,
+                        language: "rust".to_owned(),
+                        symbol_id: Some(symbol_id.clone()),
+                        created_at: 1_700_000_000_000,
+                        updated_at: 1_700_000_000_100,
+                    },
+                    TestIntentRecord {
+                        intent_id: "intent-4".to_owned(),
+                        file_path: "src/lib.rs".to_owned(),
+                        test_name: "test_retry_4".to_owned(),
+                        intent_text: "fourth intent should be trimmed".to_owned(),
+                        group_label: None,
+                        language: "rust".to_owned(),
+                        symbol_id: Some(symbol_id.clone()),
+                        created_at: 1_700_000_000_000,
+                        updated_at: 1_700_000_000_100,
+                    },
+                ],
+            )
+            .expect("insert test intents");
+
+        let cozo = CozoGraphStore::open(workspace).expect("open cozo");
+        cozo.upsert_co_change_edges(&[CouplingEdgeRecord {
+            file_a: "src/lib.rs".to_owned(),
+            file_b: "src/gateway.rs".to_owned(),
+            co_change_count: 8,
+            total_commits_a: 10,
+            total_commits_b: 9,
+            git_coupling: 0.89,
+            static_signal: 0.8,
+            semantic_signal: 0.6,
+            fused_score: 0.82,
+            coupling_type: "multi".to_owned(),
+            last_co_change_commit: "abc123".to_owned(),
+            last_co_change_at: 1_700_000_000,
+            mined_at: 1_700_000_200,
+        }])
+        .expect("insert coupling edge");
+        drop(cozo);
+        assert!(
+            top_coupling_line(workspace, "src/lib.rs")
+                .expect("resolve coupling line")
+                .is_some()
+        );
+
+        let markdown =
+            resolve_hover_markdown_for_path(workspace, &store, &source_file, Position::new(0, 4))
+                .expect("resolve hover")
+                .expect("hover markdown");
+
+        assert!(markdown.contains("📝"));
+        assert!(markdown.contains("Co-changes"));
+        assert!(markdown.contains("🧪"));
+        assert!(!markdown.contains("fourth intent should be trimmed"));
+    }
+
+    #[test]
+    fn resolve_hover_does_not_append_context_when_none_exists() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let source_file = write_source_file(workspace);
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        let symbol_id = symbol_id_at(workspace, &source_file, Position::new(0, 4));
+
+        store
+            .write_sir_blob(
+                &symbol_id,
+                r#"{
+                    "intent":"No context summary",
+                    "inputs":[],
+                    "outputs":[],
+                    "side_effects":[],
+                    "dependencies":[],
+                    "error_modes":[],
+                    "confidence":0.80
+                }"#,
+            )
+            .expect("write sir blob");
+        store
+            .upsert_sir_meta(SirMetaRecord {
+                id: symbol_id,
+                sir_hash: "hash-none".to_owned(),
+                sir_version: 1,
+                provider: "mock".to_owned(),
+                model: "mock".to_owned(),
+                updated_at: 1_700_000_000,
+                sir_status: "fresh".to_owned(),
+                last_error: None,
+                last_attempt_at: 1_700_000_000,
+            })
+            .expect("upsert sir meta");
+
+        let markdown =
+            resolve_hover_markdown_for_path(workspace, &store, &source_file, Position::new(0, 4))
+                .expect("resolve hover")
+                .expect("hover markdown");
+
+        assert!(!markdown.contains("📝"));
+        assert!(!markdown.contains("⚠️"));
+        assert!(!markdown.contains("🧪"));
+        assert!(!markdown.contains("---\n📝"));
     }
 
     #[test]

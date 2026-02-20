@@ -19,6 +19,7 @@ use aether_infer::{
     load_embedding_provider_from_config, load_reranker_provider_from_config,
 };
 use aether_memory::{
+    AskInclude as MemoryAskInclude, AskQueryRequest as MemoryAskQueryRequest,
     EntityRef as MemoryEntityRef, NoteEmbeddingRequest as MemoryNoteEmbeddingRequest,
     NoteSourceType as MemoryNoteSourceType, ProjectMemoryService,
     RecallRequest as MemoryRecallRequest, RememberRequest as MemoryRememberRequest,
@@ -228,6 +229,66 @@ pub struct AetherRecallResponse {
     pub fallback_reason: Option<String>,
     pub result_count: u32,
     pub notes: Vec<AetherRecallNote>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AetherAskInclude {
+    Symbols,
+    Notes,
+    Coupling,
+    Tests,
+}
+
+impl From<AetherAskInclude> for MemoryAskInclude {
+    fn from(value: AetherAskInclude) -> Self {
+        match value {
+            AetherAskInclude::Symbols => MemoryAskInclude::Symbols,
+            AetherAskInclude::Notes => MemoryAskInclude::Notes,
+            AetherAskInclude::Coupling => MemoryAskInclude::Coupling,
+            AetherAskInclude::Tests => MemoryAskInclude::Tests,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherAskRequest {
+    pub query: String,
+    pub limit: Option<u32>,
+    pub include: Option<Vec<AetherAskInclude>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AetherAskKind {
+    Symbol,
+    Note,
+    TestGuard,
+    CoupledFile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherAskResult {
+    pub kind: AetherAskKind,
+    pub id: Option<String>,
+    pub title: Option<String>,
+    pub snippet: String,
+    pub relevance_score: f32,
+    pub file: Option<String>,
+    pub language: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub source_type: Option<String>,
+    pub test_file: Option<String>,
+    pub fused_score: Option<f32>,
+    pub coupling_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherAskResponse {
+    pub schema_version: String,
+    pub query: String,
+    pub result_count: u32,
+    pub results: Vec<AetherAskResult>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1184,6 +1245,85 @@ impl AetherMcpServer {
             fallback_reason: result.fallback_reason,
             result_count,
             notes,
+        })
+    }
+
+    pub async fn aether_ask_logic(
+        &self,
+        request: AetherAskRequest,
+    ) -> Result<AetherAskResponse, AetherMcpError> {
+        let limit = effective_limit(request.limit);
+        let include = request
+            .include
+            .unwrap_or_default()
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<_>>();
+
+        let mut semantic_query = None;
+        match load_embedding_provider_from_config(
+            &self.workspace,
+            EmbeddingProviderOverrides::default(),
+        ) {
+            Ok(Some(loaded)) => match loaded.provider.embed_text(request.query.as_str()).await {
+                Ok(embedding) if !embedding.is_empty() => {
+                    semantic_query = Some(MemorySemanticQuery {
+                        provider: loaded.provider_name,
+                        model: loaded.model_name,
+                        embedding,
+                    });
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(error = %err, "embedding provider error while handling aether_ask");
+                }
+            },
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to load embedding provider for aether_ask");
+            }
+        }
+
+        let memory = ProjectMemoryService::new(&self.workspace);
+        let result = memory
+            .ask(MemoryAskQueryRequest {
+                query: request.query.clone(),
+                limit,
+                include,
+                now_ms: None,
+                semantic: semantic_query,
+            })
+            .await?;
+
+        let results = result
+            .results
+            .into_iter()
+            .map(|entry| AetherAskResult {
+                kind: match entry.kind {
+                    aether_memory::AskResultKind::Symbol => AetherAskKind::Symbol,
+                    aether_memory::AskResultKind::Note => AetherAskKind::Note,
+                    aether_memory::AskResultKind::TestGuard => AetherAskKind::TestGuard,
+                    aether_memory::AskResultKind::CoupledFile => AetherAskKind::CoupledFile,
+                },
+                id: entry.id,
+                title: entry.title,
+                snippet: entry.snippet,
+                relevance_score: entry.relevance_score,
+                file: entry.file,
+                language: entry.language,
+                tags: (!entry.tags.is_empty()).then_some(entry.tags),
+                source_type: entry.source_type,
+                test_file: entry.test_file,
+                fused_score: entry.fused_score,
+                coupling_type: entry.coupling_type,
+            })
+            .collect::<Vec<_>>();
+
+        Ok(AetherAskResponse {
+            schema_version: MEMORY_SCHEMA_VERSION.to_owned(),
+            query: result.query,
+            result_count: results.len() as u32,
+            results,
         })
     }
 
@@ -2511,6 +2651,21 @@ impl AetherMcpServer {
     }
 
     #[tool(
+        name = "aether_ask",
+        description = "Search symbols, notes, coupling, and test intents with unified ranking"
+    )]
+    pub async fn aether_ask(
+        &self,
+        Parameters(request): Parameters<AetherAskRequest>,
+    ) -> Result<Json<AetherAskResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_ask");
+        self.aether_ask_logic(request)
+            .await
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
         name = "aether_blast_radius",
         description = "Analyze coupled files and risk levels for blast-radius impact"
     )]
@@ -2636,6 +2791,124 @@ pub async fn run_stdio_server(workspace: impl AsRef<Path>, verbose: bool) -> Res
 
 fn to_mcp_error(err: AetherMcpError) -> McpError {
     McpError::internal_error(err.to_string(), None)
+}
+
+#[cfg(test)]
+mod tests {
+    use aether_store::{
+        CouplingEdgeRecord, CozoGraphStore, ProjectNoteRecord, SqliteStore, Store, SymbolRecord,
+        TestIntentRecord,
+    };
+    use tempfile::tempdir;
+
+    use super::{AetherAskKind, AetherAskRequest, AetherMcpServer};
+
+    #[tokio::test]
+    async fn aether_ask_returns_mixed_result_types() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let server = AetherMcpServer::new(workspace, false).expect("new mcp server");
+        let store = SqliteStore::open(workspace).expect("open store");
+
+        store
+            .upsert_symbol(SymbolRecord {
+                id: "sym-payment".to_owned(),
+                file_path: "src/payments/processor.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "process_payment_with_retry".to_owned(),
+                signature_fingerprint: "sig-payment".to_owned(),
+                last_seen_at: 1_700_000_000,
+            })
+            .expect("upsert symbol");
+        store
+            .write_sir_blob(
+                "sym-payment",
+                r#"{
+                    "intent":"Processes payment retries with capped backoff",
+                    "inputs":[],
+                    "outputs":[],
+                    "side_effects":[],
+                    "dependencies":[],
+                    "error_modes":[],
+                    "confidence":0.9
+                }"#,
+            )
+            .expect("write sir");
+
+        store
+            .upsert_project_note(ProjectNoteRecord {
+                note_id: "note-payment".to_owned(),
+                content: "Refactored payment retry workflow for timeout spikes".to_owned(),
+                content_hash: "note-hash-payment".to_owned(),
+                source_type: "session".to_owned(),
+                source_agent: Some("test".to_owned()),
+                tags: vec!["refactor".to_owned()],
+                entity_refs: Vec::new(),
+                file_refs: vec!["src/payments/processor.rs".to_owned()],
+                symbol_refs: vec!["sym-payment".to_owned()],
+                created_at: 1_700_000_000_000,
+                updated_at: 1_700_000_000_000,
+                access_count: 0,
+                last_accessed_at: None,
+                is_archived: false,
+            })
+            .expect("upsert note");
+
+        store
+            .replace_test_intents_for_file(
+                "tests/payment_test.rs",
+                &[TestIntentRecord {
+                    intent_id: "intent-timeout".to_owned(),
+                    file_path: "tests/payment_test.rs".to_owned(),
+                    test_name: "test_retry_timeout".to_owned(),
+                    intent_text: "retries payment timeout".to_owned(),
+                    group_label: None,
+                    language: "rust".to_owned(),
+                    symbol_id: Some("sym-payment".to_owned()),
+                    created_at: 1_700_000_000_000,
+                    updated_at: 1_700_000_000_100,
+                }],
+            )
+            .expect("upsert test intent");
+
+        let cozo = CozoGraphStore::open(workspace).expect("open cozo");
+        cozo.upsert_co_change_edges(&[CouplingEdgeRecord {
+            file_a: "src/payments/processor.rs".to_owned(),
+            file_b: "src/payments/gateway.rs".to_owned(),
+            co_change_count: 8,
+            total_commits_a: 10,
+            total_commits_b: 9,
+            git_coupling: 0.85,
+            static_signal: 0.7,
+            semantic_signal: 0.6,
+            fused_score: 0.8,
+            coupling_type: "multi".to_owned(),
+            last_co_change_commit: "abc123".to_owned(),
+            last_co_change_at: 1_700_000_000,
+            mined_at: 1_700_000_100,
+        }])
+        .expect("upsert co-change");
+
+        let response = server
+            .aether_ask_logic(AetherAskRequest {
+                query: "payment".to_owned(),
+                limit: Some(10),
+                include: None,
+            })
+            .await
+            .expect("aether ask");
+
+        let kinds = response
+            .results
+            .iter()
+            .map(|item| item.kind)
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&AetherAskKind::Symbol));
+        assert!(kinds.contains(&AetherAskKind::Note));
+        assert!(kinds.contains(&AetherAskKind::TestGuard));
+        assert!(response.result_count >= 3);
+    }
 }
 
 fn count_table_rows(conn: &Connection, table_name: &str) -> Result<i64, AetherMcpError> {

@@ -7,13 +7,14 @@ use aether_core::{
 };
 use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
 use aether_memory::{
-    ListNotesRequest, NoteEmbeddingRequest, NoteSourceType, ProjectMemoryService, RecallRequest,
-    RememberRequest, SemanticQuery, truncate_content_for_embedding,
+    AskInclude, AskQueryRequest, ListNotesRequest, NoteEmbeddingRequest, NoteSourceType,
+    ProjectMemoryService, RecallRequest, RememberRequest, SemanticQuery,
+    truncate_content_for_embedding,
 };
 use anyhow::{Context, Result};
 use serde_json::json;
 
-use crate::cli::{NotesArgs, RecallArgs, RememberArgs};
+use crate::cli::{AskArgs, AskIncludeArg, NotesArgs, RecallArgs, RememberArgs};
 
 pub fn run_remember_command(workspace: &Path, args: RememberArgs) -> Result<()> {
     let service = ProjectMemoryService::new(workspace);
@@ -164,6 +165,71 @@ pub fn run_recall_command(workspace: &Path, args: RecallArgs) -> Result<()> {
         "notes": notes,
     });
 
+    write_json_to_stdout(&response)
+}
+
+pub fn run_ask_command(workspace: &Path, args: AskArgs) -> Result<()> {
+    let service = ProjectMemoryService::new(workspace);
+    let mut semantic_query = None;
+
+    match load_embedding_provider_from_config(workspace, EmbeddingProviderOverrides::default()) {
+        Ok(Some(loaded)) => {
+            let runtime = build_runtime().context("failed to build runtime for ask query")?;
+            match runtime.block_on(loaded.provider.embed_text(args.query.as_str())) {
+                Ok(embedding) if !embedding.is_empty() => {
+                    semantic_query = Some(SemanticQuery {
+                        provider: loaded.provider_name,
+                        model: loaded.model_name,
+                        embedding,
+                    });
+                }
+                Ok(_) => {
+                    eprintln!(
+                        "warning: embedding provider returned empty vector; running lexical-only ask"
+                    );
+                }
+                Err(err) => {
+                    eprintln!(
+                        "warning: embedding generation failed for ask query; running lexical-only: {err}"
+                    );
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!(
+                "warning: failed to load embedding provider for ask query; running lexical-only: {err}"
+            );
+        }
+    }
+
+    let include = args
+        .include
+        .into_iter()
+        .map(|value| match value {
+            AskIncludeArg::Symbols => AskInclude::Symbols,
+            AskIncludeArg::Notes => AskInclude::Notes,
+            AskIncludeArg::Coupling => AskInclude::Coupling,
+            AskIncludeArg::Tests => AskInclude::Tests,
+        })
+        .collect::<Vec<_>>();
+
+    let runtime = build_runtime().context("failed to build runtime for ask query")?;
+    let result = runtime
+        .block_on(service.ask(AskQueryRequest {
+            query: args.query.clone(),
+            limit: args.limit,
+            include,
+            now_ms: None,
+            semantic: semantic_query,
+        }))
+        .context("failed to run unified ask query")?;
+
+    let response = json!({
+        "query": result.query,
+        "result_count": result.results.len() as u32,
+        "results": result.results,
+    });
     write_json_to_stdout(&response)
 }
 

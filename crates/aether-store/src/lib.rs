@@ -87,6 +87,8 @@ pub struct SymbolSearchResult {
     pub file_path: String,
     pub language: String,
     pub kind: String,
+    pub access_count: i64,
+    pub last_accessed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -396,6 +398,11 @@ pub trait Store {
         &self,
         symbol_id: &str,
     ) -> Result<Vec<TestIntentRecord>, StoreError>;
+    fn search_test_intents_lexical(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<TestIntentRecord>, StoreError>;
 }
 
 pub trait GraphStore: Send + Sync {
@@ -512,7 +519,7 @@ impl SqliteStore {
     ) -> Result<Option<SymbolSearchResult>, StoreError> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT id, qualified_name, file_path, language, kind
+            SELECT id, qualified_name, file_path, language, kind, access_count, last_accessed_at
             FROM symbols
             WHERE id = ?1
             "#,
@@ -526,6 +533,8 @@ impl SqliteStore {
                     file_path: row.get(2)?,
                     language: row.get(3)?,
                     kind: row.get(4)?,
+                    access_count: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0),
+                    last_accessed_at: row.get(6)?,
                 })
             })
             .optional()?;
@@ -861,7 +870,7 @@ impl Store for SqliteStore {
 
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT id, qualified_name, file_path, language, kind
+            SELECT id, qualified_name, file_path, language, kind, access_count, last_accessed_at
             FROM symbols
             WHERE LOWER(id) LIKE LOWER(?1)
                OR LOWER(qualified_name) LIKE LOWER(?1)
@@ -880,6 +889,8 @@ impl Store for SqliteStore {
                 file_path: row.get(2)?,
                 language: row.get(3)?,
                 kind: row.get(4)?,
+                access_count: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0),
+                last_accessed_at: row.get(6)?,
             })
         })?;
 
@@ -2284,6 +2295,60 @@ impl Store for SqliteStore {
             "#,
         )?;
         let rows = stmt.query_map(params![symbol_id], test_intent_tuple_from_row)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(test_intent_from_tuple(row?)?);
+        }
+        Ok(records)
+    }
+
+    fn search_test_intents_lexical(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<TestIntentRecord>, StoreError> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let terms = project_note_lexical_terms(query);
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut sql = String::from(
+            r#"
+            SELECT
+                intent_id, file_path, test_name, intent_text, group_label,
+                language, symbol_id, created_at, updated_at
+            FROM test_intents
+            WHERE
+            "#,
+        );
+        let mut params_vec = Vec::<SqlValue>::new();
+
+        for (index, term) in terms.iter().enumerate() {
+            if index > 0 {
+                sql.push_str(" OR ");
+            }
+            sql.push_str(
+                "(LOWER(test_name) LIKE ? OR LOWER(intent_text) LIKE ? OR LOWER(COALESCE(group_label, '')) LIKE ? OR LOWER(file_path) LIKE ?)",
+            );
+
+            let pattern = format!("%{term}%");
+            params_vec.push(SqlValue::Text(pattern.clone()));
+            params_vec.push(SqlValue::Text(pattern.clone()));
+            params_vec.push(SqlValue::Text(pattern.clone()));
+            params_vec.push(SqlValue::Text(pattern));
+        }
+
+        sql.push_str(" ORDER BY updated_at DESC, intent_id ASC LIMIT ?");
+        params_vec.push(SqlValue::Integer(limit.clamp(1, 100) as i64));
+
+        let mut stmt = self.conn.prepare(sql.as_str())?;
+        let rows = stmt.query_map(params_from_iter(params_vec), test_intent_tuple_from_row)?;
+
         let mut records = Vec::new();
         for row in rows {
             records.push(test_intent_from_tuple(row?)?);
@@ -3985,6 +4050,63 @@ mirror_sir_files = false
                 .expect("list after clear")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn search_test_intents_lexical_matches_names_text_and_paths() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        store
+            .replace_test_intents_for_file(
+                "tests/payment_test.rs",
+                &[
+                    test_intent_record(
+                        "tests/payment_test.rs",
+                        "test_retries_timeout",
+                        "retries on timeout",
+                        Some("sym-payment"),
+                    ),
+                    test_intent_record(
+                        "tests/payment_test.rs",
+                        "test_records_audit_log",
+                        "writes audit trail",
+                        Some("sym-payment"),
+                    ),
+                ],
+            )
+            .expect("upsert payment intents");
+        store
+            .replace_test_intents_for_file(
+                "tests/refund_test.rs",
+                &[test_intent_record(
+                    "tests/refund_test.rs",
+                    "test_retries_refund_gateway",
+                    "retries refund gateway failures",
+                    Some("sym-refund"),
+                )],
+            )
+            .expect("upsert refund intents");
+
+        let retry_hits = store
+            .search_test_intents_lexical("retries gateway", 10)
+            .expect("search retries");
+        assert_eq!(retry_hits.len(), 2);
+        assert!(
+            retry_hits
+                .iter()
+                .any(|record| record.file_path == "tests/payment_test.rs")
+        );
+        assert!(
+            retry_hits
+                .iter()
+                .any(|record| record.file_path == "tests/refund_test.rs")
+        );
+
+        let path_hits = store
+            .search_test_intents_lexical("payment_test", 10)
+            .expect("search by path");
+        assert_eq!(path_hits.len(), 2);
     }
 
     #[test]
