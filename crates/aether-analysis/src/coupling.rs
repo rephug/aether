@@ -30,6 +30,8 @@ pub enum AnalysisError {
     Io(#[from] std::io::Error),
     #[error("git error: {0}")]
     Git(String),
+    #[error("{0}")]
+    Message(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

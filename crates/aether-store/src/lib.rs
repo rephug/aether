@@ -281,6 +281,25 @@ pub struct GraphSyncStats {
     pub unresolved_edges: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamDependencyNodeRecord {
+    pub symbol_id: String,
+    pub depth: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamDependencyEdgeRecord {
+    pub source_id: String,
+    pub target_id: String,
+    pub depth: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UpstreamDependencyTraversal {
+    pub nodes: Vec<UpstreamDependencyNodeRecord>,
+    pub edges: Vec<UpstreamDependencyEdgeRecord>,
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("io error: {0}")]
