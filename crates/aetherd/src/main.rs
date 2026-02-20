@@ -7,15 +7,18 @@ use aether_config::{
 use aether_infer::{download_candle_embedding_model, download_candle_reranker_model};
 use aetherd::calibrate::run_calibration_once;
 use aetherd::cli::{
-    BlastRadiusArgs, Cli, Commands, CouplingReportArgs, InitAgentArgs, LogFormat, MineCouplingArgs,
-    NotesArgs, RecallArgs, RememberArgs, SetupLocalArgs, TestIntentsArgs, parse_cli,
+    AskArgs, BlastRadiusArgs, Cli, Commands, CouplingReportArgs, InitAgentArgs, LogFormat,
+    MineCouplingArgs, NotesArgs, RecallArgs, RememberArgs, SetupLocalArgs, TestIntentsArgs,
+    parse_cli,
 };
 use aetherd::coupling::{
     run_blast_radius_command, run_coupling_report_command, run_mine_coupling_command,
 };
 use aetherd::indexer::{IndexerConfig, run_indexing_loop, run_initial_index_once};
 use aetherd::init_agent::{InitAgentOptions, run_init_agent};
-use aetherd::memory::{run_notes_command, run_recall_command, run_remember_command};
+use aetherd::memory::{
+    run_ask_command, run_notes_command, run_recall_command, run_remember_command,
+};
 use aetherd::search::run_search_once;
 use aetherd::setup_local::{SetupLocalOptions, run_setup_local};
 use aetherd::test_intents::run_test_intents_command;
@@ -211,6 +214,7 @@ fn run_subcommand(workspace: &Path, command: Commands) -> Result<()> {
         Commands::SetupLocal(args) => run_setup_local_command(workspace, args),
         Commands::Remember(args) => run_remember_note_command(workspace, args),
         Commands::Recall(args) => run_recall_note_command(workspace, args),
+        Commands::Ask(args) => run_ask_subcommand(workspace, args),
         Commands::Notes(args) => run_notes_list_command(workspace, args),
         Commands::MineCoupling(args) => run_mine_coupling_subcommand(workspace, args),
         Commands::BlastRadius(args) => run_blast_radius_subcommand(workspace, args),
@@ -281,6 +285,10 @@ fn run_recall_note_command(workspace: &Path, args: RecallArgs) -> Result<()> {
 
 fn run_notes_list_command(workspace: &Path, args: NotesArgs) -> Result<()> {
     run_notes_command(workspace, args).context("notes command failed")
+}
+
+fn run_ask_subcommand(workspace: &Path, args: AskArgs) -> Result<()> {
+    run_ask_command(workspace, args).context("ask command failed")
 }
 
 fn run_mine_coupling_subcommand(workspace: &Path, args: MineCouplingArgs) -> Result<()> {

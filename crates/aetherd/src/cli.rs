@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use aether_analysis::RiskLevel as CouplingRiskLevel;
 use aether_config::{InferenceProviderKind, OLLAMA_DEFAULT_ENDPOINT, VerifyMode};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::init_agent::AgentPlatform;
 use crate::search::{SearchMode, SearchOutputFormat};
@@ -119,6 +119,36 @@ pub struct RecallArgs {
     pub tags: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum AskIncludeArg {
+    Symbols,
+    Notes,
+    Coupling,
+    Tests,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct AskArgs {
+    #[arg(help = "Unified query text across symbols, notes, coupling, and tests")]
+    pub query: String,
+
+    #[arg(
+        long,
+        default_value_t = 10,
+        help = "Result limit for ask (clamped to 1..100)"
+    )]
+    pub limit: u32,
+
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "TYPE",
+        help = "Optional include filters: symbols,notes,coupling,tests"
+    )]
+    pub include: Vec<AskIncludeArg>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct NotesArgs {
     #[arg(
@@ -185,6 +215,8 @@ pub enum Commands {
     Remember(RememberArgs),
     /// Search project memory notes
     Recall(RecallArgs),
+    /// Unified search across symbols, notes, coupling, and test intents
+    Ask(AskArgs),
     /// List recent project memory notes
     Notes(NotesArgs),
     /// Mine temporal/static/semantic file coupling signals
@@ -618,6 +650,31 @@ mod tests {
                 assert_eq!(args.mode.as_str(), "semantic");
                 assert_eq!(args.limit, 7);
                 assert_eq!(args.tags, vec!["architecture".to_owned()]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ask_subcommand_parses_limit_and_include_filters() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "ask",
+            "payment retry",
+            "--limit",
+            "12",
+            "--include",
+            "symbols,tests",
+        ])
+        .expect("ask should parse");
+
+        match cli.command {
+            Some(Commands::Ask(args)) => {
+                assert_eq!(args.query, "payment retry");
+                assert_eq!(args.limit, 12);
+                assert_eq!(args.include.len(), 2);
             }
             other => panic!("unexpected command: {other:?}"),
         }

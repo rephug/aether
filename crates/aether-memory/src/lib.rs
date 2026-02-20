@@ -4,7 +4,9 @@ use thiserror::Error;
 
 mod dedup;
 mod note;
+mod ranking;
 mod search;
+mod unified_query;
 
 pub use dedup::{compute_content_hash, compute_note_id, normalize_content_for_hash};
 pub use note::{
@@ -12,6 +14,9 @@ pub use note::{
     ProjectNote, RememberAction, RememberRequest, RememberResult, truncate_content_for_embedding,
 };
 pub use search::{RecallRequest, RecallResult, RecallScoredNote, SemanticQuery};
+pub use unified_query::{
+    AskInclude, AskQueryRequest, AskQueryResult, AskResultItem, AskResultKind,
+};
 
 #[derive(Debug, Error)]
 pub enum MemoryError {

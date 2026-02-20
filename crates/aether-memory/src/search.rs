@@ -6,12 +6,9 @@ use aether_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::note::{ProjectMemoryService, ProjectNote, normalize_tags, project_note_from_store};
+use crate::ranking::{apply_recency_access_boost, rrf_score};
 use crate::{MemoryError, current_unix_timestamp_millis};
 use aether_store::{Store, open_vector_store};
-
-const RRF_K: f32 = 60.0;
-const RECENCY_WINDOW_MS: f32 = 30.0 * 24.0 * 60.0 * 60.0 * 1000.0;
-const ACCESS_NORMALIZATION_BASE: f32 = 100.0;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticQuery {
@@ -193,10 +190,15 @@ fn lexical_ranked(lexical: &[ProjectNote], now_ms: i64, limit: usize) -> Vec<Rec
         .iter()
         .enumerate()
         .map(|(rank, note)| {
-            let base = 1.0 / (RRF_K + rank as f32 + 1.0);
+            let base = rrf_score(rank);
             RecallScoredNote {
                 note: note.clone(),
-                relevance_score: boosted_score(base, note, now_ms),
+                relevance_score: apply_recency_access_boost(
+                    base,
+                    note.access_count,
+                    note.last_accessed_at,
+                    now_ms,
+                ),
             }
         })
         .collect::<Vec<_>>();
@@ -214,7 +216,12 @@ fn semantic_ranked(
         .iter()
         .map(|(note, semantic_score)| RecallScoredNote {
             note: note.clone(),
-            relevance_score: boosted_score(*semantic_score, note, now_ms),
+            relevance_score: apply_recency_access_boost(
+                *semantic_score,
+                note.access_count,
+                note.last_accessed_at,
+                now_ms,
+            ),
         })
         .collect::<Vec<_>>();
 
@@ -235,20 +242,25 @@ fn hybrid_ranked(
     for (rank, note) in lexical.iter().enumerate() {
         let id = note.note_id.clone();
         by_id.entry(id.clone()).or_insert_with(|| note.clone());
-        *score_by_id.entry(id).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
+        *score_by_id.entry(id).or_insert(0.0) += rrf_score(rank);
     }
 
     for (rank, (note, _semantic_score)) in semantic.iter().enumerate() {
         let id = note.note_id.clone();
         by_id.entry(id.clone()).or_insert_with(|| note.clone());
-        *score_by_id.entry(id).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
+        *score_by_id.entry(id).or_insert(0.0) += rrf_score(rank);
     }
 
     let mut scored = score_by_id
         .into_iter()
         .filter_map(|(id, base)| {
             by_id.remove(id.as_str()).map(|note| RecallScoredNote {
-                relevance_score: boosted_score(base, &note, now_ms),
+                relevance_score: apply_recency_access_boost(
+                    base,
+                    note.access_count,
+                    note.last_accessed_at,
+                    now_ms,
+                ),
                 note,
             })
         })
@@ -257,21 +269,6 @@ fn hybrid_ranked(
     sort_scored_notes(scored.as_mut_slice());
     scored.truncate(limit);
     scored
-}
-
-fn boosted_score(base: f32, note: &ProjectNote, now_ms: i64) -> f32 {
-    let base = base.max(0.0);
-    let recency_factor = note
-        .last_accessed_at
-        .map(|last_accessed_at| {
-            let age_ms = (now_ms.saturating_sub(last_accessed_at)).max(0) as f32;
-            (1.0 - (age_ms / RECENCY_WINDOW_MS)).clamp(0.0, 1.0)
-        })
-        .unwrap_or(0.0);
-    let access_factor =
-        (note.access_count.max(0) as f32 + 1.0).ln() / ACCESS_NORMALIZATION_BASE.ln();
-
-    base * (1.0 + (0.1 * recency_factor) + (0.05 * access_factor))
 }
 
 fn sort_scored_notes(entries: &mut [RecallScoredNote]) {
