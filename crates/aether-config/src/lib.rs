@@ -33,6 +33,13 @@ pub const MAX_SEARCH_THRESHOLD: f32 = 0.95;
 pub const DEFAULT_DRIFT_THRESHOLD: f32 = 0.85;
 pub const DEFAULT_DRIFT_ANALYSIS_WINDOW: &str = "100 commits";
 pub const DEFAULT_DRIFT_HUB_PERCENTILE: u32 = 95;
+pub const DEFAULT_HEALTH_RISK_WEIGHT_PAGERANK: f32 = 0.3;
+pub const DEFAULT_HEALTH_RISK_WEIGHT_TEST_GAP: f32 = 0.25;
+pub const DEFAULT_HEALTH_RISK_WEIGHT_DRIFT: f32 = 0.2;
+pub const DEFAULT_HEALTH_RISK_WEIGHT_NO_SIR: f32 = 0.15;
+pub const DEFAULT_HEALTH_RISK_WEIGHT_RECENCY: f32 = 0.1;
+pub const DEFAULT_INTENT_SIMILARITY_PRESERVED_THRESHOLD: f32 = 0.90;
+pub const DEFAULT_INTENT_SIMILARITY_SHIFTED_THRESHOLD: f32 = 0.70;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -221,6 +228,10 @@ pub struct AetherConfig {
     pub coupling: CouplingConfig,
     #[serde(default)]
     pub drift: DriftConfig,
+    #[serde(default)]
+    pub health: HealthConfig,
+    #[serde(default)]
+    pub intent: IntentConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -632,6 +643,72 @@ impl Default for DriftConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HealthRiskWeights {
+    #[serde(default = "default_health_risk_weight_pagerank")]
+    pub pagerank: f32,
+    #[serde(default = "default_health_risk_weight_test_gap")]
+    pub test_gap: f32,
+    #[serde(default = "default_health_risk_weight_drift")]
+    pub drift: f32,
+    #[serde(default = "default_health_risk_weight_no_sir")]
+    pub no_sir: f32,
+    #[serde(default = "default_health_risk_weight_recency")]
+    pub recency: f32,
+}
+
+impl Default for HealthRiskWeights {
+    fn default() -> Self {
+        Self {
+            pagerank: default_health_risk_weight_pagerank(),
+            test_gap: default_health_risk_weight_test_gap(),
+            drift: default_health_risk_weight_drift(),
+            no_sir: default_health_risk_weight_no_sir(),
+            recency: default_health_risk_weight_recency(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HealthConfig {
+    #[serde(default = "default_health_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub risk_weights: HealthRiskWeights,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_health_enabled(),
+            risk_weights: HealthRiskWeights::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IntentConfig {
+    #[serde(default = "default_intent_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_intent_similarity_preserved_threshold")]
+    pub similarity_preserved_threshold: f32,
+    #[serde(default = "default_intent_similarity_shifted_threshold")]
+    pub similarity_shifted_threshold: f32,
+    #[serde(default = "default_intent_auto_regenerate_sir")]
+    pub auto_regenerate_sir: bool,
+}
+
+impl Default for IntentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_intent_enabled(),
+            similarity_preserved_threshold: default_intent_similarity_preserved_threshold(),
+            similarity_shifted_threshold: default_intent_similarity_shifted_threshold(),
+            auto_regenerate_sir: default_intent_auto_regenerate_sir(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigWarning {
     pub code: &'static str,
@@ -986,6 +1063,46 @@ fn default_drift_hub_percentile() -> u32 {
     DEFAULT_DRIFT_HUB_PERCENTILE
 }
 
+fn default_health_enabled() -> bool {
+    true
+}
+
+fn default_health_risk_weight_pagerank() -> f32 {
+    DEFAULT_HEALTH_RISK_WEIGHT_PAGERANK
+}
+
+fn default_health_risk_weight_test_gap() -> f32 {
+    DEFAULT_HEALTH_RISK_WEIGHT_TEST_GAP
+}
+
+fn default_health_risk_weight_drift() -> f32 {
+    DEFAULT_HEALTH_RISK_WEIGHT_DRIFT
+}
+
+fn default_health_risk_weight_no_sir() -> f32 {
+    DEFAULT_HEALTH_RISK_WEIGHT_NO_SIR
+}
+
+fn default_health_risk_weight_recency() -> f32 {
+    DEFAULT_HEALTH_RISK_WEIGHT_RECENCY
+}
+
+fn default_intent_enabled() -> bool {
+    true
+}
+
+fn default_intent_similarity_preserved_threshold() -> f32 {
+    DEFAULT_INTENT_SIMILARITY_PRESERVED_THRESHOLD
+}
+
+fn default_intent_similarity_shifted_threshold() -> f32 {
+    DEFAULT_INTENT_SIMILARITY_SHIFTED_THRESHOLD
+}
+
+fn default_intent_auto_regenerate_sir() -> bool {
+    true
+}
+
 fn normalize_optional(input: Option<String>) -> Option<String> {
     input
         .map(|value| value.trim().to_owned())
@@ -1154,6 +1271,37 @@ fn normalize_config(mut config: AetherConfig) -> AetherConfig {
         config.drift.drift_threshold = config.drift.drift_threshold.clamp(0.0, 1.0);
     }
     config.drift.hub_percentile = config.drift.hub_percentile.clamp(1, 100);
+    config.health.risk_weights.pagerank = normalize_unit_weight(
+        config.health.risk_weights.pagerank,
+        default_health_risk_weight_pagerank(),
+    );
+    config.health.risk_weights.test_gap = normalize_unit_weight(
+        config.health.risk_weights.test_gap,
+        default_health_risk_weight_test_gap(),
+    );
+    config.health.risk_weights.drift = normalize_unit_weight(
+        config.health.risk_weights.drift,
+        default_health_risk_weight_drift(),
+    );
+    config.health.risk_weights.no_sir = normalize_unit_weight(
+        config.health.risk_weights.no_sir,
+        default_health_risk_weight_no_sir(),
+    );
+    config.health.risk_weights.recency = normalize_unit_weight(
+        config.health.risk_weights.recency,
+        default_health_risk_weight_recency(),
+    );
+    config.intent.similarity_preserved_threshold = normalize_unit_weight(
+        config.intent.similarity_preserved_threshold,
+        default_intent_similarity_preserved_threshold(),
+    );
+    config.intent.similarity_shifted_threshold = normalize_unit_weight(
+        config.intent.similarity_shifted_threshold,
+        default_intent_similarity_shifted_threshold(),
+    );
+    if config.intent.similarity_shifted_threshold > config.intent.similarity_preserved_threshold {
+        config.intent.similarity_shifted_threshold = config.intent.similarity_preserved_threshold;
+    }
 
     let api_key_env = config.inference.api_key_env.trim();
     if api_key_env.is_empty() {
@@ -1170,6 +1318,14 @@ fn normalize_config(mut config: AetherConfig) -> AetherConfig {
     }
 
     config
+}
+
+fn normalize_unit_weight(value: f32, fallback: f32) -> f32 {
+    if !value.is_finite() {
+        fallback
+    } else {
+        value.clamp(0.0, 1.0)
+    }
 }
 
 #[cfg(test)]
@@ -1276,6 +1432,37 @@ mod tests {
         );
         assert!(!config.drift.auto_analyze);
         assert_eq!(config.drift.hub_percentile, DEFAULT_DRIFT_HUB_PERCENTILE);
+        assert!(config.health.enabled);
+        assert_eq!(
+            config.health.risk_weights.pagerank,
+            DEFAULT_HEALTH_RISK_WEIGHT_PAGERANK
+        );
+        assert_eq!(
+            config.health.risk_weights.test_gap,
+            DEFAULT_HEALTH_RISK_WEIGHT_TEST_GAP
+        );
+        assert_eq!(
+            config.health.risk_weights.drift,
+            DEFAULT_HEALTH_RISK_WEIGHT_DRIFT
+        );
+        assert_eq!(
+            config.health.risk_weights.no_sir,
+            DEFAULT_HEALTH_RISK_WEIGHT_NO_SIR
+        );
+        assert_eq!(
+            config.health.risk_weights.recency,
+            DEFAULT_HEALTH_RISK_WEIGHT_RECENCY
+        );
+        assert!(config.intent.enabled);
+        assert_eq!(
+            config.intent.similarity_preserved_threshold,
+            DEFAULT_INTENT_SIMILARITY_PRESERVED_THRESHOLD
+        );
+        assert_eq!(
+            config.intent.similarity_shifted_threshold,
+            DEFAULT_INTENT_SIMILARITY_SHIFTED_THRESHOLD
+        );
+        assert!(config.intent.auto_regenerate_sir);
         assert!(config_path(workspace).exists());
 
         let content = fs::read_to_string(config_path(workspace)).expect("read config file");
@@ -1323,6 +1510,13 @@ mod tests {
         assert!(content.contains("analysis_window = \"100 commits\""));
         assert!(content.contains("auto_analyze = false"));
         assert!(content.contains("hub_percentile = 95"));
+        assert!(content.contains("[health]"));
+        assert!(content.contains("enabled = true"));
+        assert!(content.contains("risk_weights =") || content.contains("[health.risk_weights]"));
+        assert!(content.contains("[intent]"));
+        assert!(content.contains("similarity_preserved_threshold"));
+        assert!(content.contains("similarity_shifted_threshold"));
+        assert!(content.contains("auto_regenerate_sir = true"));
         assert!(content.contains("\"cargo fmt --all --check\""));
         assert!(content.contains("\"cargo clippy --workspace -- -D warnings\""));
         assert!(content.contains("\"cargo test --workspace\""));
@@ -1396,6 +1590,16 @@ drift_threshold = 0.9
 analysis_window = " 50 commits "
 auto_analyze = true
 hub_percentile = 0
+
+[health]
+enabled = false
+risk_weights = { pagerank = 5.0, test_gap = -1.0, drift = 0.4, no_sir = 0.2, recency = nan }
+
+[intent]
+enabled = false
+similarity_preserved_threshold = 1.5
+similarity_shifted_threshold = 1.2
+auto_regenerate_sir = false
 "#;
         fs::write(config_path(workspace), raw).expect("write config");
 
@@ -1486,6 +1690,19 @@ hub_percentile = 0
         assert_eq!(config.drift.analysis_window, "50 commits");
         assert!(config.drift.auto_analyze);
         assert_eq!(config.drift.hub_percentile, 1);
+        assert!(!config.health.enabled);
+        assert_eq!(config.health.risk_weights.pagerank, 1.0);
+        assert_eq!(config.health.risk_weights.test_gap, 0.0);
+        assert_eq!(config.health.risk_weights.drift, 0.4);
+        assert_eq!(config.health.risk_weights.no_sir, 0.2);
+        assert_eq!(
+            config.health.risk_weights.recency,
+            DEFAULT_HEALTH_RISK_WEIGHT_RECENCY
+        );
+        assert!(!config.intent.enabled);
+        assert_eq!(config.intent.similarity_preserved_threshold, 1.0);
+        assert_eq!(config.intent.similarity_shifted_threshold, 1.0);
+        assert!(!config.intent.auto_regenerate_sir);
     }
 
     #[test]
@@ -1610,6 +1827,17 @@ fallback_to_host_on_unavailable = true
         assert_eq!(config.drift.analysis_window, DEFAULT_DRIFT_ANALYSIS_WINDOW);
         assert!(!config.drift.auto_analyze);
         assert_eq!(config.drift.hub_percentile, DEFAULT_DRIFT_HUB_PERCENTILE);
+        assert!(config.health.enabled);
+        assert!(config.intent.enabled);
+        assert_eq!(
+            config.intent.similarity_preserved_threshold,
+            DEFAULT_INTENT_SIMILARITY_PRESERVED_THRESHOLD
+        );
+        assert_eq!(
+            config.intent.similarity_shifted_threshold,
+            DEFAULT_INTENT_SIMILARITY_SHIFTED_THRESHOLD
+        );
+        assert!(config.intent.auto_regenerate_sir);
     }
 
     #[test]
@@ -1642,6 +1870,8 @@ fallback_to_host_on_unavailable = true
             },
             coupling: CouplingConfig::default(),
             drift: DriftConfig::default(),
+            health: HealthConfig::default(),
+            intent: IntentConfig::default(),
         };
 
         let warnings = validate_config(&config);

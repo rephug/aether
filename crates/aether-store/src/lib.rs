@@ -203,6 +203,17 @@ pub struct CommunitySnapshotRecord {
     pub captured_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentSnapshotRecord {
+    pub snapshot_id: String,
+    pub label: String,
+    pub scope: String,
+    pub target: String,
+    pub symbols_json: String,
+    pub commit_hash: Option<String>,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CouplingEdgeRecord {
     pub file_a: String,
@@ -319,7 +330,12 @@ pub enum StoreError {
 pub trait Store {
     fn upsert_symbol(&self, record: SymbolRecord) -> Result<(), StoreError>;
     fn mark_removed(&self, symbol_id: &str) -> Result<(), StoreError>;
+    fn list_symbols(&self) -> Result<Vec<SymbolRecord>, StoreError>;
     fn list_symbols_for_file(&self, file_path: &str) -> Result<Vec<SymbolRecord>, StoreError>;
+    fn list_symbol_files_by_directory_prefix(
+        &self,
+        directory_prefix: &str,
+    ) -> Result<Vec<String>, StoreError>;
     fn search_symbols(
         &self,
         query: &str,
@@ -466,6 +482,12 @@ pub trait Store {
         assignments: &[CommunitySnapshotRecord],
     ) -> Result<(), StoreError>;
     fn list_latest_community_snapshot(&self) -> Result<Vec<CommunitySnapshotRecord>, StoreError>;
+    fn insert_intent_snapshot(&self, record: IntentSnapshotRecord) -> Result<(), StoreError>;
+    fn get_intent_snapshot(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Option<IntentSnapshotRecord>, StoreError>;
+    fn list_intent_snapshots(&self, limit: u32) -> Result<Vec<IntentSnapshotRecord>, StoreError>;
     fn resolve_sir_baseline_by_selector(
         &self,
         symbol_id: &str,
@@ -940,6 +962,60 @@ impl Store for SqliteStore {
 
         let records = rows.collect::<Result<Vec<_>, _>>()?;
         Ok(records)
+    }
+
+    fn list_symbols(&self) -> Result<Vec<SymbolRecord>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, file_path, language, kind, qualified_name, signature_fingerprint, last_seen_at
+            FROM symbols
+            ORDER BY id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SymbolRecord {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                language: row.get(2)?,
+                kind: row.get(3)?,
+                qualified_name: row.get(4)?,
+                signature_fingerprint: row.get(5)?,
+                last_seen_at: row.get(6)?,
+            })
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row?);
+        }
+        Ok(records)
+    }
+
+    fn list_symbol_files_by_directory_prefix(
+        &self,
+        directory_prefix: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let normalized = normalize_path(directory_prefix.trim().trim_end_matches('/'));
+        if normalized.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let like_pattern = format!("{normalized}/%");
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT DISTINCT file_path
+            FROM symbols
+            WHERE file_path = ?1 OR file_path LIKE ?2
+            ORDER BY file_path ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![normalized, like_pattern], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut files = Vec::new();
+        for row in rows {
+            files.push(row?);
+        }
+        Ok(files)
     }
 
     fn search_symbols(
@@ -2563,6 +2639,107 @@ impl Store for SqliteStore {
         Ok(records)
     }
 
+    fn insert_intent_snapshot(&self, record: IntentSnapshotRecord) -> Result<(), StoreError> {
+        let snapshot_id = record.snapshot_id.trim().to_ascii_lowercase();
+        let label = record.label.trim();
+        let scope = record.scope.trim();
+        let target = normalize_path(record.target.trim());
+        let symbols_json = record.symbols_json.trim();
+        if snapshot_id.is_empty() || label.is_empty() || scope.is_empty() || target.is_empty() {
+            return Ok(());
+        }
+        if symbols_json.is_empty() {
+            return Ok(());
+        }
+
+        self.conn.execute(
+            r#"
+            INSERT INTO intent_snapshots (
+                snapshot_id, label, scope, target, symbols_json, commit_hash, created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(snapshot_id) DO UPDATE SET
+                label = excluded.label,
+                scope = excluded.scope,
+                target = excluded.target,
+                symbols_json = excluded.symbols_json,
+                commit_hash = excluded.commit_hash,
+                created_at = excluded.created_at
+            "#,
+            params![
+                snapshot_id,
+                label,
+                scope,
+                target,
+                symbols_json,
+                record.commit_hash.as_deref(),
+                record.created_at.max(0),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get_intent_snapshot(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Option<IntentSnapshotRecord>, StoreError> {
+        let snapshot_id = snapshot_id.trim().to_ascii_lowercase();
+        if snapshot_id.is_empty() {
+            return Ok(None);
+        }
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT snapshot_id, label, scope, target, symbols_json, commit_hash, created_at
+            FROM intent_snapshots
+            WHERE snapshot_id = ?1
+            LIMIT 1
+            "#,
+        )?;
+        let record = stmt
+            .query_row(params![snapshot_id], |row| {
+                Ok(IntentSnapshotRecord {
+                    snapshot_id: row.get(0)?,
+                    label: row.get(1)?,
+                    scope: row.get(2)?,
+                    target: row.get(3)?,
+                    symbols_json: row.get(4)?,
+                    commit_hash: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })
+            .optional()?;
+        Ok(record)
+    }
+
+    fn list_intent_snapshots(&self, limit: u32) -> Result<Vec<IntentSnapshotRecord>, StoreError> {
+        let capped_limit = limit.clamp(1, 100) as i64;
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT snapshot_id, label, scope, target, symbols_json, commit_hash, created_at
+            FROM intent_snapshots
+            ORDER BY created_at DESC, snapshot_id DESC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = stmt.query_map(params![capped_limit], |row| {
+            Ok(IntentSnapshotRecord {
+                snapshot_id: row.get(0)?,
+                label: row.get(1)?,
+                scope: row.get(2)?,
+                target: row.get(3)?,
+                symbols_json: row.get(4)?,
+                commit_hash: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row?);
+        }
+        Ok(records)
+    }
+
     fn resolve_sir_baseline_by_selector(
         &self,
         symbol_id: &str,
@@ -3278,6 +3455,19 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         CREATE INDEX IF NOT EXISTS idx_community_snapshot_captured
             ON community_snapshot(captured_at);
 
+        CREATE TABLE IF NOT EXISTS intent_snapshots (
+            snapshot_id TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            target TEXT NOT NULL,
+            symbols_json TEXT NOT NULL,
+            commit_hash TEXT,
+            created_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_intent_snapshots_created_at
+            ON intent_snapshots(created_at DESC);
+
         CREATE TABLE IF NOT EXISTS test_intents (
             intent_id TEXT PRIMARY KEY,
             file_path TEXT NOT NULL,
@@ -3305,6 +3495,7 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
     ensure_sir_history_column(conn, "commit_hash", "TEXT")?;
     ensure_symbols_column(conn, "access_count", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_symbols_column(conn, "last_accessed_at", "INTEGER")?;
+    ensure_intent_snapshots_column(conn, "commit_hash", "TEXT")?;
 
     conn.execute(
         "UPDATE sir SET sir_status = 'fresh' WHERE COALESCE(TRIM(sir_status), '') = ''",
@@ -3379,6 +3570,20 @@ fn ensure_symbols_column(
     }
 
     let sql = format!("ALTER TABLE symbols ADD COLUMN {column_name} {column_definition}");
+    conn.execute(&sql, [])?;
+    Ok(())
+}
+
+fn ensure_intent_snapshots_column(
+    conn: &Connection,
+    column_name: &str,
+    column_definition: &str,
+) -> Result<(), StoreError> {
+    if table_has_column(conn, "intent_snapshots", column_name)? {
+        return Ok(());
+    }
+
+    let sql = format!("ALTER TABLE intent_snapshots ADD COLUMN {column_name} {column_definition}");
     conn.execute(&sql, [])?;
     Ok(())
 }
@@ -4731,6 +4936,103 @@ mirror_sir_files = false
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
         assert_eq!(latest[0].community_id, 3);
+    }
+
+    #[test]
+    fn intent_snapshots_round_trip_and_list_descending() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        store
+            .insert_intent_snapshot(IntentSnapshotRecord {
+                snapshot_id: "snap-a".to_owned(),
+                label: "before-a".to_owned(),
+                scope: "file".to_owned(),
+                target: "src/a.rs".to_owned(),
+                symbols_json: "[{\"symbol_id\":\"sym-a\"}]".to_owned(),
+                commit_hash: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+                created_at: 1_700_000_000_000,
+            })
+            .expect("insert first snapshot");
+        store
+            .insert_intent_snapshot(IntentSnapshotRecord {
+                snapshot_id: "snap-b".to_owned(),
+                label: "before-b".to_owned(),
+                scope: "directory".to_owned(),
+                target: "src/payments".to_owned(),
+                symbols_json: "[{\"symbol_id\":\"sym-b\"}]".to_owned(),
+                commit_hash: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned()),
+                created_at: 1_700_000_000_100,
+            })
+            .expect("insert second snapshot");
+
+        let loaded = store
+            .get_intent_snapshot("snap-a")
+            .expect("get snapshot")
+            .expect("snapshot exists");
+        assert_eq!(loaded.label, "before-a");
+        assert_eq!(loaded.scope, "file");
+        assert_eq!(loaded.target, "src/a.rs");
+        assert_eq!(
+            loaded.commit_hash.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+
+        let snapshots = store.list_intent_snapshots(10).expect("list snapshots");
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].snapshot_id, "snap-b");
+        assert_eq!(snapshots[1].snapshot_id, "snap-a");
+    }
+
+    #[test]
+    fn list_symbol_files_by_directory_prefix_returns_distinct_paths() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        store
+            .upsert_symbol(SymbolRecord {
+                id: "sym-1".to_owned(),
+                file_path: "src/payments/processor.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "payments::processor".to_owned(),
+                signature_fingerprint: "sig-1".to_owned(),
+                last_seen_at: 1_700_000_000,
+            })
+            .expect("upsert sym 1");
+        store
+            .upsert_symbol(SymbolRecord {
+                id: "sym-2".to_owned(),
+                file_path: "src/payments/processor.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "payments::processor_retry".to_owned(),
+                signature_fingerprint: "sig-2".to_owned(),
+                last_seen_at: 1_700_000_000,
+            })
+            .expect("upsert sym 2");
+        store
+            .upsert_symbol(SymbolRecord {
+                id: "sym-3".to_owned(),
+                file_path: "src/payments/gateway.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "payments::gateway".to_owned(),
+                signature_fingerprint: "sig-3".to_owned(),
+                last_seen_at: 1_700_000_000,
+            })
+            .expect("upsert sym 3");
+
+        let files = store
+            .list_symbol_files_by_directory_prefix("src/payments")
+            .expect("list files");
+        assert_eq!(
+            files,
+            vec![
+                "src/payments/gateway.rs".to_owned(),
+                "src/payments/processor.rs".to_owned()
+            ]
+        );
     }
 
     #[test]

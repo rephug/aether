@@ -6,8 +6,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aether_analysis::{
     AcknowledgeDriftRequest as AnalysisAcknowledgeDriftRequest, BlastRadiusRequest, CausalAnalyzer,
     CouplingAnalyzer, DriftAnalyzer, DriftInclude as AnalysisDriftInclude,
-    DriftReportRequest as AnalysisDriftReportRequest, RiskLevel as CouplingRiskLevel,
+    DriftReportRequest as AnalysisDriftReportRequest, HealthAnalyzer,
+    HealthInclude as AnalysisHealthInclude, HealthReportRequest as AnalysisHealthReportRequest,
+    IntentAnalyzer, IntentScope as AnalysisIntentScope,
+    IntentSnapshotRequest as AnalysisIntentSnapshotRequest, IntentStatus as AnalysisIntentStatus,
+    IntentSymbolAddedEntry as AnalysisIntentSymbolAddedEntry,
+    IntentSymbolPreservedEntry as AnalysisIntentSymbolPreservedEntry,
+    IntentSymbolRemovedEntry as AnalysisIntentSymbolRemovedEntry,
+    IntentSymbolShiftedEntry as AnalysisIntentSymbolShiftedEntry,
+    IntentTestCoverageGap as AnalysisIntentTestCoverageGap, RiskLevel as CouplingRiskLevel,
     TestIntentAnalyzer, TraceCauseRequest as AnalysisTraceCauseRequest,
+    VerifyIntentRequest as AnalysisVerifyIntentRequest,
 };
 use aether_config::{SearchRerankerKind, VerifyMode, load_workspace_config};
 pub use aether_core::SearchMode;
@@ -37,6 +46,7 @@ use aether_store::{
     SirHistorySelector, SirMetaRecord, SqliteStore, Store, StoreError, SymbolRecord,
     SymbolSearchResult, open_graph_store, open_vector_store,
 };
+use aetherd::intent::regenerate_snapshot_symbols_if_enabled;
 use aetherd::verification::{VerificationRequest, run_verification};
 use anyhow::Result;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
@@ -398,6 +408,260 @@ pub struct AetherTestIntentsResponse {
     pub symbol_id: Option<String>,
     pub result_count: u32,
     pub intents: Vec<AetherTestIntentEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AetherHealthInclude {
+    CriticalSymbols,
+    Bottlenecks,
+    Cycles,
+    Orphans,
+    RiskHotspots,
+}
+
+impl From<AetherHealthInclude> for AnalysisHealthInclude {
+    fn from(value: AetherHealthInclude) -> Self {
+        match value {
+            AetherHealthInclude::CriticalSymbols => AnalysisHealthInclude::CriticalSymbols,
+            AetherHealthInclude::Bottlenecks => AnalysisHealthInclude::Bottlenecks,
+            AetherHealthInclude::Cycles => AnalysisHealthInclude::Cycles,
+            AetherHealthInclude::Orphans => AnalysisHealthInclude::Orphans,
+            AetherHealthInclude::RiskHotspots => AnalysisHealthInclude::RiskHotspots,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherHealthRequest {
+    pub include: Option<Vec<AetherHealthInclude>>,
+    pub limit: Option<u32>,
+    pub min_risk: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherHealthAnalysisSummary {
+    pub total_symbols: u32,
+    pub total_edges: u32,
+    pub communities_detected: u32,
+    pub cycles_detected: u32,
+    pub orphaned_subgraphs: u32,
+    pub analyzed_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherHealthSymbolEntry {
+    pub symbol_id: String,
+    pub symbol_name: String,
+    pub file: String,
+    pub pagerank: f32,
+    pub betweenness: f32,
+    pub dependents_count: u32,
+    pub has_sir: bool,
+    pub test_count: u32,
+    pub drift_magnitude: f32,
+    pub risk_score: f32,
+    pub risk_factors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherHealthBottleneckEntry {
+    pub symbol_id: String,
+    pub symbol_name: String,
+    pub file: String,
+    pub betweenness: f32,
+    pub pagerank: f32,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherHealthCycleSymbol {
+    pub id: String,
+    pub name: String,
+    pub file: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherHealthCycleEntry {
+    pub cycle_id: u32,
+    pub symbols: Vec<AetherHealthCycleSymbol>,
+    pub edge_count: u32,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherHealthOrphanEntry {
+    pub subgraph_id: u32,
+    pub symbols: Vec<AetherHealthCycleSymbol>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherHealthRiskHotspotEntry {
+    pub symbol_id: String,
+    pub symbol_name: String,
+    pub file: String,
+    pub risk_score: f32,
+    pub risk_factors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherHealthResponse {
+    pub schema_version: String,
+    pub analysis: AetherHealthAnalysisSummary,
+    pub critical_symbols: Vec<AetherHealthSymbolEntry>,
+    pub bottlenecks: Vec<AetherHealthBottleneckEntry>,
+    pub cycles: Vec<AetherHealthCycleEntry>,
+    pub orphans: Vec<AetherHealthOrphanEntry>,
+    pub risk_hotspots: Vec<AetherHealthRiskHotspotEntry>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AetherIntentScope {
+    Symbol,
+    File,
+    Directory,
+}
+
+impl From<AetherIntentScope> for AnalysisIntentScope {
+    fn from(value: AetherIntentScope) -> Self {
+        match value {
+            AetherIntentScope::Symbol => AnalysisIntentScope::Symbol,
+            AetherIntentScope::File => AnalysisIntentScope::File,
+            AetherIntentScope::Directory => AnalysisIntentScope::Directory,
+        }
+    }
+}
+
+impl From<AnalysisIntentScope> for AetherIntentScope {
+    fn from(value: AnalysisIntentScope) -> Self {
+        match value {
+            AnalysisIntentScope::Symbol => Self::Symbol,
+            AnalysisIntentScope::File => Self::File,
+            AnalysisIntentScope::Directory => Self::Directory,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherSnapshotIntentRequest {
+    pub scope: AetherIntentScope,
+    pub target: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherSnapshotIntentSkippedSymbol {
+    pub symbol_id: String,
+    pub symbol_name: String,
+    pub file: String,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherSnapshotIntentResponse {
+    pub schema_version: String,
+    pub snapshot_id: String,
+    pub label: String,
+    pub scope: AetherIntentScope,
+    pub target: String,
+    pub symbols_captured: u32,
+    pub created_at: i64,
+    pub commit_hash: Option<String>,
+    pub skipped_symbols: Vec<AetherSnapshotIntentSkippedSymbol>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherVerifyIntentRequest {
+    pub snapshot_id: String,
+    pub regenerate_sir: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AetherIntentStatus {
+    Preserved,
+    ShiftedMinor,
+    ShiftedMajor,
+}
+
+impl From<AnalysisIntentStatus> for AetherIntentStatus {
+    fn from(value: AnalysisIntentStatus) -> Self {
+        match value {
+            AnalysisIntentStatus::Preserved => Self::Preserved,
+            AnalysisIntentStatus::ShiftedMinor => Self::ShiftedMinor,
+            AnalysisIntentStatus::ShiftedMajor => Self::ShiftedMajor,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherVerifyIntentSummary {
+    pub symbols_checked: u32,
+    pub intent_preserved: u32,
+    pub intent_shifted: u32,
+    pub symbols_removed: u32,
+    pub symbols_added: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherVerifyIntentPreservedEntry {
+    pub symbol_id: String,
+    pub symbol_name: String,
+    pub similarity: f32,
+    pub status: AetherIntentStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherVerifyIntentCoverageGap {
+    pub existing_tests: Vec<String>,
+    pub untested_new_intents: Vec<String>,
+    pub recommendation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherVerifyIntentShiftedEntry {
+    pub symbol_id: String,
+    pub symbol_name: String,
+    pub similarity: f32,
+    pub status: AetherIntentStatus,
+    pub before_purpose: String,
+    pub after_purpose: String,
+    pub before_edge_cases: Vec<String>,
+    pub after_edge_cases: Vec<String>,
+    pub test_coverage_gap: AetherVerifyIntentCoverageGap,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherVerifyIntentAddedEntry {
+    pub symbol_id: String,
+    pub symbol_name: String,
+    pub file: String,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherVerifyIntentRemovedEntry {
+    pub symbol_id: String,
+    pub symbol_name: String,
+    pub file: String,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherVerifyIntentResponse {
+    pub schema_version: String,
+    pub snapshot_id: String,
+    pub label: String,
+    pub verification: AetherVerifyIntentSummary,
+    pub preserved: Vec<AetherVerifyIntentPreservedEntry>,
+    pub shifted: Vec<AetherVerifyIntentShiftedEntry>,
+    pub added: Vec<AetherVerifyIntentAddedEntry>,
+    pub removed: Vec<AetherVerifyIntentRemovedEntry>,
+    pub embedding_fallback_count: u32,
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1729,6 +1993,206 @@ impl AetherMcpServer {
             symbol_id,
             result_count: intents.len() as u32,
             intents,
+        })
+    }
+
+    pub fn aether_health_logic(
+        &self,
+        request: AetherHealthRequest,
+    ) -> Result<AetherHealthResponse, AetherMcpError> {
+        let analyzer = HealthAnalyzer::new(&self.workspace)?;
+        let report = analyzer.report(AnalysisHealthReportRequest {
+            include: request
+                .include
+                .map(|items| items.into_iter().map(Into::into).collect()),
+            limit: request.limit,
+            min_risk: request.min_risk,
+        })?;
+
+        Ok(AetherHealthResponse {
+            schema_version: report.schema_version,
+            analysis: AetherHealthAnalysisSummary {
+                total_symbols: report.analysis.total_symbols,
+                total_edges: report.analysis.total_edges,
+                communities_detected: report.analysis.communities_detected,
+                cycles_detected: report.analysis.cycles_detected,
+                orphaned_subgraphs: report.analysis.orphaned_subgraphs,
+                analyzed_at: report.analysis.analyzed_at,
+            },
+            critical_symbols: report
+                .critical_symbols
+                .into_iter()
+                .map(|entry| AetherHealthSymbolEntry {
+                    symbol_id: entry.symbol_id,
+                    symbol_name: entry.symbol_name,
+                    file: entry.file,
+                    pagerank: entry.pagerank,
+                    betweenness: entry.betweenness,
+                    dependents_count: entry.dependents_count,
+                    has_sir: entry.has_sir,
+                    test_count: entry.test_count,
+                    drift_magnitude: entry.drift_magnitude,
+                    risk_score: entry.risk_score,
+                    risk_factors: entry.risk_factors,
+                })
+                .collect(),
+            bottlenecks: report
+                .bottlenecks
+                .into_iter()
+                .map(|entry| AetherHealthBottleneckEntry {
+                    symbol_id: entry.symbol_id,
+                    symbol_name: entry.symbol_name,
+                    file: entry.file,
+                    betweenness: entry.betweenness,
+                    pagerank: entry.pagerank,
+                    note: entry.note,
+                })
+                .collect(),
+            cycles: report
+                .cycles
+                .into_iter()
+                .map(|entry| AetherHealthCycleEntry {
+                    cycle_id: entry.cycle_id,
+                    symbols: entry
+                        .symbols
+                        .into_iter()
+                        .map(|symbol| AetherHealthCycleSymbol {
+                            id: symbol.id,
+                            name: symbol.name,
+                            file: symbol.file,
+                        })
+                        .collect(),
+                    edge_count: entry.edge_count,
+                    note: entry.note,
+                })
+                .collect(),
+            orphans: report
+                .orphans
+                .into_iter()
+                .map(|entry| AetherHealthOrphanEntry {
+                    subgraph_id: entry.subgraph_id,
+                    symbols: entry
+                        .symbols
+                        .into_iter()
+                        .map(|symbol| AetherHealthCycleSymbol {
+                            id: symbol.id,
+                            name: symbol.name,
+                            file: symbol.file,
+                        })
+                        .collect(),
+                    note: entry.note,
+                })
+                .collect(),
+            risk_hotspots: report
+                .risk_hotspots
+                .into_iter()
+                .map(|entry| AetherHealthRiskHotspotEntry {
+                    symbol_id: entry.symbol_id,
+                    symbol_name: entry.symbol_name,
+                    file: entry.file,
+                    risk_score: entry.risk_score,
+                    risk_factors: entry.risk_factors,
+                })
+                .collect(),
+            notes: report.notes,
+        })
+    }
+
+    pub fn aether_snapshot_intent_logic(
+        &self,
+        request: AetherSnapshotIntentRequest,
+    ) -> Result<AetherSnapshotIntentResponse, AetherMcpError> {
+        let analyzer = IntentAnalyzer::new(&self.workspace)?;
+        let snapshot = analyzer.snapshot_intent(AnalysisIntentSnapshotRequest {
+            scope: request.scope.into(),
+            target: request.target,
+            label: request.label,
+        })?;
+
+        Ok(AetherSnapshotIntentResponse {
+            schema_version: snapshot.schema_version,
+            snapshot_id: snapshot.snapshot_id,
+            label: snapshot.label,
+            scope: snapshot.scope.into(),
+            target: snapshot.target,
+            symbols_captured: snapshot.symbols_captured,
+            created_at: snapshot.created_at,
+            commit_hash: snapshot.commit_hash,
+            skipped_symbols: snapshot
+                .skipped_symbols
+                .into_iter()
+                .map(|symbol| AetherSnapshotIntentSkippedSymbol {
+                    symbol_id: symbol.symbol_id,
+                    symbol_name: symbol.symbol_name,
+                    file: symbol.file,
+                    note: symbol.note,
+                })
+                .collect(),
+        })
+    }
+
+    pub fn aether_verify_intent_logic(
+        &self,
+        request: AetherVerifyIntentRequest,
+    ) -> Result<AetherVerifyIntentResponse, AetherMcpError> {
+        let analyzer = IntentAnalyzer::new(&self.workspace)?;
+        let regenerate = request
+            .regenerate_sir
+            .unwrap_or(analyzer.config().auto_regenerate_sir);
+        let regen_report = regenerate_snapshot_symbols_if_enabled(
+            &self.workspace,
+            request.snapshot_id.as_str(),
+            regenerate,
+        )
+        .map_err(|err| AetherMcpError::Message(format!("intent regeneration failed: {err}")))?;
+
+        let mut result = analyzer.verify_intent(AnalysisVerifyIntentRequest {
+            snapshot_id: request.snapshot_id,
+        })?;
+
+        if let Some(report) = regen_report {
+            result.notes.push(format!(
+                "regenerated {} symbols across {} changed files (baseline={}, head={})",
+                report.regenerated_symbols,
+                report.changed_files.len(),
+                report.baseline_commit.as_deref().unwrap_or("unknown"),
+                report.head_commit.as_deref().unwrap_or("unknown")
+            ));
+        }
+
+        Ok(AetherVerifyIntentResponse {
+            schema_version: result.schema_version,
+            snapshot_id: result.snapshot_id,
+            label: result.label,
+            verification: AetherVerifyIntentSummary {
+                symbols_checked: result.verification.symbols_checked,
+                intent_preserved: result.verification.intent_preserved,
+                intent_shifted: result.verification.intent_shifted,
+                symbols_removed: result.verification.symbols_removed,
+                symbols_added: result.verification.symbols_added,
+            },
+            preserved: result
+                .preserved
+                .into_iter()
+                .map(map_preserved_intent_entry)
+                .collect(),
+            shifted: result
+                .shifted
+                .into_iter()
+                .map(map_shifted_intent_entry)
+                .collect(),
+            added: result
+                .added
+                .into_iter()
+                .map(map_added_intent_entry)
+                .collect(),
+            removed: result
+                .removed
+                .into_iter()
+                .map(map_removed_intent_entry)
+                .collect(),
+            embedding_fallback_count: result.embedding_fallback_count,
+            notes: result.notes,
         })
     }
 
@@ -3141,6 +3605,48 @@ impl AetherMcpServer {
     }
 
     #[tool(
+        name = "aether_health",
+        description = "Generate graph health dashboard with risk scoring and bottleneck/cycle/orphan views"
+    )]
+    pub async fn aether_health(
+        &self,
+        Parameters(request): Parameters<AetherHealthRequest>,
+    ) -> Result<Json<AetherHealthResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_health");
+        self.aether_health_logic(request)
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_snapshot_intent",
+        description = "Snapshot current SIR intent state for a file, symbol, or directory scope"
+    )]
+    pub async fn aether_snapshot_intent(
+        &self,
+        Parameters(request): Parameters<AetherSnapshotIntentRequest>,
+    ) -> Result<Json<AetherSnapshotIntentResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_snapshot_intent");
+        self.aether_snapshot_intent_logic(request)
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_verify_intent",
+        description = "Verify intent preservation for a snapshot, with optional SIR regeneration for changed files"
+    )]
+    pub async fn aether_verify_intent(
+        &self,
+        Parameters(request): Parameters<AetherVerifyIntentRequest>,
+    ) -> Result<Json<AetherVerifyIntentResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_verify_intent");
+        self.aether_verify_intent_logic(request)
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
         name = "aether_drift_report",
         description = "Run semantic drift analysis with boundary and structural anomaly detection"
     )]
@@ -3280,6 +3786,61 @@ pub async fn run_stdio_server(workspace: impl AsRef<Path>, verbose: bool) -> Res
 
 fn to_mcp_error(err: AetherMcpError) -> McpError {
     McpError::internal_error(err.to_string(), None)
+}
+
+fn map_preserved_intent_entry(
+    entry: AnalysisIntentSymbolPreservedEntry,
+) -> AetherVerifyIntentPreservedEntry {
+    AetherVerifyIntentPreservedEntry {
+        symbol_id: entry.symbol_id,
+        symbol_name: entry.symbol_name,
+        similarity: entry.similarity,
+        status: entry.status.into(),
+    }
+}
+
+fn map_coverage_gap(entry: AnalysisIntentTestCoverageGap) -> AetherVerifyIntentCoverageGap {
+    AetherVerifyIntentCoverageGap {
+        existing_tests: entry.existing_tests,
+        untested_new_intents: entry.untested_new_intents,
+        recommendation: entry.recommendation,
+    }
+}
+
+fn map_shifted_intent_entry(
+    entry: AnalysisIntentSymbolShiftedEntry,
+) -> AetherVerifyIntentShiftedEntry {
+    AetherVerifyIntentShiftedEntry {
+        symbol_id: entry.symbol_id,
+        symbol_name: entry.symbol_name,
+        similarity: entry.similarity,
+        status: entry.status.into(),
+        before_purpose: entry.before_purpose,
+        after_purpose: entry.after_purpose,
+        before_edge_cases: entry.before_edge_cases,
+        after_edge_cases: entry.after_edge_cases,
+        test_coverage_gap: map_coverage_gap(entry.test_coverage_gap),
+    }
+}
+
+fn map_added_intent_entry(entry: AnalysisIntentSymbolAddedEntry) -> AetherVerifyIntentAddedEntry {
+    AetherVerifyIntentAddedEntry {
+        symbol_id: entry.symbol_id,
+        symbol_name: entry.symbol_name,
+        file: entry.file,
+        note: entry.note,
+    }
+}
+
+fn map_removed_intent_entry(
+    entry: AnalysisIntentSymbolRemovedEntry,
+) -> AetherVerifyIntentRemovedEntry {
+    AetherVerifyIntentRemovedEntry {
+        symbol_id: entry.symbol_id,
+        symbol_name: entry.symbol_name,
+        file: entry.file,
+        note: entry.note,
+    }
 }
 
 #[cfg(test)]

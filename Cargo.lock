@@ -200,6 +200,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "gix",
  "notify",
  "serde_json",
  "tempfile",

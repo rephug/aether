@@ -288,6 +288,10 @@ impl CozoGraphStore {
         Ok(edges)
     }
 
+    pub fn list_dependency_edges(&self) -> Result<Vec<(String, String, String)>, StoreError> {
+        self.list_dependency_edges_raw()
+    }
+
     fn try_louvain_from_cozo(&self) -> Result<Vec<(String, i64)>, StoreError> {
         let rows = self.run_script(
             r#"
@@ -355,6 +359,44 @@ impl CozoGraphStore {
                 return Err(StoreError::Cozo("invalid pagerank value".to_owned()));
             };
             scores.push((node, rank));
+        }
+        Ok(scores)
+    }
+
+    fn try_betweenness_from_cozo(&self) -> Result<Vec<(String, f32)>, StoreError> {
+        let rows = self.run_script(
+            r#"
+            dep_edges[source, target] :=
+                *edges{source_id: source, target_id: target, edge_kind},
+                edge_kind = "calls"
+            dep_edges[source, target] :=
+                *edges{source_id: source, target_id: target, edge_kind},
+                edge_kind = "depends_on"
+
+            ?[node, centrality] := betweenness_centrality(*dep_edges[], node, centrality)
+            :order node
+            "#,
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+
+        let mut scores = Vec::new();
+        for row in rows.rows {
+            if row.len() < 2 {
+                return Err(StoreError::Cozo("invalid betweenness row shape".to_owned()));
+            }
+            let node = row[0]
+                .get_str()
+                .ok_or_else(|| StoreError::Cozo("invalid betweenness node value".to_owned()))?
+                .to_owned();
+            let centrality = if let Some(value) = row[1].get_float() {
+                value as f32
+            } else if let Some(value) = row[1].get_int() {
+                value as f32
+            } else {
+                return Err(StoreError::Cozo("invalid betweenness value".to_owned()));
+            };
+            scores.push((node, centrality));
         }
         Ok(scores)
     }
@@ -497,6 +539,22 @@ impl CozoGraphStore {
                 Ok(records)
             }
             Err(_) => self.list_pagerank_fallback(),
+        }
+    }
+
+    pub fn list_betweenness_centrality(&self) -> Result<Vec<(String, f32)>, StoreError> {
+        match self.try_betweenness_from_cozo() {
+            Ok(mut records) => {
+                records.sort_by(|left, right| {
+                    right
+                        .1
+                        .partial_cmp(&left.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| left.0.cmp(&right.0))
+                });
+                Ok(records)
+            }
+            Err(_) => self.list_betweenness_fallback(),
         }
     }
 
@@ -643,6 +701,121 @@ impl CozoGraphStore {
         }
 
         let mut scored = rank.into_iter().collect::<Vec<_>>();
+        scored.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        Ok(scored)
+    }
+
+    fn list_betweenness_fallback(&self) -> Result<Vec<(String, f32)>, StoreError> {
+        let edges = self.list_dependency_edges_raw()?;
+        if edges.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut adjacency = HashMap::<String, Vec<String>>::new();
+        let mut nodes = HashSet::new();
+        for (source, target, _) in edges {
+            nodes.insert(source.clone());
+            nodes.insert(target.clone());
+            adjacency.entry(source).or_default().push(target);
+        }
+        let mut node_ids = nodes.into_iter().collect::<Vec<_>>();
+        node_ids.sort();
+        for neighbors in adjacency.values_mut() {
+            neighbors.sort();
+            neighbors.dedup();
+        }
+
+        let mut centrality = node_ids
+            .iter()
+            .map(|node| (node.clone(), 0.0f32))
+            .collect::<HashMap<_, _>>();
+
+        for source in &node_ids {
+            let mut stack = Vec::<String>::new();
+            let mut predecessors = node_ids
+                .iter()
+                .map(|node| (node.clone(), Vec::<String>::new()))
+                .collect::<HashMap<_, _>>();
+            let mut sigma = node_ids
+                .iter()
+                .map(|node| (node.clone(), 0.0f32))
+                .collect::<HashMap<_, _>>();
+            let mut distance = node_ids
+                .iter()
+                .map(|node| (node.clone(), -1i32))
+                .collect::<HashMap<_, _>>();
+
+            sigma.insert(source.clone(), 1.0);
+            distance.insert(source.clone(), 0);
+
+            let mut queue = VecDeque::<String>::new();
+            queue.push_back(source.clone());
+            while let Some(vertex) = queue.pop_front() {
+                stack.push(vertex.clone());
+                let vertex_distance = distance.get(vertex.as_str()).copied().unwrap_or(-1);
+                for neighbor in adjacency
+                    .get(vertex.as_str())
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+                {
+                    if distance.get(neighbor.as_str()).copied().unwrap_or(-1) < 0 {
+                        distance.insert(neighbor.clone(), vertex_distance + 1);
+                        queue.push_back(neighbor.clone());
+                    }
+                    if distance.get(neighbor.as_str()).copied().unwrap_or(-1) == vertex_distance + 1
+                    {
+                        let sigma_neighbor = sigma.get(neighbor.as_str()).copied().unwrap_or(0.0);
+                        let sigma_vertex = sigma.get(vertex.as_str()).copied().unwrap_or(0.0);
+                        sigma.insert(neighbor.clone(), sigma_neighbor + sigma_vertex);
+                        predecessors
+                            .entry(neighbor.clone())
+                            .or_default()
+                            .push(vertex.clone());
+                    }
+                }
+            }
+
+            let mut dependency = node_ids
+                .iter()
+                .map(|node| (node.clone(), 0.0f32))
+                .collect::<HashMap<_, _>>();
+
+            while let Some(vertex) = stack.pop() {
+                let preds = predecessors
+                    .get(vertex.as_str())
+                    .cloned()
+                    .unwrap_or_default();
+                for predecessor in preds {
+                    let sigma_vertex = sigma.get(vertex.as_str()).copied().unwrap_or(0.0);
+                    if sigma_vertex <= f32::EPSILON {
+                        continue;
+                    }
+                    let sigma_pred = sigma.get(predecessor.as_str()).copied().unwrap_or(0.0);
+                    let dependency_vertex = dependency.get(vertex.as_str()).copied().unwrap_or(0.0);
+                    let contribution = (sigma_pred / sigma_vertex) * (1.0 + dependency_vertex);
+                    let previous = dependency.get(predecessor.as_str()).copied().unwrap_or(0.0);
+                    dependency.insert(predecessor.clone(), previous + contribution);
+                }
+                if vertex != *source {
+                    let previous = centrality.get(vertex.as_str()).copied().unwrap_or(0.0);
+                    let contribution = dependency.get(vertex.as_str()).copied().unwrap_or(0.0);
+                    centrality.insert(vertex, previous + contribution);
+                }
+            }
+        }
+
+        let node_count = node_ids.len() as f32;
+        let normalizer = ((node_count - 1.0) * (node_count - 2.0)).max(1.0);
+        let mut scored = centrality
+            .into_iter()
+            .map(|(node, value)| (node, (value / normalizer).clamp(0.0, 1.0)))
+            .collect::<Vec<_>>();
         scored.sort_by(|left, right| {
             right
                 .1
@@ -1857,6 +2030,11 @@ mod tests {
         let pagerank = graph.list_pagerank().expect("pagerank");
         assert!(!pagerank.is_empty());
 
+        let betweenness = graph
+            .list_betweenness_centrality()
+            .expect("betweenness centrality");
+        assert!(!betweenness.is_empty());
+
         let scc = graph
             .list_strongly_connected_components()
             .expect("scc components");
@@ -1870,6 +2048,50 @@ mod tests {
             .list_connected_components()
             .expect("connected components");
         assert!(!connected.is_empty());
+    }
+
+    #[test]
+    fn cozo_graph_betweenness_identifies_bottleneck_node() {
+        let temp = tempdir().expect("tempdir");
+        let graph = CozoGraphStore::open(temp.path()).expect("open cozo graph store");
+
+        let a = symbol("sym-a", "a");
+        let b = symbol("sym-b", "b");
+        let c = symbol("sym-c", "c");
+        let d = symbol("sym-d", "d");
+        for node in [&a, &b, &c, &d] {
+            graph.upsert_symbol_node(node).expect("upsert symbol");
+        }
+
+        for edge in [
+            ResolvedEdge {
+                source_id: a.id.clone(),
+                target_id: b.id.clone(),
+                edge_kind: EdgeKind::Calls,
+                file_path: "src/lib.rs".to_owned(),
+            },
+            ResolvedEdge {
+                source_id: b.id.clone(),
+                target_id: c.id.clone(),
+                edge_kind: EdgeKind::Calls,
+                file_path: "src/lib.rs".to_owned(),
+            },
+            ResolvedEdge {
+                source_id: b.id.clone(),
+                target_id: d.id.clone(),
+                edge_kind: EdgeKind::Calls,
+                file_path: "src/lib.rs".to_owned(),
+            },
+        ] {
+            graph.upsert_edge(&edge).expect("upsert edge");
+        }
+
+        let scores = graph
+            .list_betweenness_centrality()
+            .expect("betweenness scores");
+        assert!(!scores.is_empty());
+        assert_eq!(scores[0].0, b.id);
+        assert!(scores[0].1 > 0.0);
     }
 
     #[test]

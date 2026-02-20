@@ -9,15 +9,18 @@ use aetherd::calibrate::run_calibration_once;
 use aetherd::causal::run_trace_cause_command;
 use aetherd::cli::{
     AskArgs, BlastRadiusArgs, Cli, Commands, CommunitiesArgs, CouplingReportArgs, DriftAckArgs,
-    DriftReportArgs, InitAgentArgs, LogFormat, MineCouplingArgs, NotesArgs, RecallArgs,
-    RememberArgs, SetupLocalArgs, TestIntentsArgs, TraceCauseArgs, parse_cli,
+    DriftReportArgs, HealthArgs, InitAgentArgs, LogFormat, MineCouplingArgs, NotesArgs, RecallArgs,
+    RememberArgs, SetupLocalArgs, SnapshotIntentArgs, TestIntentsArgs, TraceCauseArgs,
+    VerifyIntentArgs, parse_cli,
 };
 use aetherd::coupling::{
     run_blast_radius_command, run_coupling_report_command, run_mine_coupling_command,
 };
 use aetherd::drift::{run_communities_command, run_drift_ack_command, run_drift_report_command};
+use aetherd::health::run_health_command;
 use aetherd::indexer::{IndexerConfig, run_indexing_loop, run_initial_index_once};
 use aetherd::init_agent::{InitAgentOptions, run_init_agent};
+use aetherd::intent::{run_snapshot_intent_command, run_verify_intent_command};
 use aetherd::memory::{
     run_ask_command, run_notes_command, run_recall_command, run_remember_command,
 };
@@ -226,6 +229,9 @@ fn run_subcommand(workspace: &Path, command: Commands) -> Result<()> {
         Commands::DriftAck(args) => run_drift_ack_subcommand(workspace, args),
         Commands::Communities(args) => run_communities_subcommand(workspace, args),
         Commands::TraceCause(args) => run_trace_cause_subcommand(workspace, args),
+        Commands::Health(args) => run_health_subcommand(workspace, args),
+        Commands::SnapshotIntent(args) => run_snapshot_intent_subcommand(workspace, args),
+        Commands::VerifyIntent(args) => run_verify_intent_subcommand(workspace, args),
     }
 }
 
@@ -327,6 +333,18 @@ fn run_communities_subcommand(workspace: &Path, args: CommunitiesArgs) -> Result
 
 fn run_trace_cause_subcommand(workspace: &Path, args: TraceCauseArgs) -> Result<()> {
     run_trace_cause_command(workspace, args).context("trace-cause command failed")
+}
+
+fn run_health_subcommand(workspace: &Path, args: HealthArgs) -> Result<()> {
+    run_health_command(workspace, args).context("health command failed")
+}
+
+fn run_snapshot_intent_subcommand(workspace: &Path, args: SnapshotIntentArgs) -> Result<()> {
+    run_snapshot_intent_command(workspace, args).context("snapshot-intent command failed")
+}
+
+fn run_verify_intent_subcommand(workspace: &Path, args: VerifyIntentArgs) -> Result<()> {
+    run_verify_intent_command(workspace, args).context("verify-intent command failed")
 }
 
 fn init_tracing_subscriber(log_format: LogFormat, configured_log_level: &str) -> Result<()> {

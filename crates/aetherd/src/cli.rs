@@ -2,7 +2,7 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use aether_analysis::RiskLevel as CouplingRiskLevel;
+use aether_analysis::{IntentScope, RiskLevel as CouplingRiskLevel};
 use aether_config::{InferenceProviderKind, OLLAMA_DEFAULT_ENDPOINT, VerifyMode};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -320,6 +320,74 @@ pub struct TraceCauseArgs {
     pub limit: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthFilter {
+    Critical,
+    Cycles,
+    Orphans,
+    Bottlenecks,
+    RiskHotspots,
+}
+
+#[derive(Debug, Clone, PartialEq, Args)]
+pub struct HealthArgs {
+    #[arg(
+        value_parser = parse_health_filter,
+        help = "Optional health view filter: critical, cycles, orphans, bottlenecks, risk-hotspots"
+    )]
+    pub filter: Option<HealthFilter>,
+
+    #[arg(
+        long,
+        default_value_t = 10,
+        help = "Result limit for list sections (clamped to 1..200)"
+    )]
+    pub limit: u32,
+
+    #[arg(
+        long = "min-risk",
+        default_value_t = 0.5,
+        help = "Minimum composite risk score threshold (0.0..1.0)"
+    )]
+    pub min_risk: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct SnapshotIntentArgs {
+    #[arg(
+        long,
+        value_parser = parse_intent_scope,
+        help = "Snapshot scope: file, symbol, directory"
+    )]
+    pub scope: IntentScope,
+
+    #[arg(long, help = "Target identifier for scope (path or symbol id)")]
+    pub target: String,
+
+    #[arg(long, help = "Human-readable snapshot label")]
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct VerifyIntentArgs {
+    #[arg(help = "Intent snapshot identifier")]
+    pub snapshot_id: String,
+
+    #[arg(
+        long,
+        conflicts_with = "no_regenerate_sir",
+        help = "Force SIR regeneration before verification"
+    )]
+    pub regenerate_sir: bool,
+
+    #[arg(
+        long,
+        conflicts_with = "regenerate_sir",
+        help = "Skip SIR regeneration before verification"
+    )]
+    pub no_regenerate_sir: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Subcommand)]
 pub enum Commands {
     /// Generate agent configuration files for AI coding agents
@@ -350,6 +418,12 @@ pub enum Commands {
     Communities(CommunitiesArgs),
     /// Trace likely upstream semantic causes for a target symbol
     TraceCause(TraceCauseArgs),
+    /// Graph health dashboard and risk hotspots
+    Health(HealthArgs),
+    /// Snapshot current symbol intent state for a refactor scope
+    SnapshotIntent(SnapshotIntentArgs),
+    /// Verify post-refactor intent against a saved snapshot
+    VerifyIntent(VerifyIntentArgs),
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -561,6 +635,25 @@ fn parse_coupling_risk_level(value: &str) -> Result<CouplingRiskLevel, String> {
 
 fn parse_communities_format(value: &str) -> Result<CommunitiesFormat, String> {
     value.parse()
+}
+
+fn parse_health_filter(value: &str) -> Result<HealthFilter, String> {
+    match value.trim() {
+        "critical" => Ok(HealthFilter::Critical),
+        "cycles" => Ok(HealthFilter::Cycles),
+        "orphans" => Ok(HealthFilter::Orphans),
+        "bottlenecks" => Ok(HealthFilter::Bottlenecks),
+        "risk-hotspots" | "risk_hotspots" => Ok(HealthFilter::RiskHotspots),
+        other => Err(format!(
+            "invalid health filter '{other}', expected one of: critical, cycles, orphans, bottlenecks, risk-hotspots"
+        )),
+    }
+}
+
+fn parse_intent_scope(value: &str) -> Result<IntentScope, String> {
+    IntentScope::parse(value).ok_or_else(|| {
+        format!("invalid intent scope '{value}', expected one of: file, symbol, directory")
+    })
 }
 
 fn parse_since_duration(value: &str) -> Result<Duration, String> {
@@ -1030,6 +1123,79 @@ mod tests {
                 assert_eq!(args.symbol_name, None);
                 assert_eq!(args.file, None);
                 assert_eq!(args.depth, 3);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn health_subcommand_parses_optional_filter_and_flags() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "health",
+            "risk-hotspots",
+            "--limit",
+            "15",
+            "--min-risk",
+            "0.7",
+        ])
+        .expect("health should parse");
+
+        match cli.command {
+            Some(Commands::Health(args)) => {
+                assert_eq!(args.filter, Some(super::HealthFilter::RiskHotspots));
+                assert_eq!(args.limit, 15);
+                assert!((args.min_risk - 0.7).abs() < f32::EPSILON);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_intent_subcommand_parses_scope_target_label() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "snapshot-intent",
+            "--scope",
+            "file",
+            "--target",
+            "src/payments/processor.rs",
+            "--label",
+            "pre-refactor",
+        ])
+        .expect("snapshot-intent should parse");
+
+        match cli.command {
+            Some(Commands::SnapshotIntent(args)) => {
+                assert_eq!(args.scope, super::IntentScope::File);
+                assert_eq!(args.target, "src/payments/processor.rs");
+                assert_eq!(args.label, "pre-refactor");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_intent_subcommand_parses_regeneration_flags() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "verify-intent",
+            "snap_abc123",
+            "--regenerate-sir",
+        ])
+        .expect("verify-intent should parse");
+
+        match cli.command {
+            Some(Commands::VerifyIntent(args)) => {
+                assert_eq!(args.snapshot_id, "snap_abc123");
+                assert!(args.regenerate_sir);
+                assert!(!args.no_regenerate_sir);
             }
             other => panic!("unexpected command: {other:?}"),
         }
