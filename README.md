@@ -2,7 +2,7 @@
   <img src="docs/assets/aether-logo.jpg" alt="AETHER Logo" width="200" />
 </p>
 
-<h1 align="center">AETHER</h1>
+<h1 align="center"></h1>
 <p align="center"><strong>Active Semantic Simulation Engine</strong></p>
 <p align="center">A verified, living graph of your codebase — not just searchable text.</p>
 
