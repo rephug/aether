@@ -99,8 +99,16 @@ pub fn execute_search(
         ensure_workspace_config(workspace).context("failed to load workspace config for search")?;
     let limit = limit.clamp(1, 100);
     let (normalized_query, language_hint) = extract_language_hint_from_query(query);
+    let search_config = config.search.clone();
+    let retrieval_limit = if matches!(mode, SearchMode::Hybrid)
+        && !matches!(search_config.reranker, SearchRerankerKind::None)
+    {
+        search_config.rerank_window.max(limit).clamp(1, 200)
+    } else {
+        limit
+    };
 
-    let lexical_matches = lexical_search(&store, &normalized_query, limit)?;
+    let lexical_matches = lexical_search(&store, &normalized_query, retrieval_limit)?;
     match mode {
         SearchMode::Lexical => Ok(SearchExecution {
             mode_requested: SearchMode::Lexical,
@@ -140,7 +148,7 @@ pub fn execute_search(
                 &store,
                 &normalized_query,
                 language_hint.as_deref(),
-                limit,
+                retrieval_limit,
                 store_present,
                 &config,
             )?;
@@ -153,12 +161,7 @@ pub fn execute_search(
                 });
             }
 
-            let search_config = config.search.clone();
-            let fuse_limit = if matches!(search_config.reranker, SearchRerankerKind::None) {
-                limit
-            } else {
-                search_config.rerank_window.max(limit).clamp(1, 200)
-            };
+            let fuse_limit = retrieval_limit;
             let fused = fuse_hybrid_results(&lexical_matches, &semantic_matches, fuse_limit);
             let matches = maybe_rerank_hybrid_results(
                 workspace,

@@ -58,13 +58,12 @@
         "aether.inferenceModel": {
           "type": "string",
           "enum": [
-            "qwen3-embeddings-0.6B",
-            "qwen3-embeddings-4B",
-            "qwen3-embeddings-8B",
+            "qwen2.5-coder:7b-instruct-q4_K_M",
+            "qwen2.5-coder:1.5b-instruct-q4_K_M",
             "gemini-2.0-flash"
           ],
-          "default": "qwen3-embeddings-0.6B",
-          "description": "Model name passed to the selected provider."
+          "default": "gemini-2.0-flash",
+          "description": "Model name passed to the selected provider for SIR generation."
         },
         "aether.inferenceEndpoint": {
           "type": "string",

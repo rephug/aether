@@ -440,6 +440,13 @@ fn parse_import_from_statement(text: &str, file_path: &str) -> Vec<String> {
 
     let module = resolve_import_module(module_raw.trim(), file_path);
     let names = names_raw.trim();
+    // Strip surrounding parentheses from multi-line imports:
+    // from module import (a, b) -> a, b
+    let names = names
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+        .unwrap_or(names)
+        .trim();
     if names == "*" {
         return (!module.is_empty()).then_some(module).into_iter().collect();
     }
@@ -545,4 +552,22 @@ fn find_inner_definition(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| child.kind() == "function_definition" || child.kind() == "class_definition")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_import_from_statement;
+
+    #[test]
+    fn parenthesized_import() {
+        let edges = parse_import_from_statement("from module import (a, b)", "src/main.py");
+        assert_eq!(edges, vec!["module.a".to_owned(), "module.b".to_owned()]);
+    }
+
+    #[test]
+    fn parenthesized_import_with_whitespace() {
+        let edges =
+            parse_import_from_statement("from module import (\n    a,\n    b,\n)", "src/main.py");
+        assert_eq!(edges, vec!["module.a".to_owned(), "module.b".to_owned()]);
+    }
 }
