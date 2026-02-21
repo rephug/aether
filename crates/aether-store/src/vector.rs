@@ -25,9 +25,21 @@ const VECTOR_TABLE_PREFIX: &str = "sir_embeddings_";
 const PROJECT_NOTES_VECTOR_TABLE_PREFIX: &str = "project_notes_vectors_";
 const MIGRATION_MARKER_FILE: &str = ".sqlite_migrated_v1";
 const NOTES_MIGRATION_MARKER_FILE: &str = ".sqlite_project_notes_migrated_v1";
+/// Maximum IDs per IN clause to stay within DataFusion parser limits.
+const PUSHDOWN_CHUNK_SIZE: usize = 500;
 
 pub type VectorRecord = SymbolEmbeddingRecord;
 pub type VectorEmbeddingMetaRecord = SymbolEmbeddingMetaRecord;
+
+/// Build a SQL predicate: symbol_id IN ('id1', 'id2', ...)
+fn build_in_predicate(ids: &[&str]) -> String {
+    let values = ids
+        .iter()
+        .map(|id| format!("'{}'", id.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("symbol_id IN ({values})")
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorSearchResult {
@@ -711,6 +723,10 @@ impl VectorStore for LanceVectorStore {
 
         let connection = self.connect().await?;
         let mut records = Vec::new();
+        let symbol_ids = symbol_set
+            .iter()
+            .map(|symbol| symbol.as_str())
+            .collect::<Vec<_>>();
         for table_name in connection
             .table_names()
             .execute()
@@ -723,22 +739,29 @@ impl VectorStore for LanceVectorStore {
                 continue;
             };
 
-            let batches = table
-                .query()
-                .select(Select::columns(&[
-                    "symbol_id",
-                    "sir_hash",
-                    "provider",
-                    "model",
-                    "embedding",
-                    "updated_at",
-                ]))
-                .execute()
-                .await
-                .map_err(map_lancedb_err)?
-                .try_collect::<Vec<_>>()
-                .await
-                .map_err(map_lancedb_err)?;
+            // Chunk symbol IDs to avoid exceeding DataFusion's IN clause parser limits.
+            let mut batches = Vec::new();
+            for chunk in symbol_ids.chunks(PUSHDOWN_CHUNK_SIZE) {
+                let predicate = build_in_predicate(chunk);
+                let chunk_batches = table
+                    .query()
+                    .select(Select::columns(&[
+                        "symbol_id",
+                        "sir_hash",
+                        "provider",
+                        "model",
+                        "embedding",
+                        "updated_at",
+                    ]))
+                    .only_if(predicate.as_str())
+                    .execute()
+                    .await
+                    .map_err(map_lancedb_err)?
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .map_err(map_lancedb_err)?;
+                batches.extend(chunk_batches);
+            }
 
             for batch in batches {
                 for row in 0..batch.num_rows() {

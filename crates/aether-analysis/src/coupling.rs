@@ -796,13 +796,24 @@ fn normalize_repo_path(path: &str) -> String {
 
 fn normalize_rename_path(path: &str) -> String {
     let value = path.trim();
+
+    // Handle brace-enclosed renames: prefix{old => new}suffix
+    // Example: crates/{old => new}/src/lib.rs -> crates/new/src/lib.rs
+    if let (Some(brace_start), Some(brace_end)) = (value.find('{'), value.find('}'))
+        && brace_start < brace_end
+    {
+        let prefix = &value[..brace_start];
+        let inner = &value[brace_start + 1..brace_end];
+        let suffix = &value[brace_end + 1..];
+
+        if let Some((_, new_part)) = inner.split_once("=>") {
+            return format!("{}{}{}", prefix, new_part.trim(), suffix);
+        }
+    }
+
+    // Handle simple renames: old_path => new_path
     if let Some((_, right)) = value.rsplit_once("=>") {
-        return right
-            .trim()
-            .trim_start_matches('{')
-            .trim_end_matches('}')
-            .trim()
-            .to_owned();
+        return right.trim().to_owned();
     }
 
     value.to_owned()
@@ -870,6 +881,7 @@ mod tests {
 
     use super::{
         CouplingAnalyzer, CouplingType, MineCouplingRequest, classify_coupling_type, fused_score,
+        normalize_rename_path,
     };
     use tempfile::tempdir;
 
@@ -904,6 +916,35 @@ mod tests {
             classify_coupling_type(0.3, 0.0, 0.1),
             CouplingType::Temporal
         );
+    }
+
+    #[test]
+    fn normalize_rename_path_brace_enclosed() {
+        assert_eq!(
+            normalize_rename_path("crates/{old => new}/src/lib.rs"),
+            "crates/new/src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn normalize_rename_path_brace_enclosed_no_prefix() {
+        assert_eq!(
+            normalize_rename_path("{old_crate => new_crate}/src/main.rs"),
+            "new_crate/src/main.rs"
+        );
+    }
+
+    #[test]
+    fn normalize_rename_path_simple() {
+        assert_eq!(
+            normalize_rename_path("old/path.rs => new/path.rs"),
+            "new/path.rs"
+        );
+    }
+
+    #[test]
+    fn normalize_rename_path_no_rename() {
+        assert_eq!(normalize_rename_path("src/lib.rs"), "src/lib.rs");
     }
 
     #[test]

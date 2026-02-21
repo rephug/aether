@@ -11,7 +11,7 @@ pub const COHERE_MODEL_NAME: &str = "rerank-v3.5";
 #[derive(Debug, Clone)]
 pub struct CohereRerankerProvider {
     client: reqwest::Client,
-    api_key: String,
+    api_key: aether_core::Secret,
     model: String,
 }
 
@@ -21,6 +21,7 @@ impl CohereRerankerProvider {
             .ok()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
+            .map(aether_core::Secret::new)
             .ok_or_else(|| InferError::MissingCohereApiKey(api_key_env.to_owned()))?;
 
         Ok(Self {
@@ -61,7 +62,7 @@ impl CohereRerankerProvider {
         let response = self
             .client
             .post(COHERE_ENDPOINT)
-            .bearer_auth(&self.api_key)
+            .bearer_auth(self.api_key.expose())
             .json(&request)
             .send()
             .await?

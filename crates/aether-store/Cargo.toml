@@ -8,8 +8,8 @@ authors.workspace = true
 [dependencies]
 aether-config = { path = "../aether-config" }
 aether-core = { path = "../aether-core" }
-arrow-array = "56.2"
-arrow-schema = "56.2"
+arrow-array.workspace = true
+arrow-schema.workspace = true
 async-trait.workspace = true
 cozo.workspace = true
 futures = "0.3"

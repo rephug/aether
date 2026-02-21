@@ -2054,8 +2054,13 @@ impl Store for SqliteStore {
             .map(|tag| tag.trim())
             .filter(|tag| !tag.is_empty())
         {
-            sql.push_str(" AND LOWER(tags) LIKE LOWER(?)");
-            params_vec.push(SqlValue::Text(format!("%\"{tag}\"%")));
+            sql.push_str(
+                " AND EXISTS (
+                    SELECT 1 FROM json_each(tags) AS je
+                    WHERE LOWER(je.value) = LOWER(?)
+                )",
+            );
+            params_vec.push(SqlValue::Text(tag.to_owned()));
         }
 
         sql.push_str(" ORDER BY updated_at DESC, note_id ASC LIMIT ?");

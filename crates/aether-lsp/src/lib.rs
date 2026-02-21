@@ -1,12 +1,12 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aether_core::{
     HoverMarkdownSections, Language, NO_SIR_MESSAGE, SourceRange, format_hover_markdown_sections,
     normalize_path, stable_symbol_id, stale_warning_message,
 };
-use aether_parse::{RustUsePrefix, SymbolExtractor, language_for_path, rust_use_path_at_cursor};
+use aether_parse::{RustUsePrefix, language_for_path, rust_use_path_at_cursor};
 use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
 use aether_store::{CouplingEdgeRecord, CozoGraphStore, SqliteStore, Store, StoreError};
 use serde_json::Value;
@@ -40,6 +40,21 @@ pub struct AetherLspBackend {
     client: Client,
     workspace_root: PathBuf,
     store: Arc<Mutex<SqliteStore>>,
+}
+
+static SYMBOL_EXTRACTOR: OnceLock<std::sync::Mutex<aether_parse::SymbolExtractor>> =
+    OnceLock::new();
+
+fn get_extractor()
+-> Result<std::sync::MutexGuard<'static, aether_parse::SymbolExtractor>, HoverResolveError> {
+    let mutex = SYMBOL_EXTRACTOR.get_or_init(|| {
+        std::sync::Mutex::new(
+            aether_parse::SymbolExtractor::new().expect("failed to initialize SymbolExtractor"),
+        )
+    });
+    mutex
+        .lock()
+        .map_err(|_| HoverResolveError::Parse("SymbolExtractor lock poisoned".to_owned()))
 }
 
 impl AetherLspBackend {
@@ -149,8 +164,7 @@ pub fn resolve_hover_markdown_for_path(
 
     let display_path = workspace_relative_display_path(workspace_root, file_path);
 
-    let mut extractor =
-        SymbolExtractor::new().map_err(|err| HoverResolveError::Parse(err.to_string()))?;
+    let mut extractor = get_extractor()?;
     let symbols = extractor
         .extract_from_source(language, &display_path, &source)
         .map_err(|err| HoverResolveError::Parse(err.to_string()))?;
@@ -817,6 +831,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
+    use aether_parse::SymbolExtractor;
     use aether_store::{
         CouplingEdgeRecord, CozoGraphStore, ProjectNoteRecord, SirMetaRecord, Store, SymbolRecord,
         TestIntentRecord,

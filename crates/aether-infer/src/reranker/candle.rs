@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::qwen2;
 use hf_hub::api::sync::ApiBuilder;
@@ -25,6 +25,24 @@ const CHECKSUMS_FILE: &str = "checksums.txt";
 const MAX_TOKENS: usize = 2048;
 const BATCH_CHUNK_SIZE: usize = 4;
 const REQUIRED_FILES: [&str; 3] = ["config.json", "tokenizer.json", "model.safetensors"];
+/// Default instruction for code search reranking. Qwen3-Reranker supports custom
+/// instructions that tell the model what "relevant" means for this domain.
+const RERANKER_INSTRUCTION: &str = "Given a code search query, retrieve relevant code documentation that describes matching symbols, functions, or modules";
+
+/// Format a query-document pair using the Qwen3-Reranker chat template.
+/// The model was trained with this exact template format and produces
+/// meaningless scores without it.
+///
+/// Template structure:
+///   <|im_start|>system\n{judge prompt}<|im_end|>
+///   <|im_start|>user\n<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {doc}<|im_end|>
+///   <|im_start|>assistant\n<think>\n\n</think>\n\n
+fn format_reranker_input(query: &str, document: &str) -> String {
+    format!(
+        "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n<Instruct>: {}\n<Query>: {}\n<Document>: {}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        RERANKER_INSTRUCTION, query, document
+    )
+}
 
 #[derive(Clone)]
 pub struct CandleRerankerProvider {
@@ -36,6 +54,8 @@ struct LoadedRerankerModel {
     model: Mutex<qwen2::Model>,
     tokenizer: Mutex<Tokenizer>,
     device: Device,
+    yes_token_id: u32,
+    no_token_id: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -234,6 +254,12 @@ impl CandleRerankerProvider {
 
         let tokenizer = Tokenizer::from_file(&files.tokenizer_path)
             .map_err(|err| InferError::Tokenizer(err.to_string()))?;
+        let yes_token_id = tokenizer
+            .token_to_id("yes")
+            .ok_or_else(|| InferError::Tokenizer("tokenizer missing 'yes' token".to_owned()))?;
+        let no_token_id = tokenizer
+            .token_to_id("no")
+            .ok_or_else(|| InferError::Tokenizer("tokenizer missing 'no' token".to_owned()))?;
 
         let device = Device::Cpu;
         tracing::info!("Using CPU with F32 for Candle reranker");
@@ -250,6 +276,8 @@ impl CandleRerankerProvider {
             model: Mutex::new(model),
             tokenizer: Mutex::new(tokenizer),
             device,
+            yes_token_id,
+            no_token_id,
         })
     }
 
@@ -334,8 +362,11 @@ impl CandleRerankerProvider {
 
             let mut encodings = Vec::with_capacity(documents.len());
             for document in documents {
+                // Format with the full chat template — the model was trained with
+                // this exact format and requires it for meaningful scores.
+                let formatted = format_reranker_input(query, document);
                 let encoding = tokenizer
-                    .encode((query, *document), true)
+                    .encode(formatted.as_str(), false)
                     .map_err(|err| InferError::Tokenizer(err.to_string()))?;
                 encodings.push(encoding);
             }
@@ -355,8 +386,13 @@ impl CandleRerankerProvider {
 
         let mut input_ids = Vec::with_capacity(documents.len() * max_len);
         let mut attention_masks = Vec::with_capacity(documents.len() * max_len);
+        // Track the actual (non-padded) length of each sequence so we can find the
+        // last real token position for logit extraction.
+        let mut seq_lengths: Vec<usize> = Vec::with_capacity(documents.len());
 
         for encoding in &encodings {
+            let len = encoding.get_ids().len().min(MAX_TOKENS);
+            seq_lengths.push(len);
             append_encoding(
                 encoding,
                 pad_id,
@@ -370,7 +406,9 @@ impl CandleRerankerProvider {
         let attention_mask =
             Tensor::from_vec(attention_masks, (documents.len(), max_len), &loaded.device)?;
 
-        let hidden_states = {
+        // model.forward() returns LOGITS of shape (batch, seq_len, vocab_size).
+        // The lm_head projection is already applied inside qwen2::Model.
+        let logits = {
             let mut model = loaded
                 .model
                 .lock()
@@ -381,13 +419,34 @@ impl CandleRerankerProvider {
             output
         };
 
-        let pooled = mean_pool(&hidden_states, &attention_mask)?.to_dtype(DType::F32)?;
-        let rows = pooled.to_vec2::<f32>()?;
+        // For each sequence: extract the logit vector at the last non-padded token,
+        // then compute softmax([no_logit, yes_logit])[1] as the relevance score.
+        // This is the official Qwen3-Reranker scoring method.
+        let logits_f32 = logits.to_dtype(DType::F32)?;
+        let mut scores = Vec::with_capacity(documents.len());
 
-        Ok(rows
-            .into_iter()
-            .map(|row| sigmoid(row_mean(&row)))
-            .collect::<Vec<_>>())
+        for (batch_idx, &seq_len) in seq_lengths.iter().enumerate() {
+            let last_pos = if seq_len > 0 { seq_len - 1 } else { 0 };
+            // logits shape: (batch, seq_len, vocab_size)
+            let token_logits = logits_f32.i((batch_idx, last_pos))?.to_vec1::<f32>()?;
+
+            let yes_logit = *token_logits
+                .get(loaded.yes_token_id as usize)
+                .unwrap_or(&-10.0);
+            let no_logit = *token_logits
+                .get(loaded.no_token_id as usize)
+                .unwrap_or(&-10.0);
+
+            // softmax([no_logit, yes_logit])[1] = P(yes | query, document)
+            let max_val = yes_logit.max(no_logit);
+            let exp_yes = (yes_logit - max_val).exp();
+            let exp_no = (no_logit - max_val).exp();
+            let score = exp_yes / (exp_yes + exp_no);
+
+            scores.push(score);
+        }
+
+        Ok(scores)
     }
 }
 
@@ -441,29 +500,6 @@ fn append_encoding(
         input_ids.extend(std::iter::repeat_n(pad_id, max_len - len));
         attention_masks.extend(std::iter::repeat_n(0u32, max_len - len));
     }
-}
-
-fn mean_pool(last_hidden_state: &Tensor, attention_mask: &Tensor) -> Result<Tensor, InferError> {
-    let (batch, seq, hidden) = last_hidden_state.dims3()?;
-    let mask = attention_mask.to_dtype(last_hidden_state.dtype())?;
-    let expanded_mask = mask.unsqueeze(2)?.broadcast_as((batch, seq, hidden))?;
-    let summed = (last_hidden_state * expanded_mask)?.sum(1)?;
-    let counts = mask.sum(1)?.unsqueeze(1)?.expand((batch, hidden))?;
-    Ok(summed.broadcast_div(&counts)?)
-}
-
-fn row_mean(row: &[f32]) -> f32 {
-    if row.is_empty() {
-        return 0.0;
-    }
-
-    let sum = row.iter().copied().fold(0.0f32, |acc, value| acc + value);
-    sum / row.len() as f32
-}
-
-fn sigmoid(value: f32) -> f32 {
-    let clamped = value.clamp(-30.0, 30.0);
-    1.0 / (1.0 + (-clamped).exp())
 }
 
 fn sha256_file(path: impl AsRef<Path>) -> Result<String, InferError> {
