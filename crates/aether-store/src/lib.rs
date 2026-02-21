@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 
 use aether_config::{GraphBackend, load_workspace_config};
 use aether_core::{EdgeKind, SymbolEdge, content_hash, normalize_path};
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value as SqlValue};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
+    types::Value as SqlValue,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::from_str as json_from_str;
 use thiserror::Error;
@@ -24,6 +27,7 @@ pub use vector::{
 
 const SYMBOL_ACCESS_COUNTER_MAX: i64 = i64::MAX;
 const SYMBOL_ACCESS_DEBOUNCE_SECONDS: u64 = 60;
+const SQLITE_PARAM_CHUNK: usize = 900;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolRecord {
@@ -629,6 +633,62 @@ impl SqliteStore {
         Ok(record)
     }
 
+    pub fn get_symbol_search_results_batch(
+        &self,
+        ids: &[String],
+    ) -> Result<HashMap<String, SymbolSearchResult>, StoreError> {
+        let normalized = ids
+            .iter()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if normalized.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut records = HashMap::new();
+        for chunk in normalized.chunks(SQLITE_PARAM_CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                r#"
+                SELECT id, qualified_name, file_path, language, kind, access_count, last_accessed_at
+                FROM symbols
+                WHERE id IN ({placeholders})
+                ORDER BY id ASC
+                "#
+            );
+
+            let params_vec = chunk
+                .iter()
+                .cloned()
+                .map(SqlValue::Text)
+                .collect::<Vec<_>>();
+            let mut stmt = self.conn.prepare(sql.as_str())?;
+            let rows = stmt.query_map(params_from_iter(params_vec), |row| {
+                Ok(SymbolSearchResult {
+                    symbol_id: row.get(0)?,
+                    qualified_name: row.get(1)?,
+                    file_path: row.get(2)?,
+                    language: row.get(3)?,
+                    kind: row.get(4)?,
+                    access_count: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0),
+                    last_accessed_at: row.get(6)?,
+                })
+            })?;
+
+            for row in rows {
+                let record = row?;
+                records.insert(record.symbol_id.clone(), record);
+            }
+        }
+
+        Ok(records)
+    }
+
     pub fn get_symbol_record(&self, symbol_id: &str) -> Result<Option<SymbolRecord>, StoreError> {
         let mut stmt = self.conn.prepare(
             r#"
@@ -733,54 +793,68 @@ impl SqliteStore {
             return Ok(Vec::new());
         }
 
-        let placeholders = std::iter::repeat_n("?", symbol_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            r#"
-            SELECT symbol_id, sir_hash, provider, model, embedding_json, updated_at
-            FROM sir_embeddings
-            WHERE provider = ?1
-              AND model = ?2
-              AND symbol_id IN ({placeholders})
-            ORDER BY symbol_id ASC
-            "#
-        );
-
-        let mut params_vec: Vec<SqlValue> = vec![
-            SqlValue::Text(provider.to_owned()),
-            SqlValue::Text(model.to_owned()),
-        ];
-        params_vec.extend(symbol_ids.iter().cloned().map(SqlValue::Text));
-
-        let mut stmt = self.conn.prepare(sql.as_str())?;
-        let rows = stmt.query_map(params_from_iter(params_vec), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)?,
-            ))
-        })?;
+        let normalized = symbol_ids
+            .iter()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if normalized.is_empty() {
+            return Ok(Vec::new());
+        }
 
         let mut records = Vec::new();
-        for row in rows {
-            let (symbol_id, sir_hash, provider, model, embedding_json, updated_at) = row?;
-            let embedding = json_from_str::<Vec<f32>>(&embedding_json)?;
-            if embedding.is_empty() {
-                continue;
+        for chunk in normalized.chunks(SQLITE_PARAM_CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                r#"
+                SELECT symbol_id, sir_hash, provider, model, embedding_json, updated_at
+                FROM sir_embeddings
+                WHERE provider = ?1
+                  AND model = ?2
+                  AND symbol_id IN ({placeholders})
+                ORDER BY symbol_id ASC
+                "#
+            );
+
+            let mut params_vec: Vec<SqlValue> = vec![
+                SqlValue::Text(provider.to_owned()),
+                SqlValue::Text(model.to_owned()),
+            ];
+            params_vec.extend(chunk.iter().cloned().map(SqlValue::Text));
+
+            let mut stmt = self.conn.prepare(sql.as_str())?;
+            let rows = stmt.query_map(params_from_iter(params_vec), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?;
+
+            for row in rows {
+                let (symbol_id, sir_hash, provider, model, embedding_json, updated_at) = row?;
+                let embedding = json_from_str::<Vec<f32>>(&embedding_json)?;
+                if embedding.is_empty() {
+                    continue;
+                }
+                records.push(SymbolEmbeddingRecord {
+                    symbol_id,
+                    sir_hash,
+                    provider,
+                    model,
+                    embedding,
+                    updated_at,
+                });
             }
-            records.push(SymbolEmbeddingRecord {
-                symbol_id,
-                sir_hash,
-                provider,
-                model,
-                embedding,
-                updated_at,
-            });
         }
+        records.sort_by(|left, right| left.symbol_id.cmp(&right.symbol_id));
 
         Ok(records)
     }
@@ -1004,9 +1078,9 @@ impl Store for SqliteStore {
             return Ok(());
         }
 
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
-        let result = (|| -> Result<(), StoreError> {
-            let mut stmt = self.conn.prepare(
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        {
+            let mut stmt = tx.prepare(
                 r#"
                 UPDATE symbols
                 SET access_count = CASE
@@ -1021,20 +1095,9 @@ impl Store for SqliteStore {
             for symbol_id in unique_ids {
                 stmt.execute(params![symbol_id, SYMBOL_ACCESS_COUNTER_MAX, accessed_at])?;
             }
-
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
         }
+        tx.commit()?;
+        Ok(())
     }
 
     fn increment_symbol_access_debounced(
@@ -1053,6 +1116,7 @@ impl Store for SqliteStore {
                 "symbol access debounce lock poisoned: {err}"
             )))
         })?;
+        tracker.retain(|_, last_accessed| now.duration_since(*last_accessed) < debounce_window);
 
         let mut symbol_ids_to_increment = Vec::new();
         for symbol_id in symbol_ids {
@@ -1085,10 +1149,9 @@ impl Store for SqliteStore {
             return Ok(());
         }
 
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
-
-        let result = (|| -> Result<(), StoreError> {
-            let mut stmt = self.conn.prepare(
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        {
+            let mut stmt = tx.prepare(
                 r#"
                 INSERT INTO symbol_edges (
                     source_id, target_qualified_name, edge_kind, file_path
@@ -1107,20 +1170,9 @@ impl Store for SqliteStore {
                     edge.file_path,
                 ])?;
             }
-
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
         }
+        tx.commit()?;
+        Ok(())
     }
 
     fn get_callers(&self, target_qualified_name: &str) -> Result<Vec<SymbolEdge>, StoreError> {
@@ -1372,10 +1424,10 @@ impl Store for SqliteStore {
     ) -> Result<SirVersionWriteResult, StoreError> {
         let created_at = created_at.max(0);
         let commit_hash = normalize_commit_hash(commit_hash);
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
 
-        let result = (|| -> Result<SirVersionWriteResult, StoreError> {
-            let mut latest_stmt = self.conn.prepare(
+        let write_result = {
+            let mut latest_stmt = tx.prepare(
                 r#"
                 SELECT version, sir_hash, created_at
                 FROM sir_history
@@ -1397,24 +1449,48 @@ impl Store for SqliteStore {
 
             if let Some((latest_version, latest_hash, latest_created_at)) = latest {
                 if latest_hash == sir_hash {
-                    return Ok(SirVersionWriteResult {
+                    SirVersionWriteResult {
                         version: latest_version,
                         updated_at: latest_created_at,
                         changed: false,
-                    });
-                }
+                    }
+                } else {
+                    let next_version = latest_version + 1;
+                    tx.execute(
+                        r#"
+                        INSERT INTO sir_history (
+                            symbol_id, version, sir_hash, provider, model, created_at, sir_json, commit_hash
+                        )
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                        "#,
+                        params![
+                            symbol_id,
+                            next_version,
+                            sir_hash,
+                            provider,
+                            model,
+                            created_at,
+                            sir_json,
+                            commit_hash.as_deref(),
+                        ],
+                    )?;
 
-                let next_version = latest_version + 1;
-                self.conn.execute(
+                    SirVersionWriteResult {
+                        version: next_version,
+                        updated_at: created_at,
+                        changed: true,
+                    }
+                }
+            } else {
+                tx.execute(
                     r#"
                     INSERT INTO sir_history (
                         symbol_id, version, sir_hash, provider, model, created_at, sir_json, commit_hash
                     )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, ?7)
                     "#,
                     params![
                         symbol_id,
-                        next_version,
                         sir_hash,
                         provider,
                         model,
@@ -1424,48 +1500,16 @@ impl Store for SqliteStore {
                     ],
                 )?;
 
-                return Ok(SirVersionWriteResult {
-                    version: next_version,
+                SirVersionWriteResult {
+                    version: 1,
                     updated_at: created_at,
                     changed: true,
-                });
+                }
             }
+        };
 
-            self.conn.execute(
-                r#"
-                INSERT INTO sir_history (
-                    symbol_id, version, sir_hash, provider, model, created_at, sir_json, commit_hash
-                )
-                VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, ?7)
-                "#,
-                params![
-                    symbol_id,
-                    sir_hash,
-                    provider,
-                    model,
-                    created_at,
-                    sir_json,
-                    commit_hash.as_deref(),
-                ],
-            )?;
-
-            Ok(SirVersionWriteResult {
-                version: 1,
-                updated_at: created_at,
-                changed: true,
-            })
-        })();
-
-        match result {
-            Ok(write_result) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(write_result)
-            }
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
-        }
+        tx.commit()?;
+        Ok(write_result)
     }
 
     fn upsert_symbol_embedding(&self, record: SymbolEmbeddingRecord) -> Result<(), StoreError> {
@@ -2037,9 +2081,9 @@ impl Store for SqliteStore {
             return Ok(());
         }
 
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
-        let result = (|| -> Result<(), StoreError> {
-            let mut stmt = self.conn.prepare(
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        {
+            let mut stmt = tx.prepare(
                 r#"
                 UPDATE project_notes
                 SET access_count = access_count + 1,
@@ -2055,20 +2099,9 @@ impl Store for SqliteStore {
                 }
                 stmt.execute(params![trimmed, accessed_at.max(0)])?;
             }
-
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
         }
+        tx.commit()?;
+        Ok(())
     }
 
     fn upsert_project_note_embedding(
@@ -2292,9 +2325,9 @@ impl Store for SqliteStore {
             return Ok(());
         }
 
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
-        let result = (|| -> Result<(), StoreError> {
-            let mut stmt = self.conn.prepare(
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        {
+            let mut stmt = tx.prepare(
                 r#"
                 INSERT INTO drift_results (
                     result_id, symbol_id, file_path, symbol_name, drift_type, drift_magnitude,
@@ -2353,19 +2386,9 @@ impl Store for SqliteStore {
                     if record.is_acknowledged { 1 } else { 0 },
                 ])?;
             }
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
         }
+        tx.commit()?;
+        Ok(())
     }
 
     fn list_drift_results(
@@ -2409,36 +2432,48 @@ impl Store for SqliteStore {
             .iter()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
+            .collect::<HashSet<_>>()
+            .into_iter()
             .collect::<Vec<_>>();
         if normalized.is_empty() {
             return Ok(Vec::new());
         }
 
-        let placeholders = std::iter::repeat_n("?", normalized.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            r#"
-            SELECT
-                result_id, symbol_id, file_path, symbol_name, drift_type, drift_magnitude,
-                current_sir_hash, baseline_sir_hash, commit_range_start, commit_range_end,
-                drift_summary, detail_json, detected_at, is_acknowledged
-            FROM drift_results
-            WHERE result_id IN ({placeholders})
-            ORDER BY detected_at DESC, result_id ASC
-            "#
-        );
-
-        let params_vec = normalized
-            .into_iter()
-            .map(SqlValue::Text)
-            .collect::<Vec<_>>();
-        let mut stmt = self.conn.prepare(sql.as_str())?;
-        let rows = stmt.query_map(params_from_iter(params_vec), drift_result_from_row)?;
         let mut records = Vec::new();
-        for row in rows {
-            records.push(row?);
+        for chunk in normalized.chunks(SQLITE_PARAM_CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                r#"
+                SELECT
+                    result_id, symbol_id, file_path, symbol_name, drift_type, drift_magnitude,
+                    current_sir_hash, baseline_sir_hash, commit_range_start, commit_range_end,
+                    drift_summary, detail_json, detected_at, is_acknowledged
+                FROM drift_results
+                WHERE result_id IN ({placeholders})
+                ORDER BY detected_at DESC, result_id ASC
+                "#
+            );
+
+            let params_vec = chunk
+                .iter()
+                .cloned()
+                .map(SqlValue::Text)
+                .collect::<Vec<_>>();
+            let mut stmt = self.conn.prepare(sql.as_str())?;
+            let rows = stmt.query_map(params_from_iter(params_vec), drift_result_from_row)?;
+            for row in rows {
+                records.push(row?);
+            }
         }
+        records.sort_by(|left, right| {
+            right
+                .detected_at
+                .cmp(&left.detected_at)
+                .then_with(|| left.result_id.cmp(&right.result_id))
+        });
+        records.dedup_by(|left, right| left.result_id == right.result_id);
         Ok(records)
     }
 
@@ -2447,24 +2482,30 @@ impl Store for SqliteStore {
             .iter()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
+            .collect::<HashSet<_>>()
+            .into_iter()
             .collect::<Vec<_>>();
         if normalized.is_empty() {
             return Ok(0);
         }
 
-        let placeholders = std::iter::repeat_n("?", normalized.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "UPDATE drift_results SET is_acknowledged = 1 WHERE result_id IN ({placeholders})"
-        );
-        let params_vec = normalized
-            .into_iter()
-            .map(SqlValue::Text)
-            .collect::<Vec<_>>();
-        let changed = self
-            .conn
-            .execute(sql.as_str(), params_from_iter(params_vec))?;
+        let mut changed = 0usize;
+        for chunk in normalized.chunks(SQLITE_PARAM_CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "UPDATE drift_results SET is_acknowledged = 1 WHERE result_id IN ({placeholders})"
+            );
+            let params_vec = chunk
+                .iter()
+                .cloned()
+                .map(SqlValue::Text)
+                .collect::<Vec<_>>();
+            changed += self
+                .conn
+                .execute(sql.as_str(), params_from_iter(params_vec))?;
+        }
         Ok(changed as u32)
     }
 
@@ -2479,14 +2520,14 @@ impl Store for SqliteStore {
             return Ok(());
         }
 
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
-        let result = (|| -> Result<(), StoreError> {
-            self.conn.execute(
-                "DELETE FROM community_snapshot WHERE snapshot_id = ?1",
-                params![snapshot_id],
-            )?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM community_snapshot WHERE snapshot_id = ?1",
+            params![snapshot_id],
+        )?;
 
-            let mut stmt = self.conn.prepare(
+        {
+            let mut stmt = tx.prepare(
                 r#"
                 INSERT INTO community_snapshot (snapshot_id, symbol_id, community_id, captured_at)
                 VALUES (?1, ?2, ?3, ?4)
@@ -2507,19 +2548,9 @@ impl Store for SqliteStore {
                     captured_at.max(0),
                 ])?;
             }
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
         }
+        tx.commit()?;
+        Ok(())
     }
 
     fn list_latest_community_snapshot(&self) -> Result<Vec<CommunitySnapshotRecord>, StoreError> {
@@ -2700,14 +2731,14 @@ impl Store for SqliteStore {
             return Ok(());
         }
 
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
-        let result = (|| -> Result<(), StoreError> {
-            self.conn.execute(
-                "DELETE FROM test_intents WHERE file_path = ?1",
-                params![file_path],
-            )?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM test_intents WHERE file_path = ?1",
+            params![file_path],
+        )?;
 
-            let mut stmt = self.conn.prepare(
+        {
+            let mut stmt = tx.prepare(
                 r#"
                 INSERT INTO test_intents (
                     intent_id, file_path, test_name, intent_text, group_label,
@@ -2742,20 +2773,9 @@ impl Store for SqliteStore {
                     intent.updated_at.max(0),
                 ])?;
             }
-
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
         }
+        tx.commit()?;
+        Ok(())
     }
 
     fn list_test_intents_for_file(

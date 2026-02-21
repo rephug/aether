@@ -251,8 +251,8 @@ impl CandleRerankerProvider {
         })
     }
 
-    fn rerank_sync(
-        &self,
+    fn rerank_sync_with_loaded(
+        loaded: &LoadedRerankerModel,
         query: &str,
         candidates: &[RerankCandidate],
         top_n: usize,
@@ -275,7 +275,6 @@ impl CandleRerankerProvider {
             return Ok(passthrough);
         }
 
-        let loaded = self.ensure_loaded()?;
         let mut scored = Vec::with_capacity(candidates.len());
 
         for batch in candidates.chunks(BATCH_CHUNK_SIZE) {
@@ -283,7 +282,7 @@ impl CandleRerankerProvider {
                 .iter()
                 .map(|candidate| candidate.text.as_str())
                 .collect::<Vec<_>>();
-            let scores = Self::score_chunk(loaded.as_ref(), query, &docs)?;
+            let scores = Self::score_chunk(loaded, query, &docs)?;
             for (candidate, score) in batch.iter().zip(scores.into_iter()) {
                 scored.push((candidate.id.clone(), score));
             }
@@ -398,7 +397,22 @@ impl RerankerProvider for CandleRerankerProvider {
         candidates: &[RerankCandidate],
         top_n: usize,
     ) -> Result<Vec<RerankResult>, InferError> {
-        self.rerank_sync(query, candidates, top_n)
+        let loaded = Arc::clone(self.ensure_loaded()?);
+        let query = query.to_owned();
+        let candidates = candidates.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            Self::rerank_sync_with_loaded(
+                loaded.as_ref(),
+                query.as_str(),
+                candidates.as_slice(),
+                top_n,
+            )
+        })
+        .await
+        .map_err(|err| {
+            InferError::ModelUnavailable(format!("candle reranker task failed: {err}"))
+        })?
     }
 
     fn provider_name(&self) -> &str {

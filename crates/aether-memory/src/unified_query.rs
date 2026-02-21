@@ -109,74 +109,71 @@ impl ProjectMemoryService {
         let workspace = self.workspace().to_path_buf();
         let query_owned = query.to_owned();
 
-        let (symbol_lexical, note_lexical, test_lexical) = std::thread::scope(|scope| {
-            let symbol_handle = fetch_symbols.then(|| {
-                let workspace = workspace.clone();
-                let query = query_owned.clone();
-                scope.spawn(
-                    move || -> Result<Vec<aether_store::SymbolSearchResult>, MemoryError> {
-                        let store = SqliteStore::open(&workspace)?;
-                        store
-                            .search_symbols(query.as_str(), candidate_limit)
-                            .map_err(Into::into)
-                    },
-                )
-            });
+        let symbol_task = async {
+            if !fetch_symbols {
+                return Ok(Vec::new());
+            }
 
-            let note_handle = fetch_notes.then(|| {
-                let workspace = workspace.clone();
-                let query = query_owned.clone();
-                scope.spawn(
-                    move || -> Result<Vec<aether_store::ProjectNoteRecord>, MemoryError> {
-                        let store = SqliteStore::open(&workspace)?;
-                        store
-                            .search_project_notes_lexical(
-                                query.as_str(),
-                                candidate_limit,
-                                false,
-                                &[],
-                            )
-                            .map_err(Into::into)
-                    },
-                )
-            });
+            let workspace = workspace.clone();
+            let query = query_owned.clone();
+            tokio::task::spawn_blocking(
+                move || -> Result<Vec<aether_store::SymbolSearchResult>, MemoryError> {
+                    let store = SqliteStore::open(&workspace)?;
+                    store
+                        .search_symbols(query.as_str(), candidate_limit)
+                        .map_err(Into::into)
+                },
+            )
+            .await
+            .map_err(|err| {
+                MemoryError::InvalidInput(format!("symbol search task join failure: {err}"))
+            })?
+        };
 
-            let test_handle = fetch_tests.then(|| {
-                let workspace = workspace.clone();
-                let query = query_owned.clone();
-                scope.spawn(
-                    move || -> Result<Vec<aether_store::TestIntentRecord>, MemoryError> {
-                        let store = SqliteStore::open(&workspace)?;
-                        store
-                            .search_test_intents_lexical(query.as_str(), candidate_limit)
-                            .map_err(Into::into)
-                    },
-                )
-            });
+        let note_task = async {
+            if !fetch_notes {
+                return Ok(Vec::new());
+            }
 
-            let symbol_lexical = match symbol_handle {
-                Some(handle) => handle.join().map_err(|_| {
-                    MemoryError::InvalidInput("symbol search thread panicked".to_owned())
-                })??,
-                None => Vec::new(),
-            };
+            let workspace = workspace.clone();
+            let query = query_owned.clone();
+            tokio::task::spawn_blocking(
+                move || -> Result<Vec<aether_store::ProjectNoteRecord>, MemoryError> {
+                    let store = SqliteStore::open(&workspace)?;
+                    store
+                        .search_project_notes_lexical(query.as_str(), candidate_limit, false, &[])
+                        .map_err(Into::into)
+                },
+            )
+            .await
+            .map_err(|err| {
+                MemoryError::InvalidInput(format!("note search task join failure: {err}"))
+            })?
+        };
 
-            let note_lexical = match note_handle {
-                Some(handle) => handle.join().map_err(|_| {
-                    MemoryError::InvalidInput("note search thread panicked".to_owned())
-                })??,
-                None => Vec::new(),
-            };
+        let test_task = async {
+            if !fetch_tests {
+                return Ok(Vec::new());
+            }
 
-            let test_lexical = match test_handle {
-                Some(handle) => handle.join().map_err(|_| {
-                    MemoryError::InvalidInput("test intent search thread panicked".to_owned())
-                })??,
-                None => Vec::new(),
-            };
+            let workspace = workspace.clone();
+            let query = query_owned.clone();
+            tokio::task::spawn_blocking(
+                move || -> Result<Vec<aether_store::TestIntentRecord>, MemoryError> {
+                    let store = SqliteStore::open(&workspace)?;
+                    store
+                        .search_test_intents_lexical(query.as_str(), candidate_limit)
+                        .map_err(Into::into)
+                },
+            )
+            .await
+            .map_err(|err| {
+                MemoryError::InvalidInput(format!("test intent search task join failure: {err}"))
+            })?
+        };
 
-            Ok::<_, MemoryError>((symbol_lexical, note_lexical, test_lexical))
-        })?;
+        let (symbol_lexical, note_lexical, test_lexical) =
+            tokio::try_join!(symbol_task, note_task, test_task)?;
 
         let mut symbol_semantic = Vec::<aether_store::SymbolSearchResult>::new();
         let mut note_semantic = Vec::<aether_store::ProjectNoteRecord>::new();
@@ -346,27 +343,23 @@ fn rank_note_candidates(
     semantic: Vec<aether_store::ProjectNoteRecord>,
     now_ms: i64,
 ) -> Vec<RankedCandidate> {
-    let mut by_id = HashMap::<String, aether_store::ProjectNoteRecord>::new();
+    let mut by_id = HashMap::<String, &aether_store::ProjectNoteRecord>::new();
     let mut score_by_id = HashMap::<String, f32>::new();
 
     for (rank, row) in lexical.iter().enumerate() {
-        by_id
-            .entry(row.note_id.clone())
-            .or_insert_with(|| row.clone());
+        by_id.entry(row.note_id.clone()).or_insert(row);
         *score_by_id.entry(row.note_id.clone()).or_insert(0.0) += rrf_score(rank);
     }
     for (rank, row) in semantic.iter().enumerate() {
-        by_id
-            .entry(row.note_id.clone())
-            .or_insert_with(|| row.clone());
+        by_id.entry(row.note_id.clone()).or_insert(row);
         *score_by_id.entry(row.note_id.clone()).or_insert(0.0) += rrf_score(rank);
     }
 
     let mut ranked = score_by_id
         .into_iter()
         .filter_map(|(note_id, score)| {
-            by_id.remove(note_id.as_str()).map(|record| {
-                let note = project_note_from_store(record);
+            by_id.get(note_id.as_str()).map(|record| {
+                let note = project_note_from_store((*record).clone());
                 let boosted = apply_recency_access_boost(
                     score,
                     note.access_count,

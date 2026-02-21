@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use aether_core::{
-    SEARCH_FALLBACK_EMBEDDINGS_DISABLED, SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED, SearchMode,
+    SEARCH_FALLBACK_EMBEDDINGS_DISABLED, SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY, SearchMode,
 };
 use aether_mcp::{
     AetherBlastRadiusRequest, AetherCallChainRequest, AetherDependenciesRequest,
@@ -555,7 +555,7 @@ vector_backend = "sqlite"
     assert_eq!(response.mode_used, SearchMode::Lexical);
     assert_eq!(
         response.fallback_reason.as_deref(),
-        Some(SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED)
+        Some(SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY)
     );
     assert_eq!(response.mode_requested, SearchMode::Semantic);
     assert_eq!(response.result_count, 0);

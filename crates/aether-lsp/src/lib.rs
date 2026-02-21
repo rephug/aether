@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aether_core::{
@@ -11,6 +11,7 @@ use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
 use aether_store::{CouplingEdgeRecord, CozoGraphStore, SqliteStore, Store, StoreError};
 use serde_json::Value;
 use thiserror::Error;
+use tokio::sync::Mutex;
 use tower_lsp::lsp_types::{
     Hover, HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
     MarkupContent, MarkupKind, Position, ServerCapabilities,
@@ -88,10 +89,7 @@ impl LanguageServer for AetherLspBackend {
         };
 
         let resolution = {
-            let guard = match self.store.lock() {
-                Ok(guard) => guard,
-                Err(_) => return Ok(Some(no_sir_hover())),
-            };
+            let guard = self.store.lock().await;
 
             resolve_hover_markdown_for_path(
                 &self.workspace_root,

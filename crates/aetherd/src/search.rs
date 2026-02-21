@@ -316,6 +316,13 @@ fn semantic_search(
 
     let mut semantic_rows = Vec::new();
     let mut mismatched_languages = HashSet::new();
+    let symbol_ids = matches
+        .iter()
+        .map(|candidate| candidate.symbol_id.clone())
+        .collect::<Vec<_>>();
+    let symbols_by_id = store
+        .get_symbol_search_results_batch(symbol_ids.as_slice())
+        .context("failed to resolve semantic search symbols in batch")?;
     let mut threshold_context = ThresholdResolutionContext {
         query_language_hint,
         thresholds: &config.search.thresholds,
@@ -326,15 +333,7 @@ fn semantic_search(
         mismatched_languages: &mut mismatched_languages,
     };
     for candidate in matches {
-        let Some(symbol) = store
-            .get_symbol_search_result(&candidate.symbol_id)
-            .with_context(|| {
-                format!(
-                    "failed to resolve semantic search symbol {}",
-                    candidate.symbol_id
-                )
-            })?
-        else {
+        let Some(symbol) = symbols_by_id.get(candidate.symbol_id.as_str()) else {
             continue;
         };
 
@@ -344,11 +343,11 @@ fn semantic_search(
         }
 
         semantic_rows.push(SearchResultRow {
-            symbol_id: symbol.symbol_id,
-            qualified_name: symbol.qualified_name,
-            file_path: symbol.file_path,
-            language: symbol.language,
-            kind: symbol.kind,
+            symbol_id: symbol.symbol_id.clone(),
+            qualified_name: symbol.qualified_name.clone(),
+            file_path: symbol.file_path.clone(),
+            language: symbol.language.clone(),
+            kind: symbol.kind.clone(),
             semantic_score: Some(candidate.semantic_score),
         });
     }

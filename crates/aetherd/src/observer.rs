@@ -9,6 +9,8 @@ use aether_parse::{SymbolExtractor, language_for_path};
 use anyhow::{Context, Result};
 use walkdir::WalkDir;
 
+const MAX_PARSE_FILE_SIZE: u64 = 2 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 struct FileSnapshot {
     language: Language,
@@ -87,6 +89,27 @@ impl ObserverState {
         };
 
         let current_symbols = if path.exists() && path.is_file() {
+            if let Some(metadata) = match fs::metadata(path) {
+                Ok(metadata) => Some(metadata),
+                Err(err) if err.kind() == ErrorKind::NotFound => None,
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("failed to inspect changed file {}", path.display())
+                    });
+                }
+            } {
+                let size = metadata.len();
+                if size > MAX_PARSE_FILE_SIZE {
+                    tracing::warn!(
+                        path = %path.display(),
+                        size,
+                        limit = MAX_PARSE_FILE_SIZE,
+                        "skipping oversized changed file"
+                    );
+                    return Ok(None);
+                }
+            }
+
             match fs::read_to_string(path) {
                 Ok(source) => self
                     .extractor

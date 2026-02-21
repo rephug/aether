@@ -1018,20 +1018,30 @@ fn parse_and_validate_sir(candidate_json: &str) -> Result<SirAnnotation, String>
 
 fn normalize_candidate_json(candidate_json: &str) -> String {
     let trimmed = candidate_json.trim();
+    let lower = trimmed.to_ascii_lowercase();
 
-    if !trimmed.starts_with("```") {
-        return trimmed.to_owned();
+    let extract_fenced_body = |input: &str, opening_idx: usize| -> Option<String> {
+        let fence_payload = input.get((opening_idx + 3)..)?;
+        let newline_idx = fence_payload.find('\n')?;
+        let body_start = opening_idx + 3 + newline_idx + 1;
+        let after_newline = input.get(body_start..)?;
+        let closing_idx = after_newline.find("```")?;
+        Some(after_newline[..closing_idx].trim().to_owned())
+    };
+
+    if let Some(idx) = lower.find("```json")
+        && let Some(extracted) = extract_fenced_body(trimmed, idx)
+    {
+        return extracted;
     }
 
-    let mut lines = trimmed.lines();
-    let _fence_line = lines.next();
-
-    let mut body: Vec<&str> = lines.collect();
-    if body.last().is_some_and(|line| line.trim() == "```") {
-        body.pop();
+    if let Some(idx) = trimmed.find("```")
+        && let Some(extracted) = extract_fenced_body(trimmed, idx)
+    {
+        return extracted;
     }
 
-    body.join("\n").trim().to_owned()
+    trimmed.to_owned()
 }
 
 fn normalize_optional(value: Option<String>) -> Option<String> {
@@ -1180,6 +1190,37 @@ mod tests {
             Some(&json!(OLLAMA_SIR_TEMPERATURE))
         );
         assert_eq!(body.pointer("/temperature"), None);
+    }
+
+    #[test]
+    fn normalize_candidate_json_extracts_json_after_preamble() {
+        let input = "Here is the data:\n```json\n{\"purpose\":\"test\"}\n```";
+        assert_eq!(normalize_candidate_json(input), "{\"purpose\":\"test\"}");
+    }
+
+    #[test]
+    fn normalize_candidate_json_extracts_json_with_language_tag() {
+        let input = "```json\n{\"purpose\":\"test\"}\n```";
+        assert_eq!(normalize_candidate_json(input), "{\"purpose\":\"test\"}");
+    }
+
+    #[test]
+    fn normalize_candidate_json_returns_raw_json_when_unfenced() {
+        let input = "{\"purpose\":\"test\"}";
+        assert_eq!(normalize_candidate_json(input), input);
+    }
+
+    #[test]
+    fn normalize_candidate_json_returns_trimmed_input_when_fence_is_unclosed() {
+        let input = "```json\n{\"purpose\":\"test\"}";
+        assert_eq!(normalize_candidate_json(input), input);
+    }
+
+    #[test]
+    fn normalize_candidate_json_uses_first_fenced_block_when_multiple_present() {
+        let input =
+            "```json\n{\"purpose\":\"first\"}\n```\n\n```json\n{\"purpose\":\"second\"}\n```";
+        assert_eq!(normalize_candidate_json(input), "{\"purpose\":\"first\"}");
     }
 
     #[tokio::test]
