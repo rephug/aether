@@ -5,8 +5,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub mod git;
+pub mod secret;
 
 pub use git::{BlameLine, CommitInfo, GitContext};
+pub use secret::Secret;
 
 pub type SymbolId = String;
 pub const NO_SIR_MESSAGE: &str =
@@ -223,6 +225,10 @@ pub struct Position {
 pub struct SourceRange {
     pub start: Position,
     pub end: Position,
+    #[serde(default)]
+    pub start_byte: Option<usize>,
+    #[serde(default)]
+    pub end_byte: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -396,6 +402,8 @@ mod tests {
                     line: 1,
                     column: 10,
                 },
+                start_byte: None,
+                end_byte: None,
             },
         }
     }
@@ -499,5 +507,13 @@ mod tests {
         assert!(markdown.contains("> AETHER WARNING: SIR is stale."));
         assert!(markdown.contains("**Intent**"));
         assert!(markdown.contains("**Side Effects**\n(none)"));
+    }
+
+    #[test]
+    fn secret_redacts_debug_and_display() {
+        let secret = Secret::new("top-secret-token".to_owned());
+        assert_eq!(format!("{secret:?}"), "[REDACTED]");
+        assert_eq!(format!("{secret}"), "[REDACTED]");
+        assert_eq!(secret.expose(), "top-secret-token");
     }
 }

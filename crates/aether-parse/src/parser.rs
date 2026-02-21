@@ -587,6 +587,8 @@ pub(crate) fn node_range(node: Node<'_>) -> SourceRange {
     SourceRange {
         start: point_to_position(node.start_position()),
         end: point_to_position(node.end_position()),
+        start_byte: Some(node.start_byte()),
+        end_byte: Some(node.end_byte()),
     }
 }
 
@@ -594,9 +596,19 @@ pub(crate) fn rust_call_target(node: Node<'_>, source: &[u8]) -> Option<String> 
     let callee = node
         .child_by_field_name("function")
         .or_else(|| node.named_child(0))?;
-    let text = node_text(callee, source);
-    let target = text.trim();
-    (!target.is_empty()).then(|| target.to_owned())
+    match callee.kind() {
+        "field_expression" => {
+            let field = callee.child_by_field_name("field")?;
+            let text = node_text(field, source);
+            let target = text.trim();
+            (!target.is_empty()).then(|| target.to_owned())
+        }
+        _ => {
+            let text = node_text(callee, source);
+            let target = text.trim();
+            (!target.is_empty()).then(|| target.to_owned())
+        }
+    }
 }
 
 pub(crate) fn rust_use_target(node: Node<'_>, source: &[u8]) -> Option<String> {
@@ -1117,6 +1129,123 @@ fn alpha() {
         assert_eq!(calls[0].source_id, alpha.id);
         assert_eq!(calls[0].target_qualified_name, "beta");
         assert_eq!(calls[0].file_path, "src/lib.rs");
+    }
+
+    #[test]
+    fn extracts_rust_calls_edges_for_free_method_and_path_calls() {
+        let source = r#"
+struct Worker;
+
+impl Worker {
+    fn process(&self) {}
+}
+
+fn run_free() {}
+
+fn example(obj: Worker) {
+    run_free();
+    obj.process();
+    String::from("x");
+}
+"#;
+
+        let extracted = extract_with_edges(Language::Rust, "src/lib.rs", source);
+        let example = extracted
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "example")
+            .expect("example symbol should exist");
+
+        let targets = extracted
+            .edges
+            .iter()
+            .filter(|edge| edge.edge_kind == EdgeKind::Calls && edge.source_id == example.id)
+            .map(|edge| edge.target_qualified_name.clone())
+            .collect::<Vec<_>>();
+
+        assert!(targets.iter().any(|target| target == "run_free"));
+        assert!(targets.iter().any(|target| target == "process"));
+        assert!(targets.iter().any(|target| target == "String::from"));
+    }
+
+    #[test]
+    fn rust_trait_function_is_classified_as_method() {
+        let source = r#"
+trait Processor {
+    fn process(&self) {}
+}
+"#;
+
+        let symbols = extract(Language::Rust, "src/lib.rs", source);
+        let method = symbols
+            .iter()
+            .find(|symbol| symbol.name == "process")
+            .expect("trait method symbol should exist");
+        assert_eq!(method.kind, SymbolKind::Method);
+    }
+
+    #[test]
+    fn rust_source_range_includes_byte_offsets() {
+        let source = "fn alpha() {\n    beta();\n}\n";
+        let symbols = extract(Language::Rust, "src/lib.rs", source);
+        let alpha = symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "alpha")
+            .expect("alpha symbol should exist");
+
+        assert_eq!(alpha.range.start_byte, Some(0));
+        assert_eq!(alpha.range.end_byte, Some(source.len() - 1));
+    }
+
+    #[test]
+    fn rust_call_node_diagnostics_prints_ast_and_call_kinds() {
+        let source = r#"
+fn process() {}
+
+fn example(obj: String) {
+    process();
+    obj.process();
+    String::from("x");
+}
+"#;
+
+        let mut parser = Parser::new();
+        parser
+            .set_language(&rust_language())
+            .expect("load rust language");
+        let tree = parser.parse(source, None).expect("parse rust source");
+        let root = tree.root_node();
+
+        println!("RUST_DIAG_SEXP: {}", root.to_sexp());
+
+        let mut kinds = Vec::new();
+        let mut stack = vec![root];
+        let source_bytes = source.as_bytes();
+        while let Some(node) = stack.pop() {
+            if node.kind().contains("call")
+                && node.named_child_count() > 0
+                && let Ok(text) = node.utf8_text(source_bytes)
+            {
+                let trimmed = text.trim().to_owned();
+                if trimmed.contains("process()")
+                    || trimmed.contains("obj.process()")
+                    || trimmed.contains("String::from(\"x\")")
+                {
+                    println!("RUST_DIAG_CALL kind={} text={}", node.kind(), trimmed);
+                    kinds.push((trimmed, node.kind().to_owned()));
+                }
+            }
+
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+
+        kinds.sort_by(|left, right| left.0.cmp(&right.0));
+        assert!(kinds.iter().any(|(text, _)| text == "process()"));
+        assert!(kinds.iter().any(|(text, _)| text == "obj.process()"));
+        assert!(kinds.iter().any(|(text, _)| text == "String::from(\"x\")"));
     }
 
     #[test]

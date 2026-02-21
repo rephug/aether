@@ -7,6 +7,7 @@ authors.workspace = true
 
 [dependencies]
 aether-config = { path = "../aether-config" }
+aether-core = { path = "../aether-core" }
 aether-sir = { path = "../aether-sir" }
 async-trait = "0.1"
 candle-core.workspace = true

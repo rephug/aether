@@ -26,6 +26,7 @@ const MAX_TOKENS: usize = 2048;
 const BATCH_CHUNK_SIZE: usize = 4;
 const REQUIRED_FILES: [&str; 3] = ["config.json", "tokenizer.json", "model.safetensors"];
 
+#[derive(Clone)]
 pub struct CandleRerankerProvider {
     model_dir: PathBuf,
     loaded_model: OnceLock<Arc<LoadedRerankerModel>>,
@@ -235,10 +236,11 @@ impl CandleRerankerProvider {
             .map_err(|err| InferError::Tokenizer(err.to_string()))?;
 
         let device = Device::Cpu;
+        tracing::info!("Using CPU with F32 for Candle reranker");
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(
                 std::slice::from_ref(&files.weights_path),
-                DType::F16,
+                DType::F32,
                 &device,
             )?
         };
@@ -397,11 +399,12 @@ impl RerankerProvider for CandleRerankerProvider {
         candidates: &[RerankCandidate],
         top_n: usize,
     ) -> Result<Vec<RerankResult>, InferError> {
-        let loaded = Arc::clone(self.ensure_loaded()?);
+        let provider = self.clone();
         let query = query.to_owned();
         let candidates = candidates.to_vec();
 
         tokio::task::spawn_blocking(move || {
+            let loaded = Arc::clone(provider.ensure_loaded()?);
             Self::rerank_sync_with_loaded(
                 loaded.as_ref(),
                 query.as_str(),

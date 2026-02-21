@@ -6,7 +6,7 @@ use aether_config::InferenceProviderKind;
 use aether_infer::ProviderOverrides;
 use aether_store::SqliteStore;
 use anyhow::{Context, Result};
-use notify::{Config, Event, PollWatcher, RecursiveMode, Watcher};
+use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::observer::{DebounceQueue, ObserverState, is_ignored_path};
 use crate::sir_pipeline::SirPipeline;
@@ -38,11 +38,11 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
     }
 
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
-    let mut watcher = PollWatcher::new(
+    let mut watcher = RecommendedWatcher::new(
         move |result| {
             let _ = tx.send(result);
         },
-        Config::default().with_poll_interval(Duration::from_millis(200)),
+        Config::default(),
     )
     .context("failed to initialize file watcher")?;
 

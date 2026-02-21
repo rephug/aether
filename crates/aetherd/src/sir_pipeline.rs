@@ -767,8 +767,12 @@ fn build_job(workspace_root: &Path, symbol: Symbol) -> Result<SirJob> {
 }
 
 fn extract_symbol_source_text(source: &str, range: SourceRange) -> Option<String> {
-    let start = byte_offset_for_position(source, range.start)?;
-    let end = byte_offset_for_position(source, range.end)?;
+    let start = range
+        .start_byte
+        .or_else(|| byte_offset_for_position(source, range.start))?;
+    let end = range
+        .end_byte
+        .or_else(|| byte_offset_for_position(source, range.end))?;
 
     if start > end || end > source.len() {
         return None;

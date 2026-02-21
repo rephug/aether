@@ -13,7 +13,6 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
-use lancedb::table::AddDataMode;
 use lancedb::{Connection as LanceConnection, DistanceType, Error as LanceError, connect};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -344,12 +343,25 @@ impl LanceVectorStore {
             Err(LanceError::TableNotFound { .. }) => {
                 let (schema, batch) = single_record_batch(record)?;
                 let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
-                connection
+                match connection
                     .create_table(&table_name, Box::new(reader))
                     .execute()
                     .await
-                    .map_err(map_lancedb_err)?;
-                return Ok(());
+                {
+                    Ok(_) => return Ok(()),
+                    Err(err) if is_table_already_exists_error(&err) => {
+                        tracing::debug!(
+                            table = %table_name,
+                            "table created by concurrent task, opening instead"
+                        );
+                        connection
+                            .open_table(&table_name)
+                            .execute()
+                            .await
+                            .map_err(map_lancedb_err)?
+                    }
+                    Err(err) => return Err(map_lancedb_err(err)),
+                }
             }
             Err(err) => return Err(map_lancedb_err(err)),
         };
@@ -395,12 +407,25 @@ impl LanceVectorStore {
             Err(LanceError::TableNotFound { .. }) => {
                 let (schema, batch) = record_batch(records)?;
                 let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
-                connection
+                match connection
                     .create_table(table_name, Box::new(reader))
                     .execute()
                     .await
-                    .map_err(map_lancedb_err)?;
-                return Ok(());
+                {
+                    Ok(_) => return Ok(()),
+                    Err(err) if is_table_already_exists_error(&err) => {
+                        tracing::debug!(
+                            table = table_name,
+                            "table created by concurrent task, opening instead"
+                        );
+                        connection
+                            .open_table(table_name)
+                            .execute()
+                            .await
+                            .map_err(map_lancedb_err)?
+                    }
+                    Err(err) => return Err(map_lancedb_err(err)),
+                }
             }
             Err(err) => return Err(map_lancedb_err(err)),
         };
@@ -412,20 +437,14 @@ impl LanceVectorStore {
             .when_matched_update_all(None)
             .when_not_matched_insert_all();
         if let Err(err) = merge.execute(Box::new(reader)).await {
-            tracing::warn!(
+            tracing::error!(
                 error = %err,
                 table = table_name,
-                "merge_insert failed during migration; falling back to overwrite add"
+                "LanceDB merge_insert failed during migration"
             );
-            let (fallback_schema, fallback_batch) = record_batch(records)?;
-            let fallback_reader =
-                RecordBatchIterator::new(vec![Ok(fallback_batch)].into_iter(), fallback_schema);
-            table
-                .add(Box::new(fallback_reader))
-                .mode(AddDataMode::Overwrite)
-                .execute()
-                .await
-                .map_err(map_lancedb_err)?;
+            return Err(StoreError::LanceDb(format!(
+                "LanceDB merge_insert failed: {err}"
+            )));
         }
 
         Ok(())
@@ -451,12 +470,25 @@ impl LanceVectorStore {
             Err(LanceError::TableNotFound { .. }) => {
                 let (schema, batch) = single_project_note_record_batch(record)?;
                 let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
-                connection
+                match connection
                     .create_table(&table_name, Box::new(reader))
                     .execute()
                     .await
-                    .map_err(map_lancedb_err)?;
-                return Ok(());
+                {
+                    Ok(_) => return Ok(()),
+                    Err(err) if is_table_already_exists_error(&err) => {
+                        tracing::debug!(
+                            table = %table_name,
+                            "table created by concurrent task, opening instead"
+                        );
+                        connection
+                            .open_table(&table_name)
+                            .execute()
+                            .await
+                            .map_err(map_lancedb_err)?
+                    }
+                    Err(err) => return Err(map_lancedb_err(err)),
+                }
             }
             Err(err) => return Err(map_lancedb_err(err)),
         };
@@ -854,6 +886,12 @@ impl VectorStore for LanceVectorStore {
 
 fn map_lancedb_err(err: LanceError) -> StoreError {
     StoreError::LanceDb(err.to_string())
+}
+
+fn is_table_already_exists_error(err: &LanceError) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("already exists")
 }
 
 fn vector_schema(embedding_dim: i32) -> SchemaRef {

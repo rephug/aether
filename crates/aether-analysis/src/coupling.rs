@@ -389,7 +389,14 @@ impl CouplingAnalyzer {
                 0.0
             };
             let semantic_signal = embedding_context.max_similarity(&file_a, &file_b);
-            let fused_score = fused_score(temporal_signal, static_signal, semantic_signal);
+            let fused_score = fused_score(
+                temporal_signal,
+                static_signal,
+                semantic_signal,
+                self.config.temporal_weight,
+                self.config.static_weight,
+                self.config.semantic_weight,
+            );
             let coupling_type =
                 classify_coupling_type(temporal_signal, static_signal, semantic_signal).as_str();
 
@@ -750,8 +757,17 @@ impl EmbeddingContext {
     }
 }
 
-pub fn fused_score(temporal_signal: f32, static_signal: f32, semantic_signal: f32) -> f32 {
-    (0.5 * temporal_signal) + (0.3 * static_signal) + (0.2 * semantic_signal)
+pub fn fused_score(
+    temporal_signal: f32,
+    static_signal: f32,
+    semantic_signal: f32,
+    temporal_weight: f32,
+    static_weight: f32,
+    semantic_weight: f32,
+) -> f32 {
+    (temporal_weight * temporal_signal)
+        + (static_weight * static_signal)
+        + (semantic_weight * semantic_signal)
 }
 
 pub fn classify_coupling_type(
@@ -858,9 +874,15 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn fused_score_uses_expected_weights() {
-        let fused = fused_score(0.8, 1.0, 0.5);
+    fn fused_score_defaults_preserve_previous_behavior() {
+        let fused = fused_score(0.8, 1.0, 0.5, 0.5, 0.3, 0.2);
         assert!((fused - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fused_score_supports_custom_weights() {
+        let fused = fused_score(0.8, 1.0, 0.5, 0.2, 0.6, 0.2);
+        assert!((fused - 0.86).abs() < 1e-6);
     }
 
     #[test]

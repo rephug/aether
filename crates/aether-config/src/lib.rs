@@ -580,7 +580,7 @@ impl Default for VerifyMicrovmConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CouplingConfig {
     #[serde(default = "default_coupling_enabled")]
     pub enabled: bool,
@@ -592,6 +592,12 @@ pub struct CouplingConfig {
     pub exclude_patterns: Vec<String>,
     #[serde(default = "default_coupling_bulk_commit_threshold")]
     pub bulk_commit_threshold: u32,
+    #[serde(default = "default_coupling_temporal_weight")]
+    pub temporal_weight: f32,
+    #[serde(default = "default_coupling_static_weight")]
+    pub static_weight: f32,
+    #[serde(default = "default_coupling_semantic_weight")]
+    pub semantic_weight: f32,
 }
 
 impl Default for CouplingConfig {
@@ -602,6 +608,9 @@ impl Default for CouplingConfig {
             min_co_change_count: default_coupling_min_co_change_count(),
             exclude_patterns: default_coupling_exclude_patterns(),
             bulk_commit_threshold: default_coupling_bulk_commit_threshold(),
+            temporal_weight: default_coupling_temporal_weight(),
+            static_weight: default_coupling_static_weight(),
+            semantic_weight: default_coupling_semantic_weight(),
         }
     }
 }
@@ -859,6 +868,18 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
         });
     }
 
+    let coupling_sum = config.coupling.temporal_weight
+        + config.coupling.static_weight
+        + config.coupling.semantic_weight;
+    if (coupling_sum - 1.0).abs() > 0.01 {
+        warnings.push(ConfigWarning {
+            code: "coupling_weights_normalized",
+            message: format!(
+                "coupling weights should sum to 1.0 (found {coupling_sum:.3}); values will be normalized"
+            ),
+        });
+    }
+
     warnings
 }
 
@@ -966,6 +987,18 @@ fn default_coupling_bulk_commit_threshold() -> u32 {
     30
 }
 
+fn default_coupling_temporal_weight() -> f32 {
+    0.5
+}
+
+fn default_coupling_static_weight() -> f32 {
+    0.3
+}
+
+fn default_coupling_semantic_weight() -> f32 {
+    0.2
+}
+
 fn default_drift_enabled() -> bool {
     true
 }
@@ -1060,6 +1093,41 @@ fn normalize_patterns(patterns: Vec<String>) -> Vec<String> {
     normalized
 }
 
+fn normalize_weight_value(value: f32, fallback: f32) -> f32 {
+    if !value.is_finite() || value < 0.0 {
+        fallback
+    } else {
+        value
+    }
+}
+
+fn normalize_coupling_weights(config: &mut CouplingConfig) {
+    config.temporal_weight =
+        normalize_weight_value(config.temporal_weight, default_coupling_temporal_weight());
+    config.static_weight =
+        normalize_weight_value(config.static_weight, default_coupling_static_weight());
+    config.semantic_weight =
+        normalize_weight_value(config.semantic_weight, default_coupling_semantic_weight());
+
+    let sum = config.temporal_weight + config.static_weight + config.semantic_weight;
+    if (sum - 1.0).abs() <= 0.01 {
+        return;
+    }
+
+    if sum <= f32::EPSILON {
+        config.temporal_weight = default_coupling_temporal_weight();
+        config.static_weight = default_coupling_static_weight();
+        config.semantic_weight = default_coupling_semantic_weight();
+        eprintln!("AETHER config warning: coupling weights summed to {sum:.3}; reset to defaults");
+        return;
+    }
+
+    config.temporal_weight /= sum;
+    config.static_weight /= sum;
+    config.semantic_weight /= sum;
+    eprintln!("AETHER config warning: coupling weights summed to {sum:.3}; normalized to 1.0");
+}
+
 fn normalize_config(mut config: AetherConfig) -> AetherConfig {
     config.general.log_level = normalize_with_default(
         std::mem::take(&mut config.general.log_level),
@@ -1144,6 +1212,7 @@ fn normalize_config(mut config: AetherConfig) -> AetherConfig {
     if config.coupling.exclude_patterns.is_empty() {
         config.coupling.exclude_patterns = default_coupling_exclude_patterns();
     }
+    normalize_coupling_weights(&mut config.coupling);
     config.drift.analysis_window = normalize_with_default(
         std::mem::take(&mut config.drift.analysis_window),
         default_drift_analysis_window(),
@@ -1260,6 +1329,9 @@ mod tests {
         assert_eq!(config.coupling.commit_window, 500);
         assert_eq!(config.coupling.min_co_change_count, 3);
         assert_eq!(config.coupling.bulk_commit_threshold, 30);
+        assert!((config.coupling.temporal_weight - 0.5).abs() < 1e-6);
+        assert!((config.coupling.static_weight - 0.3).abs() < 1e-6);
+        assert!((config.coupling.semantic_weight - 0.2).abs() < 1e-6);
         assert_eq!(
             config.coupling.exclude_patterns,
             vec![
@@ -1318,6 +1390,9 @@ mod tests {
         assert!(content.contains("commit_window = 500"));
         assert!(content.contains("min_co_change_count = 3"));
         assert!(content.contains("bulk_commit_threshold = 30"));
+        assert!(content.contains("temporal_weight = 0.5"));
+        assert!(content.contains("static_weight = 0.3"));
+        assert!(content.contains("semantic_weight = 0.2"));
         assert!(content.contains("[drift]"));
         assert!(content.contains("drift_threshold = 0.85"));
         assert!(content.contains("analysis_window = \"100 commits\""));
@@ -1481,6 +1556,9 @@ hub_percentile = 0
         assert_eq!(config.coupling.commit_window, 500);
         assert_eq!(config.coupling.min_co_change_count, 3);
         assert_eq!(config.coupling.bulk_commit_threshold, 30);
+        assert!((config.coupling.temporal_weight - 0.5).abs() < 1e-6);
+        assert!((config.coupling.static_weight - 0.3).abs() < 1e-6);
+        assert!((config.coupling.semantic_weight - 0.2).abs() < 1e-6);
         assert!(!config.drift.enabled);
         assert_eq!(config.drift.drift_threshold, 0.9);
         assert_eq!(config.drift.analysis_window, "50 commits");
@@ -1605,11 +1683,38 @@ fallback_to_host_on_unavailable = true
         assert_eq!(config.coupling.commit_window, 500);
         assert_eq!(config.coupling.min_co_change_count, 3);
         assert_eq!(config.coupling.bulk_commit_threshold, 30);
+        assert!((config.coupling.temporal_weight - 0.5).abs() < 1e-6);
+        assert!((config.coupling.static_weight - 0.3).abs() < 1e-6);
+        assert!((config.coupling.semantic_weight - 0.2).abs() < 1e-6);
         assert!(config.drift.enabled);
         assert_eq!(config.drift.drift_threshold, DEFAULT_DRIFT_THRESHOLD);
         assert_eq!(config.drift.analysis_window, DEFAULT_DRIFT_ANALYSIS_WINDOW);
         assert!(!config.drift.auto_analyze);
         assert_eq!(config.drift.hub_percentile, DEFAULT_DRIFT_HUB_PERCENTILE);
+    }
+
+    #[test]
+    fn load_workspace_config_normalizes_coupling_weights_when_sum_is_invalid() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(aether_dir(workspace)).expect("create .aether");
+
+        let raw = r#"
+[coupling]
+temporal_weight = 2.0
+static_weight = 1.0
+semantic_weight = 1.0
+"#;
+        fs::write(config_path(workspace), raw).expect("write config");
+
+        let config = load_workspace_config(workspace).expect("load config");
+        let sum = config.coupling.temporal_weight
+            + config.coupling.static_weight
+            + config.coupling.semantic_weight;
+        assert!((sum - 1.0).abs() < 1e-6);
+        assert!((config.coupling.temporal_weight - 0.5).abs() < 1e-6);
+        assert!((config.coupling.static_weight - 0.25).abs() < 1e-6);
+        assert!((config.coupling.semantic_weight - 0.25).abs() < 1e-6);
     }
 
     #[test]
