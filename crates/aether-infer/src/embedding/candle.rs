@@ -26,6 +26,7 @@ const MAX_TOKENS: usize = 8192;
 const BATCH_CHUNK_SIZE: usize = 8;
 const REQUIRED_FILES: [&str; 3] = ["config.json", "tokenizer.json", "model.safetensors"];
 
+#[derive(Clone)]
 pub struct CandleEmbeddingProvider {
     model_dir: PathBuf,
     loaded_model: OnceLock<Arc<LoadedModel>>,
@@ -236,10 +237,11 @@ impl CandleEmbeddingProvider {
             .map_err(|err| InferError::Tokenizer(err.to_string()))?;
 
         let device = Device::Cpu;
+        tracing::info!("Using CPU with F32 for Candle embeddings");
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(
                 std::slice::from_ref(&files.weights_path),
-                DType::F16,
+                DType::F32,
                 &device,
             )?
         };
@@ -369,9 +371,10 @@ impl EmbeddingProvider for CandleEmbeddingProvider {
             return Ok(vec![0.0; CANDLE_EMBEDDING_DIM]);
         }
 
-        let loaded = Arc::clone(self.ensure_loaded()?);
+        let provider = self.clone();
         let input = vec![text.to_owned()];
         let mut output = tokio::task::spawn_blocking(move || {
+            let loaded = Arc::clone(provider.ensure_loaded()?);
             Self::embed_texts_with_loaded(loaded.as_ref(), &input)
         })
         .await

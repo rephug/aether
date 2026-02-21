@@ -3046,7 +3046,12 @@ impl AetherMcpServer {
     #[tool(name = "aether_status", description = "Get AETHER local store status")]
     pub async fn aether_status(&self) -> Result<Json<AetherStatusResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_status");
-        self.aether_status_logic().map(Json).map_err(to_mcp_error)
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_status_logic())
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
     }
 
     #[tool(
@@ -3058,7 +3063,10 @@ impl AetherMcpServer {
         Parameters(request): Parameters<AetherSymbolLookupRequest>,
     ) -> Result<Json<AetherSymbolLookupResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_symbol_lookup");
-        self.aether_symbol_lookup_logic(request)
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_symbol_lookup_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)
             .map_err(to_mcp_error)
     }
@@ -3072,7 +3080,10 @@ impl AetherMcpServer {
         Parameters(request): Parameters<AetherDependenciesRequest>,
     ) -> Result<Json<AetherDependenciesResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_dependencies");
-        self.aether_dependencies_logic(request)
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_dependencies_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)
             .map_err(to_mcp_error)
     }
@@ -3086,7 +3097,10 @@ impl AetherMcpServer {
         Parameters(request): Parameters<AetherCallChainRequest>,
     ) -> Result<Json<AetherCallChainResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_call_chain");
-        self.aether_call_chain_logic(request)
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_call_chain_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)
             .map_err(to_mcp_error)
     }
@@ -3175,7 +3189,10 @@ impl AetherMcpServer {
         Parameters(request): Parameters<AetherBlastRadiusRequest>,
     ) -> Result<Json<AetherBlastRadiusResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_blast_radius");
-        self.aether_blast_radius_logic(request)
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_blast_radius_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)
             .map_err(to_mcp_error)
     }
@@ -3189,7 +3206,10 @@ impl AetherMcpServer {
         Parameters(request): Parameters<AetherTestIntentsRequest>,
     ) -> Result<Json<AetherTestIntentsResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_test_intents");
-        self.aether_test_intents_logic(request)
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_test_intents_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)
             .map_err(to_mcp_error)
     }
@@ -3203,7 +3223,10 @@ impl AetherMcpServer {
         Parameters(request): Parameters<AetherDriftReportRequest>,
     ) -> Result<Json<AetherDriftReportResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_drift_report");
-        self.aether_drift_report_logic(request)
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_drift_report_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)
             .map_err(to_mcp_error)
     }
@@ -3217,7 +3240,10 @@ impl AetherMcpServer {
         Parameters(request): Parameters<AetherTraceCauseRequest>,
     ) -> Result<Json<AetherTraceCauseResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_trace_cause");
-        self.aether_trace_cause_logic(request)
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_trace_cause_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)
             .map_err(to_mcp_error)
     }
@@ -3231,7 +3257,10 @@ impl AetherMcpServer {
         Parameters(request): Parameters<AetherAcknowledgeDriftRequest>,
     ) -> Result<Json<AetherAcknowledgeDriftResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_acknowledge_drift");
-        self.aether_acknowledge_drift_logic(request)
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_acknowledge_drift_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)
             .map_err(to_mcp_error)
     }
@@ -3245,7 +3274,10 @@ impl AetherMcpServer {
         Parameters(request): Parameters<AetherVerifyRequest>,
     ) -> Result<Json<AetherVerifyResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_verify");
-        self.aether_verify_logic(request)
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_verify_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)
             .map_err(to_mcp_error)
     }
@@ -3259,7 +3291,10 @@ impl AetherMcpServer {
         Parameters(request): Parameters<AetherSymbolTimelineRequest>,
     ) -> Result<Json<AetherSymbolTimelineResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_symbol_timeline");
-        self.aether_symbol_timeline_logic(request)
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_symbol_timeline_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)
             .map_err(to_mcp_error)
     }
@@ -3273,7 +3308,10 @@ impl AetherMcpServer {
         Parameters(request): Parameters<AetherWhyChangedRequest>,
     ) -> Result<Json<AetherWhyChangedResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_why_changed");
-        self.aether_why_changed_logic(request)
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_why_changed_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)
             .map_err(to_mcp_error)
     }
@@ -3287,7 +3325,10 @@ impl AetherMcpServer {
         Parameters(request): Parameters<AetherGetSirRequest>,
     ) -> Result<Json<AetherGetSirResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_get_sir");
-        self.aether_get_sir_logic(request)
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_get_sir_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)
             .map_err(to_mcp_error)
     }
@@ -3301,7 +3342,10 @@ impl AetherMcpServer {
         Parameters(request): Parameters<AetherExplainRequest>,
     ) -> Result<Json<AetherExplainResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_explain");
-        self.aether_explain_logic(request)
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_explain_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)
             .map_err(to_mcp_error)
     }

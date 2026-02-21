@@ -3119,8 +3119,11 @@ fn project_entity_refs_to_json(
 }
 
 fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
-    conn.execute_batch(
-        r#"
+    let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+
+    if version < 1 {
+        conn.execute_batch(
+            r#"
         CREATE TABLE IF NOT EXISTS symbols (
             id TEXT PRIMARY KEY,
             file_path TEXT NOT NULL,
@@ -3313,29 +3316,29 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         CREATE INDEX IF NOT EXISTS idx_test_intents_file
             ON test_intents(file_path);
         "#,
-    )?;
+        )?;
 
-    if !table_has_column(conn, "sir", "sir_json")? {
-        conn.execute("ALTER TABLE sir ADD COLUMN sir_json TEXT", [])?;
-    }
+        if !table_has_column(conn, "sir", "sir_json")? {
+            conn.execute("ALTER TABLE sir ADD COLUMN sir_json TEXT", [])?;
+        }
 
-    ensure_sir_column(conn, "sir_status", "TEXT NOT NULL DEFAULT 'fresh'")?;
-    ensure_sir_column(conn, "last_error", "TEXT")?;
-    ensure_sir_column(conn, "last_attempt_at", "INTEGER NOT NULL DEFAULT 0")?;
-    ensure_sir_history_column(conn, "commit_hash", "TEXT")?;
-    ensure_symbols_column(conn, "access_count", "INTEGER NOT NULL DEFAULT 0")?;
-    ensure_symbols_column(conn, "last_accessed_at", "INTEGER")?;
+        ensure_sir_column(conn, "sir_status", "TEXT NOT NULL DEFAULT 'fresh'")?;
+        ensure_sir_column(conn, "last_error", "TEXT")?;
+        ensure_sir_column(conn, "last_attempt_at", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_sir_history_column(conn, "commit_hash", "TEXT")?;
+        ensure_symbols_column(conn, "access_count", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_symbols_column(conn, "last_accessed_at", "INTEGER")?;
 
-    conn.execute(
-        "UPDATE sir SET sir_status = 'fresh' WHERE COALESCE(TRIM(sir_status), '') = ''",
-        [],
-    )?;
-    conn.execute(
-        "UPDATE sir SET last_attempt_at = updated_at WHERE last_attempt_at = 0",
-        [],
-    )?;
-    conn.execute(
-        r#"
+        conn.execute(
+            "UPDATE sir SET sir_status = 'fresh' WHERE COALESCE(TRIM(sir_status), '') = ''",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE sir SET last_attempt_at = updated_at WHERE last_attempt_at = 0",
+            [],
+        )?;
+        conn.execute(
+            r#"
         INSERT INTO sir_history (
             symbol_id, version, sir_hash, provider, model, created_at, sir_json, commit_hash
         )
@@ -3355,8 +3358,15 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
               SELECT 1 FROM sir_history h WHERE h.symbol_id = s.id
           )
         "#,
-        [],
-    )?;
+            [],
+        )?;
+
+        conn.execute("PRAGMA user_version = 1", [])?;
+    }
+
+    if version < 2 {
+        // Reserved for next migration
+    }
 
     Ok(())
 }
@@ -4459,6 +4469,23 @@ mirror_sir_files = false
             .expect("query migrated symbol access fields");
         assert_eq!(access.0, 0);
         assert_eq!(access.1, None);
+    }
+
+    #[test]
+    fn run_migrations_sets_user_version_and_is_idempotent() {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+
+        run_migrations(&conn).expect("run migrations once");
+        let first_version: i32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("query first user_version");
+        assert_eq!(first_version, 1);
+
+        run_migrations(&conn).expect("run migrations twice");
+        let second_version: i32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("query second user_version");
+        assert_eq!(second_version, 1);
     }
 
     #[test]

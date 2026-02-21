@@ -7,9 +7,28 @@ use std::time::{Duration, Instant};
 use aether_core::{Language, Symbol, SymbolChangeEvent, diff_symbols, normalize_path};
 use aether_parse::{SymbolExtractor, language_for_path};
 use anyhow::{Context, Result};
-use walkdir::WalkDir;
+use ignore::WalkBuilder;
 
 const MAX_PARSE_FILE_SIZE: u64 = 2 * 1024 * 1024;
+const IGNORED_PATH_MARKERS: &[&str] = &[
+    ".git",
+    ".aether",
+    "target",
+    "node_modules",
+    ".venv",
+    "venv",
+    "pycache",
+    "__pycache__",
+    "dist",
+    "build",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".next",
+    ".nuxt",
+    ".output",
+    "coverage",
+];
 
 #[derive(Debug, Clone)]
 struct FileSnapshot {
@@ -33,11 +52,18 @@ impl ObserverState {
     }
 
     pub fn seed_from_disk(&mut self) -> Result<()> {
-        for entry in WalkDir::new(&self.workspace)
-            .into_iter()
-            .filter_map(std::result::Result::ok)
+        for entry in WalkBuilder::new(&self.workspace)
+            .standard_filters(true)
+            .build()
         {
-            if !entry.file_type().is_file() {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            if !entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
+            {
                 continue;
             }
 
@@ -217,8 +243,8 @@ pub fn relative_workspace_path(workspace: &Path, path: &Path) -> PathBuf {
 
 pub fn is_ignored_path(path: &Path) -> bool {
     path.components().any(|component| {
-        let part = component.as_os_str().to_string_lossy();
-        part == ".git" || part == ".aether" || part == "target"
+        let part = component.as_os_str().to_string_lossy().to_ascii_lowercase();
+        IGNORED_PATH_MARKERS.contains(&part.as_str())
     })
 }
 
@@ -296,5 +322,22 @@ mod tests {
         assert_eq!(event.removed[0].name, "keep");
 
         Ok(())
+    }
+
+    #[test]
+    fn ignores_node_modules_paths() {
+        assert!(is_ignored_path(Path::new(
+            "frontend/node_modules/react/index.js"
+        )));
+    }
+
+    #[test]
+    fn ignores_dot_venv_paths() {
+        assert!(is_ignored_path(Path::new(".venv/bin/python")));
+    }
+
+    #[test]
+    fn does_not_ignore_regular_source_paths() {
+        assert!(!is_ignored_path(Path::new("src/main.rs")));
     }
 }

@@ -7,6 +7,7 @@ use aether_config::{
     EmbeddingProviderKind, InferenceProviderKind, OLLAMA_SIR_TEMPERATURE, SearchRerankerKind,
     ensure_workspace_config,
 };
+use aether_core::Secret;
 use aether_sir::{SirAnnotation, validate_sir};
 use async_trait::async_trait;
 use embedding::candle::CandleEmbeddingProvider;
@@ -170,7 +171,7 @@ impl EmbeddingProvider for MockEmbeddingProvider {
 #[derive(Debug, Clone)]
 pub struct GeminiProvider {
     client: reqwest::Client,
-    api_key: String,
+    api_key: Secret,
     model: String,
     api_base: String,
 }
@@ -182,10 +183,10 @@ impl GeminiProvider {
 
         let model = resolve_gemini_model(model);
 
-        Ok(Self::new(api_key, model))
+        Ok(Self::new(Secret::new(api_key), model))
     }
 
-    pub fn new(api_key: String, model: String) -> Self {
+    pub fn new(api_key: Secret, model: String) -> Self {
         Self {
             client: reqwest::Client::new(),
             api_key,
@@ -195,10 +196,7 @@ impl GeminiProvider {
     }
 
     fn endpoint_url(&self) -> String {
-        format!(
-            "{}/models/{}:generateContent?key={}",
-            self.api_base, self.model, self.api_key
-        )
+        format!("{}/models/{}:generateContent", self.api_base, self.model)
     }
 
     async fn request_candidate_json(
@@ -225,6 +223,7 @@ impl GeminiProvider {
         let response_value: Value = self
             .client
             .post(self.endpoint_url())
+            .header("x-goog-api-key", self.api_key.expose())
             .json(&body)
             .send()
             .await?
@@ -463,7 +462,7 @@ pub fn load_provider_from_env_or_mock(
             if let Some(api_key) = read_env_non_empty(&selected_api_key_env) {
                 let model = resolve_gemini_model(selected_model);
                 Ok(LoadedProvider {
-                    provider: Box::new(GeminiProvider::new(api_key, model.clone())),
+                    provider: Box::new(GeminiProvider::new(Secret::new(api_key), model.clone())),
                     provider_name: InferenceProviderKind::Gemini.as_str().to_owned(),
                     model_name: model,
                 })
@@ -523,13 +522,10 @@ pub async fn summarize_text_with_config(
                 return Ok(None);
             };
             let model = resolve_gemini_model(selected_model);
-            let summary = request_gemini_summary(
-                api_key.as_str(),
-                model.as_str(),
-                system_prompt,
-                user_prompt,
-            )
-            .await?;
+            let api_key = Secret::new(api_key);
+            let summary =
+                request_gemini_summary(&api_key, model.as_str(), system_prompt, user_prompt)
+                    .await?;
             Ok(clean_summary(summary))
         }
         InferenceProviderKind::Gemini => {
@@ -537,13 +533,10 @@ pub async fn summarize_text_with_config(
                 return Ok(None);
             };
             let model = resolve_gemini_model(selected_model);
-            let summary = request_gemini_summary(
-                api_key.as_str(),
-                model.as_str(),
-                system_prompt,
-                user_prompt,
-            )
-            .await?;
+            let api_key = Secret::new(api_key);
+            let summary =
+                request_gemini_summary(&api_key, model.as_str(), system_prompt, user_prompt)
+                    .await?;
             Ok(clean_summary(summary))
         }
         InferenceProviderKind::Qwen3Local => {
@@ -869,12 +862,12 @@ fn extract_local_text_part(response: &Value) -> Result<String, InferError> {
 }
 
 async fn request_gemini_summary(
-    api_key: &str,
+    api_key: &Secret,
     model: &str,
     system_prompt: &str,
     user_prompt: &str,
 ) -> Result<String, InferError> {
-    let endpoint = format!("{GEMINI_API_BASE}/models/{model}:generateContent?key={api_key}");
+    let endpoint = format!("{GEMINI_API_BASE}/models/{model}:generateContent");
     let body = json!({
         "systemInstruction": {
             "parts": [{"text": system_prompt}]
@@ -890,6 +883,7 @@ async fn request_gemini_summary(
     });
     let response_value: Value = reqwest::Client::new()
         .post(endpoint)
+        .header("x-goog-api-key", api_key.expose())
         .json(&body)
         .send()
         .await?

@@ -55,7 +55,7 @@ impl LanguageHooks for RustHooks {
             "symbol.trait" => SymbolKind::Trait,
             "symbol.type_alias" => SymbolKind::TypeAlias,
             "symbol.function" => {
-                if has_ancestor_kind(node, "impl_item") {
+                if has_ancestor_kind(node, "impl_item") || has_ancestor_kind(node, "trait_item") {
                     SymbolKind::Method
                 } else {
                     SymbolKind::Function
