@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aether_analysis::{
@@ -9,7 +10,9 @@ use aether_analysis::{
     DriftReportRequest as AnalysisDriftReportRequest, RiskLevel as CouplingRiskLevel,
     TestIntentAnalyzer, TraceCauseRequest as AnalysisTraceCauseRequest,
 };
-use aether_config::{SearchRerankerKind, VerifyMode, load_workspace_config};
+use aether_config::{
+    AetherConfig, EmbeddingVectorBackend, SearchRerankerKind, VerifyMode, load_workspace_config,
+};
 pub use aether_core::SearchMode;
 use aether_core::{
     HoverMarkdownSections, Language, NO_SIR_MESSAGE, SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR,
@@ -34,8 +37,8 @@ use aether_sir::{
     file_sir_hash, sir_hash, synthetic_file_sir_id, synthetic_module_sir_id, validate_sir,
 };
 use aether_store::{
-    SirHistorySelector, SirMetaRecord, SqliteStore, Store, StoreError, SymbolRecord,
-    SymbolSearchResult, open_graph_store, open_vector_store,
+    SirHistorySelector, SirMetaRecord, SqliteStore, SqliteVectorStore, Store, StoreError,
+    SymbolRecord, SymbolSearchResult, VectorStore, open_graph_store, open_vector_store,
 };
 use aetherd::verification::{VerificationRequest, run_verification};
 use anyhow::Result;
@@ -985,21 +988,69 @@ impl WhySelector {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AetherMcpServer {
     workspace: PathBuf,
     verbose: bool,
     tool_router: ToolRouter<Self>,
+    store: Arc<Mutex<SqliteStore>>,
+    vector_store: Arc<dyn VectorStore>,
+    config: AetherConfig,
 }
 
 impl AetherMcpServer {
     pub fn new(workspace: impl AsRef<Path>, verbose: bool) -> Result<Self, AetherMcpError> {
         let workspace = workspace.as_ref().canonicalize()?;
+        let config = load_workspace_config(&workspace).map_err(|err| {
+            AetherMcpError::Message(format!("failed to load workspace config: {err}"))
+        })?;
+        let store = Arc::new(Mutex::new(SqliteStore::open(&workspace)?));
+
+        let vector_store: Arc<dyn VectorStore> = match config.embeddings.vector_backend {
+            EmbeddingVectorBackend::Sqlite => Arc::new(SqliteVectorStore::new(&workspace)),
+            EmbeddingVectorBackend::Lancedb => {
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    return Err(AetherMcpError::Message(
+                        "cannot initialize LanceDB vector store synchronously from an async runtime; use AetherMcpServer::init".to_owned(),
+                    ));
+                }
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|err| {
+                        AetherMcpError::Message(format!(
+                            "failed to create runtime for vector store initialization: {err}"
+                        ))
+                    })?;
+                runtime.block_on(open_vector_store(&workspace))?
+            }
+        };
 
         Ok(Self {
             workspace,
             verbose,
             tool_router: Self::tool_router(),
+            store,
+            vector_store,
+            config,
+        })
+    }
+
+    pub async fn init(workspace: impl AsRef<Path>, verbose: bool) -> Result<Self, AetherMcpError> {
+        let workspace = workspace.as_ref().canonicalize()?;
+        let config = load_workspace_config(&workspace).map_err(|err| {
+            AetherMcpError::Message(format!("failed to load workspace config: {err}"))
+        })?;
+        let store = Arc::new(Mutex::new(SqliteStore::open(&workspace)?));
+        let vector_store = open_vector_store(&workspace).await?;
+
+        Ok(Self {
+            workspace,
+            verbose,
+            tool_router: Self::tool_router(),
+            store,
+            vector_store,
+            config,
         })
     }
 
@@ -1081,7 +1132,7 @@ impl AetherMcpServer {
             });
         }
 
-        let store = SqliteStore::open(&self.workspace)?;
+        let store = self.lock_store()?;
         let Some(symbol) = store.get_symbol_record(symbol_id)? else {
             return Ok(AetherDependenciesResponse {
                 symbol_id: symbol_id.to_owned(),
@@ -1150,7 +1201,7 @@ impl AetherMcpServer {
             });
         }
 
-        let store = SqliteStore::open(&self.workspace)?;
+        let store = self.lock_store()?;
         let mut start_symbol = None;
         if !symbol_id_input.is_empty() {
             start_symbol = store.get_symbol_record(&symbol_id_input)?;
@@ -1197,9 +1248,7 @@ impl AetherMcpServer {
         let mode_requested = request.mode.unwrap_or_default();
         let limit = effective_limit(request.limit);
         let lexical = self.lexical_search_matches(&request.query, limit)?;
-        let search_config = load_workspace_config(&self.workspace).map_err(|err| {
-            AetherMcpError::Message(format!("failed to load workspace config: {err}"))
-        })?;
+        let search_config = &self.config;
         let reranker_kind = search_config.search.reranker;
         let rerank_window = search_config.search.rerank_window;
 
@@ -1576,7 +1625,7 @@ impl AetherMcpServer {
                 last_mined_at: state.last_mined_at,
             });
 
-        let store = SqliteStore::open(&self.workspace)?;
+        let store = self.lock_store()?;
         let target_symbol_ids = store
             .list_symbols_for_file(blast.target_file.as_str())?
             .into_iter()
@@ -1676,7 +1725,7 @@ impl AetherMcpServer {
             });
         }
 
-        let store = SqliteStore::open(&self.workspace)?;
+        let store = self.lock_store()?;
         let mut by_id = HashMap::<String, AetherTestIntentEntry>::new();
 
         if let Some(file_path) = file.as_deref()
@@ -1845,7 +1894,7 @@ impl AetherMcpServer {
         &self,
         request: AetherTraceCauseRequest,
     ) -> Result<AetherTraceCauseResponse, AetherMcpError> {
-        let store = SqliteStore::open(&self.workspace)?;
+        let store = self.lock_store()?;
         let target_symbol = self.resolve_trace_cause_symbol(&store, &request)?;
         let analyzer = CausalAnalyzer::new(&self.workspace)?;
         let result = analyzer.trace_cause(AnalysisTraceCauseRequest {
@@ -2048,7 +2097,7 @@ impl AetherMcpServer {
             });
         }
 
-        let store = SqliteStore::open(&self.workspace)?;
+        let store = self.lock_store()?;
         let mut history = store.list_sir_history(symbol_id)?;
         if history.len() > limit as usize {
             let split_idx = history.len().saturating_sub(limit as usize);
@@ -2081,13 +2130,9 @@ impl AetherMcpServer {
         &self,
         request: AetherVerifyRequest,
     ) -> Result<AetherVerifyResponse, AetherMcpError> {
-        let config = load_workspace_config(&self.workspace).map_err(|err| {
-            AetherMcpError::Message(format!("failed to load workspace config: {err}"))
-        })?;
-
         let execution = run_verification(
             &self.workspace,
-            &config,
+            &self.config,
             VerificationRequest {
                 commands: request.commands,
                 mode: request.mode.map(Into::into),
@@ -2150,7 +2195,7 @@ impl AetherMcpServer {
             ));
         }
 
-        let store = SqliteStore::open(&self.workspace)?;
+        let store = self.lock_store()?;
         let history = store.list_sir_history(symbol_id)?;
         if history.is_empty() {
             return Ok(empty_why_changed_response(
@@ -2221,7 +2266,7 @@ impl AetherMcpServer {
             return Ok(Vec::new());
         }
 
-        let store = SqliteStore::open(&self.workspace)?;
+        let store = self.lock_store()?;
         let matches = store.search_symbols(query, limit)?;
 
         Ok(matches
@@ -2268,7 +2313,7 @@ impl AetherMcpServer {
             ));
         }
 
-        let vector_store = open_vector_store(&self.workspace).await?;
+        let vector_store = Arc::clone(&self.vector_store);
         let candidates = vector_store
             .search_nearest(
                 &query_embedding,
@@ -2284,7 +2329,7 @@ impl AetherMcpServer {
             ));
         }
 
-        let store = SqliteStore::open(&self.workspace)?;
+        let store = self.lock_store()?;
         let mut matches = Vec::new();
         for candidate in candidates {
             let Some(symbol) = store.get_symbol_search_result(&candidate.symbol_id)? else {
@@ -2378,7 +2423,6 @@ impl AetherMcpServer {
             return Ok(fused_matches.iter().take(limit).cloned().collect());
         }
 
-        let store = SqliteStore::open(&self.workspace)?;
         let window = rerank_window.max(limit as u32).clamp(1, 200) as usize;
         let candidate_matches = fused_matches
             .iter()
@@ -2386,13 +2430,17 @@ impl AetherMcpServer {
             .cloned()
             .collect::<Vec<_>>();
 
-        let mut rerank_candidates = Vec::with_capacity(candidate_matches.len());
-        for candidate in &candidate_matches {
-            rerank_candidates.push(RerankCandidate {
-                id: candidate.symbol_id.clone(),
-                text: self.rerank_candidate_text(&store, candidate)?,
-            });
-        }
+        let rerank_candidates = {
+            let store = self.lock_store()?;
+            let mut rerank_candidates = Vec::with_capacity(candidate_matches.len());
+            for candidate in &candidate_matches {
+                rerank_candidates.push(RerankCandidate {
+                    id: candidate.symbol_id.clone(),
+                    text: self.rerank_candidate_text(&store, candidate)?,
+                });
+            }
+            rerank_candidates
+        };
 
         let reranked = provider.rerank(query, &rerank_candidates, limit).await?;
 
@@ -2489,7 +2537,7 @@ impl AetherMcpServer {
             ));
         }
 
-        let store = SqliteStore::open(&self.workspace)?;
+        let store = self.lock_store()?;
         store.increment_symbol_access(&[symbol_id.to_owned()], current_unix_timestamp_millis())?;
         let meta = store.get_sir_meta(symbol_id)?;
         let (sir_status, last_error, last_attempt_at) = meta_status_fields(meta.as_ref());
@@ -2555,7 +2603,7 @@ impl AetherMcpServer {
             return Ok(empty_get_sir_response(SirLevel::File.into(), rollup_id));
         }
 
-        let store = SqliteStore::open(&self.workspace)?;
+        let store = self.lock_store()?;
         let meta = store.get_sir_meta(&rollup_id)?;
         let (sir_status, last_error, last_attempt_at) = meta_status_fields(meta.as_ref());
         let blob = store.read_sir_blob(&rollup_id)?;
@@ -2629,7 +2677,7 @@ impl AetherMcpServer {
             });
         }
 
-        let store = SqliteStore::open(&self.workspace)?;
+        let store = self.lock_store()?;
         let coverage = self.generate_module_rollup_on_demand(&store, &module_path, language)?;
         let meta = store.get_sir_meta(&coverage.module_id)?;
         let (sir_status, last_error, last_attempt_at) = meta_status_fields(meta.as_ref());
@@ -2854,7 +2902,7 @@ impl AetherMcpServer {
             &symbol.signature_fingerprint,
         );
         if self.sqlite_path().exists() {
-            let store = SqliteStore::open(&self.workspace)?;
+            let store = self.lock_store()?;
             store.increment_symbol_access(
                 std::slice::from_ref(&symbol_id),
                 current_unix_timestamp_millis(),
@@ -2959,7 +3007,7 @@ impl AetherMcpServer {
             return Ok(None);
         }
 
-        let store = SqliteStore::open(&self.workspace)?;
+        let store = self.lock_store()?;
         let blob = store.read_sir_blob(symbol_id)?;
 
         let Some(blob) = blob else {
@@ -2976,8 +3024,14 @@ impl AetherMcpServer {
             return Ok(None);
         }
 
-        let store = SqliteStore::open(&self.workspace)?;
+        let store = self.lock_store()?;
         store.get_sir_meta(symbol_id).map_err(Into::into)
+    }
+
+    fn lock_store(&self) -> Result<MutexGuard<'_, SqliteStore>, AetherMcpError> {
+        self.store.lock().map_err(|err| {
+            AetherMcpError::Message(format!("failed to acquire sqlite store lock: {err}"))
+        })
     }
 
     fn verbose_log(&self, message: &str) {
@@ -3272,7 +3326,7 @@ impl ServerHandler for AetherMcpServer {
 }
 
 pub async fn run_stdio_server(workspace: impl AsRef<Path>, verbose: bool) -> Result<()> {
-    let server = AetherMcpServer::new(workspace, verbose)?;
+    let server = AetherMcpServer::init(workspace, verbose).await?;
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -3300,7 +3354,9 @@ mod tests {
     async fn aether_ask_returns_mixed_result_types() {
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();
-        let server = AetherMcpServer::new(workspace, false).expect("new mcp server");
+        let server = AetherMcpServer::init(workspace, false)
+            .await
+            .expect("new mcp server");
         let store = SqliteStore::open(workspace).expect("open store");
 
         store

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,6 +13,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
+use lancedb::table::AddDataMode;
 use lancedb::{Connection as LanceConnection, DistanceType, Error as LanceError, connect};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -264,10 +265,32 @@ impl LanceVectorStore {
             count = records.len(),
             "migrating SQLite embeddings into LanceDB"
         );
-        let connection = self.connect().await?;
+        let mut records_by_table = BTreeMap::<String, Vec<VectorRecord>>::new();
         for record in records {
-            self.upsert_embedding_with_connection(&connection, &record)
-                .await?;
+            if record.embedding.is_empty() {
+                continue;
+            }
+
+            let table_name = table_name_for(
+                record.provider.as_str(),
+                record.model.as_str(),
+                record.embedding.len() as i32,
+            );
+            records_by_table.entry(table_name).or_default().push(record);
+        }
+        if records_by_table.is_empty() {
+            fs::write(self.marker_path(), b"empty")?;
+            return Ok(());
+        }
+
+        let connection = self.connect().await?;
+        for (table_name, table_records) in records_by_table {
+            self.upsert_embedding_batch_with_connection(
+                &connection,
+                table_name.as_str(),
+                table_records.as_slice(),
+            )
+            .await?;
         }
 
         fs::write(self.marker_path(), b"done")?;
@@ -341,6 +364,70 @@ impl LanceVectorStore {
             .execute(Box::new(reader))
             .await
             .map_err(map_lancedb_err)?;
+        Ok(())
+    }
+
+    async fn upsert_embedding_batch_with_connection(
+        &self,
+        connection: &LanceConnection,
+        table_name: &str,
+        records: &[VectorRecord],
+    ) -> Result<(), StoreError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let expected_dim = records[0].embedding.len();
+        if expected_dim == 0 {
+            return Ok(());
+        }
+        if records
+            .iter()
+            .any(|record| record.embedding.len() != expected_dim)
+        {
+            return Err(StoreError::LanceDb(format!(
+                "inconsistent embedding dimensions in migration batch for table {table_name}"
+            )));
+        }
+
+        let table = match connection.open_table(table_name).execute().await {
+            Ok(table) => table,
+            Err(LanceError::TableNotFound { .. }) => {
+                let (schema, batch) = record_batch(records)?;
+                let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
+                connection
+                    .create_table(table_name, Box::new(reader))
+                    .execute()
+                    .await
+                    .map_err(map_lancedb_err)?;
+                return Ok(());
+            }
+            Err(err) => return Err(map_lancedb_err(err)),
+        };
+
+        let (schema, batch) = record_batch(records)?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
+        let mut merge = table.merge_insert(&["symbol_id"]);
+        merge
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        if let Err(err) = merge.execute(Box::new(reader)).await {
+            tracing::warn!(
+                error = %err,
+                table = table_name,
+                "merge_insert failed during migration; falling back to overwrite add"
+            );
+            let (fallback_schema, fallback_batch) = record_batch(records)?;
+            let fallback_reader =
+                RecordBatchIterator::new(vec![Ok(fallback_batch)].into_iter(), fallback_schema);
+            table
+                .add(Box::new(fallback_reader))
+                .mode(AddDataMode::Overwrite)
+                .execute()
+                .await
+                .map_err(map_lancedb_err)?;
+        }
+
         Ok(())
     }
 
@@ -807,33 +894,78 @@ fn project_note_vector_schema(embedding_dim: i32) -> SchemaRef {
 }
 
 fn single_record_batch(record: &VectorRecord) -> Result<(SchemaRef, RecordBatch), StoreError> {
-    let embedding_dim = record.embedding.len() as i32;
+    record_batch(std::slice::from_ref(record))
+}
+
+fn record_batch(records: &[VectorRecord]) -> Result<(SchemaRef, RecordBatch), StoreError> {
+    if records.is_empty() {
+        return Err(StoreError::LanceDb(
+            "cannot build LanceDB record batch from empty records".to_owned(),
+        ));
+    }
+
+    let embedding_dim = records[0].embedding.len() as i32;
     if embedding_dim <= 0 {
         return Err(StoreError::LanceDb(
             "embedding cannot be empty for LanceDB upsert".to_owned(),
         ));
     }
+    if records
+        .iter()
+        .any(|record| record.embedding.len() as i32 != embedding_dim)
+    {
+        return Err(StoreError::LanceDb(
+            "embedding dimensions must match within a LanceDB record batch".to_owned(),
+        ));
+    }
 
     let schema = vector_schema(embedding_dim);
     let embedding = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-        std::iter::once(Some(
-            record
-                .embedding
-                .iter()
-                .copied()
-                .map(Some)
-                .collect::<Vec<Option<f32>>>(),
-        )),
+        records.iter().map(|record| {
+            Some(
+                record
+                    .embedding
+                    .iter()
+                    .copied()
+                    .map(Some)
+                    .collect::<Vec<Option<f32>>>(),
+            )
+        }),
         embedding_dim,
     );
 
     let columns: Vec<ArrayRef> = vec![
-        Arc::new(StringArray::from(vec![record.symbol_id.clone()])),
-        Arc::new(StringArray::from(vec![record.sir_hash.clone()])),
-        Arc::new(StringArray::from(vec![record.provider.clone()])),
-        Arc::new(StringArray::from(vec![record.model.clone()])),
+        Arc::new(StringArray::from(
+            records
+                .iter()
+                .map(|record| record.symbol_id.clone())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            records
+                .iter()
+                .map(|record| record.sir_hash.clone())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            records
+                .iter()
+                .map(|record| record.provider.clone())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            records
+                .iter()
+                .map(|record| record.model.clone())
+                .collect::<Vec<_>>(),
+        )),
         Arc::new(embedding),
-        Arc::new(Int64Array::from(vec![record.updated_at])),
+        Arc::new(Int64Array::from(
+            records
+                .iter()
+                .map(|record| record.updated_at)
+                .collect::<Vec<_>>(),
+        )),
     ];
     let batch = RecordBatch::try_new(schema.clone(), columns)
         .map_err(|err| StoreError::LanceDb(err.to_string()))?;

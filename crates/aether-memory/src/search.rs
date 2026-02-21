@@ -236,32 +236,32 @@ fn hybrid_ranked(
     now_ms: i64,
     limit: usize,
 ) -> Vec<RecallScoredNote> {
-    let mut by_id = HashMap::<String, ProjectNote>::new();
+    let mut by_id = HashMap::<String, &ProjectNote>::new();
     let mut score_by_id = HashMap::<String, f32>::new();
 
     for (rank, note) in lexical.iter().enumerate() {
         let id = note.note_id.clone();
-        by_id.entry(id.clone()).or_insert_with(|| note.clone());
+        by_id.entry(id.clone()).or_insert(note);
         *score_by_id.entry(id).or_insert(0.0) += rrf_score(rank);
     }
 
     for (rank, (note, _semantic_score)) in semantic.iter().enumerate() {
         let id = note.note_id.clone();
-        by_id.entry(id.clone()).or_insert_with(|| note.clone());
+        by_id.entry(id.clone()).or_insert(note);
         *score_by_id.entry(id).or_insert(0.0) += rrf_score(rank);
     }
 
     let mut scored = score_by_id
         .into_iter()
         .filter_map(|(id, base)| {
-            by_id.remove(id.as_str()).map(|note| RecallScoredNote {
+            by_id.get(id.as_str()).map(|note| RecallScoredNote {
                 relevance_score: apply_recency_access_boost(
                     base,
                     note.access_count,
                     note.last_accessed_at,
                     now_ms,
                 ),
-                note,
+                note: (*note).clone(),
             })
         })
         .collect::<Vec<_>>();

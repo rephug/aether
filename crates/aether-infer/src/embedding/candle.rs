@@ -252,7 +252,10 @@ impl CandleEmbeddingProvider {
         })
     }
 
-    fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, InferError> {
+    fn embed_texts_with_loaded(
+        loaded: &LoadedModel,
+        texts: &[String],
+    ) -> Result<Vec<Vec<f32>>, InferError> {
         let mut outputs = vec![vec![0.0; CANDLE_EMBEDDING_DIM]; texts.len()];
 
         let mut active = Vec::new();
@@ -267,11 +270,9 @@ impl CandleEmbeddingProvider {
             return Ok(outputs);
         }
 
-        let loaded = self.ensure_loaded()?;
-
         for chunk in active.chunks(BATCH_CHUNK_SIZE) {
             let batch_inputs = chunk.iter().map(|(_, text)| *text).collect::<Vec<_>>();
-            let batch_outputs = Self::embed_chunk(loaded.as_ref(), &batch_inputs)?;
+            let batch_outputs = Self::embed_chunk(loaded, &batch_inputs)?;
 
             for ((index, _), embedding) in chunk.iter().zip(batch_outputs.into_iter()) {
                 outputs[*index] = embedding;
@@ -368,8 +369,15 @@ impl EmbeddingProvider for CandleEmbeddingProvider {
             return Ok(vec![0.0; CANDLE_EMBEDDING_DIM]);
         }
 
+        let loaded = Arc::clone(self.ensure_loaded()?);
         let input = vec![text.to_owned()];
-        let mut output = self.embed_texts(&input)?;
+        let mut output = tokio::task::spawn_blocking(move || {
+            Self::embed_texts_with_loaded(loaded.as_ref(), &input)
+        })
+        .await
+        .map_err(|err| {
+            InferError::ModelUnavailable(format!("candle embedding task failed: {err}"))
+        })??;
         Ok(output
             .pop()
             .unwrap_or_else(|| vec![0.0; CANDLE_EMBEDDING_DIM]))
@@ -391,12 +399,12 @@ fn l2_normalize(embedding: &mut [f32]) {
         .map(|value| value * value)
         .fold(0.0f32, |acc, value| acc + value);
 
-    if norm_sq <= f32::EPSILON {
+    let norm = norm_sq.sqrt();
+    if norm < 1e-8 {
         embedding.fill(0.0);
         return;
     }
 
-    let norm = norm_sq.sqrt();
     for value in embedding.iter_mut() {
         *value /= norm;
     }
@@ -421,5 +429,30 @@ mod tests {
     #[test]
     fn embedding_dimension_is_1024() {
         assert_eq!(CANDLE_EMBEDDING_DIM, 1024);
+    }
+
+    #[test]
+    fn l2_normalize_zero_vector_returns_zeros() {
+        let mut embedding = vec![0.0f32, 0.0, 0.0, 0.0];
+        l2_normalize(&mut embedding);
+
+        assert!(embedding.iter().all(|value| *value == 0.0));
+        assert!(embedding.iter().all(|value| !value.is_nan()));
+    }
+
+    #[test]
+    fn l2_normalize_non_zero_vector_has_unit_length() {
+        let mut embedding = vec![3.0f32, 4.0, 0.0];
+        l2_normalize(&mut embedding);
+
+        let norm = embedding
+            .iter()
+            .map(|value| value * value)
+            .fold(0.0f32, |acc, value| acc + value)
+            .sqrt();
+        assert!((norm - 1.0).abs() < 1e-6);
+        assert!((embedding[0] - 0.6).abs() < 1e-6);
+        assert!((embedding[1] - 0.8).abs() < 1e-6);
+        assert_eq!(embedding[2], 0.0);
     }
 }
