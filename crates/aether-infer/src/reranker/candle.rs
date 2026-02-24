@@ -470,10 +470,13 @@ impl RerankerProvider for CandleRerankerProvider {
                 candidates.as_slice(),
                 top_n,
             )
+            .map_err(|err| {
+                InferError::ModelUnavailable(format!("candle reranker task failed: {err}"))
+            })
         })
         .await
         .map_err(|err| {
-            InferError::ModelUnavailable(format!("candle reranker task failed: {err}"))
+            InferError::ModelUnavailable(format!("candle reranker join failed: {err}"))
         })?
     }
 

@@ -1007,7 +1007,7 @@ impl AetherMcpServer {
         let store = Arc::new(Mutex::new(SqliteStore::open(&workspace)?));
 
         let vector_store: Arc<dyn VectorStore> = match config.embeddings.vector_backend {
-            EmbeddingVectorBackend::Sqlite => Arc::new(SqliteVectorStore::new(&workspace)),
+            EmbeddingVectorBackend::Sqlite => Arc::new(SqliteVectorStore::new(&workspace)?),
             EmbeddingVectorBackend::Lancedb => {
                 if tokio::runtime::Handle::try_current().is_ok() {
                     return Err(AetherMcpError::Message(

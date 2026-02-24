@@ -375,11 +375,13 @@ impl EmbeddingProvider for CandleEmbeddingProvider {
         let input = vec![text.to_owned()];
         let mut output = tokio::task::spawn_blocking(move || {
             let loaded = Arc::clone(provider.ensure_loaded()?);
-            Self::embed_texts_with_loaded(loaded.as_ref(), &input)
+            Self::embed_texts_with_loaded(loaded.as_ref(), &input).map_err(|err| {
+                InferError::ModelUnavailable(format!("candle embedding task failed: {err}"))
+            })
         })
         .await
         .map_err(|err| {
-            InferError::ModelUnavailable(format!("candle embedding task failed: {err}"))
+            InferError::ModelUnavailable(format!("candle embedding join failed: {err}"))
         })??;
         Ok(output
             .pop()

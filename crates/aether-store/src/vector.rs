@@ -106,7 +106,7 @@ pub async fn open_vector_store(
     let config = load_workspace_config(workspace_root)?;
 
     match config.embeddings.vector_backend {
-        EmbeddingVectorBackend::Sqlite => Ok(Arc::new(SqliteVectorStore::new(workspace_root))),
+        EmbeddingVectorBackend::Sqlite => Ok(Arc::new(SqliteVectorStore::new(workspace_root)?)),
         EmbeddingVectorBackend::Lancedb => {
             Ok(Arc::new(LanceVectorStore::open(workspace_root).await?))
         }
@@ -114,36 +114,38 @@ pub async fn open_vector_store(
 }
 
 pub struct SqliteVectorStore {
-    workspace_root: PathBuf,
+    store: std::sync::Mutex<SqliteStore>,
 }
 
 impl SqliteVectorStore {
-    pub fn new(workspace_root: impl AsRef<Path>) -> Self {
-        Self {
-            workspace_root: workspace_root.as_ref().to_path_buf(),
-        }
-    }
-
-    fn store(&self) -> Result<SqliteStore, StoreError> {
-        SqliteStore::open(&self.workspace_root)
+    pub fn new(workspace_root: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Ok(Self {
+            store: std::sync::Mutex::new(SqliteStore::open(workspace_root)?),
+        })
     }
 }
 
 #[async_trait]
 impl VectorStore for SqliteVectorStore {
     async fn upsert_embedding(&self, record: VectorRecord) -> Result<(), StoreError> {
-        self.store()?.upsert_symbol_embedding(record)
+        self.store.lock().unwrap().upsert_symbol_embedding(record)
     }
 
     async fn get_embedding_meta(
         &self,
         symbol_id: &str,
     ) -> Result<Option<VectorEmbeddingMetaRecord>, StoreError> {
-        self.store()?.get_symbol_embedding_meta(symbol_id)
+        self.store
+            .lock()
+            .unwrap()
+            .get_symbol_embedding_meta(symbol_id)
     }
 
     async fn delete_embedding(&self, symbol_id: &str) -> Result<(), StoreError> {
-        self.store()?.delete_symbol_embedding(symbol_id)
+        self.store
+            .lock()
+            .unwrap()
+            .delete_symbol_embedding(symbol_id)
     }
 
     async fn search_nearest(
@@ -153,9 +155,12 @@ impl VectorStore for SqliteVectorStore {
         model: &str,
         limit: u32,
     ) -> Result<Vec<VectorSearchResult>, StoreError> {
-        let matches =
-            self.store()?
-                .search_symbols_semantic(query_embedding, provider, model, limit)?;
+        let matches = self.store.lock().unwrap().search_symbols_semantic(
+            query_embedding,
+            provider,
+            model,
+            limit,
+        )?;
 
         Ok(matches
             .into_iter()
@@ -172,7 +177,9 @@ impl VectorStore for SqliteVectorStore {
         model: &str,
         symbol_ids: &[String],
     ) -> Result<Vec<VectorRecord>, StoreError> {
-        self.store()?
+        self.store
+            .lock()
+            .unwrap()
             .list_symbol_embeddings_for_ids(provider, model, symbol_ids)
     }
 
@@ -180,7 +187,9 @@ impl VectorStore for SqliteVectorStore {
         &self,
         record: ProjectNoteVectorRecord,
     ) -> Result<(), StoreError> {
-        self.store()?
+        self.store
+            .lock()
+            .unwrap()
             .upsert_project_note_embedding(ProjectNoteEmbeddingRecord {
                 note_id: record.note_id,
                 provider: record.provider,
@@ -193,7 +202,10 @@ impl VectorStore for SqliteVectorStore {
     }
 
     async fn delete_project_note_embedding(&self, note_id: &str) -> Result<(), StoreError> {
-        self.store()?.delete_project_note_embedding(note_id)
+        self.store
+            .lock()
+            .unwrap()
+            .delete_project_note_embedding(note_id)
     }
 
     async fn search_project_notes_nearest(
@@ -203,9 +215,12 @@ impl VectorStore for SqliteVectorStore {
         model: &str,
         limit: u32,
     ) -> Result<Vec<ProjectNoteVectorSearchResult>, StoreError> {
-        let matches =
-            self.store()?
-                .search_project_notes_semantic(query_embedding, provider, model, limit)?;
+        let matches = self.store.lock().unwrap().search_project_notes_semantic(
+            query_embedding,
+            provider,
+            model,
+            limit,
+        )?;
 
         Ok(matches
             .into_iter()

@@ -58,6 +58,13 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
     loop {
         match rx.recv_timeout(poll_interval) {
             Ok(result) => {
+                if let Ok(ref event) = result {
+                    for path in &event.paths {
+                        if path.is_dir() && !crate::observer::is_ignored_path(path) {
+                            let _ = watcher.watch(path, notify::RecursiveMode::NonRecursive);
+                        }
+                    }
+                }
                 if let Err(err) =
                     enqueue_event_paths(&config.workspace, result, &mut debounce_queue)
                 {
@@ -71,6 +78,13 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
         }
 
         while let Ok(result) = rx.try_recv() {
+            if let Ok(ref event) = result {
+                for path in &event.paths {
+                    if path.is_dir() && !crate::observer::is_ignored_path(path) {
+                        let _ = watcher.watch(path, notify::RecursiveMode::NonRecursive);
+                    }
+                }
+            }
             if let Err(err) = enqueue_event_paths(&config.workspace, result, &mut debounce_queue) {
                 tracing::warn!(error = ?err, "watch event error");
             }

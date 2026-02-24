@@ -102,14 +102,19 @@ impl LanguageServer for AetherLspBackend {
             Ok(path) => path,
             Err(()) => return Ok(Some(no_sir_hover())),
         };
+        let source = match std::fs::read_to_string(&file_path) {
+            Ok(source) => source,
+            Err(_) => return Ok(Some(no_sir_hover())),
+        };
 
         let resolution = {
             let guard = self.store.lock().await;
 
-            resolve_hover_markdown_for_path(
+            resolve_hover_markdown_for_source(
                 &self.workspace_root,
                 &guard,
                 &file_path,
+                &source,
                 text_doc_pos.position,
             )
         };
@@ -155,18 +160,27 @@ pub fn resolve_hover_markdown_for_path(
     file_path: &Path,
     position: Position,
 ) -> Result<Option<String>, HoverResolveError> {
+    let source = std::fs::read_to_string(file_path)?;
+    resolve_hover_markdown_for_source(workspace_root, store, file_path, &source, position)
+}
+
+pub fn resolve_hover_markdown_for_source(
+    workspace_root: &Path,
+    store: &SqliteStore,
+    file_path: &Path,
+    source: &str,
+    position: Position,
+) -> Result<Option<String>, HoverResolveError> {
     let language = match language_for_path(file_path) {
         Some(language) => language,
         None => return Ok(None),
     };
 
-    let source = std::fs::read_to_string(file_path)?;
-
     let display_path = workspace_relative_display_path(workspace_root, file_path);
 
     let mut extractor = get_extractor()?;
     let symbols = extractor
-        .extract_from_source(language, &display_path, &source)
+        .extract_from_source(language, &display_path, source)
         .map_err(|err| HoverResolveError::Parse(err.to_string()))?;
 
     let cursor_line = (position.line as usize) + 1;
@@ -176,7 +190,7 @@ pub fn resolve_hover_markdown_for_path(
         workspace_root,
         store,
         file_path,
-        &source,
+        source,
         cursor_line,
         cursor_column,
     )? {
