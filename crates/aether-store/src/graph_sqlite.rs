@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use rusqlite::{Connection, OpenFlags, params};
 
 use super::{GraphStore, ResolvedEdge, StoreError, SymbolRecord, run_migrations};
@@ -60,16 +61,17 @@ impl SqliteGraphStore {
     }
 }
 
+#[async_trait]
 impl GraphStore for SqliteGraphStore {
-    fn upsert_symbol_node(&self, _symbol: &SymbolRecord) -> Result<(), StoreError> {
+    async fn upsert_symbol_node(&self, _symbol: &SymbolRecord) -> Result<(), StoreError> {
         Ok(())
     }
 
-    fn upsert_edge(&self, _edge: &ResolvedEdge) -> Result<(), StoreError> {
+    async fn upsert_edge(&self, _edge: &ResolvedEdge) -> Result<(), StoreError> {
         Ok(())
     }
 
-    fn get_callers(&self, qualified_name: &str) -> Result<Vec<SymbolRecord>, StoreError> {
+    async fn get_callers(&self, qualified_name: &str) -> Result<Vec<SymbolRecord>, StoreError> {
         let qualified_name = qualified_name.trim();
         if qualified_name.is_empty() {
             return Ok(Vec::new());
@@ -101,7 +103,7 @@ impl GraphStore for SqliteGraphStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    fn get_dependencies(&self, symbol_id: &str) -> Result<Vec<SymbolRecord>, StoreError> {
+    async fn get_dependencies(&self, symbol_id: &str) -> Result<Vec<SymbolRecord>, StoreError> {
         let symbol_id = symbol_id.trim();
         if symbol_id.is_empty() {
             return Ok(Vec::new());
@@ -133,7 +135,7 @@ impl GraphStore for SqliteGraphStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    fn get_call_chain(
+    async fn get_call_chain(
         &self,
         symbol_id: &str,
         depth: u32,
@@ -211,7 +213,7 @@ impl GraphStore for SqliteGraphStore {
         Ok(levels)
     }
 
-    fn delete_edges_for_file(&self, _file_path: &str) -> Result<(), StoreError> {
+    async fn delete_edges_for_file(&self, _file_path: &str) -> Result<(), StoreError> {
         Ok(())
     }
 }
@@ -236,8 +238,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sqlite_graph_resolves_callers_and_dependencies() {
+    #[tokio::test]
+    async fn sqlite_graph_resolves_callers_and_dependencies() {
         let temp = tempdir().expect("tempdir");
         let store = crate::SqliteStore::open(temp.path()).expect("open sqlite store");
         let graph = SqliteGraphStore::open(temp.path()).expect("open sqlite graph store");
@@ -263,17 +265,20 @@ mod tests {
             ])
             .expect("upsert edges");
 
-        let callers = graph.get_callers("beta").expect("get callers");
+        let callers = graph.get_callers("beta").await.expect("get callers");
         assert_eq!(callers.len(), 1);
         assert_eq!(callers[0].id, alpha.id);
 
-        let deps = graph.get_dependencies(&alpha.id).expect("get dependencies");
+        let deps = graph
+            .get_dependencies(&alpha.id)
+            .await
+            .expect("get dependencies");
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].id, beta.id);
     }
 
-    #[test]
-    fn sqlite_graph_returns_multi_hop_call_chain() {
+    #[tokio::test]
+    async fn sqlite_graph_returns_multi_hop_call_chain() {
         let temp = tempdir().expect("tempdir");
         let store = crate::SqliteStore::open(temp.path()).expect("open sqlite store");
         let graph = SqliteGraphStore::open(temp.path()).expect("open sqlite graph store");
@@ -311,6 +316,7 @@ mod tests {
 
         let chain = graph
             .get_call_chain(&alpha.id, 3)
+            .await
             .expect("get call chain at depth 3");
         assert_eq!(chain.len(), 3);
         assert_eq!(chain[0][0].id, beta.id);

@@ -758,7 +758,7 @@ mod tests {
     use std::process::Command;
 
     use aether_core::EdgeKind;
-    use aether_store::{CozoGraphStore, GraphStore, ResolvedEdge, Store, SymbolRecord};
+    use aether_store::{CozoGraphStore, ResolvedEdge, Store, SymbolRecord};
     use tempfile::tempdir;
 
     use super::{CausalAnalyzer, TraceCauseRequest, now_millis};

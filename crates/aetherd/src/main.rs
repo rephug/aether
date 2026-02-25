@@ -5,6 +5,8 @@ use aether_config::{
     DEFAULT_LOG_LEVEL, SearchRerankerKind, ensure_workspace_config, validate_config,
 };
 use aether_infer::{download_candle_embedding_model, download_candle_reranker_model};
+#[cfg(feature = "legacy-cozo")]
+use aether_store::migrate_cozo_to_surreal;
 use aetherd::calibrate::run_calibration_once;
 use aetherd::causal::run_trace_cause_command;
 use aetherd::cli::{
@@ -226,6 +228,8 @@ fn run_subcommand(workspace: &Path, command: Commands) -> Result<()> {
         Commands::DriftAck(args) => run_drift_ack_subcommand(workspace, args),
         Commands::Communities(args) => run_communities_subcommand(workspace, args),
         Commands::TraceCause(args) => run_trace_cause_subcommand(workspace, args),
+        #[cfg(feature = "legacy-cozo")]
+        Commands::GraphMigrate(args) => run_graph_migrate_subcommand(workspace, args),
     }
 }
 
@@ -327,6 +331,37 @@ fn run_communities_subcommand(workspace: &Path, args: CommunitiesArgs) -> Result
 
 fn run_trace_cause_subcommand(workspace: &Path, args: TraceCauseArgs) -> Result<()> {
     run_trace_cause_command(workspace, args).context("trace-cause command failed")
+}
+
+#[cfg(feature = "legacy-cozo")]
+fn run_graph_migrate_subcommand(
+    _workspace_from_global: &Path,
+    args: aetherd::cli::GraphMigrateArgs,
+) -> Result<()> {
+    let workspace = args.workspace.canonicalize().with_context(|| {
+        format!(
+            "failed to resolve workspace path {}",
+            args.workspace.display()
+        )
+    })?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime for graph migration")?;
+    let result = runtime
+        .block_on(migrate_cozo_to_surreal(&workspace, args.dry_run))
+        .context("graph migration failed")?;
+    eprintln!(
+        "graph migration {}: symbols={}, edges={}",
+        if result.dry_run {
+            "dry-run"
+        } else {
+            "completed"
+        },
+        result.symbols_migrated,
+        result.edges_migrated
+    );
+    Ok(())
 }
 
 fn init_tracing_subscriber(log_format: LogFormat, configured_log_level: &str) -> Result<()> {

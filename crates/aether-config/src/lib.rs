@@ -174,6 +174,7 @@ impl std::str::FromStr for EmbeddingVectorBackend {
 #[serde(rename_all = "snake_case")]
 pub enum GraphBackend {
     #[default]
+    Surreal,
     Cozo,
     Sqlite,
 }
@@ -181,6 +182,7 @@ pub enum GraphBackend {
 impl GraphBackend {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Surreal => "surreal",
             Self::Cozo => "cozo",
             Self::Sqlite => "sqlite",
         }
@@ -192,10 +194,11 @@ impl std::str::FromStr for GraphBackend {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim() {
+            "surreal" => Ok(Self::Surreal),
             "cozo" => Ok(Self::Cozo),
             "sqlite" => Ok(Self::Sqlite),
             other => Err(format!(
-                "invalid graph backend '{other}', expected one of: cozo, sqlite"
+                "invalid graph backend '{other}', expected one of: surreal, cozo, sqlite"
             )),
         }
     }
@@ -710,6 +713,15 @@ pub fn save_workspace_config(
 pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
     let mut warnings = Vec::new();
 
+    if config.storage.graph_backend == GraphBackend::Cozo {
+        warnings.push(ConfigWarning {
+            code: "graph_backend_cozo_deprecated",
+            message:
+                "storage.graph_backend=cozo is deprecated; run `aether graph-migrate` and switch to surreal"
+                    .to_owned(),
+        });
+    }
+
     if !config.embeddings.enabled {
         if config.embeddings.model.is_some() {
             warnings.push(ConfigWarning {
@@ -896,7 +908,7 @@ fn default_mirror_sir_files() -> bool {
 }
 
 fn default_graph_backend() -> GraphBackend {
-    GraphBackend::Cozo
+    GraphBackend::Surreal
 }
 
 fn default_embeddings_enabled() -> bool {
@@ -1260,7 +1272,7 @@ mod tests {
         assert_eq!(config.inference.provider, InferenceProviderKind::Auto);
         assert_eq!(config.inference.api_key_env, DEFAULT_GEMINI_API_KEY_ENV);
         assert!(config.storage.mirror_sir_files);
-        assert_eq!(config.storage.graph_backend, GraphBackend::Cozo);
+        assert_eq!(config.storage.graph_backend, GraphBackend::Surreal);
         assert!(!config.embeddings.enabled);
         assert_eq!(config.embeddings.provider, EmbeddingProviderKind::Mock);
         assert_eq!(config.search.reranker, SearchRerankerKind::None);
@@ -1357,7 +1369,7 @@ mod tests {
         assert!(content.contains("provider = \"auto\""));
         assert!(content.contains("[storage]"));
         assert!(content.contains("mirror_sir_files = true"));
-        assert!(content.contains("graph_backend = \"cozo\""));
+        assert!(content.contains("graph_backend = \"surreal\""));
         assert!(content.contains("[embeddings]"));
         assert!(content.contains("enabled = false"));
         assert!(content.contains("provider = \"mock\""));
@@ -1758,6 +1770,7 @@ semantic_weight = 1.0
         assert!(codes.contains(&"inference_endpoint_ignored_for_auto"));
         assert!(codes.contains(&"embeddings_model_ignored"));
         assert!(codes.contains(&"embeddings_endpoint_ignored"));
+        assert!(codes.contains(&"graph_backend_cozo_deprecated"));
     }
 
     #[test]

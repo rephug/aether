@@ -1,6 +1,7 @@
 mod causal;
 mod coupling;
 mod drift;
+mod graph_algorithms;
 mod test_intents;
 
 pub use causal::{
@@ -17,5 +18,9 @@ pub use drift::{
     CommunitiesResult, CommunityEntry, DriftAnalyzer, DriftInclude, DriftReportRequest,
     DriftReportResult, DriftReportSummary, DriftReportWindow, EmergingHubEntry, NewCycleEntry,
     OrphanedSubgraphEntry, SemanticDriftEntry, StructuralAnomalies,
+};
+pub use graph_algorithms::{
+    GraphAlgorithmEdge, bfs_shortest_path, connected_components, cross_community_edges,
+    louvain_communities, page_rank, strongly_connected_components,
 };
 pub use test_intents::{InferredTestTarget, TestGuard, TestIntentAnalyzer};
