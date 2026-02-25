@@ -2,32 +2,59 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OpenFlags, params};
 
 use super::{GraphStore, ResolvedEdge, StoreError, SymbolRecord, run_migrations};
 
 pub struct SqliteGraphStore {
     sqlite_path: PathBuf,
+    read_only: bool,
 }
 
 impl SqliteGraphStore {
     pub fn open(workspace_root: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_internal(workspace_root, false)
+    }
+
+    pub fn open_readonly(workspace_root: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_internal(workspace_root, true)
+    }
+
+    fn open_internal(
+        workspace_root: impl AsRef<Path>,
+        read_only: bool,
+    ) -> Result<Self, StoreError> {
         let workspace_root = workspace_root.as_ref();
         let aether_dir = workspace_root.join(".aether");
         let sqlite_path = aether_dir.join("meta.sqlite");
 
-        fs::create_dir_all(&aether_dir)?;
+        if !read_only {
+            fs::create_dir_all(&aether_dir)?;
+        }
 
-        let conn = Connection::open(&sqlite_path)?;
+        let conn = if read_only {
+            Connection::open_with_flags(&sqlite_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?
+        } else {
+            Connection::open(&sqlite_path)?
+        };
         conn.busy_timeout(Duration::from_secs(5))?;
-        run_migrations(&conn)?;
+        if !read_only {
+            run_migrations(&conn)?;
+        }
         drop(conn);
 
-        Ok(Self { sqlite_path })
+        Ok(Self {
+            sqlite_path,
+            read_only,
+        })
     }
 
     fn connection(&self) -> Result<Connection, StoreError> {
-        let conn = Connection::open(&self.sqlite_path)?;
+        let conn = if self.read_only {
+            Connection::open_with_flags(&self.sqlite_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?
+        } else {
+            Connection::open(&self.sqlite_path)?
+        };
         conn.busy_timeout(Duration::from_secs(5))?;
         Ok(conn)
     }

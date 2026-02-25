@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aether_analysis::{
@@ -10,9 +10,7 @@ use aether_analysis::{
     DriftReportRequest as AnalysisDriftReportRequest, RiskLevel as CouplingRiskLevel,
     TestIntentAnalyzer, TraceCauseRequest as AnalysisTraceCauseRequest,
 };
-use aether_config::{
-    AetherConfig, EmbeddingVectorBackend, SearchRerankerKind, VerifyMode, load_workspace_config,
-};
+use aether_config::{SearchRerankerKind, VerifyMode};
 pub use aether_core::SearchMode;
 use aether_core::{
     HoverMarkdownSections, Language, NO_SIR_MESSAGE, SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR,
@@ -37,8 +35,8 @@ use aether_sir::{
     file_sir_hash, sir_hash, synthetic_file_sir_id, synthetic_module_sir_id, validate_sir,
 };
 use aether_store::{
-    SirHistorySelector, SirMetaRecord, SqliteStore, SqliteVectorStore, Store, StoreError,
-    SymbolRecord, SymbolSearchResult, VectorStore, open_graph_store, open_vector_store,
+    SirHistorySelector, SirMetaRecord, SqliteStore, Store, StoreError, SymbolRecord,
+    SymbolSearchResult,
 };
 use aetherd::verification::{VerificationRequest, run_verification};
 use anyhow::Result;
@@ -53,6 +51,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+
+mod state;
+pub use state::SharedState;
 
 pub const SERVER_NAME: &str = "aether";
 pub const SERVER_VERSION: &str = "0.1.0";
@@ -78,6 +79,8 @@ pub enum AetherMcpError {
     Analysis(#[from] aether_analysis::AnalysisError),
     #[error("sir validation error: {0}")]
     Sir(#[from] SirError),
+    #[error("read-only mode: {0}")]
+    ReadOnly(String),
     #[error("{0}")]
     Message(String),
 }
@@ -990,72 +993,32 @@ impl WhySelector {
 
 #[derive(Clone)]
 pub struct AetherMcpServer {
-    workspace: PathBuf,
+    state: Arc<SharedState>,
     verbose: bool,
     tool_router: ToolRouter<Self>,
-    store: Arc<Mutex<SqliteStore>>,
-    vector_store: Arc<dyn VectorStore>,
-    config: AetherConfig,
 }
 
 impl AetherMcpServer {
     pub fn new(workspace: impl AsRef<Path>, verbose: bool) -> Result<Self, AetherMcpError> {
-        let workspace = workspace.as_ref().canonicalize()?;
-        let config = load_workspace_config(&workspace).map_err(|err| {
-            AetherMcpError::Message(format!("failed to load workspace config: {err}"))
-        })?;
-        let store = Arc::new(Mutex::new(SqliteStore::open(&workspace)?));
-
-        let vector_store: Arc<dyn VectorStore> = match config.embeddings.vector_backend {
-            EmbeddingVectorBackend::Sqlite => Arc::new(SqliteVectorStore::new(&workspace)?),
-            EmbeddingVectorBackend::Lancedb => {
-                if tokio::runtime::Handle::try_current().is_ok() {
-                    return Err(AetherMcpError::Message(
-                        "cannot initialize LanceDB vector store synchronously from an async runtime; use AetherMcpServer::init".to_owned(),
-                    ));
-                }
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|err| {
-                        AetherMcpError::Message(format!(
-                            "failed to create runtime for vector store initialization: {err}"
-                        ))
-                    })?;
-                runtime.block_on(open_vector_store(&workspace))?
-            }
-        };
-
-        Ok(Self {
-            workspace,
-            verbose,
-            tool_router: Self::tool_router(),
-            store,
-            vector_store,
-            config,
-        })
+        let state = Arc::new(SharedState::open_readwrite(workspace.as_ref())?);
+        Ok(Self::from_state(state, verbose))
     }
 
     pub async fn init(workspace: impl AsRef<Path>, verbose: bool) -> Result<Self, AetherMcpError> {
-        let workspace = workspace.as_ref().canonicalize()?;
-        let config = load_workspace_config(&workspace).map_err(|err| {
-            AetherMcpError::Message(format!("failed to load workspace config: {err}"))
-        })?;
-        let store = Arc::new(Mutex::new(SqliteStore::open(&workspace)?));
-        let vector_store = open_vector_store(&workspace).await?;
+        let state = Arc::new(SharedState::open_readwrite_async(workspace.as_ref()).await?);
+        Ok(Self::from_state(state, verbose))
+    }
 
-        Ok(Self {
-            workspace,
+    pub fn from_state(state: Arc<SharedState>, verbose: bool) -> Self {
+        Self {
+            state,
             verbose,
             tool_router: Self::tool_router(),
-            store,
-            vector_store,
-            config,
-        })
+        }
     }
 
     pub fn workspace(&self) -> &Path {
-        &self.workspace
+        &self.state.workspace
     }
 
     pub fn aether_status_logic(&self) -> Result<AetherStatusResponse, AetherMcpError> {
@@ -1076,7 +1039,7 @@ impl AetherMcpServer {
         Ok(AetherStatusResponse {
             schema_version: MCP_SCHEMA_VERSION,
             generated_at: current_unix_timestamp(),
-            workspace: normalize_path(&self.workspace.to_string_lossy()),
+            workspace: normalize_path(&self.state.workspace.to_string_lossy()),
             store_present,
             sqlite_path: normalize_path(&sqlite_path.to_string_lossy()),
             sir_dir: normalize_path(&sir_dir.to_string_lossy()),
@@ -1132,7 +1095,7 @@ impl AetherMcpServer {
             });
         }
 
-        let store = self.lock_store()?;
+        let store = self.state.store.as_ref();
         let Some(symbol) = store.get_symbol_record(symbol_id)? else {
             return Ok(AetherDependenciesResponse {
                 symbol_id: symbol_id.to_owned(),
@@ -1144,7 +1107,7 @@ impl AetherMcpServer {
             });
         };
 
-        let graph_store = open_graph_store(&self.workspace)?;
+        let graph_store = self.state.graph.as_ref();
         let callers = graph_store
             .get_callers(&symbol.qualified_name)?
             .into_iter()
@@ -1201,7 +1164,7 @@ impl AetherMcpServer {
             });
         }
 
-        let store = self.lock_store()?;
+        let store = self.state.store.as_ref();
         let mut start_symbol = None;
         if !symbol_id_input.is_empty() {
             start_symbol = store.get_symbol_record(&symbol_id_input)?;
@@ -1220,7 +1183,7 @@ impl AetherMcpServer {
             });
         };
 
-        let graph_store = open_graph_store(&self.workspace)?;
+        let graph_store = self.state.graph.as_ref();
         let levels = graph_store
             .get_call_chain(&start_symbol.id, max_depth)?
             .into_iter()
@@ -1248,7 +1211,7 @@ impl AetherMcpServer {
         let mode_requested = request.mode.unwrap_or_default();
         let limit = effective_limit(request.limit);
         let lexical = self.lexical_search_matches(&request.query, limit)?;
-        let search_config = &self.config;
+        let search_config = self.state.config.as_ref();
         let reranker_kind = search_config.search.reranker;
         let rerank_window = search_config.search.rerank_window;
 
@@ -1326,7 +1289,7 @@ impl AetherMcpServer {
         request: AetherRememberRequest,
         source_type: MemoryNoteSourceType,
     ) -> Result<aether_memory::RememberResult, AetherMcpError> {
-        let memory = ProjectMemoryService::new(&self.workspace);
+        let memory = ProjectMemoryService::new(self.workspace());
         let entity_refs = request
             .entity_refs
             .unwrap_or_default()
@@ -1350,7 +1313,7 @@ impl AetherMcpServer {
 
         if remember.action == aether_memory::RememberAction::Created {
             match load_embedding_provider_from_config(
-                &self.workspace,
+                self.workspace(),
                 EmbeddingProviderOverrides::default(),
             ) {
                 Ok(Some(loaded)) => {
@@ -1399,6 +1362,7 @@ impl AetherMcpServer {
         &self,
         request: AetherRememberRequest,
     ) -> Result<AetherRememberResponse, AetherMcpError> {
+        self.state.require_writable()?;
         let remember = self
             .remember_note_with_source_type(request, MemoryNoteSourceType::Agent)
             .await?;
@@ -1417,6 +1381,7 @@ impl AetherMcpServer {
         &self,
         request: AetherRememberRequest,
     ) -> Result<AetherSessionNoteResponse, AetherMcpError> {
+        self.state.require_writable()?;
         let remember = self
             .remember_note_with_source_type(request, MemoryNoteSourceType::Session)
             .await?;
@@ -1440,7 +1405,7 @@ impl AetherMcpServer {
         let mut semantic_fallback_reason = None;
         if !matches!(mode, SearchMode::Lexical) {
             match load_embedding_provider_from_config(
-                &self.workspace,
+                self.workspace(),
                 EmbeddingProviderOverrides::default(),
             ) {
                 Ok(Some(loaded)) => {
@@ -1472,7 +1437,7 @@ impl AetherMcpServer {
             }
         }
 
-        let memory = ProjectMemoryService::new(&self.workspace);
+        let memory = ProjectMemoryService::new(self.workspace());
         let result = memory
             .recall(MemoryRecallRequest {
                 query: request.query.clone(),
@@ -1528,7 +1493,7 @@ impl AetherMcpServer {
 
         let mut semantic_query = None;
         match load_embedding_provider_from_config(
-            &self.workspace,
+            self.workspace(),
             EmbeddingProviderOverrides::default(),
         ) {
             Ok(Some(loaded)) => match loaded.provider.embed_text(request.query.as_str()).await {
@@ -1550,7 +1515,7 @@ impl AetherMcpServer {
             }
         }
 
-        let memory = ProjectMemoryService::new(&self.workspace);
+        let memory = ProjectMemoryService::new(self.workspace());
         let result = memory
             .ask(MemoryAskQueryRequest {
                 query: request.query.clone(),
@@ -1608,7 +1573,7 @@ impl AetherMcpServer {
             });
         }
 
-        let analyzer = CouplingAnalyzer::new(&self.workspace)?;
+        let analyzer = CouplingAnalyzer::new(self.workspace())?;
         let blast = analyzer.blast_radius(BlastRadiusRequest {
             file_path: target_file.clone(),
             min_risk: request
@@ -1625,7 +1590,7 @@ impl AetherMcpServer {
                 last_mined_at: state.last_mined_at,
             });
 
-        let store = self.lock_store()?;
+        let store = self.state.store.as_ref();
         let target_symbol_ids = store
             .list_symbols_for_file(blast.target_file.as_str())?
             .into_iter()
@@ -1661,7 +1626,7 @@ impl AetherMcpServer {
             });
         }
 
-        let test_guards = match TestIntentAnalyzer::new(&self.workspace)
+        let test_guards = match TestIntentAnalyzer::new(self.workspace())
             .and_then(|analyzer| analyzer.list_guards_for_target_file(blast.target_file.as_str()))
         {
             Ok(guards) => {
@@ -1676,7 +1641,7 @@ impl AetherMcpServer {
                     .collect::<Vec<_>>();
 
                 if mapped.is_empty() {
-                    self.fallback_test_guards_from_naming(&store, blast.target_file.as_str())?
+                    self.fallback_test_guards_from_naming(store, blast.target_file.as_str())?
                 } else {
                     mapped
                 }
@@ -1687,7 +1652,7 @@ impl AetherMcpServer {
                     target_file = %blast.target_file,
                     "falling back to naming-based test guard inference"
                 );
-                self.fallback_test_guards_from_naming(&store, blast.target_file.as_str())?
+                self.fallback_test_guards_from_naming(store, blast.target_file.as_str())?
             }
         };
 
@@ -1725,7 +1690,7 @@ impl AetherMcpServer {
             });
         }
 
-        let store = self.lock_store()?;
+        let store = self.state.store.as_ref();
         let mut by_id = HashMap::<String, AetherTestIntentEntry>::new();
 
         if let Some(file_path) = file.as_deref()
@@ -1785,7 +1750,7 @@ impl AetherMcpServer {
         &self,
         request: AetherDriftReportRequest,
     ) -> Result<AetherDriftReportResponse, AetherMcpError> {
-        let analyzer = DriftAnalyzer::new(&self.workspace)?;
+        let analyzer = DriftAnalyzer::new(self.workspace())?;
         let report = analyzer.report(AnalysisDriftReportRequest {
             window: request.window,
             include: request
@@ -1894,9 +1859,9 @@ impl AetherMcpServer {
         &self,
         request: AetherTraceCauseRequest,
     ) -> Result<AetherTraceCauseResponse, AetherMcpError> {
-        let store = self.lock_store()?;
-        let target_symbol = self.resolve_trace_cause_symbol(&store, &request)?;
-        let analyzer = CausalAnalyzer::new(&self.workspace)?;
+        let store = self.state.store.as_ref();
+        let target_symbol = self.resolve_trace_cause_symbol(store, &request)?;
+        let analyzer = CausalAnalyzer::new(self.workspace())?;
         let result = analyzer.trace_cause(AnalysisTraceCauseRequest {
             target_symbol_id: target_symbol.id,
             lookback: request.lookback,
@@ -1959,7 +1924,8 @@ impl AetherMcpServer {
         &self,
         request: AetherAcknowledgeDriftRequest,
     ) -> Result<AetherAcknowledgeDriftResponse, AetherMcpError> {
-        let analyzer = DriftAnalyzer::new(&self.workspace)?;
+        self.state.require_writable()?;
+        let analyzer = DriftAnalyzer::new(self.workspace())?;
         let result = analyzer.acknowledge_drift(AnalysisAcknowledgeDriftRequest {
             result_ids: request.result_ids,
             note: request.note,
@@ -2097,7 +2063,7 @@ impl AetherMcpServer {
             });
         }
 
-        let store = self.lock_store()?;
+        let store = self.state.store.as_ref();
         let mut history = store.list_sir_history(symbol_id)?;
         if history.len() > limit as usize {
             let split_idx = history.len().saturating_sub(limit as usize);
@@ -2131,8 +2097,8 @@ impl AetherMcpServer {
         request: AetherVerifyRequest,
     ) -> Result<AetherVerifyResponse, AetherMcpError> {
         let execution = run_verification(
-            &self.workspace,
-            &self.config,
+            self.workspace(),
+            self.state.config.as_ref(),
             VerificationRequest {
                 commands: request.commands,
                 mode: request.mode.map(Into::into),
@@ -2157,7 +2123,7 @@ impl AetherMcpServer {
 
         Ok(AetherVerifyResponse {
             schema_version: MCP_SCHEMA_VERSION,
-            workspace: normalize_path(&self.workspace.to_string_lossy()),
+            workspace: normalize_path(&self.state.workspace.to_string_lossy()),
             mode: execution.mode,
             mode_requested: execution.mode_requested,
             mode_used: execution.mode_used,
@@ -2195,7 +2161,7 @@ impl AetherMcpServer {
             ));
         }
 
-        let store = self.lock_store()?;
+        let store = self.state.store.as_ref();
         let history = store.list_sir_history(symbol_id)?;
         if history.is_empty() {
             return Ok(empty_why_changed_response(
@@ -2266,7 +2232,7 @@ impl AetherMcpServer {
             return Ok(Vec::new());
         }
 
-        let store = self.lock_store()?;
+        let store = self.state.store.as_ref();
         let matches = store.search_symbols(query, limit)?;
 
         Ok(matches
@@ -2289,7 +2255,7 @@ impl AetherMcpServer {
         }
 
         let loaded = load_embedding_provider_from_config(
-            &self.workspace,
+            self.workspace(),
             EmbeddingProviderOverrides::default(),
         )?;
         let Some(loaded) = loaded else {
@@ -2313,7 +2279,12 @@ impl AetherMcpServer {
             ));
         }
 
-        let vector_store = Arc::clone(&self.vector_store);
+        let Some(vector_store) = self.state.vector_store.as_ref().map(Arc::clone) else {
+            return Ok((
+                Vec::new(),
+                Some(SEARCH_FALLBACK_EMBEDDINGS_DISABLED.to_owned()),
+            ));
+        };
         let candidates = vector_store
             .search_nearest(
                 &query_embedding,
@@ -2329,7 +2300,7 @@ impl AetherMcpServer {
             ));
         }
 
-        let store = self.lock_store()?;
+        let store = self.state.store.as_ref();
         let mut matches = Vec::new();
         for candidate in candidates {
             let Some(symbol) = store.get_symbol_search_result(&candidate.symbol_id)? else {
@@ -2378,7 +2349,7 @@ impl AetherMcpServer {
             .cloned()
             .collect::<Vec<_>>();
         let loaded = match load_reranker_provider_from_config(
-            &self.workspace,
+            self.workspace(),
             RerankerProviderOverrides::default(),
         ) {
             Ok(Some(loaded)) => loaded,
@@ -2431,12 +2402,12 @@ impl AetherMcpServer {
             .collect::<Vec<_>>();
 
         let rerank_candidates = {
-            let store = self.lock_store()?;
+            let store = self.state.store.as_ref();
             let mut rerank_candidates = Vec::with_capacity(candidate_matches.len());
             for candidate in &candidate_matches {
                 rerank_candidates.push(RerankCandidate {
                     id: candidate.symbol_id.clone(),
-                    text: self.rerank_candidate_text(&store, candidate)?,
+                    text: self.rerank_candidate_text(store, candidate)?,
                 });
             }
             rerank_candidates
@@ -2537,7 +2508,7 @@ impl AetherMcpServer {
             ));
         }
 
-        let store = self.lock_store()?;
+        let store = self.state.store.as_ref();
         store.increment_symbol_access(&[symbol_id.to_owned()], current_unix_timestamp_millis())?;
         let meta = store.get_sir_meta(symbol_id)?;
         let (sir_status, last_error, last_attempt_at) = meta_status_fields(meta.as_ref());
@@ -2603,7 +2574,7 @@ impl AetherMcpServer {
             return Ok(empty_get_sir_response(SirLevel::File.into(), rollup_id));
         }
 
-        let store = self.lock_store()?;
+        let store = self.state.store.as_ref();
         let meta = store.get_sir_meta(&rollup_id)?;
         let (sir_status, last_error, last_attempt_at) = meta_status_fields(meta.as_ref());
         let blob = store.read_sir_blob(&rollup_id)?;
@@ -2677,8 +2648,8 @@ impl AetherMcpServer {
             });
         }
 
-        let store = self.lock_store()?;
-        let coverage = self.generate_module_rollup_on_demand(&store, &module_path, language)?;
+        let store = self.state.store.as_ref();
+        let coverage = self.generate_module_rollup_on_demand(store, &module_path, language)?;
         let meta = store.get_sir_meta(&coverage.module_id)?;
         let (sir_status, last_error, last_attempt_at) = meta_status_fields(meta.as_ref());
         let blob = store.read_sir_blob(&coverage.module_id)?;
@@ -2731,17 +2702,17 @@ impl AetherMcpServer {
         let value = required_request_field(raw, field_name)?;
         let path = PathBuf::from(value);
         let normalized = if path.is_absolute() {
-            if !path.starts_with(&self.workspace) {
+            if !path.starts_with(self.workspace()) {
                 return Err(AetherMcpError::Message(format!(
                     "{field_name} must be under workspace {}",
-                    self.workspace.display()
+                    self.workspace().display()
                 )));
             }
 
-            let relative = path.strip_prefix(&self.workspace).map_err(|_| {
+            let relative = path.strip_prefix(self.workspace()).map_err(|_| {
                 AetherMcpError::Message(format!(
                     "{field_name} must be under workspace {}",
-                    self.workspace.display()
+                    self.workspace().display()
                 ))
             })?;
             normalize_path(&relative.to_string_lossy())
@@ -2902,7 +2873,7 @@ impl AetherMcpServer {
             &symbol.signature_fingerprint,
         );
         if self.sqlite_path().exists() {
-            let store = self.lock_store()?;
+            let store = self.state.store.as_ref();
             store.increment_symbol_access(
                 std::slice::from_ref(&symbol_id),
                 current_unix_timestamp_millis(),
@@ -2959,11 +2930,11 @@ impl AetherMcpServer {
     }
 
     fn sqlite_path(&self) -> PathBuf {
-        self.workspace.join(".aether").join("meta.sqlite")
+        self.state.workspace.join(".aether").join("meta.sqlite")
     }
 
     fn sir_dir(&self) -> PathBuf {
-        self.workspace.join(".aether").join("sir")
+        self.state.workspace.join(".aether").join("sir")
     }
 
     fn open_sqlite_connection(&self, sqlite_path: &Path) -> Result<Connection, AetherMcpError> {
@@ -2977,14 +2948,14 @@ impl AetherMcpServer {
         let joined = if path.is_absolute() {
             path
         } else {
-            self.workspace.join(path)
+            self.state.workspace.join(path)
         };
 
         let absolute = joined.canonicalize()?;
-        if !absolute.starts_with(&self.workspace) {
+        if !absolute.starts_with(self.workspace()) {
             return Err(AetherMcpError::Message(format!(
                 "file_path must be under workspace {}",
-                self.workspace.display()
+                self.workspace().display()
             )));
         }
 
@@ -2992,7 +2963,7 @@ impl AetherMcpServer {
     }
 
     fn workspace_relative_display_path(&self, absolute_path: &Path) -> String {
-        if let Ok(relative) = absolute_path.strip_prefix(&self.workspace) {
+        if let Ok(relative) = absolute_path.strip_prefix(self.workspace()) {
             return normalize_path(&relative.to_string_lossy());
         }
 
@@ -3007,7 +2978,7 @@ impl AetherMcpServer {
             return Ok(None);
         }
 
-        let store = self.lock_store()?;
+        let store = self.state.store.as_ref();
         let blob = store.read_sir_blob(symbol_id)?;
 
         let Some(blob) = blob else {
@@ -3024,14 +2995,8 @@ impl AetherMcpServer {
             return Ok(None);
         }
 
-        let store = self.lock_store()?;
+        let store = self.state.store.as_ref();
         store.get_sir_meta(symbol_id).map_err(Into::into)
-    }
-
-    fn lock_store(&self) -> Result<MutexGuard<'_, SqliteStore>, AetherMcpError> {
-        self.store.lock().map_err(|err| {
-            AetherMcpError::Message(format!("failed to acquire sqlite store lock: {err}"))
-        })
     }
 
     fn verbose_log(&self, message: &str) {
