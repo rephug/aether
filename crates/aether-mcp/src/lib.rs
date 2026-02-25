@@ -1068,7 +1068,7 @@ impl AetherMcpServer {
         ))
     }
 
-    pub fn aether_dependencies_logic(
+    pub async fn aether_dependencies_logic(
         &self,
         request: AetherDependenciesRequest,
     ) -> Result<AetherDependenciesResponse, AetherMcpError> {
@@ -1109,12 +1109,14 @@ impl AetherMcpServer {
 
         let graph_store = self.state.graph.as_ref();
         let callers = graph_store
-            .get_callers(&symbol.qualified_name)?
+            .get_callers(&symbol.qualified_name)
+            .await?
             .into_iter()
             .map(AetherSymbolLookupMatch::from)
             .collect::<Vec<_>>();
         let dependencies = graph_store
-            .get_dependencies(&symbol.id)?
+            .get_dependencies(&symbol.id)
+            .await?
             .into_iter()
             .map(AetherSymbolLookupMatch::from)
             .collect::<Vec<_>>();
@@ -1129,7 +1131,7 @@ impl AetherMcpServer {
         })
     }
 
-    pub fn aether_call_chain_logic(
+    pub async fn aether_call_chain_logic(
         &self,
         request: AetherCallChainRequest,
     ) -> Result<AetherCallChainResponse, AetherMcpError> {
@@ -1185,7 +1187,8 @@ impl AetherMcpServer {
 
         let graph_store = self.state.graph.as_ref();
         let levels = graph_store
-            .get_call_chain(&start_symbol.id, max_depth)?
+            .get_call_chain(&start_symbol.id, max_depth)
+            .await?
             .into_iter()
             .map(|rows| {
                 rows.into_iter()
@@ -3045,10 +3048,8 @@ impl AetherMcpServer {
         Parameters(request): Parameters<AetherDependenciesRequest>,
     ) -> Result<Json<AetherDependenciesResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_dependencies");
-        let server = self.clone();
-        tokio::task::spawn_blocking(move || server.aether_dependencies_logic(request))
+        self.aether_dependencies_logic(request)
             .await
-            .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)
             .map_err(to_mcp_error)
     }
@@ -3062,10 +3063,8 @@ impl AetherMcpServer {
         Parameters(request): Parameters<AetherCallChainRequest>,
     ) -> Result<Json<AetherCallChainResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_call_chain");
-        let server = self.clone();
-        tokio::task::spawn_blocking(move || server.aether_call_chain_logic(request))
+        self.aether_call_chain_logic(request)
             .await
-            .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)
             .map_err(to_mcp_error)
     }

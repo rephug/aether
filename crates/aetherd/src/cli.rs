@@ -320,6 +320,15 @@ pub struct TraceCauseArgs {
     pub limit: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct GraphMigrateArgs {
+    #[arg(long, help = "Preview migration actions without writing changes")]
+    pub dry_run: bool,
+
+    #[arg(long, default_value = ".", help = "Workspace root to migrate")]
+    pub workspace: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq, Subcommand)]
 pub enum Commands {
     /// Generate agent configuration files for AI coding agents
@@ -350,6 +359,9 @@ pub enum Commands {
     Communities(CommunitiesArgs),
     /// Trace likely upstream semantic causes for a target symbol
     TraceCause(TraceCauseArgs),
+    #[cfg(feature = "legacy-cozo")]
+    /// Migrate graph backend data from CozoDB to SurrealDB
+    GraphMigrate(GraphMigrateArgs),
 }
 
 #[derive(Debug, Clone, Parser)]

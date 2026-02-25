@@ -1,7 +1,10 @@
+#![cfg(feature = "legacy-cozo")]
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
 
+use async_trait::async_trait;
 use cozo::{DataValue, DbInstance, NamedRows, ScriptMutability};
 
 use super::{
@@ -307,6 +310,94 @@ impl CozoGraphStore {
             }
 
             edges.push((source_id, target_id, edge_kind));
+        }
+        Ok(edges)
+    }
+
+    pub fn list_all_symbols_for_migration(&self) -> Result<Vec<SymbolRecord>, StoreError> {
+        let rows = self.run_script(
+            r#"
+            ?[
+                symbol_id,
+                file_path,
+                language,
+                kind,
+                qualified_name,
+                signature_fingerprint,
+                last_seen_at
+            ] :=
+                *symbols{
+                    symbol_id,
+                    qualified_name,
+                    name,
+                    kind,
+                    file_path,
+                    language,
+                    signature_fingerprint,
+                    last_seen_at
+                }
+            :order symbol_id
+            "#,
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+
+        let mut records = rows
+            .rows
+            .iter()
+            .map(|row| Self::row_to_symbol(row.as_slice()))
+            .collect::<Result<Vec<_>, _>>()?;
+        records.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(records)
+    }
+
+    pub fn list_all_edges_for_migration(&self) -> Result<Vec<ResolvedEdge>, StoreError> {
+        let rows = self.run_script(
+            r#"
+            ?[source_id, target_id, edge_kind, file_path] :=
+                *edges{source_id, target_id, edge_kind, file_path}
+            :order source_id, target_id, edge_kind, file_path
+            "#,
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+
+        let mut edges = Vec::new();
+        for row in &rows.rows {
+            if row.len() < 4 {
+                return Err(StoreError::Cozo(
+                    "invalid migration edge row shape".to_owned(),
+                ));
+            }
+            let edge_kind_str = row[2]
+                .get_str()
+                .ok_or_else(|| StoreError::Cozo("invalid migration edge_kind value".to_owned()))?;
+            let edge_kind = match edge_kind_str {
+                "calls" => aether_core::EdgeKind::Calls,
+                "depends_on" => aether_core::EdgeKind::DependsOn,
+                _ => continue,
+            };
+            edges.push(ResolvedEdge {
+                source_id: row[0]
+                    .get_str()
+                    .ok_or_else(|| {
+                        StoreError::Cozo("invalid migration source_id value".to_owned())
+                    })?
+                    .to_owned(),
+                target_id: row[1]
+                    .get_str()
+                    .ok_or_else(|| {
+                        StoreError::Cozo("invalid migration target_id value".to_owned())
+                    })?
+                    .to_owned(),
+                edge_kind,
+                file_path: row[3]
+                    .get_str()
+                    .ok_or_else(|| {
+                        StoreError::Cozo("invalid migration file_path value".to_owned())
+                    })?
+                    .to_owned(),
+            });
         }
         Ok(edges)
     }
@@ -1332,8 +1423,9 @@ impl CozoGraphStore {
     }
 }
 
+#[async_trait]
 impl GraphStore for CozoGraphStore {
-    fn upsert_symbol_node(&self, symbol: &SymbolRecord) -> Result<(), StoreError> {
+    async fn upsert_symbol_node(&self, symbol: &SymbolRecord) -> Result<(), StoreError> {
         let mut params = BTreeMap::new();
         params.insert("symbol_id".to_owned(), DataValue::from(symbol.id.clone()));
         params.insert(
@@ -1401,7 +1493,7 @@ impl GraphStore for CozoGraphStore {
         Ok(())
     }
 
-    fn upsert_edge(&self, edge: &ResolvedEdge) -> Result<(), StoreError> {
+    async fn upsert_edge(&self, edge: &ResolvedEdge) -> Result<(), StoreError> {
         let mut params = BTreeMap::new();
         params.insert(
             "source_id".to_owned(),
@@ -1437,7 +1529,7 @@ impl GraphStore for CozoGraphStore {
         Ok(())
     }
 
-    fn get_callers(&self, qualified_name: &str) -> Result<Vec<SymbolRecord>, StoreError> {
+    async fn get_callers(&self, qualified_name: &str) -> Result<Vec<SymbolRecord>, StoreError> {
         let qualified_name = qualified_name.trim();
         if qualified_name.is_empty() {
             return Ok(Vec::new());
@@ -1483,7 +1575,7 @@ impl GraphStore for CozoGraphStore {
             .collect()
     }
 
-    fn get_dependencies(&self, symbol_id: &str) -> Result<Vec<SymbolRecord>, StoreError> {
+    async fn get_dependencies(&self, symbol_id: &str) -> Result<Vec<SymbolRecord>, StoreError> {
         let symbol_id = symbol_id.trim();
         if symbol_id.is_empty() {
             return Ok(Vec::new());
@@ -1528,7 +1620,7 @@ impl GraphStore for CozoGraphStore {
             .collect()
     }
 
-    fn get_call_chain(
+    async fn get_call_chain(
         &self,
         symbol_id: &str,
         depth: u32,
@@ -1607,7 +1699,7 @@ impl GraphStore for CozoGraphStore {
         Ok(levels)
     }
 
-    fn delete_edges_for_file(&self, file_path: &str) -> Result<(), StoreError> {
+    async fn delete_edges_for_file(&self, file_path: &str) -> Result<(), StoreError> {
         let file_path = file_path.trim();
         if file_path.is_empty() {
             return Ok(());
@@ -1731,8 +1823,8 @@ mod tests {
         assert_eq!(chain[2][0].id, delta.id);
     }
 
-    #[test]
-    fn unresolved_edges_are_skipped_during_sync() {
+    #[tokio::test]
+    async fn unresolved_edges_are_skipped_during_sync() {
         let temp = tempdir().expect("tempdir");
         let store = crate::SqliteStore::open(temp.path()).expect("open sqlite store");
         let graph = CozoGraphStore::open(temp.path()).expect("open cozo graph store");
@@ -1750,6 +1842,7 @@ mod tests {
 
         let stats = store
             .sync_graph_for_file(&graph, "src/lib.rs")
+            .await
             .expect("sync graph for file");
         assert_eq!(stats.resolved_edges, 0);
         assert_eq!(stats.unresolved_edges, 1);

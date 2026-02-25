@@ -12,6 +12,7 @@ aether-infer = { path = "../aether-infer" }
 aether-memory = { path = "../aether-memory" }
 aether-store = { path = "../aether-store" }
 gix.workspace = true
+petgraph = "0.6"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

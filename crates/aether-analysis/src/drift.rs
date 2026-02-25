@@ -1745,8 +1745,7 @@ mod tests {
     use std::process::Command;
 
     use aether_store::{
-        CozoGraphStore, DriftResultRecord, GraphStore, SirMetaRecord, SqliteStore, Store,
-        SymbolRecord,
+        CozoGraphStore, DriftResultRecord, SirMetaRecord, SqliteStore, Store, SymbolRecord,
     };
     use tempfile::tempdir;
 

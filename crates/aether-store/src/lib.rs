@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use aether_config::{GraphBackend, load_workspace_config};
 use aether_core::{EdgeKind, SymbolEdge, content_hash, normalize_path};
+use async_trait::async_trait;
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
     params_from_iter, types::Value as SqlValue,
@@ -15,11 +16,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::from_str as json_from_str;
 use thiserror::Error;
 
+#[cfg(feature = "legacy-cozo")]
 mod graph_cozo;
+#[cfg(not(feature = "legacy-cozo"))]
+mod graph_cozo_compat;
+#[cfg(feature = "legacy-cozo")]
+mod graph_migrate;
 mod graph_sqlite;
+mod graph_surreal;
 mod vector;
+#[cfg(feature = "legacy-cozo")]
 pub use graph_cozo::CozoGraphStore;
+#[cfg(not(feature = "legacy-cozo"))]
+pub use graph_cozo_compat::CozoGraphStore;
+#[cfg(feature = "legacy-cozo")]
+pub use graph_migrate::{GraphMigrationOptions, GraphMigrationResult, migrate_cozo_to_surreal};
 pub use graph_sqlite::SqliteGraphStore;
+pub use graph_surreal::SurrealGraphStore;
 pub use vector::{
     LanceVectorStore, ProjectNoteVectorRecord, ProjectNoteVectorSearchResult, SqliteVectorStore,
     VectorEmbeddingMetaRecord, VectorRecord, VectorSearchResult, VectorStore, open_vector_store,
@@ -29,7 +42,7 @@ const SYMBOL_ACCESS_COUNTER_MAX: i64 = i64::MAX;
 const SYMBOL_ACCESS_DEBOUNCE_SECONDS: u64 = 60;
 const SQLITE_PARAM_CHUNK: usize = 900;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolRecord {
     pub id: String,
     pub file_path: String,
@@ -207,7 +220,7 @@ pub struct CommunitySnapshotRecord {
     pub captured_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CouplingEdgeRecord {
     pub file_a: String,
     pub file_b: String,
@@ -244,7 +257,7 @@ pub struct TestIntentRecord {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TestedByRecord {
     pub target_file: String,
     pub test_file: String,
@@ -321,6 +334,8 @@ pub enum StoreError {
     Config(#[from] aether_config::ConfigError),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("graph error: {0}")]
+    Graph(String),
     #[error("cozo error: {0}")]
     Cozo(String),
     #[error("lancedb error: {0}")]
@@ -505,26 +520,40 @@ pub trait Store {
     ) -> Result<Vec<TestIntentRecord>, StoreError>;
 }
 
+#[async_trait]
 pub trait GraphStore: Send + Sync {
-    fn upsert_symbol_node(&self, symbol: &SymbolRecord) -> Result<(), StoreError>;
-    fn upsert_edge(&self, edge: &ResolvedEdge) -> Result<(), StoreError>;
-    fn get_callers(&self, qualified_name: &str) -> Result<Vec<SymbolRecord>, StoreError>;
-    fn get_dependencies(&self, symbol_id: &str) -> Result<Vec<SymbolRecord>, StoreError>;
-    fn get_call_chain(
+    async fn upsert_symbol_node(&self, symbol: &SymbolRecord) -> Result<(), StoreError>;
+    async fn upsert_edge(&self, edge: &ResolvedEdge) -> Result<(), StoreError>;
+    async fn get_callers(&self, qualified_name: &str) -> Result<Vec<SymbolRecord>, StoreError>;
+    async fn get_dependencies(&self, symbol_id: &str) -> Result<Vec<SymbolRecord>, StoreError>;
+    async fn get_call_chain(
         &self,
         symbol_id: &str,
         depth: u32,
     ) -> Result<Vec<Vec<SymbolRecord>>, StoreError>;
-    fn delete_edges_for_file(&self, file_path: &str) -> Result<(), StoreError>;
+    async fn delete_edges_for_file(&self, file_path: &str) -> Result<(), StoreError>;
 }
 
-pub fn open_graph_store(
+pub async fn open_graph_store(
     workspace_root: impl AsRef<Path>,
 ) -> Result<Box<dyn GraphStore>, StoreError> {
     let workspace_root = workspace_root.as_ref();
     let config = load_workspace_config(workspace_root)?;
     match config.storage.graph_backend {
-        GraphBackend::Cozo => Ok(Box::new(CozoGraphStore::open(workspace_root)?)),
+        GraphBackend::Surreal => Ok(Box::new(SurrealGraphStore::open(workspace_root).await?)),
+        GraphBackend::Cozo => {
+            #[cfg(feature = "legacy-cozo")]
+            {
+                tracing::warn!("CozoDB backend is deprecated. Run 'aether graph-migrate'");
+                Ok(Box::new(CozoGraphStore::open(workspace_root)?))
+            }
+            #[cfg(not(feature = "legacy-cozo"))]
+            {
+                Err(StoreError::Graph(
+                    "graph_backend=cozo requires building with feature `legacy-cozo`; run `aether graph-migrate`".to_owned(),
+                ))
+            }
+        }
         GraphBackend::Sqlite => Ok(Box::new(SqliteGraphStore::open(workspace_root)?)),
     }
 }
@@ -535,6 +564,7 @@ pub fn open_graph_store_readonly(
     let workspace_root = workspace_root.as_ref();
     let config = load_workspace_config(workspace_root)?;
     match config.storage.graph_backend {
+        GraphBackend::Surreal => Ok(Box::new(CozoGraphStore::open_readonly(workspace_root)?)),
         GraphBackend::Cozo => Ok(Box::new(CozoGraphStore::open_readonly(workspace_root)?)),
         GraphBackend::Sqlite => Ok(Box::new(SqliteGraphStore::open_readonly(workspace_root)?)),
     }
@@ -956,7 +986,7 @@ impl SqliteStore {
         Ok(records)
     }
 
-    pub fn sync_graph_for_file(
+    pub async fn sync_graph_for_file(
         &self,
         graph_store: &dyn GraphStore,
         file_path: &str,
@@ -969,63 +999,67 @@ impl SqliteStore {
             });
         }
 
-        graph_store.delete_edges_for_file(file_path)?;
+        graph_store.delete_edges_for_file(file_path).await?;
 
         let symbols = self.list_symbols_for_file(file_path)?;
         for symbol in &symbols {
-            graph_store.upsert_symbol_node(symbol)?;
+            graph_store.upsert_symbol_node(symbol).await?;
         }
 
-        let mut unresolved_edges = 0usize;
-        let conn = self.conn.lock().unwrap();
-        let mut unresolved_stmt = conn.prepare(
-            r#"
-            SELECT e.source_id, e.target_qualified_name
-            FROM symbol_edges e
-            LEFT JOIN symbols s ON s.qualified_name = e.target_qualified_name
-            WHERE e.file_path = ?1
-              AND e.edge_kind = 'calls'
-              AND s.id IS NULL
-            ORDER BY e.source_id ASC, e.target_qualified_name ASC
-            "#,
-        )?;
-        let unresolved_rows = unresolved_stmt.query_map(params![file_path], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in unresolved_rows {
-            let (source_id, target_qualified_name) = row?;
-            unresolved_edges += 1;
-            tracing::debug!(
-                source_id = %source_id,
-                target_qualified_name = %target_qualified_name,
-                file_path = %file_path,
-                "unresolved call edge skipped during graph sync"
-            );
-        }
+        let (unresolved_edges, resolved) = {
+            let conn = self.conn.lock().unwrap();
+            let mut unresolved_edges = 0usize;
+            let mut unresolved_stmt = conn.prepare(
+                r#"
+                SELECT e.source_id, e.target_qualified_name
+                FROM symbol_edges e
+                LEFT JOIN symbols s ON s.qualified_name = e.target_qualified_name
+                WHERE e.file_path = ?1
+                  AND e.edge_kind = 'calls'
+                  AND s.id IS NULL
+                ORDER BY e.source_id ASC, e.target_qualified_name ASC
+                "#,
+            )?;
+            let unresolved_rows = unresolved_stmt.query_map(params![file_path], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in unresolved_rows {
+                let (source_id, target_qualified_name) = row?;
+                unresolved_edges += 1;
+                tracing::debug!(
+                    source_id = %source_id,
+                    target_qualified_name = %target_qualified_name,
+                    file_path = %file_path,
+                    "unresolved call edge skipped during graph sync"
+                );
+            }
 
-        let mut resolved_stmt = conn.prepare(
-            r#"
-            SELECT e.source_id, s.id, e.file_path
-            FROM symbol_edges e
-            JOIN symbols s ON s.qualified_name = e.target_qualified_name
-            WHERE e.file_path = ?1
-              AND e.edge_kind = 'calls'
-            ORDER BY e.source_id ASC, s.id ASC
-            "#,
-        )?;
-        let resolved_rows = resolved_stmt.query_map(params![file_path], |row| {
-            Ok(ResolvedEdge {
-                source_id: row.get(0)?,
-                target_id: row.get(1)?,
-                edge_kind: EdgeKind::Calls,
-                file_path: row.get(2)?,
-            })
-        })?;
+            let mut resolved_stmt = conn.prepare(
+                r#"
+                SELECT e.source_id, s.id, e.file_path
+                FROM symbol_edges e
+                JOIN symbols s ON s.qualified_name = e.target_qualified_name
+                WHERE e.file_path = ?1
+                  AND e.edge_kind = 'calls'
+                ORDER BY e.source_id ASC, s.id ASC
+                "#,
+            )?;
+            let resolved_rows = resolved_stmt.query_map(params![file_path], |row| {
+                Ok(ResolvedEdge {
+                    source_id: row.get(0)?,
+                    target_id: row.get(1)?,
+                    edge_kind: EdgeKind::Calls,
+                    file_path: row.get(2)?,
+                })
+            })?;
+            let resolved: Vec<ResolvedEdge> = resolved_rows.collect::<Result<Vec<_>, _>>()?;
+            (unresolved_edges, resolved)
+        };
 
         let mut resolved_edges = 0usize;
-        for edge in resolved_rows {
+        for edge in &resolved {
             resolved_edges += 1;
-            graph_store.upsert_edge(&edge?)?;
+            graph_store.upsert_edge(edge).await?;
         }
 
         Ok(GraphSyncStats {
@@ -3887,11 +3921,13 @@ mod tests {
         assert_eq!(deps_after_delete.len(), 1);
     }
 
-    #[test]
-    fn sync_graph_for_file_skips_unresolved_calls() {
+    #[tokio::test]
+    async fn sync_graph_for_file_skips_unresolved_calls() {
         let temp = tempdir().expect("tempdir");
         let store = SqliteStore::open(temp.path()).expect("open store");
-        let graph = CozoGraphStore::open(temp.path()).expect("open cozo graph store");
+        let graph = SurrealGraphStore::open(temp.path())
+            .await
+            .expect("open surreal graph store");
 
         let alpha = SymbolRecord {
             id: "sym-alpha".to_owned(),
@@ -3909,18 +3945,21 @@ mod tests {
 
         let stats = store
             .sync_graph_for_file(&graph, "src/lib.rs")
+            .await
             .expect("sync graph for file");
         assert_eq!(stats.resolved_edges, 0);
         assert_eq!(stats.unresolved_edges, 1);
 
         let deps = graph
             .get_dependencies(&alpha.id)
+            .await
             .expect("query dependencies");
         assert!(deps.is_empty());
     }
 
-    #[test]
-    fn graph_backend_config_toggle_switches_between_sqlite_and_cozo() {
+    #[cfg(feature = "legacy-cozo")]
+    #[tokio::test]
+    async fn graph_backend_config_toggle_switches_between_sqlite_and_cozo() {
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();
         fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
@@ -3958,9 +3997,12 @@ graph_backend = "sqlite"
             .upsert_edges(&[calls_edge(&alpha.id, "beta", "src/lib.rs")])
             .expect("upsert call edge");
 
-        let sqlite_graph = open_graph_store(workspace).expect("open sqlite graph backend");
+        let sqlite_graph = open_graph_store(workspace)
+            .await
+            .expect("open sqlite graph backend");
         let sqlite_deps = sqlite_graph
             .get_dependencies(&alpha.id)
+            .await
             .expect("query sqlite backend");
         assert_eq!(sqlite_deps.len(), 1);
         assert_eq!(sqlite_deps[0].id, beta.id);
@@ -3974,15 +4016,19 @@ graph_backend = "cozo"
         )
         .expect("write cozo graph config");
 
-        let cozo_graph = open_graph_store(workspace).expect("open cozo graph backend");
+        let cozo_graph = open_graph_store(workspace)
+            .await
+            .expect("open cozo graph backend");
         let stats = store
             .sync_graph_for_file(cozo_graph.as_ref(), "src/lib.rs")
+            .await
             .expect("sync cozo graph");
         assert_eq!(stats.resolved_edges, 1);
         assert_eq!(stats.unresolved_edges, 0);
 
         let cozo_deps = cozo_graph
             .get_dependencies(&alpha.id)
+            .await
             .expect("query cozo backend");
         assert_eq!(cozo_deps.len(), 1);
         assert_eq!(cozo_deps[0].id, beta.id);

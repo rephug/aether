@@ -406,11 +406,15 @@ impl SirPipeline {
     }
 
     fn sync_graph_for_file(&self, store: &SqliteStore, file_path: &str) -> Result<()> {
-        let graph_store = open_graph_store(&self.workspace_root)
-            .context("failed to open configured graph store")?;
-        let stats = store
-            .sync_graph_for_file(graph_store.as_ref(), file_path)
-            .with_context(|| format!("failed to sync graph edges for file {file_path}"))?;
+        let stats = self.runtime.block_on(async {
+            let graph_store = open_graph_store(&self.workspace_root)
+                .await
+                .context("failed to open configured graph store")?;
+            store
+                .sync_graph_for_file(graph_store.as_ref(), file_path)
+                .await
+                .with_context(|| format!("failed to sync graph edges for file {file_path}"))
+        })?;
 
         if stats.unresolved_edges > 0 {
             tracing::debug!(

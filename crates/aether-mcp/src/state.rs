@@ -147,7 +147,7 @@ fn open_shared_graph(
     // Using the sqlite-backed `GraphStore` avoids Cozo/sled file-lock contention with analyzers
     // that still open their own Cozo handles in the same process.
     let graph: Arc<dyn GraphStore> = match config.storage.graph_backend {
-        GraphBackend::Sqlite | GraphBackend::Cozo => {
+        GraphBackend::Surreal | GraphBackend::Sqlite | GraphBackend::Cozo => {
             if read_only {
                 Arc::new(SqliteGraphStore::open_readonly(workspace)?)
             } else {
