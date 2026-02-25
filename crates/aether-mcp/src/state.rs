@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use aether_config::{AetherConfig, EmbeddingVectorBackend, GraphBackend, load_workspace_config};
 use aether_store::{
-    GraphStore, SchemaVersion, SqliteGraphStore, SqliteStore, SqliteVectorStore, VectorStore,
-    open_vector_store,
+    GraphStore, SchemaVersion, SqliteGraphStore, SqliteStore, SqliteVectorStore, SurrealGraphStore,
+    VectorStore, open_vector_store,
 };
 
 use crate::AetherMcpError;
@@ -57,6 +57,26 @@ impl SharedState {
             vector_store,
             config,
             read_only: false,
+            schema_version,
+        })
+    }
+
+    pub async fn open_readonly_async(workspace: &Path) -> Result<Self, AetherMcpError> {
+        let workspace = workspace.canonicalize()?;
+        let config = Arc::new(load_config(&workspace)?);
+        let store = Arc::new(SqliteStore::open_readonly(&workspace)?);
+        store.check_compatibility("core", 1)?;
+        let graph = open_shared_graph_async(&workspace, &config, true).await?;
+        let vector_store = open_vector_store_async_optional(&workspace, &config).await?;
+        let schema_version = store.get_schema_version()?;
+
+        Ok(Self {
+            workspace,
+            store,
+            graph,
+            vector_store,
+            config,
+            read_only: true,
             schema_version,
         })
     }
@@ -152,6 +172,30 @@ fn open_shared_graph(
                 Arc::new(SqliteGraphStore::open_readonly(workspace)?)
             } else {
                 Arc::new(SqliteGraphStore::open(workspace)?)
+            }
+        }
+    };
+    Ok(graph)
+}
+
+async fn open_shared_graph_async(
+    workspace: &Path,
+    config: &AetherConfig,
+    read_only: bool,
+) -> Result<Arc<dyn GraphStore>, AetherMcpError> {
+    let graph: Arc<dyn GraphStore> = match config.storage.graph_backend {
+        GraphBackend::Sqlite | GraphBackend::Cozo => {
+            if read_only {
+                Arc::new(SqliteGraphStore::open_readonly(workspace)?)
+            } else {
+                Arc::new(SqliteGraphStore::open(workspace)?)
+            }
+        }
+        GraphBackend::Surreal => {
+            if read_only {
+                Arc::new(SurrealGraphStore::open_readonly(workspace).await?)
+            } else {
+                Arc::new(SurrealGraphStore::open(workspace).await?)
             }
         }
     };

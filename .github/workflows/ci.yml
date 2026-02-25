@@ -55,6 +55,7 @@ jobs:
           - aether-store
           - aether-memory
           - aether-analysis
+          - aether-query
           - aether-mcp
           - aether-infer
           - aether-parse
