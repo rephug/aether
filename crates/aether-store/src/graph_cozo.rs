@@ -17,16 +17,39 @@ pub type CrossCommunityEdge = (String, String, String, i64, i64);
 
 impl CozoGraphStore {
     pub fn open(workspace_root: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_internal(workspace_root, false)
+    }
+
+    pub fn open_readonly(workspace_root: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_internal(workspace_root, true)
+    }
+
+    fn open_internal(
+        workspace_root: impl AsRef<Path>,
+        read_only: bool,
+    ) -> Result<Self, StoreError> {
         let workspace_root = workspace_root.as_ref();
         let aether_dir = workspace_root.join(".aether");
         let graph_path = aether_dir.join("graph.db");
-        fs::create_dir_all(&aether_dir)?;
+        if !read_only {
+            fs::create_dir_all(&aether_dir)?;
+        }
 
         let graph_path_str = graph_path.to_string_lossy().to_string();
-        let db = DbInstance::new("sled", &graph_path_str, Default::default())
-            .map_err(|err| StoreError::Cozo(err.to_string()))?;
+        let db = DbInstance::new(
+            "sled",
+            &graph_path_str,
+            if read_only {
+                r#"{"read_only":true}"#
+            } else {
+                ""
+            },
+        )
+        .map_err(|err| StoreError::Cozo(err.to_string()))?;
         let store = Self { db };
-        store.ensure_schema()?;
+        if !read_only {
+            store.ensure_schema()?;
+        }
         Ok(store)
     }
 

@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use aether_config::{GraphBackend, load_workspace_config};
 use aether_core::{EdgeKind, SymbolEdge, content_hash, normalize_path};
 use rusqlite::{
-    Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
-    types::Value as SqlValue,
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+    params_from_iter, types::Value as SqlValue,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::from_str as json_from_str;
@@ -304,6 +304,13 @@ pub struct UpstreamDependencyTraversal {
     pub edges: Vec<UpstreamDependencyEdgeRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaVersion {
+    pub component: String,
+    pub version: u32,
+    pub migrated_at: i64,
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("io error: {0}")]
@@ -318,6 +325,8 @@ pub enum StoreError {
     Cozo(String),
     #[error("lancedb error: {0}")]
     LanceDb(String),
+    #[error("schema compatibility error: {0}")]
+    Compatibility(String),
 }
 
 pub trait Store {
@@ -520,8 +529,19 @@ pub fn open_graph_store(
     }
 }
 
+pub fn open_graph_store_readonly(
+    workspace_root: impl AsRef<Path>,
+) -> Result<Box<dyn GraphStore>, StoreError> {
+    let workspace_root = workspace_root.as_ref();
+    let config = load_workspace_config(workspace_root)?;
+    match config.storage.graph_backend {
+        GraphBackend::Cozo => Ok(Box::new(CozoGraphStore::open_readonly(workspace_root)?)),
+        GraphBackend::Sqlite => Ok(Box::new(SqliteGraphStore::open_readonly(workspace_root)?)),
+    }
+}
+
 pub struct SqliteStore {
-    conn: Connection,
+    conn: Mutex<Connection>,
     aether_dir: PathBuf,
     sir_dir: PathBuf,
     mirror_sir_files: bool,
@@ -530,21 +550,43 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     pub fn open(workspace_root: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_with_flags(
+            workspace_root,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+            false,
+        )
+    }
+
+    pub fn open_readonly(workspace_root: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_with_flags(workspace_root, OpenFlags::SQLITE_OPEN_READ_ONLY, true)
+    }
+
+    fn open_with_flags(
+        workspace_root: impl AsRef<Path>,
+        flags: OpenFlags,
+        read_only: bool,
+    ) -> Result<Self, StoreError> {
         let workspace_root = workspace_root.as_ref();
         let config = load_workspace_config(workspace_root)?;
         let aether_dir = workspace_root.join(".aether");
         let sir_dir = aether_dir.join("sir");
         let sqlite_path = aether_dir.join("meta.sqlite");
 
-        fs::create_dir_all(&sir_dir)?;
+        if !read_only {
+            fs::create_dir_all(&sir_dir)?;
+        }
 
-        let conn = Connection::open(sqlite_path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        let conn = Connection::open_with_flags(sqlite_path, flags)?;
+        if !read_only {
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+        }
         conn.busy_timeout(Duration::from_secs(5))?;
-        run_migrations(&conn)?;
+        if !read_only {
+            run_migrations(&conn)?;
+        }
 
         Ok(Self {
-            conn,
+            conn: Mutex::new(conn),
             aether_dir,
             sir_dir,
             mirror_sir_files: config.storage.mirror_sir_files,
@@ -564,6 +606,54 @@ impl SqliteStore {
         self.mirror_sir_files
     }
 
+    pub fn get_schema_version(&self) -> Result<SchemaVersion, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            r#"
+            SELECT component, version, migrated_at
+            FROM schema_version
+            WHERE component = 'core'
+            "#,
+            [],
+            |row| {
+                Ok(SchemaVersion {
+                    component: row.get(0)?,
+                    version: row.get::<_, i64>(1)? as u32,
+                    migrated_at: row.get(2)?,
+                })
+            },
+        )
+        .map_err(Into::into)
+    }
+
+    pub fn check_compatibility(
+        &self,
+        component: &str,
+        max_supported: u32,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let found = conn
+            .query_row(
+                r#"
+                SELECT version
+                FROM schema_version
+                WHERE component = ?1
+                "#,
+                params![component],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        match found {
+            Some(version) if version >= 0 && (version as u32) <= max_supported => Ok(()),
+            Some(version) => Err(StoreError::Compatibility(format!(
+                "component '{component}' schema version {version} exceeds max supported {max_supported}"
+            ))),
+            None => Err(StoreError::Compatibility(format!(
+                "missing schema_version row for component '{component}'"
+            ))),
+        }
+    }
+
     fn sir_blob_path(&self, symbol_id: &str) -> PathBuf {
         self.sir_dir.join(format!("{symbol_id}.json"))
     }
@@ -573,7 +663,7 @@ impl SqliteStore {
         symbol_id: &str,
         sir_json_string: &str,
     ) -> Result<(), StoreError> {
-        self.conn.execute(
+        self.conn.lock().unwrap().execute(
             r#"
             INSERT INTO sir (id, sir_hash, sir_version, provider, model, updated_at, sir_json)
             VALUES (?1, '', 1, '', '', unixepoch(), ?2)
@@ -587,7 +677,8 @@ impl SqliteStore {
     }
 
     fn read_sir_json_from_db(&self, symbol_id: &str) -> Result<Option<String>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             r#"
             SELECT sir_json
             FROM sir
@@ -608,7 +699,8 @@ impl SqliteStore {
         &self,
         symbol_id: &str,
     ) -> Result<Option<SymbolSearchResult>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             r#"
             SELECT id, qualified_name, file_path, language, kind, access_count, last_accessed_at
             FROM symbols
@@ -649,6 +741,7 @@ impl SqliteStore {
         }
 
         let mut records = HashMap::new();
+        let conn = self.conn.lock().unwrap();
         for chunk in normalized.chunks(SQLITE_PARAM_CHUNK) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
@@ -667,7 +760,7 @@ impl SqliteStore {
                 .cloned()
                 .map(SqlValue::Text)
                 .collect::<Vec<_>>();
-            let mut stmt = self.conn.prepare(sql.as_str())?;
+            let mut stmt = conn.prepare(sql.as_str())?;
             let rows = stmt.query_map(params_from_iter(params_vec), |row| {
                 Ok(SymbolSearchResult {
                     symbol_id: row.get(0)?,
@@ -690,7 +783,8 @@ impl SqliteStore {
     }
 
     pub fn get_symbol_record(&self, symbol_id: &str) -> Result<Option<SymbolRecord>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             r#"
             SELECT id, file_path, language, kind, qualified_name, signature_fingerprint, last_seen_at
             FROM symbols
@@ -724,7 +818,8 @@ impl SqliteStore {
             return Ok(None);
         }
 
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             r#"
             SELECT id, file_path, language, kind, qualified_name, signature_fingerprint, last_seen_at
             FROM symbols
@@ -763,7 +858,8 @@ impl SqliteStore {
         }
 
         let like_pattern = format!("{module_path}/%");
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             r#"
             SELECT DISTINCT file_path
             FROM symbols
@@ -805,6 +901,7 @@ impl SqliteStore {
         }
 
         let mut records = Vec::new();
+        let conn = self.conn.lock().unwrap();
         for chunk in normalized.chunks(SQLITE_PARAM_CHUNK) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
@@ -826,7 +923,7 @@ impl SqliteStore {
             ];
             params_vec.extend(chunk.iter().cloned().map(SqlValue::Text));
 
-            let mut stmt = self.conn.prepare(sql.as_str())?;
+            let mut stmt = conn.prepare(sql.as_str())?;
             let rows = stmt.query_map(params_from_iter(params_vec), |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -880,7 +977,8 @@ impl SqliteStore {
         }
 
         let mut unresolved_edges = 0usize;
-        let mut unresolved_stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut unresolved_stmt = conn.prepare(
             r#"
             SELECT e.source_id, e.target_qualified_name
             FROM symbol_edges e
@@ -905,7 +1003,7 @@ impl SqliteStore {
             );
         }
 
-        let mut resolved_stmt = self.conn.prepare(
+        let mut resolved_stmt = conn.prepare(
             r#"
             SELECT e.source_id, s.id, e.file_path
             FROM symbol_edges e
@@ -939,7 +1037,7 @@ impl SqliteStore {
 
 impl Store for SqliteStore {
     fn upsert_symbol(&self, record: SymbolRecord) -> Result<(), StoreError> {
-        self.conn.execute(
+        self.conn.lock().unwrap().execute(
             r#"
             INSERT INTO symbols (
                 id, file_path, language, kind, qualified_name, signature_fingerprint, last_seen_at
@@ -967,18 +1065,19 @@ impl Store for SqliteStore {
     }
 
     fn mark_removed(&self, symbol_id: &str) -> Result<(), StoreError> {
-        self.conn.execute(
-            "DELETE FROM sir_embeddings WHERE symbol_id = ?1",
-            params![symbol_id],
-        )?;
-        self.conn.execute(
-            "DELETE FROM sir_history WHERE symbol_id = ?1",
-            params![symbol_id],
-        )?;
-        self.conn
-            .execute("DELETE FROM symbols WHERE id = ?1", params![symbol_id])?;
-        self.conn
-            .execute("DELETE FROM sir WHERE id = ?1", params![symbol_id])?;
+        {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "DELETE FROM sir_embeddings WHERE symbol_id = ?1",
+                params![symbol_id],
+            )?;
+            conn.execute(
+                "DELETE FROM sir_history WHERE symbol_id = ?1",
+                params![symbol_id],
+            )?;
+            conn.execute("DELETE FROM symbols WHERE id = ?1", params![symbol_id])?;
+            conn.execute("DELETE FROM sir WHERE id = ?1", params![symbol_id])?;
+        }
 
         let path = self.sir_blob_path(symbol_id);
         match fs::remove_file(path) {
@@ -991,7 +1090,8 @@ impl Store for SqliteStore {
     }
 
     fn list_symbols_for_file(&self, file_path: &str) -> Result<Vec<SymbolRecord>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             r#"
             SELECT id, file_path, language, kind, qualified_name, signature_fingerprint, last_seen_at
             FROM symbols
@@ -1029,7 +1129,8 @@ impl Store for SqliteStore {
         let capped_limit = limit.clamp(1, 100) as i64;
         let pattern = format!("%{query}%");
 
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             r#"
             SELECT id, qualified_name, file_path, language, kind, access_count, last_accessed_at
             FROM symbols
@@ -1078,7 +1179,8 @@ impl Store for SqliteStore {
             return Ok(());
         }
 
-        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
         {
             let mut stmt = tx.prepare(
                 r#"
@@ -1149,7 +1251,8 @@ impl Store for SqliteStore {
             return Ok(());
         }
 
-        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
         {
             let mut stmt = tx.prepare(
                 r#"
@@ -1181,7 +1284,8 @@ impl Store for SqliteStore {
             return Ok(Vec::new());
         }
 
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             r#"
             SELECT source_id, target_qualified_name, file_path
             FROM symbol_edges
@@ -1210,7 +1314,8 @@ impl Store for SqliteStore {
             return Ok(Vec::new());
         }
 
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             r#"
             SELECT source_id, target_qualified_name, file_path
             FROM symbol_edges
@@ -1234,7 +1339,7 @@ impl Store for SqliteStore {
     }
 
     fn delete_edges_for_file(&self, file_path: &str) -> Result<(), StoreError> {
-        self.conn.execute(
+        self.conn.lock().unwrap().execute(
             "DELETE FROM symbol_edges WHERE file_path = ?1",
             params![file_path],
         )?;
@@ -1275,7 +1380,7 @@ impl Store for SqliteStore {
     }
 
     fn upsert_sir_meta(&self, record: SirMetaRecord) -> Result<(), StoreError> {
-        self.conn.execute(
+        self.conn.lock().unwrap().execute(
             r#"
             INSERT INTO sir (
                 id, sir_hash, sir_version, provider, model, updated_at,
@@ -1309,7 +1414,8 @@ impl Store for SqliteStore {
     }
 
     fn get_sir_meta(&self, symbol_id: &str) -> Result<Option<SirMetaRecord>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             r#"
             SELECT
                 id,
@@ -1346,7 +1452,8 @@ impl Store for SqliteStore {
     }
 
     fn list_sir_history(&self, symbol_id: &str) -> Result<Vec<SirHistoryRecord>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             r#"
             SELECT symbol_id, version, sir_hash, provider, model, created_at, sir_json, commit_hash
             FROM sir_history
@@ -1424,7 +1531,8 @@ impl Store for SqliteStore {
     ) -> Result<SirVersionWriteResult, StoreError> {
         let created_at = created_at.max(0);
         let commit_hash = normalize_commit_hash(commit_hash);
-        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
 
         let write_result = {
             let mut latest_stmt = tx.prepare(
@@ -1516,7 +1624,7 @@ impl Store for SqliteStore {
         let embedding_dim = record.embedding.len() as i64;
         let embedding_json = serde_json::to_string(&record.embedding)?;
 
-        self.conn.execute(
+        self.conn.lock().unwrap().execute(
             r#"
             INSERT INTO sir_embeddings (
                 symbol_id, sir_hash, provider, model, embedding_dim, embedding_json, updated_at
@@ -1548,7 +1656,8 @@ impl Store for SqliteStore {
         &self,
         symbol_id: &str,
     ) -> Result<Option<SymbolEmbeddingMetaRecord>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             r#"
             SELECT symbol_id, sir_hash, provider, model, embedding_dim, updated_at
             FROM sir_embeddings
@@ -1573,7 +1682,7 @@ impl Store for SqliteStore {
     }
 
     fn delete_symbol_embedding(&self, symbol_id: &str) -> Result<(), StoreError> {
-        self.conn.execute(
+        self.conn.lock().unwrap().execute(
             "DELETE FROM sir_embeddings WHERE symbol_id = ?1",
             params![symbol_id],
         )?;
@@ -1603,43 +1712,46 @@ impl Store for SqliteStore {
         let query_norm = query_norm_sq.sqrt();
         let capped_limit = limit.clamp(1, 100) as usize;
 
-        let mut stmt = self.conn.prepare(
-            r#"
-            SELECT symbol_id, embedding_json
-            FROM sir_embeddings
-            WHERE provider = ?1
-              AND model = ?2
-              AND embedding_dim = ?3
-            "#,
-        )?;
-        let rows = stmt.query_map(
-            params![provider, model, query_embedding.len() as i64],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )?;
-
         let mut scored = Vec::new();
-        for row in rows {
-            let (symbol_id, embedding_json) = row?;
-            let embedding = json_from_str::<Vec<f32>>(&embedding_json)?;
-            if embedding.len() != query_embedding.len() {
-                continue;
-            }
+        {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT symbol_id, embedding_json
+                FROM sir_embeddings
+                WHERE provider = ?1
+                  AND model = ?2
+                  AND embedding_dim = ?3
+                "#,
+            )?;
+            let rows = stmt.query_map(
+                params![provider, model, query_embedding.len() as i64],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?;
 
-            let dot = embedding
-                .iter()
-                .zip(query_embedding.iter())
-                .map(|(left, right)| left * right)
-                .fold(0.0f32, |acc, value| acc + value);
-            let embedding_norm_sq = embedding
-                .iter()
-                .map(|value| value * value)
-                .fold(0.0f32, |acc, value| acc + value);
-            if embedding_norm_sq <= f32::EPSILON {
-                continue;
-            }
+            for row in rows {
+                let (symbol_id, embedding_json) = row?;
+                let embedding = json_from_str::<Vec<f32>>(&embedding_json)?;
+                if embedding.len() != query_embedding.len() {
+                    continue;
+                }
 
-            let score = dot / (embedding_norm_sq.sqrt() * query_norm);
-            scored.push((symbol_id, score));
+                let dot = embedding
+                    .iter()
+                    .zip(query_embedding.iter())
+                    .map(|(left, right)| left * right)
+                    .fold(0.0f32, |acc, value| acc + value);
+                let embedding_norm_sq = embedding
+                    .iter()
+                    .map(|value| value * value)
+                    .fold(0.0f32, |acc, value| acc + value);
+                if embedding_norm_sq <= f32::EPSILON {
+                    continue;
+                }
+
+                let score = dot / (embedding_norm_sq.sqrt() * query_norm);
+                scored.push((symbol_id, score));
+            }
         }
 
         scored.sort_by(|left, right| {
@@ -1678,7 +1790,7 @@ impl Store for SqliteStore {
             return Ok(());
         }
 
-        self.conn.execute(
+        self.conn.lock().unwrap().execute(
             r#"
             INSERT INTO threshold_calibration (
                 language, threshold, sample_size, provider, model, calibrated_at
@@ -1713,7 +1825,8 @@ impl Store for SqliteStore {
             return Ok(None);
         }
 
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             r#"
             SELECT language, threshold, sample_size, provider, model, calibrated_at
             FROM threshold_calibration
@@ -1738,7 +1851,8 @@ impl Store for SqliteStore {
     }
 
     fn list_threshold_calibrations(&self) -> Result<Vec<ThresholdCalibrationRecord>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             r#"
             SELECT language, threshold, sample_size, provider, model, calibrated_at
             FROM threshold_calibration
@@ -1772,7 +1886,8 @@ impl Store for SqliteStore {
             return Ok(Vec::new());
         }
 
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             r#"
             SELECT e.symbol_id, s.file_path, s.language, e.embedding_json
             FROM sir_embeddings e
@@ -1814,7 +1929,7 @@ impl Store for SqliteStore {
         let symbol_refs_json = serde_json::to_string(&record.symbol_refs)?;
         let archived = if record.is_archived { 1 } else { 0 };
 
-        self.conn.execute(
+        self.conn.lock().unwrap().execute(
             r#"
             INSERT INTO project_notes (
                 note_id, content, content_hash, source_type, source_agent,
@@ -1893,7 +2008,8 @@ impl Store for SqliteStore {
             "#
         };
 
-        let mut stmt = self.conn.prepare(sql)?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(sql)?;
         let row = stmt
             .query_row(params![content_hash], |row| {
                 project_note_tuple_from_row(row)
@@ -1909,7 +2025,8 @@ impl Store for SqliteStore {
             return Ok(None);
         }
 
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             r#"
             SELECT
                 note_id, content, content_hash, source_type, source_agent,
@@ -1957,7 +2074,8 @@ impl Store for SqliteStore {
         sql.push_str(" ORDER BY updated_at DESC, note_id ASC LIMIT ?");
         params_vec.push(SqlValue::Integer(limit.clamp(1, 100) as i64));
 
-        let mut stmt = self.conn.prepare(sql.as_str())?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(sql.as_str())?;
         let rows = stmt.query_map(params_from_iter(params_vec), project_note_tuple_from_row)?;
 
         let mut records = Vec::new();
@@ -1978,7 +2096,8 @@ impl Store for SqliteStore {
             return Ok(Vec::new());
         }
 
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             r#"
             SELECT
                 note_id, content, content_hash, source_type, source_agent,
@@ -2066,7 +2185,8 @@ impl Store for SqliteStore {
         sql.push_str(" ORDER BY updated_at DESC, note_id ASC LIMIT ?");
         params_vec.push(SqlValue::Integer(limit.clamp(1, 100) as i64));
 
-        let mut stmt = self.conn.prepare(sql.as_str())?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(sql.as_str())?;
         let rows = stmt.query_map(params_from_iter(params_vec), project_note_tuple_from_row)?;
 
         let mut records = Vec::new();
@@ -2086,7 +2206,8 @@ impl Store for SqliteStore {
             return Ok(());
         }
 
-        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
         {
             let mut stmt = tx.prepare(
                 r#"
@@ -2117,7 +2238,7 @@ impl Store for SqliteStore {
             return Ok(());
         }
 
-        self.conn.execute(
+        self.conn.lock().unwrap().execute(
             r#"
             INSERT INTO project_notes_embeddings (
                 note_id, provider, model, embedding_dim, embedding_json, content, created_at, updated_at
@@ -2148,7 +2269,7 @@ impl Store for SqliteStore {
     }
 
     fn delete_project_note_embedding(&self, note_id: &str) -> Result<(), StoreError> {
-        self.conn.execute(
+        self.conn.lock().unwrap().execute(
             "DELETE FROM project_notes_embeddings WHERE note_id = ?1",
             params![note_id],
         )?;
@@ -2178,46 +2299,49 @@ impl Store for SqliteStore {
         let query_norm = query_norm_sq.sqrt();
         let capped_limit = limit.clamp(1, 100) as usize;
 
-        let mut stmt = self.conn.prepare(
-            r#"
-            SELECT note_id, embedding_json
-            FROM project_notes_embeddings
-            WHERE provider = ?1
-              AND model = ?2
-              AND embedding_dim = ?3
-            "#,
-        )?;
-        let rows = stmt.query_map(
-            params![provider, model, query_embedding.len() as i64],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )?;
-
         let mut scored = Vec::new();
-        for row in rows {
-            let (note_id, embedding_json) = row?;
-            let embedding = json_from_str::<Vec<f32>>(&embedding_json)?;
-            if embedding.len() != query_embedding.len() {
-                continue;
-            }
+        {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT note_id, embedding_json
+                FROM project_notes_embeddings
+                WHERE provider = ?1
+                  AND model = ?2
+                  AND embedding_dim = ?3
+                "#,
+            )?;
+            let rows = stmt.query_map(
+                params![provider, model, query_embedding.len() as i64],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?;
 
-            let dot = embedding
-                .iter()
-                .zip(query_embedding.iter())
-                .map(|(left, right)| left * right)
-                .fold(0.0f32, |acc, value| acc + value);
-            let embedding_norm_sq = embedding
-                .iter()
-                .map(|value| value * value)
-                .fold(0.0f32, |acc, value| acc + value);
-            if embedding_norm_sq <= f32::EPSILON {
-                continue;
-            }
+            for row in rows {
+                let (note_id, embedding_json) = row?;
+                let embedding = json_from_str::<Vec<f32>>(&embedding_json)?;
+                if embedding.len() != query_embedding.len() {
+                    continue;
+                }
 
-            let score = dot / (embedding_norm_sq.sqrt() * query_norm);
-            scored.push(ProjectNoteSemanticSearchResult {
-                note_id,
-                semantic_score: score,
-            });
+                let dot = embedding
+                    .iter()
+                    .zip(query_embedding.iter())
+                    .map(|(left, right)| left * right)
+                    .fold(0.0f32, |acc, value| acc + value);
+                let embedding_norm_sq = embedding
+                    .iter()
+                    .map(|value| value * value)
+                    .fold(0.0f32, |acc, value| acc + value);
+                if embedding_norm_sq <= f32::EPSILON {
+                    continue;
+                }
+
+                let score = dot / (embedding_norm_sq.sqrt() * query_norm);
+                scored.push(ProjectNoteSemanticSearchResult {
+                    note_id,
+                    semantic_score: score,
+                });
+            }
         }
 
         scored.sort_by(|left, right| {
@@ -2232,7 +2356,8 @@ impl Store for SqliteStore {
     }
 
     fn get_coupling_mining_state(&self) -> Result<Option<CouplingMiningStateRecord>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             r#"
             SELECT last_commit_hash, last_mined_at, commits_scanned
             FROM coupling_mining_state
@@ -2256,7 +2381,7 @@ impl Store for SqliteStore {
         &self,
         state: CouplingMiningStateRecord,
     ) -> Result<(), StoreError> {
-        self.conn.execute(
+        self.conn.lock().unwrap().execute(
             r#"
             INSERT INTO coupling_mining_state (id, last_commit_hash, last_mined_at, commits_scanned)
             VALUES (1, ?1, ?2, ?3)
@@ -2276,7 +2401,8 @@ impl Store for SqliteStore {
     }
 
     fn get_drift_analysis_state(&self) -> Result<Option<DriftAnalysisStateRecord>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             r#"
             SELECT last_analysis_commit, last_analysis_at, symbols_analyzed, drift_detected
             FROM drift_analysis_state
@@ -2301,7 +2427,7 @@ impl Store for SqliteStore {
         &self,
         state: DriftAnalysisStateRecord,
     ) -> Result<(), StoreError> {
-        self.conn.execute(
+        self.conn.lock().unwrap().execute(
             r#"
             INSERT INTO drift_analysis_state (
                 id, last_analysis_commit, last_analysis_at, symbols_analyzed, drift_detected
@@ -2330,7 +2456,8 @@ impl Store for SqliteStore {
             return Ok(());
         }
 
-        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
         {
             let mut stmt = tx.prepare(
                 r#"
@@ -2420,7 +2547,8 @@ impl Store for SqliteStore {
             ORDER BY detected_at DESC, result_id ASC
             "#
         };
-        let mut stmt = self.conn.prepare(sql)?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([], drift_result_from_row)?;
         let mut records = Vec::new();
         for row in rows {
@@ -2445,6 +2573,7 @@ impl Store for SqliteStore {
         }
 
         let mut records = Vec::new();
+        let conn = self.conn.lock().unwrap();
         for chunk in normalized.chunks(SQLITE_PARAM_CHUNK) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
@@ -2466,7 +2595,7 @@ impl Store for SqliteStore {
                 .cloned()
                 .map(SqlValue::Text)
                 .collect::<Vec<_>>();
-            let mut stmt = self.conn.prepare(sql.as_str())?;
+            let mut stmt = conn.prepare(sql.as_str())?;
             let rows = stmt.query_map(params_from_iter(params_vec), drift_result_from_row)?;
             for row in rows {
                 records.push(row?);
@@ -2495,6 +2624,7 @@ impl Store for SqliteStore {
         }
 
         let mut changed = 0usize;
+        let conn = self.conn.lock().unwrap();
         for chunk in normalized.chunks(SQLITE_PARAM_CHUNK) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
@@ -2507,9 +2637,7 @@ impl Store for SqliteStore {
                 .cloned()
                 .map(SqlValue::Text)
                 .collect::<Vec<_>>();
-            changed += self
-                .conn
-                .execute(sql.as_str(), params_from_iter(params_vec))?;
+            changed += conn.execute(sql.as_str(), params_from_iter(params_vec))?;
         }
         Ok(changed as u32)
     }
@@ -2525,7 +2653,8 @@ impl Store for SqliteStore {
             return Ok(());
         }
 
-        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
         tx.execute(
             "DELETE FROM community_snapshot WHERE snapshot_id = ?1",
             params![snapshot_id],
@@ -2559,8 +2688,8 @@ impl Store for SqliteStore {
     }
 
     fn list_latest_community_snapshot(&self) -> Result<Vec<CommunitySnapshotRecord>, StoreError> {
-        let latest_snapshot_id = self
-            .conn
+        let conn = self.conn.lock().unwrap();
+        let latest_snapshot_id = conn
             .query_row(
                 r#"
                 SELECT snapshot_id
@@ -2576,7 +2705,7 @@ impl Store for SqliteStore {
             return Ok(Vec::new());
         };
 
-        let mut stmt = self.conn.prepare(
+        let mut stmt = conn.prepare(
             r#"
             SELECT snapshot_id, symbol_id, community_id, captured_at
             FROM community_snapshot
@@ -2642,7 +2771,8 @@ impl Store for SqliteStore {
             }
         };
 
-        let mut stmt = self.conn.prepare(sql)?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(sql)?;
         let record = match selector {
             SirHistoryBaselineSelector::Version(version) => stmt
                 .query_row(params![symbol_id, version], |row| {
@@ -2703,7 +2833,7 @@ impl Store for SqliteStore {
             return Ok(false);
         }
 
-        let exists = self.conn.query_row(
+        let exists = self.conn.lock().unwrap().query_row(
             r#"
             SELECT EXISTS (
                 SELECT 1
@@ -2736,7 +2866,8 @@ impl Store for SqliteStore {
             return Ok(());
         }
 
-        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
         tx.execute(
             "DELETE FROM test_intents WHERE file_path = ?1",
             params![file_path],
@@ -2792,7 +2923,8 @@ impl Store for SqliteStore {
             return Ok(Vec::new());
         }
 
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             r#"
             SELECT
                 intent_id, file_path, test_name, intent_text, group_label,
@@ -2819,7 +2951,8 @@ impl Store for SqliteStore {
             return Ok(Vec::new());
         }
 
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             r#"
             SELECT
                 intent_id, file_path, test_name, intent_text, group_label,
@@ -2881,7 +3014,8 @@ impl Store for SqliteStore {
         sql.push_str(" ORDER BY updated_at DESC, intent_id ASC LIMIT ?");
         params_vec.push(SqlValue::Integer(limit.clamp(1, 100) as i64));
 
-        let mut stmt = self.conn.prepare(sql.as_str())?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(sql.as_str())?;
         let rows = stmt.query_map(params_from_iter(params_vec), test_intent_tuple_from_row)?;
 
         let mut records = Vec::new();
@@ -3200,6 +3334,15 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         CREATE INDEX IF NOT EXISTS idx_threshold_calibration_provider_model
             ON threshold_calibration(provider, model);
 
+        CREATE TABLE IF NOT EXISTS schema_version (
+            component TEXT PRIMARY KEY,
+            version INTEGER NOT NULL,
+            migrated_at INTEGER NOT NULL
+        );
+
+        INSERT OR IGNORE INTO schema_version (component, version, migrated_at)
+        VALUES ('core', 1, unixepoch());
+
         CREATE TABLE IF NOT EXISTS project_notes (
             note_id TEXT PRIMARY KEY,
             content TEXT NOT NULL,
@@ -3372,6 +3515,20 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
     if version < 2 {
         // Reserved for next migration
     }
+
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS schema_version (
+            component TEXT PRIMARY KEY,
+            version INTEGER NOT NULL,
+            migrated_at INTEGER NOT NULL
+        );
+        "#,
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_version (component, version, migrated_at) VALUES ('core', 1, unixepoch())",
+        [],
+    )?;
 
     Ok(())
 }
@@ -4233,8 +4390,8 @@ mirror_sir_files = false
             .increment_symbol_access(&["sym-1".to_owned()], 1_700_100_000)
             .expect("increment symbol access");
 
-        let mut stmt = store
-            .conn
+        let conn = store.conn.lock().unwrap();
+        let mut stmt = conn
             .prepare("SELECT access_count, last_accessed_at FROM symbols WHERE id = ?1")
             .expect("prepare symbol access lookup");
         let access = stmt
@@ -4260,8 +4417,8 @@ mirror_sir_files = false
             .increment_symbol_access_debounced(&["sym-1".to_owned()], 1_700_100_101)
             .expect("second debounced increment");
 
-        let mut stmt = store
-            .conn
+        let conn = store.conn.lock().unwrap();
+        let mut stmt = conn
             .prepare("SELECT access_count, last_accessed_at FROM symbols WHERE id = ?1")
             .expect("prepare symbol access lookup");
         let access = stmt
@@ -4463,8 +4620,8 @@ mirror_sir_files = false
         drop(conn);
 
         let store = SqliteStore::open(workspace).expect("open migrated store");
-        let mut stmt = store
-            .conn
+        let conn = store.conn.lock().unwrap();
+        let mut stmt = conn
             .prepare("SELECT access_count, last_accessed_at FROM symbols WHERE id = ?1")
             .expect("prepare migrated symbol lookup");
         let access = stmt
@@ -4491,6 +4648,43 @@ mirror_sir_files = false
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("query second user_version");
         assert_eq!(second_version, 1);
+    }
+
+    #[test]
+    fn schema_version_table_is_populated() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        let schema = store.get_schema_version().expect("get schema version");
+        assert_eq!(schema.component, "core");
+        assert_eq!(schema.version, 1);
+        assert!(schema.migrated_at > 0);
+    }
+
+    #[test]
+    fn open_readonly_store_rejects_insert_operations() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let store = SqliteStore::open(workspace).expect("open store");
+        drop(store);
+
+        let readonly = SqliteStore::open_readonly(workspace).expect("open readonly store");
+        let err = readonly
+            .upsert_symbol(symbol_record())
+            .expect_err("readonly insert should fail");
+
+        match err {
+            StoreError::Sqlite(inner) => {
+                let message = inner.to_string().to_ascii_lowercase();
+                assert!(
+                    message.contains("readonly")
+                        || message.contains("read-only")
+                        || message.contains("attempt to write"),
+                    "unexpected sqlite error: {message}"
+                );
+            }
+            other => panic!("expected sqlite readonly error, got {other}"),
+        }
     }
 
     #[test]
