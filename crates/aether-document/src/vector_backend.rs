@@ -11,7 +11,11 @@ pub struct DocumentVectorMatch {
 
 #[async_trait]
 pub trait DocumentVectorBackend: Send + Sync {
-    async fn upsert_embeddings(&self, domain: &str, records: &[(String, Vec<f32>)]) -> Result<usize>;
+    async fn upsert_embeddings(
+        &self,
+        domain: &str,
+        records: &[(String, Vec<f32>)],
+    ) -> Result<usize>;
     async fn search(
         &self,
         domain: &str,

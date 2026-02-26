@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::from_str as json_from_str;
 use thiserror::Error;
 
+pub mod document_store;
+pub mod document_vector_store;
 #[cfg(feature = "legacy-cozo")]
 mod graph_cozo;
 #[cfg(not(feature = "legacy-cozo"))]
@@ -25,8 +27,6 @@ mod graph_migrate;
 mod graph_sqlite;
 mod graph_surreal;
 mod vector;
-pub mod document_store;
-pub mod document_vector_store;
 #[cfg(feature = "legacy-cozo")]
 pub use graph_cozo::CozoGraphStore;
 #[cfg(not(feature = "legacy-cozo"))]

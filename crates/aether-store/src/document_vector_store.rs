@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aether_document::{DocumentError, DocumentVectorBackend, DocumentVectorMatch, Result as DocumentResult};
+use aether_document::{
+    DocumentError, DocumentVectorBackend, DocumentVectorMatch, Result as DocumentResult,
+};
 use arrow_array::types::Float32Type;
 use arrow_array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, Float64Array, Int64Array, RecordBatch,
@@ -33,8 +35,9 @@ impl LanceDocumentVectorStore {
     }
 
     async fn connect(&self) -> DocumentResult<LanceConnection> {
-        fs::create_dir_all(&self.vectors_dir)
-            .map_err(|err| DocumentError::Backend(format!("failed to create vectors dir: {err}")))?;
+        fs::create_dir_all(&self.vectors_dir).map_err(|err| {
+            DocumentError::Backend(format!("failed to create vectors dir: {err}"))
+        })?;
         connect(self.vectors_dir.to_string_lossy().as_ref())
             .execute()
             .await
@@ -305,8 +308,9 @@ fn document_record_batch(
         Arc::new(StringArray::from(vec![domain.to_owned(); records.len()])),
         Arc::new(Int64Array::from(vec![updated_at; records.len()])),
     ];
-    let batch = RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|err| DocumentError::Backend(format!("failed to build document vector batch: {err}")))?;
+    let batch = RecordBatch::try_new(schema.clone(), columns).map_err(|err| {
+        DocumentError::Backend(format!("failed to build document vector batch: {err}"))
+    })?;
     Ok((schema, batch))
 }
 

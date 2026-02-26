@@ -74,7 +74,9 @@ impl DocumentEmbedder {
         if embedding.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        self.vector_backend.search(domain, embedding.as_slice(), limit).await
+        self.vector_backend
+            .search(domain, embedding.as_slice(), limit)
+            .await
     }
 }
 
@@ -86,9 +88,7 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
 
-    use crate::{
-        DocumentError, DocumentVectorBackend, DocumentVectorMatch, GenericRecord, Result,
-    };
+    use crate::{DocumentError, DocumentVectorBackend, DocumentVectorMatch, GenericRecord, Result};
 
     use super::DocumentEmbedder;
 
@@ -223,7 +223,10 @@ mod tests {
             "mock-64d",
         );
 
-        let matches = embedder.search("docs", "query text", 5).await.expect("search");
+        let matches = embedder
+            .search("docs", "query text", 5)
+            .await
+            .expect("search");
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].record_id, "record-1");
 

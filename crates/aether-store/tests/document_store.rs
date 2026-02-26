@@ -1,6 +1,6 @@
 use aether_document::{GenericRecord, GenericUnit};
-use aether_store::document_store::DomainStats;
 use aether_store::SqliteStore;
+use aether_store::document_store::DomainStats;
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -29,7 +29,10 @@ fn document_store_crud_and_domain_stats_work() {
         .expect("unit exists");
     assert_eq!(fetched.unit_id, unit.unit_id);
     assert_eq!(fetched.byte_range, (0, 48));
-    assert_eq!(fetched.metadata_json, json!({"section":"intro","lang":"en"}));
+    assert_eq!(
+        fetched.metadata_json,
+        json!({"section":"intro","lang":"en"})
+    );
 
     let by_domain = store.get_units_by_domain("docs").expect("units by domain");
     assert_eq!(by_domain.len(), 1);

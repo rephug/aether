@@ -32,7 +32,9 @@ fn existing_symbol_and_sir_operations_still_work_after_migration_v2() {
         last_error: None,
         last_attempt_at: 1_700_000_100,
     };
-    store.upsert_sir_meta(meta.clone()).expect("upsert sir meta");
+    store
+        .upsert_sir_meta(meta.clone())
+        .expect("upsert sir meta");
     let loaded = store.get_sir_meta("sym-1").expect("get sir meta");
     assert_eq!(loaded, Some(meta));
 }

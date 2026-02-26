@@ -100,7 +100,12 @@ impl DocumentUnit for GenericUnit {
     }
 }
 
-fn stable_unit_id(domain: &str, source_path: &str, unit_kind: &str, normalized_content: &str) -> String {
+fn stable_unit_id(
+    domain: &str,
+    source_path: &str,
+    unit_kind: &str,
+    normalized_content: &str,
+) -> String {
     let mut hasher = Hasher::new();
     hasher.update(domain.as_bytes());
     hasher.update(b"\n");

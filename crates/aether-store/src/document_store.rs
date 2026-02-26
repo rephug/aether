@@ -252,7 +252,11 @@ impl SqliteStore {
         row.map(record_from_row_tuple).transpose()
     }
 
-    pub fn get_records_by_domain(&self, domain: &str, limit: usize) -> Result<Vec<GenericRecord>, StoreError> {
+    pub fn get_records_by_domain(
+        &self,
+        domain: &str,
+        limit: usize,
+    ) -> Result<Vec<GenericRecord>, StoreError> {
         if limit == 0 {
             return Ok(Vec::new());
         }

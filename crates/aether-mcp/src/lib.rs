@@ -3348,8 +3348,8 @@ fn to_mcp_error(err: AetherMcpError) -> McpError {
 mod tests {
     use aether_core::EdgeKind;
     use aether_store::{
-        CouplingEdgeRecord, CozoGraphStore, DriftResultRecord, ProjectNoteRecord,
-        ResolvedEdge, SqliteStore, Store, SymbolRecord, TestIntentRecord,
+        CouplingEdgeRecord, CozoGraphStore, DriftResultRecord, ProjectNoteRecord, ResolvedEdge,
+        SqliteStore, Store, SymbolRecord, TestIntentRecord,
     };
     use tempfile::tempdir;
 

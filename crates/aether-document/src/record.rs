@@ -49,7 +49,11 @@ impl GenericRecord {
         let embedding_text = embedding_text.into();
 
         let content_hash = canonical_content_hash(&record_json)?;
-        let record_id = stable_record_id(unit_id.as_str(), schema_version.as_str(), content_hash.as_str());
+        let record_id = stable_record_id(
+            unit_id.as_str(),
+            schema_version.as_str(),
+            content_hash.as_str(),
+        );
 
         Ok(Self {
             record_id,
@@ -203,8 +207,15 @@ mod tests {
 
     #[test]
     fn generic_record_new_rejects_non_object_json() {
-        let err = GenericRecord::new("unit-1", "docs", "entity", "v1", json!(["not", "object"]), "text")
-            .expect_err("array should be rejected");
+        let err = GenericRecord::new(
+            "unit-1",
+            "docs",
+            "entity",
+            "v1",
+            json!(["not", "object"]),
+            "text",
+        )
+        .expect_err("array should be rejected");
         match err {
             DocumentError::InvalidRecordJson(message) => {
                 assert!(message.contains("JSON object"));

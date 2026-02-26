@@ -36,7 +36,9 @@ impl VerticalRegistry {
     }
 
     pub fn parser_for_domain(&self, domain: &str) -> Option<Arc<dyn DocumentParser>> {
-        self.parsers_by_domain.get(&normalize_domain(domain)).cloned()
+        self.parsers_by_domain
+            .get(&normalize_domain(domain))
+            .cloned()
     }
 
     pub fn parser_for_extension(&self, extension: &str) -> Option<Arc<dyn DocumentParser>> {
@@ -71,7 +73,9 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
 
-    use crate::{DocumentEdge, DocumentParser, GenericRecord, GenericUnit, Result, SemanticAnnotator};
+    use crate::{
+        DocumentEdge, DocumentParser, GenericRecord, GenericUnit, Result, SemanticAnnotator,
+    };
 
     use super::VerticalRegistry;
 
@@ -115,7 +119,11 @@ mod tests {
             )
         }
 
-        async fn summarize(&self, _units: &[GenericUnit], _records: &[GenericRecord]) -> Result<GenericRecord> {
+        async fn summarize(
+            &self,
+            _units: &[GenericUnit],
+            _records: &[GenericRecord],
+        ) -> Result<GenericRecord> {
             GenericRecord::new(
                 "summary",
                 "docs",

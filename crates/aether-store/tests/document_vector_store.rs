@@ -1,4 +1,3 @@
-
 use aether_document::DocumentVectorBackend;
 use aether_store::document_vector_store::LanceDocumentVectorStore;
 use tempfile::tempdir;
