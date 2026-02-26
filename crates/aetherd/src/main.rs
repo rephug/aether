@@ -173,6 +173,50 @@ fn run(cli: Cli) -> Result<()> {
         std::process::exit(exit_code);
     }
 
+    #[cfg(feature = "dashboard")]
+    {
+        let dashboard_enabled = config.dashboard.enabled && !cli.no_dashboard;
+        if dashboard_enabled {
+            let ws = workspace.clone();
+            let dash_port = config.dashboard.port;
+            std::thread::spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(err) => {
+                        tracing::error!(error = %err, "dashboard: failed to build tokio runtime");
+                        return;
+                    }
+                };
+
+                rt.block_on(async move {
+                    let state = match aether_dashboard::SharedState::open_readonly_async(&ws).await {
+                        Ok(s) => std::sync::Arc::new(s),
+                        Err(err) => {
+                            tracing::error!(error = %err, "failed to open dashboard state");
+                            return;
+                        }
+                    };
+                    let router = aether_dashboard::dashboard_router(state);
+                    let bind_addr = format!("127.0.0.1:{dash_port}");
+                    let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
+                        Ok(l) => l,
+                        Err(err) => {
+                            tracing::error!(error = %err, addr = %bind_addr, "dashboard: failed to bind");
+                            return;
+                        }
+                    };
+                    tracing::info!("Dashboard available at http://{bind_addr}/dashboard/");
+                    if let Err(err) = axum::serve(listener, router.into_make_service()).await {
+                        tracing::error!(error = %err, "dashboard server error");
+                    }
+                });
+            });
+        }
+    }
+
     let indexer_config = IndexerConfig {
         workspace: workspace.clone(),
         debounce_ms: cli.debounce_ms,

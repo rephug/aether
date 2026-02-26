@@ -409,6 +409,10 @@ pub struct Cli {
     )]
     pub index: bool,
 
+    #[cfg(feature = "dashboard")]
+    #[arg(long, help = "Disable web dashboard even if compiled with feature")]
+    pub no_dashboard: bool,
+
     #[arg(
         long,
         conflicts_with_all = ["lsp", "index", "index_once", "verify"],
@@ -644,6 +648,17 @@ mod tests {
         assert!(cli.command.is_none());
         assert!(cli.lsp);
         assert!(cli.index);
+    }
+
+    #[cfg(feature = "dashboard")]
+    #[test]
+    fn legacy_dashboard_disable_flag_parses_without_subcommand() {
+        let cli = Cli::try_parse_from(["aetherd", "--workspace", ".", "--lsp", "--no-dashboard"])
+            .expect("no-dashboard flag should parse");
+
+        assert!(cli.command.is_none());
+        assert!(cli.lsp);
+        assert!(cli.no_dashboard);
     }
 
     #[test]
