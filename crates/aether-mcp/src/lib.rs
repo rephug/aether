@@ -10,7 +10,9 @@ use aether_analysis::{
     DriftReportRequest as AnalysisDriftReportRequest, RiskLevel as CouplingRiskLevel,
     TestIntentAnalyzer, TraceCauseRequest as AnalysisTraceCauseRequest,
 };
-use aether_config::{SearchRerankerKind, VerifyMode};
+use aether_config::SearchRerankerKind;
+#[cfg(feature = "verification")]
+use aether_config::VerifyMode;
 pub use aether_core::SearchMode;
 use aether_core::{
     HoverMarkdownSections, Language, NO_SIR_MESSAGE, SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR,
@@ -38,6 +40,7 @@ use aether_store::{
     SirHistorySelector, SirMetaRecord, SqliteStore, Store, StoreError, SymbolRecord,
     SymbolSearchResult,
 };
+#[cfg(feature = "verification")]
 use aetherd::verification::{VerificationRequest, run_verification};
 use anyhow::Result;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
@@ -620,6 +623,7 @@ pub struct AetherTraceCauseResponse {
     pub notes: Vec<String>,
 }
 
+#[cfg(feature = "verification")]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherVerifyRequest {
     pub commands: Option<Vec<String>>,
@@ -628,6 +632,7 @@ pub struct AetherVerifyRequest {
     pub fallback_to_container_on_unavailable: Option<bool>,
 }
 
+#[cfg(feature = "verification")]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherVerifyCommandResult {
     pub command: String,
@@ -637,6 +642,7 @@ pub struct AetherVerifyCommandResult {
     pub passed: bool,
 }
 
+#[cfg(feature = "verification")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AetherVerifyMode {
@@ -645,6 +651,7 @@ pub enum AetherVerifyMode {
     Microvm,
 }
 
+#[cfg(feature = "verification")]
 impl From<AetherVerifyMode> for VerifyMode {
     fn from(value: AetherVerifyMode) -> Self {
         match value {
@@ -655,6 +662,7 @@ impl From<AetherVerifyMode> for VerifyMode {
     }
 }
 
+#[cfg(feature = "verification")]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherVerifyResponse {
     pub schema_version: u32,
@@ -1010,10 +1018,15 @@ impl AetherMcpServer {
     }
 
     pub fn from_state(state: Arc<SharedState>, verbose: bool) -> Self {
+        let tool_router = Self::tool_router();
+        #[cfg(feature = "verification")]
+        let tool_router =
+            tool_router.with_route((Self::aether_verify_tool_attr(), Self::aether_verify));
+
         Self {
             state,
             verbose,
-            tool_router: Self::tool_router(),
+            tool_router,
         }
     }
 
@@ -2095,6 +2108,7 @@ impl AetherMcpServer {
         })
     }
 
+    #[cfg(feature = "verification")]
     pub fn aether_verify_logic(
         &self,
         request: AetherVerifyRequest,
@@ -3230,23 +3244,6 @@ impl AetherMcpServer {
     }
 
     #[tool(
-        name = "aether_verify",
-        description = "Run allowlisted verification commands in host, container, or microvm mode"
-    )]
-    pub async fn aether_verify(
-        &self,
-        Parameters(request): Parameters<AetherVerifyRequest>,
-    ) -> Result<Json<AetherVerifyResponse>, McpError> {
-        self.verbose_log("MCP tool called: aether_verify");
-        let server = self.clone();
-        tokio::task::spawn_blocking(move || server.aether_verify_logic(request))
-            .await
-            .map_err(|err| McpError::internal_error(err.to_string(), None))?
-            .map(Json)
-            .map_err(to_mcp_error)
-    }
-
-    #[tool(
         name = "aether_symbol_timeline",
         description = "Get ordered SIR timeline entries for a symbol"
     )]
@@ -3308,6 +3305,26 @@ impl AetherMcpServer {
         self.verbose_log("MCP tool called: aether_explain");
         let server = self.clone();
         tokio::task::spawn_blocking(move || server.aether_explain_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+}
+
+#[cfg(feature = "verification")]
+impl AetherMcpServer {
+    #[tool(
+        name = "aether_verify",
+        description = "Run allowlisted verification commands in host, container, or microvm mode"
+    )]
+    pub async fn aether_verify(
+        &self,
+        Parameters(request): Parameters<AetherVerifyRequest>,
+    ) -> Result<Json<AetherVerifyResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_verify");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_verify_logic(request))
             .await
             .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)

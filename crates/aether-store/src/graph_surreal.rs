@@ -5,14 +5,13 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use aether_core::EdgeKind;
+use aether_graph_algo::{
+    GraphAlgorithmEdge, connected_components_sync, louvain_sync, page_rank_sync,
+    strongly_connected_components_sync,
+};
 use async_trait::async_trait;
-use petgraph::Direction;
-use petgraph::algo::kosaraju_scc;
-use petgraph::graph::{DiGraph, NodeIndex, UnGraph};
-use petgraph::unionfind::UnionFind;
-use petgraph::visit::EdgeRef;
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
 use surrealdb::engine::local::{Db, SurrealKv};
 
@@ -181,7 +180,7 @@ impl SurrealGraphStore {
             return Ok(Vec::new());
         }
         let algo_edges = to_algo_edges(edges);
-        let assignments = tokio::task::spawn_blocking(move || louvain_sync_local(&algo_edges))
+        let assignments = tokio::task::spawn_blocking(move || louvain_sync(&algo_edges))
             .await
             .map_err(|err| StoreError::Graph(format!("spawn_blocking louvain failed: {err}")))?;
         let mut records = assignments
@@ -234,12 +233,9 @@ impl SurrealGraphStore {
             return Ok(Vec::new());
         }
         let algo_edges = to_algo_edges(edges);
-        let scores =
-            tokio::task::spawn_blocking(move || page_rank_sync_local(&algo_edges, 0.85, 25))
-                .await
-                .map_err(|err| {
-                    StoreError::Graph(format!("spawn_blocking pagerank failed: {err}"))
-                })?;
+        let scores = tokio::task::spawn_blocking(move || page_rank_sync(&algo_edges, 0.85, 25))
+            .await
+            .map_err(|err| StoreError::Graph(format!("spawn_blocking pagerank failed: {err}")))?;
         Ok(scores
             .into_iter()
             .map(|(node, score)| (node, score as f32))
@@ -252,7 +248,7 @@ impl SurrealGraphStore {
             return Ok(Vec::new());
         }
         let algo_edges = to_algo_edges(edges);
-        tokio::task::spawn_blocking(move || strongly_connected_components_sync_local(&algo_edges))
+        tokio::task::spawn_blocking(move || strongly_connected_components_sync(&algo_edges))
             .await
             .map_err(|err| StoreError::Graph(format!("spawn_blocking scc failed: {err}")))
     }
@@ -263,7 +259,7 @@ impl SurrealGraphStore {
             return Ok(Vec::new());
         }
         let algo_edges = to_algo_edges(edges);
-        tokio::task::spawn_blocking(move || connected_components_sync_local(&algo_edges))
+        tokio::task::spawn_blocking(move || connected_components_sync(&algo_edges))
             .await
             .map_err(|err| {
                 StoreError::Graph(format!("spawn_blocking connected_components failed: {err}"))
@@ -1133,328 +1129,15 @@ struct DependencyEdgeRow {
     edge_kind: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct AlgoEdge {
-    source_id: String,
-    target_id: String,
-    edge_kind: String,
-}
-
-fn to_algo_edges(edges: Vec<DependencyEdgeRow>) -> Vec<AlgoEdge> {
+fn to_algo_edges(edges: Vec<DependencyEdgeRow>) -> Vec<GraphAlgorithmEdge> {
     edges
         .into_iter()
-        .map(|edge| AlgoEdge {
+        .map(|edge| GraphAlgorithmEdge {
             source_id: edge.source_id,
             target_id: edge.target_id,
             edge_kind: edge.edge_kind,
         })
         .collect()
-}
-
-fn build_digraph(
-    edges: &[AlgoEdge],
-) -> (
-    DiGraph<String, String>,
-    HashMap<String, NodeIndex>,
-    HashMap<NodeIndex, String>,
-) {
-    let mut graph = DiGraph::<String, String>::new();
-    let mut by_id = HashMap::<String, NodeIndex>::new();
-    for edge in edges {
-        for node in [&edge.source_id, &edge.target_id] {
-            if by_id.contains_key(node.as_str()) {
-                continue;
-            }
-            let idx = graph.add_node(node.clone());
-            by_id.insert(node.clone(), idx);
-        }
-        let src = by_id[edge.source_id.as_str()];
-        let dst = by_id[edge.target_id.as_str()];
-        graph.add_edge(src, dst, edge.edge_kind.clone());
-    }
-    let by_index = by_id
-        .iter()
-        .map(|(id, idx)| (*idx, id.clone()))
-        .collect::<HashMap<_, _>>();
-    (graph, by_id, by_index)
-}
-
-fn build_undirected_weighted_local(
-    edges: &[AlgoEdge],
-) -> (
-    UnGraph<String, f64>,
-    HashMap<String, NodeIndex>,
-    HashMap<NodeIndex, String>,
-) {
-    let mut graph = UnGraph::<String, f64>::new_undirected();
-    let mut by_id = HashMap::<String, NodeIndex>::new();
-    let mut weights = HashMap::<(NodeIndex, NodeIndex), f64>::new();
-
-    for edge in edges {
-        for node in [&edge.source_id, &edge.target_id] {
-            if by_id.contains_key(node.as_str()) {
-                continue;
-            }
-            let idx = graph.add_node(node.clone());
-            by_id.insert(node.clone(), idx);
-        }
-        let src = by_id[edge.source_id.as_str()];
-        let dst = by_id[edge.target_id.as_str()];
-        let (a, b) = if src.index() <= dst.index() {
-            (src, dst)
-        } else {
-            (dst, src)
-        };
-        *weights.entry((a, b)).or_insert(0.0) += 1.0;
-    }
-
-    for ((a, b), weight) in weights {
-        graph.add_edge(a, b, weight);
-    }
-
-    let by_index = by_id
-        .iter()
-        .map(|(id, idx)| (*idx, id.clone()))
-        .collect::<HashMap<_, _>>();
-    (graph, by_id, by_index)
-}
-
-fn page_rank_sync_local(edges: &[AlgoEdge], damping: f64, iterations: usize) -> Vec<(String, f64)> {
-    let (graph, _, names) = build_digraph(edges);
-    if graph.node_count() == 0 {
-        return Vec::new();
-    }
-    let nodes = graph.node_indices().collect::<Vec<_>>();
-    let n = nodes.len() as f64;
-    let mut rank = HashMap::<NodeIndex, f64>::new();
-    for node in &nodes {
-        rank.insert(*node, 1.0 / n);
-    }
-    let base = (1.0 - damping) / n;
-    for _ in 0..iterations {
-        let dangling_sum = nodes
-            .iter()
-            .filter(|node| {
-                graph
-                    .neighbors_directed(**node, Direction::Outgoing)
-                    .next()
-                    .is_none()
-            })
-            .map(|node| rank.get(node).copied().unwrap_or(0.0))
-            .sum::<f64>();
-        let mut next = HashMap::<NodeIndex, f64>::new();
-        for &node in &nodes {
-            let incoming_sum = graph
-                .neighbors_directed(node, Direction::Incoming)
-                .map(|src| {
-                    let out_deg = graph
-                        .neighbors_directed(src, Direction::Outgoing)
-                        .count()
-                        .max(1);
-                    rank.get(&src).copied().unwrap_or(0.0) / out_deg as f64
-                })
-                .sum::<f64>();
-            next.insert(node, base + damping * (incoming_sum + dangling_sum / n));
-        }
-        rank = next;
-    }
-    let mut scored = rank
-        .into_iter()
-        .filter_map(|(idx, score)| names.get(&idx).cloned().map(|name| (name, score)))
-        .collect::<Vec<_>>();
-    scored.sort_by(|left, right| {
-        right
-            .1
-            .partial_cmp(&left.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    scored
-}
-
-fn connected_components_sync_local(edges: &[AlgoEdge]) -> Vec<Vec<String>> {
-    let (graph, _, names) = build_digraph(edges);
-    let mut union_find = UnionFind::new(graph.node_count());
-    for edge in graph.edge_references() {
-        union_find.union(edge.source().index(), edge.target().index());
-    }
-    let mut components_by_root = HashMap::<usize, Vec<String>>::new();
-    for node in graph.node_indices() {
-        let root = union_find.find(node.index());
-        if let Some(name) = names.get(&node) {
-            components_by_root
-                .entry(root)
-                .or_default()
-                .push(name.clone());
-        }
-    }
-    let mut components = components_by_root.into_values().collect::<Vec<_>>();
-    for component in &mut components {
-        component.sort();
-        component.dedup();
-    }
-    components.sort_by(|left, right| {
-        right
-            .len()
-            .cmp(&left.len())
-            .then_with(|| left.join(",").cmp(&right.join(",")))
-    });
-    components
-}
-
-fn strongly_connected_components_sync_local(edges: &[AlgoEdge]) -> Vec<Vec<String>> {
-    let (graph, _, names) = build_digraph(edges);
-    let mut components = kosaraju_scc(&graph)
-        .into_iter()
-        .map(|component| {
-            let mut nodes = component
-                .into_iter()
-                .filter_map(|idx| names.get(&idx).cloned())
-                .collect::<Vec<_>>();
-            nodes.sort();
-            nodes
-        })
-        .collect::<Vec<_>>();
-    components.sort_by(|left, right| {
-        right
-            .len()
-            .cmp(&left.len())
-            .then_with(|| left.join(",").cmp(&right.join(",")))
-    });
-    components
-}
-
-fn louvain_sync_local(edges: &[AlgoEdge]) -> Vec<(String, usize)> {
-    let (graph, _, names) = build_undirected_weighted_local(edges);
-    if graph.node_count() == 0 {
-        return Vec::new();
-    }
-
-    let total_weight = graph.edge_weights().copied().sum::<f64>();
-    if total_weight <= f64::EPSILON {
-        let mut singleton = names
-            .into_values()
-            .enumerate()
-            .map(|(idx, node)| (node, idx + 1))
-            .collect::<Vec<_>>();
-        singleton.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
-        return singleton;
-    }
-
-    let mut node_order = graph.node_indices().collect::<Vec<_>>();
-    node_order.sort_by(|left, right| {
-        names[left]
-            .cmp(&names[right])
-            .then_with(|| left.index().cmp(&right.index()))
-    });
-
-    let mut communities = HashMap::<NodeIndex, usize>::new();
-    let mut degrees = HashMap::<NodeIndex, f64>::new();
-    let mut sum_tot = HashMap::<usize, f64>::new();
-    for node in graph.node_indices() {
-        let degree = graph.edges(node).map(|edge| *edge.weight()).sum::<f64>();
-        degrees.insert(node, degree);
-        let community = node.index();
-        communities.insert(node, community);
-        sum_tot.insert(community, degree);
-    }
-
-    let two_m = 2.0 * total_weight;
-    for _ in 0..50 {
-        let mut moved_any = false;
-        for &node in &node_order {
-            let current = communities[&node];
-            let k_i = *degrees.get(&node).unwrap_or(&0.0);
-            if k_i <= f64::EPSILON {
-                continue;
-            }
-
-            let mut neighbor_weight_by_community = HashMap::<usize, f64>::new();
-            for edge in graph.edges(node) {
-                let neighbor = if edge.source() == node {
-                    edge.target()
-                } else {
-                    edge.source()
-                };
-                let community = communities[&neighbor];
-                *neighbor_weight_by_community.entry(community).or_insert(0.0) += *edge.weight();
-            }
-
-            if let Some(total) = sum_tot.get_mut(&current) {
-                *total -= k_i;
-            }
-
-            let mut best_community = current;
-            let mut best_gain = 0.0f64;
-            let mut candidates = neighbor_weight_by_community
-                .keys()
-                .copied()
-                .collect::<Vec<_>>();
-            candidates.push(current);
-            candidates.sort_unstable();
-            candidates.dedup();
-
-            for candidate in candidates {
-                let k_i_in = *neighbor_weight_by_community.get(&candidate).unwrap_or(&0.0);
-                let sum_tot_candidate = *sum_tot.get(&candidate).unwrap_or(&0.0);
-                let gain = k_i_in - (k_i * sum_tot_candidate) / two_m;
-                if gain > best_gain + 1e-12
-                    || ((gain - best_gain).abs() <= 1e-12 && candidate < best_community)
-                {
-                    best_gain = gain;
-                    best_community = candidate;
-                }
-            }
-
-            communities.insert(node, best_community);
-            *sum_tot.entry(best_community).or_insert(0.0) += k_i;
-            if best_community != current {
-                moved_any = true;
-            }
-        }
-        if !moved_any {
-            break;
-        }
-    }
-
-    let mut members_by_community = HashMap::<usize, Vec<String>>::new();
-    for (node, community) in &communities {
-        members_by_community
-            .entry(*community)
-            .or_default()
-            .push(names[node].clone());
-    }
-    for members in members_by_community.values_mut() {
-        members.sort();
-    }
-
-    let mut community_order = members_by_community
-        .iter()
-        .map(|(community, members)| (*community, members.clone()))
-        .collect::<Vec<_>>();
-    community_order.sort_by(|left, right| {
-        left.1
-            .len()
-            .cmp(&right.1.len())
-            .then_with(|| left.1.join(",").cmp(&right.1.join(",")))
-    });
-
-    let remapped = community_order
-        .into_iter()
-        .enumerate()
-        .map(|(idx, (old, _))| (old, idx + 1))
-        .collect::<HashMap<_, _>>();
-
-    let mut assignments = communities
-        .into_iter()
-        .filter_map(|(node, community)| {
-            let node_id = names.get(&node)?.clone();
-            let community_id = *remapped.get(&community)?;
-            Some((node_id, community_id))
-        })
-        .collect::<Vec<_>>();
-    assignments.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
-    assignments
 }
 
 #[cfg(test)]

@@ -53,6 +53,7 @@ jobs:
           - aether-core
           - aether-config
           - aether-document
+          - aether-graph-algo
           - aether-store
           - aether-memory
           - aether-analysis

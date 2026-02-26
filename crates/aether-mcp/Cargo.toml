@@ -5,12 +5,16 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+verification = ["dep:aetherd"]
+
 [dependencies]
 aether-analysis = { path = "../aether-analysis" }
 aether-config = { path = "../aether-config" }
 aether-core = { path = "../aether-core" }
 aether-memory = { path = "../aether-memory" }
-aetherd = { path = "../aetherd" }
+aetherd = { path = "../aetherd", optional = true }
 aether-infer = { path = "../aether-infer" }
 aether-parse = { path = "../aether-parse" }
 aether-sir = { path = "../aether-sir" }
@@ -27,4 +31,5 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing.workspace = true
 
 [dev-dependencies]
+aetherd = { path = "../aetherd" }
 tempfile.workspace = true
