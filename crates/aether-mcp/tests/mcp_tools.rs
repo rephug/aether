@@ -8,10 +8,12 @@ use aether_mcp::{
     AetherBlastRadiusRequest, AetherCallChainRequest, AetherDependenciesRequest,
     AetherExplainRequest, AetherGetSirRequest, AetherMcpServer, AetherRecallRequest,
     AetherRememberRequest, AetherSearchRequest, AetherSymbolLookupRequest,
-    AetherSymbolTimelineRequest, AetherTestIntentsRequest, AetherVerifyMode, AetherVerifyRequest,
-    AetherWhyChangedReason, AetherWhyChangedRequest, AetherWhySelectorMode, MCP_SCHEMA_VERSION,
-    MEMORY_SCHEMA_VERSION, SirLevelRequest,
+    AetherSymbolTimelineRequest, AetherTestIntentsRequest, AetherWhyChangedReason,
+    AetherWhyChangedRequest, AetherWhySelectorMode, MCP_SCHEMA_VERSION, MEMORY_SCHEMA_VERSION,
+    SirLevelRequest,
 };
+#[cfg(feature = "verification")]
+use aether_mcp::{AetherVerifyMode, AetherVerifyRequest};
 use aether_sir::{synthetic_file_sir_id, synthetic_module_sir_id};
 use aether_store::{SqliteStore, Store, TestIntentRecord};
 use aetherd::indexer::{IndexerConfig, run_initial_index_once};
@@ -927,6 +929,7 @@ fn mcp_why_changed_supports_timestamp_selector_mode() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "verification")]
 #[test]
 fn mcp_verify_runs_allowlisted_subset_and_has_stable_response_shape() -> Result<()> {
     let temp = tempdir()?;
@@ -1002,6 +1005,7 @@ commands = ["cargo --version", "cargo --definitely-invalid-flag"]
     Ok(())
 }
 
+#[cfg(feature = "verification")]
 #[test]
 fn mcp_verify_reports_failure_status_output_and_allowlist_rejection() -> Result<()> {
     let temp = tempdir()?;
@@ -1064,6 +1068,7 @@ commands = ["cargo --version", "cargo --definitely-invalid-flag"]
     Ok(())
 }
 
+#[cfg(feature = "verification")]
 #[test]
 fn mcp_verify_handles_unavailable_container_runtime_with_optional_fallback() -> Result<()> {
     let temp = tempdir()?;
@@ -1135,6 +1140,7 @@ fallback_to_host_on_unavailable = false
     Ok(())
 }
 
+#[cfg(feature = "verification")]
 #[test]
 fn mcp_verify_handles_unavailable_microvm_runtime_with_optional_fallback() -> Result<()> {
     let temp = tempdir()?;

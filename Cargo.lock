@@ -38,6 +38,7 @@ version = "0.1.0"
 dependencies = [
  "aether-config",
  "aether-core",
+ "aether-graph-algo",
  "aether-infer",
  "aether-memory",
  "aether-store",
@@ -86,6 +87,13 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "aether-graph-algo"
+version = "0.1.0"
+dependencies = [
+ "petgraph 0.6.5",
 ]
 
 [[package]]
@@ -223,6 +231,7 @@ dependencies = [
  "aether-config",
  "aether-core",
  "aether-document",
+ "aether-graph-algo",
  "arrow-array",
  "arrow-schema",
  "async-trait",

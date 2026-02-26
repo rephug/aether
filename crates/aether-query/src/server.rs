@@ -149,6 +149,10 @@ async fn mcp_handler(State(state): State<Arc<AppState>>, request: Request) -> Re
         Err(_) => return json_error(StatusCode::GATEWAY_TIMEOUT, "query_timeout"),
     };
 
+    // TODO: _meta staleness injection deferred. rmcp StreamableHttpService returns
+    // a streaming/SSE response body that is not safely interceptable via axum
+    // middleware for JSON deserialize/modify/reserialize. MCP clients should poll
+    // GET /health for staleness fields.
     mcp_response.into_response()
 }
 
