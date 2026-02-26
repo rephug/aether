@@ -144,6 +144,26 @@ impl SurrealGraphStore {
             DEFINE FIELD IF NOT EXISTS members ON community_snapshot TYPE array;
             DEFINE FIELD IF NOT EXISTS created_at ON community_snapshot TYPE datetime DEFAULT time::now();
 
+            -- Document unit nodes (domain-scoped, parallel to code symbol table)
+            DEFINE TABLE IF NOT EXISTS document_node SCHEMAFULL;
+            DEFINE FIELD IF NOT EXISTS unit_id ON document_node TYPE string;
+            DEFINE FIELD IF NOT EXISTS domain ON document_node TYPE string;
+            DEFINE FIELD IF NOT EXISTS unit_kind ON document_node TYPE string;
+            DEFINE FIELD IF NOT EXISTS display_name ON document_node TYPE string;
+            DEFINE FIELD IF NOT EXISTS source_path ON document_node TYPE string;
+            DEFINE INDEX IF NOT EXISTS idx_doc_node_id ON document_node FIELDS unit_id UNIQUE;
+            DEFINE INDEX IF NOT EXISTS idx_doc_node_domain ON document_node FIELDS domain;
+
+            -- Document edges (domain-scoped, typed relationships)
+            DEFINE TABLE IF NOT EXISTS document_edge SCHEMAFULL TYPE RELATION
+                FROM document_node TO document_node;
+            DEFINE FIELD IF NOT EXISTS edge_type ON document_edge TYPE string;
+            DEFINE FIELD IF NOT EXISTS domain ON document_edge TYPE string;
+            DEFINE FIELD IF NOT EXISTS weight ON document_edge TYPE float DEFAULT 1.0;
+            DEFINE FIELD IF NOT EXISTS metadata_json ON document_edge TYPE string DEFAULT '{}';
+            DEFINE FIELD IF NOT EXISTS in ON document_edge TYPE record<document_node> REFERENCE;
+            DEFINE FIELD IF NOT EXISTS out ON document_edge TYPE record<document_node> REFERENCE;
+
             DEFINE FIELD IF NOT EXISTS callers ON symbol COMPUTED <~depends_on;
             DEFINE FIELD IF NOT EXISTS dependees ON symbol COMPUTED ->depends_on->symbol;
         "#;

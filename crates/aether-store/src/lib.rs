@@ -25,6 +25,8 @@ mod graph_migrate;
 mod graph_sqlite;
 mod graph_surreal;
 mod vector;
+pub mod document_store;
+pub mod document_vector_store;
 #[cfg(feature = "legacy-cozo")]
 pub use graph_cozo::CozoGraphStore;
 #[cfg(not(feature = "legacy-cozo"))]
@@ -3547,7 +3549,45 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
     }
 
     if version < 2 {
-        // Reserved for next migration
+        conn.execute_batch(
+            r#"
+        CREATE TABLE IF NOT EXISTS document_units (
+            unit_id          TEXT PRIMARY KEY,
+            domain           TEXT NOT NULL,
+            unit_kind        TEXT NOT NULL,
+            display_name     TEXT NOT NULL,
+            content          TEXT NOT NULL,
+            source_path      TEXT NOT NULL,
+            byte_range_start INTEGER NOT NULL,
+            byte_range_end   INTEGER NOT NULL,
+            parent_id        TEXT,
+            metadata_json    TEXT NOT NULL DEFAULT '{}',
+            created_at       INTEGER NOT NULL,
+            updated_at       INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_document_units_domain ON document_units(domain);
+        CREATE INDEX IF NOT EXISTS idx_document_units_source ON document_units(source_path);
+        CREATE INDEX IF NOT EXISTS idx_document_units_kind ON document_units(domain, unit_kind);
+
+        CREATE TABLE IF NOT EXISTS semantic_records (
+            record_id       TEXT PRIMARY KEY,
+            unit_id         TEXT NOT NULL,
+            domain          TEXT NOT NULL,
+            schema_name     TEXT NOT NULL,
+            schema_version  TEXT NOT NULL,
+            content_hash    TEXT NOT NULL,
+            record_json     TEXT NOT NULL,
+            embedding_text  TEXT NOT NULL,
+            created_at      INTEGER NOT NULL,
+            updated_at      INTEGER NOT NULL,
+            FOREIGN KEY (unit_id) REFERENCES document_units(unit_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_semantic_records_unit ON semantic_records(unit_id);
+        CREATE INDEX IF NOT EXISTS idx_semantic_records_domain ON semantic_records(domain);
+        CREATE INDEX IF NOT EXISTS idx_semantic_records_schema ON semantic_records(domain, schema_name);
+        "#,
+        )?;
+        conn.execute("PRAGMA user_version = 2", [])?;
     }
 
     conn.execute_batch(
@@ -3559,9 +3599,19 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         );
         "#,
     )?;
+    let current_user_version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     conn.execute(
-        "INSERT OR IGNORE INTO schema_version (component, version, migrated_at) VALUES ('core', 1, unixepoch())",
-        [],
+        r#"
+        INSERT INTO schema_version (component, version, migrated_at)
+        VALUES ('core', ?1, unixepoch())
+        ON CONFLICT(component) DO UPDATE SET
+            version = excluded.version,
+            migrated_at = CASE
+                WHEN schema_version.version <> excluded.version THEN excluded.migrated_at
+                ELSE schema_version.migrated_at
+            END
+        "#,
+        params![current_user_version],
     )?;
 
     Ok(())
@@ -4687,13 +4737,13 @@ mirror_sir_files = false
         let first_version: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("query first user_version");
-        assert_eq!(first_version, 1);
+        assert_eq!(first_version, 2);
 
         run_migrations(&conn).expect("run migrations twice");
         let second_version: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("query second user_version");
-        assert_eq!(second_version, 1);
+        assert_eq!(second_version, 2);
     }
 
     #[test]
@@ -4703,7 +4753,7 @@ mirror_sir_files = false
 
         let schema = store.get_schema_version().expect("get schema version");
         assert_eq!(schema.component, "core");
-        assert_eq!(schema.version, 1);
+        assert_eq!(schema.version, 2);
         assert!(schema.migrated_at > 0);
     }
 

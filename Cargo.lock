@@ -73,6 +73,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "aether-document"
+version = "0.1.0"
+dependencies = [
+ "aether-core",
+ "aether-infer",
+ "async-trait",
+ "blake3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "aether-infer"
 version = "0.1.0"
 dependencies = [
@@ -206,6 +222,7 @@ version = "0.1.0"
 dependencies = [
  "aether-config",
  "aether-core",
+ "aether-document",
  "arrow-array",
  "arrow-schema",
  "async-trait",

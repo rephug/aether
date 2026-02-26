@@ -1112,7 +1112,7 @@ fn table_name_for_prefix(prefix: &str, provider: &str, model: &str, embedding_di
     format!("{prefix}{embedding_dim}_{provider}_{model}")
 }
 
-fn sanitize_for_table_name(value: &str) -> String {
+pub(crate) fn sanitize_for_table_name(value: &str) -> String {
     let mut output = String::with_capacity(value.len().min(64));
     for ch in value.chars() {
         if ch.is_ascii_alphanumeric() {

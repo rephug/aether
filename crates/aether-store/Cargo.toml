@@ -12,6 +12,7 @@ legacy-cozo = ["dep:cozo"]
 [dependencies]
 aether-config = { path = "../aether-config" }
 aether-core = { path = "../aether-core" }
+aether-document = { path = "../aether-document" }
 arrow-array.workspace = true
 arrow-schema.workspace = true
 async-trait.workspace = true

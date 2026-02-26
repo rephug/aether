@@ -25,7 +25,7 @@ impl SharedState {
         let workspace = workspace.canonicalize()?;
         let config = Arc::new(load_config(&workspace)?);
         let store = Arc::new(SqliteStore::open(&workspace)?);
-        store.check_compatibility("core", 1)?;
+        store.check_compatibility("core", 2)?;
         let graph = open_shared_graph(&workspace, &config, false)?;
         let vector_store = open_vector_store_sync_optional(&workspace, &config)?;
         let schema_version = store.get_schema_version()?;
@@ -45,7 +45,7 @@ impl SharedState {
         let workspace = workspace.canonicalize()?;
         let config = Arc::new(load_config(&workspace)?);
         let store = Arc::new(SqliteStore::open(&workspace)?);
-        store.check_compatibility("core", 1)?;
+        store.check_compatibility("core", 2)?;
         let graph = open_shared_graph(&workspace, &config, false)?;
         let vector_store = open_vector_store_async_optional(&workspace, &config).await?;
         let schema_version = store.get_schema_version()?;
@@ -65,7 +65,7 @@ impl SharedState {
         let workspace = workspace.canonicalize()?;
         let config = Arc::new(load_config(&workspace)?);
         let store = Arc::new(SqliteStore::open_readonly(&workspace)?);
-        store.check_compatibility("core", 1)?;
+        store.check_compatibility("core", 2)?;
         let graph = open_shared_graph_async(&workspace, &config, true).await?;
         let vector_store = open_vector_store_async_optional(&workspace, &config).await?;
         let schema_version = store.get_schema_version()?;
@@ -85,7 +85,7 @@ impl SharedState {
         let workspace = workspace.canonicalize()?;
         let config = Arc::new(load_config(&workspace)?);
         let store = Arc::new(SqliteStore::open_readonly(&workspace)?);
-        store.check_compatibility("core", 1)?;
+        store.check_compatibility("core", 2)?;
         let graph = open_shared_graph(&workspace, &config, true)?;
         let vector_store = open_vector_store_sync_optional(&workspace, &config)?;
         let schema_version = store.get_schema_version()?;
@@ -244,7 +244,7 @@ vector_backend = "sqlite"
 
         assert!(ro.read_only);
         assert_eq!(ro.schema_version.component, "core");
-        assert_eq!(ro.schema_version.version, 1);
+        assert_eq!(ro.schema_version.version, 2);
         assert!(ro.schema_version.migrated_at > 0);
     }
 
