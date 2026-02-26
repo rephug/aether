@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/aether-analysis",
+    "crates/aether-dashboard",
     "crates/aetherd",
     "crates/aether-core",
     "crates/aether-config",
@@ -24,6 +25,7 @@ license = "MIT"
 authors = ["AETHER"]
 
 [workspace.dependencies]
+axum = "0.8"
 arrow-array = "56.2"
 arrow-schema = "56.2"
 async-trait = "0.1"
@@ -49,6 +51,7 @@ tempfile = "3.13"
 thiserror = "2.0"
 tokenizers = "0.21"
 toml = "0.8"
+tower-http = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tree-sitter = "0.24"
@@ -57,3 +60,6 @@ tree-sitter-python = "0.23"
 tree-sitter-typescript = "0.23"
 streaming-iterator = "0.1"
 walkdir = "2.5"
+maud = "0.26"
+mime_guess = "2"
+rust-embed = "8"

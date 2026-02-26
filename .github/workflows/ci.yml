@@ -41,7 +41,7 @@ jobs:
       - name: Lint
         env:
           PROTOC: /usr/bin/protoc
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --features aetherd/dashboard -- -D warnings
 
   test:
     name: test-${{ matrix.crate }}
@@ -57,6 +57,7 @@ jobs:
           - aether-store
           - aether-memory
           - aether-analysis
+          - aether-dashboard
           - aether-query
           - aether-mcp
           - aether-infer
@@ -82,3 +83,25 @@ jobs:
           PROTOC: /usr/bin/protoc
           CARGO_BUILD_JOBS: "2"
         run: cargo test -p ${{ matrix.crate }}
+
+  test-aetherd-dashboard:
+    name: test-aetherd-dashboard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler mold clang
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: aetherd-dashboard
+      - name: Test aetherd with dashboard feature
+        env:
+          PROTOC: /usr/bin/protoc
+          CARGO_BUILD_JOBS: "2"
+        run: cargo test -p aetherd --features dashboard

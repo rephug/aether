@@ -33,6 +33,7 @@ pub const MAX_SEARCH_THRESHOLD: f32 = 0.95;
 pub const DEFAULT_DRIFT_THRESHOLD: f32 = 0.85;
 pub const DEFAULT_DRIFT_ANALYSIS_WINDOW: &str = "100 commits";
 pub const DEFAULT_DRIFT_HUB_PERCENTILE: u32 = 95;
+pub const DEFAULT_DASHBOARD_PORT: u16 = 9720;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -224,6 +225,8 @@ pub struct AetherConfig {
     pub coupling: CouplingConfig,
     #[serde(default)]
     pub drift: DriftConfig,
+    #[serde(default)]
+    pub dashboard: DashboardConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -644,6 +647,23 @@ impl Default for DriftConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DashboardConfig {
+    #[serde(default = "default_dashboard_port")]
+    pub port: u16,
+    #[serde(default = "default_dashboard_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        Self {
+            port: default_dashboard_port(),
+            enabled: default_dashboard_enabled(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigWarning {
     pub code: &'static str,
@@ -1031,6 +1051,14 @@ fn default_drift_hub_percentile() -> u32 {
     DEFAULT_DRIFT_HUB_PERCENTILE
 }
 
+fn default_dashboard_port() -> u16 {
+    DEFAULT_DASHBOARD_PORT
+}
+
+fn default_dashboard_enabled() -> bool {
+    true
+}
+
 fn normalize_optional(input: Option<String>) -> Option<String> {
     input
         .map(|value| value.trim().to_owned())
@@ -1360,6 +1388,8 @@ mod tests {
         );
         assert!(!config.drift.auto_analyze);
         assert_eq!(config.drift.hub_percentile, DEFAULT_DRIFT_HUB_PERCENTILE);
+        assert_eq!(config.dashboard.port, DEFAULT_DASHBOARD_PORT);
+        assert!(config.dashboard.enabled);
         assert!(config_path(workspace).exists());
 
         let content = fs::read_to_string(config_path(workspace)).expect("read config file");
@@ -1410,6 +1440,9 @@ mod tests {
         assert!(content.contains("analysis_window = \"100 commits\""));
         assert!(content.contains("auto_analyze = false"));
         assert!(content.contains("hub_percentile = 95"));
+        assert!(content.contains("[dashboard]"));
+        assert!(content.contains("port = 9720"));
+        assert!(content.contains("enabled = true"));
         assert!(content.contains("\"cargo fmt --all --check\""));
         assert!(content.contains("\"cargo clippy --workspace -- -D warnings\""));
         assert!(content.contains("\"cargo test --workspace\""));
@@ -1483,6 +1516,10 @@ drift_threshold = 0.9
 analysis_window = " 50 commits "
 auto_analyze = true
 hub_percentile = 0
+
+[dashboard]
+port = 9800
+enabled = false
 "#;
         fs::write(config_path(workspace), raw).expect("write config");
 
@@ -1576,6 +1613,8 @@ hub_percentile = 0
         assert_eq!(config.drift.analysis_window, "50 commits");
         assert!(config.drift.auto_analyze);
         assert_eq!(config.drift.hub_percentile, 1);
+        assert_eq!(config.dashboard.port, 9800);
+        assert!(!config.dashboard.enabled);
     }
 
     #[test]
@@ -1759,6 +1798,7 @@ semantic_weight = 1.0
             },
             coupling: CouplingConfig::default(),
             drift: DriftConfig::default(),
+            dashboard: DashboardConfig::default(),
         };
 
         let warnings = validate_config(&config);
