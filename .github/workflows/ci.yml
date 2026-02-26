@@ -52,6 +52,7 @@ jobs:
         crate:
           - aether-core
           - aether-config
+          - aether-document
           - aether-store
           - aether-memory
           - aether-analysis
