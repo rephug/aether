@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AETHER Dashboard</title>
+
+  <!-- Tailwind CSS (CDN) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['"IBM Plex Sans"', 'system-ui', 'sans-serif'],
+            mono: ['"JetBrains Mono"', '"Fira Code"', 'monospace'],
+          },
+          colors: {
+            surface: {
+              '0': '#0a0e14',
+              '1': '#10151c',
+              '2': '#171d27',
+              '3': '#1e2633',
+              '4': '#262f3e',
+            },
+            accent: {
+              cyan:   '#39bae6',
+              orange: '#ff8f40',
+              green:  '#7fd962',
+              red:    '#f26d78',
+              purple: '#d2a6ff',
+              yellow: '#e6b450',
+            },
+            text: {
+              primary:   '#e6e1cf',
+              secondary: '#8a919b',
+              muted:     '#5c6370',
+            }
+          }
+        }
+      }
+    }
+  </script>
+
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <!-- D3.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+
+  <!-- HTMX -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/htmx/2.0.4/htmx.min.js"></script>
+
+  <!-- Dashboard styles + charts -->
+  <link rel="stylesheet" href="/dashboard/static/style.css" />
+  <script src="/dashboard/static/charts.js" defer></script>
+</head>
+
+<body class="h-full bg-surface-0 text-text-primary font-sans antialiased">
+
+  <!-- Staleness warning banner (hidden by default) -->
+  <div id="stale-banner"
+       class="hidden fixed top-0 left-0 right-0 z-50 px-4 py-2 bg-accent-yellow/10 border-b border-accent-yellow/30 text-accent-yellow text-sm text-center font-medium backdrop-blur-sm">
+    <span class="inline-flex items-center gap-2">
+      <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" />
+      </svg>
+      Index data may be stale — last indexed <span id="stale-age">unknown</span> ago
+    </span>
+  </div>
+
+  <div class="flex h-full">
+
+    <!-- ===== SIDEBAR ===== -->
+    <aside id="sidebar"
+           class="sidebar-open flex flex-col w-56 min-h-full bg-surface-1 border-r border-surface-3/50 transition-all duration-200 ease-out">
+
+      <!-- Logo / Brand -->
+      <div class="flex items-center gap-3 px-4 py-5 border-b border-surface-3/30">
+        <div class="flex items-center justify-center w-8 h-8 rounded-lg bg-accent-cyan/15 text-accent-cyan">
+          <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904 9 18.75l-.813-2.846a4.5 4.5 0 0 0-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 0 0 3.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 0 0 3.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 0 0-3.09 3.09ZM18.259 8.715 18 9.75l-.259-1.035a3.375 3.375 0 0 0-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 0 0 2.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 0 0 2.455 2.456L21.75 6l-1.036.259a3.375 3.375 0 0 0-2.455 2.456Z" />
+          </svg>
+        </div>
+        <div class="sidebar-label">
+          <div class="text-sm font-semibold text-text-primary tracking-wide">AETHER</div>
+          <div class="text-[10px] font-mono text-text-muted uppercase tracking-widest">Dashboard</div>
+        </div>
+      </div>
+
+      <!-- Navigation -->
+      <nav class="flex-1 px-2 py-3 space-y-0.5 overflow-y-auto">
+
+        <a href="#" class="nav-link active"
+           hx-get="/dashboard/frag/overview"
+           hx-target="#main-content"
+           hx-push-url="/dashboard/overview"
+           onclick="setActiveNav(this)">
+          <svg class="nav-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6A2.25 2.25 0 0 1 6 3.75h2.25A2.25 2.25 0 0 1 10.5 6v2.25a2.25 2.25 0 0 1-2.25 2.25H6a2.25 2.25 0 0 1-2.25-2.25V6ZM3.75 15.75A2.25 2.25 0 0 1 6 13.5h2.25a2.25 2.25 0 0 1 2.25 2.25V18a2.25 2.25 0 0 1-2.25 2.25H6A2.25 2.25 0 0 1 3.75 18v-2.25ZM13.5 6a2.25 2.25 0 0 1 2.25-2.25H18A2.25 2.25 0 0 1 20.25 6v2.25A2.25 2.25 0 0 1 18 10.5h-2.25a2.25 2.25 0 0 1-2.25-2.25V6ZM13.5 15.75a2.25 2.25 0 0 1 2.25-2.25H18a2.25 2.25 0 0 1 2.25 2.25V18A2.25 2.25 0 0 1 18 20.25h-2.25a2.25 2.25 0 0 1-2.25-2.25v-2.25Z" />
+          </svg>
+          <span class="sidebar-label">Overview</span>
+        </a>
+
+        <a href="#" class="nav-link"
+           hx-get="/dashboard/frag/graph"
+           hx-target="#main-content"
+           hx-push-url="/dashboard/graph"
+           onclick="setActiveNav(this)">
+          <svg class="nav-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M7.217 10.907a2.25 2.25 0 1 0 0 2.186m0-2.186c.18.324.283.696.283 1.093s-.103.77-.283 1.093m0-2.186 9.566-5.314m-9.566 7.5 9.566 5.314m0 0a2.25 2.25 0 1 0 3.935 2.186 2.25 2.25 0 0 0-3.935-2.186Zm0-12.814a2.25 2.25 0 1 0 3.933-2.185 2.25 2.25 0 0 0-3.933 2.185Z" />
+          </svg>
+          <span class="sidebar-label">Dependencies</span>
+        </a>
+
+        <a href="#" class="nav-link"
+           hx-get="/dashboard/frag/drift-table"
+           hx-target="#main-content"
+           hx-push-url="/dashboard/drift"
+           onclick="setActiveNav(this)">
+          <svg class="nav-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M2.25 18 9 11.25l4.306 4.306a11.95 11.95 0 0 1 5.814-5.518l2.74-1.22m0 0-5.94-2.281m5.94 2.28-2.28 5.941" />
+          </svg>
+          <span class="sidebar-label">Drift Report</span>
+        </a>
+
+        <a href="#" class="nav-link"
+           hx-get="/dashboard/frag/coupling"
+           hx-target="#main-content"
+           hx-push-url="/dashboard/coupling"
+           onclick="setActiveNav(this)">
+          <svg class="nav-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5M12 17.25h8.25" />
+          </svg>
+          <span class="sidebar-label">Coupling Map</span>
+        </a>
+
+        <a href="#" class="nav-link"
+           hx-get="/dashboard/frag/health"
+           hx-target="#main-content"
+           hx-push-url="/dashboard/health"
+           onclick="setActiveNav(this)">
+          <svg class="nav-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75 11.25 15 15 9.75m-3-7.036A11.959 11.959 0 0 1 3.598 6 11.99 11.99 0 0 0 3 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285Z" />
+          </svg>
+          <span class="sidebar-label">Health</span>
+        </a>
+
+        <!-- Divider -->
+        <div class="!my-3 border-t border-surface-3/30"></div>
+
+        <!-- Search -->
+        <div class="px-2 sidebar-label">
+          <div class="relative">
+            <svg class="absolute left-2.5 top-2.5 w-3.5 h-3.5 text-text-muted pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="m21 21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z" />
+            </svg>
+            <input type="text" id="search-input" placeholder="Search symbols…"
+                   class="w-full pl-8 pr-3 py-2 text-xs bg-surface-0/60 border border-surface-3/50 rounded-md text-text-primary placeholder-text-muted focus:outline-none focus:border-accent-cyan/50 focus:ring-1 focus:ring-accent-cyan/20 transition-colors"
+                   hx-get="/dashboard/frag/search"
+                   hx-target="#main-content"
+                   hx-trigger="keyup changed delay:300ms"
+                   hx-include="this"
+                   name="q" />
+          </div>
+        </div>
+
+      </nav>
+
+      <!-- Footer -->
+      <div class="px-4 py-3 border-t border-surface-3/30 sidebar-label">
+        <div class="text-[10px] font-mono text-text-muted">
+          <span id="footer-version">AETHER</span>
+          <span class="float-right" id="footer-backend">—</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ===== MAIN CONTENT ===== -->
+    <div class="flex-1 flex flex-col min-h-full overflow-hidden">
+
+      <!-- Top bar -->
+      <header class="flex items-center justify-between px-5 py-3 bg-surface-1/50 border-b border-surface-3/30 backdrop-blur-sm">
+        <div class="flex items-center gap-3">
+          <!-- Mobile sidebar toggle -->
+          <button onclick="toggleSidebar()" class="lg:hidden p-1.5 rounded-md hover:bg-surface-3/50 text-text-secondary transition-colors">
+            <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5" />
+            </svg>
+          </button>
+          <h1 id="page-title" class="text-sm font-semibold text-text-primary">Overview</h1>
+        </div>
+        <div class="flex items-center gap-4 text-xs text-text-muted font-mono">
+          <span id="header-indexed" class="hidden sm:inline">—</span>
+          <div id="header-status" class="flex items-center gap-1.5">
+            <span class="relative flex h-2 w-2">
+              <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-accent-green opacity-75"></span>
+              <span class="relative inline-flex rounded-full h-2 w-2 bg-accent-green"></span>
+            </span>
+            <span class="text-accent-green">Live</span>
+          </div>
+        </div>
+      </header>
+
+      <!-- Scrollable content area -->
+      <div class="flex-1 overflow-y-auto">
+        <main id="main-content" class="p-5 lg:p-6"
+              hx-get="/dashboard/frag/overview"
+              hx-trigger="load"
+              hx-target="this">
+          <!-- Loading state -->
+          <div class="flex items-center justify-center h-64">
+            <div class="loading-spinner"></div>
+          </div>
+        </main>
+      </div>
+    </div>
+
+    <!-- ===== DETAIL PANEL (symbol detail overlay) ===== -->
+    <div id="detail-panel"
+         class="detail-panel hidden fixed right-0 top-0 h-full w-96 bg-surface-1 border-l border-surface-3/50 shadow-2xl z-40 overflow-y-auto transition-transform duration-200">
+      <!-- Populated by HTMX when a symbol is clicked -->
+    </div>
+    <div id="detail-overlay"
+         class="hidden fixed inset-0 bg-black/30 z-30"
+         onclick="closeDetailPanel()"></div>
+
+  </div>
+
+  <script>
+    /* ── Navigation ────────────────────────────────────── */
+    function setActiveNav(el) {
+      document.querySelectorAll('.nav-link').forEach(link => link.classList.remove('active'));
+      el.classList.add('active');
+      // Update page title from link text
+      const label = el.querySelector('.sidebar-label');
+      if (label) {
+        document.getElementById('page-title').textContent = label.textContent.trim();
+      }
+    }
+
+    /* ── Sidebar toggle (mobile) ──────────────────────── */
+    function toggleSidebar() {
+      const sidebar = document.getElementById('sidebar');
+      sidebar.classList.toggle('sidebar-open');
+      sidebar.classList.toggle('sidebar-closed');
+    }
+
+    /* ── Detail panel ─────────────────────────────────── */
+    function openDetailPanel() {
+      document.getElementById('detail-panel').classList.remove('hidden');
+      document.getElementById('detail-overlay').classList.remove('hidden');
+    }
+    function closeDetailPanel() {
+      document.getElementById('detail-panel').classList.add('hidden');
+      document.getElementById('detail-overlay').classList.add('hidden');
+      document.getElementById('detail-panel').innerHTML = '';
+    }
+
+    /* ── HTMX event: after swap → init D3 charts ──────── */
+    document.body.addEventListener('htmx:afterSwap', function(evt) {
+      if (evt.detail.target.id === 'main-content') {
+        requestAnimationFrame(() => {
+          if (document.getElementById('overview-chart'))     initOverviewCharts();
+          if (document.getElementById('graph-container'))    initGraph();
+          if (document.getElementById('drift-chart'))        initDriftChart();
+          if (document.getElementById('heatmap-container'))  initHeatmap();
+          if (document.getElementById('health-chart'))       initHealthChart();
+        });
+      }
+      if (evt.detail.target.id === 'detail-panel') {
+        openDetailPanel();
+      }
+    });
+
+    /* ── Staleness check (polls overview for meta) ──────── */
+    function checkStaleness(meta) {
+      if (!meta) return;
+      const banner = document.getElementById('stale-banner');
+      if (meta.stale) {
+        banner.classList.remove('hidden');
+        const ageEl = document.getElementById('stale-age');
+        if (meta.index_age_seconds != null) {
+          const mins = Math.round(meta.index_age_seconds / 60);
+          ageEl.textContent = mins > 60 ? `${Math.round(mins/60)}h` : `${mins}m`;
+        }
+      } else {
+        banner.classList.add('hidden');
+      }
+      // Update header
+      const hdr = document.getElementById('header-indexed');
+      if (meta.index_age_seconds != null) {
+        const mins = Math.round(meta.index_age_seconds / 60);
+        hdr.textContent = `Indexed ${mins > 60 ? Math.round(mins/60) + 'h' : mins + 'm'} ago`;
+      }
+    }
+
+    /* ── Keyboard shortcut: / focuses search ──────────── */
+    document.addEventListener('keydown', function(e) {
+      if (e.key === '/' && !e.ctrlKey && !e.metaKey) {
+        const active = document.activeElement;
+        if (active.tagName !== 'INPUT' && active.tagName !== 'TEXTAREA') {
+          e.preventDefault();
+          document.getElementById('search-input').focus();
+        }
+      }
+      if (e.key === 'Escape') {
+        closeDetailPanel();
+        document.getElementById('search-input').blur();
+      }
+    });
+  </script>
+
+</body>
+</html>
