@@ -320,6 +320,22 @@ pub struct TraceCauseArgs {
     pub limit: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Args)]
+pub struct HealthArgs {
+    #[arg(help = "Optional section filter: critical, cycles, orphans, bottlenecks, risk-hotspots")]
+    pub filter: Option<String>,
+
+    #[arg(long, default_value = "10", help = "Maximum rows per selected section")]
+    pub limit: u32,
+
+    #[arg(
+        long,
+        default_value = "0.0",
+        help = "Minimum risk score threshold for critical/risk-hotspot sections"
+    )]
+    pub min_risk: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct GraphMigrateArgs {
     #[arg(long, help = "Preview migration actions without writing changes")]
@@ -359,6 +375,8 @@ pub enum Commands {
     Communities(CommunitiesArgs),
     /// Trace likely upstream semantic causes for a target symbol
     TraceCause(TraceCauseArgs),
+    /// Show graph health metrics with risk scoring
+    Health(HealthArgs),
     #[cfg(feature = "legacy-cozo")]
     /// Migrate graph backend data from CozoDB to SurrealDB
     GraphMigrate(GraphMigrateArgs),
@@ -1057,6 +1075,31 @@ mod tests {
                 assert_eq!(args.symbol_name, None);
                 assert_eq!(args.file, None);
                 assert_eq!(args.depth, 3);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn health_subcommand_parses_filter_limit_and_min_risk() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "health",
+            "risk-hotspots",
+            "--limit",
+            "25",
+            "--min-risk",
+            "0.4",
+        ])
+        .expect("health subcommand should parse");
+
+        match cli.command {
+            Some(Commands::Health(args)) => {
+                assert_eq!(args.filter.as_deref(), Some("risk-hotspots"));
+                assert_eq!(args.limit, 25);
+                assert!((args.min_risk - 0.4).abs() < f64::EPSILON);
             }
             other => panic!("unexpected command: {other:?}"),
         }

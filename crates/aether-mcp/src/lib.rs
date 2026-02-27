@@ -7,12 +7,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aether_analysis::{
     AcknowledgeDriftRequest as AnalysisAcknowledgeDriftRequest, BlastRadiusRequest, CausalAnalyzer,
     CouplingAnalyzer, DriftAnalyzer, DriftInclude as AnalysisDriftInclude,
-    DriftReportRequest as AnalysisDriftReportRequest, RiskLevel as CouplingRiskLevel,
-    TestIntentAnalyzer, TraceCauseRequest as AnalysisTraceCauseRequest,
+    DriftReportRequest as AnalysisDriftReportRequest, HealthAnalyzer,
+    HealthInclude as AnalysisHealthInclude, HealthRequest as AnalysisHealthRequest,
+    RiskLevel as CouplingRiskLevel, TestIntentAnalyzer,
+    TraceCauseRequest as AnalysisTraceCauseRequest,
 };
-use aether_config::SearchRerankerKind;
 #[cfg(feature = "verification")]
 use aether_config::VerifyMode;
+use aether_config::{GraphBackend, SearchRerankerKind};
 pub use aether_core::SearchMode;
 use aether_core::{
     HoverMarkdownSections, Language, NO_SIR_MESSAGE, SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR,
@@ -546,6 +548,113 @@ pub struct AetherAcknowledgeDriftResponse {
     pub acknowledged: u32,
     pub note_created: bool,
     pub note_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AetherHealthInclude {
+    CriticalSymbols,
+    Bottlenecks,
+    Cycles,
+    Orphans,
+    RiskHotspots,
+}
+
+impl From<AetherHealthInclude> for AnalysisHealthInclude {
+    fn from(value: AetherHealthInclude) -> Self {
+        match value {
+            AetherHealthInclude::CriticalSymbols => AnalysisHealthInclude::CriticalSymbols,
+            AetherHealthInclude::Bottlenecks => AnalysisHealthInclude::Bottlenecks,
+            AetherHealthInclude::Cycles => AnalysisHealthInclude::Cycles,
+            AetherHealthInclude::Orphans => AnalysisHealthInclude::Orphans,
+            AetherHealthInclude::RiskHotspots => AnalysisHealthInclude::RiskHotspots,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherHealthRequest {
+    pub include: Option<Vec<AetherHealthInclude>>,
+    pub limit: Option<u32>,
+    pub min_risk: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherHealthAnalysisSummary {
+    pub total_symbols: u32,
+    pub total_edges: u32,
+    pub communities_detected: u32,
+    pub cycles_detected: u32,
+    pub orphaned_subgraphs: u32,
+    pub analyzed_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherSymbolHealthEntry {
+    pub symbol_id: String,
+    pub symbol_name: String,
+    pub file: String,
+    pub pagerank: f64,
+    pub betweenness: f64,
+    pub dependents_count: u32,
+    pub has_sir: bool,
+    pub test_count: u32,
+    pub drift_magnitude: f64,
+    pub risk_score: f64,
+    pub risk_factors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherBottleneckEntry {
+    pub symbol_id: String,
+    pub symbol_name: String,
+    pub file: String,
+    pub betweenness: f64,
+    pub pagerank: f64,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherHealthSymbolRef {
+    pub id: String,
+    pub name: String,
+    pub file: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherCycleEntry {
+    pub cycle_id: u32,
+    pub symbols: Vec<AetherHealthSymbolRef>,
+    pub edge_count: u32,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherOrphanEntry {
+    pub subgraph_id: u32,
+    pub symbols: Vec<AetherHealthSymbolRef>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherRiskHotspotEntry {
+    pub symbol_id: String,
+    pub symbol_name: String,
+    pub file: String,
+    pub risk_score: f64,
+    pub risk_factors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherHealthResponse {
+    pub schema_version: String,
+    pub analysis: AetherHealthAnalysisSummary,
+    pub critical_symbols: Vec<AetherSymbolHealthEntry>,
+    pub bottlenecks: Vec<AetherBottleneckEntry>,
+    pub cycles: Vec<AetherCycleEntry>,
+    pub orphans: Vec<AetherOrphanEntry>,
+    pub risk_hotspots: Vec<AetherRiskHotspotEntry>,
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1868,6 +1977,124 @@ impl AetherMcpServer {
                     })
                     .collect(),
             },
+        })
+    }
+
+    pub async fn aether_health_logic(
+        &self,
+        request: AetherHealthRequest,
+    ) -> Result<AetherHealthResponse, AetherMcpError> {
+        let analyzer = HealthAnalyzer::new(self.workspace())?;
+        let analysis_request = AnalysisHealthRequest {
+            include: request
+                .include
+                .unwrap_or_default()
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            limit: request.limit.unwrap_or(10),
+            min_risk: request.min_risk.unwrap_or(0.0),
+        };
+
+        let report = if self.state.config.storage.graph_backend == GraphBackend::Surreal {
+            match self.state.surreal_graph_for_health().await {
+                Ok(graph) => {
+                    analyzer
+                        .analyze_with_graph(&analysis_request, graph.as_ref())
+                        .await?
+                }
+                Err(_) => analyzer.analyze(&analysis_request).await?,
+            }
+        } else {
+            analyzer.analyze(&analysis_request).await?
+        };
+
+        Ok(AetherHealthResponse {
+            schema_version: report.schema_version,
+            analysis: AetherHealthAnalysisSummary {
+                total_symbols: report.analysis.total_symbols,
+                total_edges: report.analysis.total_edges,
+                communities_detected: report.analysis.communities_detected,
+                cycles_detected: report.analysis.cycles_detected,
+                orphaned_subgraphs: report.analysis.orphaned_subgraphs,
+                analyzed_at: report.analysis.analyzed_at,
+            },
+            critical_symbols: report
+                .critical_symbols
+                .into_iter()
+                .map(|entry| AetherSymbolHealthEntry {
+                    symbol_id: entry.symbol_id,
+                    symbol_name: entry.symbol_name,
+                    file: entry.file,
+                    pagerank: entry.pagerank,
+                    betweenness: entry.betweenness,
+                    dependents_count: entry.dependents_count,
+                    has_sir: entry.has_sir,
+                    test_count: entry.test_count,
+                    drift_magnitude: entry.drift_magnitude,
+                    risk_score: entry.risk_score,
+                    risk_factors: entry.risk_factors,
+                })
+                .collect(),
+            bottlenecks: report
+                .bottlenecks
+                .into_iter()
+                .map(|entry| AetherBottleneckEntry {
+                    symbol_id: entry.symbol_id,
+                    symbol_name: entry.symbol_name,
+                    file: entry.file,
+                    betweenness: entry.betweenness,
+                    pagerank: entry.pagerank,
+                    note: entry.note,
+                })
+                .collect(),
+            cycles: report
+                .cycles
+                .into_iter()
+                .map(|entry| AetherCycleEntry {
+                    cycle_id: entry.cycle_id,
+                    symbols: entry
+                        .symbols
+                        .into_iter()
+                        .map(|symbol| AetherHealthSymbolRef {
+                            id: symbol.id,
+                            name: symbol.name,
+                            file: symbol.file,
+                        })
+                        .collect(),
+                    edge_count: entry.edge_count,
+                    note: entry.note,
+                })
+                .collect(),
+            orphans: report
+                .orphans
+                .into_iter()
+                .map(|entry| AetherOrphanEntry {
+                    subgraph_id: entry.subgraph_id,
+                    symbols: entry
+                        .symbols
+                        .into_iter()
+                        .map(|symbol| AetherHealthSymbolRef {
+                            id: symbol.id,
+                            name: symbol.name,
+                            file: symbol.file,
+                        })
+                        .collect(),
+                    note: entry.note,
+                })
+                .collect(),
+            risk_hotspots: report
+                .risk_hotspots
+                .into_iter()
+                .map(|entry| AetherRiskHotspotEntry {
+                    symbol_id: entry.symbol_id,
+                    symbol_name: entry.symbol_name,
+                    file: entry.file,
+                    risk_score: entry.risk_score,
+                    risk_factors: entry.risk_factors,
+                })
+                .collect(),
+            notes: report.notes,
         })
     }
 
@@ -3205,6 +3432,21 @@ impl AetherMcpServer {
         tokio::task::spawn_blocking(move || server.aether_drift_report_logic(request))
             .await
             .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_health",
+        description = "Get codebase health metrics including critical symbols, bottlenecks, dependency cycles, orphaned code, and risk hotspots."
+    )]
+    pub async fn aether_health(
+        &self,
+        Parameters(request): Parameters<AetherHealthRequest>,
+    ) -> Result<Json<AetherHealthResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_health");
+        self.aether_health_logic(request)
+            .await
             .map(Json)
             .map_err(to_mcp_error)
     }
