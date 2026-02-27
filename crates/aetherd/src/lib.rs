@@ -3,6 +3,7 @@ pub mod causal;
 pub mod cli;
 pub mod coupling;
 pub mod drift;
+pub mod health;
 pub mod indexer;
 pub mod init_agent;
 pub mod memory;

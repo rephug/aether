@@ -6,6 +6,7 @@ use aether_store::{
     GraphStore, SchemaVersion, SqliteGraphStore, SqliteStore, SqliteVectorStore, SurrealGraphStore,
     VectorStore, open_vector_store,
 };
+use tokio::sync::Mutex;
 
 use crate::AetherMcpError;
 
@@ -14,6 +15,7 @@ pub struct SharedState {
     pub workspace: PathBuf,
     pub store: Arc<SqliteStore>,
     pub graph: Arc<dyn GraphStore>,
+    pub surreal_graph: Arc<Mutex<Option<Arc<SurrealGraphStore>>>>,
     pub vector_store: Option<Arc<dyn VectorStore>>,
     pub config: Arc<AetherConfig>,
     pub read_only: bool,
@@ -27,6 +29,7 @@ impl SharedState {
         let store = Arc::new(SqliteStore::open(&workspace)?);
         store.check_compatibility("core", 2)?;
         let graph = open_shared_graph(&workspace, &config, false)?;
+        let surreal_graph = Arc::new(Mutex::new(None));
         let vector_store = open_vector_store_sync_optional(&workspace, &config)?;
         let schema_version = store.get_schema_version()?;
 
@@ -34,6 +37,7 @@ impl SharedState {
             workspace,
             store,
             graph,
+            surreal_graph,
             vector_store,
             config,
             read_only: false,
@@ -47,6 +51,7 @@ impl SharedState {
         let store = Arc::new(SqliteStore::open(&workspace)?);
         store.check_compatibility("core", 2)?;
         let graph = open_shared_graph(&workspace, &config, false)?;
+        let surreal_graph = Arc::new(Mutex::new(None));
         let vector_store = open_vector_store_async_optional(&workspace, &config).await?;
         let schema_version = store.get_schema_version()?;
 
@@ -54,6 +59,7 @@ impl SharedState {
             workspace,
             store,
             graph,
+            surreal_graph,
             vector_store,
             config,
             read_only: false,
@@ -66,7 +72,8 @@ impl SharedState {
         let config = Arc::new(load_config(&workspace)?);
         let store = Arc::new(SqliteStore::open_readonly(&workspace)?);
         store.check_compatibility("core", 2)?;
-        let graph = open_shared_graph_async(&workspace, &config, true).await?;
+        let (graph, surreal_graph) = open_shared_graph_async(&workspace, &config, true).await?;
+        let surreal_graph = Arc::new(Mutex::new(surreal_graph));
         let vector_store = open_vector_store_async_optional(&workspace, &config).await?;
         let schema_version = store.get_schema_version()?;
 
@@ -74,6 +81,7 @@ impl SharedState {
             workspace,
             store,
             graph,
+            surreal_graph,
             vector_store,
             config,
             read_only: true,
@@ -87,6 +95,7 @@ impl SharedState {
         let store = Arc::new(SqliteStore::open_readonly(&workspace)?);
         store.check_compatibility("core", 2)?;
         let graph = open_shared_graph(&workspace, &config, true)?;
+        let surreal_graph = Arc::new(Mutex::new(None));
         let vector_store = open_vector_store_sync_optional(&workspace, &config)?;
         let schema_version = store.get_schema_version()?;
 
@@ -94,6 +103,7 @@ impl SharedState {
             workspace,
             store,
             graph,
+            surreal_graph,
             vector_store,
             config,
             read_only: true,
@@ -108,6 +118,23 @@ impl SharedState {
             ));
         }
         Ok(())
+    }
+
+    pub async fn surreal_graph_for_health(&self) -> Result<Arc<SurrealGraphStore>, AetherMcpError> {
+        if self.config.storage.graph_backend != GraphBackend::Surreal {
+            return Err(AetherMcpError::Message(
+                "health analysis requires surreal graph backend".to_owned(),
+            ));
+        }
+
+        let mut guard = self.surreal_graph.lock().await;
+        if let Some(existing) = guard.as_ref() {
+            return Ok(existing.clone());
+        }
+
+        let graph = Arc::new(SurrealGraphStore::open_readonly(&self.workspace).await?);
+        *guard = Some(graph.clone());
+        Ok(graph)
     }
 }
 
@@ -182,24 +209,26 @@ async fn open_shared_graph_async(
     workspace: &Path,
     config: &AetherConfig,
     read_only: bool,
-) -> Result<Arc<dyn GraphStore>, AetherMcpError> {
-    let graph: Arc<dyn GraphStore> = match config.storage.graph_backend {
+) -> Result<(Arc<dyn GraphStore>, Option<Arc<SurrealGraphStore>>), AetherMcpError> {
+    match config.storage.graph_backend {
         GraphBackend::Sqlite | GraphBackend::Cozo => {
-            if read_only {
+            let graph: Arc<dyn GraphStore> = if read_only {
                 Arc::new(SqliteGraphStore::open_readonly(workspace)?)
             } else {
                 Arc::new(SqliteGraphStore::open(workspace)?)
-            }
+            };
+            Ok((graph, None))
         }
         GraphBackend::Surreal => {
-            if read_only {
+            let surreal = if read_only {
                 Arc::new(SurrealGraphStore::open_readonly(workspace).await?)
             } else {
                 Arc::new(SurrealGraphStore::open(workspace).await?)
-            }
+            };
+            let graph: Arc<dyn GraphStore> = surreal.clone();
+            Ok((graph, Some(surreal)))
         }
-    };
-    Ok(graph)
+    }
 }
 
 #[cfg(test)]

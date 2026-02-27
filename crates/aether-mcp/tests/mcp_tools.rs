@@ -6,8 +6,8 @@ use aether_core::{
 };
 use aether_mcp::{
     AetherBlastRadiusRequest, AetherCallChainRequest, AetherDependenciesRequest,
-    AetherExplainRequest, AetherGetSirRequest, AetherMcpServer, AetherRecallRequest,
-    AetherRememberRequest, AetherSearchRequest, AetherSymbolLookupRequest,
+    AetherExplainRequest, AetherGetSirRequest, AetherHealthRequest, AetherMcpServer,
+    AetherRecallRequest, AetherRememberRequest, AetherSearchRequest, AetherSymbolLookupRequest,
     AetherSymbolTimelineRequest, AetherTestIntentsRequest, AetherWhyChangedReason,
     AetherWhyChangedRequest, AetherWhySelectorMode, MCP_SCHEMA_VERSION, MEMORY_SCHEMA_VERSION,
     SirLevelRequest,
@@ -90,7 +90,6 @@ vector_backend = "sqlite"
     let server = AetherMcpServer::new(workspace, false)?;
 
     let rt = Runtime::new()?;
-
     let status = rt
         .block_on(server.aether_status())
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
@@ -100,7 +99,17 @@ vector_backend = "sqlite"
     assert!(status.store_present);
     assert!(status.symbol_count > 0);
     assert!(status.sir_count > 0);
-
+    let health = rt
+        .block_on(server.aether_health(Parameters(AetherHealthRequest {
+            include: None,
+            limit: Some(10),
+            min_risk: Some(0.0),
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert_eq!(health.schema_version, "1.0");
+    assert!(health.analysis.analyzed_at > 0);
+    assert!(health.critical_symbols.len() <= 10);
     let lookup = rt
         .block_on(
             server.aether_symbol_lookup(Parameters(AetherSymbolLookupRequest {
@@ -123,7 +132,6 @@ vector_backend = "sqlite"
             .iter()
             .any(|item| item.qualified_name.contains("alpha"))
     );
-
     let search = rt
         .block_on(server.aether_search(Parameters(AetherSearchRequest {
             query: "app.ts".to_owned(),
@@ -145,7 +153,6 @@ vector_backend = "sqlite"
             .iter()
             .any(|item| item.file_path.contains("src/app.ts"))
     );
-
     let python_search = rt
         .block_on(server.aether_search(Parameters(AetherSearchRequest {
             query: "compute_total".to_owned(),
@@ -175,7 +182,6 @@ vector_backend = "sqlite"
         search_with_zero_limit.result_count as usize,
         search_with_zero_limit.matches.len()
     );
-
     let semantic_search = rt
         .block_on(server.aether_search(Parameters(AetherSearchRequest {
             query: "alpha summary".to_owned(),
@@ -193,7 +199,6 @@ vector_backend = "sqlite"
         semantic_search.matches.len()
     );
     assert!(semantic_search.matches[0].semantic_score.is_some());
-
     let explain = rt
         .block_on(server.aether_explain(Parameters(AetherExplainRequest {
             file_path: "src/lib.rs".to_owned(),
@@ -211,7 +216,6 @@ vector_backend = "sqlite"
     assert_eq!(explain.sir_status.as_deref(), Some("fresh"));
     assert_eq!(explain.last_error, None);
     assert!(explain.last_attempt_at.unwrap_or_default() > 0);
-
     let sir = rt
         .block_on(server.aether_get_sir(Parameters(AetherGetSirRequest {
             level: None,
@@ -247,7 +251,6 @@ vector_backend = "sqlite"
         last_error: Some("provider timeout".to_owned()),
         last_attempt_at: existing_meta.last_attempt_at + 1,
     })?;
-
     let stale_sir = rt
         .block_on(server.aether_get_sir(Parameters(AetherGetSirRequest {
             level: None,
@@ -262,7 +265,6 @@ vector_backend = "sqlite"
     assert_eq!(stale_sir.sir_status.as_deref(), Some("stale"));
     assert_eq!(stale_sir.last_error.as_deref(), Some("provider timeout"));
     assert!(stale_sir.last_attempt_at.unwrap_or_default() > existing_meta.last_attempt_at);
-
     let stale_explain = rt
         .block_on(server.aether_explain(Parameters(AetherExplainRequest {
             file_path: "src/lib.rs".to_owned(),
@@ -288,7 +290,6 @@ vector_backend = "sqlite"
         let path = entry?.path();
         fs::remove_file(path)?;
     }
-
     let sir_without_mirror = rt
         .block_on(server.aether_get_sir(Parameters(AetherGetSirRequest {
             level: None,

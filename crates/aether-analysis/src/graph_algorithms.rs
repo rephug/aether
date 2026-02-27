@@ -16,6 +16,10 @@ pub fn page_rank(
         .collect()
 }
 
+pub fn betweenness_centrality(edges: &[GraphAlgorithmEdge]) -> Vec<(String, f64)> {
+    aether_graph_algo::betweenness_centrality_sync(edges)
+}
+
 pub fn louvain_communities(edges: &[GraphAlgorithmEdge]) -> HashMap<String, usize> {
     aether_graph_algo::louvain_sync(edges).into_iter().collect()
 }

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use petgraph::Direction;
 use petgraph::algo::kosaraju_scc;
@@ -184,6 +184,122 @@ pub fn page_rank_sync(
         .into_iter()
         .filter_map(|(node, score)| names.get(&node).cloned().map(|name| (name, score)))
         .collect::<Vec<_>>();
+    scored.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    scored
+}
+
+pub fn betweenness_centrality_sync(edges: &[GraphAlgorithmEdge]) -> Vec<(String, f64)> {
+    let (graph, _, names) = build_digraph(edges);
+    let nodes = graph.node_indices().collect::<Vec<_>>();
+    let node_count = nodes.len();
+    if node_count == 0 {
+        return Vec::new();
+    }
+
+    let mut centrality = nodes
+        .iter()
+        .copied()
+        .map(|node| (node, 0.0f64))
+        .collect::<HashMap<_, _>>();
+
+    for &source in &nodes {
+        let mut stack = Vec::<NodeIndex>::new();
+        let mut predecessors = nodes
+            .iter()
+            .copied()
+            .map(|node| (node, Vec::<NodeIndex>::new()))
+            .collect::<HashMap<_, _>>();
+        let mut sigma = nodes
+            .iter()
+            .copied()
+            .map(|node| (node, 0.0f64))
+            .collect::<HashMap<_, _>>();
+        let mut distance = nodes
+            .iter()
+            .copied()
+            .map(|node| (node, -1i64))
+            .collect::<HashMap<_, _>>();
+
+        sigma.insert(source, 1.0);
+        distance.insert(source, 0);
+
+        let mut queue = VecDeque::new();
+        queue.push_back(source);
+
+        while let Some(node) = queue.pop_front() {
+            stack.push(node);
+            let node_distance = *distance.get(&node).unwrap_or(&-1);
+
+            for neighbor in graph.neighbors_directed(node, Direction::Outgoing) {
+                if *distance.get(&neighbor).unwrap_or(&-1) < 0 {
+                    distance.insert(neighbor, node_distance + 1);
+                    queue.push_back(neighbor);
+                }
+
+                if *distance.get(&neighbor).unwrap_or(&-1) == node_distance + 1 {
+                    predecessors.entry(neighbor).or_default().push(node);
+                    let sigma_node = *sigma.get(&node).unwrap_or(&0.0);
+                    *sigma.entry(neighbor).or_insert(0.0) += sigma_node;
+                }
+            }
+        }
+
+        let mut dependency = nodes
+            .iter()
+            .copied()
+            .map(|node| (node, 0.0f64))
+            .collect::<HashMap<_, _>>();
+
+        while let Some(node) = stack.pop() {
+            let sigma_node = *sigma.get(&node).unwrap_or(&0.0);
+            if sigma_node <= f64::EPSILON {
+                continue;
+            }
+
+            let pred = predecessors.remove(&node).unwrap_or_default();
+            for predecessor in pred {
+                let sigma_predecessor = *sigma.get(&predecessor).unwrap_or(&0.0);
+                if sigma_predecessor <= f64::EPSILON {
+                    continue;
+                }
+                let contribution = (sigma_predecessor / sigma_node)
+                    * (1.0 + dependency.get(&node).copied().unwrap_or(0.0));
+                *dependency.entry(predecessor).or_insert(0.0) += contribution;
+            }
+
+            if node != source {
+                *centrality.entry(node).or_insert(0.0) +=
+                    dependency.get(&node).copied().unwrap_or(0.0);
+            }
+        }
+    }
+
+    let normalization = if node_count > 2 {
+        ((node_count - 1) * (node_count - 2)) as f64
+    } else {
+        0.0
+    };
+
+    let mut scored = nodes
+        .into_iter()
+        .filter_map(|node| {
+            let name = names.get(&node)?.clone();
+            let raw = centrality.get(&node).copied().unwrap_or(0.0);
+            let score = if normalization > f64::EPSILON {
+                raw / normalization
+            } else {
+                0.0
+            };
+            Some((name, score))
+        })
+        .collect::<Vec<_>>();
+
     scored.sort_by(|left, right| {
         right
             .1
@@ -497,5 +613,52 @@ mod tests {
             cross,
             vec![("b".to_owned(), "c".to_owned(), "calls".to_owned())]
         );
+    }
+
+    #[test]
+    fn betweenness_center_of_star_is_highest() {
+        let edges = vec![
+            edge("a", "center"),
+            edge("b", "center"),
+            edge("d", "center"),
+            edge("center", "a"),
+            edge("center", "b"),
+            edge("center", "d"),
+        ];
+        let scores = betweenness_centrality_sync(&edges)
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        assert!(scores["center"] > scores["a"]);
+        assert!(scores["center"] > scores["b"]);
+        assert!(scores["center"] > scores["d"]);
+    }
+
+    #[test]
+    fn betweenness_chain_middle_nodes_are_higher() {
+        let edges = vec![edge("a", "b"), edge("b", "c"), edge("c", "d")];
+        let scores = betweenness_centrality_sync(&edges)
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        assert!(scores["b"] > scores["a"]);
+        assert!(scores["c"] > scores["d"]);
+        assert!(scores["b"] > scores["d"]);
+    }
+
+    #[test]
+    fn betweenness_disconnected_graph_is_zero() {
+        let edges = vec![edge("a", "b"), edge("c", "d")];
+        let scores = betweenness_centrality_sync(&edges)
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(scores["a"], 0.0);
+        assert_eq!(scores["b"], 0.0);
+        assert_eq!(scores["c"], 0.0);
+        assert_eq!(scores["d"], 0.0);
+    }
+
+    #[test]
+    fn betweenness_empty_graph_is_empty() {
+        let scores = betweenness_centrality_sync(&[]);
+        assert!(scores.is_empty());
     }
 }

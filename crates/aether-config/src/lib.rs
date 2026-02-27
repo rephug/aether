@@ -34,6 +34,11 @@ pub const DEFAULT_DRIFT_THRESHOLD: f32 = 0.85;
 pub const DEFAULT_DRIFT_ANALYSIS_WINDOW: &str = "100 commits";
 pub const DEFAULT_DRIFT_HUB_PERCENTILE: u32 = 95;
 pub const DEFAULT_DASHBOARD_PORT: u16 = 9720;
+pub const DEFAULT_HEALTH_PAGERANK_WEIGHT: f64 = 0.3;
+pub const DEFAULT_HEALTH_TEST_GAP_WEIGHT: f64 = 0.25;
+pub const DEFAULT_HEALTH_DRIFT_WEIGHT: f64 = 0.2;
+pub const DEFAULT_HEALTH_NO_SIR_WEIGHT: f64 = 0.15;
+pub const DEFAULT_HEALTH_RECENCY_WEIGHT: f64 = 0.1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -225,6 +230,8 @@ pub struct AetherConfig {
     pub coupling: CouplingConfig,
     #[serde(default)]
     pub drift: DriftConfig,
+    #[serde(default)]
+    pub health: HealthConfig,
     #[serde(default)]
     pub dashboard: DashboardConfig,
 }
@@ -647,6 +654,49 @@ impl Default for DriftConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HealthConfig {
+    #[serde(default = "default_health_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub risk_weights: RiskWeights,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_health_enabled(),
+            risk_weights: RiskWeights::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RiskWeights {
+    #[serde(default = "default_health_pagerank_weight")]
+    pub pagerank: f64,
+    #[serde(default = "default_health_test_gap_weight")]
+    pub test_gap: f64,
+    #[serde(default = "default_health_drift_weight")]
+    pub drift: f64,
+    #[serde(default = "default_health_no_sir_weight")]
+    pub no_sir: f64,
+    #[serde(default = "default_health_recency_weight")]
+    pub recency: f64,
+}
+
+impl Default for RiskWeights {
+    fn default() -> Self {
+        Self {
+            pagerank: default_health_pagerank_weight(),
+            test_gap: default_health_test_gap_weight(),
+            drift: default_health_drift_weight(),
+            no_sir: default_health_no_sir_weight(),
+            recency: default_health_recency_weight(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DashboardConfig {
     #[serde(default = "default_dashboard_port")]
@@ -1051,6 +1101,30 @@ fn default_drift_hub_percentile() -> u32 {
     DEFAULT_DRIFT_HUB_PERCENTILE
 }
 
+fn default_health_enabled() -> bool {
+    true
+}
+
+fn default_health_pagerank_weight() -> f64 {
+    DEFAULT_HEALTH_PAGERANK_WEIGHT
+}
+
+fn default_health_test_gap_weight() -> f64 {
+    DEFAULT_HEALTH_TEST_GAP_WEIGHT
+}
+
+fn default_health_drift_weight() -> f64 {
+    DEFAULT_HEALTH_DRIFT_WEIGHT
+}
+
+fn default_health_no_sir_weight() -> f64 {
+    DEFAULT_HEALTH_NO_SIR_WEIGHT
+}
+
+fn default_health_recency_weight() -> f64 {
+    DEFAULT_HEALTH_RECENCY_WEIGHT
+}
+
 fn default_dashboard_port() -> u16 {
     DEFAULT_DASHBOARD_PORT
 }
@@ -1168,6 +1242,55 @@ fn normalize_coupling_weights(config: &mut CouplingConfig) {
     eprintln!("AETHER config warning: coupling weights summed to {sum:.3}; normalized to 1.0");
 }
 
+fn normalize_health_weight_value(value: f64, fallback: f64) -> f64 {
+    if !value.is_finite() || value < 0.0 {
+        fallback
+    } else {
+        value
+    }
+}
+
+fn normalize_health_weights(config: &mut HealthConfig) {
+    config.risk_weights.pagerank = normalize_health_weight_value(
+        config.risk_weights.pagerank,
+        default_health_pagerank_weight(),
+    );
+    config.risk_weights.test_gap = normalize_health_weight_value(
+        config.risk_weights.test_gap,
+        default_health_test_gap_weight(),
+    );
+    config.risk_weights.drift =
+        normalize_health_weight_value(config.risk_weights.drift, default_health_drift_weight());
+    config.risk_weights.no_sir =
+        normalize_health_weight_value(config.risk_weights.no_sir, default_health_no_sir_weight());
+    config.risk_weights.recency =
+        normalize_health_weight_value(config.risk_weights.recency, default_health_recency_weight());
+
+    let sum = config.risk_weights.pagerank
+        + config.risk_weights.test_gap
+        + config.risk_weights.drift
+        + config.risk_weights.no_sir
+        + config.risk_weights.recency;
+    if (sum - 1.0).abs() <= 0.000_001 {
+        return;
+    }
+
+    if sum <= f64::EPSILON {
+        config.risk_weights = RiskWeights::default();
+        eprintln!(
+            "AETHER config warning: health risk weights summed to {sum:.3}; reset to defaults"
+        );
+        return;
+    }
+
+    config.risk_weights.pagerank /= sum;
+    config.risk_weights.test_gap /= sum;
+    config.risk_weights.drift /= sum;
+    config.risk_weights.no_sir /= sum;
+    config.risk_weights.recency /= sum;
+    eprintln!("AETHER config warning: health risk weights summed to {sum:.3}; normalized to 1.0");
+}
+
 fn normalize_config(mut config: AetherConfig) -> AetherConfig {
     config.general.log_level = normalize_with_default(
         std::mem::take(&mut config.general.log_level),
@@ -1263,6 +1386,7 @@ fn normalize_config(mut config: AetherConfig) -> AetherConfig {
         config.drift.drift_threshold = config.drift.drift_threshold.clamp(0.0, 1.0);
     }
     config.drift.hub_percentile = config.drift.hub_percentile.clamp(1, 100);
+    normalize_health_weights(&mut config.health);
 
     let api_key_env = config.inference.api_key_env.trim();
     if api_key_env.is_empty() {
@@ -1388,6 +1512,27 @@ mod tests {
         );
         assert!(!config.drift.auto_analyze);
         assert_eq!(config.drift.hub_percentile, DEFAULT_DRIFT_HUB_PERCENTILE);
+        assert!(config.health.enabled);
+        assert_eq!(
+            config.health.risk_weights.pagerank,
+            DEFAULT_HEALTH_PAGERANK_WEIGHT
+        );
+        assert_eq!(
+            config.health.risk_weights.test_gap,
+            DEFAULT_HEALTH_TEST_GAP_WEIGHT
+        );
+        assert_eq!(
+            config.health.risk_weights.drift,
+            DEFAULT_HEALTH_DRIFT_WEIGHT
+        );
+        assert_eq!(
+            config.health.risk_weights.no_sir,
+            DEFAULT_HEALTH_NO_SIR_WEIGHT
+        );
+        assert_eq!(
+            config.health.risk_weights.recency,
+            DEFAULT_HEALTH_RECENCY_WEIGHT
+        );
         assert_eq!(config.dashboard.port, DEFAULT_DASHBOARD_PORT);
         assert!(config.dashboard.enabled);
         assert!(config_path(workspace).exists());
@@ -1440,6 +1585,14 @@ mod tests {
         assert!(content.contains("analysis_window = \"100 commits\""));
         assert!(content.contains("auto_analyze = false"));
         assert!(content.contains("hub_percentile = 95"));
+        assert!(content.contains("[health]"));
+        assert!(content.contains("enabled = true"));
+        assert!(content.contains("risk_weights = {") || content.contains("[health.risk_weights]"));
+        assert!(content.contains("pagerank = 0.3"));
+        assert!(content.contains("test_gap = 0.25"));
+        assert!(content.contains("drift = 0.2"));
+        assert!(content.contains("no_sir = 0.15"));
+        assert!(content.contains("recency = 0.1"));
         assert!(content.contains("[dashboard]"));
         assert!(content.contains("port = 9720"));
         assert!(content.contains("enabled = true"));
@@ -1516,6 +1669,10 @@ drift_threshold = 0.9
 analysis_window = " 50 commits "
 auto_analyze = true
 hub_percentile = 0
+
+[health]
+enabled = false
+risk_weights = { pagerank = 3.0, test_gap = 1.0, drift = 1.0, no_sir = 1.0, recency = 2.0 }
 
 [dashboard]
 port = 9800
@@ -1613,6 +1770,13 @@ enabled = false
         assert_eq!(config.drift.analysis_window, "50 commits");
         assert!(config.drift.auto_analyze);
         assert_eq!(config.drift.hub_percentile, 1);
+        assert!(!config.health.enabled);
+        let health_sum = config.health.risk_weights.pagerank
+            + config.health.risk_weights.test_gap
+            + config.health.risk_weights.drift
+            + config.health.risk_weights.no_sir
+            + config.health.risk_weights.recency;
+        assert!((health_sum - 1.0).abs() < 1e-6);
         assert_eq!(config.dashboard.port, 9800);
         assert!(!config.dashboard.enabled);
     }
@@ -1742,6 +1906,11 @@ fallback_to_host_on_unavailable = true
         assert_eq!(config.drift.analysis_window, DEFAULT_DRIFT_ANALYSIS_WINDOW);
         assert!(!config.drift.auto_analyze);
         assert_eq!(config.drift.hub_percentile, DEFAULT_DRIFT_HUB_PERCENTILE);
+        assert!(config.health.enabled);
+        assert_eq!(
+            config.health.risk_weights.pagerank,
+            DEFAULT_HEALTH_PAGERANK_WEIGHT
+        );
     }
 
     #[test]
@@ -1766,6 +1935,27 @@ semantic_weight = 1.0
         assert!((config.coupling.temporal_weight - 0.5).abs() < 1e-6);
         assert!((config.coupling.static_weight - 0.25).abs() < 1e-6);
         assert!((config.coupling.semantic_weight - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn load_workspace_config_normalizes_health_weights_when_sum_is_invalid() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(aether_dir(workspace)).expect("create .aether");
+
+        let raw = r#"
+[health]
+risk_weights = { pagerank = 2.0, test_gap = 1.0, drift = 1.0, no_sir = 1.0, recency = 1.0 }
+"#;
+        fs::write(config_path(workspace), raw).expect("write config");
+
+        let config = load_workspace_config(workspace).expect("load config");
+        let sum = config.health.risk_weights.pagerank
+            + config.health.risk_weights.test_gap
+            + config.health.risk_weights.drift
+            + config.health.risk_weights.no_sir
+            + config.health.risk_weights.recency;
+        assert!((sum - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -1798,6 +1988,7 @@ semantic_weight = 1.0
             },
             coupling: CouplingConfig::default(),
             drift: DriftConfig::default(),
+            health: HealthConfig::default(),
             dashboard: DashboardConfig::default(),
         };
 
