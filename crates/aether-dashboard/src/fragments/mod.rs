@@ -5,9 +5,12 @@ use axum::routing::get;
 
 use crate::support::DashboardState;
 
+mod coupling;
+mod drift_table;
+mod graph;
+mod health;
 mod overview;
 mod search_results;
-mod stubs;
 mod symbol_detail;
 
 pub(crate) fn fragment_router() -> Router<Arc<DashboardState>> {
@@ -21,8 +24,11 @@ pub(crate) fn fragment_router() -> Router<Arc<DashboardState>> {
             "/dashboard/frag/symbol/{symbol_id}",
             get(symbol_detail::symbol_detail_fragment),
         )
-        .route("/dashboard/frag/graph", get(stubs::graph_fragment))
-        .route("/dashboard/frag/drift-table", get(stubs::drift_fragment))
-        .route("/dashboard/frag/coupling", get(stubs::coupling_fragment))
-        .route("/dashboard/frag/health", get(stubs::health_fragment))
+        .route("/dashboard/frag/graph", get(graph::graph_fragment))
+        .route(
+            "/dashboard/frag/drift-table",
+            get(drift_table::drift_fragment),
+        )
+        .route("/dashboard/frag/coupling", get(coupling::coupling_fragment))
+        .route("/dashboard/frag/health", get(health::health_fragment))
 }
