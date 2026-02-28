@@ -11,7 +11,6 @@ use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
 use aether_store::{CouplingEdgeRecord, CozoGraphStore, SqliteStore, Store, StoreError};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::sync::Mutex;
 use tower_lsp::lsp_types::{
     Hover, HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
     MarkupContent, MarkupKind, Position, ServerCapabilities,
@@ -39,7 +38,7 @@ pub enum LspServerError {
 pub struct AetherLspBackend {
     client: Client,
     workspace_root: PathBuf,
-    store: Arc<Mutex<SqliteStore>>,
+    store: Arc<SqliteStore>,
 }
 
 static SYMBOL_EXTRACTOR: OnceLock<std::sync::Mutex<aether_parse::SymbolExtractor>> =
@@ -58,7 +57,7 @@ fn get_extractor()
 }
 
 impl AetherLspBackend {
-    pub fn new(client: Client, workspace_root: PathBuf, store: Arc<Mutex<SqliteStore>>) -> Self {
+    pub fn new(client: Client, workspace_root: PathBuf, store: Arc<SqliteStore>) -> Self {
         Self {
             client,
             workspace_root,
@@ -107,16 +106,31 @@ impl LanguageServer for AetherLspBackend {
             Err(_) => return Ok(Some(no_sir_hover())),
         };
 
-        let resolution = {
-            let guard = self.store.lock().await;
-
+        let workspace_root = self.workspace_root.clone();
+        let store = Arc::clone(&self.store);
+        let position = text_doc_pos.position;
+        let resolution = match tokio::task::spawn_blocking(move || {
             resolve_hover_markdown_for_source(
-                &self.workspace_root,
-                &guard,
+                &workspace_root,
+                store.as_ref(),
                 &file_path,
                 &source,
-                text_doc_pos.position,
+                position,
             )
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                let _ = self
+                    .client
+                    .log_message(
+                        tower_lsp::lsp_types::MessageType::ERROR,
+                        format!("AETHER hover task panicked: {err}"),
+                    )
+                    .await;
+                return Err(tower_lsp::jsonrpc::Error::internal_error());
+            }
         };
 
         let markdown = match resolution {
@@ -141,7 +155,7 @@ impl LanguageServer for AetherLspBackend {
 }
 
 pub async fn run_stdio(workspace_root: PathBuf) -> Result<(), LspServerError> {
-    let store = Arc::new(Mutex::new(SqliteStore::open(&workspace_root)?));
+    let store = Arc::new(SqliteStore::open(&workspace_root)?);
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();

@@ -38,6 +38,7 @@ const INFERENCE_MAX_RETRIES: usize = 2;
 const INFERENCE_ATTEMPT_TIMEOUT_SECS: u64 = 30;
 const INFERENCE_BACKOFF_BASE_MS: u64 = 200;
 const INFERENCE_BACKOFF_MAX_MS: u64 = 2_000;
+const MAX_SYMBOL_TEXT_CHARS: usize = 10_000;
 
 pub struct SirPipeline {
     workspace_root: PathBuf,
@@ -796,9 +797,24 @@ fn build_job(workspace_root: &Path, symbol: Symbol) -> Result<SirJob> {
     let source = fs::read_to_string(&full_path)
         .with_context(|| format!("failed to read symbol source file {}", full_path.display()))?;
 
-    let symbol_text = extract_symbol_source_text(&source, symbol.range)
+    let mut symbol_text = extract_symbol_source_text(&source, symbol.range)
         .filter(|text| !text.trim().is_empty())
         .unwrap_or(source);
+    if symbol_text.len() > MAX_SYMBOL_TEXT_CHARS {
+        let truncated = symbol_text
+            .char_indices()
+            .take_while(|(index, _)| *index < MAX_SYMBOL_TEXT_CHARS)
+            .last()
+            .map(|(index, ch)| index + ch.len_utf8())
+            .unwrap_or(0);
+        tracing::warn!(
+            symbol = %symbol.name,
+            original_len = symbol_text.len(),
+            truncated_len = truncated,
+            "symbol text truncated for inference"
+        );
+        symbol_text = symbol_text[..truncated].to_owned();
+    }
 
     let context = SirContext {
         language: symbol.language.as_str().to_owned(),

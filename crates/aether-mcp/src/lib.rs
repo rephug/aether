@@ -1335,7 +1335,24 @@ impl AetherMcpServer {
     ) -> Result<AetherSearchResponse, AetherMcpError> {
         let mode_requested = request.mode.unwrap_or_default();
         let limit = effective_limit(request.limit);
-        let lexical = self.lexical_search_matches(&request.query, limit)?;
+        let query = request.query.clone();
+        let sqlite_path = self.sqlite_path();
+        let store = Arc::clone(&self.state.store);
+        let lexical = tokio::task::spawn_blocking(
+            move || -> Result<Vec<AetherSymbolLookupMatch>, AetherMcpError> {
+                if !sqlite_path.exists() {
+                    return Ok(Vec::new());
+                }
+
+                let matches = store.search_symbols(query.as_str(), limit)?;
+                Ok(matches
+                    .into_iter()
+                    .map(AetherSymbolLookupMatch::from)
+                    .collect::<Vec<_>>())
+            },
+        )
+        .await
+        .map_err(|err| AetherMcpError::Message(format!("search join: {err}")))??;
         let search_config = self.state.config.as_ref();
         let reranker_kind = search_config.search.reranker;
         let rerank_window = search_config.search.rerank_window;
@@ -1414,7 +1431,11 @@ impl AetherMcpServer {
         request: AetherRememberRequest,
         source_type: MemoryNoteSourceType,
     ) -> Result<aether_memory::RememberResult, AetherMcpError> {
-        let memory = ProjectMemoryService::new(self.workspace());
+        let memory = ProjectMemoryService::with_shared(
+            self.workspace(),
+            Arc::clone(&self.state.store),
+            self.state.vector_store.clone(),
+        );
         let entity_refs = request
             .entity_refs
             .unwrap_or_default()
@@ -1562,7 +1583,11 @@ impl AetherMcpServer {
             }
         }
 
-        let memory = ProjectMemoryService::new(self.workspace());
+        let memory = ProjectMemoryService::with_shared(
+            self.workspace(),
+            Arc::clone(&self.state.store),
+            self.state.vector_store.clone(),
+        );
         let result = memory
             .recall(MemoryRecallRequest {
                 query: request.query.clone(),
@@ -1640,7 +1665,11 @@ impl AetherMcpServer {
             }
         }
 
-        let memory = ProjectMemoryService::new(self.workspace());
+        let memory = ProjectMemoryService::with_shared(
+            self.workspace(),
+            Arc::clone(&self.state.store),
+            self.state.vector_store.clone(),
+        );
         let result = memory
             .ask(MemoryAskQueryRequest {
                 query: request.query.clone(),

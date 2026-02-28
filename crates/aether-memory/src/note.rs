@@ -1,12 +1,13 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{MemoryError, compute_content_hash, compute_note_id, current_unix_timestamp_millis};
 use aether_store::{
     ProjectEntityRefRecord, ProjectNoteRecord, ProjectNoteVectorRecord, SqliteStore, Store,
-    open_vector_store,
+    VectorStore, open_vector_store,
 };
 
 const EMBEDDING_CONTENT_MAX_BYTES: usize = 2 * 1024;
@@ -107,15 +108,31 @@ pub struct NoteEmbeddingRequest {
     pub updated_at: Option<i64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProjectMemoryService {
     workspace: PathBuf,
+    shared_store: Option<Arc<SqliteStore>>,
+    shared_vector_store: Option<Arc<dyn VectorStore>>,
 }
 
 impl ProjectMemoryService {
     pub fn new(workspace: impl AsRef<Path>) -> Self {
         Self {
             workspace: workspace.as_ref().to_path_buf(),
+            shared_store: None,
+            shared_vector_store: None,
+        }
+    }
+
+    pub fn with_shared(
+        workspace: impl AsRef<Path>,
+        store: Arc<SqliteStore>,
+        vector_store: Option<Arc<dyn VectorStore>>,
+    ) -> Self {
+        Self {
+            workspace: workspace.as_ref().to_path_buf(),
+            shared_store: Some(store),
+            shared_vector_store: vector_store,
         }
     }
 
@@ -123,8 +140,18 @@ impl ProjectMemoryService {
         &self.workspace
     }
 
-    pub(crate) fn open_store(&self) -> Result<SqliteStore, MemoryError> {
-        Ok(SqliteStore::open(&self.workspace)?)
+    pub(crate) fn open_store(&self) -> Result<Arc<SqliteStore>, MemoryError> {
+        match &self.shared_store {
+            Some(store) => Ok(Arc::clone(store)),
+            None => Ok(Arc::new(SqliteStore::open(&self.workspace)?)),
+        }
+    }
+
+    pub(crate) async fn open_vector_store(&self) -> Result<Arc<dyn VectorStore>, MemoryError> {
+        match &self.shared_vector_store {
+            Some(store) => Ok(Arc::clone(store)),
+            None => Ok(open_vector_store(&self.workspace).await?),
+        }
     }
 
     pub fn remember(&self, request: RememberRequest) -> Result<RememberResult, MemoryError> {
@@ -196,7 +223,7 @@ impl ProjectMemoryService {
             return Ok(());
         }
 
-        let vector_store = open_vector_store(&self.workspace).await?;
+        let vector_store = self.open_vector_store().await?;
         vector_store
             .upsert_project_note_embedding(ProjectNoteVectorRecord {
                 note_id: note_id.to_owned(),

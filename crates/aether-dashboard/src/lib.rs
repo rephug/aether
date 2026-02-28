@@ -6,7 +6,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Router, extract::State};
 use rust_embed::Embed;
-use tower_http::cors::CorsLayer;
 
 mod api;
 mod fragments;
@@ -28,7 +27,6 @@ pub fn dashboard_router(state: Arc<SharedState>) -> Router {
         .merge(fragments::fragment_router())
         .merge(api::api_router())
         .route("/dashboard/{*path}", get(dashboard_shell_fallback))
-        .layer(CorsLayer::permissive())
         .with_state(app_state)
 }
 

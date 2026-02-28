@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::note::{ProjectMemoryService, ProjectNote, normalize_tags, project_note_from_store};
 use crate::ranking::{apply_recency_access_boost, rrf_score};
 use crate::{MemoryError, current_unix_timestamp_millis};
-use aether_store::{Store, open_vector_store};
+use aether_store::Store;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticQuery {
@@ -69,7 +69,7 @@ impl ProjectMemoryService {
         let mut semantic_fallback = request.semantic_fallback_reason;
         if !matches!(request.mode, SearchMode::Lexical) {
             if let Some(semantic_query) = request.semantic {
-                let vector_store = open_vector_store(self.workspace()).await?;
+                let vector_store = self.open_vector_store().await?;
                 let candidates = vector_store
                     .search_project_notes_nearest(
                         semantic_query.embedding.as_slice(),

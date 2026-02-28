@@ -219,7 +219,7 @@ impl DebounceQueue {
         let mut due = Vec::new();
 
         self.pending.retain(|path, last_seen| {
-            if now.duration_since(*last_seen) >= debounce {
+            if now.saturating_duration_since(*last_seen) >= debounce {
                 due.push(path.clone());
                 false
             } else {
