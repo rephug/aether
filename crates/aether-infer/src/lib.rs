@@ -23,7 +23,7 @@ pub use reranker::{MockRerankerProvider, RerankCandidate, RerankResult, Reranker
 
 pub const GEMINI_API_KEY_ENV: &str = DEFAULT_GEMINI_API_KEY_ENV;
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
-const GEMINI_DEFAULT_MODEL: &str = "gemini-2.0-flash";
+const GEMINI_DEFAULT_MODEL: &str = "gemini-flash-latest";
 const PARSE_VALIDATION_RETRIES: usize = 2;
 const MOCK_EMBEDDING_DIM: usize = 64;
 const OLLAMA_PULL_SUCCESS_STATUS: &str = "success";
