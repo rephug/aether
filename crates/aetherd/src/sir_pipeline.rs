@@ -171,6 +171,13 @@ impl SirPipeline {
             .collect();
 
         let commit_hash = resolve_workspace_head_commit(&self.workspace_root);
+        tracing::info!(
+            file_path = %event.file_path,
+            added = event.added.len(),
+            updated = event.updated.len(),
+            removed = event.removed.len(),
+            "processing symbol change event"
+        );
         if !changed_symbols.is_empty() {
             let now_ts = unix_timestamp_secs();
             for symbol in &changed_symbols {
@@ -184,12 +191,20 @@ impl SirPipeline {
                 .map(|symbol| build_job(&self.workspace_root, symbol))
                 .collect::<Result<Vec<_>>>()?;
 
+            tracing::info!(
+                job_count = jobs.len(),
+                provider = %self.provider_name,
+                model = %self.model_name,
+                "submitting SIR generation jobs"
+            );
             let results = self.runtime.block_on(generate_sir_jobs(
                 self.provider.clone(),
                 jobs,
                 self.sir_concurrency,
             ))?;
 
+            let mut success_count: usize = 0;
+            let mut failure_count: usize = 0;
             for result in results {
                 match result {
                     SirGenerationOutcome::Success(generated) => {
@@ -268,6 +283,12 @@ impl SirPipeline {
                             )
                             .context("failed to write SIR print line")?;
                         }
+
+                        success_count += 1;
+                        tracing::debug!(
+                            symbol_id = %generated.symbol.id,
+                            "SIR generated successfully"
+                        );
                     }
                     SirGenerationOutcome::Failure(failed) => {
                         let last_attempt_at = unix_timestamp_secs();
@@ -309,6 +330,13 @@ impl SirPipeline {
                             },
                         );
 
+                        failure_count += 1;
+                        tracing::warn!(
+                            symbol_id = %failed.symbol.id,
+                            qualified_name = %failed.symbol.qualified_name,
+                            error = %failed.error_message,
+                            "SIR generation failed"
+                        );
                         store.upsert_sir_meta(stale_meta).with_context(|| {
                             format!(
                                 "failed to store stale SIR metadata for {}",
@@ -327,6 +355,21 @@ impl SirPipeline {
                         }
                     }
                 }
+            }
+
+            if failure_count > 0 {
+                tracing::warn!(
+                    file_path = %event.file_path,
+                    successes = success_count,
+                    failures = failure_count,
+                    "SIR processing complete with failures"
+                );
+            } else if success_count > 0 {
+                tracing::info!(
+                    file_path = %event.file_path,
+                    successes = success_count,
+                    "SIR processing complete"
+                );
             }
         }
 
