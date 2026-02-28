@@ -160,6 +160,183 @@ async fn static_shell_serves_index_with_htmx() {
 }
 
 #[tokio::test]
+async fn graph_api_returns_nodes_array_and_envelope() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/graph?limit=5")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json.get("data").is_some());
+    assert!(json.get("meta").is_some());
+    assert!(json["data"]["nodes"].is_array());
+    assert!(json["data"]["edges"].is_array());
+}
+
+#[tokio::test]
+async fn drift_api_returns_entries_array_and_envelope() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/drift")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json.get("data").is_some());
+    assert!(json.get("meta").is_some());
+    assert!(json["data"]["drift_entries"].is_array());
+}
+
+#[tokio::test]
+async fn coupling_api_returns_pairs_array_and_envelope() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/coupling")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json.get("data").is_some());
+    assert!(json.get("meta").is_some());
+    assert!(json["data"]["pairs"].is_array());
+}
+
+#[tokio::test]
+async fn health_api_returns_dimensions_and_envelope() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json.get("data").is_some());
+    assert!(json.get("meta").is_some());
+    assert!(json["data"]["dimensions"].is_object());
+}
+
+#[tokio::test]
+async fn graph_fragment_contains_chart_container() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/graph")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("id=\"graph-container\""));
+}
+
+#[tokio::test]
+async fn drift_fragment_contains_chart_container() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/drift-table")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("id=\"drift-chart\""));
+}
+
+#[tokio::test]
+async fn coupling_fragment_contains_chart_container() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/coupling")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("id=\"heatmap-container\""));
+}
+
+#[tokio::test]
+async fn health_fragment_contains_chart_container() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("id=\"health-chart\""));
+}
+
+#[tokio::test]
 async fn unknown_static_path_returns_404() {
     let (_tmp, app, _ids) = seeded_app().await;
     let response = app
