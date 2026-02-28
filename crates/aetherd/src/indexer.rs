@@ -6,6 +6,7 @@ use aether_config::InferenceProviderKind;
 use aether_infer::ProviderOverrides;
 use aether_store::SqliteStore;
 use anyhow::{Context, Result};
+use ignore::WalkBuilder;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::observer::{DebounceQueue, ObserverState, is_ignored_path};
@@ -46,9 +47,18 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
     )
     .context("failed to initialize file watcher")?;
 
-    watcher
-        .watch(&config.workspace, RecursiveMode::Recursive)
-        .with_context(|| format!("failed to watch workspace {}", config.workspace.display()))?;
+    for entry in WalkBuilder::new(&config.workspace)
+        .hidden(true)
+        .git_ignore(true)
+        .build()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+        .filter(|entry| !is_ignored_path(entry.path()))
+    {
+        watcher
+            .watch(entry.path(), RecursiveMode::NonRecursive)
+            .with_context(|| format!("failed to watch directory {}", entry.path().display()))?;
+    }
 
     let debounce_window = Duration::from_millis(config.debounce_ms);
     let poll_interval = Duration::from_millis(50);

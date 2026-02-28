@@ -34,7 +34,7 @@ struct ServeArgs {
         help = "Workspace root containing .aether/ (not the .aether dir itself)"
     )]
     index_path: Option<PathBuf>,
-    #[arg(long, help = "Bind address for HTTP server, e.g. 127.0.0.1:9720")]
+    #[arg(long, help = "Bind address for HTTP server, e.g. 127.0.0.1:9721")]
     bind: Option<String>,
     #[arg(long, help = "Bearer token required on all routes when set")]
     auth_token: Option<String>,
@@ -44,7 +44,7 @@ struct ServeArgs {
 
 #[derive(Debug, Args)]
 struct ClientArgs {
-    #[arg(long, help = "Server bind address, e.g. 127.0.0.1:9720")]
+    #[arg(long, help = "Server bind address, e.g. 127.0.0.1:9721")]
     bind: Option<String>,
     #[arg(long, help = "Bearer token for Authorization header")]
     auth_token: Option<String>,

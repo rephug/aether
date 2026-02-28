@@ -14,7 +14,6 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use serde::Serialize;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
-use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::config::QueryConfig;
@@ -87,7 +86,6 @@ pub fn build_router(
             state.clone(),
             auth_middleware,
         ))
-        .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -133,7 +131,7 @@ fn is_bearer_authorized(headers: &HeaderMap, expected_token: &str) -> bool {
 }
 
 async fn mcp_handler(State(state): State<Arc<AppState>>, request: Request) -> Response {
-    let _permit = match state.semaphore.clone().try_acquire_owned() {
+    let permit = match state.semaphore.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => return json_error(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
     };
@@ -153,7 +151,9 @@ async fn mcp_handler(State(state): State<Arc<AppState>>, request: Request) -> Re
     // a streaming/SSE response body that is not safely interceptable via axum
     // middleware for JSON deserialize/modify/reserialize. MCP clients should poll
     // GET /health for staleness fields.
-    mcp_response.into_response()
+    let mut response = mcp_response.into_response();
+    response.extensions_mut().insert(Arc::new(permit));
+    response
 }
 
 async fn health_handler(State(state): State<Arc<AppState>>) -> Response {
@@ -239,4 +239,53 @@ fn json_error_with_message(status: StatusCode, code: &'static str, message: Stri
         }),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use aether_mcp::{AetherMcpServer, SharedState};
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::Request;
+    use tempfile::tempdir;
+    use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+    use super::{AppState, QueryConfig, build_mcp_http_service, mcp_handler};
+
+    #[tokio::test]
+    async fn mcp_handler_holds_semaphore_permit_until_response_drop() {
+        let temp = tempdir().expect("tempdir");
+        let shared_state =
+            Arc::new(SharedState::open_readwrite(temp.path()).expect("shared state"));
+        let mcp_server = AetherMcpServer::from_state(shared_state.clone(), false);
+        let state = Arc::new(AppState {
+            mcp_http_service: build_mcp_http_service(mcp_server.clone()),
+            mcp_server,
+            shared_state,
+            query_config: QueryConfig::default(),
+            semaphore: Arc::new(Semaphore::new(1)),
+        });
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .expect("request");
+
+        assert_eq!(state.semaphore.available_permits(), 1);
+        let response = mcp_handler(State(state.clone()), request).await;
+        assert_eq!(state.semaphore.available_permits(), 0);
+        assert!(
+            response
+                .extensions()
+                .get::<Arc<OwnedSemaphorePermit>>()
+                .is_some()
+        );
+
+        drop(response);
+        assert_eq!(state.semaphore.available_permits(), 1);
+    }
 }

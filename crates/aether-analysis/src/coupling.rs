@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aether_config::{CouplingConfig, GraphBackend, load_workspace_config};
@@ -9,6 +8,7 @@ use aether_store::{
     CouplingEdgeRecord, CouplingMiningStateRecord, CozoGraphStore, SqliteStore, Store, StoreError,
     open_vector_store,
 };
+use gix::bstr::ByteSlice;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -595,41 +595,48 @@ impl CouplingAnalyzer {
     }
 
     fn changed_files_for_commit(&self, commit_hash: &str) -> Result<Vec<String>, AnalysisError> {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&self.workspace)
-            .args([
-                "diff-tree",
-                "--numstat",
-                "--no-commit-id",
-                "-r",
-                "--root",
-                commit_hash,
-            ])
-            .output()?;
-        if !output.status.success() {
-            return Err(AnalysisError::Git(format!(
-                "git diff-tree failed for commit {commit_hash}: status {}",
-                output.status
-            )));
-        }
-
         let mut files = BTreeSet::new();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let line = line.trim();
-            if line.is_empty() {
+        let repo = gix::discover(&self.workspace)
+            .map_err(|err| AnalysisError::Git(format!("failed to open git repo: {err}")))?;
+        let commit_id = repo.rev_parse_single(commit_hash).map_err(|err| {
+            AnalysisError::Git(format!("failed to resolve commit {commit_hash}: {err}"))
+        })?;
+        let commit = repo.find_commit(commit_id.detach()).map_err(|err| {
+            AnalysisError::Git(format!("failed to load commit {commit_hash}: {err}"))
+        })?;
+        let tree = commit.tree().map_err(|err| {
+            AnalysisError::Git(format!("failed to load tree for {commit_hash}: {err}"))
+        })?;
+
+        let parent_tree = if let Some(parent_id) = commit.parent_ids().next() {
+            let parent_commit = repo.find_commit(parent_id.detach()).map_err(|err| {
+                AnalysisError::Git(format!(
+                    "failed to load parent commit for {commit_hash}: {err}"
+                ))
+            })?;
+            Some(parent_commit.tree().map_err(|err| {
+                AnalysisError::Git(format!(
+                    "failed to load parent tree for {commit_hash}: {err}"
+                ))
+            })?)
+        } else {
+            None
+        };
+
+        let mut diff_options = gix::diff::Options::default();
+        diff_options.track_rewrites(None);
+        let changes = repo
+            .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(diff_options))
+            .map_err(|err| {
+                AnalysisError::Git(format!("failed to diff commit {commit_hash}: {err}"))
+            })?;
+
+        for change in changes {
+            let raw_path = change.location().to_str_lossy();
+            let raw_path = raw_path.trim();
+            if raw_path.is_empty() {
                 continue;
             }
-
-            let mut parts = line.splitn(3, '\t');
-            let added = parts.next().unwrap_or_default().trim();
-            let removed = parts.next().unwrap_or_default().trim();
-            let raw_path = parts.next().unwrap_or_default().trim();
-            if raw_path.is_empty() || added == "-" || removed == "-" {
-                continue;
-            }
-
             let path = normalize_repo_path(normalize_rename_path(raw_path).as_str());
             if path.is_empty() || self.is_excluded(path.as_str()) {
                 continue;

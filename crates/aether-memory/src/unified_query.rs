@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -7,7 +8,7 @@ use crate::note::{ProjectMemoryService, project_note_from_store};
 use crate::ranking::{apply_recency_access_boost, rrf_score};
 use crate::search::SemanticQuery;
 use crate::{MemoryError, current_unix_timestamp_millis};
-use aether_store::{CouplingEdgeRecord, CozoGraphStore, SqliteStore, Store, open_vector_store};
+use aether_store::{CouplingEdgeRecord, CozoGraphStore, SqliteStore, Store};
 
 const SYMBOL_COUPLING_SEED_LIMIT: usize = 10;
 
@@ -106,80 +107,111 @@ impl ProjectMemoryService {
         let fetch_notes = include.contains(&AskInclude::Notes);
         let fetch_tests = include.contains(&AskInclude::Tests);
 
-        let workspace = self.workspace().to_path_buf();
         let query_owned = query.to_owned();
+        let store = self.open_store()?;
 
-        let symbol_task = async {
-            if !fetch_symbols {
-                return Ok(Vec::new());
-            }
-
-            let workspace = workspace.clone();
+        let symbol_task = {
+            let store = Arc::clone(&store);
             let query = query_owned.clone();
-            tokio::task::spawn_blocking(
-                move || -> Result<Vec<aether_store::SymbolSearchResult>, MemoryError> {
-                    let store = SqliteStore::open(&workspace)?;
-                    store
-                        .search_symbols(query.as_str(), candidate_limit)
-                        .map_err(Into::into)
-                },
-            )
-            .await
-            .map_err(|err| {
-                MemoryError::InvalidInput(format!("symbol search task join failure: {err}"))
-            })?
+            async move {
+                if !fetch_symbols {
+                    return Ok(Vec::new());
+                }
+
+                tokio::task::spawn_blocking(
+                    move || -> Result<Vec<aether_store::SymbolSearchResult>, MemoryError> {
+                        store
+                            .search_symbols(query.as_str(), candidate_limit)
+                            .map_err(Into::into)
+                    },
+                )
+                .await
+                .map_err(|err| {
+                    MemoryError::InvalidInput(format!("symbol search task join failure: {err}"))
+                })?
+            }
         };
 
-        let note_task = async {
-            if !fetch_notes {
-                return Ok(Vec::new());
-            }
-
-            let workspace = workspace.clone();
+        let note_task = {
+            let store = Arc::clone(&store);
             let query = query_owned.clone();
-            tokio::task::spawn_blocking(
-                move || -> Result<Vec<aether_store::ProjectNoteRecord>, MemoryError> {
-                    let store = SqliteStore::open(&workspace)?;
-                    store
-                        .search_project_notes_lexical(query.as_str(), candidate_limit, false, &[])
-                        .map_err(Into::into)
-                },
-            )
-            .await
-            .map_err(|err| {
-                MemoryError::InvalidInput(format!("note search task join failure: {err}"))
-            })?
+            async move {
+                if !fetch_notes {
+                    return Ok(Vec::new());
+                }
+
+                tokio::task::spawn_blocking(
+                    move || -> Result<Vec<aether_store::ProjectNoteRecord>, MemoryError> {
+                        store
+                            .search_project_notes_lexical(
+                                query.as_str(),
+                                candidate_limit,
+                                false,
+                                &[],
+                            )
+                            .map_err(Into::into)
+                    },
+                )
+                .await
+                .map_err(|err| {
+                    MemoryError::InvalidInput(format!("note search task join failure: {err}"))
+                })?
+            }
         };
 
-        let test_task = async {
-            if !fetch_tests {
-                return Ok(Vec::new());
-            }
-
-            let workspace = workspace.clone();
+        let test_task = {
+            let store = Arc::clone(&store);
             let query = query_owned.clone();
-            tokio::task::spawn_blocking(
-                move || -> Result<Vec<aether_store::TestIntentRecord>, MemoryError> {
-                    let store = SqliteStore::open(&workspace)?;
-                    store
-                        .search_test_intents_lexical(query.as_str(), candidate_limit)
-                        .map_err(Into::into)
-                },
-            )
-            .await
-            .map_err(|err| {
-                MemoryError::InvalidInput(format!("test intent search task join failure: {err}"))
-            })?
+            async move {
+                if !fetch_tests {
+                    return Ok(Vec::new());
+                }
+
+                tokio::task::spawn_blocking(
+                    move || -> Result<Vec<aether_store::TestIntentRecord>, MemoryError> {
+                        store
+                            .search_test_intents_lexical(query.as_str(), candidate_limit)
+                            .map_err(Into::into)
+                    },
+                )
+                .await
+                .map_err(|err| {
+                    MemoryError::InvalidInput(format!(
+                        "test intent search task join failure: {err}"
+                    ))
+                })?
+            }
         };
 
-        let (symbol_lexical, note_lexical, test_lexical) =
-            tokio::try_join!(symbol_task, note_task, test_task)?;
+        let (symbol_result, note_result, test_result) =
+            tokio::join!(symbol_task, note_task, test_task);
+
+        let symbol_lexical = match symbol_result {
+            Ok(results) => results,
+            Err(err) => {
+                tracing::warn!("symbol search failed in ask(): {err}");
+                Vec::new()
+            }
+        };
+        let note_lexical = match note_result {
+            Ok(results) => results,
+            Err(err) => {
+                tracing::warn!("note search failed in ask(): {err}");
+                Vec::new()
+            }
+        };
+        let test_lexical = match test_result {
+            Ok(results) => results,
+            Err(err) => {
+                tracing::warn!("test search failed in ask(): {err}");
+                Vec::new()
+            }
+        };
 
         let mut symbol_semantic = Vec::<aether_store::SymbolSearchResult>::new();
         let mut note_semantic = Vec::<aether_store::ProjectNoteRecord>::new();
         if let Some(semantic) = request.semantic {
-            let vector_store = open_vector_store(self.workspace()).await?;
-            let store = self.open_store()?;
+            let vector_store = self.open_vector_store().await?;
 
             if fetch_symbols {
                 let semantic_rows = vector_store
@@ -256,7 +288,6 @@ impl ProjectMemoryService {
         );
         result.query = query.to_owned();
 
-        let store = self.open_store()?;
         enrich_symbol_snippets(&store, result.results.as_mut_slice())?;
         increment_access_from_results(&store, result.results.as_mut_slice(), now_ms)?;
 

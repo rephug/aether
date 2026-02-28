@@ -304,23 +304,6 @@ impl SurrealGraphStore {
             return Ok(UpstreamDependencyTraversal::default());
         }
 
-        let edges = self.list_dependency_edges_raw().await?;
-        if edges.is_empty() {
-            return Ok(UpstreamDependencyTraversal::default());
-        }
-
-        let mut adjacency = HashMap::<String, Vec<String>>::new();
-        for edge in edges {
-            adjacency
-                .entry(edge.source_id)
-                .or_default()
-                .push(edge.target_id);
-        }
-        for neighbors in adjacency.values_mut() {
-            neighbors.sort();
-            neighbors.dedup();
-        }
-
         let mut seen_edges = BTreeSet::<(String, String, u32)>::new();
         let mut min_depth_by_symbol = HashMap::<String, u32>::new();
         let mut frontier = BTreeSet::<String>::new();
@@ -330,19 +313,27 @@ impl SurrealGraphStore {
             if frontier.is_empty() {
                 break;
             }
+
+            let sources = frontier.iter().cloned().collect::<Vec<_>>();
+            let edges = self
+                .list_dependency_edges_for_sources_by_kind(
+                    sources.as_slice(),
+                    &["calls", "depends_on"],
+                )
+                .await?;
+            if edges.is_empty() {
+                break;
+            }
+
             let mut next = BTreeSet::<String>::new();
-            for source in &frontier {
-                let Some(targets) = adjacency.get(source.as_str()) else {
-                    continue;
-                };
-                for target in targets {
-                    seen_edges.insert((source.clone(), target.clone(), depth));
-                    min_depth_by_symbol
-                        .entry(target.clone())
-                        .and_modify(|current| *current = (*current).min(depth))
-                        .or_insert(depth);
-                    next.insert(target.clone());
-                }
+            for edge in edges {
+                let target = edge.target_id;
+                seen_edges.insert((edge.source_id, target.clone(), depth));
+                min_depth_by_symbol
+                    .entry(target.clone())
+                    .and_modify(|current| *current = (*current).min(depth))
+                    .or_insert(depth);
+                next.insert(target);
             }
             frontier = next;
         }
@@ -932,23 +923,6 @@ impl GraphStore for SurrealGraphStore {
             return Ok(Vec::new());
         }
 
-        let edges = self.list_dependency_edges_by_kind(&["calls"]).await?;
-        if edges.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut adjacency = HashMap::<String, Vec<String>>::new();
-        for edge in edges {
-            adjacency
-                .entry(edge.source_id)
-                .or_default()
-                .push(edge.target_id);
-        }
-        for targets in adjacency.values_mut() {
-            targets.sort();
-            targets.dedup();
-        }
-
         let mut min_depth = HashMap::<String, u32>::new();
         let mut frontier = BTreeSet::<String>::new();
         frontier.insert(symbol_id.to_owned());
@@ -957,16 +931,21 @@ impl GraphStore for SurrealGraphStore {
             if frontier.is_empty() {
                 break;
             }
+
+            let sources = frontier.iter().cloned().collect::<Vec<_>>();
+            let edges = self
+                .list_dependency_edges_for_sources_by_kind(sources.as_slice(), &["calls"])
+                .await?;
+            if edges.is_empty() {
+                break;
+            }
+
             let mut next = BTreeSet::<String>::new();
-            for source in &frontier {
-                let Some(targets) = adjacency.get(source.as_str()) else {
-                    continue;
-                };
-                for target in targets {
-                    let entry = min_depth.entry(target.clone()).or_insert(current_depth);
-                    if *entry == current_depth {
-                        next.insert(target.clone());
-                    }
+            for edge in edges {
+                let target = edge.target_id;
+                let entry = min_depth.entry(target.clone()).or_insert(current_depth);
+                if *entry == current_depth {
+                    next.insert(target);
                 }
             }
             frontier = next;
@@ -1070,6 +1049,68 @@ impl SurrealGraphStore {
     async fn list_dependency_edges_raw(&self) -> Result<Vec<DependencyEdgeRow>, StoreError> {
         self.list_dependency_edges_by_kind(&["calls", "depends_on"])
             .await
+    }
+
+    async fn list_dependency_edges_for_sources_by_kind(
+        &self,
+        source_ids: &[String],
+        edge_kinds: &[&str],
+    ) -> Result<Vec<DependencyEdgeRow>, StoreError> {
+        if source_ids.is_empty() || edge_kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut source_ids = source_ids
+            .iter()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        source_ids.sort();
+        source_ids.dedup();
+        if source_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let edge_kinds = edge_kinds
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>();
+        let mut response = self
+            .db
+            .query(
+                r#"
+                SELECT VALUE {
+                    source_id: source_symbol_id,
+                    target_id: target_symbol_id,
+                    edge_kind: edge_kind
+                }
+                FROM depends_on
+                WHERE source_symbol_id INSIDE $source_ids AND edge_kind INSIDE $edge_kinds;
+                "#,
+            )
+            .bind(("source_ids", source_ids))
+            .bind(("edge_kinds", edge_kinds))
+            .await
+            .map_err(|err| {
+                StoreError::Graph(format!(
+                    "SurrealDB list dependency edges by source failed: {err}"
+                ))
+            })?;
+        let rows: Vec<serde_json::Value> = response.take(0).map_err(|err| {
+            StoreError::Graph(format!(
+                "SurrealDB list dependency edges by source decode failed: {err}"
+            ))
+        })?;
+        let mut edges = decode_rows::<DependencyEdgeRow>(rows)?;
+        edges.retain(|edge| !edge.source_id.is_empty() && !edge.target_id.is_empty());
+        edges.retain(|edge| matches!(edge.edge_kind.as_str(), "calls" | "depends_on"));
+        edges.sort_by(|left, right| {
+            left.source_id
+                .cmp(&right.source_id)
+                .then_with(|| left.target_id.cmp(&right.target_id))
+                .then_with(|| left.edge_kind.cmp(&right.edge_kind))
+        });
+        Ok(edges)
     }
 
     async fn list_dependency_edges_by_kind(
