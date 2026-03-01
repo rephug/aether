@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use aether_store::{Store, SymbolRecord};
 
+use crate::api::common;
 use crate::state::SharedState;
 use crate::support::{self, DashboardState};
 
@@ -29,6 +30,12 @@ pub(crate) struct GraphNode {
     pub kind: String,
     pub file: String,
     pub sir_exists: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pagerank: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub community_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -245,6 +252,14 @@ pub(crate) async fn load_graph_data(
             .then_with(|| left.edge_type.cmp(&right.edge_type))
     });
 
+    let all_edges = common::load_dependency_algo_edges(shared)?;
+    let pagerank = common::pagerank_map(shared, &all_edges).await;
+    let communities = common::louvain_map(shared, &all_edges).await;
+    let drift_map = common::latest_drift_score_by_symbol(shared)?;
+    let test_map = common::test_count_by_symbol(shared)?;
+    let sir_symbols = common::symbols_with_sir(shared)?;
+    let max_pagerank = pagerank.values().copied().fold(0.0f64, f64::max);
+
     let mut nodes = nodes_by_id
         .values()
         .map(|symbol| GraphNode {
@@ -252,7 +267,16 @@ pub(crate) async fn load_graph_data(
             label: support::symbol_name_from_qualified(symbol.qualified_name.as_str()),
             kind: symbol.kind.clone(),
             file: support::normalized_display_path(symbol.file_path.as_str()),
-            sir_exists: support::sir_exists_for_symbol(shared, symbol.id.as_str()),
+            sir_exists: sir_symbols.contains(symbol.id.as_str()),
+            pagerank: Some(pagerank.get(symbol.id.as_str()).copied().unwrap_or(0.0)),
+            risk_score: Some(common::risk_score(
+                pagerank.get(symbol.id.as_str()).copied().unwrap_or(0.0),
+                drift_map.get(symbol.id.as_str()).copied().unwrap_or(0.0),
+                sir_symbols.contains(symbol.id.as_str()),
+                test_map.get(symbol.id.as_str()).copied().unwrap_or(0),
+                max_pagerank,
+            )),
+            community_id: communities.get(symbol.id.as_str()).copied(),
         })
         .collect::<Vec<_>>();
 

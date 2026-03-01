@@ -385,25 +385,6 @@ pub(crate) fn badge_class_for_language(language: &str) -> &'static str {
     }
 }
 
-pub(crate) fn sir_exists_for_symbol(shared: &SharedState, symbol_id: &str) -> bool {
-    match shared.store.get_sir_meta(symbol_id) {
-        Ok(Some(meta)) if meta.sir_status.trim().eq_ignore_ascii_case("ready") => true,
-        Ok(Some(_)) => shared
-            .store
-            .read_sir_blob(symbol_id)
-            .ok()
-            .flatten()
-            .is_some_and(|blob| !blob.trim().is_empty()),
-        Ok(None) => shared
-            .store
-            .read_sir_blob(symbol_id)
-            .ok()
-            .flatten()
-            .is_some_and(|blob| !blob.trim().is_empty()),
-        Err(_) => false,
-    }
-}
-
 pub(crate) fn sir_excerpt_for_symbol(shared: &SharedState, symbol_id: &str) -> Option<String> {
     let blob = shared.store.read_sir_blob(symbol_id).ok().flatten()?;
     let value: Value = serde_json::from_str(&blob).ok()?;

@@ -58,6 +58,13 @@ async fn search_api_returns_results() {
     assert!(!results.is_empty());
     assert!(results.iter().any(|r| r["symbol_id"] == ids.primary));
     assert!(results.iter().all(|r| r.get("sir_exists").is_some()));
+    let first = results.first().unwrap();
+    assert!(first.get("sir_summary").is_some());
+    assert!(first.get("risk_score").is_some());
+    assert!(first.get("pagerank").is_some());
+    assert!(first.get("drift_score").is_some());
+    assert!(first.get("test_count").is_some());
+    assert!(first.get("related_symbols").is_some());
 }
 
 #[tokio::test]
@@ -105,9 +112,13 @@ async fn search_fragment_contains_clickable_results() {
             .to_vec(),
     )
     .unwrap();
-    assert!(body.contains("class=\"clickable\""));
-    assert!(body.contains(&format!("/dashboard/frag/symbol/{}", ids.primary)));
-    assert!(body.contains("hx-target=\"#detail-panel\""));
+    assert!(body.contains("data-page=\"search\""));
+    assert!(body.contains("id=\"smart-search-results\""));
+    assert!(body.contains("Risk: loading"));
+    assert!(body.contains(&format!(
+        "/dashboard/frag/blast-radius?symbol_id={}",
+        ids.primary
+    )));
 }
 
 #[tokio::test]
@@ -157,6 +168,9 @@ async fn static_shell_serves_index_with_htmx() {
     .unwrap();
     assert!(body.contains("htmx.min.js"));
     assert!(body.contains("/dashboard/static/style.css"));
+    assert!(body.contains("localStorage.theme"));
+    assert!(body.contains("id=\"theme-toggle\""));
+    assert!(body.contains("hx-get=\"/dashboard/frag/xray\""));
 }
 
 #[tokio::test]
@@ -242,6 +256,144 @@ async fn health_api_returns_dimensions_and_envelope() {
     assert!(json.get("data").is_some());
     assert!(json.get("meta").is_some());
     assert!(json["data"]["dimensions"].is_object());
+}
+
+#[tokio::test]
+async fn xray_api_returns_metrics_hotspots_and_envelope() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/xray?window=7d")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json.get("data").is_some());
+    assert!(json.get("meta").is_some());
+    assert!(json["data"]["metrics"].is_object());
+    assert!(json["data"]["hotspots"].is_array());
+}
+
+#[tokio::test]
+async fn xray_api_empty_data_returns_not_computed_null_metrics() {
+    let (_tmp, app) = empty_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/xray?window=7d")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    let metrics = &json["data"]["metrics"];
+    for metric in [
+        "sir_coverage",
+        "orphan_count",
+        "avg_drift",
+        "graph_connectivity",
+        "high_coupling_pairs",
+        "sir_coverage_pct",
+        "index_freshness_secs",
+        "risk_grade",
+    ] {
+        assert!(metrics[metric]["value"].is_null());
+        assert_eq!(metrics[metric]["not_computed"].as_bool(), Some(true));
+    }
+}
+
+#[tokio::test]
+async fn blast_radius_invalid_symbol_returns_404() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/blast-radius?symbol_id=does-not-exist")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn architecture_api_empty_returns_not_computed() {
+    let (_tmp, app) = empty_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/architecture?granularity=symbol")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["not_computed"].as_bool(), Some(true));
+    assert!(json["data"]["communities"].as_array().is_some());
+    assert!(json["data"]["symbols"].as_array().is_some());
+}
+
+#[tokio::test]
+async fn time_machine_api_returns_snapshot_shape() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/time-machine?at=2026-01-01T00:00:00Z&layers=deps,drift")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["data"]["nodes"].is_array());
+    assert!(json["data"]["edges"].is_array());
+    assert!(json["data"]["events"].is_array());
+    assert!(json["data"]["time_range"].is_object());
+}
+
+#[tokio::test]
+async fn causal_chain_api_returns_shape_and_envelope() {
+    let (_tmp, app, ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/causal-chain?symbol_id={}&depth=3&lookback=30d",
+                    ids.primary
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json.get("data").is_some());
+    assert!(json.get("meta").is_some());
+    assert!(json["data"]["target"].is_object());
+    assert!(json["data"]["chain"].is_array());
+    assert!(json["data"]["overall_confidence"].is_number());
 }
 
 #[tokio::test]
@@ -337,6 +489,129 @@ async fn health_fragment_contains_chart_container() {
 }
 
 #[tokio::test]
+async fn xray_fragment_contains_metric_grid() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/xray")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("id=\"xray-metrics-grid\""));
+    assert!(body.contains("id=\"xray-hotspots-body\""));
+}
+
+#[tokio::test]
+async fn blast_radius_fragment_contains_search_and_controls() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/blast-radius")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("id=\"blast-symbol-input\""));
+    assert!(body.contains("id=\"blast-depth\""));
+    assert!(body.contains("id=\"blast-min-coupling\""));
+    assert!(body.contains("id=\"blast-radius-chart\""));
+}
+
+#[tokio::test]
+async fn architecture_fragment_contains_treemap_container() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/architecture")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("id=\"architecture-treemap\""));
+}
+
+#[tokio::test]
+async fn time_machine_fragment_contains_timeline_controls() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/time-machine")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("id=\"time-machine-at\""));
+    assert!(body.contains("id=\"time-machine-graph\""));
+    assert!(body.contains("id=\"time-machine-events\""));
+}
+
+#[tokio::test]
+async fn causal_fragment_contains_search_and_animate_button() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/causal")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("id=\"causal-symbol-input\""));
+    assert!(body.contains("id=\"causal-animate\""));
+    assert!(body.contains("id=\"causal-graph\""));
+}
+
+#[tokio::test]
 async fn unknown_static_path_returns_404() {
     let (_tmp, app, _ids) = seeded_app().await;
     let response = app
@@ -367,6 +642,18 @@ async fn seeded_app() -> (TempDir, axum::Router, TestIds) {
             primary: "sym-demo-run".to_owned(),
         },
     )
+}
+
+async fn empty_app() -> (TempDir, axum::Router) {
+    let temp = TempDir::new().unwrap();
+    let mut config = AetherConfig::default();
+    config.storage.graph_backend = GraphBackend::Sqlite;
+    config.embeddings.enabled = false;
+    save_workspace_config(temp.path(), &config).unwrap();
+    let _store = SqliteStore::open(temp.path()).unwrap();
+    let state = Arc::new(SharedState::open_readonly_async(temp.path()).await.unwrap());
+    let app = dashboard_router(state);
+    (temp, app)
 }
 
 fn seed_workspace(workspace: &std::path::Path) {

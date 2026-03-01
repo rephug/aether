@@ -1,0 +1,41 @@
+:root {
+  --aether-emerald: #10b981;
+  --aether-amber: #f59e0b;
+  --aether-rose: #ef4444;
+}
+
+.dark .chart-container {
+  background: rgba(15, 23, 42, 0.75);
+}
+
+/* diagonal stripe pattern for misplaced symbols */
+svg defs pattern#aether-misplaced-diagonal line {
+  stroke: rgba(239, 68, 68, 0.8);
+  stroke-width: 1;
+}
+
+/* sparkline gradients */
+svg defs linearGradient#aether-sparkline-good stop:first-child { stop-color: rgba(16,185,129,0.35); }
+svg defs linearGradient#aether-sparkline-good stop:last-child { stop-color: rgba(16,185,129,0.02); }
+svg defs linearGradient#aether-sparkline-warn stop:first-child { stop-color: rgba(245,158,11,0.35); }
+svg defs linearGradient#aether-sparkline-warn stop:last-child { stop-color: rgba(245,158,11,0.02); }
+svg defs linearGradient#aether-sparkline-bad stop:first-child { stop-color: rgba(239,68,68,0.35); }
+svg defs linearGradient#aether-sparkline-bad stop:last-child { stop-color: rgba(239,68,68,0.02); }
+
+@keyframes aetherPulse {
+  0% { filter: drop-shadow(0 0 0 rgba(245, 158, 11, 0.0)); }
+  50% { filter: drop-shadow(0 0 8px rgba(245, 158, 11, 0.85)); }
+  100% { filter: drop-shadow(0 0 0 rgba(245, 158, 11, 0.0)); }
+}
+
+.aether-pulse {
+  animation: aetherPulse 1.2s ease-in-out infinite;
+}
+
+/* dark mode scrollbar */
+.dark *::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.35);
+}
+.dark *::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.55);
+}

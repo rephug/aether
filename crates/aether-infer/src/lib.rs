@@ -1348,8 +1348,15 @@ model_dir = ".aether/models"
         let temp = tempdir().expect("tempdir");
         ensure_workspace_config(temp.path()).expect("ensure config");
 
-        let loaded = load_provider_from_env_or_mock(temp.path(), ProviderOverrides::default())
-            .expect("load provider");
+        let loaded = load_provider_from_env_or_mock(
+            temp.path(),
+            ProviderOverrides {
+                provider: Some(InferenceProviderKind::Auto),
+                api_key_env: Some("AETHER_TEST_NONEXISTENT_KEY_ZZZZZ".to_owned()),
+                ..ProviderOverrides::default()
+            },
+        )
+        .expect("load provider");
 
         assert_eq!(loaded.provider_name, InferenceProviderKind::Mock.as_str());
         assert_eq!(loaded.model_name, "mock");

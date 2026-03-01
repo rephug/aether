@@ -1,5 +1,6 @@
 use std::fs;
 
+use aether_config::InferenceProviderKind;
 use aether_lsp::resolve_hover_markdown_for_path;
 use aether_store::SqliteStore;
 use aetherd::indexer::{IndexerConfig, run_initial_index_once};
@@ -33,10 +34,10 @@ fn lsp_index_mode_path_generates_sir_and_hover_reads_it() -> Result<(), Box<dyn 
         print_sir: false,
         sir_concurrency: 2,
         lifecycle_logs: true,
-        inference_provider: None,
+        inference_provider: Some(InferenceProviderKind::Mock),
         inference_model: None,
         inference_endpoint: None,
-        inference_api_key_env: None,
+        inference_api_key_env: Some("AETHER_TEST_NONEXISTENT_KEY_ZZZZZ".to_owned()),
     };
 
     run_initial_index_once(&config)?;
