@@ -354,6 +354,38 @@ similarity_shifted_threshold = 0.70
 auto_regenerate_sir = true
 ```
 
+### Cloud Providers (OpenAI-Compatible)
+
+Z.ai (GLM-4.7) for low-cost general coding inference:
+
+```toml
+[inference]
+provider = "openai_compat"
+endpoint = "https://api.z.ai/api/paas/v4"
+model = "glm-4.7"
+api_key_env = "ZAI_API_KEY"
+```
+
+NanoGPT (Qwen3 Coder) for access to hosted open-source coding models:
+
+```toml
+[inference]
+provider = "openai_compat"
+endpoint = "https://nano-gpt.com/api/v1"
+model = "qwen3-coder:480b-cloud"
+api_key_env = "NANOGPT_API_KEY"
+```
+
+OpenRouter for model routing across multiple providers:
+
+```toml
+[inference]
+provider = "openai_compat"
+endpoint = "https://openrouter.ai/api/v1"
+model = "anthropic/claude-sonnet-4.5"
+api_key_env = "OPENROUTER_API_KEY"
+```
+
 ## Development
 
 ### Prerequisites

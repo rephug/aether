@@ -1,11 +1,12 @@
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use aether_config::{
     AETHER_DIR_NAME, DEFAULT_COHERE_API_KEY_ENV, DEFAULT_GEMINI_API_KEY_ENV,
-    DEFAULT_QWEN_EMBEDDING_ENDPOINT, DEFAULT_QWEN_ENDPOINT, DEFAULT_QWEN_MODEL,
-    EmbeddingProviderKind, InferenceProviderKind, OLLAMA_SIR_TEMPERATURE, SearchRerankerKind,
-    ensure_workspace_config,
+    DEFAULT_OPENAI_COMPAT_API_KEY_ENV, DEFAULT_QWEN_EMBEDDING_ENDPOINT, DEFAULT_QWEN_ENDPOINT,
+    DEFAULT_QWEN_MODEL, EmbeddingProviderKind, InferenceProviderKind, OLLAMA_SIR_TEMPERATURE,
+    SearchRerankerKind, ensure_workspace_config,
 };
 use aether_core::Secret;
 use aether_sir::{SirAnnotation, validate_sir};
@@ -13,6 +14,7 @@ use async_trait::async_trait;
 use embedding::candle::CandleEmbeddingProvider;
 use reranker::candle::CandleRerankerProvider;
 use reranker::cohere::CohereRerankerProvider;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -27,6 +29,10 @@ const GEMINI_DEFAULT_MODEL: &str = "gemini-flash-latest";
 const PARSE_VALIDATION_RETRIES: usize = 2;
 const MOCK_EMBEDDING_DIM: usize = 64;
 const OLLAMA_PULL_SUCCESS_STATUS: &str = "success";
+const OPENAI_COMPAT_JSON_FALLBACK_SUFFIX: &str =
+    "\n\nRespond with ONLY valid JSON. No markdown, no explanation, no code fences.";
+const OPENAI_COMPAT_SIR_SYSTEM_PROMPT: &str =
+    "You are generating Structured Intent Records for source code.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SirContext {
@@ -91,6 +97,12 @@ pub enum InferError {
     MissingApiKey(String),
     #[error("missing Cohere API key in {0}")]
     MissingCohereApiKey(String),
+    #[error("openai_compat provider requires endpoint to be set in config")]
+    MissingEndpoint,
+    #[error("openai_compat provider requires model to be set in config")]
+    MissingModel,
+    #[error("provider rejected response_format")]
+    ProviderRejectedFormat,
     #[error("config load failed: {0}")]
     Config(#[from] aether_config::ConfigError),
     #[error("request failed: {0}")]
@@ -315,6 +327,161 @@ impl InferenceProvider for Qwen3LocalProvider {
     }
 }
 
+pub struct OpenAiCompatProvider {
+    client: reqwest::Client,
+    api_base: String,
+    api_key: Secret,
+    model: String,
+    json_mode_supported: AtomicBool,
+}
+
+impl std::fmt::Debug for OpenAiCompatProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAiCompatProvider")
+            .field("client", &self.client)
+            .field("api_base", &self.api_base)
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field(
+                "json_mode_supported",
+                &self.json_mode_supported.load(Ordering::Relaxed),
+            )
+            .finish()
+    }
+}
+
+impl Clone for OpenAiCompatProvider {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            api_base: self.api_base.clone(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+            json_mode_supported: AtomicBool::new(self.json_mode_supported.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+impl OpenAiCompatProvider {
+    pub fn new(api_key: Secret, api_base: String, model: String) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            api_base: normalize_openai_api_base(&api_base),
+            api_key,
+            model,
+            json_mode_supported: AtomicBool::new(true),
+        }
+    }
+
+    fn endpoint_url(&self) -> String {
+        format!("{}/chat/completions", self.api_base)
+    }
+
+    async fn request_chat_completion(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        include_response_format: bool,
+    ) -> Result<String, InferError> {
+        let body = build_openai_chat_completion_body(
+            &self.model,
+            system_prompt,
+            user_prompt,
+            include_response_format,
+        );
+        let response = self
+            .client
+            .post(self.endpoint_url())
+            .header("Authorization", format!("Bearer {}", self.api_key.expose()))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = response.status();
+        let response_body = response.text().await?;
+        if !status.is_success() {
+            if include_response_format
+                && (status == reqwest::StatusCode::BAD_REQUEST
+                    || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY)
+                && response_indicates_unsupported_json_mode(&response_body)
+            {
+                return Err(InferError::ProviderRejectedFormat);
+            }
+
+            let provider_message = extract_openai_error_message(&response_body)
+                .unwrap_or_else(|| response_body.trim().to_owned());
+            let provider_message = if provider_message.is_empty() {
+                "unknown provider error".to_owned()
+            } else {
+                provider_message
+            };
+            return Err(InferError::InvalidResponse(format!(
+                "openai_compat request failed with status {status}: {provider_message}"
+            )));
+        }
+
+        extract_openai_chat_content_from_body(&response_body)
+    }
+
+    async fn request_candidate_json(
+        &self,
+        symbol_text: &str,
+        context: &SirContext,
+    ) -> Result<String, InferError> {
+        let user_prompt = build_strict_json_prompt(symbol_text, context);
+        let json_mode_supported = self.json_mode_supported.load(Ordering::Relaxed);
+
+        if json_mode_supported {
+            match self
+                .request_chat_completion(OPENAI_COMPAT_SIR_SYSTEM_PROMPT, &user_prompt, true)
+                .await
+            {
+                Ok(content) => Ok(content),
+                Err(InferError::ProviderRejectedFormat) => {
+                    self.json_mode_supported.store(false, Ordering::Relaxed);
+                    let fallback_prompt =
+                        format!("{user_prompt}{OPENAI_COMPAT_JSON_FALLBACK_SUFFIX}");
+                    self.request_chat_completion(
+                        OPENAI_COMPAT_SIR_SYSTEM_PROMPT,
+                        &fallback_prompt,
+                        false,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            let fallback_prompt = format!("{user_prompt}{OPENAI_COMPAT_JSON_FALLBACK_SUFFIX}");
+            self.request_chat_completion(OPENAI_COMPAT_SIR_SYSTEM_PROMPT, &fallback_prompt, false)
+                .await
+        }
+    }
+
+    async fn request_summary(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+    ) -> Result<String, InferError> {
+        self.request_chat_completion(system_prompt, user_prompt, false)
+            .await
+    }
+}
+
+#[async_trait]
+impl InferenceProvider for OpenAiCompatProvider {
+    async fn generate_sir(
+        &self,
+        symbol_text: &str,
+        context: &SirContext,
+    ) -> Result<SirAnnotation, InferError> {
+        run_sir_parse_validation_retries(PARSE_VALIDATION_RETRIES, || async {
+            self.request_candidate_json(symbol_text, context).await
+        })
+        .await
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Qwen3LocalEmbeddingProvider {
     client: reqwest::Client,
@@ -450,12 +617,20 @@ pub fn load_provider_from_env_or_mock(
 ) -> Result<LoadedProvider, InferError> {
     let config = ensure_workspace_config(workspace_root)?;
 
-    let selected_provider = overrides.provider.unwrap_or(config.inference.provider);
-    let selected_model = first_non_empty(overrides.model, config.inference.model);
-    let selected_endpoint = first_non_empty(overrides.endpoint, config.inference.endpoint);
-    let selected_api_key_env =
-        first_non_empty(overrides.api_key_env, Some(config.inference.api_key_env))
-            .unwrap_or_else(|| DEFAULT_GEMINI_API_KEY_ENV.to_owned());
+    let ProviderOverrides {
+        provider,
+        model,
+        endpoint,
+        api_key_env,
+    } = overrides;
+    let selected_provider = provider.unwrap_or(config.inference.provider);
+    let selected_model = first_non_empty(model, config.inference.model);
+    let selected_endpoint = first_non_empty(endpoint, config.inference.endpoint);
+    let selected_api_key_env = resolve_inference_api_key_env(
+        selected_provider,
+        api_key_env,
+        Some(config.inference.api_key_env),
+    );
 
     match selected_provider {
         InferenceProviderKind::Auto => {
@@ -495,6 +670,18 @@ pub fn load_provider_from_env_or_mock(
                 provider_name: InferenceProviderKind::Qwen3Local.as_str().to_owned(),
             })
         }
+        InferenceProviderKind::OpenAiCompat => {
+            let api_key = read_env_non_empty(&selected_api_key_env)
+                .ok_or_else(|| InferError::MissingApiKey(selected_api_key_env.clone()))?;
+            let api_base = selected_endpoint.ok_or(InferError::MissingEndpoint)?;
+            let model = selected_model.ok_or(InferError::MissingModel)?;
+            let provider = OpenAiCompatProvider::new(Secret::new(api_key), api_base, model.clone());
+            Ok(LoadedProvider {
+                model_name: model,
+                provider: Box::new(provider),
+                provider_name: InferenceProviderKind::OpenAiCompat.as_str().to_owned(),
+            })
+        }
     }
 }
 
@@ -508,7 +695,8 @@ pub async fn summarize_text_with_config(
     let selected_provider = config.inference.provider;
     let selected_model = config.inference.model;
     let selected_endpoint = config.inference.endpoint;
-    let selected_api_key_env = config.inference.api_key_env;
+    let selected_api_key_env =
+        resolve_inference_api_key_env(selected_provider, None, Some(config.inference.api_key_env));
     let system_prompt = system_prompt.trim();
     let user_prompt = user_prompt.trim();
     if system_prompt.is_empty() || user_prompt.is_empty() {
@@ -551,6 +739,16 @@ pub async fn summarize_text_with_config(
                 user_prompt,
             )
             .await?;
+            Ok(clean_summary(summary))
+        }
+        InferenceProviderKind::OpenAiCompat => {
+            let Some(api_key) = read_env_non_empty(selected_api_key_env.as_str()) else {
+                return Ok(None);
+            };
+            let api_base = selected_endpoint.ok_or(InferError::MissingEndpoint)?;
+            let model = selected_model.ok_or(InferError::MissingModel)?;
+            let provider = OpenAiCompatProvider::new(Secret::new(api_key), api_base, model);
+            let summary = provider.request_summary(system_prompt, user_prompt).await?;
             Ok(clean_summary(summary))
         }
     }
@@ -726,6 +924,88 @@ fn build_ollama_text_generate_body(model: &str, prompt: &str) -> Value {
             "temperature": OLLAMA_SIR_TEMPERATURE
         }
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiCompatChatCompletionResponse {
+    choices: Vec<OpenAiCompatChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiCompatChoice {
+    message: OpenAiCompatMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiCompatMessage {
+    content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiCompatErrorEnvelope {
+    error: Option<OpenAiCompatErrorBody>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiCompatErrorBody {
+    message: Option<String>,
+}
+
+fn build_openai_chat_completion_body(
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    include_response_format: bool,
+) -> Value {
+    let mut body = json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.0
+    });
+
+    if include_response_format && let Some(body_obj) = body.as_object_mut() {
+        body_obj.insert("response_format".to_owned(), json!({"type": "json_object"}));
+    }
+
+    body
+}
+
+fn response_indicates_unsupported_json_mode(response_body: &str) -> bool {
+    let lower = response_body.to_ascii_lowercase();
+    lower.contains("response_format") || lower.contains("json_object")
+}
+
+fn extract_openai_error_message(response_body: &str) -> Option<String> {
+    let envelope: OpenAiCompatErrorEnvelope = serde_json::from_str(response_body).ok()?;
+    envelope.error?.message.and_then(|message| {
+        let trimmed = message.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    })
+}
+
+fn extract_openai_chat_content_from_body(response_body: &str) -> Result<String, InferError> {
+    let response: OpenAiCompatChatCompletionResponse = serde_json::from_str(response_body)?;
+    let first = response
+        .choices
+        .first()
+        .ok_or_else(|| InferError::InvalidResponse("missing choices[0]".to_owned()))?;
+    let content = first.message.content.as_deref().ok_or_else(|| {
+        InferError::InvalidResponse("missing choices[0].message.content".to_owned())
+    })?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Err(InferError::InvalidResponse(
+            "empty choices[0].message.content".to_owned(),
+        ));
+    }
+    Ok(trimmed.to_owned())
 }
 
 fn parse_pull_progress(value: &Value) -> OllamaPullProgress {
@@ -1108,6 +1388,40 @@ fn first_non_empty(left: Option<String>, right: Option<String>) -> Option<String
     normalize_optional(left).or_else(|| normalize_optional(right))
 }
 
+fn normalize_openai_api_base(api_base: &str) -> String {
+    let trimmed = api_base.trim().trim_end_matches('/');
+    let trimmed = trimmed
+        .strip_suffix("/chat/completions")
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
+    trimmed.to_owned()
+}
+
+fn default_api_key_env_for_provider(provider: InferenceProviderKind) -> &'static str {
+    match provider {
+        InferenceProviderKind::OpenAiCompat => DEFAULT_OPENAI_COMPAT_API_KEY_ENV,
+        _ => DEFAULT_GEMINI_API_KEY_ENV,
+    }
+}
+
+fn resolve_inference_api_key_env(
+    provider: InferenceProviderKind,
+    override_api_key_env: Option<String>,
+    config_api_key_env: Option<String>,
+) -> String {
+    let selected = first_non_empty(override_api_key_env, config_api_key_env);
+    match selected {
+        Some(value)
+            if provider == InferenceProviderKind::OpenAiCompat
+                && value == DEFAULT_GEMINI_API_KEY_ENV =>
+        {
+            DEFAULT_OPENAI_COMPAT_API_KEY_ENV.to_owned()
+        }
+        Some(value) => value,
+        None => default_api_key_env_for_provider(provider).to_owned(),
+    }
+}
+
 fn read_env_non_empty(name: &str) -> Option<String> {
     env::var(name)
         .ok()
@@ -1215,6 +1529,65 @@ mod tests {
         let input =
             "```json\n{\"purpose\":\"first\"}\n```\n\n```json\n{\"purpose\":\"second\"}\n```";
         assert_eq!(normalize_candidate_json(input), "{\"purpose\":\"first\"}");
+    }
+
+    #[test]
+    fn openai_compat_provider_debug_redacts_api_key() {
+        let provider = OpenAiCompatProvider::new(
+            Secret::new("super-secret-value".to_owned()),
+            "https://api.example.com/v1".to_owned(),
+            "test-model".to_owned(),
+        );
+        let debug = format!("{provider:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("super-secret-value"));
+    }
+
+    #[test]
+    fn extract_openai_chat_content_returns_content_for_valid_response() {
+        let response = r#"{
+            "choices": [
+                {
+                    "message": {
+                        "content": "{\"intent\":\"ok\"}"
+                    }
+                }
+            ]
+        }"#;
+
+        let content = extract_openai_chat_content_from_body(response).expect("valid response");
+        assert_eq!(content, r#"{"intent":"ok"}"#);
+    }
+
+    #[test]
+    fn extract_openai_chat_content_rejects_empty_choices() {
+        let response = r#"{"choices":[]}"#;
+        let error = extract_openai_chat_content_from_body(response)
+            .expect_err("choices should be required");
+        match error {
+            InferError::InvalidResponse(message) => assert!(message.contains("choices[0]")),
+            _ => panic!("expected invalid response"),
+        }
+    }
+
+    #[test]
+    fn extract_openai_chat_content_rejects_missing_content() {
+        let response = r#"{
+            "choices": [
+                {
+                    "message": {}
+                }
+            ]
+        }"#;
+
+        let error = extract_openai_chat_content_from_body(response)
+            .expect_err("message content should be required");
+        match error {
+            InferError::InvalidResponse(message) => {
+                assert!(message.contains("choices[0].message.content"))
+            }
+            _ => panic!("expected invalid response"),
+        }
     }
 
     #[tokio::test]
@@ -1397,6 +1770,95 @@ model_dir = ".aether/models"
         // SAFETY: cleanup of test-scoped environment variable.
         unsafe {
             env::remove_var(env_name);
+        }
+    }
+
+    #[test]
+    fn load_provider_openai_compat_requires_api_key_with_fabricated_env_var() {
+        let temp = tempdir().expect("tempdir");
+        ensure_workspace_config(temp.path()).expect("ensure config");
+        let env_name = "AETHER_TEST_OPENAI_COMPAT_KEY_ZZZZZ".to_owned();
+
+        let result = load_provider_from_env_or_mock(
+            temp.path(),
+            ProviderOverrides {
+                provider: Some(InferenceProviderKind::OpenAiCompat),
+                endpoint: Some("https://api.example.com/v1".to_owned()),
+                model: Some("glm-4.7".to_owned()),
+                api_key_env: Some(env_name.clone()),
+                ..ProviderOverrides::default()
+            },
+        );
+
+        match result {
+            Err(InferError::MissingApiKey(name)) => assert_eq!(name, env_name),
+            _ => panic!("expected missing api key"),
+        }
+    }
+
+    #[test]
+    fn load_provider_openai_compat_requires_endpoint() {
+        let temp = tempdir().expect("tempdir");
+        ensure_workspace_config(temp.path()).expect("ensure config");
+        let env_name = format!(
+            "AETHER_TEST_OPENAI_COMPAT_KEY_ENDPOINT_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        );
+        // SAFETY: test-scoped environment variable with unique name.
+        unsafe {
+            env::set_var(&env_name, "test-key");
+        }
+
+        let result = load_provider_from_env_or_mock(
+            temp.path(),
+            ProviderOverrides {
+                provider: Some(InferenceProviderKind::OpenAiCompat),
+                model: Some("glm-4.7".to_owned()),
+                api_key_env: Some(env_name),
+                ..ProviderOverrides::default()
+            },
+        );
+
+        match result {
+            Err(InferError::MissingEndpoint) => {}
+            _ => panic!("expected missing endpoint"),
+        }
+    }
+
+    #[test]
+    fn load_provider_openai_compat_requires_model() {
+        let temp = tempdir().expect("tempdir");
+        ensure_workspace_config(temp.path()).expect("ensure config");
+        let env_name = format!(
+            "AETHER_TEST_OPENAI_COMPAT_KEY_MODEL_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        );
+        // SAFETY: test-scoped environment variable with unique name.
+        unsafe {
+            env::set_var(&env_name, "test-key");
+        }
+
+        let result = load_provider_from_env_or_mock(
+            temp.path(),
+            ProviderOverrides {
+                provider: Some(InferenceProviderKind::OpenAiCompat),
+                endpoint: Some("https://api.example.com/v1".to_owned()),
+                api_key_env: Some(env_name),
+                ..ProviderOverrides::default()
+            },
+        );
+
+        match result {
+            Err(InferError::MissingModel) => {}
+            _ => panic!("expected missing model"),
         }
     }
 

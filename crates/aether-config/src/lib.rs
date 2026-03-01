@@ -7,6 +7,7 @@ use thiserror::Error;
 pub const AETHER_DIR_NAME: &str = ".aether";
 pub const CONFIG_FILE_NAME: &str = "config.toml";
 pub const DEFAULT_GEMINI_API_KEY_ENV: &str = "GEMINI_API_KEY";
+pub const DEFAULT_OPENAI_COMPAT_API_KEY_ENV: &str = "OPENAI_COMPAT_API_KEY";
 pub const DEFAULT_QWEN_ENDPOINT: &str = "http://127.0.0.1:11434";
 pub const DEFAULT_QWEN_MODEL: &str = "qwen2.5-coder:7b-instruct-q4_K_M";
 pub const DEFAULT_QWEN_EMBEDDING_ENDPOINT: &str = "http://127.0.0.1:11434/api/embeddings";
@@ -48,6 +49,8 @@ pub enum InferenceProviderKind {
     Mock,
     Gemini,
     Qwen3Local,
+    #[serde(rename = "openai_compat")]
+    OpenAiCompat,
 }
 
 impl InferenceProviderKind {
@@ -57,6 +60,7 @@ impl InferenceProviderKind {
             Self::Mock => "mock",
             Self::Gemini => "gemini",
             Self::Qwen3Local => "qwen3_local",
+            Self::OpenAiCompat => "openai_compat",
         }
     }
 }
@@ -70,8 +74,9 @@ impl std::str::FromStr for InferenceProviderKind {
             "mock" => Ok(Self::Mock),
             "gemini" => Ok(Self::Gemini),
             "qwen3_local" => Ok(Self::Qwen3Local),
+            "openai_compat" => Ok(Self::OpenAiCompat),
             other => Err(format!(
-                "invalid provider '{other}', expected one of: auto, mock, gemini, qwen3_local"
+                "invalid provider '{other}', expected one of: auto, mock, gemini, qwen3_local, openai_compat"
             )),
         }
     }
@@ -911,6 +916,7 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
                 });
             }
         }
+        InferenceProviderKind::OpenAiCompat => {}
     }
 
     if config.verify.commands.is_empty() {
@@ -2159,5 +2165,43 @@ typescript = 0.67
         let rendered = fs::read_to_string(config_path(workspace)).expect("read config");
         assert!(rendered.contains("[search.thresholds]"));
         assert!(rendered.contains("[search.calibrated_thresholds]"));
+    }
+
+    #[test]
+    fn inference_provider_kind_from_str_accepts_openai_compat() {
+        let parsed: InferenceProviderKind =
+            "openai_compat".parse().expect("openai_compat should parse");
+        assert_eq!(parsed, InferenceProviderKind::OpenAiCompat);
+    }
+
+    #[test]
+    fn inference_provider_kind_openai_compat_as_str_matches_config_value() {
+        assert_eq!(
+            InferenceProviderKind::OpenAiCompat.as_str(),
+            "openai_compat"
+        );
+    }
+
+    #[test]
+    fn load_workspace_config_parses_openai_compat_provider() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(aether_dir(workspace)).expect("create .aether");
+        fs::write(
+            config_path(workspace),
+            r#"
+[inference]
+provider = "openai_compat"
+model = "glm-4.7"
+endpoint = "https://api.z.ai/api/paas/v4"
+"#,
+        )
+        .expect("write config");
+
+        let config = load_workspace_config(workspace).expect("load config");
+        assert_eq!(
+            config.inference.provider,
+            InferenceProviderKind::OpenAiCompat
+        );
     }
 }
