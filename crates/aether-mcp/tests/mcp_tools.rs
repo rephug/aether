@@ -33,6 +33,27 @@ fn symbol_access_count(workspace: &Path, symbol_id: &str) -> Result<i64> {
     Ok(count)
 }
 
+fn write_test_config(workspace: &Path) {
+    fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
+    fs::write(
+        workspace.join(".aether/config.toml"),
+        r#"[inference]
+provider = "mock"
+api_key_env = "GEMINI_API_KEY"
+
+[storage]
+mirror_sir_files = true
+graph_backend = "sqlite"
+
+[embeddings]
+enabled = false
+provider = "mock"
+vector_backend = "sqlite"
+"#,
+    )
+    .expect("write config");
+}
+
 #[test]
 fn mcp_tool_handlers_work_with_local_store() -> Result<()> {
     let temp = tempdir()?;
@@ -571,6 +592,7 @@ vector_backend = "sqlite"
 fn mcp_symbol_timeline_returns_expected_commit_order_and_hashes() -> Result<()> {
     let temp = tempdir()?;
     let workspace = temp.path();
+    write_test_config(workspace);
 
     let store = SqliteStore::open(workspace)?;
     store.record_sir_version_if_changed(
@@ -643,6 +665,7 @@ fn mcp_symbol_timeline_returns_expected_commit_order_and_hashes() -> Result<()> 
 fn mcp_symbol_timeline_reports_null_commit_hash_when_unavailable() -> Result<()> {
     let temp = tempdir()?;
     let workspace = temp.path();
+    write_test_config(workspace);
 
     let store = SqliteStore::open(workspace)?;
     store.record_sir_version_if_changed(
@@ -681,6 +704,7 @@ fn mcp_symbol_timeline_reports_null_commit_hash_when_unavailable() -> Result<()>
 fn mcp_why_changed_returns_deterministic_diff_and_commit_linkage() -> Result<()> {
     let temp = tempdir()?;
     let workspace = temp.path();
+    write_test_config(workspace);
 
     let store = SqliteStore::open(workspace)?;
     store.record_sir_version_if_changed(
@@ -795,6 +819,7 @@ fn mcp_why_changed_returns_deterministic_diff_and_commit_linkage() -> Result<()>
 fn mcp_why_changed_handles_no_history_and_single_version_fallbacks() -> Result<()> {
     let temp = tempdir()?;
     let workspace = temp.path();
+    write_test_config(workspace);
     let server = AetherMcpServer::new(workspace, false)?;
     let rt = Runtime::new()?;
 
@@ -866,6 +891,7 @@ fn mcp_why_changed_handles_no_history_and_single_version_fallbacks() -> Result<(
 fn mcp_why_changed_supports_timestamp_selector_mode() -> Result<()> {
     let temp = tempdir()?;
     let workspace = temp.path();
+    write_test_config(workspace);
 
     let store = SqliteStore::open(workspace)?;
     store.record_sir_version_if_changed(
@@ -939,7 +965,10 @@ fn mcp_verify_runs_allowlisted_subset_and_has_stable_response_shape() -> Result<
     fs::create_dir_all(workspace.join(".aether"))?;
     fs::write(
         workspace.join(".aether/config.toml"),
-        r#"[verify]
+        r#"[storage]
+graph_backend = "sqlite"
+
+[verify]
 commands = ["cargo --version", "cargo --definitely-invalid-flag"]
 "#,
     )?;
@@ -1015,7 +1044,10 @@ fn mcp_verify_reports_failure_status_output_and_allowlist_rejection() -> Result<
     fs::create_dir_all(workspace.join(".aether"))?;
     fs::write(
         workspace.join(".aether/config.toml"),
-        r#"[verify]
+        r#"[storage]
+graph_backend = "sqlite"
+
+[verify]
 commands = ["cargo --version", "cargo --definitely-invalid-flag"]
 "#,
     )?;
@@ -1078,7 +1110,10 @@ fn mcp_verify_handles_unavailable_container_runtime_with_optional_fallback() -> 
     fs::create_dir_all(workspace.join(".aether"))?;
     fs::write(
         workspace.join(".aether/config.toml"),
-        r#"[verify]
+        r#"[storage]
+graph_backend = "sqlite"
+
+[verify]
 mode = "container"
 commands = ["cargo --version"]
 
@@ -1152,7 +1187,10 @@ fn mcp_verify_handles_unavailable_microvm_runtime_with_optional_fallback() -> Re
     fs::write(workspace.join("rootfs.ext4"), "")?;
     fs::write(
         workspace.join(".aether/config.toml"),
-        r#"[verify]
+        r#"[storage]
+graph_backend = "sqlite"
+
+[verify]
 mode = "microvm"
 commands = ["cargo --version"]
 
@@ -1232,7 +1270,10 @@ fn mcp_memory_tools_dedup_and_recall_fallback_work() -> Result<()> {
     fs::create_dir_all(workspace.join(".aether"))?;
     fs::write(
         workspace.join(".aether/config.toml"),
-        r#"[embeddings]
+        r#"[storage]
+graph_backend = "sqlite"
+
+[embeddings]
 enabled = false
 provider = "mock"
 vector_backend = "sqlite"
@@ -1326,6 +1367,7 @@ vector_backend = "sqlite"
 fn mcp_memory_tool_response_schema_shapes_are_stable() -> Result<()> {
     let temp = tempdir()?;
     let workspace = temp.path();
+    write_test_config(workspace);
     let server = AetherMcpServer::new(workspace, false)?;
     let rt = Runtime::new()?;
 

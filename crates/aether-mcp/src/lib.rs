@@ -3634,6 +3634,9 @@ fn to_mcp_error(err: AetherMcpError) -> McpError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::Path;
+
     use aether_core::EdgeKind;
     use aether_store::{
         CouplingEdgeRecord, CozoGraphStore, DriftResultRecord, ProjectNoteRecord, ResolvedEdge,
@@ -3646,10 +3649,32 @@ mod tests {
         AetherMcpServer, AetherTraceCauseRequest,
     };
 
+    fn write_test_config(workspace: &Path) {
+        fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
+        fs::write(
+            workspace.join(".aether/config.toml"),
+            r#"[inference]
+provider = "mock"
+api_key_env = "GEMINI_API_KEY"
+
+[storage]
+mirror_sir_files = true
+graph_backend = "sqlite"
+
+[embeddings]
+enabled = false
+provider = "mock"
+vector_backend = "sqlite"
+"#,
+        )
+        .expect("write config");
+    }
+
     #[tokio::test]
     async fn aether_ask_returns_mixed_result_types() {
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();
+        write_test_config(workspace);
         let server = AetherMcpServer::init(workspace, false)
             .await
             .expect("new mcp server");
@@ -3759,10 +3784,14 @@ mod tests {
     fn aether_drift_report_logic_returns_schema() {
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();
+        write_test_config(workspace);
         std::fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
         std::fs::write(
             workspace.join(".aether/config.toml"),
-            r#"[drift]
+            r#"[storage]
+graph_backend = "sqlite"
+
+[drift]
 enabled = true
 drift_threshold = 0.85
 analysis_window = "10 commits"
@@ -3788,6 +3817,7 @@ hub_percentile = 95
     fn aether_acknowledge_drift_logic_marks_rows() {
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();
+        write_test_config(workspace);
         let server = AetherMcpServer::new(workspace, false).expect("new mcp server");
         let store = SqliteStore::open(workspace).expect("open store");
         store
@@ -3828,6 +3858,7 @@ hub_percentile = 95
     fn aether_trace_cause_logic_resolves_symbol_name_and_file() {
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();
+        write_test_config(workspace);
         std::fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
         std::fs::write(
             workspace.join(".aether/config.toml"),
