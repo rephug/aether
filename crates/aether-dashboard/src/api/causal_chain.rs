@@ -72,9 +72,26 @@ pub(crate) async fn causal_chain_handler(
     let depth = query.depth.unwrap_or(3).clamp(1, 5);
     let lookback = query.lookback.unwrap_or_else(|| "30d".to_owned());
 
-    match load_causal_chain_data(state.shared.as_ref(), symbol_id, depth, lookback.as_str()) {
+    let shared = state.shared.clone();
+    let symbol_id = symbol_id.to_owned();
+    match support::run_blocking_with_timeout(move || {
+        load_causal_chain_data(
+            shared.as_ref(),
+            symbol_id.as_str(),
+            depth,
+            lookback.as_str(),
+        )
+    })
+    .await
+    {
         Ok(data) => support::api_json(state.shared.as_ref(), data).into_response(),
-        Err(err) => support::json_internal_error(err),
+        Err(err) => {
+            if let Some(message) = support::extract_timeout_error_message(err.as_str()) {
+                support::json_timeout_error(message)
+            } else {
+                support::json_internal_error(err)
+            }
+        }
     }
 }
 

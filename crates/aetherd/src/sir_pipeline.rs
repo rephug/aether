@@ -150,6 +150,7 @@ impl SirPipeline {
         &self,
         store: &SqliteStore,
         event: &SymbolChangeEvent,
+        force: bool,
         print_sir: bool,
         out: &mut dyn Write,
     ) -> Result<()> {
@@ -164,12 +165,10 @@ impl SirPipeline {
 
         self.replace_edges_for_file(store, event)?;
 
-        let changed_symbols: Vec<Symbol> = event
-            .added
-            .iter()
-            .chain(event.updated.iter())
-            .cloned()
-            .collect();
+        let mut changed_symbols: Vec<(Symbol, bool)> =
+            Vec::with_capacity(event.added.len() + event.updated.len());
+        changed_symbols.extend(event.added.iter().cloned().map(|symbol| (symbol, true)));
+        changed_symbols.extend(event.updated.iter().cloned().map(|symbol| (symbol, false)));
 
         let commit_hash = resolve_workspace_head_commit(&self.workspace_root);
         tracing::info!(
@@ -181,21 +180,61 @@ impl SirPipeline {
         );
         if !changed_symbols.is_empty() {
             let now_ts = unix_timestamp_secs();
-            for symbol in &changed_symbols {
+            for (symbol, _) in &changed_symbols {
                 store
                     .upsert_symbol(to_symbol_record(symbol, now_ts))
                     .with_context(|| format!("failed to upsert symbol {}", symbol.id))?;
             }
 
-            let jobs = changed_symbols
-                .into_iter()
-                .map(|symbol| build_job(&self.workspace_root, symbol))
-                .collect::<Result<Vec<_>>>()?;
+            let mut jobs = Vec::new();
+            let mut skipped_existing = 0usize;
+            for (symbol, allow_existing_skip) in changed_symbols {
+                if allow_existing_skip
+                    && !force
+                    && self.should_skip_sir_generation(store, &symbol)?
+                {
+                    skipped_existing += 1;
+                    tracing::debug!(
+                        symbol_name = %symbol.name,
+                        symbol_id = %symbol.id,
+                        "Skipping SIR generation for {}: already exists",
+                        symbol.name
+                    );
+                    if print_sir {
+                        writeln!(
+                            out,
+                            "SIR_SKIPPED symbol_id={} reason=already_exists",
+                            symbol.id
+                        )
+                        .context("failed to write skipped SIR print line")?;
+                    }
+                    continue;
+                }
+
+                jobs.push(build_job(&self.workspace_root, symbol)?);
+            }
+
+            if skipped_existing > 0 {
+                tracing::info!(
+                    file_path = %event.file_path,
+                    skipped_existing,
+                    queued_jobs = jobs.len(),
+                    "Skipping SIR generation for existing symbols: already exists"
+                );
+            }
+
+            if jobs.is_empty() {
+                tracing::info!(
+                    file_path = %event.file_path,
+                    "SIR generation processed 0 jobs"
+                );
+            }
 
             tracing::info!(
                 job_count = jobs.len(),
                 provider = %self.provider_name,
                 model = %self.model_name,
+                force,
                 "submitting SIR generation jobs"
             );
             let results = self.runtime.block_on(generate_sir_jobs(
@@ -384,6 +423,38 @@ impl SirPipeline {
         )?;
 
         Ok(())
+    }
+
+    fn should_skip_sir_generation(&self, store: &SqliteStore, symbol: &Symbol) -> Result<bool> {
+        let Some(meta) = store
+            .get_sir_meta(&symbol.id)
+            .with_context(|| format!("failed to read SIR metadata for {}", symbol.id))?
+        else {
+            return Ok(false);
+        };
+
+        let status = meta.sir_status.trim().to_ascii_lowercase();
+        if status != SIR_STATUS_FRESH && status != "ready" {
+            return Ok(false);
+        }
+
+        let Some(existing_blob) = store
+            .read_sir_blob(&symbol.id)
+            .with_context(|| format!("failed to read SIR blob for {}", symbol.id))?
+        else {
+            return Ok(false);
+        };
+        if existing_blob.trim().is_empty() {
+            return Ok(false);
+        }
+
+        let Some(source_modified_at_ms) =
+            source_modified_unix_millis(self.workspace_root.join(&symbol.file_path).as_path())
+        else {
+            return Ok(false);
+        };
+
+        Ok(source_modified_at_ms < meta.updated_at.max(0).saturating_mul(1_000))
     }
 
     fn replace_edges_for_file(&self, store: &SqliteStore, event: &SymbolChangeEvent) -> Result<()> {
@@ -1017,6 +1088,14 @@ fn unix_timestamp_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn source_modified_unix_millis(path: &Path) -> Option<i64> {
+    fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
 }
 
 fn to_test_intent_record(intent: TestIntent, now_ms: i64) -> TestIntentRecord {

@@ -32,6 +32,7 @@ fn lsp_index_mode_path_generates_sir_and_hover_reads_it() -> Result<(), Box<dyn 
         debounce_ms: 300,
         print_events: false,
         print_sir: false,
+        force: false,
         sir_concurrency: 2,
         lifecycle_logs: true,
         inference_provider: Some(InferenceProviderKind::Mock),

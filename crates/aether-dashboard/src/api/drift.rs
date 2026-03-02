@@ -41,9 +41,17 @@ pub(crate) async fn drift_handler(
     State(state): State<Arc<DashboardState>>,
     Query(query): Query<DriftQuery>,
 ) -> impl IntoResponse {
-    match load_drift_data(state.shared.as_ref(), &query) {
+    let shared = state.shared.clone();
+    match support::run_blocking_with_timeout(move || load_drift_data(shared.as_ref(), &query)).await
+    {
         Ok(data) => support::api_json(state.shared.as_ref(), data).into_response(),
-        Err(err) => support::json_internal_error(err),
+        Err(err) => {
+            if let Some(message) = support::extract_timeout_error_message(err.as_str()) {
+                support::json_timeout_error(message)
+            } else {
+                support::json_internal_error(err)
+            }
+        }
     }
 }
 

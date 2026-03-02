@@ -1527,7 +1527,7 @@ mod tests {
         let mut startup_stdout = Vec::new();
         for event in observer.initial_symbol_events() {
             pipeline
-                .process_event(&store, &event, false, &mut startup_stdout)
+                .process_event(&store, &event, false, false, &mut startup_stdout)
                 .expect("process startup event");
         }
 
@@ -1545,7 +1545,7 @@ mod tests {
             .expect("expected rename event");
         let mut update_stdout = Vec::new();
         pipeline
-            .process_event(&store, &rename_event, false, &mut update_stdout)
+            .process_event(&store, &rename_event, false, false, &mut update_stdout)
             .expect("process rename event");
 
         let alpha_after_rename = store
@@ -1564,7 +1564,7 @@ mod tests {
             .expect("expected removal event");
         let mut removal_stdout = Vec::new();
         pipeline
-            .process_event(&store, &removal_event, false, &mut removal_stdout)
+            .process_event(&store, &removal_event, false, false, &mut removal_stdout)
             .expect("process removal event");
 
         let beta_after_remove = store

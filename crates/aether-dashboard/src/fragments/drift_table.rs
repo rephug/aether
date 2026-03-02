@@ -38,8 +38,19 @@ pub(crate) async fn drift_fragment(
 
     support::html_markup_response(html! {
         div class="space-y-4" {
+            (support::explanation_header(
+                "What's Changed Since Last Analysis",
+                "Drift means the code changed but AETHER's understanding hasn't been updated yet.",
+                "Higher change risk means bigger mismatch between recent edits and stored understanding.",
+                "Drift report based on semantic delta magnitude."
+            ))
+
             div class="flex items-center justify-between gap-3" {
-                h2 class="text-lg font-semibold" { "Drift Report" }
+                h2 class="text-lg font-semibold" {
+                    span class="beginner-only" { "What's Changed Since Last Analysis" }
+                    span class="intermediate-only" { "Change Risk Report" }
+                    span class="expert-only" { "Drift Report" }
+                }
                 span class="badge badge-orange" {
                     (data.drift_entries.len()) " entries"
                 }
@@ -48,7 +59,10 @@ pub(crate) async fn drift_fragment(
             div class="rounded-xl border border-surface-3/40 bg-surface-1/40 p-4 space-y-3" {
                 div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_72px] md:items-end" {
                     label class="space-y-1" {
-                        span class="text-xs uppercase tracking-wider text-text-muted" { "Magnitude Threshold" }
+                        span class="text-xs uppercase tracking-wider text-text-muted" {
+                            "Change Risk Threshold "
+                            (support::help_icon("Only show components at or above this risk level. Higher values are riskier changes."))
+                        }
                         input
                             type="range"
                             min="0"
@@ -68,8 +82,12 @@ pub(crate) async fn drift_fragment(
                 }
 
                 div class="flex flex-wrap gap-2 text-xs" {
-                    span class="badge badge-muted" { "Checked: " (data.total_checked) }
-                    span class="badge badge-yellow" { "Drifted: " (data.drifted_count) }
+                    span class="badge badge-muted" {
+                        "Components Checked: " (data.total_checked)
+                    }
+                    span class="badge badge-yellow" {
+                        "At-Risk Components: " (data.drifted_count)
+                    }
                     @if !data.analysis_available {
                         span class="badge badge-red" { "Analysis unavailable" }
                     }
@@ -84,9 +102,9 @@ pub(crate) async fn drift_fragment(
                 table class="data-table" {
                     thead {
                         tr {
-                            th { "Symbol" }
+                            th { "Component" }
                             th { "Type" }
-                            th { "Magnitude" }
+                            th { "Change Risk" }
                             th { "File" }
                         }
                     }

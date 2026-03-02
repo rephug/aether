@@ -141,7 +141,7 @@ fn step2_pipeline_generates_and_persists_sir_with_mock_provider()
 
     let mut startup_stdout = Vec::new();
     for event in observer.initial_symbol_events() {
-        pipeline.process_event(&store, &event, true, &mut startup_stdout)?;
+        pipeline.process_event(&store, &event, false, true, &mut startup_stdout)?;
     }
 
     assert!(workspace.join(".aether/meta.sqlite").exists());
@@ -191,8 +191,8 @@ fn step2_pipeline_generates_and_persists_sir_with_mock_provider()
     assert_eq!(ts_event.updated[0].name, "delta");
 
     let mut update_stdout = Vec::new();
-    pipeline.process_event(&store, &rust_event, true, &mut update_stdout)?;
-    pipeline.process_event(&store, &ts_event, true, &mut update_stdout)?;
+    pipeline.process_event(&store, &rust_event, false, true, &mut update_stdout)?;
+    pipeline.process_event(&store, &ts_event, false, true, &mut update_stdout)?;
 
     for symbol in rust_event.updated.iter().chain(ts_event.updated.iter()) {
         let blob = store
@@ -260,7 +260,7 @@ fn step2_file_rollup_aggregates_side_effects_and_concatenates_intent_for_small_f
 
     let mut sink = Vec::new();
     for event in observer.initial_symbol_events() {
-        pipeline.process_event(&store, &event, false, &mut sink)?;
+        pipeline.process_event(&store, &event, false, false, &mut sink)?;
     }
 
     let file_rollup_id = synthetic_file_sir_id("rust", "src/lib.rs");
@@ -332,7 +332,7 @@ vector_backend = "sqlite"
 
     let mut sink = Vec::new();
     for event in observer.initial_symbol_events() {
-        pipeline.process_event(&store, &event, false, &mut sink)?;
+        pipeline.process_event(&store, &event, false, false, &mut sink)?;
     }
 
     let symbol = store
@@ -358,7 +358,7 @@ vector_backend = "sqlite"
     let update_event = observer
         .process_path(&rust_file)?
         .expect("expected update event");
-    pipeline.process_event(&store, &update_event, false, &mut sink)?;
+    pipeline.process_event(&store, &update_event, false, false, &mut sink)?;
 
     let refreshed_meta = store
         .get_symbol_embedding_meta(&symbol.id)?
@@ -372,7 +372,7 @@ vector_backend = "sqlite"
     let removal_event = observer
         .process_path(&rust_file)?
         .expect("expected removal event");
-    pipeline.process_event(&store, &removal_event, false, &mut sink)?;
+    pipeline.process_event(&store, &removal_event, false, false, &mut sink)?;
 
     let after_remove = store.get_symbol_embedding_meta(&symbol.id)?;
     assert!(after_remove.is_none());
@@ -400,7 +400,7 @@ fn step2_pipeline_marks_stale_on_failure_and_clears_on_recovery()
 
     let mut sink = Vec::new();
     for event in observer.initial_symbol_events() {
-        success_pipeline.process_event(&store, &event, false, &mut sink)?;
+        success_pipeline.process_event(&store, &event, false, false, &mut sink)?;
     }
 
     let symbol = store
@@ -428,7 +428,7 @@ fn step2_pipeline_marks_stale_on_failure_and_clears_on_recovery()
         "qwen3_local",
         "qwen3",
     )?;
-    failing_pipeline.process_event(&store, &stale_event, false, &mut sink)?;
+    failing_pipeline.process_event(&store, &stale_event, false, false, &mut sink)?;
 
     let stale_blob = store
         .read_sir_blob(&symbol.id)?
@@ -446,7 +446,7 @@ fn step2_pipeline_marks_stale_on_failure_and_clears_on_recovery()
     let recovery_event = observer
         .process_path(&rust_file)?
         .expect("expected recovery update event");
-    success_pipeline.process_event(&store, &recovery_event, false, &mut sink)?;
+    success_pipeline.process_event(&store, &recovery_event, false, false, &mut sink)?;
 
     let recovered_meta = store
         .get_sir_meta(&symbol.id)?
@@ -483,7 +483,7 @@ fn step2_pipeline_creates_new_version_on_hash_change_without_duplicate_on_reinde
 
     let mut sink = Vec::new();
     for event in observer.initial_symbol_events() {
-        pipeline.process_event(&store, &event, false, &mut sink)?;
+        pipeline.process_event(&store, &event, false, false, &mut sink)?;
     }
 
     let symbol = store
@@ -503,7 +503,7 @@ fn step2_pipeline_creates_new_version_on_hash_change_without_duplicate_on_reinde
     let mut reindex_observer = ObserverState::new(workspace.to_path_buf())?;
     reindex_observer.seed_from_disk()?;
     for event in reindex_observer.initial_symbol_events() {
-        pipeline.process_event(&store, &event, false, &mut sink)?;
+        pipeline.process_event(&store, &event, false, false, &mut sink)?;
     }
 
     let history_after_reindex = store.list_sir_history(&symbol.id)?;
@@ -519,7 +519,7 @@ fn step2_pipeline_creates_new_version_on_hash_change_without_duplicate_on_reinde
     let update_event = reindex_observer
         .process_path(&rust_file)?
         .expect("expected update event");
-    pipeline.process_event(&store, &update_event, false, &mut sink)?;
+    pipeline.process_event(&store, &update_event, false, false, &mut sink)?;
 
     let history_after_update = store.list_sir_history(&symbol.id)?;
     assert_eq!(history_after_update.len(), 2);
@@ -565,7 +565,7 @@ fn step2_reindex_replaces_old_dependency_edges() -> Result<(), Box<dyn std::erro
 
     let mut sink = Vec::new();
     for event in observer.initial_symbol_events() {
-        pipeline.process_event(&store, &event, false, &mut sink)?;
+        pipeline.process_event(&store, &event, false, false, &mut sink)?;
     }
 
     let alpha = store
@@ -586,7 +586,7 @@ fn step2_reindex_replaces_old_dependency_edges() -> Result<(), Box<dyn std::erro
     let event = observer
         .process_path(&rust_file)?
         .expect("expected update event");
-    pipeline.process_event(&store, &event, false, &mut sink)?;
+    pipeline.process_event(&store, &event, false, false, &mut sink)?;
 
     let beta_callers_after = store.get_callers("beta")?;
     assert!(beta_callers_after.is_empty());
@@ -622,14 +622,14 @@ fn step2_sir_history_retrieval_persists_after_restart() -> Result<(), Box<dyn st
 
     let mut sink = Vec::new();
     for event in observer.initial_symbol_events() {
-        pipeline.process_event(&store, &event, false, &mut sink)?;
+        pipeline.process_event(&store, &event, false, false, &mut sink)?;
     }
 
     fs::write(&rust_file, "fn alpha() -> i32 { 2 }\n")?;
     let update_event = observer
         .process_path(&rust_file)?
         .expect("expected update event");
-    pipeline.process_event(&store, &update_event, false, &mut sink)?;
+    pipeline.process_event(&store, &update_event, false, false, &mut sink)?;
 
     let symbol = store
         .list_symbols_for_file("src/lib.rs")?
@@ -678,7 +678,7 @@ fn step2_pipeline_links_sir_versions_to_git_commits() -> Result<(), Box<dyn std:
 
     let mut sink = Vec::new();
     for event in observer.initial_symbol_events() {
-        pipeline.process_event(&store, &event, false, &mut sink)?;
+        pipeline.process_event(&store, &event, false, false, &mut sink)?;
     }
 
     let symbol = store
@@ -701,7 +701,7 @@ fn step2_pipeline_links_sir_versions_to_git_commits() -> Result<(), Box<dyn std:
     let update_event = observer
         .process_path(&rust_file)?
         .expect("expected update event");
-    pipeline.process_event(&store, &update_event, false, &mut sink)?;
+    pipeline.process_event(&store, &update_event, false, false, &mut sink)?;
 
     let history = store.list_sir_history(&symbol.id)?;
     assert_eq!(history.len(), 2);
@@ -738,14 +738,14 @@ fn step2_pipeline_records_null_commit_hash_when_git_is_unavailable()
 
     let mut sink = Vec::new();
     for event in observer.initial_symbol_events() {
-        pipeline.process_event(&store, &event, false, &mut sink)?;
+        pipeline.process_event(&store, &event, false, false, &mut sink)?;
     }
 
     fs::write(&rust_file, "fn alpha() -> i32 { 2 }\n")?;
     let update_event = observer
         .process_path(&rust_file)?
         .expect("expected update event");
-    pipeline.process_event(&store, &update_event, false, &mut sink)?;
+    pipeline.process_event(&store, &update_event, false, false, &mut sink)?;
 
     let symbol = store
         .list_symbols_for_file("src/lib.rs")?

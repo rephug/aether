@@ -47,9 +47,21 @@ pub(crate) async fn architecture_handler(
     State(state): State<Arc<DashboardState>>,
     Query(query): Query<ArchitectureQuery>,
 ) -> impl IntoResponse {
-    match load_architecture_data(state.shared.as_ref(), query.granularity.as_deref()) {
+    let shared = state.shared.clone();
+    let granularity = query.granularity;
+    match support::run_blocking_with_timeout(move || {
+        load_architecture_data(shared.as_ref(), granularity.as_deref())
+    })
+    .await
+    {
         Ok(data) => support::api_json(state.shared.as_ref(), data).into_response(),
-        Err(err) => support::json_internal_error(err),
+        Err(err) => {
+            if let Some(message) = support::extract_timeout_error_message(err.as_str()) {
+                support::json_timeout_error(message)
+            } else {
+                support::json_internal_error(err)
+            }
+        }
     }
 }
 

@@ -135,7 +135,7 @@
         .attr('stroke-width', 1.5)
         .style('cursor', 'pointer')
         .on('mouseover', function (event, d) {
-          tip.show(event, `<strong>${d.label}</strong><br/>${d.file}<br/>risk ${(d.risk_score || 0).toFixed(2)} / pr ${(d.pagerank || 0).toFixed(2)}`);
+          tip.show(event, `<strong>${d.label}</strong><br/>${d.file}<br/>risk ${(d.risk_score || 0).toFixed(2)} / importance ${(d.pagerank || 0).toFixed(2)}`);
         })
         .on('mouseout', () => tip.hide())
         .on('click', function (_event, d) {
@@ -300,10 +300,11 @@
       }
 
       const entries = [
-        ['SIR Coverage', Number(d.dimensions.sir_coverage || 0)],
+        ['Understanding Coverage', Number(d.dimensions.sir_coverage || 0)],
         ['Test Coverage', Number(d.dimensions.test_coverage || 0)],
+        ['Graph Connectivity', Number(d.dimensions.graph_connectivity || 0)],
         ['Coupling Health', Number(d.dimensions.coupling_health || 0)],
-        ['Drift Health', Number(d.dimensions.drift_health || 0)],
+        ['Change Risk Health', Number(d.dimensions.drift_health || 0)],
       ];
 
       container.innerHTML = '';

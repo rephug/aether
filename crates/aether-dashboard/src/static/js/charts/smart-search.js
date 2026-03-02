@@ -12,9 +12,9 @@
         badges[0].textContent = `Risk: ${risk.toFixed(2)}`;
         badges[0].style.background = `${window.AetherTheme.riskColor(risk)}22`;
         badges[0].style.color = window.AetherTheme.riskColor(risk);
-        badges[1].textContent = `PageRank: ${Number(row.pagerank || 0).toFixed(3)}`;
-        badges[2].textContent = `Drift: ${Number(row.drift_score || 0).toFixed(2)}`;
-        badges[3].textContent = `Tests: ${row.test_count ?? 0}`;
+        badges[1].textContent = `Importance Score: ${Number(row.pagerank || 0).toFixed(3)}`;
+        badges[2].textContent = `Change Risk: ${Number(row.drift_score || 0).toFixed(2)}`;
+        badges[3].textContent = `Test Count: ${row.test_count ?? 0}`;
       }
 
       const related = card.querySelector('.mt-3.text-xs.text-text-muted');

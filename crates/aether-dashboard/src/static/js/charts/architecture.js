@@ -19,10 +19,15 @@
     };
   }
 
-  function draw(data) {
+  function draw(data, errorMessage) {
     const container = document.getElementById('architecture-treemap');
     if (!container) return;
     container.innerHTML = '';
+
+    if (errorMessage) {
+      container.innerHTML = `<div class="chart-empty"><div class="empty-state-title">${errorMessage}</div></div>`;
+      return;
+    }
 
     if (!data || data.not_computed) {
       container.innerHTML = '<div class="chart-empty"><div class="empty-state-title">Community data not computed</div></div>';
@@ -72,8 +77,8 @@
 
     const c = document.getElementById('architecture-community-count');
     const m = document.getElementById('architecture-misplaced-count');
-    if (c) c.textContent = `Communities: ${data.community_count}`;
-    if (m) m.textContent = `Misplaced: ${data.misplaced_count}`;
+    if (c) c.textContent = `Neighborhoods: ${data.community_count}`;
+    if (m) m.textContent = `Misplaced Components: ${data.misplaced_count}`;
   }
 
   window.initArchitectureMap = function initArchitectureMap() {
@@ -82,17 +87,24 @@
 
     const granularity = page.getAttribute('data-granularity') || 'symbol';
     fetch(`/api/v1/architecture?granularity=${encodeURIComponent(granularity)}`)
-      .then((r) => r.json())
+      .then(async (r) => {
+        const payload = await r.json().catch(() => null);
+        if (!r.ok) {
+          const message = payload?.message || 'This analysis is taking too long. Try reducing the graph scope or run `aetherd health` from the CLI for faster results.';
+          throw new Error(message);
+        }
+        return payload;
+      })
       .then((json) => {
         window.__AETHER_ARCH = json?.data || null;
         draw(window.__AETHER_ARCH);
       })
-      .catch(() => draw(null));
+      .catch((err) => draw(null, err?.message || 'Failed to load architecture data'));
 
     const chk = document.getElementById('architecture-show-misplaced');
     if (chk && !chk.dataset.bound) {
       chk.dataset.bound = '1';
-      chk.addEventListener('change', () => draw(window.__AETHER_ARCH));
+      chk.addEventListener('change', () => draw(window.__AETHER_ARCH, null));
     }
   };
 })();

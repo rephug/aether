@@ -181,7 +181,8 @@ fn run(cli: Cli) -> Result<()> {
             let ws = workspace.clone();
             let dash_port = config.dashboard.port;
             std::thread::spawn(move || {
-                let rt = match tokio::runtime::Builder::new_current_thread()
+                let rt = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
                     .enable_all()
                     .build()
                 {
@@ -223,6 +224,7 @@ fn run(cli: Cli) -> Result<()> {
         debounce_ms: cli.debounce_ms,
         print_events: cli.print_events,
         print_sir: cli.print_sir,
+        force: cli.force,
         sir_concurrency: cli.sir_concurrency,
         lifecycle_logs: cli.lsp && cli.index && std::io::stdout().is_terminal(),
         inference_provider: cli.inference_provider,

@@ -58,9 +58,21 @@ pub(crate) async fn xray_handler(
     State(state): State<Arc<DashboardState>>,
     Query(query): Query<XrayQuery>,
 ) -> impl IntoResponse {
-    match load_xray_data(state.shared.as_ref(), query.window.as_deref()).await {
+    let shared = state.shared.clone();
+    let window = query.window;
+    match support::run_async_with_timeout(move || async move {
+        load_xray_data(shared.as_ref(), window.as_deref()).await
+    })
+    .await
+    {
         Ok(data) => support::api_json(state.shared.as_ref(), data).into_response(),
-        Err(err) => support::json_internal_error(err),
+        Err(err) => {
+            if let Some(message) = support::extract_timeout_error_message(err.as_str()) {
+                support::json_timeout_error(message)
+            } else {
+                support::json_internal_error(err)
+            }
+        }
     }
 }
 

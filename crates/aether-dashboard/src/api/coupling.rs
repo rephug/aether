@@ -68,9 +68,20 @@ pub(crate) async fn coupling_handler(
     let min_score = query.min_score.unwrap_or(0.0).clamp(0.0, 1.0);
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
-    match load_coupling_data(state.shared.as_ref(), min_score, limit).await {
+    let shared = state.shared.clone();
+    match support::run_async_with_timeout(move || async move {
+        load_coupling_data(shared.as_ref(), min_score, limit).await
+    })
+    .await
+    {
         Ok(data) => support::api_json(state.shared.as_ref(), data).into_response(),
-        Err(err) => support::json_internal_error(err),
+        Err(err) => {
+            if let Some(message) = support::extract_timeout_error_message(err.as_str()) {
+                support::json_timeout_error(message)
+            } else {
+                support::json_internal_error(err)
+            }
+        }
     }
 }
 
@@ -98,15 +109,14 @@ pub(crate) async fn load_coupling_data(
         .map_err(|e| e.to_string())?;
 
     let query_text = r#"
-        SELECT VALUE {
-            file_a: file_a,
-            file_b: file_b,
-            fused_score: fused_score,
-            git_coupling: git_coupling,
-            static_signal: static_signal,
-            semantic_signal: semantic_signal,
-            coupling_type: coupling_type
-        }
+        SELECT
+            file_a,
+            file_b,
+            fused_score,
+            git_coupling,
+            static_signal,
+            semantic_signal,
+            coupling_type
         FROM co_change
         WHERE fused_score >= $min_score
         ORDER BY fused_score DESC

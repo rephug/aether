@@ -9,8 +9,19 @@ use crate::support::{self, DashboardState};
 pub(crate) async fn causal_fragment(State(_state): State<Arc<DashboardState>>) -> Html<String> {
     support::html_markup_response(html! {
         div class="space-y-4" data-page="causal" {
+            (support::explanation_header(
+                "Why This Changed",
+                "Trace likely upstream causes for a target component using dependency and co-change evidence.",
+                "This view ranks probable causes behind a selected change.",
+                "Causal chain explorer over drift and coupling signals."
+            ))
+
             div class="flex items-center justify-between gap-3" {
-                h2 class="text-lg font-semibold" { "Causal Explorer" }
+                h2 class="text-lg font-semibold" {
+                    span class="beginner-only" { "Why This Changed" }
+                    span class="intermediate-only" { "Causal Explorer" }
+                    span class="expert-only" { "Causal Explorer" }
+                }
                 button id="causal-animate" class="px-2 py-1 rounded-md border border-surface-3/50 hover:bg-surface-3/40 text-xs" { "Animate" }
             }
 
