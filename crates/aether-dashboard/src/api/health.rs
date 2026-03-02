@@ -25,6 +25,7 @@ pub(crate) struct HealthQuery {
 pub(crate) struct HealthDimensions {
     pub sir_coverage: f64,
     pub test_coverage: f64,
+    pub graph_connectivity: f64,
     pub coupling_health: f64,
     pub drift_health: f64,
 }
@@ -68,8 +69,21 @@ pub(crate) async fn health_handler(
     State(state): State<Arc<DashboardState>>,
     Query(query): Query<HealthQuery>,
 ) -> impl IntoResponse {
-    let data = load_health_data(state.shared.as_ref(), &query).await;
-    support::api_json(state.shared.as_ref(), data).into_response()
+    let shared = state.shared.clone();
+    match support::run_async_with_timeout(move || async move {
+        Ok(load_health_data(shared.as_ref(), &query).await)
+    })
+    .await
+    {
+        Ok(data) => support::api_json(state.shared.as_ref(), data).into_response(),
+        Err(err) => {
+            if let Some(message) = support::extract_timeout_error_message(err.as_str()) {
+                support::json_timeout_error(message)
+            } else {
+                support::json_internal_error(err)
+            }
+        }
+    }
 }
 
 pub(crate) async fn load_health_data(shared: &SharedState, query: &HealthQuery) -> HealthData {
@@ -209,21 +223,24 @@ async fn health_data_with_dimensions(
     orphans: Vec<HealthOrphan>,
 ) -> HealthData {
     let (sir_coverage, test_coverage) = compute_sir_test_dimensions(shared, &mut notes);
+    let graph_connectivity = compute_graph_connectivity(shared, &mut notes).await;
     let coupling_health = compute_coupling_health(shared, &mut notes).await;
     let drift_health = compute_drift_health(shared, &mut notes);
 
     let dimensions = HealthDimensions {
         sir_coverage,
         test_coverage,
+        graph_connectivity,
         coupling_health,
         drift_health,
     };
 
     let base_score = (dimensions.sir_coverage
         + dimensions.test_coverage
+        + dimensions.graph_connectivity
         + dimensions.coupling_health
         + dimensions.drift_health)
-        / 4.0;
+        / 5.0;
     let overall_score = if analysis_available {
         Some(base_score.clamp(0.0, 1.0))
     } else {
@@ -342,6 +359,37 @@ async fn compute_coupling_health(shared: &SharedState, notes: &mut Vec<String>) 
             1.0
         }
     }
+}
+
+async fn compute_graph_connectivity(shared: &SharedState, notes: &mut Vec<String>) -> f64 {
+    let symbols = match crate::api::common::load_symbols(shared) {
+        Ok(symbols) => symbols,
+        Err(err) => {
+            push_note(
+                notes,
+                format!("Failed to load symbols for graph connectivity: {err}"),
+            );
+            return 0.0;
+        }
+    };
+    if symbols.is_empty() {
+        return 0.0;
+    }
+
+    let edges = match crate::api::common::load_dependency_algo_edges(shared) {
+        Ok(edges) => edges,
+        Err(err) => {
+            push_note(
+                notes,
+                format!("Failed to load graph edges for connectivity: {err}"),
+            );
+            return 0.0;
+        }
+    };
+
+    let components = crate::api::common::connected_components_vec(shared, &edges).await;
+    let largest_component = components.iter().map(Vec::len).max().unwrap_or(0);
+    (largest_component as f64 / symbols.len() as f64).clamp(0.0, 1.0)
 }
 
 fn compute_drift_health(shared: &SharedState, notes: &mut Vec<String>) -> f64 {

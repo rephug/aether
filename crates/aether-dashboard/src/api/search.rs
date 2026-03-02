@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use aether_store::Store;
 
 use crate::api::common;
+use crate::state::SharedState;
 use crate::support::{self, DashboardState};
 
 #[derive(Debug, Default, Deserialize)]
@@ -59,6 +60,24 @@ pub(crate) async fn search_handler(
     State(state): State<Arc<DashboardState>>,
     Query(query): Query<SearchQuery>,
 ) -> impl IntoResponse {
+    let shared = state.shared.clone();
+    match support::run_async_with_timeout(move || load_search_data(shared, query)).await {
+        Ok(data) => support::api_json(state.shared.as_ref(), data).into_response(),
+        Err(err) => {
+            if let Some(message) = support::extract_timeout_error_message(err.as_str()) {
+                support::json_timeout_error(message)
+            } else {
+                support::json_internal_error(err)
+            }
+        }
+    }
+}
+
+async fn load_search_data(
+    shared: Arc<SharedState>,
+    query: SearchQuery,
+) -> Result<SearchApiData, String> {
+    let shared = shared.as_ref();
     let q = query.q.unwrap_or_default();
     let requested_mode = query
         .mode
@@ -74,22 +93,19 @@ pub(crate) async fn search_handler(
 
     // Lexical fallback for all modes at this stage.
     let mode_not_computed = mode != "lexical";
-    let results = match state.shared.store.search_symbols(&q, limit) {
-        Ok(records) => records,
-        Err(err) => return support::json_internal_error(err.to_string()),
-    };
+    let results = shared
+        .store
+        .search_symbols(&q, limit)
+        .map_err(|err| err.to_string())?;
 
-    let edges = match common::load_dependency_algo_edges(state.shared.as_ref()) {
-        Ok(rows) => rows,
-        Err(err) => return support::json_internal_error(err),
-    };
-    let pagerank = common::pagerank_map(state.shared.as_ref(), &edges).await;
-    let drift_map = common::latest_drift_score_by_symbol(state.shared.as_ref()).unwrap_or_default();
-    let test_map = common::test_count_by_symbol(state.shared.as_ref()).unwrap_or_default();
-    let sir_symbols = common::symbols_with_sir(state.shared.as_ref()).unwrap_or_default();
+    let edges = common::load_dependency_algo_edges(shared)?;
+    let pagerank = common::pagerank_map(shared, &edges).await;
+    let drift_map = common::latest_drift_score_by_symbol(shared).unwrap_or_default();
+    let test_map = common::test_count_by_symbol(shared).unwrap_or_default();
+    let sir_symbols = common::symbols_with_sir(shared).unwrap_or_default();
     let max_pagerank = pagerank.values().copied().fold(0.0f64, f64::max);
 
-    let symbol_records = common::load_symbols(state.shared.as_ref())
+    let symbol_records = common::load_symbols(shared)
         .unwrap_or_default()
         .into_iter()
         .map(|row| (row.id.clone(), row))
@@ -143,15 +159,14 @@ pub(crate) async fn search_handler(
             .unwrap_or_else(|| row.qualified_name.clone());
 
         let related = related_symbols(
-            state.shared.as_ref(),
+            shared,
             symbol_id.as_str(),
             qualified_name.as_str(),
             &pagerank,
         )
         .await;
 
-        let sir_excerpt =
-            support::sir_excerpt_for_symbol(state.shared.as_ref(), symbol_id.as_str());
+        let sir_excerpt = support::sir_excerpt_for_symbol(shared, symbol_id.as_str());
         let sir_summary = sir_excerpt
             .as_deref()
             .map(common::first_sentence)
@@ -191,16 +206,12 @@ pub(crate) async fn search_handler(
             .then_with(|| left.qualified_name.cmp(&right.qualified_name))
     });
 
-    support::api_json(
-        state.shared.as_ref(),
-        SearchApiData {
-            mode,
-            mode_not_computed,
-            count: mapped.len(),
-            results: mapped,
-        },
-    )
-    .into_response()
+    Ok(SearchApiData {
+        mode,
+        mode_not_computed,
+        count: mapped.len(),
+        results: mapped,
+    })
 }
 
 async fn related_symbols(

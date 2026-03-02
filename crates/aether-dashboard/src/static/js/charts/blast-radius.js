@@ -104,7 +104,7 @@
       .attr('stroke-dasharray', (d) => d.has_tests ? '0' : '4,3')
       .style('cursor', 'pointer')
       .on('mouseover', (event, d) => {
-        tip.show(event, `<strong>${d.qualified_name}</strong><br/>risk ${Number(d.risk_score || 0).toFixed(2)} / pr ${Number(d.pagerank || 0).toFixed(3)}<br/>${d.file_path}`);
+        tip.show(event, `<strong>${d.qualified_name}</strong><br/>risk ${Number(d.risk_score || 0).toFixed(2)} / importance ${Number(d.pagerank || 0).toFixed(3)}<br/>${d.file_path}`);
       })
       .on('mouseout', () => tip.hide())
       .on('click', (event, d) => {

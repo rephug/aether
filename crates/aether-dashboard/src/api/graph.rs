@@ -67,9 +67,21 @@ pub(crate) async fn graph_handler(
         .unwrap_or(DEFAULT_LIMIT as u32)
         .clamp(1, MAX_LIMIT as u32) as usize;
 
-    match load_graph_data(state.shared.as_ref(), query.root.clone(), depth, limit).await {
+    let shared = state.shared.clone();
+    let root = query.root;
+    match support::run_async_with_timeout(move || async move {
+        load_graph_data(shared.as_ref(), root, depth, limit).await
+    })
+    .await
+    {
         Ok(data) => support::api_json(state.shared.as_ref(), data).into_response(),
-        Err(err) => support::json_internal_error(err),
+        Err(err) => {
+            if let Some(message) = support::extract_timeout_error_message(err.as_str()) {
+                support::json_timeout_error(message)
+            } else {
+                support::json_internal_error(err)
+            }
+        }
     }
 }
 
@@ -288,7 +300,7 @@ pub(crate) async fn load_graph_data(
 
     let total_nodes = nodes.len().saturating_add(dropped_nodes);
     if truncated && message.is_none() {
-        message = Some(format!("Graph truncated to {} nodes", limit));
+        message = Some(format!("Graph truncated to {} connected components", limit));
     }
 
     Ok(GraphData {

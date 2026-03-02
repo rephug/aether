@@ -488,6 +488,12 @@ pub struct Cli {
 
     #[arg(
         long,
+        help = "Force SIR regeneration during indexing, even when existing SIR data is fresh"
+    )]
+    pub force: bool,
+
+    #[arg(
+        long,
         conflicts_with_all = ["search", "lsp", "index", "index_once"],
         help = "Run verification commands and exit"
     )]

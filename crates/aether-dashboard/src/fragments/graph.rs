@@ -20,15 +20,35 @@ pub(crate) async fn graph_fragment(
 
     support::html_markup_response(html! {
         div class="space-y-4" {
+            (support::explanation_header(
+                "How This Project's Pieces Connect",
+                "Each dot is a component. Lines mean one depends on another. Bigger dots are more important.",
+                "Nodes are components and edges are dependencies. Larger nodes indicate higher importance.",
+                "Dependency graph view with centrality-informed node sizing."
+            ))
+
             div class="flex items-center justify-between gap-3" {
-                h2 class="text-lg font-semibold" { "Dependency Graph" }
-                span class="badge badge-muted" { "Depth: 2" }
+                h2 class="text-lg font-semibold" {
+                    span class="beginner-only" { "Connected Components Graph" }
+                    span class="intermediate-only" { "Project Dependency Graph" }
+                    span class="expert-only" { "Dependency Graph" }
+                }
+                span class="badge badge-muted" {
+                    "Depth: 2 "
+                    (support::help_icon("Depth controls how many dependency hops are loaded from the selected root component."))
+                }
             }
 
             div class="rounded-xl border border-surface-3/40 bg-surface-1/40 p-4 space-y-3" {
                 div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]" {
                     label class="space-y-1" {
-                        span class="text-xs uppercase tracking-wider text-text-muted" { "Root Symbol" }
+                        span class="text-xs uppercase tracking-wider text-text-muted" {
+                            span class="beginner-only" { "Root Component" }
+                            span class="intermediate-only" { "Root Component (Symbol)" }
+                            span class="expert-only" { "Root Symbol" }
+                            " "
+                            (support::help_icon("Start the graph from this component ID or qualified symbol name."))
+                        }
                         input
                             id="graph-root"
                             name="root"
@@ -44,8 +64,8 @@ pub(crate) async fn graph_fragment(
                         "Load Graph"
                     }
                 }
-                p class="text-xs text-text-muted" {
-                    "Click nodes in the graph to open symbol details in the right-side panel."
+                    p class="text-xs text-text-muted" {
+                    "Click nodes in the graph to open component details in the right-side panel."
                 }
             }
 
@@ -54,11 +74,11 @@ pub(crate) async fn graph_fragment(
                 div id="graph-selection-panel" class="rounded-xl border border-surface-3/40 bg-surface-1/40 p-4 space-y-2" {
                     h3 class="text-sm font-semibold" { "Selection" }
                     p class="text-xs text-text-muted" {
-                        "Node details appear in the side panel when you click a graph node."
+                        "Component details appear in the side panel when you click a graph node."
                     }
                     ul class="text-xs text-text-secondary space-y-1" {
-                        li { "- circle color groups nodes by file" }
-                        li { "- cyan outline means SIR exists" }
+                        li { "- circle color groups components by file" }
+                        li { "- cyan outline means understanding data exists" }
                         li { "- zoom/pan available with mouse wheel and drag" }
                     }
                 }

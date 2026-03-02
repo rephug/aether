@@ -30,6 +30,12 @@ pub(crate) async fn search_fragment(
     if trimmed.is_empty() {
         return support::html_markup_response(html! {
             div class="space-y-4" data-page="search" {
+                (support::explanation_header(
+                    "Ask the Codebase",
+                    "Search for components by name, intent, language, or risk signals.",
+                    "Use filters to narrow the component list quickly.",
+                    "Lexical/semantic-hybrid symbol search surface."
+                ))
                 h2 class="text-lg font-semibold" { "Smart Search" }
                 (support::html_empty_state("Type in the search box to find symbols", Some("/ to focus search")))
             }
@@ -58,6 +64,13 @@ pub(crate) async fn search_fragment(
 
     support::html_markup_response(html! {
         div class="space-y-4" data-page="search" data-query=(trimmed.clone()) {
+            (support::explanation_header(
+                "Ask the Codebase",
+                "Search results combine name matching with project risk signals so you can prioritize what to inspect first.",
+                "Use mode and filters to focus by language, risk, drift, and test coverage.",
+                "Search result list enriched with risk, pagerank, drift, and related symbols."
+            ))
+
             div class="flex flex-wrap items-center justify-between gap-3" {
                 h2 class="text-lg font-semibold" { "Smart Search" }
                 span class="badge badge-muted" id="search-result-count" { (results.len()) " results" }
@@ -155,9 +168,9 @@ pub(crate) async fn search_fragment(
 
                                 div class="mt-3 flex flex-wrap gap-2 text-xs" {
                                     span class="badge badge-muted" { "Risk: loading" }
-                                    span class="badge badge-muted" { "PageRank: loading" }
-                                    span class="badge badge-muted" { "Drift: loading" }
-                                    span class="badge badge-muted" { "Tests: loading" }
+                                    span class="badge badge-muted" { "Importance Score: loading" }
+                                    span class="badge badge-muted" { "Change Risk: loading" }
+                                    span class="badge badge-muted" { "Test Count: loading" }
                                 }
 
                                 div class="mt-3 text-xs text-text-muted" { "Related: loading..." }

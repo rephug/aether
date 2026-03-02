@@ -27,18 +27,29 @@ pub(crate) async fn symbol_detail_fragment(
 
     let sir_meta = state.shared.store.get_sir_meta(&symbol.id).ok().flatten();
     let sir_fields = support::sir_key_values_for_symbol(state.shared.as_ref(), &symbol.id);
-    let deps = state
-        .shared
-        .graph
-        .get_dependencies(&symbol.id)
-        .await
-        .unwrap_or_default();
-    let callers = state
-        .shared
-        .graph
-        .get_callers(&symbol.qualified_name)
-        .await
-        .unwrap_or_default();
+    let deps_shared = state.shared.clone();
+    let dep_symbol_id = symbol.id.clone();
+    let deps = support::run_async_with_timeout(move || async move {
+        deps_shared
+            .graph
+            .get_dependencies(&dep_symbol_id)
+            .await
+            .map_err(|err| err.to_string())
+    })
+    .await
+    .unwrap_or_default();
+
+    let callers_shared = state.shared.clone();
+    let qualified_name = symbol.qualified_name.clone();
+    let callers = support::run_async_with_timeout(move || async move {
+        callers_shared
+            .graph
+            .get_callers(&qualified_name)
+            .await
+            .map_err(|err| err.to_string())
+    })
+    .await
+    .unwrap_or_default();
 
     support::html_markup_response(html! {
         div class="p-4 space-y-4" {

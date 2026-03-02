@@ -68,15 +68,22 @@ pub(crate) async fn time_machine_handler(
     State(state): State<Arc<DashboardState>>,
     Query(query): Query<TimeMachineQuery>,
 ) -> impl IntoResponse {
-    match load_time_machine_data(
-        state.shared.as_ref(),
-        query.at.as_deref(),
-        query.layers.as_deref(),
-    )
+    let shared = state.shared.clone();
+    let at = query.at;
+    let layers = query.layers;
+    match support::run_async_with_timeout(move || async move {
+        load_time_machine_data(shared.as_ref(), at.as_deref(), layers.as_deref()).await
+    })
     .await
     {
         Ok(data) => support::api_json(state.shared.as_ref(), data).into_response(),
-        Err(err) => support::json_internal_error(err),
+        Err(err) => {
+            if let Some(message) = support::extract_timeout_error_message(err.as_str()) {
+                support::json_timeout_error(message)
+            } else {
+                support::json_internal_error(err)
+            }
+        }
     }
 }
 

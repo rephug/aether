@@ -32,6 +32,14 @@ svg defs linearGradient#aether-sparkline-bad stop:last-child { stop-color: rgba(
   animation: aetherPulse 1.2s ease-in-out infinite;
 }
 
+.complexity-expert .metric-help {
+  opacity: 0.45;
+}
+
+.tippy-box {
+  font-size: 12px;
+}
+
 /* dark mode scrollbar */
 .dark *::-webkit-scrollbar-thumb {
   background: rgba(148, 163, 184, 0.35);

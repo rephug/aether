@@ -124,7 +124,7 @@ fn index_workspace_with_mock(workspace: &Path) -> Result<(), Box<dyn std::error:
 
     let mut sink = Vec::new();
     for event in observer.initial_symbol_events() {
-        pipeline.process_event(&store, &event, false, &mut sink)?;
+        pipeline.process_event(&store, &event, false, false, &mut sink)?;
     }
 
     Ok(())

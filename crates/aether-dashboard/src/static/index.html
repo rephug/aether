@@ -46,6 +46,8 @@
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/htmx/2.0.4/htmx.min.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/tippy.js/6.3.7/tippy.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/tippy.js/6.3.7/tippy-bundle.umd.min.js"></script>
 
   <link rel="stylesheet" href="/dashboard/static/style.css" />
   <link rel="stylesheet" href="/dashboard/static/css/aether-dashboard.css" />
@@ -66,7 +68,7 @@
   <script src="/dashboard/static/js/charts/smart-search.js" defer></script>
 </head>
 
-<body class="h-full bg-gradient-to-br from-surface-0 via-surface-1 to-surface-2 text-text-primary dark:bg-slate-950 dark:text-slate-100">
+<body class="h-full complexity-beginner bg-gradient-to-br from-surface-0 via-surface-1 to-surface-2 text-text-primary dark:bg-slate-950 dark:text-slate-100">
   <div class="flex h-full">
     <aside id="sidebar" class="sidebar-open flex w-64 min-h-full flex-col border-r border-surface-3/50 bg-surface-1/85 dark:bg-slate-900/90 dark:border-slate-700">
       <div class="px-4 py-4 border-b border-surface-3/50 dark:border-slate-700">
@@ -92,6 +94,21 @@
       </nav>
 
       <div class="px-3 py-3 border-t border-surface-3/40 dark:border-slate-700 space-y-2">
+        <div class="rounded-md border border-surface-3/50 p-2 space-y-1.5 text-xs">
+          <div class="font-semibold text-text-secondary">Complexity</div>
+          <label class="complexity-option">
+            <input type="radio" name="aether-complexity" value="beginner" />
+            <span>🟢 I'm new here</span>
+          </label>
+          <label class="complexity-option">
+            <input type="radio" name="aether-complexity" value="intermediate" />
+            <span>🟡 I know some code</span>
+          </label>
+          <label class="complexity-option">
+            <input type="radio" name="aether-complexity" value="expert" />
+            <span>🔴 Show me the data</span>
+          </label>
+        </div>
         <button id="theme-toggle" class="w-full px-2 py-2 rounded-md border border-surface-3/50 hover:bg-surface-3/30 text-xs flex items-center justify-between" onclick="toggleTheme()">
           <span>Theme</span>
           <span id="theme-icon">☀</span>
@@ -118,6 +135,8 @@
   </div>
 
   <script>
+    const COMPLEXITY_KEY = 'aether-complexity';
+
     function setActiveNav(el) {
       document.querySelectorAll('.nav-link').forEach(link => link.classList.remove('active'));
       el.classList.add('active');
@@ -149,6 +168,55 @@
       icon.textContent = window.AetherTheme.isDark() ? '🌙' : '☀';
     }
 
+    function initTippyTooltips(scope) {
+      if (!window.tippy) return;
+      const root = scope || document;
+      const items = root.querySelectorAll ? root.querySelectorAll('[data-tippy-content]') : [];
+      items.forEach((el) => {
+        if (el._tippy) {
+          if (document.body.classList.contains('complexity-expert')) {
+            el._tippy.disable();
+          } else {
+            el._tippy.enable();
+          }
+          return;
+        }
+        window.tippy(el, {
+          allowHTML: false,
+          placement: 'top',
+          delay: [120, 50],
+          maxWidth: 320,
+        });
+      });
+    }
+
+    function applyComplexityMode(mode) {
+      const chosen = ['beginner', 'intermediate', 'expert'].includes(mode) ? mode : 'beginner';
+      const body = document.body;
+      body.classList.remove('complexity-beginner', 'complexity-intermediate', 'complexity-expert');
+      body.classList.add(`complexity-${chosen}`);
+      localStorage.setItem(COMPLEXITY_KEY, chosen);
+
+      document.querySelectorAll('input[name="aether-complexity"]').forEach((input) => {
+        input.checked = input.value === chosen;
+      });
+
+      initTippyTooltips(document);
+    }
+
+    function initComplexitySelector() {
+      const stored = localStorage.getItem(COMPLEXITY_KEY) || 'beginner';
+      applyComplexityMode(stored);
+
+      document.querySelectorAll('input[name="aether-complexity"]').forEach((input) => {
+        if (input.dataset.bound === '1') return;
+        input.dataset.bound = '1';
+        input.addEventListener('change', (event) => {
+          applyComplexityMode(event.target.value);
+        });
+      });
+    }
+
     function initPageModules() {
       if (window.initOverviewCharts && document.getElementById('overview-chart')) window.initOverviewCharts();
       if (window.initGraph && document.getElementById('graph-container')) window.initGraph();
@@ -167,10 +235,15 @@
 
     document.body.addEventListener('htmx:afterSwap', function(evt) {
       if (evt.detail.target.id === 'main-content') {
-        requestAnimationFrame(initPageModules);
+        requestAnimationFrame(() => {
+          initPageModules();
+          initComplexitySelector();
+          initTippyTooltips(evt.detail.target);
+        });
       }
       if (evt.detail.target.id === 'detail-panel') {
         openDetailPanel();
+        initTippyTooltips(evt.detail.target);
       }
     });
 
@@ -178,7 +251,11 @@
       if (e.key === 'Escape') closeDetailPanel();
     });
 
-    window.addEventListener('load', updateThemeIcon);
+    window.addEventListener('load', function() {
+      updateThemeIcon();
+      initComplexitySelector();
+      initTippyTooltips(document);
+    });
   </script>
 </body>
 </html>

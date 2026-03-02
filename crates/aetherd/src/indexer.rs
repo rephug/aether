@@ -18,6 +18,7 @@ pub struct IndexerConfig {
     pub debounce_ms: u64,
     pub print_events: bool,
     pub print_sir: bool,
+    pub force: bool,
     pub sir_concurrency: usize,
     pub lifecycle_logs: bool,
     pub inference_provider: Option<InferenceProviderKind>,
@@ -109,9 +110,13 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
                         println!("{line}");
                     }
 
-                    if let Err(err) =
-                        sir_pipeline.process_event(&store, &event, config.print_sir, &mut stdout)
-                    {
+                    if let Err(err) = sir_pipeline.process_event(
+                        &store,
+                        &event,
+                        config.force,
+                        config.print_sir,
+                        &mut stdout,
+                    ) {
                         tracing::error!(
                             file_path = %event.file_path,
                             error = %err,
@@ -153,7 +158,8 @@ fn initialize_indexer(config: &IndexerConfig) -> Result<(ObserverState, SqliteSt
 
     let mut stdout = std::io::stdout();
     for event in observer.initial_symbol_events() {
-        if let Err(err) = sir_pipeline.process_event(&store, &event, config.print_sir, &mut stdout)
+        if let Err(err) =
+            sir_pipeline.process_event(&store, &event, config.force, config.print_sir, &mut stdout)
         {
             tracing::error!(
                 file_path = %event.file_path,

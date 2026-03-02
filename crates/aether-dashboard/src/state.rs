@@ -23,6 +23,7 @@ pub struct SharedState {
 impl SharedState {
     pub async fn open_readonly_async(workspace: &Path) -> Result<Self, DashboardStateError> {
         let workspace = workspace.canonicalize()?;
+        ensure_workspace_store_ready(&workspace)?;
         let config = Arc::new(load_workspace_config(&workspace)?);
         let store = Arc::new(SqliteStore::open_readonly(&workspace)?);
         store.check_compatibility("core", 2)?;
@@ -73,6 +74,18 @@ impl SharedState {
         *guard = Some(graph.clone());
         Ok(graph)
     }
+}
+
+fn ensure_workspace_store_ready(workspace: &Path) -> Result<(), DashboardStateError> {
+    let aether_dir = workspace.join(".aether");
+    std::fs::create_dir_all(&aether_dir)?;
+
+    let sqlite_path = aether_dir.join("meta.sqlite");
+    if !sqlite_path.exists() {
+        let _bootstrap = SqliteStore::open(workspace)?;
+    }
+
+    Ok(())
 }
 
 async fn open_vector_store_async_optional(

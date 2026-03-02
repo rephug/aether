@@ -1,8 +1,13 @@
 (function () {
-  function render(data) {
+  function render(data, errorMessage) {
     const container = document.getElementById('causal-graph');
     if (!container) return;
     container.innerHTML = '';
+
+    if (errorMessage) {
+      container.innerHTML = `<div class="chart-empty"><div class="empty-state-title">${errorMessage}</div></div>`;
+      return;
+    }
 
     if (!data || !data.target) {
       container.innerHTML = '<div class="chart-empty"><div class="empty-state-title">Select a target symbol</div></div>';
@@ -92,7 +97,7 @@
       .attr('filter', (d, i) => i === 0 ? 'drop-shadow(0 0 8px rgba(14,165,168,0.25))' : null);
 
     nodes.append('text').attr('x', 8).attr('y', 16).attr('font-size', 11).attr('fill', '#0f172a').text((d) => d.qualified_name.split('::').pop());
-    nodes.append('text').attr('x', 8).attr('y', 30).attr('font-size', 10).attr('fill', '#475569').text((d) => `drift ${Number(d.drift_score || 0).toFixed(2)} · conf ${Number(d.causal_confidence || 0).toFixed(2)}`);
+    nodes.append('text').attr('x', 8).attr('y', 30).attr('font-size', 10).attr('fill', '#475569').text((d) => `change risk ${Number(d.drift_score || 0).toFixed(2)} · conf ${Number(d.causal_confidence || 0).toFixed(2)}`);
     nodes.append('text').attr('x', 8).attr('y', 44).attr('font-size', 9).attr('fill', '#64748b').text((d) => (d.sir_diff_summary || 'No SIR diff').slice(0, 45));
   }
 
@@ -106,12 +111,19 @@
     const lookback = document.getElementById('causal-lookback')?.value || '30d';
 
     fetch(`/api/v1/causal-chain?symbol_id=${encodeURIComponent(id)}&depth=${depth}&lookback=${encodeURIComponent(lookback)}`)
-      .then((r) => r.json())
+      .then(async (r) => {
+        const payload = await r.json().catch(() => null);
+        if (!r.ok) {
+          const message = payload?.message || 'This analysis is taking too long. Try reducing the graph scope or run `aetherd health` from the CLI for faster results.';
+          throw new Error(message);
+        }
+        return payload;
+      })
       .then((json) => {
         window.__AETHER_CAUSAL = json?.data || null;
         render(window.__AETHER_CAUSAL);
       })
-      .catch(() => render(null));
+      .catch((err) => render(null, err?.message || 'Failed to load causal analysis'));
   }
 
   window.initCausalExplorer = function initCausalExplorer() {

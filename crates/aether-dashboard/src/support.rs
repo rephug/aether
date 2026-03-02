@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aether_core::normalize_path;
 use aether_store::{Store, SurrealGraphStore};
@@ -18,6 +19,9 @@ use crate::state::SharedState;
 
 pub(crate) const STALE_WARN_AFTER_MINUTES: u64 = 30;
 pub(crate) const SIR_EXCERPT_MAX_LEN: usize = 160;
+pub(crate) const GRAPH_QUERY_TIMEOUT_SECS: u64 = 10;
+pub(crate) const GRAPH_QUERY_TIMEOUT_MESSAGE: &str = "This analysis is taking too long. Try reducing the graph scope or run `aetherd health` from the CLI for faster results.";
+const TIMEOUT_ERROR_PREFIX: &str = "__aether_dashboard_timeout__:";
 
 #[derive(Clone)]
 pub(crate) struct DashboardState {
@@ -314,6 +318,61 @@ pub(crate) fn json_internal_error(message: impl Into<String>) -> Response {
         .into_response()
 }
 
+pub(crate) fn json_timeout_error(message: impl Into<String>) -> Response {
+    (
+        StatusCode::GATEWAY_TIMEOUT,
+        Json(ErrorBody {
+            error: "timeout",
+            message: message.into(),
+        }),
+    )
+        .into_response()
+}
+
+pub(crate) fn timeout_error_message(message: impl Into<String>) -> String {
+    format!("{TIMEOUT_ERROR_PREFIX}{}", message.into())
+}
+
+pub(crate) fn extract_timeout_error_message(message: &str) -> Option<String> {
+    message
+        .strip_prefix(TIMEOUT_ERROR_PREFIX)
+        .map(ToOwned::to_owned)
+}
+
+pub(crate) async fn run_blocking_with_timeout<T, F>(operation: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    let join = tokio::time::timeout(
+        Duration::from_secs(GRAPH_QUERY_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(operation),
+    )
+    .await
+    .map_err(|_| timeout_error_message(GRAPH_QUERY_TIMEOUT_MESSAGE))?;
+
+    match join {
+        Ok(result) => result,
+        Err(err) => Err(format!("dashboard task join failure: {err}")),
+    }
+}
+
+pub(crate) async fn run_async_with_timeout<T, F, Fut>(operation: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, String>> + Send + 'static,
+{
+    run_blocking_with_timeout(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| format!("failed to build blocking query runtime: {err}"))?;
+        runtime.block_on(operation())
+    })
+    .await
+}
+
 pub(crate) fn html_empty_state(title: &str, cmd: Option<&str>) -> Markup {
     html! {
         div class="empty-state" {
@@ -336,6 +395,46 @@ pub(crate) fn html_error_state(title: &str, detail: &str) -> Markup {
 
 pub(crate) fn html_markup_response(markup: Markup) -> Html<String> {
     Html(markup.into_string())
+}
+
+pub(crate) fn help_icon(tooltip: &str) -> Markup {
+    html! {
+        span class="metric-help" tabindex="0" data-tippy-content=(tooltip) aria-label="What does this mean?" { "ⓘ" }
+    }
+}
+
+pub(crate) fn metric_label_with_tooltip(label: &str, tooltip: &str) -> Markup {
+    html! {
+        span class="inline-flex items-center gap-1" {
+            span { (label) }
+            (help_icon(tooltip))
+        }
+    }
+}
+
+pub(crate) fn explanation_header(
+    title: &str,
+    beginner_text: &str,
+    intermediate_text: &str,
+    expert_text: &str,
+) -> Markup {
+    html! {
+        div class="explanation-header rounded-lg bg-slate-50 p-4 mb-6 border border-slate-200/80" {
+            h2 class="text-base font-semibold text-slate-900" { (title) }
+            p class="mt-2 text-sm text-slate-700 beginner-only" { (beginner_text) }
+            p class="mt-2 text-sm text-slate-700 intermediate-only" { (intermediate_text) }
+            p class="mt-2 text-sm text-slate-700 expert-only" { (expert_text) }
+        }
+    }
+}
+
+pub(crate) fn coupling_strength_label(score: f64) -> &'static str {
+    match score {
+        s if s < 0.3 => "Weak",
+        s if s < 0.6 => "Moderate",
+        s if s < 0.8 => "Strong",
+        _ => "Very Strong",
+    }
 }
 
 pub(crate) fn format_age_seconds(age_seconds: Option<i64>) -> String {

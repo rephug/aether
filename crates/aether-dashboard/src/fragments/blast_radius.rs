@@ -24,8 +24,19 @@ pub(crate) async fn blast_radius_fragment(
 
     support::html_markup_response(html! {
         div class="space-y-4" data-page="blast-radius" data-symbol-id=(symbol_id.clone()) {
+            (support::explanation_header(
+                "Impact Radius",
+                "See which components are most likely to be affected when this component changes.",
+                "Rings represent dependency distance and estimated impact.",
+                "Blast radius traversal across dependency and coupling signals."
+            ))
+
             div class="flex items-center justify-between gap-3" {
-                h2 class="text-lg font-semibold" { "Blast Radius Explorer" }
+                h2 class="text-lg font-semibold" {
+                    span class="beginner-only" { "Impact Radius Explorer" }
+                    span class="intermediate-only" { "Blast Radius Explorer" }
+                    span class="expert-only" { "Blast Radius Explorer" }
+                }
                 span class="badge badge-purple" { "Symbol impact rings" }
             }
 
