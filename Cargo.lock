@@ -80,6 +80,8 @@ dependencies = [
  "aether-analysis",
  "aether-config",
  "aether-core",
+ "aether-infer",
+ "aether-memory",
  "aether-store",
  "axum",
  "chrono",

@@ -81,6 +81,7 @@
         <a href="#" class="nav-link" hx-get="/dashboard/frag/tour" hx-target="#main-content" hx-push-url="/dashboard/tour" onclick="setActiveNav(this)"><span class="sidebar-label">🗺️ Tour</span></a>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/flow" hx-target="#main-content" hx-push-url="/dashboard/flow" onclick="setActiveNav(this)"><span class="sidebar-label">🔄 Trace Flow</span></a>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/glossary" hx-target="#main-content" hx-push-url="/dashboard/glossary" onclick="setActiveNav(this)"><span class="sidebar-label">📚 Glossary</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/changes" hx-target="#main-content" hx-push-url="/dashboard/changes" onclick="setActiveNav(this)"><span class="sidebar-label">🕐 Recent Changes</span></a>
 
         <div class="my-2 border-t border-surface-3/40 dark:border-slate-700"></div>
 
@@ -122,6 +123,24 @@
       </header>
 
       <div class="flex-1 overflow-y-auto">
+        <div id="ask-container" class="mb-2 px-5 lg:px-6 pt-4 space-y-3 transition-opacity duration-150">
+          <div class="relative">
+            <input
+              type="text"
+              id="ask-input"
+              name="question"
+              placeholder="Ask about this codebase..."
+              class="w-full p-4 text-base lg:text-lg border-2 border-blue-200 rounded-lg focus:border-blue-500 focus:ring-2 focus:ring-blue-200 bg-white/85 dark:bg-slate-900/85"
+              hx-post="/dashboard/frag/ask"
+              hx-trigger="keyup[key=='Enter']"
+              hx-target="#ask-results"
+              hx-indicator="#ask-spinner" />
+            <div id="ask-spinner" class="htmx-indicator absolute right-4 top-4">
+              <div class="loading-spinner"></div>
+            </div>
+          </div>
+          <div id="ask-results" class="min-h-[1px]"></div>
+        </div>
         <main id="main-content" class="p-5 lg:p-6" hx-get="/dashboard/frag/anatomy" hx-trigger="load" hx-target="this">
           <div class="flex items-center justify-center h-64"><div class="loading-spinner"></div></div>
         </main>
@@ -132,6 +151,8 @@
 
   <script>
     const COMPLEXITY_KEY = 'aether-complexity';
+    const ASK_UNAVAILABLE_PLACEHOLDER = 'Direct questions require indexing - run aetherd --index first';
+    const ASK_DEFAULT_PLACEHOLDER = 'Ask about this codebase...';
 
     function setActiveNav(el) {
       document.querySelectorAll('.nav-link').forEach(link => link.classList.remove('active'));
@@ -151,6 +172,37 @@
       const icon = document.getElementById('theme-icon');
       if (!icon || !window.AetherTheme) return;
       icon.textContent = window.AetherTheme.isDark() ? '🌙' : '☀';
+    }
+
+    function setAskAvailability(available) {
+      const container = document.getElementById('ask-container');
+      const input = document.getElementById('ask-input');
+      if (!container || !input) return;
+
+      if (available) {
+        container.classList.remove('ask-unavailable');
+        input.placeholder = ASK_DEFAULT_PLACEHOLDER;
+        input.setAttribute('aria-disabled', 'false');
+        return;
+      }
+
+      container.classList.add('ask-unavailable');
+      input.placeholder = ASK_UNAVAILABLE_PLACEHOLDER;
+      input.setAttribute('aria-disabled', 'true');
+    }
+
+    async function initAskAvailability() {
+      try {
+        const res = await fetch('/api/v1/overview', { headers: { Accept: 'application/json' } });
+        if (!res.ok) return;
+        const payload = await res.json();
+        const data = payload && payload.data ? payload.data : {};
+        const hasSymbols = Number(data.total_symbols || 0) > 0;
+        const hasSir = Number(data.sir_count || 0) > 0;
+        setAskAvailability(hasSymbols && hasSir);
+      } catch (_err) {
+        // Keep default ask behavior when availability cannot be checked.
+      }
     }
 
     function initTippyTooltips(scope) {
@@ -261,6 +313,7 @@
       updateThemeIcon();
       initComplexitySelector();
       initTippyTooltips(document);
+      initAskAvailability();
     });
   </script>
 </body>

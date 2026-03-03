@@ -121,6 +121,38 @@ async fn dashboard_router_serves_stage79_routes_and_preserves_existing_endpoints
     assert!(causal_json["data"]["target"].is_object());
     assert!(causal_json["data"]["chain"].is_array());
 
+    let changes = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/changes?since=24h")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(changes.status(), StatusCode::OK);
+    let changes_json: Value =
+        serde_json::from_slice(&to_bytes(changes.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(changes_json["data"]["changes"].is_array());
+
+    let ask = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/ask")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"question":"test"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ask.status(), StatusCode::OK);
+    let ask_json: Value =
+        serde_json::from_slice(&to_bytes(ask.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(ask_json["data"]["summary"].is_string());
+
     let xray_fragment = app
         .clone()
         .oneshot(
@@ -144,6 +176,7 @@ async fn dashboard_router_serves_stage79_routes_and_preserves_existing_endpoints
     // Regression check for original endpoints from stage 7.6.
     for endpoint in [
         "/api/v1/overview",
+        "/api/v1/changes",
         "/api/v1/search?q=test",
         "/api/v1/graph?limit=5",
         "/api/v1/drift",

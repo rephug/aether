@@ -97,6 +97,56 @@ async fn search_api_returns_results() {
 }
 
 #[tokio::test]
+async fn changes_api_returns_shape() {
+    let (_tmp, app, _ids) = seeded_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/changes?since=24h&limit=20")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json.get("data").is_some());
+    assert!(json["data"]["period"].is_string());
+    assert!(json["data"]["change_count"].is_number());
+    assert!(json["data"]["changes"].is_array());
+    assert!(json["data"]["file_summary"].is_object());
+}
+
+#[tokio::test]
+async fn ask_api_returns_envelope_and_summary() {
+    let (_tmp, app, _ids) = seeded_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/ask")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"question":"demo"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json.get("data").is_some());
+    assert!(json["data"]["question"].is_string());
+    assert!(json["data"]["answer_type"].is_string());
+    assert!(json["data"]["results"].is_array());
+    assert!(json["data"]["summary"].is_string());
+}
+
+#[tokio::test]
 async fn overview_fragment_contains_stat_cards_and_chart() {
     let (_tmp, app, _ids) = seeded_app().await;
     let response = app
@@ -119,6 +169,30 @@ async fn overview_fragment_contains_stat_cards_and_chart() {
     assert!(body.contains("stat-card"));
     assert!(body.contains("id=\"overview-chart\""));
     assert!(body.contains("data-table"));
+}
+
+#[tokio::test]
+async fn overview_fragment_contains_recent_changes_loader() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/overview")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("id=\"overview-recent-changes\""));
+    assert!(body.contains("/dashboard/frag/changes?since=24h&amp;limit=20&amp;embed=true"));
 }
 
 #[tokio::test]
@@ -220,6 +294,81 @@ async fn search_fragment_contains_clickable_results() {
         "/dashboard/frag/blast-radius?symbol_id={}",
         ids.primary
     )));
+}
+
+#[tokio::test]
+async fn changes_fragment_renders_content() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/changes?since=24h&limit=20")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("What Changed Recently"));
+    assert!(body.contains("id=\"changes-content\""));
+}
+
+#[tokio::test]
+async fn ask_fragment_renders_related_components() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/frag/ask")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("question=demo"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("Related Components"));
+    assert!(body.contains("symbol-link"));
+}
+
+#[tokio::test]
+async fn ask_fragment_shows_index_message_when_unavailable() {
+    let (_tmp, app) = empty_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/frag/ask")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("question=demo"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("AETHER needs to index this project before it can answer questions"));
 }
 
 #[tokio::test]
@@ -487,6 +636,10 @@ async fn static_shell_serves_index_with_htmx() {
     assert!(body.contains("localStorage.theme"));
     assert!(body.contains("id=\"theme-toggle\""));
     assert!(body.contains("hx-get=\"/dashboard/frag/anatomy\""));
+    assert!(body.contains("id=\"ask-container\""));
+    assert!(body.contains("hx-post=\"/dashboard/frag/ask\""));
+    assert!(body.contains("🕐 Recent Changes"));
+    assert!(body.contains("hx-get=\"/dashboard/frag/changes\""));
 }
 
 #[tokio::test]

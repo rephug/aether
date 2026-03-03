@@ -1,15 +1,17 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::get;
+use axum::routing::{get, post};
 
 use crate::support::DashboardState;
 
 pub(crate) mod anatomy;
 mod architecture;
+pub(crate) mod ask;
 mod blast_radius;
 pub(crate) mod catalog;
 mod causal_chain;
+pub(crate) mod changes;
 pub(crate) mod common;
 pub(crate) mod coupling;
 pub(crate) mod drift;
@@ -34,7 +36,9 @@ pub(crate) fn api_router() -> Router<Arc<DashboardState>> {
         .route("/api/v1/file/{*path}", get(file::file_handler))
         .route("/api/v1/flow", get(flow::flow_handler))
         .route("/api/v1/overview", get(overview::overview_handler))
+        .route("/api/v1/changes", get(changes::changes_handler))
         .route("/api/v1/search", get(search::search_handler))
+        .route("/api/v1/ask", post(ask::ask_handler))
         .route("/api/v1/graph", get(graph::graph_handler))
         .route("/api/v1/drift", get(drift::drift_handler))
         .route("/api/v1/coupling", get(coupling::coupling_handler))

@@ -90,6 +90,14 @@
 }
 
 /* ── Loading spinner ──────────────────────────────────── */
+.htmx-indicator {
+  display: none;
+}
+.htmx-request .htmx-indicator,
+.htmx-request.htmx-indicator {
+  display: block;
+}
+
 .loading-spinner {
   width: 24px;
   height: 24px;
@@ -100,6 +108,10 @@
 }
 @keyframes spin {
   to { transform: rotate(360deg); }
+}
+
+#ask-container.ask-unavailable {
+  opacity: 0.58;
 }
 
 /* ── Stat cards ───────────────────────────────────────── */
