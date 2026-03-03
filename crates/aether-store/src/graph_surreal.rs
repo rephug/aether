@@ -734,7 +734,7 @@ impl GraphStore for SurrealGraphStore {
                 IF $src = NONE OR $dst = NONE {
                     RETURN NONE;
                 };
-                DELETE depends_on WHERE out = $src AND in = $dst AND file_path = $file_path AND edge_kind = $edge_kind;
+                DELETE depends_on WHERE in = $src AND out = $dst AND file_path = $file_path AND edge_kind = $edge_kind;
                 RELATE $src->depends_on->$dst SET
                     edge_kind = $edge_kind,
                     file_path = $file_path,
@@ -1285,6 +1285,43 @@ mod tests {
             .await
             .expect("traversal");
         assert!(!traversal.edges.is_empty());
+    }
+
+    #[tokio::test]
+    async fn upsert_edge_deduplicates_on_reindex() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path().to_path_buf();
+        std::fs::create_dir_all(workspace.join(".aether")).expect("mkdir");
+        let graph = SurrealGraphStore::open(&workspace).await.expect("open");
+
+        let sym_a = symbol("alpha", "alpha", "src/a.rs");
+        let sym_b = symbol("beta", "beta", "src/b.rs");
+        graph.upsert_symbol_node(&sym_a).await.expect("upsert a");
+        graph.upsert_symbol_node(&sym_b).await.expect("upsert b");
+
+        let edge = ResolvedEdge {
+            source_id: "alpha".to_owned(),
+            target_id: "beta".to_owned(),
+            edge_kind: EdgeKind::Calls,
+            file_path: "src/a.rs".to_owned(),
+        };
+
+        graph.upsert_edge(&edge).await.expect("upsert 1");
+        graph.upsert_edge(&edge).await.expect("upsert 2");
+        graph.upsert_edge(&edge).await.expect("upsert 3");
+
+        let edges = graph
+            .list_dependency_edges_by_kind(&["calls"])
+            .await
+            .expect("list edges");
+        let matching = edges
+            .iter()
+            .filter(|e| e.source_id == "alpha" && e.target_id == "beta")
+            .count();
+        assert_eq!(
+            matching, 1,
+            "expected exactly one edge after three upserts, got {matching}"
+        );
     }
 
     #[tokio::test]

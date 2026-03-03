@@ -39,28 +39,35 @@ AETHER watches your code, understands what it *means*, tracks how that meaning *
 ```bash
 # Install from source
 cargo install --path crates/aetherd
+cargo install --path crates/aether-query
 
 # Index your project
-aether --workspace . --index
+aetherd --workspace .
 
 # Search for symbols
-aether search "payment processing"
+aetherd --workspace . --search "payment processing" --search-mode hybrid
 
-# Start the LSP + MCP server
-aether --workspace . --lsp --mcp
+# Start the LSP server with background indexing
+aetherd --workspace . --lsp --index
+
+# Start the MCP-over-HTTP query server
+aether-query serve --index-path .
 ```
 
 ### Give AI Agents Persistent Memory
 
-Register AETHER as an MCP server for Claude Code, Codex, or any MCP-compatible agent:
+Register AETHER for MCP access from Claude Code, Codex, or any MCP-compatible agent:
 
 ```bash
-# Claude Code
-claude mcp add --transport stdio --scope project aether -- aetherd --workspace . --mcp
+# Start the read-only MCP server (HTTP/SSE)
+aether-query serve --index-path .
 
-# Verify connection
-claude mcp list
+# Verify server health
+aether-query status --bind 127.0.0.1:9721
 
+# Then configure your MCP client to use:
+# http://127.0.0.1:9721/mcp
+#
 # Then ask your agent:
 # "What does process_payment do?"
 # "What upstream change most likely broke the order validation?"
@@ -226,7 +233,7 @@ AETHER uses a pluggable provider system for SIR generation and embeddings:
 
 ## MCP Tools
 
-AETHER exposes 17 MCP tools for AI agent integration:
+AETHER exposes 20 MCP tools for AI agent integration:
 
 ### Core Tools
 | Tool | Purpose |
@@ -235,7 +242,7 @@ AETHER exposes 17 MCP tools for AI agent integration:
 | `aether_explain` | Get SIR-powered explanation of a symbol |
 | `aether_get_sir` | Retrieve raw SIR JSON for a symbol |
 | `aether_search` | Hybrid lexical + semantic search |
-| `aether_why` | Show SIR diff between two versions of a symbol |
+| `aether_why_changed` | Show SIR diff between two versions of a symbol |
 
 ### Project Memory Tools
 | Tool | Purpose |
@@ -254,60 +261,61 @@ AETHER exposes 17 MCP tools for AI agent integration:
 | `aether_acknowledge_drift` | Dismiss known drift, create project note |
 | `aether_trace_cause` | Causal change chain tracing for root cause analysis |
 | `aether_health` | Graph health dashboard with composite risk scoring |
-| `aether_snapshot_intent` | Capture SIR state before a refactor |
-| `aether_verify_intent` | Compare SIR state after refactor for intent preservation |
+| `aether_call_chain` | Trace outgoing call chains from a symbol up to N depth levels |
+| `aether_dependencies` | List callers and dependencies for a symbol |
+| `aether_status` | Report workspace indexing status, SIR coverage, and provider info |
+| `aether_symbol_timeline` | Show SIR version history for a symbol across commits |
+| `aether_verify` | Run configured verification commands and return structured results |
 
 ## CLI Reference
 
 ### Indexing & Server
 
 ```bash
-aether --workspace . --index                  # Index a project
-aether --workspace . --lsp                    # Start LSP server
-aether --workspace . --mcp                    # Start MCP server
-aether --workspace . --index --lsp --mcp      # Combined mode
+aetherd --workspace .                         # Index + watch project
+aetherd --workspace . --index-once            # Run one full index pass and exit
+aetherd --workspace . --lsp --index           # Start LSP with background indexing
+aether-query serve --index-path .             # Start MCP-over-HTTP query server
 ```
 
 ### Search & Query
 
 ```bash
-aether search "payment validation" --limit 10           # Hybrid search
-aether ask "what handles currency validation?" --limit 5 # Cross-type unified search
-aether why <symbol_id> --from v1 --to v2                 # Semantic diff between versions
+aetherd --workspace . --search "payment validation" --search-mode hybrid --search-limit 10
+aetherd --workspace . ask "what handles currency validation?" --limit 5
+aetherd --workspace . recall "currency validation" --mode hybrid --limit 5
 ```
 
 ### Project Memory
 
 ```bash
-aether remember "Chose CozoDB over KuzuDB — KuzuDB archived Oct 2025"
-aether recall "graph storage decision"
-aether notes --limit 20
+aetherd --workspace . remember "Chose CozoDB over KuzuDB — KuzuDB archived Oct 2025"
+aetherd --workspace . recall "graph storage decision"
+aetherd --workspace . notes --limit 20
 ```
 
 ### Analysis
 
 ```bash
 # Coupling
-aether mine-coupling --window "100 commits"
-aether blast-radius src/payments/processor.rs
-aether coupling-report
+aetherd --workspace . mine-coupling --commits 100
+aetherd --workspace . blast-radius src/payments/processor.rs
+aetherd --workspace . coupling-report
 
 # Drift
-aether drift-report --window "50 commits" --min-drift 0.15
-aether drift-ack <result_id> --note "Intentional per ADR-23"
-aether communities --format table
+aetherd --workspace . drift-report --window "50 commits" --min-drift 0.15
+aetherd --workspace . drift-ack <result_id> --note "Intentional per ADR-23"
+aetherd --workspace . communities --format table
 
 # Causal chains
-aether trace-cause process_payment --file src/payments/processor.rs --lookback "20 commits"
+aetherd --workspace . trace-cause process_payment --file src/payments/processor.rs --lookback "20 commits"
 
 # Health
-aether health --limit 10 --min-risk 0.5
-aether health critical | cycles | orphans | bottlenecks | risk-hotspots
+aetherd --workspace . health --limit 10 --min-risk 0.5
+aetherd --workspace . health critical
 
-# Intent verification
-aether snapshot-intent --scope file --target src/payments/processor.rs --label "pre-refactor"
-# ... do refactor ...
-aether verify-intent snap_a1b2c3 --regenerate-sir
+# Verification
+aetherd --workspace . --verify
 ```
 
 ## Configuration

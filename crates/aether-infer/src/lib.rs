@@ -34,6 +34,25 @@ const OPENAI_COMPAT_JSON_FALLBACK_SUFFIX: &str =
 const OPENAI_COMPAT_SIR_SYSTEM_PROMPT: &str =
     "You are generating Structured Intent Records for source code.";
 
+/// Build a reqwest client with sensible timeouts for inference requests.
+pub(crate) fn inference_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Build a reqwest client with shorter timeouts for management calls
+/// (model listing, health checks).
+pub(crate) fn management_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SirContext {
     pub language: String,
@@ -200,7 +219,7 @@ impl GeminiProvider {
 
     pub fn new(api_key: Secret, model: String) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: inference_http_client(),
             api_key,
             model,
             api_base: GEMINI_API_BASE.to_owned(),
@@ -271,7 +290,7 @@ pub struct Qwen3LocalProvider {
 impl Qwen3LocalProvider {
     pub fn new(endpoint: Option<String>, model: Option<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: inference_http_client(),
             endpoint: normalize_optional(endpoint)
                 .unwrap_or_else(|| DEFAULT_QWEN_ENDPOINT.to_owned()),
             model: normalize_optional(model).unwrap_or_else(|| DEFAULT_QWEN_MODEL.to_owned()),
@@ -365,7 +384,7 @@ impl Clone for OpenAiCompatProvider {
 impl OpenAiCompatProvider {
     pub fn new(api_key: Secret, api_base: String, model: String) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: inference_http_client(),
             api_base: normalize_openai_api_base(&api_base),
             api_key,
             model,
@@ -492,7 +511,7 @@ pub struct Qwen3LocalEmbeddingProvider {
 impl Qwen3LocalEmbeddingProvider {
     pub fn new(endpoint: Option<String>, model: Option<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: inference_http_client(),
             endpoint: normalize_optional(endpoint)
                 .unwrap_or_else(|| DEFAULT_QWEN_EMBEDDING_ENDPOINT.to_owned()),
             model: normalize_optional(model).unwrap_or_else(|| DEFAULT_QWEN_MODEL.to_owned()),
@@ -560,7 +579,7 @@ pub fn ollama_pull_endpoint(endpoint: &str) -> String {
 }
 
 pub async fn fetch_ollama_tags(endpoint: &str) -> Result<Value, InferError> {
-    let response_value = reqwest::Client::new()
+    let response_value = management_http_client()
         .get(ollama_tags_endpoint(endpoint))
         .send()
         .await?
@@ -578,7 +597,7 @@ pub async fn pull_ollama_model_with_progress<F>(
 where
     F: FnMut(OllamaPullProgress),
 {
-    let mut response = reqwest::Client::new()
+    let mut response = management_http_client()
         .post(ollama_pull_endpoint(endpoint))
         .json(&json!({
             "model": model,
@@ -1161,7 +1180,7 @@ async fn request_gemini_summary(
             "temperature": 0.1
         }
     });
-    let response_value: Value = reqwest::Client::new()
+    let response_value: Value = inference_http_client()
         .post(endpoint)
         .header("x-goog-api-key", api_key.expose())
         .json(&body)
@@ -1183,7 +1202,7 @@ async fn request_qwen_summary(
         "System instruction:\n{system_prompt}\n\nUser prompt:\n{user_prompt}\n\nReturn exactly one concise sentence."
     );
     let body = build_ollama_text_generate_body(model, prompt.as_str());
-    let response_value: Value = reqwest::Client::new()
+    let response_value: Value = inference_http_client()
         .post(ollama_generate_endpoint(endpoint))
         .json(&body)
         .send()

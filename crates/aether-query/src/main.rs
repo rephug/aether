@@ -97,7 +97,11 @@ async fn run_client_command(path: &str, args: ClientArgs) -> Result<(), DynError
 
 async fn print_endpoint_json(config: &QueryConfig, path: &str) -> Result<(), DynError> {
     let url = format!("http://{}{}", config.query.bind_address, path);
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let mut request = client.get(url.clone());
     if !config.query.auth_token.is_empty() {
         request = request.bearer_auth(&config.query.auth_token);

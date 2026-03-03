@@ -25,7 +25,7 @@ impl CohereRerankerProvider {
             .ok_or_else(|| InferError::MissingCohereApiKey(api_key_env.to_owned()))?;
 
         Ok(Self {
-            client: reqwest::Client::new(),
+            client: crate::inference_http_client(),
             api_key,
             model: COHERE_MODEL_NAME.to_owned(),
         })

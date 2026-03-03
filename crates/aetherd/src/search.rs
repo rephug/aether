@@ -302,12 +302,13 @@ fn semantic_search(
     let vector_store = runtime
         .block_on(open_vector_store(workspace))
         .context("failed to open vector store")?;
+    let semantic_fetch_limit = limit.saturating_mul(3).max(30);
     let matches = runtime
         .block_on(vector_store.search_nearest(
             &query_embedding,
             &loaded.provider_name,
             &loaded.model_name,
-            limit,
+            semantic_fetch_limit,
         ))
         .context("failed to run semantic symbol search")?;
     if matches.is_empty() {
@@ -354,6 +355,7 @@ fn semantic_search(
             semantic_score: Some(candidate.semantic_score),
         });
     }
+    semantic_rows.truncate(limit as usize);
 
     if !mismatched_languages.is_empty() {
         let mut languages = mismatched_languages.into_iter().collect::<Vec<_>>();
