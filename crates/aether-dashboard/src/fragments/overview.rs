@@ -56,7 +56,7 @@ pub(crate) async fn overview_fragment(State(state): State<Arc<DashboardState>>) 
                 }
 
                 div class="grid gap-3 md:grid-cols-3" {
-                    (coming_soon_card("📖 Understand This Project", "/dashboard/frag/anatomy"))
+                    (feature_card("📖 Understand This Project", "/dashboard/frag/anatomy", "Open Anatomy"))
                     (coming_soon_card("🗺️ Take a Guided Tour", "/dashboard/frag/tour"))
                     (coming_soon_card("💬 Build a Question", "/dashboard/frag/prompts"))
                 }
@@ -161,6 +161,20 @@ fn stat_card(value: &str, beginner_label: &str, expert_label: &str, tooltip: &st
                 (support::metric_label_with_tooltip(beginner_label, tooltip))
                 span class="expert-only ml-1 text-[11px] normal-case tracking-normal text-text-muted" { "(" (expert_label) ")" }
             }
+        }
+    }
+}
+
+fn feature_card(title: &str, target: &str, label: &str) -> Markup {
+    html! {
+        a
+            href="#"
+            hx-get=(target)
+            hx-target="#main-content"
+            class="rounded-lg border border-accent-cyan/40 bg-surface-0/70 p-3 hover:border-accent-cyan/60 transition-colors" {
+            div class="text-sm font-semibold text-text-primary" { (title) }
+            div class="mt-1 text-xs text-text-secondary font-mono" { (target) }
+            div class="mt-2 text-[11px] uppercase tracking-wider text-accent-cyan" { (label) }
         }
     }
 }

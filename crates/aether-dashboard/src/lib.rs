@@ -9,6 +9,7 @@ use rust_embed::Embed;
 
 mod api;
 mod fragments;
+pub mod narrative;
 mod state;
 mod support;
 pub use state::SharedState;

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -6,7 +7,16 @@ use aether_store::{
     GraphStore, SchemaVersion, SqliteGraphStore, SqliteStore, SqliteVectorStore, SurrealGraphStore,
     VectorStore, open_vector_store,
 };
+
+use crate::narrative::LayerAssignmentsCache;
+
 pub type DashboardStateError = Box<dyn std::error::Error + Send + Sync>;
+
+#[derive(Debug, Default)]
+pub struct DashboardCaches {
+    pub project_summary_by_sir: Mutex<HashMap<i64, String>>,
+    pub layer_assignments_by_sir: Mutex<HashMap<i64, LayerAssignmentsCache>>,
+}
 
 #[derive(Clone)]
 pub struct SharedState {
@@ -18,6 +28,7 @@ pub struct SharedState {
     pub config: Arc<AetherConfig>,
     pub read_only: bool,
     pub schema_version: SchemaVersion,
+    pub caches: Arc<DashboardCaches>,
 }
 
 impl SharedState {
@@ -41,6 +52,7 @@ impl SharedState {
             config,
             read_only: true,
             schema_version,
+            caches: Arc::new(DashboardCaches::default()),
         })
     }
 

@@ -429,12 +429,7 @@ pub(crate) fn explanation_header(
 }
 
 pub(crate) fn coupling_strength_label(score: f64) -> &'static str {
-    match score {
-        s if s < 0.3 => "Weak",
-        s if s < 0.6 => "Moderate",
-        s if s < 0.8 => "Strong",
-        _ => "Very Strong",
-    }
+    crate::narrative::qualify_coupling(score)
 }
 
 pub(crate) fn format_age_seconds(age_seconds: Option<i64>) -> String {

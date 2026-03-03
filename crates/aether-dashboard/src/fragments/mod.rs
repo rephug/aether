@@ -5,6 +5,7 @@ use axum::routing::get;
 
 use crate::support::DashboardState;
 
+mod anatomy;
 mod architecture;
 mod blast_radius;
 mod causal;
@@ -20,6 +21,15 @@ mod xray;
 
 pub(crate) fn fragment_router() -> Router<Arc<DashboardState>> {
     Router::new()
+        .route("/dashboard/frag/anatomy", get(anatomy::anatomy_fragment))
+        .route(
+            "/dashboard/frag/anatomy/layer",
+            get(anatomy::anatomy_layer_fragment),
+        )
+        .route(
+            "/dashboard/frag/anatomy/file",
+            get(anatomy::anatomy_file_fragment),
+        )
         .route("/dashboard/frag/overview", get(overview::overview_fragment))
         .route("/dashboard/frag/xray", get(xray::xray_fragment))
         .route(
