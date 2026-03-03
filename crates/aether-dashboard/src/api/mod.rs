@@ -5,6 +5,7 @@ use axum::routing::get;
 
 use crate::support::DashboardState;
 
+pub(crate) mod anatomy;
 mod architecture;
 mod blast_radius;
 mod causal_chain;
@@ -20,6 +21,7 @@ mod xray;
 
 pub(crate) fn api_router() -> Router<Arc<DashboardState>> {
     Router::new()
+        .route("/api/v1/anatomy", get(anatomy::anatomy_handler))
         .route("/api/v1/overview", get(overview::overview_handler))
         .route("/api/v1/search", get(search::search_handler))
         .route("/api/v1/graph", get(graph::graph_handler))

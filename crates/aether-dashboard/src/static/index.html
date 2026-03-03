@@ -61,6 +61,7 @@
   <script src="/dashboard/static/js/charts/xray-cards.js" defer></script>
   <script src="/dashboard/static/js/charts/xray-hotspots.js" defer></script>
   <script src="/dashboard/static/js/charts/symbol-search.js" defer></script>
+  <script src="/dashboard/static/js/charts/anatomy.js" defer></script>
   <script src="/dashboard/static/js/charts/blast-radius.js" defer></script>
   <script src="/dashboard/static/js/charts/architecture.js" defer></script>
   <script src="/dashboard/static/js/charts/time-machine.js" defer></script>
@@ -76,7 +77,9 @@
       </div>
 
       <nav class="flex-1 overflow-y-auto p-2 space-y-0.5">
-        <a href="#" class="nav-link active" hx-get="/dashboard/frag/xray" hx-target="#main-content" hx-push-url="/dashboard/xray" onclick="setActiveNav(this)"><span class="sidebar-label">X-Ray</span></a>
+        <a href="#" class="nav-link active" hx-get="/dashboard/frag/anatomy" hx-target="#main-content" hx-push-url="/dashboard/anatomy" onclick="setActiveNav(this)"><span class="sidebar-label">📖 Anatomy</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/overview" hx-target="#main-content" hx-push-url="/dashboard/overview" onclick="setActiveNav(this)"><span class="sidebar-label">Overview</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/xray" hx-target="#main-content" hx-push-url="/dashboard/xray" onclick="setActiveNav(this)"><span class="sidebar-label">X-Ray</span></a>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/search" hx-target="#main-content" hx-push-url="/dashboard/search" onclick="setActiveNav(this)"><span class="sidebar-label">Search</span></a>
 
         <div class="my-2 border-t border-surface-3/40 dark:border-slate-700"></div>
@@ -119,12 +122,12 @@
 
     <div class="flex-1 min-h-full overflow-hidden flex flex-col">
       <header class="px-5 py-3 border-b border-surface-3/50 dark:border-slate-700 bg-surface-1/70 dark:bg-slate-900/80 flex items-center justify-between">
-        <h1 id="page-title" class="text-sm font-semibold">X-Ray</h1>
+        <h1 id="page-title" class="text-sm font-semibold">📖 Anatomy</h1>
         <div class="text-xs text-text-muted dark:text-slate-400 font-mono" id="header-indexed">—</div>
       </header>
 
       <div class="flex-1 overflow-y-auto">
-        <main id="main-content" class="p-5 lg:p-6" hx-get="/dashboard/frag/xray" hx-trigger="load" hx-target="this">
+        <main id="main-content" class="p-5 lg:p-6" hx-get="/dashboard/frag/anatomy" hx-trigger="load" hx-target="this">
           <div class="flex items-center justify-center h-64"><div class="loading-spinner"></div></div>
         </main>
       </div>
@@ -219,6 +222,7 @@
 
     function initPageModules() {
       if (window.initOverviewCharts && document.getElementById('overview-chart')) window.initOverviewCharts();
+      if (window.initAnatomyGraph && document.getElementById('anatomy-layer-graph')) window.initAnatomyGraph();
       if (window.initGraph && document.getElementById('graph-container')) window.initGraph();
       if (window.initDriftChart && document.getElementById('drift-chart')) window.initDriftChart();
       if (window.initHeatmap && document.getElementById('heatmap-container')) window.initHeatmap();

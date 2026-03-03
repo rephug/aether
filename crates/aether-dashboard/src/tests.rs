@@ -38,6 +38,35 @@ async fn overview_api_returns_expected_fields() {
 }
 
 #[tokio::test]
+async fn anatomy_api_returns_expected_sections() {
+    let (_tmp, app, _ids) = seeded_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/anatomy")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json.get("data").is_some());
+    assert!(json.get("meta").is_some());
+    assert!(json["data"].get("project_name").is_some());
+    assert!(json["data"].get("summary").is_some());
+    assert!(json["data"]["maturity"].is_object());
+    assert!(json["data"]["tech_stack"].is_array());
+    assert!(json["data"]["layers"].is_array());
+    assert!(json["data"]["key_actors"].is_array());
+    assert!(json["data"]["simplified_graph"]["nodes"].is_array());
+    assert!(json["data"]["simplified_graph"]["edges"].is_array());
+}
+
+#[tokio::test]
 async fn search_api_returns_results() {
     let (_tmp, app, ids) = seeded_app().await;
 
@@ -90,6 +119,78 @@ async fn overview_fragment_contains_stat_cards_and_chart() {
     assert!(body.contains("stat-card"));
     assert!(body.contains("id=\"overview-chart\""));
     assert!(body.contains("data-table"));
+}
+
+#[tokio::test]
+async fn anatomy_fragment_contains_layer_graph_container() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/anatomy")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("id=\"anatomy-layer-graph\""));
+    assert!(body.contains("Project Layers"));
+}
+
+#[tokio::test]
+async fn anatomy_layer_fragment_contains_file_summaries() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/anatomy/layer?name=Core%20Logic")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("Core Logic"));
+    assert!(body.contains("Show symbols"));
+}
+
+#[tokio::test]
+async fn anatomy_file_fragment_contains_symbol_links_and_sir() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/anatomy/file?path=src/lib.rs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("symbol-link text-blue-600 cursor-pointer"));
+    assert!(body.contains("SIR Intent"));
 }
 
 #[tokio::test]
@@ -170,7 +271,7 @@ async fn static_shell_serves_index_with_htmx() {
     assert!(body.contains("/dashboard/static/style.css"));
     assert!(body.contains("localStorage.theme"));
     assert!(body.contains("id=\"theme-toggle\""));
-    assert!(body.contains("hx-get=\"/dashboard/frag/xray\""));
+    assert!(body.contains("hx-get=\"/dashboard/frag/anatomy\""));
 }
 
 #[tokio::test]
