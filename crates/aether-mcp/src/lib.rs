@@ -1335,6 +1335,16 @@ impl AetherMcpServer {
     ) -> Result<AetherSearchResponse, AetherMcpError> {
         let mode_requested = request.mode.unwrap_or_default();
         let limit = effective_limit(request.limit);
+        let search_config_ref = self.state.config.as_ref();
+        let retrieval_limit = {
+            let reranker = search_config_ref.search.reranker;
+            let window = search_config_ref.search.rerank_window;
+            if !matches!(reranker, SearchRerankerKind::None) {
+                window.max(limit).clamp(1, 200)
+            } else {
+                limit
+            }
+        };
         let query = request.query.clone();
         let sqlite_path = self.sqlite_path();
         let store = Arc::clone(&self.state.store);
@@ -1344,7 +1354,7 @@ impl AetherMcpServer {
                     return Ok(Vec::new());
                 }
 
-                let matches = store.search_symbols(query.as_str(), limit)?;
+                let matches = store.search_symbols(query.as_str(), retrieval_limit)?;
                 Ok(matches
                     .into_iter()
                     .map(AetherSymbolLookupMatch::from)
@@ -1353,9 +1363,8 @@ impl AetherMcpServer {
         )
         .await
         .map_err(|err| AetherMcpError::Message(format!("search join: {err}")))??;
-        let search_config = self.state.config.as_ref();
-        let reranker_kind = search_config.search.reranker;
-        let rerank_window = search_config.search.rerank_window;
+        let reranker_kind = search_config_ref.search.reranker;
+        let rerank_window = search_config_ref.search.rerank_window;
 
         let envelope = match mode_requested {
             SearchMode::Lexical => SearchEnvelope {
@@ -1365,8 +1374,9 @@ impl AetherMcpServer {
                 matches: lexical,
             },
             SearchMode::Semantic => {
-                let (semantic, fallback_reason) =
-                    self.semantic_search_matches(&request.query, limit).await?;
+                let (semantic, fallback_reason) = self
+                    .semantic_search_matches(&request.query, retrieval_limit)
+                    .await?;
                 if semantic.is_empty() {
                     SearchEnvelope {
                         mode_requested: SearchMode::Semantic,
@@ -1384,8 +1394,9 @@ impl AetherMcpServer {
                 }
             }
             SearchMode::Hybrid => {
-                let (semantic, fallback_reason) =
-                    self.semantic_search_matches(&request.query, limit).await?;
+                let (semantic, fallback_reason) = self
+                    .semantic_search_matches(&request.query, retrieval_limit)
+                    .await?;
                 if semantic.is_empty() {
                     SearchEnvelope {
                         mode_requested: SearchMode::Hybrid,

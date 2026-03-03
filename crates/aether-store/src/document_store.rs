@@ -188,6 +188,16 @@ impl SqliteStore {
 
         let record_json = serde_json::to_string(&record.record_json)?;
         let conn = self.conn.lock().unwrap();
+        // Remove stale records for this unit+schema before inserting the new version.
+        // This prevents accumulation when content_hash changes (which changes record_id).
+        conn.execute(
+            "DELETE FROM semantic_records WHERE unit_id = ?1 AND schema_name = ?2 AND record_id != ?3",
+            params![
+                record.unit_id.as_str(),
+                record.schema_name.as_str(),
+                record.record_id.as_str(),
+            ],
+        )?;
         conn.execute(
             r#"
             INSERT INTO semantic_records (

@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -361,16 +360,11 @@ pub(crate) async fn run_async_with_timeout<T, F, Fut>(operation: F) -> Result<T,
 where
     T: Send + 'static,
     F: FnOnce() -> Fut + Send + 'static,
-    Fut: Future<Output = Result<T, String>> + Send + 'static,
+    Fut: std::future::Future<Output = Result<T, String>> + Send + 'static,
 {
-    run_blocking_with_timeout(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|err| format!("failed to build blocking query runtime: {err}"))?;
-        runtime.block_on(operation())
-    })
-    .await
+    tokio::time::timeout(Duration::from_secs(GRAPH_QUERY_TIMEOUT_SECS), operation())
+        .await
+        .map_err(|_| timeout_error_message(GRAPH_QUERY_TIMEOUT_MESSAGE))?
 }
 
 pub(crate) fn html_empty_state(title: &str, cmd: Option<&str>) -> Markup {

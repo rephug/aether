@@ -355,16 +355,18 @@ fn cached_project_summary(
 ) -> Result<String, String> {
     let mut cache = shared
         .caches
-        .project_summary_by_sir
+        .project_summary
         .lock()
         .map_err(|err| format!("project summary cache lock poisoned: {err}"))?;
 
-    if let Some(cached) = cache.get(&sir_count) {
+    if let Some((cached_count, ref cached)) = *cache
+        && cached_count == sir_count
+    {
         return Ok(cached.clone());
     }
 
     let summary = compose_project_summary(sir_intents, lang, deps);
-    cache.insert(sir_count, summary.clone());
+    *cache = Some((sir_count, summary.clone()));
     Ok(summary)
 }
 
@@ -375,11 +377,13 @@ fn layer_assignments(
 ) -> Result<LayerAssignmentsCache, String> {
     let mut cache = shared
         .caches
-        .layer_assignments_by_sir
+        .layer_assignments
         .lock()
         .map_err(|err| format!("layer assignment cache lock poisoned: {err}"))?;
 
-    if let Some(cached) = cache.get(&sir_count) {
+    if let Some((cached_count, ref cached)) = *cache
+        && cached_count == sir_count
+    {
         return Ok(cached.clone());
     }
 
@@ -393,7 +397,7 @@ fn layer_assignments(
             .insert(symbol.name.clone(), symbol.layer.name.clone());
     }
 
-    cache.insert(sir_count, assignments.clone());
+    *cache = Some((sir_count, assignments.clone()));
     Ok(assignments)
 }
 
