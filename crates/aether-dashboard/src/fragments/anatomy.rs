@@ -130,6 +130,7 @@ pub(crate) async fn anatomy_fragment(State(state): State<Arc<DashboardState>>) -
                                 th { "Layer" }
                                 th { "Centrality" }
                                 th { "Dependents" }
+                                th { "Difficulty" }
                                 th { "Description" }
                             }
                         }
@@ -145,6 +146,16 @@ pub(crate) async fn anatomy_fragment(State(state): State<Arc<DashboardState>>) -
                                     td { (actor.layer.as_str()) }
                                     td class="font-mono" { (format!("{:.3}", actor.centrality)) }
                                     td class="font-mono" { (actor.dependents_count) }
+                                    td {
+                                        span class={ "badge " (difficulty_badge_class(actor.difficulty.label.as_str())) }
+                                            data-tippy-content=(if actor.difficulty.reasons.is_empty() {
+                                                actor.difficulty.guidance.clone()
+                                            } else {
+                                                actor.difficulty.reasons.join(" | ")
+                                            }) {
+                                            (actor.difficulty.emoji.as_str()) " " (actor.difficulty.label.as_str())
+                                        }
+                                    }
                                     td class="text-xs" {
                                         @if actor.description.trim().is_empty() {
                                             "No SIR intent summary available"
@@ -337,4 +348,14 @@ fn percent_encode(input: &str) -> String {
         }
     }
     out
+}
+
+fn difficulty_badge_class(label: &str) -> &'static str {
+    if label.eq_ignore_ascii_case("easy") {
+        "badge-green"
+    } else if label.eq_ignore_ascii_case("moderate") {
+        "badge-yellow"
+    } else {
+        "badge-red"
+    }
 }

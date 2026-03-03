@@ -137,6 +137,11 @@ pub(crate) async fn glossary_fragment(
                                         span class="badge badge-cyan" { (term.kind.as_str()) }
                                         span class="badge badge-muted" { (term.layer_icon.as_str()) " " (term.layer.as_str()) }
                                         span class="badge badge-yellow" { (term.dependents_count) " dependents" }
+                                        span
+                                            class={ "badge " (difficulty_badge_class(term.difficulty.label.as_str())) }
+                                            data-tippy-content=(difficulty_tooltip(term)) {
+                                            (term.difficulty.emoji.as_str()) " " (term.difficulty.label.as_str())
+                                        }
                                     }
                                     span class="file-link text-blue-600 hover:underline cursor-pointer font-mono text-xs"
                                         data-path=(term.file.as_str()) {
@@ -144,10 +149,20 @@ pub(crate) async fn glossary_fragment(
                                     }
                                 }
                                 div class="flex items-center gap-2" {
-                                    button class="px-2 py-1 text-xs rounded-md border border-surface-3/40 bg-surface-3/20 text-text-muted cursor-not-allowed"
-                                        disabled title="Run 5" { "📋 Spec" }
-                                    button class="px-2 py-1 text-xs rounded-md border border-surface-3/40 bg-surface-3/20 text-text-muted cursor-not-allowed"
-                                        disabled title="Run 5" { "🎓 Advisor" }
+                                    button
+                                        class="px-2 py-1 text-xs rounded-md border border-surface-3/40 hover:bg-surface-3/20"
+                                        hx-get={"/dashboard/frag/spec/" (percent_encode(term.name.as_str()))}
+                                        hx-target="#main-content"
+                                        hx-push-url={"/dashboard/spec/" (percent_encode(term.name.as_str()))} {
+                                        "📋 Spec"
+                                    }
+                                    button
+                                        class="px-2 py-1 text-xs rounded-md border border-surface-3/40 hover:bg-surface-3/20"
+                                        hx-get={"/dashboard/frag/autopsy/" (percent_encode(term.name.as_str()))}
+                                        hx-target="#main-content"
+                                        hx-push-url={"/dashboard/autopsy/" (percent_encode(term.name.as_str()))} {
+                                        "🎓 Advisor"
+                                    }
                                 }
                             }
 
@@ -210,6 +225,28 @@ pub(crate) async fn glossary_fragment(
             }
         }
     })
+}
+
+fn difficulty_tooltip(term: &crate::api::glossary::GlossaryTerm) -> String {
+    if term.difficulty.reasons.is_empty() {
+        term.difficulty.guidance.clone()
+    } else {
+        format!(
+            "{} - {}",
+            term.difficulty.reasons.join(" | "),
+            term.difficulty.guidance
+        )
+    }
+}
+
+fn difficulty_badge_class(label: &str) -> &'static str {
+    if label.eq_ignore_ascii_case("easy") {
+        "badge-green"
+    } else if label.eq_ignore_ascii_case("moderate") {
+        "badge-yellow"
+    } else {
+        "badge-red"
+    }
 }
 
 fn build_query_url(

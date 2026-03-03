@@ -12,6 +12,8 @@ use crate::support;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CatalogSir {
     pub intent: String,
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
     pub side_effects: Vec<String>,
     pub dependencies: Vec<String>,
     pub error_modes: Vec<String>,
@@ -412,6 +414,8 @@ fn parse_sir(blob: &str) -> CatalogSir {
         .unwrap_or_default()
         .to_owned();
 
+    let inputs = as_string_vec(value.get("inputs"));
+    let outputs = as_string_vec(value.get("outputs"));
     let side_effects = as_string_vec(value.get("side_effects"));
     let dependencies = as_string_vec(value.get("dependencies"));
     let error_modes = as_string_vec(value.get("error_modes"));
@@ -424,6 +428,8 @@ fn parse_sir(blob: &str) -> CatalogSir {
 
     CatalogSir {
         intent,
+        inputs,
+        outputs,
         side_effects,
         dependencies,
         error_modes,

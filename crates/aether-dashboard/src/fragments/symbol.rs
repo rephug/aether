@@ -188,14 +188,54 @@ fn render_symbol_deep_dive(build: &SymbolDeepDiveBuild) -> maud::Markup {
                 }
             }
 
-            section class="grid gap-3 md:grid-cols-3" {
-                button class="rounded-lg border border-surface-3/40 bg-surface-3/20 px-3 py-3 text-sm text-text-muted cursor-not-allowed text-left"
-                    disabled title="Run 5" {
+            section class="rounded-xl border border-surface-3/40 bg-surface-1/40 p-5 space-y-3" {
+                h2 class="text-lg font-semibold" { "LLM Difficulty" }
+                div class="flex items-center gap-2" {
+                    span class="text-2xl" { (data.difficulty.emoji.as_str()) }
+                    span class={ "badge " (difficulty_badge_class(data.difficulty.label.as_str())) } {
+                        (data.difficulty.label.as_str())
+                    }
+                    span class="text-xs text-text-muted" { (format!("score {:.1}/100", data.difficulty.score)) }
+                }
+                p class="text-sm text-text-secondary" { (data.difficulty.guidance.as_str()) }
+                @if !data.difficulty.reasons.is_empty() {
+                    ul class="list-disc pl-5 text-sm text-text-secondary space-y-1" {
+                        @for reason in &data.difficulty.reasons {
+                            li { (reason.as_str()) }
+                        }
+                    }
+                }
+                p class="text-sm text-blue-600 hover:underline" {
+                    a
+                        hx-get={"/dashboard/frag/autopsy/" (percent_encode(data.name.as_str()))}
+                        hx-target="#main-content"
+                        hx-push-url={"/dashboard/autopsy/" (percent_encode(data.name.as_str()))} {
+                        "See the Prompt Advisor for guidance ->"
+                    }
+                }
+            }
+
+            section class="grid gap-3 md:grid-cols-4" {
+                button
+                    class="rounded-lg border border-surface-3/40 bg-surface-1 px-3 py-3 text-sm hover:bg-surface-3/20 text-left"
+                    hx-get={"/dashboard/frag/spec/" (percent_encode(data.name.as_str()))}
+                    hx-target="#main-content"
+                    hx-push-url={"/dashboard/spec/" (percent_encode(data.name.as_str()))} {
                     "📋 Generate Spec"
                 }
-                button class="rounded-lg border border-surface-3/40 bg-surface-3/20 px-3 py-3 text-sm text-text-muted cursor-not-allowed text-left"
-                    disabled title="Run 5" {
+                button
+                    class="rounded-lg border border-surface-3/40 bg-surface-1 px-3 py-3 text-sm hover:bg-surface-3/20 text-left"
+                    hx-get={"/dashboard/frag/autopsy/" (percent_encode(data.name.as_str()))}
+                    hx-target="#main-content"
+                    hx-push-url={"/dashboard/autopsy/" (percent_encode(data.name.as_str()))} {
                     "🎓 Prompt Advisor"
+                }
+                button
+                    class="rounded-lg border border-surface-3/40 bg-surface-1 px-3 py-3 text-sm hover:bg-surface-3/20 text-left"
+                    hx-get={"/dashboard/frag/decompose/" (percent_encode(data.name.as_str()))}
+                    hx-target="#main-content"
+                    hx-push-url={"/dashboard/decompose/" (percent_encode(data.name.as_str()))} {
+                    "🔨 See Build Steps"
                 }
                 a class="rounded-lg border border-surface-3/40 bg-surface-1 px-3 py-3 text-sm hover:bg-surface-3/20"
                     hx-get={"/dashboard/frag/flow?start=" (percent_encode(data.name.as_str()))}
@@ -215,6 +255,16 @@ fn risk_badge_class(level: &str) -> &'static str {
         "badge-yellow"
     } else {
         "badge-green"
+    }
+}
+
+fn difficulty_badge_class(label: &str) -> &'static str {
+    if label.eq_ignore_ascii_case("easy") {
+        "badge-green"
+    } else if label.eq_ignore_ascii_case("moderate") {
+        "badge-yellow"
+    } else {
+        "badge-red"
     }
 }
 

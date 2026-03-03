@@ -7,6 +7,7 @@ use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
 use crate::api::catalog::{SymbolCatalog, load_symbol_catalog};
+use crate::api::difficulty::{DifficultyView, difficulty_for_symbol};
 use crate::state::SharedState;
 use crate::support::{self, DashboardState};
 
@@ -33,6 +34,7 @@ pub(crate) struct GlossaryTerm {
     pub definition: String,
     pub related: Vec<String>,
     pub dependents_count: usize,
+    pub difficulty: DifficultyView,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -109,6 +111,7 @@ pub(crate) fn build_glossary_from_catalog(
                 definition,
                 related: related_terms(catalog, symbol.id.as_str(), 4),
                 dependents_count: symbol.dependents_count,
+                difficulty: difficulty_for_symbol(symbol),
             }
         })
         .filter(|term| {

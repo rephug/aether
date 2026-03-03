@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use aether_store::{Store, SymbolRecord};
 
 use crate::api::common;
+use crate::api::difficulty::difficulty_for_symbol;
 use crate::state::SharedState;
 use crate::support::{self, DashboardState};
 
@@ -29,7 +30,11 @@ pub(crate) struct GraphNode {
     pub label: String,
     pub kind: String,
     pub file: String,
+    pub layer: String,
     pub sir_exists: bool,
+    pub difficulty_score: f64,
+    pub difficulty_label: String,
+    pub difficulty_emoji: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pagerank: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -264,6 +269,16 @@ pub(crate) async fn load_graph_data(
             .then_with(|| left.edge_type.cmp(&right.edge_type))
     });
 
+    let catalog = crate::api::catalog::load_symbol_catalog(shared).ok();
+    let mut difficulty_by_id = HashMap::<String, crate::api::difficulty::DifficultyView>::new();
+    let mut layer_by_id = HashMap::<String, String>::new();
+    if let Some(catalog) = catalog.as_ref() {
+        for symbol in &catalog.symbols {
+            difficulty_by_id.insert(symbol.id.clone(), difficulty_for_symbol(symbol));
+            layer_by_id.insert(symbol.id.clone(), symbol.layer_name.clone());
+        }
+    }
+
     let all_edges = common::load_dependency_algo_edges(shared)?;
     let pagerank = common::pagerank_map(shared, &all_edges).await;
     let communities = common::louvain_map(shared, &all_edges).await;
@@ -274,21 +289,40 @@ pub(crate) async fn load_graph_data(
 
     let mut nodes = nodes_by_id
         .values()
-        .map(|symbol| GraphNode {
-            id: symbol.id.clone(),
-            label: support::symbol_name_from_qualified(symbol.qualified_name.as_str()),
-            kind: symbol.kind.clone(),
-            file: support::normalized_display_path(symbol.file_path.as_str()),
-            sir_exists: sir_symbols.contains(symbol.id.as_str()),
-            pagerank: Some(pagerank.get(symbol.id.as_str()).copied().unwrap_or(0.0)),
-            risk_score: Some(common::risk_score(
-                pagerank.get(symbol.id.as_str()).copied().unwrap_or(0.0),
-                drift_map.get(symbol.id.as_str()).copied().unwrap_or(0.0),
-                sir_symbols.contains(symbol.id.as_str()),
-                test_map.get(symbol.id.as_str()).copied().unwrap_or(0),
-                max_pagerank,
-            )),
-            community_id: communities.get(symbol.id.as_str()).copied(),
+        .map(|symbol| {
+            let difficulty = difficulty_by_id.get(symbol.id.as_str()).cloned().unwrap_or(
+                crate::api::difficulty::DifficultyView {
+                    score: 0.0,
+                    emoji: "🟢".to_owned(),
+                    label: "Easy".to_owned(),
+                    guidance: "Minimal prompting needed.".to_owned(),
+                    reasons: Vec::new(),
+                },
+            );
+
+            GraphNode {
+                id: symbol.id.clone(),
+                label: support::symbol_name_from_qualified(symbol.qualified_name.as_str()),
+                kind: symbol.kind.clone(),
+                file: support::normalized_display_path(symbol.file_path.as_str()),
+                layer: layer_by_id
+                    .get(symbol.id.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| "Core Logic".to_owned()),
+                sir_exists: sir_symbols.contains(symbol.id.as_str()),
+                difficulty_score: difficulty.score,
+                difficulty_label: difficulty.label,
+                difficulty_emoji: difficulty.emoji,
+                pagerank: Some(pagerank.get(symbol.id.as_str()).copied().unwrap_or(0.0)),
+                risk_score: Some(common::risk_score(
+                    pagerank.get(symbol.id.as_str()).copied().unwrap_or(0.0),
+                    drift_map.get(symbol.id.as_str()).copied().unwrap_or(0.0),
+                    sir_symbols.contains(symbol.id.as_str()),
+                    test_map.get(symbol.id.as_str()).copied().unwrap_or(0),
+                    max_pagerank,
+                )),
+                community_id: communities.get(symbol.id.as_str()).copied(),
+            }
         })
         .collect::<Vec<_>>();
 

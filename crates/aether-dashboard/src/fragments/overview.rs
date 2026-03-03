@@ -4,6 +4,8 @@ use axum::extract::State;
 use axum::response::Html;
 use maud::{Markup, html};
 
+use crate::api::catalog::load_symbol_catalog;
+use crate::api::difficulty::{DifficultySummary, summarize_catalog};
 use crate::support::{self, DashboardState};
 
 pub(crate) async fn overview_fragment(State(state): State<Arc<DashboardState>>) -> Html<String> {
@@ -30,6 +32,33 @@ pub(crate) async fn overview_fragment(State(state): State<Arc<DashboardState>>) 
         .and_then(|value| value.to_str())
         .unwrap_or("this project")
         .to_owned();
+
+    let shared_for_diff = state.shared.clone();
+    let default_summary = DifficultySummary {
+        easy: crate::api::difficulty::DifficultyBucketSummary {
+            count: 0,
+            percentage: 0,
+        },
+        moderate: crate::api::difficulty::DifficultyBucketSummary {
+            count: 0,
+            percentage: 0,
+        },
+        hard: crate::api::difficulty::DifficultyBucketSummary {
+            count: 0,
+            percentage: 0,
+        },
+        very_hard: crate::api::difficulty::DifficultyBucketSummary {
+            count: 0,
+            percentage: 0,
+        },
+    };
+
+    let difficulty_summary = support::run_blocking_with_timeout(move || {
+        let catalog = load_symbol_catalog(shared_for_diff.as_ref())?;
+        Ok::<DifficultySummary, String>(summarize_catalog(&catalog))
+    })
+    .await
+    .unwrap_or(default_summary);
 
     support::html_markup_response(html! {
         div class="space-y-5" {
@@ -58,7 +87,7 @@ pub(crate) async fn overview_fragment(State(state): State<Arc<DashboardState>>) 
                 div class="grid gap-3 md:grid-cols-3" {
                     (feature_card("📖 Understand This Project", "/dashboard/frag/anatomy", "Open Anatomy"))
                     (coming_soon_card("🗺️ Take a Guided Tour", "/dashboard/frag/tour"))
-                    (coming_soon_card("💬 Build a Question", "/dashboard/frag/prompts"))
+                    (feature_card("💬 Build a Prompt", "/dashboard/frag/prompts", "Open Prompts"))
                 }
             }
 
@@ -96,6 +125,22 @@ pub(crate) async fn overview_fragment(State(state): State<Arc<DashboardState>>) 
                     "Index Age",
                     "How long it has been since the latest indexed or analyzed symbol update."
                 ))
+            }
+
+            div class="rounded-xl border border-surface-3/40 bg-surface-1/40 p-5 space-y-2" {
+                h3 class="text-base font-semibold" { "LLM Difficulty Analysis" }
+                p class="text-sm text-text-secondary" {
+                    "🟢 Easy: " (difficulty_summary.easy.count) " components (" (difficulty_summary.easy.percentage) "%) - safe to prompt directly"
+                }
+                p class="text-sm text-text-secondary" {
+                    "🟡 Moderate: " (difficulty_summary.moderate.count) " components (" (difficulty_summary.moderate.percentage) "%) - provide context and verify"
+                }
+                p class="text-sm text-text-secondary" {
+                    "🔴 Hard: " (difficulty_summary.hard.count) " components (" (difficulty_summary.hard.percentage) "%) - decompose and specify edge cases"
+                }
+                p class="text-sm text-text-secondary" {
+                    "⛔ Very Hard: " (difficulty_summary.very_hard.count) " components (" (difficulty_summary.very_hard.percentage) "%) - use careful step-by-step prompting"
+                }
             }
 
             div class="rounded-xl border border-surface-3/40 bg-surface-1/40 p-4" {

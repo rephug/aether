@@ -7,6 +7,47 @@
     danger: '#ef4444',
     ok: '#10b981',
   };
+  const GRAPH_COLOR_MODE_KEY = 'aether-graph-color-mode';
+  const GRAPH_COLOR_LAYER = 'layer';
+  const GRAPH_COLOR_DIFFICULTY = 'difficulty';
+  let graphColorMode = normalizeGraphColorMode(localStorage.getItem(GRAPH_COLOR_MODE_KEY));
+
+  function normalizeGraphColorMode(mode) {
+    return mode === GRAPH_COLOR_DIFFICULTY ? GRAPH_COLOR_DIFFICULTY : GRAPH_COLOR_LAYER;
+  }
+
+  function difficultyColor(label) {
+    const key = String(label || '').toLowerCase();
+    if (key === 'easy') return '#22c55e';
+    if (key === 'moderate') return '#eab308';
+    if (key === 'hard') return '#ef4444';
+    if (key === 'very hard') return '#7f1d1d';
+    return '#64748b';
+  }
+
+  function updateGraphColorButtons() {
+    const layerButton = document.getElementById('graph-color-layer');
+    const difficultyButton = document.getElementById('graph-color-difficulty');
+    if (!layerButton || !difficultyButton) return;
+
+    const setState = (button, active) => {
+      button.classList.toggle('graph-color-button-active', active);
+      button.classList.toggle('graph-color-button-inactive', !active);
+      button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    };
+
+    setState(layerButton, graphColorMode === GRAPH_COLOR_LAYER);
+    setState(difficultyButton, graphColorMode === GRAPH_COLOR_DIFFICULTY);
+  }
+
+  window.setGraphColorMode = function setGraphColorMode(mode) {
+    graphColorMode = normalizeGraphColorMode(mode);
+    localStorage.setItem(GRAPH_COLOR_MODE_KEY, graphColorMode);
+    updateGraphColorButtons();
+    if (typeof window.__aetherGraphApplyColorMode === 'function') {
+      window.__aetherGraphApplyColorMode();
+    }
+  };
 
   function getTooltip() {
     return window.AetherTooltip || { show: () => {}, hide: () => {} };
@@ -82,6 +123,8 @@
   window.initGraph = function initGraph() {
     const container = document.getElementById('graph-container');
     if (!container) return;
+    updateGraphColorButtons();
+    window.__aetherGraphApplyColorMode = null;
 
     const params = new URLSearchParams();
     const root = document.getElementById('graph-root');
@@ -106,6 +149,30 @@
       const nodes = data.nodes.map((n) => ({ ...n }));
       const nodeById = new Map(nodes.map((n) => [n.id, n]));
       const edges = (data.edges || []).filter((e) => nodeById.has(e.source) && nodeById.has(e.target)).map((e) => ({ ...e }));
+      const layerDomain = Array.from(new Set(nodes.map((n) => n.layer || 'Uncategorized'))).sort();
+      const layerColor = d3.scaleOrdinal()
+        .domain(layerDomain)
+        .range([
+          '#0ea5a8',
+          '#4f46e5',
+          '#0f766e',
+          '#b45309',
+          '#0284c7',
+          '#7c3aed',
+          '#1d4ed8',
+          '#9333ea',
+          '#166534',
+          '#be185d',
+          '#0c4a6e',
+          '#312e81',
+        ]);
+
+      const graphNodeFill = (nodeData) => {
+        if (graphColorMode === GRAPH_COLOR_DIFFICULTY) {
+          return difficultyColor(nodeData.difficulty_label);
+        }
+        return layerColor(nodeData.layer || 'Uncategorized');
+      };
 
       svg.call(d3.zoom().scaleExtent([0.2, 4]).on('zoom', (event) => rootG.attr('transform', event.transform)));
 
@@ -130,12 +197,11 @@
         .data(nodes)
         .join('circle')
         .attr('r', (d) => prScale(d.pagerank || 0))
-        .attr('fill', (d) => riskColor(d.risk_score || 0))
         .attr('stroke', (d) => d.sir_exists ? '#0ea5a8' : '#94a3b8')
         .attr('stroke-width', 1.5)
         .style('cursor', 'pointer')
         .on('mouseover', function (event, d) {
-          tip.show(event, `<strong>${d.label}</strong><br/>${d.file}<br/>risk ${(d.risk_score || 0).toFixed(2)} / importance ${(d.pagerank || 0).toFixed(2)}`);
+          tip.show(event, `<strong>${d.label}</strong><br/>${d.file}<br/>layer ${d.layer || 'n/a'}<br/>difficulty ${d.difficulty_emoji || ''} ${d.difficulty_label || 'n/a'}<br/>risk ${(d.risk_score || 0).toFixed(2)} / importance ${(d.pagerank || 0).toFixed(2)}`);
         })
         .on('mouseout', () => tip.hide())
         .on('click', function (_event, d) {
@@ -164,6 +230,16 @@
           .on('drag', (event, d) => { d.fx = event.x; d.fy = event.y; })
           .on('end', (event, d) => { if (!event.active) sim.alphaTarget(0); d.fx = null; d.fy = null; }));
 
+      const applyGraphColorMode = () => {
+        node
+          .attr('fill', (d) => graphNodeFill(d))
+          .attr('data-layer', (d) => d.layer || 'Uncategorized')
+          .attr('data-difficulty', (d) => d.difficulty_label || 'Unknown');
+        updateGraphColorButtons();
+      };
+      window.__aetherGraphApplyColorMode = applyGraphColorMode;
+      applyGraphColorMode();
+
       const labels = rootG.selectAll('text.label')
         .data(nodes.filter((n) => (n.pagerank || 0) > 0))
         .join('text')
@@ -187,7 +263,10 @@
           .attr('x', (d) => d.x)
           .attr('y', (d) => d.y - 10);
       });
-    }).catch(() => empty(container, 'Failed to load graph'));
+    }).catch(() => {
+      window.__aetherGraphApplyColorMode = null;
+      empty(container, 'Failed to load graph');
+    });
   };
 
   window.initDriftChart = function initDriftChart() {

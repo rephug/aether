@@ -500,18 +500,165 @@ pub fn qualify_difficulty(
     dep_count: usize,
     is_async: bool,
 ) -> (&'static str, &'static str) {
-    let mut score =
-        error_count.saturating_mul(2) + side_effect_count.saturating_mul(2) + dep_count.min(8);
-    if is_async {
-        score = score.saturating_add(2);
+    let score = difficulty_score_value("", error_count, side_effect_count, dep_count, is_async);
+    if score <= 15.0 {
+        ("🟢", "Easy")
+    } else if score <= 40.0 {
+        ("🟡", "Moderate")
+    } else if score <= 65.0 {
+        ("🔴", "Hard")
+    } else {
+        ("⛔", "Very Hard")
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DifficultyScore {
+    pub score: f64,
+    pub emoji: String,
+    pub label: String,
+    pub guidance: String,
+    pub reasons: Vec<String>,
+}
+
+pub fn compute_difficulty(symbol: &SymbolInfo) -> DifficultyScore {
+    compute_difficulty_from_fields(
+        symbol.sir_intent.as_str(),
+        symbol.error_modes.len(),
+        symbol.side_effects.len(),
+        symbol.dependencies.len(),
+        symbol.is_async,
+    )
+}
+
+pub fn compute_difficulty_from_fields(
+    intent: &str,
+    error_count: usize,
+    side_effect_count: usize,
+    dep_count: usize,
+    is_async: bool,
+) -> DifficultyScore {
+    let mut reasons = Vec::<String>::new();
+    let score = difficulty_score_value(intent, error_count, side_effect_count, dep_count, is_async);
+
+    if error_count > 0 && error_count <= 2 {
+        reasons.push(format!("{error_count} failure modes to handle"));
+    } else if error_count > 2 {
+        reasons.push(format!(
+            "{error_count} failure modes — LLMs often miss edge cases"
+        ));
     }
 
-    match score {
-        0..=3 => ("🟢", "Easy"),
-        4..=8 => ("🟡", "Moderate"),
-        9..=13 => ("🟠", "Hard"),
-        _ => ("🔴", "Very Hard"),
+    if side_effect_count > 0 && side_effect_count <= 1 {
+        reasons.push("has side effects that must be handled correctly".to_owned());
+    } else if side_effect_count > 1 {
+        reasons.push(format!(
+            "{side_effect_count} side effects — LLMs frequently miss cleanup and notifications"
+        ));
     }
+
+    if dep_count > 2 && dep_count <= 5 {
+        reasons.push(format!(
+            "{dep_count} dependencies require context in the prompt"
+        ));
+    } else if dep_count > 5 {
+        reasons.push(format!(
+            "{dep_count} dependencies — large context window needed"
+        ));
+    }
+
+    if has_async_or_concurrent_signals(intent, is_async) {
+        reasons
+            .push("async/concurrent patterns — LLMs struggle with races and lifetimes".to_owned());
+    }
+
+    let (emoji, label, guidance) = if score <= 15.0 {
+        (
+            "🟢",
+            "Easy",
+            "Minimal prompting needed. A brief description usually produces correct code.",
+        )
+    } else if score <= 40.0 {
+        (
+            "🟡",
+            "Moderate",
+            "Provide context and verify output. Include type signatures and key constraints.",
+        )
+    } else if score <= 65.0 {
+        (
+            "🔴",
+            "Hard",
+            "Decompose into steps and specify edge cases explicitly. Verify each step before proceeding.",
+        )
+    } else {
+        (
+            "⛔",
+            "Very Hard",
+            "Break into small pieces, specify control flow, enumerate all failure modes. Manual review essential.",
+        )
+    };
+
+    DifficultyScore {
+        score,
+        emoji: emoji.to_owned(),
+        label: label.to_owned(),
+        guidance: guidance.to_owned(),
+        reasons,
+    }
+}
+
+fn difficulty_score_value(
+    intent: &str,
+    error_count: usize,
+    side_effect_count: usize,
+    dep_count: usize,
+    is_async: bool,
+) -> f64 {
+    let mut score = 0.0f64;
+
+    if error_count > 0 && error_count <= 2 {
+        score += 10.0;
+    } else if error_count > 2 {
+        score += 30.0;
+    }
+
+    if side_effect_count > 0 && side_effect_count <= 1 {
+        score += 10.0;
+    } else if side_effect_count > 1 {
+        score += 25.0;
+    }
+
+    if dep_count > 2 && dep_count <= 5 {
+        score += 10.0;
+    } else if dep_count > 5 {
+        score += 20.0;
+    }
+
+    if has_async_or_concurrent_signals(intent, is_async) {
+        score += 25.0;
+    }
+
+    score
+}
+
+fn has_async_or_concurrent_signals(intent: &str, is_async: bool) -> bool {
+    if is_async {
+        return true;
+    }
+
+    let lower = intent.to_ascii_lowercase();
+    [
+        "async",
+        "concurrent",
+        "spawn",
+        "lock",
+        "channel",
+        "select!",
+        "mutex",
+        "arc",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn has_data_touchpoints(symbols: &[SymbolInfo]) -> bool {
