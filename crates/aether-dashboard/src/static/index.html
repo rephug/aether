@@ -78,22 +78,17 @@
 
       <nav class="flex-1 overflow-y-auto p-2 space-y-0.5">
         <a href="#" class="nav-link active" hx-get="/dashboard/frag/anatomy" hx-target="#main-content" hx-push-url="/dashboard/anatomy" onclick="setActiveNav(this)"><span class="sidebar-label">📖 Anatomy</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/tour" hx-target="#main-content" hx-push-url="/dashboard/tour" onclick="setActiveNav(this)"><span class="sidebar-label">🗺️ Tour</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/flow" hx-target="#main-content" hx-push-url="/dashboard/flow" onclick="setActiveNav(this)"><span class="sidebar-label">🔄 Trace Flow</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/glossary" hx-target="#main-content" hx-push-url="/dashboard/glossary" onclick="setActiveNav(this)"><span class="sidebar-label">📚 Glossary</span></a>
+
+        <div class="my-2 border-t border-surface-3/40 dark:border-slate-700"></div>
+
         <a href="#" class="nav-link" hx-get="/dashboard/frag/overview" hx-target="#main-content" hx-push-url="/dashboard/overview" onclick="setActiveNav(this)"><span class="sidebar-label">Overview</span></a>
-        <a href="#" class="nav-link" hx-get="/dashboard/frag/xray" hx-target="#main-content" hx-push-url="/dashboard/xray" onclick="setActiveNav(this)"><span class="sidebar-label">X-Ray</span></a>
-        <a href="#" class="nav-link" hx-get="/dashboard/frag/search" hx-target="#main-content" hx-push-url="/dashboard/search" onclick="setActiveNav(this)"><span class="sidebar-label">Search</span></a>
-
-        <div class="my-2 border-t border-surface-3/40 dark:border-slate-700"></div>
-
-        <a href="#" class="nav-link" hx-get="/dashboard/frag/blast-radius" hx-target="#main-content" hx-push-url="/dashboard/blast-radius" onclick="setActiveNav(this)"><span class="sidebar-label">Blast Radius</span></a>
-        <a href="#" class="nav-link" hx-get="/dashboard/frag/architecture" hx-target="#main-content" hx-push-url="/dashboard/architecture" onclick="setActiveNav(this)"><span class="sidebar-label">Architecture Map</span></a>
-        <a href="#" class="nav-link" hx-get="/dashboard/frag/time-machine" hx-target="#main-content" hx-push-url="/dashboard/time-machine" onclick="setActiveNav(this)"><span class="sidebar-label">Time Machine</span></a>
-        <a href="#" class="nav-link" hx-get="/dashboard/frag/causal" hx-target="#main-content" hx-push-url="/dashboard/causal" onclick="setActiveNav(this)"><span class="sidebar-label">Causal Explorer</span></a>
-
-        <div class="my-2 border-t border-surface-3/40 dark:border-slate-700"></div>
-
-        <a href="#" class="nav-link" hx-get="/dashboard/frag/graph" hx-target="#main-content" hx-push-url="/dashboard/graph" onclick="setActiveNav(this)"><span class="sidebar-label">Dependency Graph</span></a>
-        <a href="#" class="nav-link" hx-get="/dashboard/frag/drift-table" hx-target="#main-content" hx-push-url="/dashboard/drift" onclick="setActiveNav(this)"><span class="sidebar-label">Drift Report</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/graph" hx-target="#main-content" hx-push-url="/dashboard/graph" onclick="setActiveNav(this)"><span class="sidebar-label">Graph</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/health" hx-target="#main-content" hx-push-url="/dashboard/health" onclick="setActiveNav(this)"><span class="sidebar-label">Health</span></a>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/coupling" hx-target="#main-content" hx-push-url="/dashboard/coupling" onclick="setActiveNav(this)"><span class="sidebar-label">Coupling Map</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/drift-table" hx-target="#main-content" hx-push-url="/dashboard/drift" onclick="setActiveNav(this)"><span class="sidebar-label">Drift Report</span></a>
       </nav>
 
       <div class="px-3 py-3 border-t border-surface-3/40 dark:border-slate-700 space-y-2">
@@ -133,8 +128,6 @@
       </div>
     </div>
 
-    <div id="detail-panel" class="detail-panel hidden fixed right-0 top-0 h-full w-96 bg-surface-1 dark:bg-slate-900 border-l border-surface-3/50 dark:border-slate-700 shadow-2xl z-40 overflow-y-auto"></div>
-    <div id="detail-overlay" class="hidden fixed inset-0 bg-black/30 z-30" onclick="closeDetailPanel()"></div>
   </div>
 
   <script>
@@ -145,17 +138,6 @@
       el.classList.add('active');
       const label = el.querySelector('.sidebar-label');
       if (label) document.getElementById('page-title').textContent = label.textContent.trim();
-    }
-
-    function openDetailPanel() {
-      document.getElementById('detail-panel').classList.remove('hidden');
-      document.getElementById('detail-overlay').classList.remove('hidden');
-    }
-
-    function closeDetailPanel() {
-      document.getElementById('detail-panel').classList.add('hidden');
-      document.getElementById('detail-overlay').classList.add('hidden');
-      document.getElementById('detail-panel').innerHTML = '';
     }
 
     function toggleTheme() {
@@ -237,6 +219,34 @@
       if (window.initSmartSearch && document.getElementById('smart-search-results')) window.initSmartSearch();
     }
 
+    document.body.addEventListener('click', function(e) {
+      const link = e.target.closest('.symbol-link');
+      if (link) {
+        const symbol = link.dataset.symbol;
+        if (!symbol) return;
+        e.preventDefault();
+        e.stopPropagation();
+        htmx.ajax('GET', '/dashboard/frag/symbol/' + encodeURIComponent(symbol), {
+          target: '#main-content',
+          pushURL: '/dashboard/symbol/' + encodeURIComponent(symbol),
+        });
+      }
+    });
+
+    document.body.addEventListener('click', function(e) {
+      const link = e.target.closest('.file-link');
+      if (link) {
+        const path = link.dataset.path;
+        if (!path) return;
+        e.preventDefault();
+        e.stopPropagation();
+        htmx.ajax('GET', '/dashboard/frag/file/' + encodeURIComponent(path), {
+          target: '#main-content',
+          pushURL: '/dashboard/file/' + encodeURIComponent(path),
+        });
+      }
+    });
+
     document.body.addEventListener('htmx:afterSwap', function(evt) {
       if (evt.detail.target.id === 'main-content') {
         requestAnimationFrame(() => {
@@ -245,14 +255,6 @@
           initTippyTooltips(evt.detail.target);
         });
       }
-      if (evt.detail.target.id === 'detail-panel') {
-        openDetailPanel();
-        initTippyTooltips(evt.detail.target);
-      }
-    });
-
-    document.addEventListener('keydown', function(e) {
-      if (e.key === 'Escape') closeDetailPanel();
     });
 
     window.addEventListener('load', function() {

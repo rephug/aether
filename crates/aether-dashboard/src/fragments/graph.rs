@@ -64,8 +64,8 @@ pub(crate) async fn graph_fragment(
                         "Load Graph"
                     }
                 }
-                    p class="text-xs text-text-muted" {
-                    "Click nodes in the graph to open component details in the right-side panel."
+                p class="text-xs text-text-muted" {
+                    "Click any node to open its full symbol deep dive in the main panel."
                 }
             }
 
@@ -74,7 +74,7 @@ pub(crate) async fn graph_fragment(
                 div id="graph-selection-panel" class="rounded-xl border border-surface-3/40 bg-surface-1/40 p-4 space-y-2" {
                     h3 class="text-sm font-semibold" { "Selection" }
                     p class="text-xs text-text-muted" {
-                        "Component details appear in the side panel when you click a graph node."
+                        "Graph node clicks load symbol deep dives directly in the main content area."
                     }
                     ul class="text-xs text-text-secondary space-y-1" {
                         li { "- circle color groups components by file" }

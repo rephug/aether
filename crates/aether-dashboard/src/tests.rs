@@ -189,7 +189,7 @@ async fn anatomy_file_fragment_contains_symbol_links_and_sir() {
             .to_vec(),
     )
     .unwrap();
-    assert!(body.contains("symbol-link text-blue-600 cursor-pointer"));
+    assert!(body.contains("symbol-link text-blue-600 hover:underline cursor-pointer"));
     assert!(body.contains("SIR Intent"));
 }
 
@@ -223,7 +223,7 @@ async fn search_fragment_contains_clickable_results() {
 }
 
 #[tokio::test]
-async fn symbol_detail_fragment_renders_sir_blocks() {
+async fn symbol_fragment_renders_narrative_sections() {
     let (_tmp, app, ids) = seeded_app().await;
     let response = app
         .oneshot(
@@ -242,9 +242,224 @@ async fn symbol_detail_fragment_renders_sir_blocks() {
             .to_vec(),
     )
     .unwrap();
-    assert!(body.contains("sir-block"));
+    assert!(body.contains("Symbol Deep Dive"));
+    assert!(body.contains("How It Fits"));
+    assert!(body.contains("How It Gets Used"));
+    assert!(body.contains("Side Effects &amp; Risks"));
     assert!(body.contains("Run demo task"));
-    assert!(body.contains("closeDetailPanel()"));
+}
+
+#[tokio::test]
+async fn tour_api_returns_stops_and_envelope() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/tour")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json.get("data").is_some());
+    assert!(json["data"]["stop_count"].is_number());
+    assert!(json["data"]["stops"].is_array());
+}
+
+#[tokio::test]
+async fn glossary_api_returns_terms_and_envelope() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/glossary")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json.get("data").is_some());
+    assert!(json["data"]["terms"].is_array());
+    assert!(json["data"]["total"].is_number());
+}
+
+#[tokio::test]
+async fn file_api_returns_file_narrative() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/file/src%2Flib.rs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["data"]["path"].is_string());
+    assert!(json["data"]["summary"].is_string());
+    assert!(json["data"]["symbols"].is_array());
+}
+
+#[tokio::test]
+async fn flow_api_returns_steps_for_start_symbol() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/flow?start=main")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["data"]["steps"].is_array());
+    assert!(json["data"]["step_count"].is_number());
+}
+
+#[tokio::test]
+async fn flow_api_returns_not_found_for_disconnected_path() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/flow?start=helper&end=main")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn flow_fragment_renders_builder_and_timeline() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let builder = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/flow")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(builder.status(), StatusCode::OK);
+    let builder_body = String::from_utf8(
+        to_bytes(builder.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(builder_body.contains("Trace Flow"));
+    assert!(builder_body.contains("Try tracing from"));
+
+    let timeline = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/flow?start=main")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(timeline.status(), StatusCode::OK);
+    let timeline_body = String::from_utf8(
+        to_bytes(timeline.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(timeline_body.contains("Step 1"));
+    assert!(timeline_body.contains("symbol-link text-blue-600 hover:underline cursor-pointer"));
+}
+
+#[tokio::test]
+async fn glossary_and_tour_fragments_render() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let glossary = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/glossary")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(glossary.status(), StatusCode::OK);
+    let glossary_body = String::from_utf8(
+        to_bytes(glossary.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(glossary_body.contains("📚 Glossary"));
+    assert!(glossary_body.contains("Spec"));
+
+    let tour = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/tour")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tour.status(), StatusCode::OK);
+    let tour_body = String::from_utf8(
+        to_bytes(tour.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(tour_body.contains("🗺️ Guided Tour"));
+    assert!(tour_body.contains("tour-content"));
+}
+
+#[tokio::test]
+async fn file_fragment_renders_file_narrative_page() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/file/src%2Flib.rs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("File Deep Dive"));
+    assert!(body.contains("How This File Works"));
+    assert!(body.contains("All Components In This File"));
 }
 
 #[tokio::test]

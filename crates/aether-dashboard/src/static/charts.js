@@ -139,7 +139,11 @@
         })
         .on('mouseout', () => tip.hide())
         .on('click', function (_event, d) {
-          htmx.ajax('GET', `/dashboard/frag/symbol/${d.id}`, '#detail-panel');
+          const encoded = encodeURIComponent(d.id);
+          htmx.ajax('GET', `/dashboard/frag/symbol/${encoded}`, {
+            target: '#main-content',
+            pushURL: `/dashboard/symbol/${encoded}`,
+          });
         })
         .on('contextmenu', function (event, d) {
           event.preventDefault();
@@ -225,7 +229,13 @@
         .attr('r', 4)
         .attr('fill', (d) => d.y >= 0.6 ? BASE_COLORS.danger : d.y >= 0.3 ? BASE_COLORS.warn : BASE_COLORS.ok)
         .style('cursor', 'pointer')
-        .on('click', (_e, d) => htmx.ajax('GET', `/dashboard/frag/symbol/${d.symbol_id}`, '#detail-panel'));
+        .on('click', (_e, d) => {
+          const encoded = encodeURIComponent(d.symbol_id);
+          htmx.ajax('GET', `/dashboard/frag/symbol/${encoded}`, {
+            target: '#main-content',
+            pushURL: `/dashboard/symbol/${encoded}`,
+          });
+        });
     }).catch(() => empty(container, 'Failed to load drift'));
   };
 

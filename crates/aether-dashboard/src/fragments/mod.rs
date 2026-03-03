@@ -11,12 +11,16 @@ mod blast_radius;
 mod causal;
 mod coupling;
 mod drift_table;
+mod file;
+mod flow;
+mod glossary;
 mod graph;
 mod health;
 mod overview;
 mod search_results;
-mod symbol_detail;
+mod symbol;
 mod time_machine;
+mod tour;
 mod xray;
 
 pub(crate) fn fragment_router() -> Router<Arc<DashboardState>> {
@@ -29,6 +33,14 @@ pub(crate) fn fragment_router() -> Router<Arc<DashboardState>> {
         .route(
             "/dashboard/frag/anatomy/file",
             get(anatomy::anatomy_file_fragment),
+        )
+        .route("/dashboard/frag/tour", get(tour::tour_fragment))
+        .route("/dashboard/frag/glossary", get(glossary::glossary_fragment))
+        .route("/dashboard/frag/flow", get(flow::flow_fragment))
+        .route("/dashboard/frag/file/{*path}", get(file::file_fragment))
+        .route(
+            "/dashboard/frag/symbol/{selector}",
+            get(symbol::symbol_fragment),
         )
         .route("/dashboard/frag/overview", get(overview::overview_fragment))
         .route("/dashboard/frag/xray", get(xray::xray_fragment))
@@ -49,10 +61,6 @@ pub(crate) fn fragment_router() -> Router<Arc<DashboardState>> {
             get(time_machine::time_machine_fragment),
         )
         .route("/dashboard/frag/causal", get(causal::causal_fragment))
-        .route(
-            "/dashboard/frag/symbol/{symbol_id}",
-            get(symbol_detail::symbol_detail_fragment),
-        )
         .route("/dashboard/frag/graph", get(graph::graph_fragment))
         .route(
             "/dashboard/frag/drift-table",

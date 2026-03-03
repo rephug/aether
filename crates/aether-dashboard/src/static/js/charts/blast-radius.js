@@ -109,7 +109,11 @@
       .on('mouseout', () => tip.hide())
       .on('click', (event, d) => {
         if (event.shiftKey) {
-          htmx.ajax('GET', `/dashboard/frag/symbol/${d.symbol_id}`, '#blast-radius-detail');
+          const encoded = encodeURIComponent(d.symbol_id);
+          htmx.ajax('GET', `/dashboard/frag/symbol/${encoded}`, {
+            target: '#main-content',
+            pushURL: `/dashboard/symbol/${encoded}`,
+          });
           return;
         }
         const hidden = document.getElementById('blast-symbol-id');

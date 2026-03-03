@@ -494,42 +494,6 @@ pub(crate) fn sir_excerpt_for_symbol(shared: &SharedState, symbol_id: &str) -> O
     Some(truncate_text(&compact, SIR_EXCERPT_MAX_LEN))
 }
 
-pub(crate) fn sir_key_values_for_symbol(
-    shared: &SharedState,
-    symbol_id: &str,
-) -> Vec<(String, String)> {
-    let blob = match shared.store.read_sir_blob(symbol_id) {
-        Ok(Some(blob)) => blob,
-        _ => return Vec::new(),
-    };
-
-    let value: Value = match serde_json::from_str(&blob) {
-        Ok(value) => value,
-        Err(_) => return Vec::new(),
-    };
-    let Some(obj) = value.as_object() else {
-        return Vec::new();
-    };
-
-    let mut out = obj
-        .iter()
-        .map(|(k, v)| (k.clone(), value_to_display(v)))
-        .collect::<Vec<_>>();
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
-}
-
-fn value_to_display(value: &Value) -> String {
-    match value {
-        Value::String(s) => s.clone(),
-        Value::Null => "null".to_owned(),
-        Value::Bool(b) => b.to_string(),
-        Value::Number(n) => n.to_string(),
-        Value::Array(arr) => truncate_text(&serde_json::to_string(arr).unwrap_or_default(), 200),
-        Value::Object(map) => truncate_text(&serde_json::to_string(map).unwrap_or_default(), 200),
-    }
-}
-
 pub(crate) fn truncate_text(input: &str, max_chars: usize) -> String {
     let trimmed = input.trim();
     if trimmed.chars().count() <= max_chars {

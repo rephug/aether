@@ -54,7 +54,13 @@
         return window.AetherTheme.communityColor(d.community_id || 0);
       })
       .attr('class', (d) => d.drift_score_at_time > 0.3 ? 'aether-pulse' : '')
-      .on('click', (_e, d) => htmx.ajax('GET', `/dashboard/frag/symbol/${encodeURIComponent(d.id)}`, '#detail-panel'));
+      .on('click', (_e, d) => {
+        const encoded = encodeURIComponent(d.id);
+        htmx.ajax('GET', `/dashboard/frag/symbol/${encoded}`, {
+          target: '#main-content',
+          pushURL: `/dashboard/symbol/${encoded}`,
+        });
+      });
 
     sim.on('tick', () => {
       link
