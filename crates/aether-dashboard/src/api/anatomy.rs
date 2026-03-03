@@ -10,9 +10,11 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::api::common;
+use crate::api::difficulty::DifficultyView;
 use crate::narrative::{
     Dep, FileInfo, Layer, LayerAssignmentsCache, SirIntent, SymbolInfo, classify_layer,
-    compose_file_summary, compose_layer_narrative, compose_project_summary, layer_catalog,
+    compose_file_summary, compose_layer_narrative, compose_project_summary,
+    compute_difficulty_from_fields, layer_catalog,
 };
 use crate::state::SharedState;
 use crate::support::{self, DashboardState};
@@ -76,6 +78,7 @@ pub(crate) struct KeyActor {
     pub description: String,
     pub centrality: f64,
     pub dependents_count: usize,
+    pub difficulty: DifficultyView,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -834,6 +837,13 @@ fn build_key_actors(
                 .get(symbol.id.as_str())
                 .copied()
                 .unwrap_or(0),
+            difficulty: difficulty_from_sir(
+                symbol.sir.intent.as_str(),
+                symbol.sir.error_modes.len(),
+                symbol.sir.side_effects.len(),
+                symbol.sir.dependencies.len(),
+                symbol.sir.is_async,
+            ),
         });
     }
 
@@ -893,4 +903,22 @@ fn build_simplified_graph(
         nodes,
         edges: simplified_edges,
     })
+}
+
+fn difficulty_from_sir(
+    intent: &str,
+    error_count: usize,
+    side_effect_count: usize,
+    dep_count: usize,
+    is_async: bool,
+) -> DifficultyView {
+    let score =
+        compute_difficulty_from_fields(intent, error_count, side_effect_count, dep_count, is_async);
+    DifficultyView {
+        score: score.score,
+        emoji: score.emoji,
+        label: score.label,
+        guidance: score.guidance,
+        reasons: score.reasons,
+    }
 }

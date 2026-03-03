@@ -409,8 +409,21 @@
   display: none !important;
 }
 
+.complexity-expert .teaching-note {
+  display: none !important;
+}
+
 .complexity-expert [data-tippy-content] {
   cursor: default;
+}
+
+.graph-color-button-active {
+  background: rgba(14, 165, 168, 0.14);
+  color: #0ea5a8;
+}
+
+.graph-color-button-inactive {
+  color: #64748b;
 }
 
 .metric-help {

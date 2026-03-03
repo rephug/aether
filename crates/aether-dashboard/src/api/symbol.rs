@@ -10,6 +10,7 @@ use serde::Serialize;
 use crate::api::catalog::{
     CatalogSymbol, SymbolCatalog, load_symbol_catalog, parse_dependency_entry,
 };
+use crate::api::difficulty::{DifficultyView, difficulty_for_symbol};
 use crate::narrative::{
     Dependency, Dependent, LayerMap, compose_dependencies_narrative, compose_dependents_narrative,
 };
@@ -83,6 +84,7 @@ pub(crate) struct SymbolDeepDiveData {
     pub side_effects: NarrativeListSection,
     pub error_modes: NarrativeListSection,
     pub blast_radius: BlastRadiusSection,
+    pub difficulty: DifficultyView,
 
     pub centrality: f64,
     pub centrality_rank: usize,
@@ -276,6 +278,8 @@ pub(crate) fn build_symbol_deep_dive(
         })
         .collect::<Vec<_>>();
 
+    let difficulty = difficulty_for_symbol(&symbol);
+
     let data = SymbolDeepDiveData {
         name: symbol.name,
         kind: symbol.kind,
@@ -298,6 +302,7 @@ pub(crate) fn build_symbol_deep_dive(
         side_effects,
         error_modes,
         blast_radius,
+        difficulty,
         centrality: catalog.centrality(symbol.id.as_str()),
         centrality_rank: rank,
         centrality_narrative,

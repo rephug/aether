@@ -33,9 +33,28 @@ pub(crate) async fn graph_fragment(
                     span class="intermediate-only" { "Project Dependency Graph" }
                     span class="expert-only" { "Dependency Graph" }
                 }
-                span class="badge badge-muted" {
-                    "Depth: 2 "
-                    (support::help_icon("Depth controls how many dependency hops are loaded from the selected root component."))
+                div class="flex items-center gap-2" {
+                    span class="badge badge-muted" {
+                        "Depth: 2 "
+                        (support::help_icon("Depth controls how many dependency hops are loaded from the selected root component."))
+                    }
+                    div class="inline-flex items-center rounded-md border border-surface-3/50 bg-surface-0/60 p-1 text-xs" {
+                        span class="px-2 text-text-muted" { "Color by:" }
+                        button
+                            type="button"
+                            id="graph-color-layer"
+                            onclick="setGraphColorMode('layer')"
+                            class="rounded px-2 py-1 hover:bg-surface-3/30 graph-color-button-inactive" {
+                            "Layer"
+                        }
+                        button
+                            type="button"
+                            id="graph-color-difficulty"
+                            onclick="setGraphColorMode('difficulty')"
+                            class="rounded px-2 py-1 hover:bg-surface-3/30 graph-color-button-inactive" {
+                            "Difficulty"
+                        }
+                    }
                 }
             }
 
@@ -77,7 +96,7 @@ pub(crate) async fn graph_fragment(
                         "Graph node clicks load symbol deep dives directly in the main content area."
                     }
                     ul class="text-xs text-text-secondary space-y-1" {
-                        li { "- circle color groups components by file" }
+                        li { "- color mode can group by layer or LLM difficulty" }
                         li { "- cyan outline means understanding data exists" }
                         li { "- zoom/pan available with mouse wheel and drag" }
                     }
