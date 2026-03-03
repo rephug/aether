@@ -1,472 +1,341 @@
+
 <p align="center">
-  <img src="docs/assets/aether-logo.jpg" alt="AETHER Logo" width="200" />
+  <img src="docs/assets/aether-logo.jpg" alt="AETHER" width="600" />
 </p>
 
-<h1 align="center"></h1>
-<p align="center"><strong>Active Semantic Simulation Engine</strong></p>
-<p align="center">A verified, living graph of your codebase — not just searchable text.</p>
+<p align="center">
+  <strong>Your codebase already knows everything. It just can't talk yet.</strong>
+</p>
 
 <p align="center">
-  <a href="#quick-start">Quick Start</a> •
-  <a href="#what-aether-does">What It Does</a> •
-  <a href="#architecture">Architecture</a> •
-  <a href="#mcp-tools">MCP Tools</a> •
-  <a href="#cli-reference">CLI Reference</a> •
-  <a href="#configuration">Configuration</a> •
-  <a href="#development">Development</a>
+  <a href="#what-the-hell-is-this">What Is This</a> •
+  <a href="#get-it-running">Get It Running</a> •
+  <a href="#what-you-can-actually-do">What You Can Do</a> •
+  <a href="#the-mcp-tools">MCP Tools</a> •
+  <a href="#the-dashboard">Dashboard</a> •
+  <a href="#configuration">Config</a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Rust-orange?style=flat-square&logo=rust" />
+  <img src="https://img.shields.io/badge/Rust%20%7C%20TypeScript%20%7C%20Python-green?style=flat-square&label=parses" />
+  <img src="https://img.shields.io/badge/MCP-compatible-purple?style=flat-square" />
 </p>
 
 ---
 
-> *"This function is the most critical in your codebase, changed meaning 3 times this month, has no test guards, and sits at a module boundary violation."*
->
-> — That's the kind of answer AETHER gives.
+## What the Hell Is This
 
-Most code intelligence tools operate on one layer — text search, or static analysis, or git blame. AETHER operates on **five layers simultaneously** and fuses them into cross-layer queries that no existing tool can answer:
+AETHER is a semantic intelligence engine for codebases. It watches your code, figures out what every function *actually does*, tracks how that meaning changes over time, maps the dependency graph, and then lets you — or your AI agent — ask questions about it.
 
-| Layer | Source | Example Query |
-|-------|--------|---------------|
-| **Structure** | Tree-sitter AST | "What calls `process_payment`?" |
-| **Semantics** | AI-generated SIR summaries | "What does this function *mean*?" |
-| **Dependencies** | CozoDB graph | "What's the blast radius if this breaks?" |
-| **History** | Git + SIR versioning | "How has this function's purpose changed?" |
-| **Similarity** | LanceDB vector search | "What other code does something similar?" |
+Not text search. Not grep with extra steps. Not another RAG tool that forgets everything between sessions.
 
-AETHER watches your code, understands what it *means*, tracks how that meaning *changes*, and exposes that intelligence to both humans and AI agents through MCP tools, LSP hover, and a CLI.
+AETHER *understands* your code. Persistently. Incrementally. And it remembers.
 
-## Quick Start
+**Here's what that means in practice:**
 
-```bash
-# Install from source
-cargo install --path crates/aetherd
-cargo install --path crates/aether-query
+You hover over a function in VS Code and instead of seeing a type signature, you see: *"Validates and processes a payment transaction. Deducts from account balance, writes to audit log. Can fail on insufficient funds, negative amounts, or database timeout. Has 7 edge cases, 2 of which have test coverage."*
 
-# Index your project
-aetherd --workspace .
+You ask your AI agent "what broke the order validation?" and instead of guessing, it traces the causal chain through the dependency graph and tells you: *"validate_amount() changed its error type from String to ValidationError in commit abc123 — process_order() was pattern-matching on the old type."*
 
-# Search for symbols
-aetherd --workspace . --search "payment processing" --search-mode hybrid
+You open the dashboard and see which functions are the most critical nodes in your codebase, which ones are silently drifting in purpose, and which ones have zero test coverage despite sitting at a module boundary.
 
-# Start the LSP server with background indexing
-aetherd --workspace . --lsp --index
+That's AETHER.
 
-# Start the MCP-over-HTTP query server
-aether-query serve --index-path .
+---
+
+## How It Works (The Short Version)
+
+```
+Your code changes
+       │
+       ▼
+  tree-sitter parses it
+  (extracts every function, struct, trait, class + who calls what)
+       │
+       ▼
+  An LLM reads each symbol and generates a SIR
+  (Semantic Intent Representation — a structured summary of
+   what the code does, how it fails, what it depends on)
+       │
+       ▼
+  Everything gets stored in three databases
+  SQLite (metadata) + SurrealDB (graph) + LanceDB (vectors)
+       │
+       ▼
+  You query it however you want
+  CLI  ·  LSP hover  ·  MCP tools  ·  Web dashboard
 ```
 
-### Give AI Agents Persistent Memory
+All of this runs locally. No code leaves your machine unless you choose a cloud provider. Run Ollama and AETHER works fully offline with real AI-generated intelligence — no API keys, no cloud calls, nothing phoning home.
 
-Register AETHER for MCP access from Claude Code, Codex, or any MCP-compatible agent:
+---
 
-```bash
-# Start the read-only MCP server (HTTP/SSE)
-aether-query serve --index-path .
-
-# Verify server health
-aether-query status --bind 127.0.0.1:9721
-
-# Then configure your MCP client to use:
-# http://127.0.0.1:9721/mcp
-#
-# Then ask your agent:
-# "What does process_payment do?"
-# "What upstream change most likely broke the order validation?"
-# "Show me the health dashboard for the payments module"
-# "Snapshot the intent of src/payments/ before I refactor"
-```
-
-## What AETHER Does
-
-### Core Intelligence (Phases 1–4)
-
-**Semantic Intent Records (SIR)** — AETHER doesn't just index your code; it *understands* it. For every function, struct, trait, and module, it generates a structured summary via Gemini Flash that captures purpose, parameters, return values, error modes, edge cases, and dependencies. These summaries are versioned, searchable, and diffable.
-
-**Dependency Graphs** — Tree-sitter AST analysis extracts CALLS and DEPENDS_ON edges between symbols, stored in CozoDB as a queryable graph. This enables recursive traversal, community detection, cycle analysis, and PageRank — the foundation for everything in Phase 6.
-
-**Hybrid Search** — Lexical search via SQL, semantic search via LanceDB vector embeddings, and Reciprocal Rank Fusion to combine results. Searches span symbols, project notes, test intents, and coupling data simultaneously.
-
-**Git-Linked History** — Every SIR version is linked to the commit that triggered it. AETHER answers "what did this function do 20 commits ago?" and computes the semantic diff between any two versions.
-
-### Project Intelligence (Phase 6 — The Chronicler)
-
-Phase 6 transforms AETHER from code intelligence into *project* intelligence. These capabilities are what makes AETHER genuinely different — they only work because AST + SIR + graph + git + vectors all live in the same process:
-
-**Project Memory** — Persistent storage for architecture decisions, design rationale, and session context. Agents `aether_remember` context and `aether_recall` it across sessions. Content-hash deduplication prevents bloat.
-
-**Multi-Signal Coupling** — Detects logically coupled files by fusing three independent signals: git co-change frequency, AST dependency edges, and semantic SIR similarity. The fused score is more reliable than any single signal alone.
-
-**Test Intent Extraction** — Parses test files to extract what each test guards (`it("should reject empty currency codes")`), creates TESTED_BY graph edges, and identifies symbols with inadequate test coverage relative to their SIR edge cases.
-
-**Semantic Drift Detection** — Detects when a function's *meaning* is changing incrementally by comparing current SIR embeddings against historical baselines. Runs Louvain community detection on the dependency graph to flag architectural boundary violations — no manually maintained architecture model required.
-
-**Causal Change Chains** — Traces the semantic causal chain backward through dependencies to find which upstream change most likely broke something. `git blame` tells you who changed a line; AETHER tells you *which upstream semantic change broke your downstream code and what specifically changed about it*.
-
-**Graph Health Dashboard** — Applies CozoDB graph algorithms (PageRank, betweenness centrality, SCC, connected components, Louvain) to the dependency graph and cross-references with SIR quality, test coverage, drift magnitude, and access recency to produce composite risk scores per symbol.
-
-**Intent Verification** — Snapshot SIR state before a refactor. After the refactor, verify which symbols preserved their original intent and which shifted — even when all tests pass. Tests verify *behavior*; AETHER verifies *intent preservation*.
-
-## Architecture
-
-### Data Flow
-
-```mermaid
-flowchart LR
-    subgraph Input
-        SRC[Source Files<br/>Rust · TS · Python]
-        GIT[Git History]
-    end
-
-    subgraph Parsing
-        TP[aether-parse<br/>Tree-sitter AST]
-    end
-
-    subgraph Intelligence
-        INF[aether-infer<br/>Gemini · Qwen · Mock]
-        AN[aether-analysis<br/>Drift · Causal<br/>Health · Intent]
-        MEM[aether-memory<br/>Notes · Search]
-    end
-
-    subgraph Storage
-        SQL[(SQLite<br/>Symbols · SIR<br/>History · Notes)]
-        COZO[(CozoDB<br/>Dependency Graph<br/>Co-change Edges)]
-        LANCE[(LanceDB<br/>Vector Embeddings<br/>ANN Search)]
-    end
-
-    subgraph Interfaces
-        MCP[aether-mcp<br/>17 MCP Tools]
-        LSP[aether-lsp<br/>Hover · Search]
-        CLI[aetherd<br/>CLI Commands]
-    end
-
-    SRC --> TP
-    GIT --> AN
-    TP -->|symbols + edges| SQL
-    TP -->|dependency edges| COZO
-    TP -->|symbol context| INF
-    INF -->|SIR text| SQL
-    INF -->|SIR embeddings| LANCE
-    AN -->|drift, coupling| SQL
-    AN -->|co-change edges| COZO
-    MEM -->|note embeddings| LANCE
-    MEM -->|notes| SQL
-
-    SQL --> MCP
-    COZO --> MCP
-    LANCE --> MCP
-    SQL --> LSP
-    SQL --> CLI
-    COZO --> CLI
-    LANCE --> CLI
-```
-
-### Cross-Layer Query Fusion
-
-This is what makes AETHER's architecture unique — a single query can traverse all five layers:
-
-```mermaid
-flowchart TB
-    Q["aether health --min-risk 0.5"]
-
-    Q --> PG[PageRank<br/>Graph Layer]
-    Q --> TC[Test Coverage<br/>AST + Graph Layer]
-    Q --> SD[Semantic Drift<br/>Vector + History Layer]
-    Q --> SIR[SIR Quality<br/>Semantic Layer]
-    Q --> AR[Access Recency<br/>Usage Layer]
-
-    PG -->|0.30 weight| RS[Composite<br/>Risk Score]
-    TC -->|0.25 weight| RS
-    SD -->|0.20 weight| RS
-    SIR -->|0.15 weight| RS
-    AR -->|0.10 weight| RS
-
-    RS --> OUT["process_payment: risk 0.87<br/>pagerank 0.78 (top 5%)<br/>semantic drift 0.31 over 50 commits<br/>2 test guards for 7 edge cases<br/>boundary violation: 2 communities"]
-
-    style OUT text-align:left
-```
-
-### Workspace Crates
-
-```mermaid
-graph TD
-    AETHERD[aetherd<br/>CLI + Daemon] --> MCP[aether-mcp<br/>MCP Tools]
-    AETHERD --> LSP[aether-lsp<br/>LSP Server]
-    AETHERD --> AN[aether-analysis<br/>Drift · Causal · Health · Intent]
-    AETHERD --> MEM[aether-memory<br/>Notes · Search]
-
-    MCP --> STORE[aether-store<br/>SQLite + CozoDB + LanceDB]
-    MCP --> INF[aether-infer<br/>SIR Generation]
-    LSP --> STORE
-    AN --> STORE
-    AN --> INF
-    AN --> MEM
-    MEM --> STORE
-
-    STORE --> PARSE[aether-parse<br/>Tree-sitter AST]
-    STORE --> CORE[aether-core<br/>Symbol Model · IDs]
-    INF --> SIR_CRATE[aether-sir<br/>SIR Schema]
-
-    PARSE --> CORE
-    CORE --> CONFIG[aether-config<br/>TOML Config]
-
-    style AETHERD fill:#4a9eff,color:#fff
-    style STORE fill:#ff6b6b,color:#fff
-    style AN fill:#ffa94d,color:#fff
-```
-
-### Storage Layers
-
-| Layer | Technology | Contents |
-|-------|-----------|----------|
-| Relational | SQLite | Symbols, SIR blobs, SIR history, project notes, test intents, drift results, intent snapshots, coupling state |
-| Graph | CozoDB | Dependency edges (CALLS, DEPENDS_ON), co-change edges, tested_by, community assignments |
-| Vector | LanceDB | SIR embeddings, project note embeddings for ANN semantic search |
-
-### Inference Providers
-
-AETHER uses a pluggable provider system for SIR generation and embeddings:
-
-| Provider | Use Case | Configuration |
-|----------|----------|---------------|
-| Gemini Flash | Cloud SIR generation (default) | `[inference] provider = "gemini"` |
-| Qwen | Alternative cloud provider | `[inference] provider = "qwen3"` |
-| Mock | Offline/testing, deterministic output | `[inference] provider = "mock"` |
-
-## MCP Tools
-
-AETHER exposes 20 MCP tools for AI agent integration:
-
-### Core Tools
-| Tool | Purpose |
-|------|---------|
-| `aether_symbol_lookup` | Find symbols by name or pattern |
-| `aether_explain` | Get SIR-powered explanation of a symbol |
-| `aether_get_sir` | Retrieve raw SIR JSON for a symbol |
-| `aether_search` | Hybrid lexical + semantic search |
-| `aether_why_changed` | Show SIR diff between two versions of a symbol |
-
-### Project Memory Tools
-| Tool | Purpose |
-|------|---------|
-| `aether_remember` | Store a project note with deduplication |
-| `aether_recall` | Search project notes by query |
-| `aether_session_note` | Quick context capture during agent sessions |
-| `aether_ask` | Unified search across all knowledge types |
-
-### Analysis Tools
-| Tool | Purpose |
-|------|---------|
-| `aether_blast_radius` | Multi-signal coupling analysis + risk assessment |
-| `aether_test_intents` | Query test guards for a file or symbol |
-| `aether_drift_report` | Semantic drift + boundary violation analysis |
-| `aether_acknowledge_drift` | Dismiss known drift, create project note |
-| `aether_trace_cause` | Causal change chain tracing for root cause analysis |
-| `aether_health` | Graph health dashboard with composite risk scoring |
-| `aether_call_chain` | Trace outgoing call chains from a symbol up to N depth levels |
-| `aether_dependencies` | List callers and dependencies for a symbol |
-| `aether_status` | Report workspace indexing status, SIR coverage, and provider info |
-| `aether_symbol_timeline` | Show SIR version history for a symbol across commits |
-| `aether_verify` | Run configured verification commands and return structured results |
-
-## CLI Reference
-
-### Indexing & Server
-
-```bash
-aetherd --workspace .                         # Index + watch project
-aetherd --workspace . --index-once            # Run one full index pass and exit
-aetherd --workspace . --lsp --index           # Start LSP with background indexing
-aether-query serve --index-path .             # Start MCP-over-HTTP query server
-```
-
-### Search & Query
-
-```bash
-aetherd --workspace . --search "payment validation" --search-mode hybrid --search-limit 10
-aetherd --workspace . ask "what handles currency validation?" --limit 5
-aetherd --workspace . recall "currency validation" --mode hybrid --limit 5
-```
-
-### Project Memory
-
-```bash
-aetherd --workspace . remember "Chose CozoDB over KuzuDB — KuzuDB archived Oct 2025"
-aetherd --workspace . recall "graph storage decision"
-aetherd --workspace . notes --limit 20
-```
-
-### Analysis
-
-```bash
-# Coupling
-aetherd --workspace . mine-coupling --commits 100
-aetherd --workspace . blast-radius src/payments/processor.rs
-aetherd --workspace . coupling-report
-
-# Drift
-aetherd --workspace . drift-report --window "50 commits" --min-drift 0.15
-aetherd --workspace . drift-ack <result_id> --note "Intentional per ADR-23"
-aetherd --workspace . communities --format table
-
-# Causal chains
-aetherd --workspace . trace-cause process_payment --file src/payments/processor.rs --lookback "20 commits"
-
-# Health
-aetherd --workspace . health --limit 10 --min-risk 0.5
-aetherd --workspace . health critical
-
-# Verification
-aetherd --workspace . --verify
-```
-
-## Configuration
-
-AETHER uses a TOML configuration file (`.aether/config.toml`):
-
-```toml
-[workspace]
-root = "."
-watch = true
-
-[inference]
-provider = "gemini"              # "gemini" | "qwen3" | "mock"
-api_key_env = "GEMINI_API_KEY"
-
-[embeddings]
-provider = "gemini"
-dimensions = 768
-
-[search]
-lexical_weight = 0.4
-semantic_weight = 0.6
-
-[drift]
-enabled = true
-drift_threshold = 0.85
-analysis_window = "100 commits"
-auto_analyze = false
-hub_percentile = 95
-
-[health]
-enabled = true
-[health.risk_weights]
-pagerank = 0.3
-test_gap = 0.25
-drift = 0.2
-no_sir = 0.15
-recency = 0.1
-
-[intent]
-enabled = true
-similarity_preserved_threshold = 0.90
-similarity_shifted_threshold = 0.70
-auto_regenerate_sir = true
-```
-
-### Cloud Providers (OpenAI-Compatible)
-
-Z.ai (GLM-4.7) for low-cost general coding inference:
-
-```toml
-[inference]
-provider = "openai_compat"
-endpoint = "https://api.z.ai/api/paas/v4"
-model = "glm-4.7"
-api_key_env = "ZAI_API_KEY"
-```
-
-NanoGPT (Qwen3 Coder) for access to hosted open-source coding models:
-
-```toml
-[inference]
-provider = "openai_compat"
-endpoint = "https://nano-gpt.com/api/v1"
-model = "qwen3-coder:480b-cloud"
-api_key_env = "NANOGPT_API_KEY"
-```
-
-OpenRouter for model routing across multiple providers:
-
-```toml
-[inference]
-provider = "openai_compat"
-endpoint = "https://openrouter.ai/api/v1"
-model = "anthropic/claude-sonnet-4.5"
-api_key_env = "OPENROUTER_API_KEY"
-```
-
-## Development
-
-### Prerequisites
-
-- Rust (stable)
-- mold linker + clang
-- protoc (Protocol Buffers compiler)
-
-### Build
+## Get It Running
 
 ```bash
 git clone https://github.com/rephug/aether.git
 cd aether
+cargo build -p aetherd -p aether-mcp -p aether-query
+```
 
+Index your project:
+
+```bash
+# One-shot: index everything and print what it found
+aetherd --workspace /path/to/project --index-once --print-sir
+
+# Watch mode: runs continuously, re-indexes on every save (300ms debounce)
+aetherd --workspace /path/to/project --print-events --print-sir
+```
+
+Search it:
+
+```bash
+# Plain text search
+aetherd --workspace . --search "authenticate"
+
+# Semantic search (finds code by meaning, not just name)
+aetherd --workspace . --search "handles user login flow" --search-mode semantic
+
+# Hybrid (fuses both via Reciprocal Rank Fusion)
+aetherd --workspace . --search "payment validation" --search-mode hybrid
+```
+
+Hook up your AI agent:
+
+```bash
+# Register as MCP server for Claude Code
+claude mcp add --transport stdio --scope project aether -- aetherd --workspace . --mcp
+```
+
+Now your agent has persistent, structured access to your entire codebase's meaning. It doesn't have to re-read files every session. It doesn't have to guess. It *knows*.
+
+---
+
+## What You Can Actually Do
+
+### Understand Any Symbol Instantly
+
+Hover in VS Code. Run a CLI lookup. Ask via MCP. For every function, struct, trait, and class, AETHER gives you the full picture — intent, inputs, outputs, dependencies, error modes, edge cases, side effects, and a confidence score. These aren't docstrings scraped from comments. They're AI-generated structured annotations produced by actually reading the code.
+
+### Search by Meaning, Not Just Text
+
+`grep` finds text. AETHER finds *intent*. Search for "handles authentication" and get back every function involved in auth — even if none of them have "auth" in the name. Semantic search uses vector embeddings with per-language adaptive thresholds so Rust's tighter clustering doesn't drown out Python's looser naming conventions.
+
+### See the Blast Radius Before You Touch Anything
+
+Change a function? AETHER tells you every downstream symbol that depends on it, how many hops deep the impact goes, which of those symbols have test guards, and which ones are flying blind. Before you refactor, you know exactly what you're about to break.
+
+### Detect Semantic Drift Automatically
+
+Functions accumulate scope creep. What started as "checks amount is positive" quietly becomes "full payment validation with fraud checks, rate limiting, and compliance." AETHER detects this automatically by comparing current SIR embeddings against historical baselines. No manually maintained architecture model required — it runs Louvain community detection on the dependency graph and flags boundary violations on its own.
+
+### Trace the Root Cause of Breaking Changes
+
+`git blame` tells you who changed a line. AETHER tells you *which upstream semantic change broke your downstream code and what specifically changed about it*. It traces the causal chain backward through the dependency graph, comparing SIR versions at each node, until it finds the commit where the meaning diverged.
+
+### Know Which Code Is Most Dangerous
+
+Graph algorithms (PageRank, betweenness centrality, connected components) identify the most critical nodes in your codebase. Cross-reference that with test coverage, drift magnitude, and access recency and you get a composite risk score per symbol. The functions that are simultaneously high-traffic, poorly tested, and actively drifting? Those are the ones that will ruin your weekend.
+
+### Remember Project Context Across Sessions
+
+Architecture decisions, design rationale, "why we chose X over Y" — store it via MCP and recall it later. Your AI agent can `aether_remember` context and `aether_recall` it across sessions. Content-hash deduplication prevents bloat. Your agent no longer starts every conversation with amnesia.
+
+### Verify Intent After Refactoring
+
+Tests verify *behavior*. AETHER verifies *intent*. Snapshot the SIR state before a refactor, do the refactor, then compare. AETHER tells you which symbols preserved their original purpose and which ones shifted — even when all tests still pass.
+
+### Find Coupled Code You Didn't Know Was Coupled
+
+AETHER fuses three independent signals — git co-change frequency, AST dependency edges, and semantic SIR similarity — to detect logically coupled files. Two files that always change together, share dependencies, AND have similar semantics? They're coupled. The fused score is more reliable than any single signal alone.
+
+### Know What Your Tests Actually Guard
+
+AETHER parses test files to extract what each test is supposed to protect (`it("should reject empty currency codes")`). It creates `TESTED_BY` graph edges and identifies symbols with inadequate test coverage relative to their SIR-documented edge cases. Seven edge cases, two tests? You'll know.
+
+---
+
+## The Dashboard
+
+A web-based visualization layer. HTMX + D3.js + Tailwind. No React. No Node.js. No build step. Just start the daemon and open your browser.
+
+```bash
+aetherd --workspace . --features dashboard
+# → http://localhost:9720/dashboard
+```
+
+| Page | What It Shows |
+|:-----|:-------------|
+| **Overview** | Symbol counts, SIR coverage, language breakdown, system health at a glance |
+| **X-Ray** | Hotspot analysis — which symbols are most critical by PageRank, churn, and risk |
+| **Blast Radius** | Interactive graph showing the downstream impact zone when a symbol changes |
+| **Architecture Map** | Force-directed dependency graph with Louvain community coloring |
+| **Time Machine** | Semantic drift timelines — watch how symbol meanings evolve across commits |
+| **Causal Explorer** | Trace breaking changes visually through the dependency chain |
+| **Smart Search** | "Ask AETHER" — one search bar across symbols, notes, coupling, and test intents |
+
+---
+
+## The MCP Tools
+
+Register AETHER with any MCP-compatible agent (Claude Code, Codex, etc.) and it gets structured access to everything. 20+ tools, zero guessing.
+
+### Search & Lookup
+
+| Tool | What It Does |
+|:-----|:------------|
+| `aether_status` | Workspace health — symbol count, SIR coverage, store paths |
+| `aether_search` | Semantic / lexical / hybrid symbol search |
+| `aether_symbol_lookup` | Find symbols by qualified name or file path |
+| `aether_get_sir` | Full SIR annotation for any symbol |
+| `aether_explain` | AI explanation of a symbol at a specific file:line:column |
+
+### History
+
+| Tool | What It Does |
+|:-----|:------------|
+| `aether_symbol_timeline` | SIR version history with git commit linkage |
+| `aether_why_changed` | Semantic diff between any two SIR versions |
+| `aether_verify` | Run verification commands, get structured results |
+
+### Intelligence
+
+| Tool | What It Does |
+|:-----|:------------|
+| `aether_remember` | Store a project note (decision, rationale, context) |
+| `aether_recall` | Retrieve notes by semantic search |
+| `aether_coupling` | Multi-signal coupling analysis for a file or symbol |
+| `aether_test_intents` | Test guard coverage for a symbol |
+| `aether_drift` | Semantic drift report for a symbol or module |
+| `aether_causal_chain` | Root cause tracing through the dependency graph |
+| `aether_blast_radius` | Downstream impact analysis |
+| `aether_health` | Composite risk scores from graph algorithms |
+| `aether_snapshot_intent` | Snapshot SIR state before a refactor |
+| `aether_verify_intent` | Compare current SIR against a saved snapshot |
+
+Every response includes `schema_version` for forward compatibility. Your agent scripts won't break when AETHER updates.
+
+---
+
+## VS Code Extension
+
+Lives in `vscode-extension/`. Gives you semantic hover intelligence without leaving your editor.
+
+```bash
+cd vscode-extension && npm install && npm run build
+# F5 to launch Extension Development Host
+```
+
+- **Hover** any Rust, TypeScript, or Python symbol → see its SIR summary
+- **Status bar** shows `AETHER: indexing` / `idle` with stale/error indicators
+- **Command palette**: Index Once, Search Symbols, Select Provider, Restart Server
+
+---
+
+## Configuration
+
+Everything lives in `.aether/config.toml`, auto-created on first run.
+
+```toml
+[inference]
+provider = "auto"              # auto | mock | gemini | ollama | openai_compat
+api_key_env = "GEMINI_API_KEY"
+
+[inference.openai_compat]
+base_url = "https://api.z.ai/v1"
+api_key_env = "ZAI_API_KEY"
+model = "gemini-2.0-flash"
+
+[embeddings]
+enabled = true
+provider = "qwen3_local"      # mock | qwen3_local | gemini
+
+[search.thresholds]
+default = 0.65
+rust = 0.70
+typescript = 0.65
+python = 0.60
+
+[dashboard]
+enabled = true
+port = 9720
+
+[verify]
+mode = "host"                  # host | container
+commands = ["cargo test", "cargo clippy -- -D warnings"]
+```
+
+### Pick Your Intelligence Backend
+
+| Provider | Needs | Good For |
+|:---------|:------|:---------|
+| `ollama` | Local Ollama server | Full offline intelligence (qwen2.5-coder:7b) — no API keys, no cloud |
+| `gemini` | API key | Production-quality SIR (Gemini Flash) |
+| `openai_compat` | API key + URL | Z.ai, NanoGPT, OpenRouter, or anything OpenAI-compatible |
+| `mock` | Nothing | CI pipelines, testing, development — deterministic, instant |
+
+`auto` tries `gemini` first, falls back to `ollama` if available, then `mock`.
+
+---
+
+## The Stack
+
+For the curious:
+
+| Thing | What |
+|:------|:-----|
+| Language | Rust (multi-crate workspace, ~15 crates) |
+| Parsing | tree-sitter (Rust, TypeScript/JS, Python — more coming) |
+| Graph DB | SurrealDB 3.0 + SurrealKV |
+| Vector Store | LanceDB |
+| Metadata | SQLite (WAL mode) |
+| Local Embeddings | Qwen3-Embedding-0.6B via Candle |
+| Reranking | Qwen3-Reranker-0.6B via Candle |
+| Dashboard | HTMX + D3.js + Tailwind CSS (no build step) |
+| HTTP | Axum + tower-http |
+| MCP Transport | stdio (LSP) + HTTP/SSE (query server) |
+| Git | gix (native Rust, no shelling out) |
+
+---
+
+## Why Not Just Use [Other Thing]?
+
+| | grep / ctags | Copilot / Cursor | Augment Code | RAG tools | AETHER |
+|:--|:------------|:-----------------|:-------------|:----------|:-------|
+| Understands intent | Nope | Per-query, forgets immediately | Indexes repo, but no structured semantic model | Per-query, forgets immediately | Persistent, incremental, versioned SIR per symbol |
+| Survives refactors | Byte offsets break | Embeddings go stale | Re-indexes, but no semantic diffing | Embeddings go stale | Semantic IDs via BLAKE3 |
+| Works offline | Yes | No | No | Usually no | Yes — full local inference via Ollama |
+| Tracks how meaning changes | No | No | No | No | Git-linked SIR versioning |
+| Agent-accessible | No | Not really | Proprietary IDE only | Ad hoc context | 20+ structured MCP tools (any agent) |
+| Detects drift | No | No | No | No | Automatic, zero config |
+| Finds root causes | No | No | No | No | Causal chain graph traversal |
+| Knows what's dangerous | No | No | No | No | PageRank + drift + test coverage |
+| Open / extensible | Yes | No | No | Varies | Yes — open source, MCP-first |
+
+---
+
+## Contributing
+
+```bash
+# Build
 cargo build --workspace
-cargo test --workspace
+
+# Test (per-crate to avoid OOM on constrained machines)
+cargo test -p aether-core
+cargo test -p aether-parse
+cargo test -p aether-store
+cargo test -p aether-mcp
+cargo test -p aetherd
+
+# Lint
 cargo fmt --all --check
 cargo clippy --workspace -- -D warnings
 ```
 
-### WSL2 Notes
+---
 
-If building on WSL2 with ≤16GB RAM, LanceDB's Apache Arrow compilation is memory-intensive. These settings prevent OOM crashes:
-
-```bash
-# In your shell profile or before building:
-export CARGO_BUILD_JOBS=1
-export CARGO_TARGET_DIR=~/aether-target    # NOT /tmp/ — that's RAM-backed in WSL2
-
-# In C:\Users\<you>\.wslconfig:
-[wsl2]
-memory=8GB
-swap=8GB
-```
-
-The mold linker (configured in `.cargo/config.toml`) also reduces peak memory during linking. Install with `apt install mold clang`.
-
-### Crate Map
-
-| Crate | Purpose |
-|-------|---------|
-| `aetherd` | CLI binary, daemon, command dispatch |
-| `aether-core` | Symbol model, stable BLAKE3 IDs, diffing |
-| `aether-config` | TOML configuration loading and validation |
-| `aether-parse` | Tree-sitter AST parsing (Rust, TypeScript, Python) |
-| `aether-sir` | SIR schema and validation |
-| `aether-infer` | Inference provider abstraction (Gemini, Qwen, mock) |
-| `aether-store` | SQLite + CozoDB + LanceDB storage layer |
-| `aether-memory` | Project notes, session context, hybrid search |
-| `aether-analysis` | Drift detection, causal chains, graph health, intent verification |
-| `aether-lsp` | Language Server Protocol implementation |
-| `aether-mcp` | Model Context Protocol tools for AI agents |
-
-### Build Phases
-
-| Phase | Codename | Focus |
-|-------|----------|-------|
-| 1 | **The Observer** | Indexing, SIR generation, search, LSP, MCP, VS Code extension, CI |
-| 2 | **The Historian** | SIR versioning, git linkage, temporal "why" queries |
-| 3 | **The Ghost** | Sandboxed execution environments *(planned)* |
-| 4 | **The Architect** | LanceDB vectors, CozoDB graphs, native git via gix, dependency extraction |
-| 5 | **The Cartographer** | Language plugin system, Python support, local embeddings |
-| 6 | **The Chronicler** | Project memory, coupling, drift, causal chains, health, intent verification |
-
-## Roadmap
-
-| Area | What | Why |
-|------|------|-----|
-| **Local inference** | Candle on-device embeddings, Ollama local SIR generation | Fully air-gapped operation for classified or restricted codebases — zero cloud dependency |
-| **Search quality** | Cross-encoder reranker, adaptive thresholds | Auto-tune drift and similarity thresholds per-project; improve precision on ambiguous queries |
-| **Agent ecosystem** | `aether init-agent` integration kit | Scaffolds MCP registration, tool chains, and starter prompts for Claude Code, Codex, and custom agents |
-| **Language expansion** | Go, Java, C# support | Via the Phase 5 language plugin system — same architecture, new grammars |
-
-## License
-
-See [LICENSE](LICENSE) for details.
+<p align="center">
+  <em>AETHER doesn't generate code. It makes sure you — and your AI — actually understand the code you already have.<br/>That's harder, and it matters more.</em>
+</p>
