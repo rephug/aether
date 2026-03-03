@@ -118,11 +118,14 @@ pub(crate) async fn health_fragment(
                             }
                             tbody {
                                 @for hotspot in data.hotspots.iter().take(20) {
-                                    tr class="clickable"
-                                        hx-get={"/dashboard/frag/symbol/" (hotspot.symbol_id)}
-                                        hx-target="#detail-panel" {
+                                    tr {
                                         td {
-                                            div class="font-medium" { (hotspot.symbol_name.clone()) }
+                                            div class="font-medium" {
+                                                span class="symbol-link text-blue-600 hover:underline cursor-pointer"
+                                                    data-symbol=(hotspot.symbol_name.as_str()) {
+                                                    (hotspot.symbol_name.as_str())
+                                                }
+                                            }
                                             div class="text-xs text-text-muted font-mono" { (hotspot.symbol_id.clone()) }
                                         }
                                         td class="font-mono" { (format!("{:.2}", hotspot.risk_score)) }

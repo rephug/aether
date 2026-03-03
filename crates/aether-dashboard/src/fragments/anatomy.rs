@@ -137,7 +137,7 @@ pub(crate) async fn anatomy_fragment(State(state): State<Arc<DashboardState>>) -
                             @for actor in &build.data.key_actors {
                                 tr {
                                     td {
-                                        span class="symbol-link text-blue-600 cursor-pointer" data-symbol=(actor.name.as_str()) {
+                                        span class="symbol-link text-blue-600 hover:underline cursor-pointer" data-symbol=(actor.name.as_str()) {
                                             (actor.name.as_str())
                                         }
                                         span class="text-xs text-text-muted ml-2" { "(" (actor.kind.as_str()) ")" }
@@ -218,7 +218,10 @@ pub(crate) async fn anatomy_layer_fragment(
                     @for file in &detail.layer.files {
                         div class="rounded-lg border border-surface-3/40 bg-surface-0/80 p-3 space-y-2" {
                             div class="flex items-center justify-between gap-2" {
-                                div class="font-mono text-xs text-text-primary" { (file.path.as_str()) }
+                                div class="file-link text-blue-600 hover:underline cursor-pointer font-mono text-xs text-text-primary"
+                                    data-path=(file.path.as_str()) {
+                                    (file.path.as_str())
+                                }
                                 button
                                     class="px-2 py-1 text-xs rounded-md border border-surface-3/50 hover:bg-surface-3/40"
                                     hx-get={"/dashboard/frag/anatomy/file?path=" (percent_encode(file.path.as_str()))}
@@ -276,7 +279,10 @@ pub(crate) async fn anatomy_file_fragment(
     support::html_markup_response(html! {
         div class="rounded-xl border border-surface-3/40 bg-surface-1/40 p-4 space-y-3" {
             div class="flex items-center justify-between gap-2" {
-                h4 class="text-sm font-semibold font-mono" { (detail.path.as_str()) }
+                h4 class="file-link text-blue-600 hover:underline cursor-pointer text-sm font-semibold font-mono"
+                    data-path=(detail.path.as_str()) {
+                    (detail.path.as_str())
+                }
                 span class="badge badge-muted" { (detail.layer_name.as_str()) }
             }
             p class="text-sm text-text-secondary" { (detail.summary.as_str()) }
@@ -296,7 +302,7 @@ pub(crate) async fn anatomy_file_fragment(
                         @for symbol in &detail.symbols {
                             tr {
                                 td {
-                                    span class="symbol-link text-blue-600 cursor-pointer" data-symbol=(symbol.name.as_str()) {
+                                    span class="symbol-link text-blue-600 hover:underline cursor-pointer" data-symbol=(symbol.name.as_str()) {
                                         (symbol.name.as_str())
                                     }
                                     div class="text-[11px] text-text-muted font-mono" {

@@ -110,11 +110,14 @@ pub(crate) async fn drift_fragment(
                     }
                     tbody {
                         @for entry in data.drift_entries {
-                            tr class="clickable"
-                                hx-get={"/dashboard/frag/symbol/" (entry.symbol_id)}
-                                hx-target="#detail-panel" {
+                            tr {
                                 td {
-                                    div class="font-medium" { (entry.symbol_name) }
+                                    div class="font-medium" {
+                                        span class="symbol-link text-blue-600 hover:underline cursor-pointer"
+                                            data-symbol=(entry.symbol_name.as_str()) {
+                                            (entry.symbol_name.as_str())
+                                        }
+                                    }
                                     div class="text-xs text-text-muted font-mono" { (entry.symbol_id) }
                                     @if let Some(summary) = entry.drift_summary {
                                         div class="text-xs text-text-secondary mt-1" { (summary) }
@@ -122,7 +125,12 @@ pub(crate) async fn drift_fragment(
                                 }
                                 td { span class="badge badge-orange" { (entry.drift_type) } }
                                 td class="font-mono" { (format!("{:.2}", entry.drift_magnitude)) }
-                                td class="font-mono text-xs" { (entry.file_path) }
+                                td class="font-mono text-xs" {
+                                    span class="file-link text-blue-600 hover:underline cursor-pointer"
+                                        data-path=(entry.file_path.as_str()) {
+                                        (entry.file_path.as_str())
+                                    }
+                                }
                             }
                         }
                     }
