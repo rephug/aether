@@ -1595,11 +1595,11 @@ impl Store for SqliteStore {
                 })
                 .optional()?;
 
-            if let Some((latest_version, latest_hash, latest_created_at)) = latest {
+            if let Some((latest_version, latest_hash, _latest_created_at)) = latest {
                 if latest_hash == sir_hash {
                     SirVersionWriteResult {
                         version: latest_version,
-                        updated_at: latest_created_at,
+                        updated_at: created_at,
                         changed: false,
                     }
                 } else {
@@ -4185,7 +4185,7 @@ graph_backend = "cozo"
             .expect("dedupe by hash");
         assert!(!duplicate.changed);
         assert_eq!(duplicate.version, 1);
-        assert_eq!(duplicate.updated_at, first.updated_at);
+        assert_eq!(duplicate.updated_at, 1_700_222_101);
 
         let second = store
             .record_sir_version_if_changed(
@@ -4294,6 +4294,31 @@ graph_backend = "cozo"
             )
             .expect("resolve reversed pair");
         assert!(unresolved.is_none());
+    }
+
+    #[test]
+    fn record_sir_version_unchanged_hash_advances_timestamp() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open");
+        let symbol_id = "test::unchanged_ts";
+        let sir_hash = "abc123";
+        let sir_json = r#"{"intent":"test"}"#;
+
+        let first = store
+            .record_sir_version_if_changed(
+                symbol_id, sir_hash, "test", "test", sir_json, 1000, None,
+            )
+            .expect("first write");
+        assert!(first.changed);
+        assert_eq!(first.updated_at, 1000);
+
+        let second = store
+            .record_sir_version_if_changed(
+                symbol_id, sir_hash, "test", "test", sir_json, 2000, None,
+            )
+            .expect("second write");
+        assert!(!second.changed);
+        assert_eq!(second.updated_at, 2000);
     }
 
     #[test]

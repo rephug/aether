@@ -127,7 +127,7 @@ pub(crate) async fn load_time_machine_data(
             SELECT symbol_id
             FROM sir_history
             GROUP BY symbol_id
-            HAVING MIN(created_at) <= ?1
+            HAVING (MIN(created_at) * 1000) <= ?1
             "#,
         ) {
             Ok(stmt) => stmt,
@@ -235,7 +235,7 @@ fn parse_iso_to_millis(input: Option<&str>) -> Option<i64> {
 
 fn read_time_range(conn: &rusqlite::Connection) -> (Option<i64>, Option<i64>) {
     let history_range = conn.query_row(
-        "SELECT MIN(created_at), MAX(created_at) FROM sir_history",
+        "SELECT MIN(created_at) * 1000, MAX(created_at) * 1000 FROM sir_history",
         [],
         |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
     );
@@ -331,7 +331,7 @@ fn events_around_timestamp(
         SELECT symbol_id, MIN(created_at) AS first_at
         FROM sir_history
         GROUP BY symbol_id
-        HAVING first_at BETWEEN ?1 AND ?2
+        HAVING (first_at * 1000) BETWEEN ?1 AND ?2
         ORDER BY first_at ASC
         "#,
     ) {
@@ -350,7 +350,7 @@ fn events_around_timestamp(
                 event_type: "added".to_owned(),
                 symbol_id,
                 qualified_name,
-                timestamp: first_at,
+                timestamp: first_at * 1000,
                 detail: None,
             });
         }

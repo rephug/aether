@@ -469,11 +469,13 @@ fn load_or_build_layer_assignments(
 ) -> Result<LayerAssignmentsCache, String> {
     let mut cache = shared
         .caches
-        .layer_assignments_by_sir
+        .layer_assignments
         .lock()
         .map_err(|err| format!("layer assignment cache lock poisoned: {err}"))?;
 
-    if let Some(cached) = cache.get(&sir_count) {
+    if let Some((cached_count, ref cached)) = *cache
+        && cached_count == sir_count
+    {
         return Ok(cached.clone());
     }
 
@@ -494,6 +496,6 @@ fn load_or_build_layer_assignments(
             .or_insert(layer.name);
     }
 
-    cache.insert(sir_count, assignments.clone());
+    *cache = Some((sir_count, assignments.clone()));
     Ok(assignments)
 }

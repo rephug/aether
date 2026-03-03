@@ -211,7 +211,16 @@ impl SirPipeline {
                     continue;
                 }
 
-                jobs.push(build_job(&self.workspace_root, symbol)?);
+                match build_job(&self.workspace_root, symbol) {
+                    Ok(job) => jobs.push(job),
+                    Err(err) => {
+                        tracing::warn!(
+                            file_path = %event.file_path,
+                            error = %err,
+                            "failed to build SIR job; skipping symbol"
+                        );
+                    }
+                }
             }
 
             if skipped_existing > 0 {
@@ -870,7 +879,13 @@ fn build_job(workspace_root: &Path, symbol: Symbol) -> Result<SirJob> {
 
     let mut symbol_text = extract_symbol_source_text(&source, symbol.range)
         .filter(|text| !text.trim().is_empty())
-        .unwrap_or(source);
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "tree-sitter extraction failed for {} in {} — skipping to avoid whole-file hallucination",
+                symbol.qualified_name,
+                symbol.file_path,
+            )
+        })?;
     if symbol_text.len() > MAX_SYMBOL_TEXT_CHARS {
         let truncated = symbol_text
             .char_indices()

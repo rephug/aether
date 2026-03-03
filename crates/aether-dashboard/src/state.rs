@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -14,8 +13,8 @@ pub type DashboardStateError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, Default)]
 pub struct DashboardCaches {
-    pub project_summary_by_sir: Mutex<HashMap<i64, String>>,
-    pub layer_assignments_by_sir: Mutex<HashMap<i64, LayerAssignmentsCache>>,
+    pub project_summary: Mutex<Option<(i64, String)>>,
+    pub layer_assignments: Mutex<Option<(i64, LayerAssignmentsCache)>>,
 }
 
 #[derive(Clone)]
