@@ -566,7 +566,11 @@ pub fn open_graph_store_readonly(
     let workspace_root = workspace_root.as_ref();
     let config = load_workspace_config(workspace_root)?;
     match config.storage.graph_backend {
-        GraphBackend::Surreal => Ok(Box::new(CozoGraphStore::open_readonly(workspace_root)?)),
+        GraphBackend::Surreal => {
+            // Uses CozoGraphStore (sync compat shim) because this function is sync.
+            // The shim wraps SurrealGraphStore internally.
+            Ok(Box::new(CozoGraphStore::open_readonly(workspace_root)?))
+        }
         GraphBackend::Cozo => Ok(Box::new(CozoGraphStore::open_readonly(workspace_root)?)),
         GraphBackend::Sqlite => Ok(Box::new(SqliteGraphStore::open_readonly(workspace_root)?)),
     }

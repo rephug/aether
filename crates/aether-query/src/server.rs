@@ -151,8 +151,14 @@ async fn mcp_handler(State(state): State<Arc<AppState>>, request: Request) -> Re
     // a streaming/SSE response body that is not safely interceptable via axum
     // middleware for JSON deserialize/modify/reserialize. MCP clients should poll
     // GET /health for staleness fields.
-    let mut response = mcp_response.into_response();
-    response.extensions_mut().insert(Arc::new(permit));
+    let response = mcp_response.into_response();
+    // Hold the permit in an Arc that lives as long as the response.
+    // For SSE, dropping the Arc (and thus the permit) happens when the
+    // response body is fully consumed or the connection closes.
+    let permit = Arc::new(permit);
+    let _hold = permit.clone();
+    let mut response = response;
+    response.extensions_mut().insert(permit);
     response
 }
 
