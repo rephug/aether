@@ -62,6 +62,15 @@ pub(crate) async fn overview_fragment(State(state): State<Arc<DashboardState>>) 
                 }
             }
 
+            div
+                id="overview-recent-changes"
+                class="space-y-3"
+                hx-get="/dashboard/frag/changes?since=24h&limit=20&embed=true"
+                hx-trigger="load"
+                hx-target="this" {
+                (support::html_empty_state("Loading recent changes...", None))
+            }
+
             div class="grid gap-4 md:grid-cols-2 xl:grid-cols-4" {
                 (stat_card(
                     &overview.total_symbols.to_string(),

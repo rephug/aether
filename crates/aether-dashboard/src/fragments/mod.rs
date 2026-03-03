@@ -1,14 +1,16 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::get;
+use axum::routing::{get, post};
 
 use crate::support::DashboardState;
 
 mod anatomy;
 mod architecture;
+mod ask;
 mod blast_radius;
 mod causal;
+mod changes;
 mod coupling;
 mod drift_table;
 mod file;
@@ -36,7 +38,9 @@ pub(crate) fn fragment_router() -> Router<Arc<DashboardState>> {
         )
         .route("/dashboard/frag/tour", get(tour::tour_fragment))
         .route("/dashboard/frag/glossary", get(glossary::glossary_fragment))
+        .route("/dashboard/frag/changes", get(changes::changes_fragment))
         .route("/dashboard/frag/flow", get(flow::flow_fragment))
+        .route("/dashboard/frag/ask", post(ask::ask_fragment))
         .route("/dashboard/frag/file/{*path}", get(file::file_fragment))
         .route(
             "/dashboard/frag/symbol/{selector}",
