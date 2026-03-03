@@ -207,9 +207,9 @@ fn render_symbol_deep_dive(build: &SymbolDeepDiveBuild) -> maud::Markup {
                 }
                 p class="text-sm text-blue-600 hover:underline" {
                     a
-                        hx-get={"/dashboard/frag/autopsy/" (percent_encode(data.name.as_str()))}
+                        hx-get={"/dashboard/frag/autopsy/" (support::percent_encode(data.name.as_str()))}
                         hx-target="#main-content"
-                        hx-push-url={"/dashboard/autopsy/" (percent_encode(data.name.as_str()))} {
+                        hx-push-url={"/dashboard/autopsy/" (support::percent_encode(data.name.as_str()))} {
                         "See the Prompt Advisor for guidance ->"
                     }
                 }
@@ -218,29 +218,29 @@ fn render_symbol_deep_dive(build: &SymbolDeepDiveBuild) -> maud::Markup {
             section class="grid gap-3 md:grid-cols-4" {
                 button
                     class="rounded-lg border border-surface-3/40 bg-surface-1 px-3 py-3 text-sm hover:bg-surface-3/20 text-left"
-                    hx-get={"/dashboard/frag/spec/" (percent_encode(data.name.as_str()))}
+                    hx-get={"/dashboard/frag/spec/" (support::percent_encode(data.name.as_str()))}
                     hx-target="#main-content"
-                    hx-push-url={"/dashboard/spec/" (percent_encode(data.name.as_str()))} {
+                    hx-push-url={"/dashboard/spec/" (support::percent_encode(data.name.as_str()))} {
                     "📋 Generate Spec"
                 }
                 button
                     class="rounded-lg border border-surface-3/40 bg-surface-1 px-3 py-3 text-sm hover:bg-surface-3/20 text-left"
-                    hx-get={"/dashboard/frag/autopsy/" (percent_encode(data.name.as_str()))}
+                    hx-get={"/dashboard/frag/autopsy/" (support::percent_encode(data.name.as_str()))}
                     hx-target="#main-content"
-                    hx-push-url={"/dashboard/autopsy/" (percent_encode(data.name.as_str()))} {
+                    hx-push-url={"/dashboard/autopsy/" (support::percent_encode(data.name.as_str()))} {
                     "🎓 Prompt Advisor"
                 }
                 button
                     class="rounded-lg border border-surface-3/40 bg-surface-1 px-3 py-3 text-sm hover:bg-surface-3/20 text-left"
-                    hx-get={"/dashboard/frag/decompose/" (percent_encode(data.name.as_str()))}
+                    hx-get={"/dashboard/frag/decompose/" (support::percent_encode(data.name.as_str()))}
                     hx-target="#main-content"
-                    hx-push-url={"/dashboard/decompose/" (percent_encode(data.name.as_str()))} {
+                    hx-push-url={"/dashboard/decompose/" (support::percent_encode(data.name.as_str()))} {
                     "🔨 See Build Steps"
                 }
                 a class="rounded-lg border border-surface-3/40 bg-surface-1 px-3 py-3 text-sm hover:bg-surface-3/20"
-                    hx-get={"/dashboard/frag/flow?start=" (percent_encode(data.name.as_str()))}
+                    hx-get={"/dashboard/frag/flow?start=" (support::percent_encode(data.name.as_str()))}
                     hx-target="#main-content"
-                    hx-push-url={"/dashboard/flow?start=" (percent_encode(data.name.as_str()))} {
+                    hx-push-url={"/dashboard/flow?start=" (support::percent_encode(data.name.as_str()))} {
                     "🔄 Trace Flow"
                 }
             }
@@ -266,17 +266,4 @@ fn difficulty_badge_class(label: &str) -> &'static str {
     } else {
         "badge-red"
     }
-}
-
-fn percent_encode(input: &str) -> String {
-    let mut out = String::new();
-    for byte in input.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            out.push(byte as char);
-        } else {
-            out.push('%');
-            out.push_str(format!("{byte:02X}").as_str());
-        }
-    }
-    out
 }

@@ -216,9 +216,9 @@ fn build_prompt_tab(
                         div class="flex flex-wrap gap-2" {
                             button
                                 class="px-2 py-1 text-xs rounded-md border border-surface-3/40 hover:bg-surface-3/20"
-                                hx-get={"/dashboard/frag/decompose/" (percent_encode(symbol.qualified_name.as_str()))}
+                                hx-get={"/dashboard/frag/decompose/" (support::percent_encode(symbol.qualified_name.as_str()))}
                                 hx-target="#main-content"
-                                hx-push-url={"/dashboard/decompose/" (percent_encode(symbol.qualified_name.as_str()))} {
+                                hx-push-url={"/dashboard/decompose/" (support::percent_encode(symbol.qualified_name.as_str()))} {
                                 "🔨 Build this component step by step"
                             }
                         }
@@ -253,7 +253,7 @@ fn spec_tab(query: &PromptsQuery) -> maud::Markup {
 
             @if let Some(symbol) = query.symbol.as_deref() {
                 div
-                    hx-get={"/dashboard/frag/spec/" (percent_encode(symbol))}
+                    hx-get={"/dashboard/frag/spec/" (support::percent_encode(symbol))}
                     hx-trigger="load"
                     hx-target="this" {
                     (support::html_empty_state("Loading spec...", None))
@@ -287,7 +287,7 @@ fn context_tab(query: &PromptsQuery) -> maud::Markup {
 
             @if let Some(symbol) = query.symbol.as_deref() {
                 div
-                    hx-get={"/dashboard/frag/context/" (percent_encode(symbol))}
+                    hx-get={"/dashboard/frag/context/" (support::percent_encode(symbol))}
                     hx-trigger="load"
                     hx-target="this" {
                     (support::html_empty_state("Loading context advisor...", None))
@@ -332,23 +332,23 @@ fn learn_tab(
                         div class="flex flex-wrap gap-2 mt-2" {
                             button
                                 class="px-2 py-1 text-xs rounded-md border border-surface-3/40 hover:bg-surface-3/20"
-                                hx-get={"/dashboard/frag/decompose/" (percent_encode(symbol))}
+                                hx-get={"/dashboard/frag/decompose/" (support::percent_encode(symbol))}
                                 hx-target="#main-content"
-                                hx-push-url={"/dashboard/decompose/" (percent_encode(symbol))} {
+                                hx-push-url={"/dashboard/decompose/" (support::percent_encode(symbol))} {
                                 "🔨 Decomposer"
                             }
                             button
                                 class="px-2 py-1 text-xs rounded-md border border-surface-3/40 hover:bg-surface-3/20"
-                                hx-get={"/dashboard/frag/autopsy/" (percent_encode(symbol))}
+                                hx-get={"/dashboard/frag/autopsy/" (support::percent_encode(symbol))}
                                 hx-target="#main-content"
-                                hx-push-url={"/dashboard/autopsy/" (percent_encode(symbol))} {
+                                hx-push-url={"/dashboard/autopsy/" (support::percent_encode(symbol))} {
                                 "🎓 Prompt Autopsy"
                             }
                             button
                                 class="px-2 py-1 text-xs rounded-md border border-surface-3/40 hover:bg-surface-3/20"
-                                hx-get={"/dashboard/frag/context/" (percent_encode(symbol))}
+                                hx-get={"/dashboard/frag/context/" (support::percent_encode(symbol))}
                                 hx-target="#main-content"
-                                hx-push-url={"/dashboard/context/" (percent_encode(symbol))} {
+                                hx-push-url={"/dashboard/context/" (support::percent_encode(symbol))} {
                                 "🧠 Context"
                             }
                         }
@@ -420,38 +420,25 @@ fn normalize_tab(raw: Option<&str>) -> &'static str {
 }
 
 fn prompt_url(tab: &str, goal: Option<&str>, symbol: Option<&str>) -> String {
-    let mut params = vec![format!("tab={}", percent_encode(tab))];
+    let mut params = vec![format!("tab={}", support::percent_encode(tab))];
     if let Some(goal) = goal.map(str::trim).filter(|value| !value.is_empty()) {
-        params.push(format!("goal={}", percent_encode(goal)));
+        params.push(format!("goal={}", support::percent_encode(goal)));
     }
     if let Some(symbol) = symbol.map(str::trim).filter(|value| !value.is_empty()) {
-        params.push(format!("symbol={}", percent_encode(symbol)));
+        params.push(format!("symbol={}", support::percent_encode(symbol)));
     }
     format!("/dashboard/frag/prompts?{}", params.join("&"))
 }
 
 fn prompt_page_url(tab: &str, goal: Option<&str>, symbol: Option<&str>) -> String {
-    let mut params = vec![format!("tab={}", percent_encode(tab))];
+    let mut params = vec![format!("tab={}", support::percent_encode(tab))];
     if let Some(goal) = goal.map(str::trim).filter(|value| !value.is_empty()) {
-        params.push(format!("goal={}", percent_encode(goal)));
+        params.push(format!("goal={}", support::percent_encode(goal)));
     }
     if let Some(symbol) = symbol.map(str::trim).filter(|value| !value.is_empty()) {
-        params.push(format!("symbol={}", percent_encode(symbol)));
+        params.push(format!("symbol={}", support::percent_encode(symbol)));
     }
     format!("/dashboard/prompts?{}", params.join("&"))
-}
-
-fn percent_encode(input: &str) -> String {
-    let mut out = String::new();
-    for byte in input.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
-            out.push(byte as char);
-        } else {
-            out.push('%');
-            out.push_str(format!("{byte:02X}").as_str());
-        }
-    }
-    out
 }
 
 fn difficulty_badge_class(label: &str) -> &'static str {

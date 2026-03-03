@@ -151,16 +151,16 @@ pub(crate) async fn glossary_fragment(
                                 div class="flex items-center gap-2" {
                                     button
                                         class="px-2 py-1 text-xs rounded-md border border-surface-3/40 hover:bg-surface-3/20"
-                                        hx-get={"/dashboard/frag/spec/" (percent_encode(term.name.as_str()))}
+                                        hx-get={"/dashboard/frag/spec/" (support::percent_encode(term.name.as_str()))}
                                         hx-target="#main-content"
-                                        hx-push-url={"/dashboard/spec/" (percent_encode(term.name.as_str()))} {
+                                        hx-push-url={"/dashboard/spec/" (support::percent_encode(term.name.as_str()))} {
                                         "📋 Spec"
                                     }
                                     button
                                         class="px-2 py-1 text-xs rounded-md border border-surface-3/40 hover:bg-surface-3/20"
-                                        hx-get={"/dashboard/frag/autopsy/" (percent_encode(term.name.as_str()))}
+                                        hx-get={"/dashboard/frag/autopsy/" (support::percent_encode(term.name.as_str()))}
                                         hx-target="#main-content"
-                                        hx-push-url={"/dashboard/autopsy/" (percent_encode(term.name.as_str()))} {
+                                        hx-push-url={"/dashboard/autopsy/" (support::percent_encode(term.name.as_str()))} {
                                         "🎓 Advisor"
                                     }
                                 }
@@ -259,13 +259,13 @@ fn build_query_url(
     let mut params = Vec::<String>::new();
 
     if let Some(search) = search.map(str::trim).filter(|value| !value.is_empty()) {
-        params.push(format!("search={}", percent_encode(search)));
+        params.push(format!("search={}", support::percent_encode(search)));
     }
     if let Some(layer) = layer.map(str::trim).filter(|value| !value.is_empty()) {
-        params.push(format!("layer={}", percent_encode(layer)));
+        params.push(format!("layer={}", support::percent_encode(layer)));
     }
     if let Some(kind) = kind.map(str::trim).filter(|value| !value.is_empty()) {
-        params.push(format!("kind={}", percent_encode(kind)));
+        params.push(format!("kind={}", support::percent_encode(kind)));
     }
     if let Some(page) = page {
         params.push(format!("page={page}"));
@@ -279,17 +279,4 @@ fn build_query_url(
     } else {
         format!("/dashboard/frag/glossary?{}", params.join("&"))
     }
-}
-
-fn percent_encode(input: &str) -> String {
-    let mut out = String::new();
-    for byte in input.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            out.push(byte as char);
-        } else {
-            out.push('%');
-            out.push_str(format!("{byte:02X}").as_str());
-        }
-    }
-    out
 }

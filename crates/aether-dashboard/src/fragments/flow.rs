@@ -135,9 +135,9 @@ fn render_flow_page(
                         @for (idx, (name, desc)) in suggestions.iter().enumerate() {
                             @if idx > 0 { " · " }
                             a class="text-blue-600 hover:underline"
-                                hx-get={"/dashboard/frag/flow?start=" (percent_encode(name.as_str()))}
+                                hx-get={"/dashboard/frag/flow?start=" (support::percent_encode(name.as_str()))}
                                 hx-target="#main-content"
-                                hx-push-url={"/dashboard/flow?start=" (percent_encode(name.as_str()))} {
+                                hx-push-url={"/dashboard/flow?start=" (support::percent_encode(name.as_str()))} {
                                 (name.as_str()) " (" (desc.as_str()) ")"
                             }
                         }
@@ -252,17 +252,4 @@ fn first_sentence_or_fallback(intent: &str) -> String {
     } else {
         first
     }
-}
-
-fn percent_encode(input: &str) -> String {
-    let mut out = String::new();
-    for byte in input.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            out.push(byte as char);
-        } else {
-            out.push('%');
-            out.push_str(format!("{byte:02X}").as_str());
-        }
-    }
-    out
 }

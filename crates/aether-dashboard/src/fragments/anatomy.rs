@@ -102,7 +102,7 @@ pub(crate) async fn anatomy_fragment(State(state): State<Arc<DashboardState>>) -
                                         span class="badge badge-cyan" { (layer.total_symbol_count) " components" }
                                         button
                                             class="px-2 py-1 text-xs rounded-md border border-surface-3/50 hover:bg-surface-3/40"
-                                            hx-get={"/dashboard/frag/anatomy/layer?name=" (percent_encode(layer.name.as_str()))}
+                                            hx-get={"/dashboard/frag/anatomy/layer?name=" (support::percent_encode(layer.name.as_str()))}
                                             hx-target="#anatomy-layer-detail" {
                                             "Show files"
                                         }
@@ -235,7 +235,7 @@ pub(crate) async fn anatomy_layer_fragment(
                                 }
                                 button
                                     class="px-2 py-1 text-xs rounded-md border border-surface-3/50 hover:bg-surface-3/40"
-                                    hx-get={"/dashboard/frag/anatomy/file?path=" (percent_encode(file.path.as_str()))}
+                                    hx-get={"/dashboard/frag/anatomy/file?path=" (support::percent_encode(file.path.as_str()))}
                                     hx-target="#anatomy-file-detail" {
                                     "Show symbols"
                                 }
@@ -335,19 +335,6 @@ pub(crate) async fn anatomy_file_fragment(
             }
         }
     })
-}
-
-fn percent_encode(input: &str) -> String {
-    let mut out = String::new();
-    for byte in input.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
-            out.push(byte as char);
-        } else {
-            out.push('%');
-            out.push_str(format!("{byte:02X}").as_str());
-        }
-    }
-    out
 }
 
 fn difficulty_badge_class(label: &str) -> &'static str {

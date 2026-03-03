@@ -452,7 +452,7 @@ impl DriftAnalyzer {
         &self,
         _request: CommunitiesRequest,
     ) -> Result<CommunitiesResult, AnalysisError> {
-        let store = SqliteStore::open(&self.workspace)?;
+        let store = SqliteStore::open_readonly(&self.workspace)?;
         let cozo = CozoGraphStore::open(&self.workspace)?;
         let mut entries = cozo
             .list_louvain_communities()?
@@ -1210,14 +1210,26 @@ fn parse_window_spec(value: &str) -> WindowSpec {
 
 fn normalize_rename_path(path: &str) -> String {
     let value = path.trim();
-    if let Some((_, right)) = value.rsplit_once("=>") {
-        return right
-            .trim()
-            .trim_start_matches('{')
-            .trim_end_matches('}')
-            .trim()
-            .to_owned();
+
+    // Handle brace-enclosed renames: prefix{old => new}suffix
+    // Example: crates/{old => new}/src/lib.rs -> crates/new/src/lib.rs
+    if let (Some(brace_start), Some(brace_end)) = (value.find('{'), value.find('}'))
+        && brace_start < brace_end
+    {
+        let prefix = &value[..brace_start];
+        let inner = &value[brace_start + 1..brace_end];
+        let suffix = &value[brace_end + 1..];
+
+        if let Some((_, new_part)) = inner.split_once("=>") {
+            return format!("{}{}{}", prefix, new_part.trim(), suffix);
+        }
     }
+
+    // Handle simple renames: old_path => new_path
+    if let Some((_, right)) = value.rsplit_once("=>") {
+        return right.trim().to_owned();
+    }
+
     value.to_owned()
 }
 
@@ -1750,8 +1762,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        AcknowledgeDriftRequest, DriftAnalyzer, DriftInclude, DriftReportRequest, now_millis,
-        parse_window_spec,
+        AcknowledgeDriftRequest, DriftAnalyzer, DriftInclude, DriftReportRequest,
+        normalize_rename_path, now_millis, parse_window_spec,
     };
 
     #[test]
@@ -1768,6 +1780,22 @@ mod tests {
             parse_window_spec("since:abc123"),
             super::WindowSpec::SinceCommit(_)
         ));
+    }
+
+    #[test]
+    fn normalize_rename_path_brace_enclosed() {
+        assert_eq!(
+            normalize_rename_path("crates/{old => new}/src/lib.rs"),
+            "crates/new/src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn normalize_rename_path_simple() {
+        assert_eq!(
+            normalize_rename_path("old/path.rs => new/path.rs"),
+            "new/path.rs"
+        );
     }
 
     #[test]
