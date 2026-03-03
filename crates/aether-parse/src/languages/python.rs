@@ -538,14 +538,22 @@ fn is_method_definition(node: Node<'_>) -> bool {
 }
 
 fn nearest_ancestor_name(node: Node<'_>, source: &[u8], kinds: &[&str]) -> Option<String> {
+    let mut parts = Vec::new();
     let mut current = node.parent();
     while let Some(parent) = current {
-        if kinds.iter().any(|kind| *kind == parent.kind()) {
-            return named_child_text(parent, "name", source);
+        if kinds.iter().any(|kind| *kind == parent.kind())
+            && let Some(name) = named_child_text(parent, "name", source)
+        {
+            parts.push(name);
         }
         current = parent.parent();
     }
-    None
+    if parts.is_empty() {
+        return None;
+    }
+    // Ancestors are collected inner-to-outer; reverse for outer-to-inner.
+    parts.reverse();
+    Some(parts.join("::"))
 }
 
 fn find_inner_definition(node: Node<'_>) -> Option<Node<'_>> {
@@ -556,7 +564,7 @@ fn find_inner_definition(node: Node<'_>) -> Option<Node<'_>> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_import_from_statement;
+    use super::{nearest_ancestor_name, parse_import_from_statement};
 
     #[test]
     fn parenthesized_import() {
@@ -569,5 +577,36 @@ mod tests {
         let edges =
             parse_import_from_statement("from module import (\n    a,\n    b,\n)", "src/main.py");
         assert_eq!(edges, vec!["module.a".to_owned(), "module.b".to_owned()]);
+    }
+
+    #[test]
+    fn nested_class_method_qualified_name() {
+        let source = r#"
+class Outer:
+    class Inner:
+        def method(self):
+            pass
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .expect("set language");
+        let tree = parser.parse(source, None).expect("parse");
+        let root = tree.root_node();
+
+        let outer = root.named_child(0).expect("Outer class");
+        let body = outer.child_by_field_name("body").expect("outer body");
+        let inner = body
+            .named_children(&mut body.walk())
+            .find(|n| n.kind() == "class_definition")
+            .expect("Inner class");
+        let inner_body = inner.child_by_field_name("body").expect("inner body");
+        let method = inner_body
+            .named_children(&mut inner_body.walk())
+            .find(|n| n.kind() == "function_definition")
+            .expect("method");
+
+        let result = nearest_ancestor_name(method, source.as_bytes(), &["class_definition"]);
+        assert_eq!(result, Some("Outer::Inner".to_owned()));
     }
 }

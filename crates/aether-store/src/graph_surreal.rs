@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
@@ -72,7 +72,10 @@ impl SurrealGraphStore {
             .map_err(|err| StoreError::Graph(format!("SurrealDB namespace setup failed: {err}")))?;
 
         let store = Self { db };
-        store.ensure_schema().await?;
+        if !is_schema_initialized(&graph_dir)? {
+            store.ensure_schema().await?;
+            mark_schema_initialized(graph_dir.clone())?;
+        }
         Ok(store)
     }
 
@@ -660,6 +663,11 @@ fn surreal_handle_cache() -> &'static Mutex<HashMap<std::path::PathBuf, Surreal<
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn schema_init_cache() -> &'static Mutex<HashSet<std::path::PathBuf>> {
+    static CACHE: OnceLock<Mutex<HashSet<std::path::PathBuf>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
 fn cached_surreal_handle(graph_dir: &std::path::Path) -> Result<Option<Surreal<Db>>, StoreError> {
     let cache = surreal_handle_cache()
         .lock()
@@ -672,6 +680,21 @@ fn cache_surreal_handle(graph_dir: std::path::PathBuf, db: Surreal<Db>) -> Resul
         .lock()
         .map_err(|_| StoreError::Graph("SurrealDB handle cache lock poisoned".to_owned()))?;
     cache.entry(graph_dir).or_insert(db);
+    Ok(())
+}
+
+fn is_schema_initialized(graph_dir: &std::path::Path) -> Result<bool, StoreError> {
+    let cache = schema_init_cache()
+        .lock()
+        .map_err(|_| StoreError::Graph("SurrealDB schema cache lock poisoned".to_owned()))?;
+    Ok(cache.contains(graph_dir))
+}
+
+fn mark_schema_initialized(graph_dir: std::path::PathBuf) -> Result<(), StoreError> {
+    let mut cache = schema_init_cache()
+        .lock()
+        .map_err(|_| StoreError::Graph("SurrealDB schema cache lock poisoned".to_owned()))?;
+    cache.insert(graph_dir);
     Ok(())
 }
 
@@ -955,8 +978,38 @@ impl GraphStore for SurrealGraphStore {
             return Ok(Vec::new());
         }
 
-        let symbols = self.list_all_symbols().await?;
-        let by_id = symbols
+        let found_ids: Vec<String> = min_depth.keys().cloned().collect();
+        let mut response = self
+            .db
+            .query(
+                r#"
+                SELECT VALUE {
+                    id: symbol_id,
+                    file_path: file_path,
+                    language: language,
+                    kind: kind,
+                    qualified_name: qualified_name,
+                    signature_fingerprint: signature_fingerprint,
+                    last_seen_at: last_seen_at
+                }
+                FROM symbol
+                WHERE symbol_id INSIDE $found_ids;
+                "#,
+            )
+            .bind(("found_ids", found_ids))
+            .await
+            .map_err(|err| {
+                StoreError::Graph(format!(
+                    "SurrealDB get_call_chain symbol fetch failed: {err}"
+                ))
+            })?;
+        let rows: Vec<serde_json::Value> = response.take(0).map_err(|err| {
+            StoreError::Graph(format!(
+                "SurrealDB get_call_chain symbol decode failed: {err}"
+            ))
+        })?;
+        let fetched = decode_symbol_records(rows)?;
+        let by_id: HashMap<String, SymbolRecord> = fetched
             .into_iter()
             .map(|row| (row.id.clone(), row))
             .collect::<HashMap<_, _>>();

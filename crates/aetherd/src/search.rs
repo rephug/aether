@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use aether_config::{
     AetherConfig, SearchCalibratedThresholdsConfig, SearchRerankerKind, SearchThresholdsConfig,
@@ -22,6 +23,16 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 pub use aether_core::SearchMode;
+
+fn reranker_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("reranker tokio runtime should initialize")
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SearchOutputFormat {
@@ -562,11 +573,7 @@ fn rerank_rows_with_provider(
         });
     }
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("failed to build runtime for reranker")?;
-    let reranked = runtime
+    let reranked = reranker_runtime()
         .block_on(provider.rerank(query, &rerank_candidates, limit))
         .context("reranker request failed")?;
 
