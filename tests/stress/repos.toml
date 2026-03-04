@@ -1,0 +1,44 @@
+[[repo]]
+name = "ripgrep"
+url = "https://github.com/BurntSushi/ripgrep.git"
+commit = "HEAD"
+tier = "small"
+language = "rust"
+approx_symbols = 2000
+clone_size_mb = 50
+
+[[repo]]
+name = "flask"
+url = "https://github.com/pallets/flask.git"
+commit = "HEAD"
+tier = "small"
+language = "python"
+approx_symbols = 3000
+clone_size_mb = 30
+
+[[repo]]
+name = "ruff"
+url = "https://github.com/astral-sh/ruff.git"
+commit = "HEAD"
+tier = "medium"
+language = "rust+python"
+approx_symbols = 10000
+clone_size_mb = 200
+
+[[repo]]
+name = "bevy"
+url = "https://github.com/bevyengine/bevy.git"
+commit = "HEAD"
+tier = "large"
+language = "rust"
+approx_symbols = 45000
+clone_size_mb = 2000
+
+[[repo]]
+name = "typescript"
+url = "https://github.com/microsoft/TypeScript.git"
+commit = "HEAD"
+tier = "large"
+language = "typescript"
+approx_symbols = 30000
+clone_size_mb = 1500
