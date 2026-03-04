@@ -9,6 +9,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use http_body_util::BodyExt;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use serde::Serialize;
@@ -152,14 +153,15 @@ async fn mcp_handler(State(state): State<Arc<AppState>>, request: Request) -> Re
     // middleware for JSON deserialize/modify/reserialize. MCP clients should poll
     // GET /health for staleness fields.
     let response = mcp_response.into_response();
-    // Hold the permit in an Arc that lives as long as the response.
-    // For SSE, dropping the Arc (and thus the permit) happens when the
-    // response body is fully consumed or the connection closes.
-    let permit = Arc::new(permit);
-    let _hold = permit.clone();
-    let mut response = response;
-    response.extensions_mut().insert(permit);
-    response
+    // Tie permit lifetime to response body consumption, not response extensions.
+    // For SSE responses, extensions can be dropped after headers are serialized.
+    let (parts, body) = response.into_parts();
+    let held_permit = Arc::new(permit);
+    let body = axum::body::Body::new(body.map_frame(move |frame| {
+        let _keep = &held_permit;
+        frame
+    }));
+    Response::from_parts(parts, body)
 }
 
 async fn health_handler(State(state): State<Arc<AppState>>) -> Response {
@@ -256,7 +258,7 @@ mod tests {
     use axum::extract::State;
     use axum::http::Request;
     use tempfile::tempdir;
-    use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+    use tokio::sync::Semaphore;
 
     use super::{AppState, QueryConfig, build_mcp_http_service, mcp_handler};
 
@@ -284,14 +286,11 @@ mod tests {
         assert_eq!(state.semaphore.available_permits(), 1);
         let response = mcp_handler(State(state.clone()), request).await;
         assert_eq!(state.semaphore.available_permits(), 0);
-        assert!(
-            response
-                .extensions()
-                .get::<Arc<OwnedSemaphorePermit>>()
-                .is_some()
-        );
+        let (parts, body) = response.into_parts();
+        drop(parts);
+        assert_eq!(state.semaphore.available_permits(), 0);
 
-        drop(response);
+        drop(body);
         assert_eq!(state.semaphore.available_permits(), 1);
     }
 }

@@ -512,3 +512,19 @@ pub(crate) fn embedded_bytes_response(bytes: Vec<u8>, mime: &str) -> Response {
     }
     response
 }
+
+/// Percent-encode a string for safe use in URL path segments and query parameters.
+pub(crate) fn percent_encode(input: &str) -> String {
+    let mut encoded = String::with_capacity(input.len() * 2);
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                encoded.push_str(&format!("%{:02X}", byte));
+            }
+        }
+    }
+    encoded
+}

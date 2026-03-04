@@ -198,7 +198,7 @@ pub fn resolve_hover_markdown_for_source(
         .map_err(|err| HoverResolveError::Parse(err.to_string()))?;
 
     let cursor_line = (position.line as usize) + 1;
-    let cursor_column = (position.character as usize) + 1;
+    let cursor_column = utf16_offset_to_byte_offset(source, position.line, position.character) + 1;
 
     if let Some(markdown) = resolve_import_hover_markdown(
         workspace_root,
@@ -814,6 +814,24 @@ fn workspace_relative_display_path(workspace_root: &Path, file_path: &Path) -> S
     normalize_path(&file_path.to_string_lossy())
 }
 
+/// Convert an LSP UTF-16 character offset to a UTF-8 byte offset for the given line.
+fn utf16_offset_to_byte_offset(source: &str, line: u32, character: u32) -> usize {
+    let target_line = line as usize;
+    let utf16_offset = character as usize;
+    let line_text = source.lines().nth(target_line).unwrap_or("");
+
+    let mut utf16_count = 0usize;
+    for (byte_idx, ch) in line_text.char_indices() {
+        if utf16_count >= utf16_offset {
+            return byte_idx;
+        }
+        utf16_count += ch.len_utf16();
+    }
+
+    // If offset is past the end of the line, return line length.
+    line_text.len()
+}
+
 fn position_in_range(range: SourceRange, line: usize, column: usize) -> bool {
     let pos = (line, column);
     let start = (range.start.line, range.start.column);
@@ -916,6 +934,23 @@ mod tests {
         assert!(markdown.contains("**Intent**\nMock summary for alpha"));
         assert!(markdown.contains("**Inputs**\n- x"));
         assert!(markdown.contains("**Side Effects**\n(none)"));
+    }
+
+    #[test]
+    fn utf16_to_byte_offset_with_emoji() {
+        // "😀hello" — emoji is 4 UTF-8 bytes but 2 UTF-16 code units.
+        let source = "😀hello";
+        // UTF-16 offset 2 (past the emoji) = byte offset 4.
+        assert_eq!(utf16_offset_to_byte_offset(source, 0, 2), 4);
+        // UTF-16 offset 0 = byte offset 0.
+        assert_eq!(utf16_offset_to_byte_offset(source, 0, 0), 0);
+    }
+
+    #[test]
+    fn utf16_to_byte_offset_ascii_only() {
+        let source = "fn hello()";
+        // For pure ASCII, UTF-16 offset == byte offset.
+        assert_eq!(utf16_offset_to_byte_offset(source, 0, 3), 3);
     }
 
     #[test]
@@ -1729,7 +1764,8 @@ mod tests {
             .expect("extract symbols");
 
         let cursor_line = (position.line as usize) + 1;
-        let cursor_column = (position.character as usize) + 1;
+        let cursor_column =
+            utf16_offset_to_byte_offset(&source, position.line, position.character) + 1;
         let symbol = symbols
             .iter()
             .filter(|symbol| position_in_range(symbol.range, cursor_line, cursor_column))

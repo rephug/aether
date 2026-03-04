@@ -188,7 +188,7 @@ impl CausalAnalyzer {
         let max_depth = requested_max_depth.clamp(1, MAX_MAX_DEPTH);
         let limit = request.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
-        let store = SqliteStore::open(&self.workspace)?;
+        let store = SqliteStore::open_readonly(&self.workspace)?;
         let cozo = CozoGraphStore::open(&self.workspace)?;
         let Some(target_symbol) = store.get_symbol_record(target_symbol_id)? else {
             return Err(AnalysisError::Message(format!(

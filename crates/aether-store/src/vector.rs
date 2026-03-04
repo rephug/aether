@@ -114,13 +114,13 @@ pub async fn open_vector_store(
 }
 
 pub struct SqliteVectorStore {
-    store: std::sync::Mutex<SqliteStore>,
+    store: SqliteStore,
 }
 
 impl SqliteVectorStore {
     pub fn new(workspace_root: impl AsRef<Path>) -> Result<Self, StoreError> {
         Ok(Self {
-            store: std::sync::Mutex::new(SqliteStore::open(workspace_root)?),
+            store: SqliteStore::open(workspace_root)?,
         })
     }
 }
@@ -128,24 +128,18 @@ impl SqliteVectorStore {
 #[async_trait]
 impl VectorStore for SqliteVectorStore {
     async fn upsert_embedding(&self, record: VectorRecord) -> Result<(), StoreError> {
-        self.store.lock().unwrap().upsert_symbol_embedding(record)
+        self.store.upsert_symbol_embedding(record)
     }
 
     async fn get_embedding_meta(
         &self,
         symbol_id: &str,
     ) -> Result<Option<VectorEmbeddingMetaRecord>, StoreError> {
-        self.store
-            .lock()
-            .unwrap()
-            .get_symbol_embedding_meta(symbol_id)
+        self.store.get_symbol_embedding_meta(symbol_id)
     }
 
     async fn delete_embedding(&self, symbol_id: &str) -> Result<(), StoreError> {
-        self.store
-            .lock()
-            .unwrap()
-            .delete_symbol_embedding(symbol_id)
+        self.store.delete_symbol_embedding(symbol_id)
     }
 
     async fn search_nearest(
@@ -155,12 +149,9 @@ impl VectorStore for SqliteVectorStore {
         model: &str,
         limit: u32,
     ) -> Result<Vec<VectorSearchResult>, StoreError> {
-        let matches = self.store.lock().unwrap().search_symbols_semantic(
-            query_embedding,
-            provider,
-            model,
-            limit,
-        )?;
+        let matches =
+            self.store
+                .search_symbols_semantic(query_embedding, provider, model, limit)?;
 
         Ok(matches
             .into_iter()
@@ -178,8 +169,6 @@ impl VectorStore for SqliteVectorStore {
         symbol_ids: &[String],
     ) -> Result<Vec<VectorRecord>, StoreError> {
         self.store
-            .lock()
-            .unwrap()
             .list_symbol_embeddings_for_ids(provider, model, symbol_ids)
     }
 
@@ -188,8 +177,6 @@ impl VectorStore for SqliteVectorStore {
         record: ProjectNoteVectorRecord,
     ) -> Result<(), StoreError> {
         self.store
-            .lock()
-            .unwrap()
             .upsert_project_note_embedding(ProjectNoteEmbeddingRecord {
                 note_id: record.note_id,
                 provider: record.provider,
@@ -202,10 +189,7 @@ impl VectorStore for SqliteVectorStore {
     }
 
     async fn delete_project_note_embedding(&self, note_id: &str) -> Result<(), StoreError> {
-        self.store
-            .lock()
-            .unwrap()
-            .delete_project_note_embedding(note_id)
+        self.store.delete_project_note_embedding(note_id)
     }
 
     async fn search_project_notes_nearest(
@@ -215,12 +199,9 @@ impl VectorStore for SqliteVectorStore {
         model: &str,
         limit: u32,
     ) -> Result<Vec<ProjectNoteVectorSearchResult>, StoreError> {
-        let matches = self.store.lock().unwrap().search_project_notes_semantic(
-            query_embedding,
-            provider,
-            model,
-            limit,
-        )?;
+        let matches =
+            self.store
+                .search_project_notes_semantic(query_embedding, provider, model, limit)?;
 
         Ok(matches
             .into_iter()

@@ -227,6 +227,7 @@ dependencies = [
  "aether-store",
  "axum",
  "clap",
+ "http-body-util",
  "reqwest 0.12.28",
  "rmcp",
  "rusqlite",

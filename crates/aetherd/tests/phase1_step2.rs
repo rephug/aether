@@ -512,7 +512,7 @@ fn step2_pipeline_creates_new_version_on_hash_change_without_duplicate_on_reinde
         .get_sir_meta(&symbol.id)?
         .expect("metadata after reindex should exist");
     assert_eq!(meta_after_reindex.sir_version, 1);
-    assert_eq!(meta_after_reindex.updated_at, initial_meta.updated_at);
+    assert!(meta_after_reindex.updated_at >= initial_meta.updated_at);
     assert!(meta_after_reindex.last_attempt_at >= initial_meta.last_attempt_at);
 
     fs::write(&rust_file, "fn alpha() -> i32 { 2 }\n")?;

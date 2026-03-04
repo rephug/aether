@@ -165,7 +165,7 @@ fn render_changes_content(
 fn changes_endpoint(period: &str, limit: usize, embed: bool) -> String {
     let mut endpoint = format!(
         "/dashboard/frag/changes?since={}&limit={limit}",
-        percent_encode(period)
+        support::percent_encode(period)
     );
     if embed {
         endpoint.push_str("&embed=true");
@@ -186,17 +186,4 @@ fn relative_timestamp(value: &str) -> String {
 
     let age_seconds = now_ms.saturating_sub(ts_ms) / 1000;
     format!("{} ago", support::format_age_seconds(Some(age_seconds)))
-}
-
-fn percent_encode(input: &str) -> String {
-    let mut out = String::new();
-    for byte in input.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
-            out.push(byte as char);
-        } else {
-            out.push('%');
-            out.push_str(format!("{byte:02X}").as_str());
-        }
-    }
-    out
 }

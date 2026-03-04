@@ -229,7 +229,15 @@ impl HealthAnalyzer {
             return Ok(empty_report(analyzed_at, notes));
         }
 
-        let store = SqliteStore::open(&self.workspace)?;
+        let sqlite_path = self.workspace.join(".aether").join("meta.sqlite");
+        if !sqlite_path.exists() {
+            notes.push(
+                "SQLite metadata store unavailable; returning empty health report".to_owned(),
+            );
+            return Ok(empty_report(analyzed_at, notes));
+        }
+
+        let store = SqliteStore::open_readonly(&self.workspace)?;
         let opened_graph = if graph_override.is_some() {
             None
         } else {
