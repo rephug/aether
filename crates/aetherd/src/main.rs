@@ -5,6 +5,7 @@ use aether_config::{
     DEFAULT_LOG_LEVEL, SearchRerankerKind, ensure_workspace_config, validate_config,
 };
 use aether_infer::{download_candle_embedding_model, download_candle_reranker_model};
+use aether_store::SqliteStore;
 #[cfg(feature = "legacy-cozo")]
 use aether_store::migrate_cozo_to_surreal;
 use aetherd::calibrate::run_calibration_once;
@@ -20,7 +21,9 @@ use aetherd::coupling::{
 use aetherd::drift::{run_communities_command, run_drift_ack_command, run_drift_report_command};
 use aetherd::fsck::run_fsck;
 use aetherd::health::run_health_command;
-use aetherd::indexer::{IndexerConfig, run_indexing_loop, run_initial_index_once};
+use aetherd::indexer::{
+    IndexerConfig, run_full_index_once, run_indexing_loop, run_initial_index_once,
+};
 use aetherd::init_agent::{InitAgentOptions, run_init_agent};
 use aetherd::memory::{
     run_ask_command, run_notes_command, run_recall_command, run_remember_command,
@@ -226,6 +229,7 @@ fn run(cli: Cli) -> Result<()> {
         print_events: cli.print_events,
         print_sir: cli.print_sir,
         force: cli.force,
+        full: cli.full,
         sir_concurrency: cli.sir_concurrency,
         lifecycle_logs: cli.lsp && cli.index && std::io::stdout().is_terminal(),
         inference_provider: cli.inference_provider,
@@ -254,6 +258,9 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     if cli.index_once {
+        if cli.full {
+            return run_full_index_once(&indexer_config);
+        }
         return run_initial_index_once(&indexer_config);
     }
 
@@ -264,6 +271,7 @@ fn run_subcommand(workspace: &Path, command: Commands) -> Result<()> {
     match command {
         Commands::InitAgent(args) => run_init_agent_command(workspace, args),
         Commands::SetupLocal(args) => run_setup_local_command(workspace, args),
+        Commands::Status => run_status_subcommand(workspace),
         Commands::Remember(args) => run_remember_note_command(workspace, args),
         Commands::Recall(args) => run_recall_note_command(workspace, args),
         Commands::Ask(args) => run_ask_subcommand(workspace, args),
@@ -332,6 +340,24 @@ fn run_setup_local_command(workspace: &Path, args: SetupLocalArgs) -> Result<()>
         std::process::exit(exit_code.code());
     }
 
+    Ok(())
+}
+
+fn run_status_subcommand(workspace: &Path) -> Result<()> {
+    let store = SqliteStore::open(workspace).context("failed to open local store")?;
+    let (total_symbols, symbols_with_sir) = store
+        .count_symbols_with_sir()
+        .context("failed to compute SIR coverage")?;
+    let coverage_pct = if total_symbols > 0 {
+        (symbols_with_sir as f64 / total_symbols as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    println!(
+        "SIR Coverage: {} / {} ({coverage_pct:.1}%)",
+        symbols_with_sir, total_symbols
+    );
     Ok(())
 }
 

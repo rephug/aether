@@ -156,6 +156,18 @@ impl SirPipeline {
         print_sir: bool,
         out: &mut dyn Write,
     ) -> Result<()> {
+        self.process_event_with_priority(store, event, force, print_sir, out, None)
+    }
+
+    pub fn process_event_with_priority(
+        &self,
+        store: &SqliteStore,
+        event: &SymbolChangeEvent,
+        force: bool,
+        print_sir: bool,
+        out: &mut dyn Write,
+        priority_score: Option<f64>,
+    ) -> Result<()> {
         for symbol in &event.removed {
             store
                 .mark_removed(&symbol.id)
@@ -214,7 +226,7 @@ impl SirPipeline {
                     continue;
                 }
 
-                match build_job(&self.workspace_root, symbol) {
+                match build_job(&self.workspace_root, symbol, priority_score) {
                     Ok(job) => jobs.push(job),
                     Err(err) => {
                         tracing::warn!(
@@ -1163,6 +1175,7 @@ impl SirPipeline {
             language: language.as_str().to_owned(),
             file_path: file_path.to_owned(),
             qualified_name: format!("file::{file_path}"),
+            priority_score: None,
         };
 
         let summarized = self
@@ -1288,7 +1301,7 @@ fn to_symbol_record(symbol: &Symbol, now_ts: i64) -> SymbolRecord {
     }
 }
 
-fn build_job(workspace_root: &Path, symbol: Symbol) -> Result<SirJob> {
+fn build_job(workspace_root: &Path, symbol: Symbol, priority_score: Option<f64>) -> Result<SirJob> {
     let full_path = workspace_root.join(&symbol.file_path);
     let source = fs::read_to_string(&full_path)
         .with_context(|| format!("failed to read symbol source file {}", full_path.display()))?;
@@ -1322,6 +1335,7 @@ fn build_job(workspace_root: &Path, symbol: Symbol) -> Result<SirJob> {
         language: symbol.language.as_str().to_owned(),
         file_path: symbol.file_path.clone(),
         qualified_name: symbol.qualified_name.clone(),
+        priority_score,
     };
 
     Ok(SirJob {

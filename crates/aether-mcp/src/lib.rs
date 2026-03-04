@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use aether_analysis::{
     AcknowledgeDriftRequest as AnalysisAcknowledgeDriftRequest, BlastRadiusRequest, CausalAnalyzer,
@@ -51,7 +51,6 @@ use rmcp::transport::stdio;
 use rmcp::{
     ErrorData as McpError, Json, ServerHandler, ServiceExt, tool, tool_handler, tool_router,
 };
-use rusqlite::Connection;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -65,6 +64,7 @@ pub const SERVER_VERSION: &str = "0.1.0";
 pub const SERVER_DESCRIPTION: &str = "AETHER local symbol/SIR lookup from .aether store";
 pub const MCP_SCHEMA_VERSION: u32 = 1;
 pub const MEMORY_SCHEMA_VERSION: &str = "1.0";
+const SIR_STATUS_GENERATING: &str = "generating";
 
 #[derive(Debug, Error)]
 pub enum AetherMcpError {
@@ -100,6 +100,14 @@ pub struct AetherStatusResponse {
     pub sir_dir: String,
     pub symbol_count: i64,
     pub sir_count: i64,
+    pub sir_coverage: SirCoverageStats,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SirCoverageStats {
+    pub total_symbols: u64,
+    pub symbols_with_sir: u64,
+    pub percentage: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -936,8 +944,18 @@ pub struct AetherGetSirResponse {
     pub sir_json: String,
     pub sir_hash: String,
     pub sir_status: Option<String>,
+    pub structural: Option<SirStructuralView>,
     pub last_error: Option<String>,
     pub last_attempt_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SirStructuralView {
+    pub symbol_name: String,
+    pub kind: String,
+    pub file_path: String,
+    pub dependencies: Vec<String>,
+    pub callers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
@@ -1148,14 +1166,32 @@ impl AetherMcpServer {
         let sir_dir = self.sir_dir();
         let store_present = sqlite_path.exists() && sir_dir.is_dir();
 
-        let (symbol_count, sir_count) = if store_present {
-            let conn = self.open_sqlite_connection(&sqlite_path)?;
+        let (symbol_count, sir_count, sir_coverage) = if store_present {
+            let (total_symbols, symbols_with_sir) = self.state.store.count_symbols_with_sir()?;
+            let percentage = if total_symbols > 0 {
+                (symbols_with_sir as f64 / total_symbols as f64).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
             (
-                count_table_rows(&conn, "symbols")?,
-                count_table_rows(&conn, "sir")?,
+                total_symbols as i64,
+                symbols_with_sir as i64,
+                SirCoverageStats {
+                    total_symbols: total_symbols as u64,
+                    symbols_with_sir: symbols_with_sir as u64,
+                    percentage,
+                },
             )
         } else {
-            (0, 0)
+            (
+                0,
+                0,
+                SirCoverageStats {
+                    total_symbols: 0,
+                    symbols_with_sir: 0,
+                    percentage: 0.0,
+                },
+            )
         };
 
         Ok(AetherStatusResponse {
@@ -1167,6 +1203,7 @@ impl AetherMcpServer {
             sir_dir: normalize_path(&sir_dir.to_string_lossy()),
             symbol_count,
             sir_count,
+            sir_coverage,
         })
     }
 
@@ -2799,6 +2836,10 @@ impl AetherMcpServer {
         let sir_blob = store.read_sir_blob(symbol_id)?;
 
         let Some(sir_blob) = sir_blob else {
+            let structural = build_structural_view(store, symbol_id)?;
+            if structural.is_some() {
+                let _ = store.enqueue_sir_request(symbol_id);
+            }
             return Ok(AetherGetSirResponse {
                 found: false,
                 level: SirLevel::Leaf.into(),
@@ -2809,7 +2850,11 @@ impl AetherMcpServer {
                 files_total: None,
                 sir_json: String::new(),
                 sir_hash: String::new(),
-                sir_status,
+                sir_status: structural
+                    .as_ref()
+                    .map(|_| SIR_STATUS_GENERATING.to_owned())
+                    .or(sir_status),
+                structural,
                 last_error,
                 last_attempt_at,
             });
@@ -2836,6 +2881,7 @@ impl AetherMcpServer {
             sir_json: canonical_json,
             sir_hash: hash,
             sir_status,
+            structural: None,
             last_error,
             last_attempt_at,
         })
@@ -2875,6 +2921,7 @@ impl AetherMcpServer {
                 sir_json: String::new(),
                 sir_hash: String::new(),
                 sir_status,
+                structural: None,
                 last_error,
                 last_attempt_at,
             });
@@ -2899,6 +2946,7 @@ impl AetherMcpServer {
             sir_json: canonical_json,
             sir_hash: hash,
             sir_status,
+            structural: None,
             last_error,
             last_attempt_at,
         })
@@ -2927,6 +2975,7 @@ impl AetherMcpServer {
                 sir_json: String::new(),
                 sir_hash: String::new(),
                 sir_status: None,
+                structural: None,
                 last_error: None,
                 last_attempt_at: None,
             });
@@ -2949,6 +2998,7 @@ impl AetherMcpServer {
                 sir_json: String::new(),
                 sir_hash: String::new(),
                 sir_status,
+                structural: None,
                 last_error,
                 last_attempt_at,
             });
@@ -2973,6 +3023,7 @@ impl AetherMcpServer {
             sir_json: canonical_json,
             sir_hash: hash,
             sir_status,
+            structural: None,
             last_error,
             last_attempt_at,
         })
@@ -3219,12 +3270,6 @@ impl AetherMcpServer {
 
     fn sir_dir(&self) -> PathBuf {
         self.state.workspace.join(".aether").join("sir")
-    }
-
-    fn open_sqlite_connection(&self, sqlite_path: &Path) -> Result<Connection, AetherMcpError> {
-        let conn = Connection::open(sqlite_path)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
-        Ok(conn)
     }
 
     fn resolve_workspace_file_path(&self, file_path: &str) -> Result<PathBuf, AetherMcpError> {
@@ -3665,7 +3710,7 @@ mod tests {
         fs::write(
             workspace.join(".aether/config.toml"),
             r#"[inference]
-provider = "mock"
+provider = "qwen3_local"
 api_key_env = "GEMINI_API_KEY"
 
 [storage]
@@ -3674,7 +3719,7 @@ graph_backend = "sqlite"
 
 [embeddings]
 enabled = false
-provider = "mock"
+provider = "qwen3_local"
 vector_backend = "sqlite"
 "#,
         )
@@ -3878,11 +3923,11 @@ graph_backend = "cozo"
 
 [embeddings]
 enabled = false
-provider = "mock"
+provider = "qwen3_local"
 vector_backend = "sqlite"
 
 [inference]
-provider = "mock"
+provider = "qwen3_local"
 api_key_env = "GEMINI_API_KEY"
 "#,
         )
@@ -3961,15 +4006,6 @@ api_key_env = "GEMINI_API_KEY"
     }
 }
 
-fn count_table_rows(conn: &Connection, table_name: &str) -> Result<i64, AetherMcpError> {
-    let sql = format!("SELECT COUNT(*) FROM {table_name}");
-    match conn.query_row(&sql, [], |row| row.get::<_, i64>(0)) {
-        Ok(count) => Ok(count),
-        Err(err) if err.to_string().contains("no such table") => Ok(0),
-        Err(err) => Err(err.into()),
-    }
-}
-
 #[derive(Debug, Clone)]
 struct ModuleRollupCoverage {
     module_id: String,
@@ -3995,6 +4031,7 @@ fn empty_get_sir_response(level: SirLevelRequest, symbol_id: String) -> AetherGe
         sir_json: String::new(),
         sir_hash: String::new(),
         sir_status: None,
+        structural: None,
         last_error: None,
         last_attempt_at: None,
     }
@@ -4089,6 +4126,53 @@ fn symbol_leaf_name(qualified_name: &str) -> &str {
         .next()
         .filter(|value| !value.is_empty())
         .unwrap_or(qualified_name)
+}
+
+fn build_structural_view(
+    store: &SqliteStore,
+    symbol_id: &str,
+) -> Result<Option<SirStructuralView>, AetherMcpError> {
+    let Some(symbol) = store.get_symbol_record(symbol_id)? else {
+        return Ok(None);
+    };
+
+    let mut dependencies = store
+        .get_dependencies(symbol_id)?
+        .into_iter()
+        .map(|edge| edge.target_qualified_name)
+        .collect::<Vec<_>>();
+    sort_and_dedup(&mut dependencies);
+
+    let mut callers = Vec::new();
+    for edge in store.get_callers(symbol.qualified_name.as_str())? {
+        if let Some(caller) = resolve_caller_name(store, edge.source_id.as_str())? {
+            callers.push(caller);
+        }
+    }
+    sort_and_dedup(&mut callers);
+
+    Ok(Some(SirStructuralView {
+        symbol_name: symbol_leaf_name(symbol.qualified_name.as_str()).to_owned(),
+        kind: symbol.kind,
+        file_path: symbol.file_path,
+        dependencies,
+        callers,
+    }))
+}
+
+fn resolve_caller_name(
+    store: &SqliteStore,
+    caller_symbol_id: &str,
+) -> Result<Option<String>, AetherMcpError> {
+    let caller_symbol_id = caller_symbol_id.trim();
+    if caller_symbol_id.is_empty() {
+        return Ok(None);
+    }
+    let display = store
+        .get_symbol_record(caller_symbol_id)?
+        .map(|record: SymbolRecord| record.qualified_name)
+        .unwrap_or_else(|| caller_symbol_id.to_owned());
+    Ok(Some(display))
 }
 
 fn split_source_root(path: &str) -> Option<(String, String)> {

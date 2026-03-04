@@ -935,7 +935,7 @@ mod tests {
         fs::write(
             workspace.join(".aether/config.toml"),
             r#"[inference]
-provider = "mock"
+provider = "qwen3_local"
 api_key_env = "GEMINI_API_KEY"
 
 [storage]
@@ -944,7 +944,7 @@ graph_backend = "surreal"
 
 [embeddings]
 enabled = false
-provider = "mock"
+provider = "qwen3_local"
 vector_backend = "sqlite"
 "#,
         )

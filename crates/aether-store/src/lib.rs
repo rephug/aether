@@ -58,6 +58,15 @@ pub struct SymbolRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolMetadata {
+    pub symbol_id: String,
+    pub kind: String,
+    pub file_path: String,
+    pub is_public: bool,
+    pub line_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SirMetaRecord {
     pub id: String,
     pub sir_hash: String,
@@ -741,6 +750,10 @@ impl SqliteStore {
         &self.sir_dir
     }
 
+    pub fn workspace_root(&self) -> Option<PathBuf> {
+        self.aether_dir.parent().map(Path::to_path_buf)
+    }
+
     pub fn mirror_sir_files_enabled(&self) -> bool {
         self.mirror_sir_files
     }
@@ -1013,6 +1026,90 @@ impl SqliteStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn count_symbols_with_sir(&self) -> Result<(usize, usize), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let total = conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        let with_sir = conn.query_row(
+            r#"
+            SELECT COUNT(DISTINCT s.id)
+            FROM symbols s
+            JOIN sir r ON r.id = s.id
+            WHERE COALESCE(TRIM(r.sir_json), '') <> ''
+            "#,
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok((total.max(0) as usize, with_sir.max(0) as usize))
+    }
+
+    pub fn list_symbol_ids_without_sir(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT s.id
+            FROM symbols s
+            LEFT JOIN sir r ON r.id = s.id
+            WHERE COALESCE(TRIM(r.sir_json), '') = ''
+            ORDER BY s.id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_symbol_metadata(
+        &self,
+        symbol_id: &str,
+    ) -> Result<Option<SymbolMetadata>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, kind, file_path, qualified_name
+            FROM symbols
+            WHERE id = ?1
+            LIMIT 1
+            "#,
+        )?;
+        let row = stmt
+            .query_row(params![symbol_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .optional()?;
+        drop(stmt);
+        drop(conn);
+
+        let Some((symbol_id, kind, file_path, qualified_name)) = row else {
+            return Ok(None);
+        };
+        let full_path = self
+            .workspace_root()
+            .map(|workspace| workspace.join(&file_path));
+        let line_count = full_path
+            .as_ref()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .map(|source| source.lines().count())
+            .unwrap_or(0);
+        let is_public = full_path
+            .as_ref()
+            .map(|path| infer_symbol_is_public(path, &qualified_name))
+            .unwrap_or(false);
+
+        Ok(Some(SymbolMetadata {
+            symbol_id,
+            kind,
+            file_path,
+            is_public,
+            line_count,
+        }))
+    }
+
     pub fn list_all_embedding_symbol_ids(&self) -> Result<Vec<String>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -1024,6 +1121,73 @@ impl SqliteStore {
         )?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn enqueue_sir_request(&self, symbol_id: &str) -> Result<(), StoreError> {
+        let symbol_id = symbol_id.trim();
+        if symbol_id.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO sir_requests (symbol_id, requested_at, request_count)
+            VALUES (?1, unixepoch(), 1)
+            ON CONFLICT(symbol_id) DO UPDATE SET
+                requested_at = excluded.requested_at,
+                request_count = sir_requests.request_count + 1
+            "#,
+            params![symbol_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_sir_request_symbol_ids(&self, limit: usize) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT symbol_id
+            FROM sir_requests
+            ORDER BY requested_at ASC, symbol_id ASC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = stmt.query_map(params![limit.max(1) as i64], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn consume_sir_requests(&self, limit: usize) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        let mut stmt = tx.prepare(
+            r#"
+            SELECT symbol_id
+            FROM sir_requests
+            ORDER BY requested_at ASC, symbol_id ASC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = stmt.query_map(params![limit.max(1) as i64], |row| row.get::<_, String>(0))?;
+        let ids = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        if !ids.is_empty() {
+            let mut delete = tx.prepare("DELETE FROM sir_requests WHERE symbol_id = ?1")?;
+            for symbol_id in &ids {
+                delete.execute(params![symbol_id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    pub fn clear_sir_request(&self, symbol_id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM sir_requests WHERE symbol_id = ?1",
+            params![symbol_id.trim()],
+        )?;
+        Ok(())
     }
 
     pub fn create_write_intent(&self, intent: &WriteIntent) -> Result<(), StoreError> {
@@ -1189,6 +1353,30 @@ impl SqliteStore {
             counts.insert(status, count);
         }
         Ok(counts)
+    }
+
+    pub fn list_graph_dependency_edges(
+        &self,
+    ) -> Result<Vec<GraphDependencyEdgeRecord>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT e.source_id, target.id, e.edge_kind
+            FROM symbol_edges e
+            JOIN symbols target
+              ON target.qualified_name = e.target_qualified_name
+            WHERE e.edge_kind IN ('calls', 'depends_on')
+            ORDER BY e.source_id ASC, target.id ASC, e.edge_kind ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(GraphDependencyEdgeRecord {
+                source_symbol_id: row.get(0)?,
+                target_symbol_id: row.get(1)?,
+                edge_kind: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn list_module_file_paths(
@@ -3972,6 +4160,22 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         conn.execute("PRAGMA user_version = 3", [])?;
     }
 
+    if version < 4 {
+        conn.execute_batch(
+            r#"
+        CREATE TABLE IF NOT EXISTS sir_requests (
+            symbol_id TEXT PRIMARY KEY,
+            requested_at INTEGER NOT NULL,
+            request_count INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sir_requests_requested_at
+            ON sir_requests(requested_at);
+        "#,
+        )?;
+        conn.execute("PRAGMA user_version = 4", [])?;
+    }
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -4057,6 +4261,27 @@ fn table_has_column(
     }
 
     Ok(false)
+}
+
+fn infer_symbol_is_public(path: &Path, qualified_name: &str) -> bool {
+    let Ok(source) = fs::read_to_string(path) else {
+        return false;
+    };
+    let leaf = qualified_name
+        .rsplit("::")
+        .next()
+        .or_else(|| qualified_name.rsplit('.').next())
+        .unwrap_or(qualified_name)
+        .trim();
+    if leaf.is_empty() {
+        return false;
+    }
+
+    source.lines().any(|line| {
+        let normalized = line.trim();
+        (normalized.starts_with("pub ") || normalized.starts_with("export "))
+            && normalized.contains(leaf)
+    })
 }
 
 fn normalize_commit_hash(commit_hash: Option<&str>) -> Option<String> {
@@ -5193,13 +5418,13 @@ mirror_sir_files = false
         let first_version: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("query first user_version");
-        assert_eq!(first_version, 3);
+        assert_eq!(first_version, 4);
 
         run_migrations(&conn).expect("run migrations twice");
         let second_version: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("query second user_version");
-        assert_eq!(second_version, 3);
+        assert_eq!(second_version, 4);
     }
 
     #[test]
@@ -5209,7 +5434,7 @@ mirror_sir_files = false
 
         let schema = store.get_schema_version().expect("get schema version");
         assert_eq!(schema.component, "core");
-        assert_eq!(schema.version, 3);
+        assert_eq!(schema.version, 4);
         assert!(schema.migrated_at > 0);
     }
 
@@ -5399,7 +5624,7 @@ mirror_sir_files = false
         let version: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("query user_version");
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
 
         let exists = conn
             .query_row(
@@ -5411,6 +5636,17 @@ mirror_sir_files = false
             .expect("query sqlite_master")
             .is_some();
         assert!(exists);
+
+        let requests_exists = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sir_requests' LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .expect("query sqlite_master")
+            .is_some();
+        assert!(requests_exists);
     }
 
     #[test]
@@ -5992,5 +6228,124 @@ mirror_sir_files = false
             .expect("query file ref");
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].note_id, "note-a");
+    }
+
+    #[test]
+    fn count_symbols_with_sir_reports_total_and_with_sir() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        store
+            .upsert_symbol(symbol_record())
+            .expect("upsert first symbol");
+        store
+            .upsert_symbol(symbol_record_ts())
+            .expect("upsert second symbol");
+        store
+            .write_sir_blob(
+                "sym-1",
+                r#"{"intent":"ok","inputs":[],"outputs":[],"side_effects":[],"dependencies":[],"error_modes":[],"confidence":0.9}"#,
+            )
+            .expect("write sir blob");
+
+        let (total, with_sir) = store
+            .count_symbols_with_sir()
+            .expect("count symbols with sir");
+        assert_eq!(total, 2);
+        assert_eq!(with_sir, 1);
+    }
+
+    #[test]
+    fn list_symbol_ids_without_sir_returns_missing_only() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        store
+            .upsert_symbol(symbol_record())
+            .expect("upsert first symbol");
+        store
+            .upsert_symbol(symbol_record_ts())
+            .expect("upsert second symbol");
+        store
+            .write_sir_blob(
+                "sym-1",
+                r#"{"intent":"ok","inputs":[],"outputs":[],"side_effects":[],"dependencies":[],"error_modes":[],"confidence":0.9}"#,
+            )
+            .expect("write sir blob");
+
+        let missing = store
+            .list_symbol_ids_without_sir()
+            .expect("list symbol ids without sir");
+        assert_eq!(missing, vec!["sym-2".to_owned()]);
+    }
+
+    #[test]
+    fn sir_request_queue_round_trip_works() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        store.enqueue_sir_request("sym-a").expect("enqueue sym-a");
+        store.enqueue_sir_request("sym-b").expect("enqueue sym-b");
+
+        let listed = store
+            .list_sir_request_symbol_ids(10)
+            .expect("list sir requests");
+        assert_eq!(listed.len(), 2);
+        assert!(listed.contains(&"sym-a".to_owned()));
+        assert!(listed.contains(&"sym-b".to_owned()));
+
+        let consumed = store
+            .consume_sir_requests(10)
+            .expect("consume sir requests");
+        assert_eq!(consumed.len(), 2);
+        assert!(
+            store
+                .list_sir_request_symbol_ids(10)
+                .expect("list after consume")
+                .is_empty()
+        );
+
+        store.enqueue_sir_request("sym-c").expect("enqueue sym-c");
+        store.clear_sir_request("sym-c").expect("clear sym-c");
+        assert!(
+            store
+                .list_sir_request_symbol_ids(10)
+                .expect("list after clear")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn get_symbol_metadata_reports_visibility_and_line_count() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(workspace.join("src")).expect("create src dir");
+        fs::write(
+            workspace.join("src/lib.rs"),
+            "pub fn alpha() {}\nfn beta() {}\n",
+        )
+        .expect("write source");
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        store
+            .upsert_symbol(SymbolRecord {
+                id: "sym-alpha".to_owned(),
+                file_path: "src/lib.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "alpha".to_owned(),
+                signature_fingerprint: "sig-alpha".to_owned(),
+                last_seen_at: 1_700_000_000,
+            })
+            .expect("upsert symbol");
+
+        let metadata = store
+            .get_symbol_metadata("sym-alpha")
+            .expect("get metadata")
+            .expect("metadata exists");
+        assert_eq!(metadata.file_path, "src/lib.rs");
+        assert_eq!(metadata.kind, "function");
+        assert!(metadata.is_public);
+        assert_eq!(metadata.line_count, 2);
     }
 }

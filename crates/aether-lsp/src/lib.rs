@@ -3,8 +3,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aether_core::{
-    HoverMarkdownSections, Language, NO_SIR_MESSAGE, SourceRange, format_hover_markdown_sections,
-    normalize_path, stable_symbol_id, stale_warning_message,
+    HoverMarkdownSections, Language, NO_SIR_MESSAGE, SourceRange, Symbol,
+    format_hover_markdown_sections, normalize_path, stable_symbol_id, stale_warning_message,
 };
 use aether_parse::{RustUsePrefix, language_for_path, rust_use_path_at_cursor};
 use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
@@ -243,11 +243,12 @@ pub fn resolve_hover_markdown_for_source(
     let sir_json = match store.read_sir_blob(&symbol_id)? {
         Some(json) => json,
         None => {
-            if let Some(warning) = stale_warning {
-                return Ok(Some(format!("{warning}\n\n{NO_SIR_MESSAGE}")));
-            }
-
-            return Ok(None);
+            return Ok(Some(render_pending_hover_markdown(
+                store,
+                symbol_id.as_str(),
+                symbol,
+                stale_warning.as_deref(),
+            )));
         }
     };
 
@@ -560,6 +561,55 @@ fn format_markdown_list(items: &[String]) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     }
+}
+
+fn render_pending_hover_markdown(
+    store: &SqliteStore,
+    symbol_id: &str,
+    symbol: &Symbol,
+    stale_warning: Option<&str>,
+) -> String {
+    let _ = store.enqueue_sir_request(symbol_id);
+
+    let mut dependencies = store
+        .get_dependencies(symbol_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|edge| edge.target_qualified_name)
+        .collect::<Vec<_>>();
+    dependencies.sort();
+    dependencies.dedup();
+
+    let mut callers = Vec::new();
+    for edge in store
+        .get_callers(symbol.qualified_name.as_str())
+        .unwrap_or_default()
+    {
+        let caller = store
+            .get_symbol_record(edge.source_id.as_str())
+            .ok()
+            .flatten()
+            .map(|record| record.qualified_name)
+            .unwrap_or(edge.source_id);
+        callers.push(caller);
+    }
+    callers.sort();
+    callers.dedup();
+
+    let mut blocks = vec![
+        format!("### {}", symbol.qualified_name),
+        format!("**Kind:** {}", symbol.kind.as_str()),
+        format!("**File:** {}", symbol.file_path),
+        format!("**Dependencies**\n{}", format_markdown_list(&dependencies)),
+        format!("**Callers**\n{}", format_markdown_list(&callers)),
+        "⏳ SIR generation in progress...".to_owned(),
+    ];
+
+    if let Some(warning) = stale_warning {
+        blocks.insert(1, format!("> {warning}"));
+    }
+
+    blocks.join("\n\n")
 }
 
 fn compact_why_hint(store: &SqliteStore, symbol_id: &str) -> Result<Option<String>, StoreError> {
@@ -964,7 +1014,7 @@ mod tests {
 
         store
             .upsert_sir_meta(SirMetaRecord {
-                id: symbol_id,
+                id: symbol_id.clone(),
                 sir_hash: "hash-alpha".to_owned(),
                 sir_version: 1,
                 provider: "mock".to_owned(),
@@ -982,7 +1032,11 @@ mod tests {
                 .expect("hover markdown");
 
         assert!(markdown.contains("AETHER WARNING: SIR is stale. Last error: provider timeout"));
-        assert!(markdown.contains(NO_SIR_MESSAGE));
+        assert!(markdown.contains("SIR generation in progress"));
+        let queued = store
+            .list_sir_request_symbol_ids(10)
+            .expect("list sir requests");
+        assert_eq!(queued, vec![symbol_id]);
     }
 
     #[test]

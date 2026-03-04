@@ -360,6 +360,8 @@ pub enum Commands {
     InitAgent(InitAgentArgs),
     /// Set up local Ollama inference for offline SIR generation
     SetupLocal(SetupLocalArgs),
+    /// Show local index health and SIR coverage
+    Status,
     /// Store a project memory note
     Remember(RememberArgs),
     /// Search project memory notes
@@ -496,6 +498,13 @@ pub struct Cli {
         help = "Run one full index pass and exit"
     )]
     pub index_once: bool,
+
+    #[arg(
+        long,
+        requires = "index_once",
+        help = "When used with --index-once, run full Pass 1 + Pass 2 indexing before exit"
+    )]
+    pub full: bool,
 
     #[arg(
         long,
@@ -771,7 +780,7 @@ mod tests {
             "--endpoint",
             "http://127.0.0.1:11435",
             "--model",
-            "qwen2.5-coder:7b-instruct-q4_K_M",
+            "qwen3.5:9b",
             "--skip-pull",
             "--skip-config",
         ])
@@ -780,15 +789,19 @@ mod tests {
         match cli.command {
             Some(Commands::SetupLocal(args)) => {
                 assert_eq!(args.endpoint, "http://127.0.0.1:11435");
-                assert_eq!(
-                    args.model.as_deref(),
-                    Some("qwen2.5-coder:7b-instruct-q4_K_M")
-                );
+                assert_eq!(args.model.as_deref(), Some("qwen3.5:9b"));
                 assert!(args.skip_pull);
                 assert!(args.skip_config);
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn status_subcommand_parses() {
+        let cli =
+            Cli::try_parse_from(["aetherd", "--workspace", ".", "status"]).expect("status parse");
+        assert!(matches!(cli.command, Some(Commands::Status)));
     }
 
     #[test]

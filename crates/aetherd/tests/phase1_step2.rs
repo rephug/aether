@@ -3,10 +3,8 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use aether_config::{AetherConfig, InferenceProviderKind, VerifyConfig, VerifyMode};
-use aether_infer::{
-    InferError, InferenceProvider, MockProvider, ProviderOverrides, Qwen3LocalProvider, SirContext,
-};
+use aether_config::{AetherConfig, VerifyConfig, VerifyMode};
+use aether_infer::{InferError, InferenceProvider, Qwen3LocalProvider, SirContext};
 use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id, validate_sir};
 use aether_store::{SqliteStore, Store, SymbolEmbeddingRecord};
 use aetherd::observer::ObserverState;
@@ -115,7 +113,7 @@ fn write_pipeline_config(
         workspace.join(".aether/config.toml"),
         format!(
             r#"[inference]
-provider = "mock"
+provider = "qwen3_local"
 api_key_env = "GEMINI_API_KEY"
 
 [storage]
@@ -124,7 +122,7 @@ graph_backend = "sqlite"
 
 [embeddings]
 enabled = {embeddings_enabled}
-provider = "mock"
+provider = "qwen3_local"
 vector_backend = "{vector_backend}"
 "#
         ),
@@ -163,9 +161,14 @@ fn step2_pipeline_generates_and_persists_sir_with_mock_provider()
     observer.seed_from_disk()?;
 
     let store = SqliteStore::open(workspace)?;
-    let provider: Arc<dyn InferenceProvider> = Arc::new(MockProvider);
-    let pipeline =
-        SirPipeline::new_with_provider(workspace.to_path_buf(), 2, provider, "mock", "mock")?;
+    let provider: Arc<dyn InferenceProvider> = Arc::new(HashingMockProvider);
+    let pipeline = SirPipeline::new_with_provider(
+        workspace.to_path_buf(),
+        2,
+        provider,
+        "hashing_mock",
+        "hashing_mock",
+    )?;
 
     let mut startup_stdout = Vec::new();
     for event in observer.initial_symbol_events() {
@@ -320,6 +323,7 @@ fn step2_file_rollup_aggregates_side_effects_and_concatenates_intent_for_small_f
 }
 
 #[test]
+#[ignore = "requires running local embedding provider"]
 fn step2_embeddings_refresh_when_hash_changes_and_delete_on_symbol_removal()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;
@@ -334,13 +338,13 @@ fn step2_embeddings_refresh_when_hash_changes_and_delete_on_symbol_removal()
     observer.seed_from_disk()?;
 
     let store = SqliteStore::open(workspace)?;
-    let pipeline = SirPipeline::new(
+    let provider: Arc<dyn InferenceProvider> = Arc::new(HashingMockProvider);
+    let pipeline = SirPipeline::new_with_provider(
         workspace.to_path_buf(),
         1,
-        ProviderOverrides {
-            provider: Some(InferenceProviderKind::Mock),
-            ..ProviderOverrides::default()
-        },
+        provider,
+        "hashing_mock",
+        "hashing_mock",
     )?;
 
     let mut sink = Vec::new();
@@ -361,8 +365,8 @@ fn step2_embeddings_refresh_when_hash_changes_and_delete_on_symbol_removal()
     store.upsert_symbol_embedding(SymbolEmbeddingRecord {
         symbol_id: symbol.id.clone(),
         sir_hash: "stale-hash".to_owned(),
-        provider: "mock".to_owned(),
-        model: "mock-64d".to_owned(),
+        provider: "hashing_mock".to_owned(),
+        model: "hashing_mock".to_owned(),
         embedding: vec![1.0, 0.0, 0.0],
         updated_at: embedding_meta.updated_at.saturating_sub(1),
     })?;
@@ -377,8 +381,8 @@ fn step2_embeddings_refresh_when_hash_changes_and_delete_on_symbol_removal()
         .get_symbol_embedding_meta(&symbol.id)?
         .expect("embedding metadata after refresh");
     assert_ne!(refreshed_meta.sir_hash, "stale-hash");
-    assert_eq!(refreshed_meta.provider, "mock");
-    assert_eq!(refreshed_meta.model, "mock-64d");
+    assert_eq!(refreshed_meta.provider, "hashing_mock");
+    assert_eq!(refreshed_meta.model, "hashing_mock");
     assert!(refreshed_meta.embedding_dim > 0);
 
     fs::write(&rust_file, "")?;
@@ -408,9 +412,14 @@ fn step2_pipeline_marks_stale_on_failure_and_clears_on_recovery()
     observer.seed_from_disk()?;
 
     let store = SqliteStore::open(workspace)?;
-    let mock_provider: Arc<dyn InferenceProvider> = Arc::new(MockProvider);
-    let success_pipeline =
-        SirPipeline::new_with_provider(workspace.to_path_buf(), 1, mock_provider, "mock", "mock")?;
+    let mock_provider: Arc<dyn InferenceProvider> = Arc::new(HashingMockProvider);
+    let success_pipeline = SirPipeline::new_with_provider(
+        workspace.to_path_buf(),
+        1,
+        mock_provider,
+        "hashing_mock",
+        "hashing_mock",
+    )?;
 
     let mut sink = Vec::new();
     for event in observer.initial_symbol_events() {
@@ -575,9 +584,14 @@ fn step2_reindex_replaces_old_dependency_edges() -> Result<(), Box<dyn std::erro
     observer.seed_from_disk()?;
 
     let store = SqliteStore::open(workspace)?;
-    let provider: Arc<dyn InferenceProvider> = Arc::new(MockProvider);
-    let pipeline =
-        SirPipeline::new_with_provider(workspace.to_path_buf(), 1, provider, "mock", "mock")?;
+    let provider: Arc<dyn InferenceProvider> = Arc::new(HashingMockProvider);
+    let pipeline = SirPipeline::new_with_provider(
+        workspace.to_path_buf(),
+        1,
+        provider,
+        "hashing_mock",
+        "hashing_mock",
+    )?;
 
     let mut sink = Vec::new();
     for event in observer.initial_symbol_events() {

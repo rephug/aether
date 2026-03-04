@@ -314,7 +314,7 @@ mod tests {
             workspace.join(".aether/config.toml"),
             format!(
                 r#"[inference]
-provider = "mock"
+provider = "qwen3_local"
 api_key_env = "GEMINI_API_KEY"
 
 [storage]
@@ -322,7 +322,7 @@ mirror_sir_files = true
 
 [embeddings]
 enabled = {embeddings_enabled}
-provider = "mock"
+provider = "qwen3_local"
 vector_backend = "sqlite"
 
 [verify]

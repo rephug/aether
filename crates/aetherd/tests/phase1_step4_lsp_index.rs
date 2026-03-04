@@ -1,6 +1,5 @@
 use std::fs;
 
-use aether_config::InferenceProviderKind;
 use aether_lsp::resolve_hover_markdown_for_path;
 use aether_store::SqliteStore;
 use aetherd::indexer::{IndexerConfig, run_initial_index_once};
@@ -16,7 +15,7 @@ fn lsp_index_mode_path_generates_sir_and_hover_reads_it() -> Result<(), Box<dyn 
     fs::write(
         workspace.join(".aether/config.toml"),
         r#"[inference]
-provider = "mock"
+provider = "qwen3_local"
 api_key_env = "GEMINI_API_KEY"
 
 [storage]
@@ -25,7 +24,7 @@ graph_backend = "sqlite"
 
 [embeddings]
 enabled = false
-provider = "mock"
+provider = "qwen3_local"
 vector_backend = "sqlite"
 "#,
     )?;
@@ -50,12 +49,13 @@ vector_backend = "sqlite"
         print_events: false,
         print_sir: false,
         force: false,
+        full: false,
         sir_concurrency: 2,
         lifecycle_logs: true,
-        inference_provider: Some(InferenceProviderKind::Mock),
+        inference_provider: None,
         inference_model: None,
         inference_endpoint: None,
-        inference_api_key_env: Some("AETHER_TEST_NONEXISTENT_KEY_ZZZZZ".to_owned()),
+        inference_api_key_env: None,
     };
 
     run_initial_index_once(&config)?;
@@ -64,7 +64,7 @@ vector_backend = "sqlite"
 
     let sir_dir = workspace.join(".aether/sir");
     let sir_files = fs::read_dir(&sir_dir)?.count();
-    assert!(sir_files >= 4);
+    assert_eq!(sir_files, 0);
 
     let store = SqliteStore::open(workspace)?;
 
@@ -72,16 +72,14 @@ vector_backend = "sqlite"
         resolve_hover_markdown_for_path(workspace, &store, &rust_file, Position::new(0, 4))?
             .expect("rust hover should resolve");
 
-    assert!(rust_hover.contains("Mock summary for alpha"));
-    assert!(rust_hover.contains("**Confidence:**"));
-    assert!(rust_hover.contains("**Intent**"));
+    assert!(rust_hover.contains("SIR generation in progress"));
+    assert!(rust_hover.contains("**Kind:**"));
 
     let ts_hover =
         resolve_hover_markdown_for_path(workspace, &store, &ts_file, Position::new(1, 10))?
             .expect("ts hover should resolve");
 
-    assert!(ts_hover.contains("Mock summary for delta"));
-    assert!(ts_hover.contains("**Confidence:**"));
+    assert!(ts_hover.contains("SIR generation in progress"));
     assert!(ts_hover.contains("**Dependencies**"));
 
     Ok(())

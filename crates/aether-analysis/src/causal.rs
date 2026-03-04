@@ -1201,11 +1201,11 @@ graph_backend = "cozo"
 
 [embeddings]
 enabled = {embeddings_enabled}
-provider = "mock"
+provider = "qwen3_local"
 vector_backend = "sqlite"
 
 [inference]
-provider = "mock"
+provider = "qwen3_local"
 api_key_env = "GEMINI_API_KEY"
 "#
             ),

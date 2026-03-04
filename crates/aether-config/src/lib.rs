@@ -9,9 +9,9 @@ pub const CONFIG_FILE_NAME: &str = "config.toml";
 pub const DEFAULT_GEMINI_API_KEY_ENV: &str = "GEMINI_API_KEY";
 pub const DEFAULT_OPENAI_COMPAT_API_KEY_ENV: &str = "OPENAI_COMPAT_API_KEY";
 pub const DEFAULT_QWEN_ENDPOINT: &str = "http://127.0.0.1:11434";
-pub const DEFAULT_QWEN_MODEL: &str = "qwen2.5-coder:7b-instruct-q4_K_M";
+pub const DEFAULT_QWEN_MODEL: &str = "qwen3.5:9b";
 pub const DEFAULT_QWEN_EMBEDDING_ENDPOINT: &str = "http://127.0.0.1:11434/api/embeddings";
-pub const RECOMMENDED_OLLAMA_MODEL: &str = "qwen2.5-coder:7b-instruct-q4_K_M";
+pub const RECOMMENDED_OLLAMA_MODEL: &str = "qwen3.5:9b";
 pub const OLLAMA_DEFAULT_ENDPOINT: &str = "http://127.0.0.1:11434";
 pub const SIR_QUALITY_FLOOR_CONFIDENCE: f32 = 0.3;
 pub const SIR_QUALITY_FLOOR_WINDOW: usize = 10;
@@ -46,7 +46,7 @@ pub const DEFAULT_HEALTH_RECENCY_WEIGHT: f64 = 0.1;
 pub enum InferenceProviderKind {
     #[default]
     Auto,
-    Mock,
+    Tiered,
     Gemini,
     Qwen3Local,
     #[serde(rename = "openai_compat")]
@@ -57,7 +57,7 @@ impl InferenceProviderKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
-            Self::Mock => "mock",
+            Self::Tiered => "tiered",
             Self::Gemini => "gemini",
             Self::Qwen3Local => "qwen3_local",
             Self::OpenAiCompat => "openai_compat",
@@ -71,12 +71,12 @@ impl std::str::FromStr for InferenceProviderKind {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim() {
             "auto" => Ok(Self::Auto),
-            "mock" => Ok(Self::Mock),
+            "tiered" => Ok(Self::Tiered),
             "gemini" => Ok(Self::Gemini),
             "qwen3_local" => Ok(Self::Qwen3Local),
             "openai_compat" => Ok(Self::OpenAiCompat),
             other => Err(format!(
-                "invalid provider '{other}', expected one of: auto, mock, gemini, qwen3_local, openai_compat"
+                "invalid provider '{other}', expected one of: auto, tiered, gemini, qwen3_local, openai_compat"
             )),
         }
     }
@@ -86,7 +86,6 @@ impl std::str::FromStr for InferenceProviderKind {
 #[serde(rename_all = "snake_case")]
 pub enum EmbeddingProviderKind {
     #[default]
-    Mock,
     Qwen3Local,
     Candle,
 }
@@ -94,7 +93,6 @@ pub enum EmbeddingProviderKind {
 impl EmbeddingProviderKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Mock => "mock",
             Self::Qwen3Local => "qwen3_local",
             Self::Candle => "candle",
         }
@@ -106,11 +104,10 @@ impl std::str::FromStr for EmbeddingProviderKind {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim() {
-            "mock" => Ok(Self::Mock),
             "qwen3_local" => Ok(Self::Qwen3Local),
             "candle" => Ok(Self::Candle),
             other => Err(format!(
-                "invalid embedding provider '{other}', expected one of: mock, qwen3_local, candle"
+                "invalid embedding provider '{other}', expected one of: qwen3_local, candle"
             )),
         }
     }
@@ -255,7 +252,7 @@ impl Default for GeneralConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InferenceConfig {
     #[serde(default)]
     pub provider: InferenceProviderKind,
@@ -265,6 +262,8 @@ pub struct InferenceConfig {
     pub endpoint: Option<String>,
     #[serde(default = "default_api_key_env")]
     pub api_key_env: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiered: Option<TieredConfig>,
 }
 
 impl Default for InferenceConfig {
@@ -274,6 +273,47 @@ impl Default for InferenceConfig {
             model: None,
             endpoint: None,
             api_key_env: default_api_key_env(),
+            tiered: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TieredConfig {
+    pub primary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_endpoint: Option<String>,
+    #[serde(default = "default_api_key_env")]
+    pub primary_api_key_env: String,
+    #[serde(default = "default_tiered_primary_threshold")]
+    pub primary_threshold: f64,
+    #[serde(
+        default = "default_tiered_fallback_model",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fallback_model: Option<String>,
+    #[serde(
+        default = "default_tiered_fallback_endpoint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fallback_endpoint: Option<String>,
+    #[serde(default = "default_tiered_retry_with_fallback")]
+    pub retry_with_fallback: bool,
+}
+
+impl Default for TieredConfig {
+    fn default() -> Self {
+        Self {
+            primary: "gemini".to_owned(),
+            primary_model: None,
+            primary_endpoint: None,
+            primary_api_key_env: default_api_key_env(),
+            primary_threshold: default_tiered_primary_threshold(),
+            fallback_model: default_tiered_fallback_model(),
+            fallback_endpoint: default_tiered_fallback_endpoint(),
+            retry_with_fallback: default_tiered_retry_with_fallback(),
         }
     }
 }
@@ -327,7 +367,7 @@ impl Default for EmbeddingsConfig {
     fn default() -> Self {
         Self {
             enabled: default_embeddings_enabled(),
-            provider: EmbeddingProviderKind::Mock,
+            provider: EmbeddingProviderKind::Qwen3Local,
             vector_backend: EmbeddingVectorBackend::Lancedb,
             model: None,
             endpoint: None,
@@ -818,25 +858,6 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
                 message: "embeddings.candle.model_dir is set but embeddings.enabled=false; model_dir will be ignored".to_owned(),
             });
         }
-    } else if matches!(config.embeddings.provider, EmbeddingProviderKind::Mock) {
-        if config.embeddings.model.is_some() {
-            warnings.push(ConfigWarning {
-                code: "embeddings_model_unused_for_mock",
-                message: "embeddings.provider=mock ignores embeddings.model".to_owned(),
-            });
-        }
-        if config.embeddings.endpoint.is_some() {
-            warnings.push(ConfigWarning {
-                code: "embeddings_endpoint_unused_for_mock",
-                message: "embeddings.provider=mock ignores embeddings.endpoint".to_owned(),
-            });
-        }
-        if config.embeddings.candle.model_dir.is_some() {
-            warnings.push(ConfigWarning {
-                code: "embeddings_candle_model_dir_unused_for_mock",
-                message: "embeddings.provider=mock ignores embeddings.candle.model_dir".to_owned(),
-            });
-        }
     } else if matches!(
         config.embeddings.provider,
         EmbeddingProviderKind::Qwen3Local
@@ -885,17 +906,31 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
                 });
             }
         }
-        InferenceProviderKind::Mock => {
+        InferenceProviderKind::Tiered => {
+            if config.inference.tiered.is_none() {
+                warnings.push(ConfigWarning {
+                    code: "inference_tiered_config_missing",
+                    message: "inference.provider=tiered requires [inference.tiered] config"
+                        .to_owned(),
+                });
+            }
             if config.inference.model.is_some() {
                 warnings.push(ConfigWarning {
-                    code: "inference_model_ignored_for_mock",
-                    message: "inference.provider=mock ignores inference.model".to_owned(),
+                    code: "inference_model_ignored_for_tiered",
+                    message: "inference.provider=tiered ignores inference.model".to_owned(),
                 });
             }
             if config.inference.endpoint.is_some() {
                 warnings.push(ConfigWarning {
-                    code: "inference_endpoint_ignored_for_mock",
-                    message: "inference.provider=mock ignores inference.endpoint".to_owned(),
+                    code: "inference_endpoint_ignored_for_tiered",
+                    message: "inference.provider=tiered ignores inference.endpoint".to_owned(),
+                });
+            }
+            if config.inference.api_key_env != DEFAULT_GEMINI_API_KEY_ENV {
+                warnings.push(ConfigWarning {
+                    code: "inference_api_key_env_ignored_for_tiered",
+                    message: "inference.api_key_env is ignored when inference.provider=tiered"
+                        .to_owned(),
                 });
             }
         }
@@ -973,6 +1008,22 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
 
 fn default_api_key_env() -> String {
     DEFAULT_GEMINI_API_KEY_ENV.to_owned()
+}
+
+fn default_tiered_primary_threshold() -> f64 {
+    0.8
+}
+
+fn default_tiered_fallback_model() -> Option<String> {
+    Some(DEFAULT_QWEN_MODEL.to_owned())
+}
+
+fn default_tiered_fallback_endpoint() -> Option<String> {
+    Some(DEFAULT_QWEN_ENDPOINT.to_owned())
+}
+
+fn default_tiered_retry_with_fallback() -> bool {
+    true
 }
 
 fn default_log_level() -> String {
@@ -1304,6 +1355,24 @@ fn normalize_config(mut config: AetherConfig) -> AetherConfig {
     );
     config.inference.model = normalize_optional(config.inference.model.take());
     config.inference.endpoint = normalize_optional(config.inference.endpoint.take());
+    if let Some(tiered) = config.inference.tiered.as_mut() {
+        tiered.primary =
+            normalize_with_default(std::mem::take(&mut tiered.primary), "gemini".to_owned());
+        tiered.primary_model = normalize_optional(tiered.primary_model.take());
+        tiered.primary_endpoint = normalize_optional(tiered.primary_endpoint.take());
+        tiered.primary_api_key_env = normalize_with_default(
+            std::mem::take(&mut tiered.primary_api_key_env),
+            default_api_key_env(),
+        );
+        if !tiered.primary_threshold.is_finite() {
+            tiered.primary_threshold = default_tiered_primary_threshold();
+        }
+        tiered.primary_threshold = tiered.primary_threshold.clamp(0.0, 1.0);
+        tiered.fallback_model =
+            normalize_optional(tiered.fallback_model.take()).or_else(default_tiered_fallback_model);
+        tiered.fallback_endpoint = normalize_optional(tiered.fallback_endpoint.take())
+            .or_else(default_tiered_fallback_endpoint);
+    }
     config.embeddings.model = normalize_optional(config.embeddings.model.take());
     config.embeddings.endpoint = normalize_optional(config.embeddings.endpoint.take());
     config.embeddings.candle.model_dir =
@@ -1432,7 +1501,10 @@ mod tests {
         assert!(config.storage.mirror_sir_files);
         assert_eq!(config.storage.graph_backend, GraphBackend::Surreal);
         assert!(!config.embeddings.enabled);
-        assert_eq!(config.embeddings.provider, EmbeddingProviderKind::Mock);
+        assert_eq!(
+            config.embeddings.provider,
+            EmbeddingProviderKind::Qwen3Local
+        );
         assert_eq!(config.search.reranker, SearchRerankerKind::None);
         assert_eq!(config.search.rerank_window, 50);
         assert_eq!(
@@ -1553,7 +1625,7 @@ mod tests {
         assert!(content.contains("graph_backend = \"surreal\""));
         assert!(content.contains("[embeddings]"));
         assert!(content.contains("enabled = false"));
-        assert!(content.contains("provider = \"mock\""));
+        assert!(content.contains("provider = \"qwen3_local\""));
         assert!(content.contains("vector_backend = \"lancedb\""));
         assert!(content.contains("[search]"));
         assert!(content.contains("reranker = \"none\""));
@@ -1824,7 +1896,7 @@ model_dir = " .aether/models "
 log_level = ""
 
 [inference]
-provider = "mock"
+provider = "qwen3_local"
 api_key_env = "CUSTOM_KEY"
 
 [storage]
@@ -1863,7 +1935,7 @@ fallback_to_host_on_unavailable = true
 
         assert_eq!(before, after);
         assert_eq!(config.general.log_level, DEFAULT_LOG_LEVEL);
-        assert_eq!(config.inference.provider, InferenceProviderKind::Mock);
+        assert_eq!(config.inference.provider, InferenceProviderKind::Qwen3Local);
         assert_eq!(config.inference.api_key_env, "CUSTOM_KEY");
         assert!(!config.storage.mirror_sir_files);
         assert_eq!(config.storage.graph_backend, GraphBackend::Sqlite);
@@ -1973,6 +2045,7 @@ risk_weights = { pagerank = 2.0, test_gap = 1.0, drift = 1.0, no_sir = 1.0, rece
                 model: None,
                 endpoint: Some("http://127.0.0.1:11434".to_owned()),
                 api_key_env: DEFAULT_GEMINI_API_KEY_ENV.to_owned(),
+                tiered: None,
             },
             storage: StorageConfig {
                 mirror_sir_files: true,
@@ -1980,7 +2053,7 @@ risk_weights = { pagerank = 2.0, test_gap = 1.0, drift = 1.0, no_sir = 1.0, rece
             },
             embeddings: EmbeddingsConfig {
                 enabled: false,
-                provider: EmbeddingProviderKind::Mock,
+                provider: EmbeddingProviderKind::Qwen3Local,
                 vector_backend: EmbeddingVectorBackend::Lancedb,
                 model: Some("mock-x".to_owned()),
                 endpoint: Some("http://127.0.0.1:11434/api/embeddings".to_owned()),

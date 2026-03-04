@@ -1799,6 +1799,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires running local embedding provider"]
     fn report_generates_semantic_drift_and_mechanical_fallback() {
         let temp = tempdir().expect("tempdir");
         init_repo(temp.path());
@@ -2004,11 +2005,11 @@ graph_backend = "cozo"
 
 [embeddings]
 enabled = true
-provider = "mock"
+provider = "qwen3_local"
 vector_backend = "sqlite"
 
 [inference]
-provider = "mock"
+provider = "qwen3_local"
 api_key_env = "GEMINI_API_KEY"
 
 [drift]
@@ -2034,11 +2035,11 @@ graph_backend = "cozo"
 
 [embeddings]
 enabled = false
-provider = "mock"
+provider = "qwen3_local"
 vector_backend = "sqlite"
 
 [inference]
-provider = "mock"
+provider = "qwen3_local"
 api_key_env = "GEMINI_API_KEY"
 
 [drift]
