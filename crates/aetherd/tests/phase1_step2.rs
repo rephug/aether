@@ -105,6 +105,33 @@ fn init_git_repo(workspace: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn write_pipeline_config(
+    workspace: &Path,
+    embeddings_enabled: bool,
+    vector_backend: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(workspace.join(".aether"))?;
+    fs::write(
+        workspace.join(".aether/config.toml"),
+        format!(
+            r#"[inference]
+provider = "mock"
+api_key_env = "GEMINI_API_KEY"
+
+[storage]
+mirror_sir_files = true
+graph_backend = "sqlite"
+
+[embeddings]
+enabled = {embeddings_enabled}
+provider = "mock"
+vector_backend = "{vector_backend}"
+"#
+        ),
+    )?;
+    Ok(())
+}
+
 fn commit_all(workspace: &Path, message: &str) -> Result<String, Box<dyn std::error::Error>> {
     run_git(workspace, &["add", "."])?;
     run_git(workspace, &["commit", "-m", message])?;
@@ -116,6 +143,7 @@ fn step2_pipeline_generates_and_persists_sir_with_mock_provider()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;
     let workspace = temp.path();
+    write_pipeline_config(workspace, false, "sqlite")?;
 
     fs::create_dir_all(workspace.join("src"))?;
 
@@ -245,6 +273,7 @@ fn step2_file_rollup_aggregates_side_effects_and_concatenates_intent_for_small_f
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;
     let workspace = temp.path();
+    write_pipeline_config(workspace, false, "sqlite")?;
 
     fs::create_dir_all(workspace.join("src"))?;
     let rust_file = workspace.join("src/lib.rs");
@@ -295,23 +324,7 @@ fn step2_embeddings_refresh_when_hash_changes_and_delete_on_symbol_removal()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;
     let workspace = temp.path();
-
-    fs::create_dir_all(workspace.join(".aether"))?;
-    fs::write(
-        workspace.join(".aether/config.toml"),
-        r#"[inference]
-provider = "mock"
-api_key_env = "GEMINI_API_KEY"
-
-[storage]
-mirror_sir_files = true
-
-[embeddings]
-enabled = true
-provider = "mock"
-vector_backend = "sqlite"
-"#,
-    )?;
+    write_pipeline_config(workspace, true, "sqlite")?;
 
     fs::create_dir_all(workspace.join("src"))?;
     let rust_file = workspace.join("src/lib.rs");
@@ -385,6 +398,7 @@ fn step2_pipeline_marks_stale_on_failure_and_clears_on_recovery()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;
     let workspace = temp.path();
+    write_pipeline_config(workspace, false, "sqlite")?;
 
     fs::create_dir_all(workspace.join("src"))?;
     let rust_file = workspace.join("src/lib.rs");
@@ -463,6 +477,7 @@ fn step2_pipeline_creates_new_version_on_hash_change_without_duplicate_on_reinde
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;
     let workspace = temp.path();
+    write_pipeline_config(workspace, false, "sqlite")?;
 
     fs::create_dir_all(workspace.join("src"))?;
     let rust_file = workspace.join("src/lib.rs");
@@ -547,6 +562,7 @@ fn step2_pipeline_creates_new_version_on_hash_change_without_duplicate_on_reinde
 fn step2_reindex_replaces_old_dependency_edges() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;
     let workspace = temp.path();
+    write_pipeline_config(workspace, false, "sqlite")?;
 
     fs::create_dir_all(workspace.join("src"))?;
     let rust_file = workspace.join("src/lib.rs");
@@ -602,6 +618,7 @@ fn step2_reindex_replaces_old_dependency_edges() -> Result<(), Box<dyn std::erro
 fn step2_sir_history_retrieval_persists_after_restart() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;
     let workspace = temp.path();
+    write_pipeline_config(workspace, false, "sqlite")?;
 
     fs::create_dir_all(workspace.join("src"))?;
     let rust_file = workspace.join("src/lib.rs");
@@ -655,6 +672,7 @@ fn step2_sir_history_retrieval_persists_after_restart() -> Result<(), Box<dyn st
 fn step2_pipeline_links_sir_versions_to_git_commits() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;
     let workspace = temp.path();
+    write_pipeline_config(workspace, false, "sqlite")?;
 
     fs::create_dir_all(workspace.join("src"))?;
     let rust_file = workspace.join("src/lib.rs");
@@ -718,6 +736,7 @@ fn step2_pipeline_records_null_commit_hash_when_git_is_unavailable()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;
     let workspace = temp.path();
+    write_pipeline_config(workspace, false, "sqlite")?;
 
     fs::create_dir_all(workspace.join("src"))?;
     let rust_file = workspace.join("src/lib.rs");

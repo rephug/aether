@@ -2,12 +2,12 @@ use aether_store::{SirMetaRecord, SqliteStore, Store, SymbolRecord};
 use tempfile::tempdir;
 
 #[test]
-fn existing_symbol_and_sir_operations_still_work_after_migration_v2() {
+fn existing_symbol_and_sir_operations_still_work_after_migration_v3() {
     let temp = tempdir().expect("tempdir");
     let store = SqliteStore::open(temp.path()).expect("open store");
 
     let schema = store.get_schema_version().expect("schema version");
-    assert_eq!(schema.version, 2);
+    assert_eq!(schema.version, 3);
 
     store
         .upsert_symbol(SymbolRecord {

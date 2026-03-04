@@ -257,6 +257,121 @@ impl LanceVectorStore {
             .map_err(map_lancedb_err)
     }
 
+    pub async fn has_embedding_tables(&self) -> Result<bool, StoreError> {
+        self.migrate_from_sqlite_if_needed().await?;
+        let connection = self.connect().await?;
+        Ok(connection
+            .table_names()
+            .execute()
+            .await
+            .map_err(map_lancedb_err)?
+            .into_iter()
+            .any(|name| name.starts_with(VECTOR_TABLE_PREFIX)))
+    }
+
+    pub async fn list_all_embedding_symbol_ids(&self) -> Result<Vec<String>, StoreError> {
+        self.migrate_from_sqlite_if_needed().await?;
+        let connection = self.connect().await?;
+        let mut ids = HashSet::new();
+
+        for name in connection
+            .table_names()
+            .execute()
+            .await
+            .map_err(map_lancedb_err)?
+            .into_iter()
+            .filter(|name| name.starts_with(VECTOR_TABLE_PREFIX))
+        {
+            let Ok(table) = connection.open_table(&name).execute().await else {
+                continue;
+            };
+            let batches = table
+                .query()
+                .select(Select::columns(&["symbol_id"]))
+                .execute()
+                .await
+                .map_err(map_lancedb_err)?
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(map_lancedb_err)?;
+
+            for batch in batches {
+                for row in 0..batch.num_rows() {
+                    let symbol_id = string_at(&batch, "symbol_id", row)?;
+                    if !symbol_id.is_empty() {
+                        ids.insert(symbol_id);
+                    }
+                }
+            }
+        }
+
+        let mut values = ids.into_iter().collect::<Vec<_>>();
+        values.sort();
+        Ok(values)
+    }
+
+    pub async fn list_existing_embedding_symbol_ids(
+        &self,
+        symbol_ids: &[String],
+    ) -> Result<Vec<String>, StoreError> {
+        self.migrate_from_sqlite_if_needed().await?;
+        if symbol_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let requested = symbol_ids
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if requested.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let connection = self.connect().await?;
+        let mut existing = HashSet::new();
+        for name in connection
+            .table_names()
+            .execute()
+            .await
+            .map_err(map_lancedb_err)?
+            .into_iter()
+            .filter(|name| name.starts_with(VECTOR_TABLE_PREFIX))
+        {
+            let Ok(table) = connection.open_table(&name).execute().await else {
+                continue;
+            };
+            for chunk in requested.chunks(PUSHDOWN_CHUNK_SIZE) {
+                let predicate = build_in_predicate(chunk);
+                let batches = table
+                    .query()
+                    .select(Select::columns(&["symbol_id"]))
+                    .only_if(predicate.as_str())
+                    .execute()
+                    .await
+                    .map_err(map_lancedb_err)?
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .map_err(map_lancedb_err)?;
+
+                for batch in batches {
+                    for row in 0..batch.num_rows() {
+                        let symbol_id = string_at(&batch, "symbol_id", row)?;
+                        if !symbol_id.is_empty() {
+                            existing.insert(symbol_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut values = existing.into_iter().collect::<Vec<_>>();
+        values.sort();
+        Ok(values)
+    }
+
     async fn migrate_from_sqlite_if_needed(&self) -> Result<(), StoreError> {
         if self.marker_path().exists() {
             return Ok(());

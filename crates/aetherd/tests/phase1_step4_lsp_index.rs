@@ -12,6 +12,23 @@ fn lsp_index_mode_path_generates_sir_and_hover_reads_it() -> Result<(), Box<dyn 
 {
     let temp = tempdir()?;
     let workspace = temp.path();
+    fs::create_dir_all(workspace.join(".aether"))?;
+    fs::write(
+        workspace.join(".aether/config.toml"),
+        r#"[inference]
+provider = "mock"
+api_key_env = "GEMINI_API_KEY"
+
+[storage]
+mirror_sir_files = true
+graph_backend = "sqlite"
+
+[embeddings]
+enabled = false
+provider = "mock"
+vector_backend = "sqlite"
+"#,
+    )?;
 
     fs::create_dir_all(workspace.join("src"))?;
 

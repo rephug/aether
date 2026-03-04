@@ -337,6 +337,15 @@ pub struct HealthArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct FsckArgs {
+    #[arg(long, help = "Attempt to repair detected inconsistencies")]
+    pub repair: bool,
+
+    #[arg(long, help = "Print additional reconciliation diagnostics")]
+    pub verbose: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct GraphMigrateArgs {
     #[arg(long, help = "Preview migration actions without writing changes")]
     pub dry_run: bool,
@@ -377,6 +386,8 @@ pub enum Commands {
     TraceCause(TraceCauseArgs),
     /// Show graph health metrics with risk scoring
     Health(HealthArgs),
+    /// Verify and optionally repair cross-store consistency
+    Fsck(FsckArgs),
     #[cfg(feature = "legacy-cozo")]
     /// Migrate graph backend data from CozoDB to SurrealDB
     GraphMigrate(GraphMigrateArgs),
@@ -1106,6 +1117,27 @@ mod tests {
                 assert_eq!(args.filter.as_deref(), Some("risk-hotspots"));
                 assert_eq!(args.limit, 25);
                 assert!((args.min_risk - 0.4).abs() < f64::EPSILON);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fsck_subcommand_parses_repair_and_verbose() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "fsck",
+            "--repair",
+            "--verbose",
+        ])
+        .expect("fsck should parse");
+
+        match cli.command {
+            Some(Commands::Fsck(args)) => {
+                assert!(args.repair);
+                assert!(args.verbose);
             }
             other => panic!("unexpected command: {other:?}"),
         }

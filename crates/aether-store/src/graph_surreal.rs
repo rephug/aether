@@ -16,8 +16,9 @@ use surrealdb::Surreal;
 use surrealdb::engine::local::{Db, SurrealKv};
 
 use super::{
-    CouplingEdgeRecord, GraphStore, ResolvedEdge, StoreError, SymbolRecord, TestedByRecord,
-    UpstreamDependencyEdgeRecord, UpstreamDependencyNodeRecord, UpstreamDependencyTraversal,
+    CouplingEdgeRecord, GraphDependencyEdgeRecord, GraphStore, ResolvedEdge, StoreError,
+    SymbolRecord, TestedByRecord, UpstreamDependencyEdgeRecord, UpstreamDependencyNodeRecord,
+    UpstreamDependencyTraversal,
 };
 
 pub type CrossCommunityEdge = (String, String, String, i64, i64);
@@ -267,6 +268,130 @@ impl SurrealGraphStore {
             .map_err(|err| {
                 StoreError::Graph(format!("spawn_blocking connected_components failed: {err}"))
             })
+    }
+
+    pub async fn list_all_symbol_ids(&self) -> Result<Vec<String>, StoreError> {
+        let mut symbol_ids = self
+            .query_rows::<String>("SELECT VALUE symbol_id FROM symbol;")
+            .await?;
+        symbol_ids.retain(|value| !value.trim().is_empty());
+        symbol_ids.sort();
+        symbol_ids.dedup();
+        Ok(symbol_ids)
+    }
+
+    pub async fn list_existing_symbol_ids(
+        &self,
+        symbol_ids: &[String],
+    ) -> Result<Vec<String>, StoreError> {
+        if symbol_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut ids = symbol_ids
+            .iter()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut response = self
+            .db
+            .query("SELECT VALUE symbol_id FROM symbol WHERE symbol_id INSIDE $ids;")
+            .bind(("ids", ids))
+            .await
+            .map_err(|err| {
+                StoreError::Graph(format!("SurrealDB list existing symbol IDs failed: {err}"))
+            })?;
+        let mut rows: Vec<String> = response.take(0).map_err(|err| {
+            StoreError::Graph(format!(
+                "SurrealDB list existing symbol IDs decode failed: {err}"
+            ))
+        })?;
+        rows.retain(|value| !value.trim().is_empty());
+        rows.sort();
+        rows.dedup();
+        Ok(rows)
+    }
+
+    pub async fn list_dependency_edges(
+        &self,
+    ) -> Result<Vec<GraphDependencyEdgeRecord>, StoreError> {
+        let mut response = self
+            .db
+            .query(
+                r#"
+                SELECT VALUE {
+                    source_symbol_id: source_symbol_id,
+                    target_symbol_id: target_symbol_id,
+                    edge_kind: edge_kind
+                }
+                FROM depends_on;
+                "#,
+            )
+            .await
+            .map_err(|err| {
+                StoreError::Graph(format!("SurrealDB list dependency edges failed: {err}"))
+            })?;
+        let rows: Vec<serde_json::Value> = response.take(0).map_err(|err| {
+            StoreError::Graph(format!(
+                "SurrealDB list dependency edges decode failed: {err}"
+            ))
+        })?;
+        let mut edges = decode_rows::<GraphDependencyEdgeRecord>(rows)?;
+        edges.retain(|edge| !edge.source_symbol_id.is_empty() && !edge.target_symbol_id.is_empty());
+        edges.sort_by(|left, right| {
+            left.source_symbol_id
+                .cmp(&right.source_symbol_id)
+                .then_with(|| left.target_symbol_id.cmp(&right.target_symbol_id))
+                .then_with(|| left.edge_kind.cmp(&right.edge_kind))
+        });
+        Ok(edges)
+    }
+
+    pub async fn delete_symbol_by_symbol_id(&self, symbol_id: &str) -> Result<(), StoreError> {
+        let symbol_id = symbol_id.trim();
+        if symbol_id.is_empty() {
+            return Ok(());
+        }
+        self.db
+            .query("DELETE symbol WHERE symbol_id = $symbol_id;")
+            .bind(("symbol_id", symbol_id.to_owned()))
+            .await
+            .map_err(|err| StoreError::Graph(format!("SurrealDB delete symbol failed: {err}")))?;
+        Ok(())
+    }
+
+    pub async fn delete_dependency_edges_by_pair(
+        &self,
+        source_symbol_id: &str,
+        target_symbol_id: &str,
+    ) -> Result<(), StoreError> {
+        let source_symbol_id = source_symbol_id.trim();
+        let target_symbol_id = target_symbol_id.trim();
+        if source_symbol_id.is_empty() || target_symbol_id.is_empty() {
+            return Ok(());
+        }
+
+        self.db
+            .query(
+                r#"
+                DELETE depends_on
+                WHERE source_symbol_id = $source_symbol_id
+                  AND target_symbol_id = $target_symbol_id;
+                "#,
+            )
+            .bind(("source_symbol_id", source_symbol_id.to_owned()))
+            .bind(("target_symbol_id", target_symbol_id.to_owned()))
+            .await
+            .map_err(|err| {
+                StoreError::Graph(format!("SurrealDB delete dependency edges failed: {err}"))
+            })?;
+        Ok(())
     }
 
     pub async fn has_dependency_between_files(

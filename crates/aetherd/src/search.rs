@@ -1515,6 +1515,7 @@ mod tests {
     fn search_reflects_symbol_rename_and_removal() {
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();
+        write_sqlite_graph_config(workspace);
 
         fs::create_dir_all(workspace.join("src")).expect("create src dir");
         let rust_file = workspace.join("src/lib.rs");
@@ -1605,6 +1606,7 @@ api_key_env = "GEMINI_API_KEY"
 
 [storage]
 mirror_sir_files = true
+graph_backend = "sqlite"
 
 [embeddings]
 enabled = true
@@ -1619,6 +1621,27 @@ python = {}
 "#,
                 thresholds.default, thresholds.rust, thresholds.typescript, thresholds.python
             ),
+        )
+        .expect("write config");
+    }
+
+    fn write_sqlite_graph_config(workspace: &Path) {
+        fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
+        fs::write(
+            workspace.join(".aether/config.toml"),
+            r#"[inference]
+provider = "mock"
+api_key_env = "GEMINI_API_KEY"
+
+[storage]
+mirror_sir_files = true
+graph_backend = "sqlite"
+
+[embeddings]
+enabled = false
+provider = "mock"
+vector_backend = "sqlite"
+"#,
         )
         .expect("write config");
     }
