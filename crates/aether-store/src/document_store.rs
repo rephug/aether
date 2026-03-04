@@ -187,10 +187,11 @@ impl SqliteStore {
         }
 
         let record_json = serde_json::to_string(&record.record_json)?;
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
         // Remove stale records for this unit+schema before inserting the new version.
         // This prevents accumulation when content_hash changes (which changes record_id).
-        conn.execute(
+        tx.execute(
             "DELETE FROM semantic_records WHERE unit_id = ?1 AND schema_name = ?2 AND record_id != ?3",
             params![
                 record.unit_id.as_str(),
@@ -198,7 +199,7 @@ impl SqliteStore {
                 record.record_id.as_str(),
             ],
         )?;
-        conn.execute(
+        tx.execute(
             r#"
             INSERT INTO semantic_records (
                 record_id, unit_id, domain, schema_name, schema_version, content_hash,
@@ -228,6 +229,7 @@ impl SqliteStore {
                 record.embedding_text.as_str(),
             ],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -487,4 +489,90 @@ fn i64_to_u64(value: i64, field: &str) -> Result<u64, StoreError> {
 
 fn non_negative_i64_to_u64(value: i64, field: &str) -> Result<u64, StoreError> {
     i64_to_u64(value, field)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn insert_semantic_record_is_atomic_when_insert_fails() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let store = SqliteStore::open(workspace).expect("open store");
+
+        let unit = GenericUnit::new(
+            "Intro",
+            "AETHER documentation",
+            "paragraph",
+            "docs/intro.md",
+            (0, 19),
+            None,
+            "docs",
+        );
+        store
+            .insert_document_unit(&unit)
+            .expect("insert document unit");
+
+        let original = GenericRecord::new(
+            unit.unit_id.clone(),
+            "docs",
+            "entity",
+            "v1",
+            json!({"title":"AETHER","state":"original"}),
+            "AETHER original",
+        )
+        .expect("build original record");
+        store
+            .insert_semantic_record(&original)
+            .expect("insert original semantic record");
+
+        let sqlite_path = workspace.join(".aether").join("meta.sqlite");
+        let conn = rusqlite::Connection::open(sqlite_path).expect("open sqlite");
+        conn.execute_batch(
+            r#"
+            CREATE TRIGGER fail_semantic_insert
+            BEFORE INSERT ON semantic_records
+            BEGIN
+                SELECT RAISE(ABORT, 'forced semantic insert failure');
+            END;
+            "#,
+        )
+        .expect("install failing trigger");
+        drop(conn);
+
+        let replacement = GenericRecord::new(
+            unit.unit_id.clone(),
+            "docs",
+            "entity",
+            "v1",
+            json!({"title":"AETHER","state":"replacement"}),
+            "AETHER replacement",
+        )
+        .expect("build replacement record");
+        let err = store
+            .insert_semantic_record(&replacement)
+            .expect_err("replacement insert should fail due to trigger");
+        match err {
+            StoreError::Sqlite(inner) => {
+                let message = inner.to_string();
+                assert!(
+                    message.contains("forced semantic insert failure"),
+                    "unexpected sqlite error: {message}"
+                );
+            }
+            other => panic!("expected sqlite error, got {other}"),
+        }
+
+        let retained = store
+            .get_record_by_unit(unit.unit_id.as_str())
+            .expect("query retained record")
+            .expect("record should remain after failed upsert");
+        assert_eq!(retained.record_id, original.record_id);
+        assert_eq!(retained.record_json, original.record_json);
+        assert_eq!(retained.embedding_text, original.embedding_text);
+    }
 }

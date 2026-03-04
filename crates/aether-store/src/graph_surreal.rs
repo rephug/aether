@@ -47,7 +47,7 @@ impl SurrealGraphStore {
                     Err(err) => {
                         let message = err.to_string();
                         if message.contains("LOCK is already locked") && attempt < 9 {
-                            std::thread::sleep(Duration::from_millis(50));
+                            tokio::time::sleep(Duration::from_millis(50)).await;
                             continue;
                         }
                         open_error =

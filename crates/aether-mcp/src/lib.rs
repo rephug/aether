@@ -1745,7 +1745,7 @@ impl AetherMcpServer {
                 .min_risk
                 .unwrap_or(AetherCouplingRiskLevel::Medium)
                 .into(),
-            auto_mine: true,
+            auto_mine: !self.state.read_only,
         })?;
 
         let mining_state = blast
