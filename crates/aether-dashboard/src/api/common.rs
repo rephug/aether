@@ -130,7 +130,10 @@ pub(crate) async fn pagerank_map(
             .collect();
     }
 
-    page_rank(fallback_edges, 0.85, 25)
+    let edges = fallback_edges.to_vec();
+    tokio::task::spawn_blocking(move || page_rank(&edges, 0.85, 25))
+        .await
+        .unwrap_or_default()
 }
 
 pub(crate) async fn louvain_map(
@@ -144,10 +147,15 @@ pub(crate) async fn louvain_map(
         return values.into_iter().collect();
     }
 
-    louvain_communities(fallback_edges)
-        .into_iter()
-        .map(|(id, community)| (id, community as i64))
-        .collect()
+    let edges = fallback_edges.to_vec();
+    tokio::task::spawn_blocking(move || {
+        louvain_communities(&edges)
+            .into_iter()
+            .map(|(id, community)| (id, community as i64))
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 pub(crate) async fn connected_components_vec(
@@ -161,7 +169,10 @@ pub(crate) async fn connected_components_vec(
         return values;
     }
 
-    connected_components(fallback_edges)
+    let edges = fallback_edges.to_vec();
+    tokio::task::spawn_blocking(move || connected_components(&edges))
+        .await
+        .unwrap_or_default()
 }
 
 pub(crate) fn latest_drift_score_by_symbol(

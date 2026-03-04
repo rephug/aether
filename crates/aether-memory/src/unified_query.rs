@@ -267,29 +267,39 @@ impl ProjectMemoryService {
         } else {
             Vec::new()
         };
-        let coupling_candidates = if include.contains(&AskInclude::Coupling) {
-            rank_coupling_candidates(self.workspace(), symbol_candidates.as_slice())?
-        } else {
-            Vec::new()
-        };
-        let symbol_candidates_for_results = if include.contains(&AskInclude::Symbols) {
-            symbol_candidates
-        } else {
-            Vec::new()
-        };
+        let workspace = self.workspace().to_path_buf();
+        let store_clone = store.clone();
+        let query_owned = query.to_owned();
 
-        let mut result = merge_candidates(
-            now_ms,
-            limit,
-            symbol_candidates_for_results,
-            note_candidates,
-            test_candidates,
-            coupling_candidates,
-        );
-        result.query = query.to_owned();
+        let result = tokio::task::spawn_blocking(move || -> Result<AskQueryResult, MemoryError> {
+            let coupling_candidates = if include.contains(&AskInclude::Coupling) {
+                rank_coupling_candidates(&workspace, symbol_candidates.as_slice())?
+            } else {
+                Vec::new()
+            };
+            let symbol_candidates_for_results = if include.contains(&AskInclude::Symbols) {
+                symbol_candidates
+            } else {
+                Vec::new()
+            };
 
-        enrich_symbol_snippets(&store, result.results.as_mut_slice())?;
-        increment_access_from_results(&store, result.results.as_mut_slice(), now_ms)?;
+            let mut res = merge_candidates(
+                now_ms,
+                limit,
+                symbol_candidates_for_results,
+                note_candidates,
+                test_candidates,
+                coupling_candidates,
+            );
+            res.query = query_owned;
+
+            enrich_symbol_snippets(&store_clone, res.results.as_mut_slice())?;
+            increment_access_from_results(&store_clone, res.results.as_mut_slice(), now_ms)?;
+
+            Ok(res)
+        })
+        .await
+        .map_err(|err| MemoryError::InvalidInput(format!("spawn_blocking failure: {err}")))??;
 
         Ok(result)
     }

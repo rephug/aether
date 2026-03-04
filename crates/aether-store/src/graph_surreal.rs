@@ -279,22 +279,29 @@ impl SurrealGraphStore {
         if file_a.is_empty() || file_b.is_empty() {
             return Ok(false);
         }
-        let symbols = self.list_all_symbols().await?;
-        let file_by_symbol = symbols
-            .into_iter()
-            .map(|row| (row.id, row.file_path))
-            .collect::<HashMap<_, _>>();
-        let edges = self.list_dependency_edges_raw().await?;
-        Ok(edges.into_iter().any(|edge| {
-            let Some(source_file) = file_by_symbol.get(edge.source_id.as_str()) else {
-                return false;
-            };
-            let Some(target_file) = file_by_symbol.get(edge.target_id.as_str()) else {
-                return false;
-            };
-            (source_file == file_a && target_file == file_b)
-                || (source_file == file_b && target_file == file_a)
-        }))
+        let mut response = self
+            .db
+            .query(
+                r#"
+                SELECT VALUE 1
+                FROM depends_on
+                WHERE (in.file_path = $file_a AND out.file_path = $file_b)
+                   OR (in.file_path = $file_b AND out.file_path = $file_a)
+                LIMIT 1;
+                "#,
+            )
+            .bind(("file_a", file_a.to_owned()))
+            .bind(("file_b", file_b.to_owned()))
+            .await
+            .map_err(|err| {
+                StoreError::Graph(format!("SurrealDB has_dependency query failed: {err}"))
+            })?;
+
+        let rows: Vec<i64> = response.take(0).map_err(|err| {
+            StoreError::Graph(format!("SurrealDB has_dependency decode failed: {err}"))
+        })?;
+
+        Ok(!rows.is_empty())
     }
 
     pub async fn list_upstream_dependency_traversal(
@@ -1072,31 +1079,6 @@ impl SurrealGraphStore {
             .take(0)
             .map_err(|err| StoreError::Graph(format!("SurrealDB query decode failed: {err}")))?;
         decode_rows(rows)
-    }
-
-    async fn list_all_symbols(&self) -> Result<Vec<SymbolRecord>, StoreError> {
-        let mut rows: Vec<SymbolRecord> = self
-            .query_rows(
-                r#"
-            SELECT VALUE {
-                id: symbol_id,
-                file_path: file_path,
-                language: language,
-                kind: kind,
-                qualified_name: qualified_name,
-                signature_fingerprint: signature_fingerprint,
-                last_seen_at: last_seen_at
-            }
-            FROM symbol;
-            "#,
-            )
-            .await?;
-        rows.sort_by(|left, right| {
-            left.qualified_name
-                .cmp(&right.qualified_name)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        Ok(rows)
     }
 
     async fn list_dependency_edges_raw(&self) -> Result<Vec<DependencyEdgeRow>, StoreError> {
