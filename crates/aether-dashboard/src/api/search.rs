@@ -77,7 +77,6 @@ async fn load_search_data(
     shared: Arc<SharedState>,
     query: SearchQuery,
 ) -> Result<SearchApiData, String> {
-    let shared = shared.as_ref();
     let q = query.q.unwrap_or_default();
     let requested_mode = query
         .mode
@@ -93,20 +92,37 @@ async fn load_search_data(
 
     // Lexical fallback for all modes at this stage.
     let mode_not_computed = mode != "lexical";
-    let results = shared
-        .store
-        .search_symbols(&q, limit)
-        .map_err(|err| err.to_string())?;
+    let shared_sync = shared.clone();
+    let q_sync = q.clone();
+    let (results, edges, drift_map, test_map, sir_symbols, symbol_records) =
+        tokio::task::spawn_blocking(move || {
+            let shared_sync = shared_sync.as_ref();
+            let results = shared_sync
+                .store
+                .search_symbols(&q_sync, limit)
+                .map_err(|err| err.to_string())?;
+            let edges = common::load_dependency_algo_edges(shared_sync)?;
+            let drift_map = common::latest_drift_score_by_symbol(shared_sync).unwrap_or_default();
+            let test_map = common::test_count_by_symbol(shared_sync).unwrap_or_default();
+            let sir_symbols = common::symbols_with_sir(shared_sync).unwrap_or_default();
+            let symbol_records = common::load_symbols(shared_sync).unwrap_or_default();
+            Ok::<_, String>((
+                results,
+                edges,
+                drift_map,
+                test_map,
+                sir_symbols,
+                symbol_records,
+            ))
+        })
+        .await
+        .map_err(|err| err.to_string())??;
 
-    let edges = common::load_dependency_algo_edges(shared)?;
+    let shared = shared.as_ref();
     let pagerank = common::pagerank_map(shared, &edges).await;
-    let drift_map = common::latest_drift_score_by_symbol(shared).unwrap_or_default();
-    let test_map = common::test_count_by_symbol(shared).unwrap_or_default();
-    let sir_symbols = common::symbols_with_sir(shared).unwrap_or_default();
     let max_pagerank = pagerank.values().copied().fold(0.0f64, f64::max);
 
-    let symbol_records = common::load_symbols(shared)
-        .unwrap_or_default()
+    let symbol_records = symbol_records
         .into_iter()
         .map(|row| (row.id.clone(), row))
         .collect::<HashMap<_, _>>();
