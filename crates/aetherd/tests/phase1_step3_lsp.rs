@@ -114,6 +114,8 @@ fn hover_resolution_shows_stale_warning_and_clears_after_fresh_meta()
 }
 
 fn index_workspace_with_mock(workspace: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    write_pipeline_config(workspace)?;
+
     let mut observer = ObserverState::new(workspace.to_path_buf())?;
     observer.seed_from_disk()?;
 
@@ -127,5 +129,26 @@ fn index_workspace_with_mock(workspace: &Path) -> Result<(), Box<dyn std::error:
         pipeline.process_event(&store, &event, false, false, &mut sink)?;
     }
 
+    Ok(())
+}
+
+fn write_pipeline_config(workspace: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(workspace.join(".aether"))?;
+    fs::write(
+        workspace.join(".aether/config.toml"),
+        r#"[inference]
+provider = "mock"
+api_key_env = "GEMINI_API_KEY"
+
+[storage]
+mirror_sir_files = true
+graph_backend = "sqlite"
+
+[embeddings]
+enabled = false
+provider = "mock"
+vector_backend = "sqlite"
+"#,
+    )?;
     Ok(())
 }

@@ -20,10 +20,12 @@ use aether_sir::{
     sir_hash, synthetic_file_sir_id, validate_sir,
 };
 use aether_store::{
-    SirMetaRecord, SqliteStore, Store, SymbolEmbeddingRecord, SymbolRecord, TestIntentRecord,
-    VectorStore, open_graph_store, open_vector_store,
+    IntentOperation, SirMetaRecord, SqliteStore, Store, SymbolEmbeddingRecord, SymbolRecord,
+    TestIntentRecord, VectorStore, WriteIntent, WriteIntentStatus, open_graph_store,
+    open_vector_store,
 };
 use anyhow::{Context, Result, anyhow};
+use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -178,6 +180,7 @@ impl SirPipeline {
             removed = event.removed.len(),
             "processing symbol change event"
         );
+        let mut intents_ready_for_graph: Vec<String> = Vec::new();
         if !changed_symbols.is_empty() {
             let now_ts = unix_timestamp_secs();
             for (symbol, _) in &changed_symbols {
@@ -254,6 +257,16 @@ impl SirPipeline {
 
             let mut success_count: usize = 0;
             let mut failure_count: usize = 0;
+            let mark_intent_failed = |intent_id: &str, message: &str| {
+                if let Err(mark_err) = store.mark_intent_failed(intent_id, message) {
+                    tracing::error!(
+                        intent_id = %intent_id,
+                        error = %mark_err,
+                        "failed to mark write intent as failed"
+                    );
+                }
+            };
+
             for result in results {
                 match result {
                     SirGenerationOutcome::Success(generated) => {
@@ -269,46 +282,122 @@ impl SirPipeline {
                             }
                         }
 
+                        let payload = UpsertSirIntentPayload {
+                            symbol: generated.symbol.clone(),
+                            sir: generated.sir.clone(),
+                            provider_name: self.provider_name.clone(),
+                            model_name: self.model_name.clone(),
+                            commit_hash: commit_hash.clone(),
+                        };
+                        let payload_json = match payload.to_json_string() {
+                            Ok(json) => json,
+                            Err(err) => {
+                                failure_count += 1;
+                                tracing::error!(
+                                    symbol_id = %generated.symbol.id,
+                                    error = %err,
+                                    "failed to serialize write intent payload"
+                                );
+                                continue;
+                            }
+                        };
+
+                        let intent = WriteIntent {
+                            intent_id: content_hash(
+                                format!("{}\n{}", generated.symbol.id, unix_timestamp_millis())
+                                    .as_str(),
+                            ),
+                            symbol_id: generated.symbol.id.clone(),
+                            file_path: generated.symbol.file_path.clone(),
+                            operation: IntentOperation::UpsertSir,
+                            status: WriteIntentStatus::Pending,
+                            payload_json: Some(payload_json),
+                            created_at: unix_timestamp_secs(),
+                            completed_at: None,
+                            error_message: None,
+                        };
+                        if let Err(err) = store.create_write_intent(&intent) {
+                            failure_count += 1;
+                            tracing::error!(
+                                symbol_id = %generated.symbol.id,
+                                error = %err,
+                                "failed to create write intent; skipping symbol write"
+                            );
+                            continue;
+                        }
+
                         let canonical_json = canonicalize_sir_json(&generated.sir);
                         let sir_hash_value = sir_hash(&generated.sir);
                         let attempted_at = unix_timestamp_secs();
-                        let version_write = store
-                            .record_sir_version_if_changed(
-                                &generated.symbol.id,
-                                &sir_hash_value,
-                                &self.provider_name,
-                                &self.model_name,
-                                &canonical_json,
-                                attempted_at,
-                                commit_hash.as_deref(),
-                            )
-                            .with_context(|| {
-                                format!("failed to record SIR history for {}", generated.symbol.id)
-                            })?;
+                        let version_write = match store.record_sir_version_if_changed(
+                            &generated.symbol.id,
+                            &sir_hash_value,
+                            payload.provider_name.as_str(),
+                            payload.model_name.as_str(),
+                            &canonical_json,
+                            attempted_at,
+                            payload.commit_hash.as_deref(),
+                        ) {
+                            Ok(version_write) => version_write,
+                            Err(err) => {
+                                failure_count += 1;
+                                mark_intent_failed(&intent.intent_id, format!("{err:#}").as_str());
+                                tracing::error!(
+                                    symbol_id = %generated.symbol.id,
+                                    error = %err,
+                                    "failed to record SIR history"
+                                );
+                                continue;
+                            }
+                        };
 
-                        if version_write.changed {
-                            store
-                                .write_sir_blob(&generated.symbol.id, &canonical_json)
-                                .with_context(|| {
-                                    format!("failed to write SIR blob for {}", generated.symbol.id)
-                                })?;
+                        if version_write.changed
+                            && let Err(err) =
+                                store.write_sir_blob(&generated.symbol.id, &canonical_json)
+                        {
+                            failure_count += 1;
+                            mark_intent_failed(&intent.intent_id, format!("{err:#}").as_str());
+                            tracing::error!(
+                                symbol_id = %generated.symbol.id,
+                                error = %err,
+                                "failed to write SIR blob"
+                            );
+                            continue;
                         }
 
-                        store
-                            .upsert_sir_meta(SirMetaRecord {
-                                id: generated.symbol.id.clone(),
-                                sir_hash: sir_hash_value.clone(),
-                                sir_version: version_write.version,
-                                provider: self.provider_name.clone(),
-                                model: self.model_name.clone(),
-                                updated_at: version_write.updated_at,
-                                sir_status: SIR_STATUS_FRESH.to_owned(),
-                                last_error: None,
-                                last_attempt_at: attempted_at,
-                            })
-                            .with_context(|| {
-                                format!("failed to upsert SIR metadata for {}", generated.symbol.id)
-                            })?;
+                        if let Err(err) = store.upsert_sir_meta(SirMetaRecord {
+                            id: generated.symbol.id.clone(),
+                            sir_hash: sir_hash_value.clone(),
+                            sir_version: version_write.version,
+                            provider: payload.provider_name.clone(),
+                            model: payload.model_name.clone(),
+                            updated_at: version_write.updated_at,
+                            sir_status: SIR_STATUS_FRESH.to_owned(),
+                            last_error: None,
+                            last_attempt_at: attempted_at,
+                        }) {
+                            failure_count += 1;
+                            mark_intent_failed(&intent.intent_id, format!("{err:#}").as_str());
+                            tracing::error!(
+                                symbol_id = %generated.symbol.id,
+                                error = %err,
+                                "failed to upsert SIR metadata"
+                            );
+                            continue;
+                        }
+
+                        if let Err(err) = store
+                            .update_intent_status(&intent.intent_id, WriteIntentStatus::SqliteDone)
+                        {
+                            failure_count += 1;
+                            mark_intent_failed(&intent.intent_id, format!("{err:#}").as_str());
+                            tracing::error!(
+                                symbol_id = %generated.symbol.id,
+                                error = %err,
+                                "failed to update write intent status to sqlite_done"
+                            );
+                            continue;
+                        }
 
                         if let Err(err) = self.refresh_embedding_if_needed(
                             &generated.symbol.id,
@@ -317,12 +406,29 @@ impl SirPipeline {
                             print_sir,
                             out,
                         ) {
-                            tracing::warn!(
+                            failure_count += 1;
+                            mark_intent_failed(&intent.intent_id, format!("{err:#}").as_str());
+                            tracing::error!(
                                 symbol_id = %generated.symbol.id,
                                 error = %err,
                                 "embedding refresh error"
                             );
+                            continue;
                         }
+
+                        if let Err(err) = store
+                            .update_intent_status(&intent.intent_id, WriteIntentStatus::VectorDone)
+                        {
+                            failure_count += 1;
+                            mark_intent_failed(&intent.intent_id, format!("{err:#}").as_str());
+                            tracing::error!(
+                                symbol_id = %generated.symbol.id,
+                                error = %err,
+                                "failed to update write intent status to vector_done"
+                            );
+                            continue;
+                        }
+                        intents_ready_for_graph.push(intent.intent_id.clone());
 
                         if print_sir {
                             writeln!(
@@ -386,12 +492,13 @@ impl SirPipeline {
                             error = %failed.error_message,
                             "SIR generation failed"
                         );
-                        store.upsert_sir_meta(stale_meta).with_context(|| {
-                            format!(
-                                "failed to store stale SIR metadata for {}",
-                                failed.symbol.id
-                            )
-                        })?;
+                        if let Err(err) = store.upsert_sir_meta(stale_meta) {
+                            tracing::error!(
+                                symbol_id = %failed.symbol.id,
+                                error = %err,
+                                "failed to store stale SIR metadata"
+                            );
+                        }
 
                         if print_sir {
                             writeln!(
@@ -403,6 +510,50 @@ impl SirPipeline {
                             .context("failed to write stale SIR print line")?;
                         }
                     }
+                }
+            }
+
+            let graph_sync = self.sync_graph_for_file(store, &event.file_path);
+            match graph_sync {
+                Ok(()) => {
+                    for intent_id in intents_ready_for_graph.drain(..) {
+                        if let Err(err) =
+                            store.update_intent_status(&intent_id, WriteIntentStatus::GraphDone)
+                        {
+                            tracing::error!(
+                                intent_id = %intent_id,
+                                error = %err,
+                                "failed to update write intent status to graph_done"
+                            );
+                            let _ = store.mark_intent_failed(
+                                &intent_id,
+                                format!("graph_done update failed: {err:#}").as_str(),
+                            );
+                            continue;
+                        }
+                        if let Err(err) = store.mark_intent_complete(&intent_id) {
+                            tracing::error!(
+                                intent_id = %intent_id,
+                                error = %err,
+                                "failed to mark write intent complete"
+                            );
+                            let _ = store.mark_intent_failed(
+                                &intent_id,
+                                format!("intent completion failed: {err:#}").as_str(),
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    let error_text = format!("{err:#}");
+                    for intent_id in intents_ready_for_graph.drain(..) {
+                        let _ = store.mark_intent_failed(&intent_id, error_text.as_str());
+                    }
+                    tracing::warn!(
+                        file_path = %event.file_path,
+                        error = %error_text,
+                        "graph sync failed after vector stage"
+                    );
                 }
             }
 
@@ -420,6 +571,12 @@ impl SirPipeline {
                     "SIR processing complete"
                 );
             }
+        } else if let Err(err) = self.sync_graph_for_file(store, &event.file_path) {
+            tracing::warn!(
+                file_path = %event.file_path,
+                error = %err,
+                "graph sync failed for event without changed symbols"
+            );
         }
 
         self.upsert_file_rollup(
@@ -432,6 +589,199 @@ impl SirPipeline {
         )?;
 
         Ok(())
+    }
+
+    pub fn replay_incomplete_intents(
+        &self,
+        store: &SqliteStore,
+        include_failed: bool,
+        batch_size: usize,
+        verbose: bool,
+    ) -> Result<usize> {
+        let mut intents = store
+            .get_incomplete_intents()
+            .context("failed to query incomplete write intents")?;
+        if include_failed {
+            intents.extend(
+                store
+                    .get_failed_intents()
+                    .context("failed to query failed write intents")?,
+            );
+        }
+
+        intents.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.intent_id.cmp(&right.intent_id))
+        });
+
+        let mut replayed = 0usize;
+        for chunk in intents.chunks(batch_size.max(1)) {
+            for intent in chunk {
+                if let Err(err) = self.replay_write_intent(store, intent, verbose) {
+                    tracing::warn!(
+                        intent_id = %intent.intent_id,
+                        symbol_id = %intent.symbol_id,
+                        status = %intent.status,
+                        error = %err,
+                        "failed to replay write intent"
+                    );
+                    continue;
+                }
+                replayed += 1;
+            }
+        }
+
+        Ok(replayed)
+    }
+
+    fn replay_write_intent(
+        &self,
+        store: &SqliteStore,
+        intent: &WriteIntent,
+        verbose: bool,
+    ) -> Result<()> {
+        match intent.operation {
+            IntentOperation::UpsertSir => {
+                let payload_json = intent.payload_json.as_deref().ok_or_else(|| {
+                    anyhow!("missing payload_json for intent {}", intent.intent_id)
+                })?;
+                let payload =
+                    UpsertSirIntentPayload::from_json_str(payload_json).with_context(|| {
+                        format!(
+                            "failed to deserialize payload_json for intent {}",
+                            intent.intent_id
+                        )
+                    })?;
+                if let Err(err) = self.replay_upsert_sir_intent(store, intent, &payload, verbose) {
+                    let message = format!("{err:#}");
+                    let _ = store.mark_intent_failed(&intent.intent_id, message.as_str());
+                    return Err(err);
+                }
+                Ok(())
+            }
+            IntentOperation::DeleteSymbol | IntentOperation::UpdateEdges => {
+                let message = format!(
+                    "unsupported write intent replay operation '{}'",
+                    intent.operation
+                );
+                let _ = store.mark_intent_failed(&intent.intent_id, message.as_str());
+                Err(anyhow!(message))
+            }
+        }
+    }
+
+    fn replay_upsert_sir_intent(
+        &self,
+        store: &SqliteStore,
+        intent: &WriteIntent,
+        payload: &UpsertSirIntentPayload,
+        verbose: bool,
+    ) -> Result<()> {
+        let mut status = match intent.status {
+            WriteIntentStatus::Failed => WriteIntentStatus::Pending,
+            ref current => current.clone(),
+        };
+        let intent_id = intent.intent_id.as_str();
+
+        let (canonical_json, sir_hash_value) = if status == WriteIntentStatus::Pending {
+            let (canonical_json, sir_hash_value) = self
+                .persist_sir_payload_into_sqlite(store, payload)
+                .with_context(|| format!("failed sqlite write stage for intent {intent_id}"))?;
+            store
+                .update_intent_status(intent_id, WriteIntentStatus::SqliteDone)
+                .with_context(|| {
+                    format!("failed to update status sqlite_done for intent {intent_id}")
+                })?;
+            status = WriteIntentStatus::SqliteDone;
+            (canonical_json, sir_hash_value)
+        } else {
+            (
+                canonicalize_sir_json(&payload.sir),
+                sir_hash(&payload.sir).to_owned(),
+            )
+        };
+
+        if status == WriteIntentStatus::SqliteDone {
+            self.refresh_embedding_if_needed(
+                payload.symbol.id.as_str(),
+                sir_hash_value.as_str(),
+                canonical_json.as_str(),
+                false,
+                &mut std::io::sink(),
+            )
+            .with_context(|| format!("failed vector write stage for intent {intent_id}"))?;
+            store
+                .update_intent_status(intent_id, WriteIntentStatus::VectorDone)
+                .with_context(|| {
+                    format!("failed to update status vector_done for intent {intent_id}")
+                })?;
+            status = WriteIntentStatus::VectorDone;
+        }
+
+        if status == WriteIntentStatus::VectorDone {
+            self.sync_graph_for_file(store, payload.symbol.file_path.as_str())
+                .with_context(|| format!("failed graph write stage for intent {intent_id}"))?;
+            store
+                .update_intent_status(intent_id, WriteIntentStatus::GraphDone)
+                .with_context(|| {
+                    format!("failed to update status graph_done for intent {intent_id}")
+                })?;
+            status = WriteIntentStatus::GraphDone;
+        }
+
+        if status == WriteIntentStatus::GraphDone {
+            store
+                .mark_intent_complete(intent_id)
+                .with_context(|| format!("failed to mark complete for intent {intent_id}"))?;
+        }
+
+        if verbose {
+            tracing::info!(
+                intent_id = %intent_id,
+                symbol_id = %intent.symbol_id,
+                "replayed write intent"
+            );
+        }
+
+        Ok(())
+    }
+
+    fn persist_sir_payload_into_sqlite(
+        &self,
+        store: &SqliteStore,
+        payload: &UpsertSirIntentPayload,
+    ) -> Result<(String, String)> {
+        let canonical_json = canonicalize_sir_json(&payload.sir);
+        let sir_hash_value = sir_hash(&payload.sir);
+        let attempted_at = unix_timestamp_secs();
+        let version_write = store.record_sir_version_if_changed(
+            payload.symbol.id.as_str(),
+            sir_hash_value.as_str(),
+            payload.provider_name.as_str(),
+            payload.model_name.as_str(),
+            canonical_json.as_str(),
+            attempted_at,
+            payload.commit_hash.as_deref(),
+        )?;
+
+        if version_write.changed {
+            store.write_sir_blob(payload.symbol.id.as_str(), canonical_json.as_str())?;
+        }
+
+        store.upsert_sir_meta(SirMetaRecord {
+            id: payload.symbol.id.clone(),
+            sir_hash: sir_hash_value.clone(),
+            sir_version: version_write.version,
+            provider: payload.provider_name.clone(),
+            model: payload.model_name.clone(),
+            updated_at: version_write.updated_at,
+            sir_status: SIR_STATUS_FRESH.to_owned(),
+            last_error: None,
+            last_attempt_at: attempted_at,
+        })?;
+
+        Ok((canonical_json, sir_hash_value))
     }
 
     fn should_skip_sir_generation(&self, store: &SqliteStore, symbol: &Symbol) -> Result<bool> {
@@ -514,7 +864,6 @@ impl SirPipeline {
                 })?;
         }
 
-        self.sync_graph_for_file(store, &event.file_path)?;
         let test_intent_analyzer = TestIntentAnalyzer::new(&self.workspace_root)
             .context("failed to initialize test intent analyzer")?;
         let _ = test_intent_analyzer
@@ -852,6 +1201,73 @@ struct FailedSirGeneration {
 struct FileLeafSir {
     qualified_name: String,
     sir: SirAnnotation,
+}
+
+#[derive(Debug, Clone)]
+struct UpsertSirIntentPayload {
+    symbol: Symbol,
+    sir: SirAnnotation,
+    provider_name: String,
+    model_name: String,
+    commit_hash: Option<String>,
+}
+
+impl UpsertSirIntentPayload {
+    fn to_json_string(&self) -> Result<String> {
+        serde_json::to_string(&json!({
+            "symbol": self.symbol,
+            "sir": self.sir,
+            "provider_name": self.provider_name,
+            "model_name": self.model_name,
+            "commit_hash": self.commit_hash,
+        }))
+        .context("failed to serialize upsert intent payload")
+    }
+
+    fn from_json_str(raw: &str) -> Result<Self> {
+        let value: Value = serde_json::from_str(raw).context("failed to parse payload JSON")?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| anyhow!("payload must be a JSON object"))?;
+        let symbol_value = object
+            .get("symbol")
+            .cloned()
+            .ok_or_else(|| anyhow!("payload missing field 'symbol'"))?;
+        let sir_value = object
+            .get("sir")
+            .cloned()
+            .ok_or_else(|| anyhow!("payload missing field 'sir'"))?;
+        let provider_name = payload_required_string(object, "provider_name")?;
+        let model_name = payload_required_string(object, "model_name")?;
+        let commit_hash = match object.get("commit_hash") {
+            Some(Value::String(value)) => Some(value.clone()),
+            Some(Value::Null) | None => None,
+            Some(_) => {
+                return Err(anyhow!(
+                    "payload field 'commit_hash' must be a string or null"
+                ));
+            }
+        };
+
+        Ok(Self {
+            symbol: serde_json::from_value(symbol_value).context("invalid payload symbol")?,
+            sir: serde_json::from_value(sir_value).context("invalid payload sir")?,
+            provider_name,
+            model_name,
+            commit_hash,
+        })
+    }
+}
+
+fn payload_required_string(
+    payload: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<String> {
+    match payload.get(field) {
+        Some(Value::String(value)) => Ok(value.clone()),
+        Some(_) => Err(anyhow!("payload field '{field}' must be a string")),
+        None => Err(anyhow!("payload missing field '{field}'")),
+    }
 }
 
 #[derive(Debug)]

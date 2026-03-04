@@ -156,6 +156,29 @@ fn initialize_indexer(config: &IndexerConfig) -> Result<(ObserverState, SqliteSt
     )
     .context("failed to initialize SIR pipeline")?;
 
+    match sir_pipeline.replay_incomplete_intents(&store, false, 100, false) {
+        Ok(replayed) => {
+            tracing::info!(
+                replayed,
+                "Replayed {} incomplete write intents from previous session",
+                replayed
+            );
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to replay incomplete write intents");
+        }
+    }
+    match store.prune_completed_intents(604_800) {
+        Ok(pruned) => {
+            if pruned > 0 {
+                tracing::info!(pruned, "pruned completed write intents older than 7 days");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to prune completed write intents");
+        }
+    }
+
     let mut stdout = std::io::stdout();
     for event in observer.initial_symbol_events() {
         if let Err(err) =

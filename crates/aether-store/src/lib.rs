@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -259,6 +261,100 @@ pub struct TestIntentRecord {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteIntent {
+    pub intent_id: String,
+    pub symbol_id: String,
+    pub file_path: String,
+    pub operation: IntentOperation,
+    pub status: WriteIntentStatus,
+    pub payload_json: Option<String>,
+    pub created_at: i64,
+    pub completed_at: Option<i64>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WriteIntentStatus {
+    Pending,
+    SqliteDone,
+    VectorDone,
+    GraphDone,
+    Complete,
+    Failed,
+}
+
+impl WriteIntentStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::SqliteDone => "sqlite_done",
+            Self::VectorDone => "vector_done",
+            Self::GraphDone => "graph_done",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl fmt::Display for WriteIntentStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for WriteIntentStatus {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "pending" => Ok(Self::Pending),
+            "sqlite_done" => Ok(Self::SqliteDone),
+            "vector_done" => Ok(Self::VectorDone),
+            "graph_done" => Ok(Self::GraphDone),
+            "complete" => Ok(Self::Complete),
+            "failed" => Ok(Self::Failed),
+            other => Err(format!("invalid write intent status '{other}'")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IntentOperation {
+    UpsertSir,
+    DeleteSymbol,
+    UpdateEdges,
+}
+
+impl IntentOperation {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UpsertSir => "upsert_sir",
+            Self::DeleteSymbol => "delete_symbol",
+            Self::UpdateEdges => "update_edges",
+        }
+    }
+}
+
+impl fmt::Display for IntentOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for IntentOperation {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "upsert_sir" => Ok(Self::UpsertSir),
+            "delete_symbol" => Ok(Self::DeleteSymbol),
+            "update_edges" => Ok(Self::UpdateEdges),
+            other => Err(format!("invalid write intent operation '{other}'")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TestedByRecord {
     pub target_file: String,
@@ -292,6 +388,13 @@ pub struct ResolvedEdge {
     pub target_id: String,
     pub edge_kind: EdgeKind,
     pub file_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphDependencyEdgeRecord {
+    pub source_symbol_id: String,
+    pub target_symbol_id: String,
+    pub edge_kind: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -880,6 +983,212 @@ impl SqliteStore {
             .optional()?;
 
         Ok(record)
+    }
+
+    pub fn list_all_symbol_ids(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id
+            FROM symbols
+            ORDER BY id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_symbol_ids_with_sir(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT s.id
+            FROM symbols s
+            JOIN sir r ON r.id = s.id
+            WHERE COALESCE(TRIM(r.sir_json), '') <> ''
+            ORDER BY s.id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_all_embedding_symbol_ids(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT DISTINCT symbol_id
+            FROM sir_embeddings
+            ORDER BY symbol_id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn create_write_intent(&self, intent: &WriteIntent) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO write_intents (
+                intent_id,
+                symbol_id,
+                file_path,
+                operation,
+                status,
+                payload_json,
+                created_at,
+                completed_at,
+                error_message
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                intent.intent_id.as_str(),
+                intent.symbol_id.as_str(),
+                intent.file_path.as_str(),
+                intent.operation.to_string(),
+                intent.status.to_string(),
+                intent.payload_json.as_deref(),
+                intent.created_at.max(0),
+                intent.completed_at.map(|value| value.max(0)),
+                intent.error_message.as_deref(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_intent_status(
+        &self,
+        intent_id: &str,
+        status: WriteIntentStatus,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            UPDATE write_intents
+            SET status = ?2
+            WHERE intent_id = ?1
+            "#,
+            params![intent_id, status.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_intent_failed(&self, intent_id: &str, error: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            UPDATE write_intents
+            SET status = ?2,
+                error_message = ?3,
+                completed_at = NULL
+            WHERE intent_id = ?1
+            "#,
+            params![
+                intent_id,
+                WriteIntentStatus::Failed.to_string(),
+                error.trim().to_owned(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_intent_complete(&self, intent_id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            UPDATE write_intents
+            SET status = ?2,
+                completed_at = unixepoch(),
+                error_message = NULL
+            WHERE intent_id = ?1
+            "#,
+            params![intent_id, WriteIntentStatus::Complete.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_incomplete_intents(&self) -> Result<Vec<WriteIntent>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT intent_id, symbol_id, file_path, operation, status, payload_json, created_at, completed_at, error_message
+            FROM write_intents
+            WHERE status NOT IN ('complete', 'failed')
+            ORDER BY created_at ASC, intent_id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], write_intent_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_failed_intents(&self) -> Result<Vec<WriteIntent>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT intent_id, symbol_id, file_path, operation, status, payload_json, created_at, completed_at, error_message
+            FROM write_intents
+            WHERE status = 'failed'
+            ORDER BY created_at ASC, intent_id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], write_intent_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_intent(&self, intent_id: &str) -> Result<Option<WriteIntent>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT intent_id, symbol_id, file_path, operation, status, payload_json, created_at, completed_at, error_message
+            FROM write_intents
+            WHERE intent_id = ?1
+            LIMIT 1
+            "#,
+        )?;
+        stmt.query_row(params![intent_id], write_intent_from_row)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn prune_completed_intents(&self, older_than_secs: i64) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            r#"
+            DELETE FROM write_intents
+            WHERE status = 'complete'
+              AND completed_at IS NOT NULL
+              AND completed_at <= (unixepoch() - ?1)
+            "#,
+            params![older_than_secs.max(0)],
+        )?;
+        Ok(deleted)
+    }
+
+    pub fn count_intents_by_status(&self) -> Result<HashMap<String, usize>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT status, COUNT(*)
+            FROM write_intents
+            GROUP BY status
+            ORDER BY status ASC
+            "#,
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?.max(0) as usize,
+            ))
+        })?;
+        let mut counts = HashMap::new();
+        for row in rows {
+            let (status, count) = row?;
+            counts.insert(status, count);
+        }
+        Ok(counts)
     }
 
     pub fn list_module_file_paths(
@@ -3311,6 +3620,37 @@ fn project_entity_refs_to_json(
     Ok(serde_json::to_string(&values)?)
 }
 
+fn write_intent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WriteIntent> {
+    let operation_raw = row.get::<_, String>(3)?;
+    let status_raw = row.get::<_, String>(4)?;
+    let operation = IntentOperation::from_str(operation_raw.as_str()).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+        )
+    })?;
+    let status = WriteIntentStatus::from_str(status_raw.as_str()).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            4,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+        )
+    })?;
+
+    Ok(WriteIntent {
+        intent_id: row.get(0)?,
+        symbol_id: row.get(1)?,
+        file_path: row.get(2)?,
+        operation,
+        status,
+        payload_json: row.get(5)?,
+        created_at: row.get(6)?,
+        completed_at: row.get(7)?,
+        error_message: row.get(8)?,
+    })
+}
+
 fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
     let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
 
@@ -3608,6 +3948,30 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         conn.execute("PRAGMA user_version = 2", [])?;
     }
 
+    if version < 3 {
+        conn.execute_batch(
+            r#"
+        CREATE TABLE IF NOT EXISTS write_intents (
+            intent_id TEXT PRIMARY KEY,
+            symbol_id TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            payload_json TEXT,
+            created_at INTEGER NOT NULL,
+            completed_at INTEGER,
+            error_message TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_write_intents_status
+            ON write_intents(status);
+        CREATE INDEX IF NOT EXISTS idx_write_intents_created
+            ON write_intents(created_at);
+        "#,
+        )?;
+        conn.execute("PRAGMA user_version = 3", [])?;
+    }
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -3837,6 +4201,20 @@ mod tests {
             symbol_id: symbol_id.map(|value| value.to_owned()),
             created_at: 1_700_000_000,
             updated_at: 1_700_000_100,
+        }
+    }
+
+    fn write_intent_record(intent_id: &str, status: WriteIntentStatus) -> WriteIntent {
+        WriteIntent {
+            intent_id: intent_id.to_owned(),
+            symbol_id: "sym-1".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            operation: IntentOperation::UpsertSir,
+            status,
+            payload_json: Some("{\"symbol_id\":\"sym-1\"}".to_owned()),
+            created_at: 1_700_000_000,
+            completed_at: None,
+            error_message: None,
         }
     }
 
@@ -4815,13 +5193,13 @@ mirror_sir_files = false
         let first_version: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("query first user_version");
-        assert_eq!(first_version, 2);
+        assert_eq!(first_version, 3);
 
         run_migrations(&conn).expect("run migrations twice");
         let second_version: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("query second user_version");
-        assert_eq!(second_version, 2);
+        assert_eq!(second_version, 3);
     }
 
     #[test]
@@ -4831,8 +5209,208 @@ mirror_sir_files = false
 
         let schema = store.get_schema_version().expect("get schema version");
         assert_eq!(schema.component, "core");
-        assert_eq!(schema.version, 2);
+        assert_eq!(schema.version, 3);
         assert!(schema.migrated_at > 0);
+    }
+
+    #[test]
+    fn write_intent_status_and_operation_round_trip() {
+        let statuses = [
+            WriteIntentStatus::Pending,
+            WriteIntentStatus::SqliteDone,
+            WriteIntentStatus::VectorDone,
+            WriteIntentStatus::GraphDone,
+            WriteIntentStatus::Complete,
+            WriteIntentStatus::Failed,
+        ];
+        for status in statuses {
+            let text = status.to_string();
+            let parsed = WriteIntentStatus::from_str(text.as_str()).expect("parse status");
+            assert_eq!(parsed, status);
+        }
+
+        let operations = [
+            IntentOperation::UpsertSir,
+            IntentOperation::DeleteSymbol,
+            IntentOperation::UpdateEdges,
+        ];
+        for operation in operations {
+            let text = operation.to_string();
+            let parsed = IntentOperation::from_str(text.as_str()).expect("parse operation");
+            assert_eq!(parsed, operation);
+        }
+    }
+
+    #[test]
+    fn write_intent_crud_updates_complete_and_failed() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        let intent = write_intent_record("intent-1", WriteIntentStatus::Pending);
+        store
+            .create_write_intent(&intent)
+            .expect("create write intent");
+        store
+            .update_intent_status(&intent.intent_id, WriteIntentStatus::SqliteDone)
+            .expect("update intent status");
+        store
+            .update_intent_status(&intent.intent_id, WriteIntentStatus::VectorDone)
+            .expect("update intent status");
+        store
+            .mark_intent_complete(&intent.intent_id)
+            .expect("mark complete");
+
+        let loaded = store
+            .get_intent(&intent.intent_id)
+            .expect("get intent")
+            .expect("intent exists");
+        assert_eq!(loaded.status, WriteIntentStatus::Complete);
+        assert!(loaded.completed_at.is_some());
+        assert_eq!(loaded.error_message, None);
+
+        let failed = write_intent_record("intent-2", WriteIntentStatus::Pending);
+        store
+            .create_write_intent(&failed)
+            .expect("create failed write intent");
+        store
+            .mark_intent_failed(&failed.intent_id, "vector write failed")
+            .expect("mark failed");
+
+        let loaded_failed = store
+            .get_intent(&failed.intent_id)
+            .expect("get failed intent")
+            .expect("failed intent exists");
+        assert_eq!(loaded_failed.status, WriteIntentStatus::Failed);
+        assert_eq!(
+            loaded_failed.error_message.as_deref(),
+            Some("vector write failed")
+        );
+    }
+
+    #[test]
+    fn get_incomplete_intents_excludes_complete_and_failed() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        store
+            .create_write_intent(&write_intent_record(
+                "intent-pending",
+                WriteIntentStatus::Pending,
+            ))
+            .expect("insert pending");
+        store
+            .create_write_intent(&write_intent_record(
+                "intent-sqlite",
+                WriteIntentStatus::SqliteDone,
+            ))
+            .expect("insert sqlite_done");
+        store
+            .create_write_intent(&write_intent_record(
+                "intent-complete",
+                WriteIntentStatus::Complete,
+            ))
+            .expect("insert complete");
+        store
+            .create_write_intent(&write_intent_record(
+                "intent-failed",
+                WriteIntentStatus::Failed,
+            ))
+            .expect("insert failed");
+
+        let incomplete = store
+            .get_incomplete_intents()
+            .expect("list incomplete intents");
+        let ids = incomplete
+            .iter()
+            .map(|intent| intent.intent_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["intent-pending", "intent-sqlite"]);
+    }
+
+    #[test]
+    fn prune_completed_intents_removes_only_old_completed_rows() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        store
+            .create_write_intent(&write_intent_record(
+                "intent-old-complete",
+                WriteIntentStatus::Complete,
+            ))
+            .expect("insert old complete");
+        store
+            .create_write_intent(&write_intent_record(
+                "intent-new-complete",
+                WriteIntentStatus::Complete,
+            ))
+            .expect("insert new complete");
+        store
+            .create_write_intent(&write_intent_record(
+                "intent-pending",
+                WriteIntentStatus::Pending,
+            ))
+            .expect("insert pending");
+
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE write_intents SET completed_at = unixepoch() - 1_000_000 WHERE intent_id = 'intent-old-complete'",
+            [],
+        )
+        .expect("set old completed_at");
+        conn.execute(
+            "UPDATE write_intents SET completed_at = unixepoch() - 10 WHERE intent_id = 'intent-new-complete'",
+            [],
+        )
+        .expect("set new completed_at");
+        drop(conn);
+
+        let deleted = store
+            .prune_completed_intents(604_800)
+            .expect("prune completed intents");
+        assert_eq!(deleted, 1);
+
+        assert!(
+            store
+                .get_intent("intent-old-complete")
+                .expect("get old")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_intent("intent-new-complete")
+                .expect("get new")
+                .is_some()
+        );
+        assert!(
+            store
+                .get_intent("intent-pending")
+                .expect("get pending")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn migration_from_v2_to_v3_adds_write_intents_table() {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        conn.execute("PRAGMA user_version = 2", [])
+            .expect("set v2 schema version");
+
+        run_migrations(&conn).expect("run migrations");
+        let version: i32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("query user_version");
+        assert_eq!(version, 3);
+
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='write_intents' LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .expect("query sqlite_master")
+            .is_some();
+        assert!(exists);
     }
 
     #[test]
