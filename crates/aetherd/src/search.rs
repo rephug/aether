@@ -13,8 +13,9 @@ use aether_core::{
     SearchEnvelope,
 };
 use aether_infer::{
-    EmbeddingProviderOverrides, RerankCandidate, RerankerProvider, RerankerProviderOverrides,
-    load_embedding_provider_from_config, load_reranker_provider_from_config,
+    EmbeddingProviderOverrides, LoadedEmbeddingProvider, RerankCandidate, RerankerProvider,
+    RerankerProviderOverrides, load_embedding_provider_from_config,
+    load_reranker_provider_from_config,
 };
 use aether_store::{
     SqliteStore, Store, SymbolSearchResult, ThresholdCalibrationRecord, open_vector_store,
@@ -104,6 +105,16 @@ pub fn execute_search(
     limit: u32,
     mode: SearchMode,
 ) -> Result<SearchExecution> {
+    execute_search_with_provider_override(workspace, query, limit, mode, None)
+}
+
+fn execute_search_with_provider_override(
+    workspace: &Path,
+    query: &str,
+    limit: u32,
+    mode: SearchMode,
+    embedding_provider_override: Option<LoadedEmbeddingProvider>,
+) -> Result<SearchExecution> {
     let store_present = workspace.join(".aether").join("meta.sqlite").exists();
     let store = SqliteStore::open(workspace).context("failed to initialize local store")?;
     let config =
@@ -130,12 +141,15 @@ pub fn execute_search(
         SearchMode::Semantic => {
             let (semantic_matches, fallback_reason) = semantic_search(
                 workspace,
-                &store,
-                &normalized_query,
-                language_hint.as_deref(),
-                limit,
-                store_present,
-                &config,
+                SemanticSearchParams {
+                    store: &store,
+                    query: &normalized_query,
+                    query_language_hint: language_hint.as_deref(),
+                    limit,
+                    store_present,
+                    config: &config,
+                    embedding_provider_override,
+                },
             )?;
             if semantic_matches.is_empty() {
                 return Ok(SearchExecution {
@@ -156,12 +170,15 @@ pub fn execute_search(
         SearchMode::Hybrid => {
             let (semantic_matches, fallback_reason) = semantic_search(
                 workspace,
-                &store,
-                &normalized_query,
-                language_hint.as_deref(),
-                retrieval_limit,
-                store_present,
-                &config,
+                SemanticSearchParams {
+                    store: &store,
+                    query: &normalized_query,
+                    query_language_hint: language_hint.as_deref(),
+                    limit: retrieval_limit,
+                    store_present,
+                    config: &config,
+                    embedding_provider_override,
+                },
             )?;
             if semantic_matches.is_empty() {
                 return Ok(SearchExecution {
@@ -254,15 +271,30 @@ fn lexical_search(store: &SqliteStore, query: &str, limit: u32) -> Result<Vec<Se
     Ok(matches.into_iter().map(SearchResultRow::from).collect())
 }
 
-fn semantic_search(
-    workspace: &Path,
-    store: &SqliteStore,
-    query: &str,
-    query_language_hint: Option<&str>,
+struct SemanticSearchParams<'a> {
+    store: &'a SqliteStore,
+    query: &'a str,
+    query_language_hint: Option<&'a str>,
     limit: u32,
     store_present: bool,
-    config: &AetherConfig,
+    config: &'a AetherConfig,
+    embedding_provider_override: Option<LoadedEmbeddingProvider>,
+}
+
+fn semantic_search(
+    workspace: &Path,
+    params: SemanticSearchParams<'_>,
 ) -> Result<(Vec<SearchResultRow>, Option<String>)> {
+    let SemanticSearchParams {
+        store,
+        query,
+        query_language_hint,
+        limit,
+        store_present,
+        config,
+        embedding_provider_override,
+    } = params;
+
     if !store_present {
         return Ok((
             Vec::new(),
@@ -270,9 +302,13 @@ fn semantic_search(
         ));
     }
 
-    let loaded =
-        load_embedding_provider_from_config(workspace, EmbeddingProviderOverrides::default())
-            .context("failed to load embedding provider")?;
+    let loaded = match embedding_provider_override {
+        Some(provider) => Some(provider),
+        None => {
+            load_embedding_provider_from_config(workspace, EmbeddingProviderOverrides::default())
+                .context("failed to load embedding provider")?
+        }
+    };
     let Some(loaded) = loaded else {
         return Ok((
             Vec::new(),
@@ -714,9 +750,11 @@ mod tests {
     use std::sync::Arc;
 
     use aether_infer::{
-        EmbeddingProvider, InferenceProvider, MockEmbeddingProvider, MockProvider,
-        MockRerankerProvider,
+        EmbeddingProvider, InferError, InferenceProvider, LoadedEmbeddingProvider,
+        MockRerankerProvider, SirContext,
     };
+    use aether_sir::SirAnnotation;
+    use async_trait::async_trait;
     use tempfile::tempdir;
 
     use super::*;
@@ -725,6 +763,59 @@ mod tests {
     use aether_store::{
         SymbolEmbeddingRecord, SymbolRecord, ThresholdCalibrationRecord, open_vector_store,
     };
+
+    const TEST_EMBED_PROVIDER: &str = "test_embedding";
+    const TEST_EMBED_MODEL: &str = "test-model";
+
+    struct TestEmbeddingProvider;
+
+    #[async_trait]
+    impl EmbeddingProvider for TestEmbeddingProvider {
+        async fn embed_text(&self, text: &str) -> std::result::Result<Vec<f32>, InferError> {
+            Ok(keyword_embedding(text))
+        }
+    }
+
+    struct TestInferenceProvider;
+
+    #[async_trait]
+    impl InferenceProvider for TestInferenceProvider {
+        async fn generate_sir(
+            &self,
+            _symbol_text: &str,
+            context: &SirContext,
+        ) -> std::result::Result<SirAnnotation, InferError> {
+            Ok(SirAnnotation {
+                intent: format!("Test summary for {}", context.qualified_name),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                side_effects: Vec::new(),
+                dependencies: Vec::new(),
+                error_modes: Vec::new(),
+                confidence: 0.9,
+            })
+        }
+    }
+
+    fn keyword_embedding(text: &str) -> Vec<f32> {
+        const TOKENS: &[&str] = &[
+            "oauth", "token", "refresh", "auth", "cache", "lookup", "memory", "hit", "session",
+            "python",
+        ];
+        let normalized = text.to_ascii_lowercase();
+        TOKENS
+            .iter()
+            .map(|token| normalized.matches(token).count() as f32)
+            .collect()
+    }
+
+    fn test_loaded_embedding_provider() -> LoadedEmbeddingProvider {
+        LoadedEmbeddingProvider {
+            provider: Box::new(TestEmbeddingProvider),
+            provider_name: TEST_EMBED_PROVIDER.to_owned(),
+            model_name: TEST_EMBED_MODEL.to_owned(),
+        }
+    }
 
     #[test]
     fn write_search_results_outputs_stable_header_and_columns() {
@@ -819,7 +910,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_search_returns_expected_top_match_with_mock_embeddings() {
+    fn semantic_search_returns_expected_top_match_with_test_embeddings() {
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();
         write_embeddings_enabled_config_with_thresholds(
@@ -857,7 +948,7 @@ mod tests {
             })
             .expect("upsert cache symbol");
 
-        let provider = MockEmbeddingProvider;
+        let provider = TestEmbeddingProvider;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -873,8 +964,8 @@ mod tests {
             .upsert_symbol_embedding(aether_store::SymbolEmbeddingRecord {
                 symbol_id: "sym-auth".to_owned(),
                 sir_hash: "hash-auth".to_owned(),
-                provider: "mock".to_owned(),
-                model: "mock-64d".to_owned(),
+                provider: TEST_EMBED_PROVIDER.to_owned(),
+                model: TEST_EMBED_MODEL.to_owned(),
                 embedding: auth_embedding,
                 updated_at: 1_700_000_100,
             })
@@ -883,22 +974,34 @@ mod tests {
             .upsert_symbol_embedding(aether_store::SymbolEmbeddingRecord {
                 symbol_id: "sym-cache".to_owned(),
                 sir_hash: "hash-cache".to_owned(),
-                provider: "mock".to_owned(),
-                model: "mock-64d".to_owned(),
+                provider: TEST_EMBED_PROVIDER.to_owned(),
+                model: TEST_EMBED_MODEL.to_owned(),
                 embedding: cache_embedding,
                 updated_at: 1_700_000_100,
             })
             .expect("upsert cache embedding");
 
-        let semantic = execute_search(workspace, "oauth refresh token", 10, SearchMode::Semantic)
-            .expect("semantic execution");
+        let semantic = execute_search_with_provider_override(
+            workspace,
+            "oauth refresh token",
+            10,
+            SearchMode::Semantic,
+            Some(test_loaded_embedding_provider()),
+        )
+        .expect("semantic execution");
         assert_eq!(semantic.mode_used, SearchMode::Semantic);
         assert!(semantic.fallback_reason.is_none());
         assert!(!semantic.matches.is_empty());
         assert_eq!(semantic.matches[0].symbol_id, "sym-auth");
 
-        let hybrid = execute_search(workspace, "oauth refresh token", 10, SearchMode::Hybrid)
-            .expect("hybrid execution");
+        let hybrid = execute_search_with_provider_override(
+            workspace,
+            "oauth refresh token",
+            10,
+            SearchMode::Hybrid,
+            Some(test_loaded_embedding_provider()),
+        )
+        .expect("hybrid execution");
         assert_eq!(hybrid.mode_used, SearchMode::Hybrid);
         assert!(!hybrid.matches.is_empty());
         assert_eq!(hybrid.matches[0].symbol_id, "sym-auth");
@@ -943,7 +1046,7 @@ mod tests {
             })
             .expect("upsert python symbol");
 
-        let provider = MockEmbeddingProvider;
+        let provider = TestEmbeddingProvider;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -959,8 +1062,8 @@ mod tests {
             .upsert_symbol_embedding(SymbolEmbeddingRecord {
                 symbol_id: "sym-rust".to_owned(),
                 sir_hash: "hash-rust".to_owned(),
-                provider: "mock".to_owned(),
-                model: "mock-64d".to_owned(),
+                provider: TEST_EMBED_PROVIDER.to_owned(),
+                model: TEST_EMBED_MODEL.to_owned(),
                 embedding: rust_embedding,
                 updated_at: 1_700_000_100,
             })
@@ -969,15 +1072,21 @@ mod tests {
             .upsert_symbol_embedding(SymbolEmbeddingRecord {
                 symbol_id: "sym-python".to_owned(),
                 sir_hash: "hash-python".to_owned(),
-                provider: "mock".to_owned(),
-                model: "mock-64d".to_owned(),
+                provider: TEST_EMBED_PROVIDER.to_owned(),
+                model: TEST_EMBED_MODEL.to_owned(),
                 embedding: python_embedding,
                 updated_at: 1_700_000_101,
             })
             .expect("upsert python embedding");
 
-        let result = execute_search(workspace, "oauth refresh token", 10, SearchMode::Semantic)
-            .expect("semantic search");
+        let result = execute_search_with_provider_override(
+            workspace,
+            "oauth refresh token",
+            10,
+            SearchMode::Semantic,
+            Some(test_loaded_embedding_provider()),
+        )
+        .expect("semantic search");
         assert_eq!(result.mode_used, SearchMode::Semantic);
         assert!(!result.matches.is_empty());
         assert!(
@@ -1529,9 +1638,9 @@ mod tests {
         observer.seed_from_disk().expect("seed observer");
 
         let store = SqliteStore::open(workspace).expect("open store");
-        let provider: Arc<dyn InferenceProvider> = Arc::new(MockProvider);
+        let provider: Arc<dyn InferenceProvider> = Arc::new(TestInferenceProvider);
         let pipeline =
-            SirPipeline::new_with_provider(workspace.to_path_buf(), 2, provider, "mock", "mock")
+            SirPipeline::new_with_provider(workspace.to_path_buf(), 2, provider, "test", "test")
                 .expect("pipeline");
 
         let mut startup_stdout = Vec::new();
@@ -1601,7 +1710,7 @@ mod tests {
             workspace.join(".aether/config.toml"),
             format!(
                 r#"[inference]
-provider = "mock"
+provider = "qwen3_local"
 api_key_env = "GEMINI_API_KEY"
 
 [storage]
@@ -1610,7 +1719,7 @@ graph_backend = "sqlite"
 
 [embeddings]
 enabled = true
-provider = "mock"
+provider = "qwen3_local"
 vector_backend = "{vector_backend}"
 
 [search.thresholds]
@@ -1630,7 +1739,7 @@ python = {}
         fs::write(
             workspace.join(".aether/config.toml"),
             r#"[inference]
-provider = "mock"
+provider = "qwen3_local"
 api_key_env = "GEMINI_API_KEY"
 
 [storage]
@@ -1639,7 +1748,7 @@ graph_backend = "sqlite"
 
 [embeddings]
 enabled = false
-provider = "mock"
+provider = "qwen3_local"
 vector_backend = "sqlite"
 "#,
         )

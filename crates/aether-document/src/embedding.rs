@@ -84,7 +84,7 @@ impl DocumentEmbedder {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use aether_infer::{EmbeddingProvider, InferError, MockEmbeddingProvider};
+    use aether_infer::{EmbeddingProvider, InferError};
     use async_trait::async_trait;
     use serde_json::json;
 
@@ -148,6 +148,19 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct TestEmbeddingProvider;
+
+    #[async_trait]
+    impl EmbeddingProvider for TestEmbeddingProvider {
+        async fn embed_text(&self, text: &str) -> std::result::Result<Vec<f32>, InferError> {
+            if text.trim().is_empty() {
+                return Ok(Vec::new());
+            }
+            Ok(vec![1.0, 0.0, 0.5])
+        }
+    }
+
     fn make_record(id_suffix: &str, embedding_text: &str) -> GenericRecord {
         GenericRecord::new(
             format!("unit-{id_suffix}"),
@@ -164,7 +177,7 @@ mod tests {
     async fn embed_records_uses_embedding_provider_and_upserts_results() {
         let backend = Arc::new(MockBackend::default());
         let embedder = DocumentEmbedder::new(
-            Arc::new(MockEmbeddingProvider),
+            Arc::new(TestEmbeddingProvider),
             backend.clone(),
             "mock",
             "mock-64d",
@@ -217,7 +230,7 @@ mod tests {
     async fn search_embeds_query_then_calls_backend_search() {
         let backend = Arc::new(MockBackend::default());
         let embedder = DocumentEmbedder::new(
-            Arc::new(MockEmbeddingProvider),
+            Arc::new(TestEmbeddingProvider),
             backend.clone(),
             "mock",
             "mock-64d",

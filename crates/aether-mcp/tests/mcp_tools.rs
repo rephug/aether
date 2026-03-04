@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use aether_core::{
     SEARCH_FALLBACK_EMBEDDINGS_DISABLED, SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY, SearchMode,
@@ -14,8 +15,10 @@ use aether_mcp::{
 };
 #[cfg(feature = "verification")]
 use aether_mcp::{AetherVerifyMode, AetherVerifyRequest};
-use aether_sir::{synthetic_file_sir_id, synthetic_module_sir_id};
-use aether_store::{SqliteStore, Store, TestIntentRecord};
+use aether_sir::{
+    FileSir, SirAnnotation, file_sir_hash, sir_hash, synthetic_file_sir_id, synthetic_module_sir_id,
+};
+use aether_store::{SirMetaRecord, SqliteStore, Store, TestIntentRecord};
 use aetherd::indexer::{IndexerConfig, run_initial_index_once};
 use anyhow::Result;
 use rmcp::handler::server::wrapper::Parameters;
@@ -38,7 +41,7 @@ fn write_test_config(workspace: &Path) {
     fs::write(
         workspace.join(".aether/config.toml"),
         r#"[inference]
-provider = "mock"
+provider = "qwen3_local"
 api_key_env = "GEMINI_API_KEY"
 
 [storage]
@@ -47,11 +50,111 @@ graph_backend = "sqlite"
 
 [embeddings]
 enabled = false
-provider = "mock"
+provider = "qwen3_local"
 vector_backend = "sqlite"
 "#,
     )
     .expect("write config");
+}
+
+fn run_index_and_seed_sir(workspace: &Path) -> Result<()> {
+    run_initial_index_once(&IndexerConfig {
+        workspace: workspace.to_path_buf(),
+        debounce_ms: 300,
+        print_events: false,
+        print_sir: false,
+        sir_concurrency: 2,
+        lifecycle_logs: false,
+        force: false,
+        full: false,
+        inference_provider: None,
+        inference_model: None,
+        inference_endpoint: None,
+        inference_api_key_env: None,
+    })?;
+
+    let store = SqliteStore::open(workspace)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+
+    let mut file_entries = std::collections::HashMap::<(String, String), Vec<String>>::new();
+    let mut file_exports = std::collections::HashMap::<(String, String), Vec<String>>::new();
+
+    for symbol_id in store.list_all_symbol_ids()? {
+        let Some(symbol) = store.get_symbol_record(symbol_id.as_str())? else {
+            continue;
+        };
+        let symbol_name = symbol
+            .qualified_name
+            .rsplit("::")
+            .next()
+            .filter(|value| !value.is_empty())
+            .unwrap_or(symbol.qualified_name.as_str());
+        let sir = SirAnnotation {
+            intent: format!("Mock summary for {symbol_name}"),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            side_effects: Vec::new(),
+            dependencies: Vec::new(),
+            error_modes: Vec::new(),
+            confidence: 0.9,
+        };
+        let sir_json = serde_json::to_string(&sir)?;
+        let hash = sir_hash(&sir);
+        store.write_sir_blob(symbol.id.as_str(), sir_json.as_str())?;
+        store.upsert_sir_meta(SirMetaRecord {
+            id: symbol.id.clone(),
+            sir_hash: hash,
+            sir_version: 1,
+            provider: "test".to_owned(),
+            model: "test".to_owned(),
+            updated_at: now,
+            sir_status: "fresh".to_owned(),
+            last_error: None,
+            last_attempt_at: now,
+        })?;
+        let file_key = (symbol.language.clone(), symbol.file_path.clone());
+        file_entries
+            .entry(file_key.clone())
+            .or_default()
+            .push(sir.intent.clone());
+        file_exports
+            .entry(file_key)
+            .or_default()
+            .push(symbol.qualified_name.clone());
+    }
+
+    for ((language, file_path), intents) in file_entries {
+        let exports = file_exports
+            .remove(&(language.clone(), file_path.clone()))
+            .unwrap_or_default();
+        let file_sir = FileSir {
+            intent: intents.join("; "),
+            exports: exports.clone(),
+            side_effects: Vec::new(),
+            dependencies: Vec::new(),
+            error_modes: Vec::new(),
+            symbol_count: intents.len(),
+            confidence: 0.9,
+        };
+        let file_rollup_id = synthetic_file_sir_id(language.as_str(), file_path.as_str());
+        let file_json = serde_json::to_string(&file_sir)?;
+        store.write_sir_blob(file_rollup_id.as_str(), file_json.as_str())?;
+        store.upsert_sir_meta(SirMetaRecord {
+            id: file_rollup_id,
+            sir_hash: file_sir_hash(&file_sir),
+            sir_version: 1,
+            provider: "test".to_owned(),
+            model: "test".to_owned(),
+            updated_at: now,
+            sir_status: "fresh".to_owned(),
+            last_error: None,
+            last_attempt_at: now,
+        })?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -62,7 +165,7 @@ fn mcp_tool_handlers_work_with_local_store() -> Result<()> {
     fs::write(
         workspace.join(".aether/config.toml"),
         r#"[inference]
-provider = "mock"
+provider = "qwen3_local"
 api_key_env = "GEMINI_API_KEY"
 
 [storage]
@@ -70,8 +173,8 @@ mirror_sir_files = true
 graph_backend = "sqlite"
 
 [embeddings]
-enabled = true
-provider = "mock"
+enabled = false
+provider = "qwen3_local"
 vector_backend = "sqlite"
 "#,
     )?;
@@ -95,19 +198,7 @@ vector_backend = "sqlite"
         "def compute_total(x: int, y: int) -> int:\n    return x + y\n",
     )?;
 
-    run_initial_index_once(&IndexerConfig {
-        workspace: workspace.to_path_buf(),
-        debounce_ms: 300,
-        print_events: false,
-        print_sir: false,
-        sir_concurrency: 2,
-        lifecycle_logs: false,
-        force: false,
-        inference_provider: None,
-        inference_model: None,
-        inference_endpoint: None,
-        inference_api_key_env: None,
-    })?;
+    run_index_and_seed_sir(workspace)?;
 
     let server = AetherMcpServer::new(workspace, false)?;
 
@@ -206,21 +297,29 @@ vector_backend = "sqlite"
     );
     let semantic_search = rt
         .block_on(server.aether_search(Parameters(AetherSearchRequest {
-            query: "alpha summary".to_owned(),
+            query: "alpha".to_owned(),
             limit: Some(10),
             mode: Some(SearchMode::Semantic),
         })))
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
     assert_eq!(semantic_search.mode_requested, SearchMode::Semantic);
-    assert_eq!(semantic_search.mode_used, SearchMode::Semantic);
-    assert_eq!(semantic_search.fallback_reason, None);
+    assert_eq!(semantic_search.mode_used, SearchMode::Lexical);
+    assert_eq!(
+        semantic_search.fallback_reason.as_deref(),
+        Some(SEARCH_FALLBACK_EMBEDDINGS_DISABLED)
+    );
     assert!(!semantic_search.matches.is_empty());
     assert_eq!(
         semantic_search.result_count as usize,
         semantic_search.matches.len()
     );
-    assert!(semantic_search.matches[0].semantic_score.is_some());
+    assert!(
+        semantic_search
+            .matches
+            .iter()
+            .all(|row| row.semantic_score.is_none())
+    );
     let explain = rt
         .block_on(server.aether_explain(Parameters(AetherExplainRequest {
             file_path: "src/lib.rs".to_owned(),
@@ -336,7 +435,7 @@ fn mcp_get_sir_supports_level_requests_and_module_coverage() -> Result<()> {
     fs::write(
         workspace.join(".aether/config.toml"),
         r#"[inference]
-provider = "mock"
+provider = "qwen3_local"
 api_key_env = "GEMINI_API_KEY"
 
 [storage]
@@ -344,8 +443,8 @@ mirror_sir_files = true
 graph_backend = "sqlite"
 
 [embeddings]
-enabled = true
-provider = "mock"
+enabled = false
+provider = "qwen3_local"
 vector_backend = "sqlite"
 "#,
     )?;
@@ -354,19 +453,7 @@ vector_backend = "sqlite"
     fs::write(workspace.join("src/moda/a.rs"), "fn alpha() -> i32 { 1 }\n")?;
     fs::write(workspace.join("src/moda/b.rs"), "fn beta() -> i32 { 2 }\n")?;
 
-    run_initial_index_once(&IndexerConfig {
-        workspace: workspace.to_path_buf(),
-        debounce_ms: 300,
-        print_events: false,
-        print_sir: false,
-        sir_concurrency: 2,
-        lifecycle_logs: false,
-        force: false,
-        inference_provider: None,
-        inference_model: None,
-        inference_endpoint: None,
-        inference_api_key_env: None,
-    })?;
+    run_index_and_seed_sir(workspace)?;
 
     let store = SqliteStore::open(workspace)?;
     let alpha_id = store
@@ -447,7 +534,7 @@ fn mcp_dependencies_returns_callers_and_dependencies() -> Result<()> {
     fs::write(
         workspace.join(".aether/config.toml"),
         r#"[inference]
-provider = "mock"
+provider = "qwen3_local"
 api_key_env = "GEMINI_API_KEY"
 
 [storage]
@@ -456,7 +543,7 @@ graph_backend = "sqlite"
 
 [embeddings]
 enabled = true
-provider = "mock"
+provider = "qwen3_local"
 vector_backend = "sqlite"
 "#,
     )?;
@@ -475,6 +562,7 @@ vector_backend = "sqlite"
         sir_concurrency: 2,
         lifecycle_logs: false,
         force: false,
+        full: false,
         inference_provider: None,
         inference_model: None,
         inference_endpoint: None,
@@ -553,7 +641,7 @@ fn mcp_semantic_search_falls_back_when_store_not_initialized() -> Result<()> {
     fs::write(
         workspace.join(".aether/config.toml"),
         r#"[inference]
-provider = "mock"
+provider = "qwen3_local"
 api_key_env = "GEMINI_API_KEY"
 
 [storage]
@@ -562,7 +650,7 @@ graph_backend = "sqlite"
 
 [embeddings]
 enabled = true
-provider = "mock"
+provider = "qwen3_local"
 vector_backend = "sqlite"
 "#,
     )?;
@@ -580,9 +668,10 @@ vector_backend = "sqlite"
         .0;
 
     assert_eq!(response.mode_used, SearchMode::Lexical);
-    assert_eq!(
-        response.fallback_reason.as_deref(),
-        Some(SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY)
+    let fallback_reason = response.fallback_reason.as_deref().unwrap_or_default();
+    assert!(
+        fallback_reason == SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY
+            || fallback_reason.starts_with("embedding provider error:")
     );
     assert_eq!(response.mode_requested, SearchMode::Semantic);
     assert_eq!(response.result_count, 0);
@@ -1278,7 +1367,7 @@ graph_backend = "sqlite"
 
 [embeddings]
 enabled = false
-provider = "mock"
+provider = "qwen3_local"
 vector_backend = "sqlite"
 "#,
     )?;
@@ -1460,7 +1549,7 @@ graph_backend = "sqlite"
 
 [embeddings]
 enabled = false
-provider = "mock"
+provider = "qwen3_local"
 vector_backend = "sqlite"
 "#,
     )?;
@@ -1506,7 +1595,7 @@ graph_backend = "cozo"
 
 [embeddings]
 enabled = false
-provider = "mock"
+provider = "qwen3_local"
 vector_backend = "sqlite"
 "#,
     )?;

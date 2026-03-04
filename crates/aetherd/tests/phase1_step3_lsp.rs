@@ -2,16 +2,39 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use aether_infer::{InferenceProvider, MockProvider};
+use aether_infer::{InferError, InferenceProvider, SirContext};
 use aether_lsp::resolve_hover_markdown_for_path;
+use aether_sir::SirAnnotation;
 use aether_store::{SqliteStore, Store};
 use aetherd::observer::ObserverState;
 use aetherd::sir_pipeline::SirPipeline;
+use async_trait::async_trait;
 use tempfile::tempdir;
 use tower_lsp::lsp_types::Position;
 
+struct TestProvider;
+
+#[async_trait]
+impl InferenceProvider for TestProvider {
+    async fn generate_sir(
+        &self,
+        _symbol_text: &str,
+        context: &SirContext,
+    ) -> std::result::Result<SirAnnotation, InferError> {
+        Ok(SirAnnotation {
+            intent: format!("Test SIR for {}", context.qualified_name),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            side_effects: Vec::new(),
+            dependencies: Vec::new(),
+            error_modes: Vec::new(),
+            confidence: 0.9,
+        })
+    }
+}
+
 #[test]
-fn hover_resolution_returns_mock_sir_for_rust_and_ts_symbols()
+fn hover_resolution_returns_test_sir_for_rust_and_ts_symbols()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;
     let workspace = temp.path();
@@ -30,7 +53,7 @@ fn hover_resolution_returns_mock_sir_for_rust_and_ts_symbols()
         "function gamma(): number { return 1; }\nfunction delta(): number { return 2; }\n",
     )?;
 
-    index_workspace_with_mock(workspace)?;
+    index_workspace_with_provider(workspace)?;
 
     let store = SqliteStore::open(workspace)?;
 
@@ -38,7 +61,7 @@ fn hover_resolution_returns_mock_sir_for_rust_and_ts_symbols()
         resolve_hover_markdown_for_path(workspace, &store, &rust_file, Position::new(0, 4))?
             .expect("rust hover should resolve");
 
-    assert!(rust_hover.contains("Mock summary for alpha"));
+    assert!(rust_hover.contains("Test SIR for"));
     assert!(rust_hover.contains("**Confidence:**"));
     assert!(rust_hover.contains("**Intent**"));
 
@@ -46,7 +69,7 @@ fn hover_resolution_returns_mock_sir_for_rust_and_ts_symbols()
         resolve_hover_markdown_for_path(workspace, &store, &ts_file, Position::new(1, 10))?
             .expect("ts hover should resolve");
 
-    assert!(ts_hover.contains("Mock summary for delta"));
+    assert!(ts_hover.contains("Test SIR for"));
     assert!(ts_hover.contains("**Confidence:**"));
     assert!(ts_hover.contains("**Dependencies**"));
 
@@ -63,7 +86,7 @@ fn hover_resolution_shows_stale_warning_and_clears_after_fresh_meta()
     let rust_file = workspace.join("src/lib.rs");
     fs::write(&rust_file, "fn alpha() -> i32 { 1 }\n")?;
 
-    index_workspace_with_mock(workspace)?;
+    index_workspace_with_provider(workspace)?;
 
     let store = SqliteStore::open(workspace)?;
     let symbol = store
@@ -113,16 +136,16 @@ fn hover_resolution_shows_stale_warning_and_clears_after_fresh_meta()
     Ok(())
 }
 
-fn index_workspace_with_mock(workspace: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn index_workspace_with_provider(workspace: &Path) -> Result<(), Box<dyn std::error::Error>> {
     write_pipeline_config(workspace)?;
 
     let mut observer = ObserverState::new(workspace.to_path_buf())?;
     observer.seed_from_disk()?;
 
     let store = SqliteStore::open(workspace)?;
-    let provider: Arc<dyn InferenceProvider> = Arc::new(MockProvider);
+    let provider: Arc<dyn InferenceProvider> = Arc::new(TestProvider);
     let pipeline =
-        SirPipeline::new_with_provider(workspace.to_path_buf(), 2, provider, "mock", "mock")?;
+        SirPipeline::new_with_provider(workspace.to_path_buf(), 2, provider, "test", "test")?;
 
     let mut sink = Vec::new();
     for event in observer.initial_symbol_events() {
@@ -137,7 +160,7 @@ fn write_pipeline_config(workspace: &Path) -> Result<(), Box<dyn std::error::Err
     fs::write(
         workspace.join(".aether/config.toml"),
         r#"[inference]
-provider = "mock"
+provider = "qwen3_local"
 api_key_env = "GEMINI_API_KEY"
 
 [storage]
@@ -146,7 +169,7 @@ graph_backend = "sqlite"
 
 [embeddings]
 enabled = false
-provider = "mock"
+provider = "qwen3_local"
 vector_backend = "sqlite"
 "#,
     )?;

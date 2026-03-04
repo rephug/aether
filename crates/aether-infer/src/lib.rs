@@ -6,7 +6,7 @@ use aether_config::{
     AETHER_DIR_NAME, DEFAULT_COHERE_API_KEY_ENV, DEFAULT_GEMINI_API_KEY_ENV,
     DEFAULT_OPENAI_COMPAT_API_KEY_ENV, DEFAULT_QWEN_EMBEDDING_ENDPOINT, DEFAULT_QWEN_ENDPOINT,
     DEFAULT_QWEN_MODEL, EmbeddingProviderKind, InferenceProviderKind, OLLAMA_SIR_TEMPERATURE,
-    SearchRerankerKind, ensure_workspace_config,
+    SearchRerankerKind, TieredConfig, ensure_workspace_config,
 };
 use aether_core::Secret;
 use aether_sir::{SirAnnotation, validate_sir};
@@ -27,7 +27,6 @@ pub const GEMINI_API_KEY_ENV: &str = DEFAULT_GEMINI_API_KEY_ENV;
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 const GEMINI_DEFAULT_MODEL: &str = "gemini-flash-latest";
 const PARSE_VALIDATION_RETRIES: usize = 2;
-const MOCK_EMBEDDING_DIM: usize = 64;
 const OLLAMA_PULL_SUCCESS_STATUS: &str = "success";
 const OPENAI_COMPAT_JSON_FALLBACK_SUFFIX: &str =
     "\n\nRespond with ONLY valid JSON. No markdown, no explanation, no code fences.";
@@ -53,11 +52,12 @@ pub(crate) fn management_http_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SirContext {
     pub language: String,
     pub file_path: String,
     pub qualified_name: String,
+    pub priority_score: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -112,7 +112,7 @@ pub struct OllamaPullProgress {
 
 #[derive(Debug, Error)]
 pub enum InferError {
-    #[error("missing Gemini API key in {0}")]
+    #[error("missing inference API key: {0}")]
     MissingApiKey(String),
     #[error("missing Cohere API key in {0}")]
     MissingCohereApiKey(String),
@@ -136,6 +136,8 @@ pub enum InferError {
     Candle(#[from] candle_core::Error),
     #[error("tokenizer operation failed: {0}")]
     Tokenizer(String),
+    #[error("invalid inference config: {0}")]
+    InvalidConfig(String),
     #[error("invalid model response: {0}")]
     InvalidResponse(String),
     #[error("SIR validation failed: {0}")]
@@ -164,38 +166,56 @@ pub trait EmbeddingProvider: Send + Sync {
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>, InferError>;
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct MockProvider;
+pub struct TieredProvider {
+    primary: Box<dyn InferenceProvider>,
+    fallback: Box<dyn InferenceProvider>,
+    threshold: f64,
+    retry_with_fallback: bool,
+    primary_name: String,
+}
 
-#[async_trait]
-impl InferenceProvider for MockProvider {
-    async fn generate_sir(
-        &self,
-        _symbol_text: &str,
-        context: &SirContext,
-    ) -> Result<SirAnnotation, InferError> {
-        let sir = SirAnnotation {
-            intent: format!("Mock summary for {}", context.qualified_name),
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            side_effects: Vec::new(),
-            dependencies: Vec::new(),
-            error_modes: Vec::new(),
-            confidence: 1.0,
-        };
-
-        validate_sir(&sir)?;
-        Ok(sir)
+impl TieredProvider {
+    pub fn new(
+        primary: Box<dyn InferenceProvider>,
+        fallback: Box<dyn InferenceProvider>,
+        threshold: f64,
+        retry_with_fallback: bool,
+        primary_name: String,
+    ) -> Self {
+        Self {
+            primary,
+            fallback,
+            threshold,
+            retry_with_fallback,
+            primary_name,
+        }
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct MockEmbeddingProvider;
-
 #[async_trait]
-impl EmbeddingProvider for MockEmbeddingProvider {
-    async fn embed_text(&self, text: &str) -> Result<Vec<f32>, InferError> {
-        Ok(mock_embedding_for_text(text))
+impl InferenceProvider for TieredProvider {
+    async fn generate_sir(
+        &self,
+        symbol_text: &str,
+        context: &SirContext,
+    ) -> Result<SirAnnotation, InferError> {
+        let score = context.priority_score.unwrap_or(0.0);
+        if score >= self.threshold {
+            match self.primary.generate_sir(symbol_text, context).await {
+                Ok(sir) => return Ok(sir),
+                Err(err) if self.retry_with_fallback => {
+                    tracing::warn!(
+                        symbol = %context.qualified_name,
+                        provider = %self.primary_name,
+                        error = %err,
+                        "Primary provider failed, falling back to local"
+                    );
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        self.fallback.generate_sir(symbol_text, context).await
     }
 }
 
@@ -630,7 +650,7 @@ where
     Ok(())
 }
 
-pub fn load_provider_from_env_or_mock(
+pub fn load_inference_provider_from_config(
     workspace_root: impl AsRef<Path>,
     overrides: ProviderOverrides,
 ) -> Result<LoadedProvider, InferError> {
@@ -653,26 +673,32 @@ pub fn load_provider_from_env_or_mock(
 
     match selected_provider {
         InferenceProviderKind::Auto => {
-            if let Some(api_key) = read_env_non_empty(&selected_api_key_env) {
-                let model = resolve_gemini_model(selected_model);
-                Ok(LoadedProvider {
-                    provider: Box::new(GeminiProvider::new(Secret::new(api_key), model.clone())),
-                    provider_name: InferenceProviderKind::Gemini.as_str().to_owned(),
-                    model_name: model,
-                })
-            } else {
-                Ok(LoadedProvider {
-                    provider: Box::new(MockProvider),
-                    provider_name: InferenceProviderKind::Mock.as_str().to_owned(),
-                    model_name: "mock".to_owned(),
-                })
-            }
+            let api_key = read_env_non_empty(&selected_api_key_env).ok_or_else(|| {
+                InferError::MissingApiKey(
+                    "No inference API key found. Set GEMINI_API_KEY or configure a provider."
+                        .to_owned(),
+                )
+            })?;
+            let model = resolve_gemini_model(selected_model);
+            Ok(LoadedProvider {
+                provider: Box::new(GeminiProvider::new(Secret::new(api_key), model.clone())),
+                provider_name: InferenceProviderKind::Gemini.as_str().to_owned(),
+                model_name: model,
+            })
         }
-        InferenceProviderKind::Mock => Ok(LoadedProvider {
-            provider: Box::new(MockProvider),
-            provider_name: InferenceProviderKind::Mock.as_str().to_owned(),
-            model_name: "mock".to_owned(),
-        }),
+        InferenceProviderKind::Tiered => {
+            let tiered = config.inference.tiered.as_ref().ok_or_else(|| {
+                InferError::InvalidConfig(
+                    "inference.provider=tiered requires [inference.tiered]".to_owned(),
+                )
+            })?;
+            load_tiered_provider(
+                tiered,
+                selected_model,
+                selected_endpoint,
+                selected_api_key_env,
+            )
+        }
         InferenceProviderKind::Gemini => {
             let provider = GeminiProvider::from_env_key(&selected_api_key_env, selected_model)?;
             Ok(LoadedProvider {
@@ -704,6 +730,163 @@ pub fn load_provider_from_env_or_mock(
     }
 }
 
+pub fn load_provider_from_env_or_mock(
+    workspace_root: impl AsRef<Path>,
+    overrides: ProviderOverrides,
+) -> Result<LoadedProvider, InferError> {
+    load_inference_provider_from_config(workspace_root, overrides)
+}
+
+fn load_tiered_provider(
+    tiered: &TieredConfig,
+    selected_model: Option<String>,
+    selected_endpoint: Option<String>,
+    selected_api_key_env: String,
+) -> Result<LoadedProvider, InferError> {
+    let primary_kind = tiered.primary.trim().to_ascii_lowercase();
+    let primary_model = first_non_empty(selected_model, tiered.primary_model.clone());
+    let primary_endpoint = first_non_empty(selected_endpoint, tiered.primary_endpoint.clone());
+    let primary_api_key_env = normalize_optional(Some(selected_api_key_env))
+        .or_else(|| normalize_optional(Some(tiered.primary_api_key_env.clone())))
+        .unwrap_or_else(|| DEFAULT_GEMINI_API_KEY_ENV.to_owned());
+
+    let (primary_provider, primary_name, primary_model_name): (
+        Box<dyn InferenceProvider>,
+        String,
+        String,
+    ) = match primary_kind.as_str() {
+        "gemini" => {
+            let provider = GeminiProvider::from_env_key(&primary_api_key_env, primary_model)?;
+            let model_name = provider.model.clone();
+            (
+                Box::new(provider),
+                InferenceProviderKind::Gemini.as_str().to_owned(),
+                model_name,
+            )
+        }
+        "openai_compat" => {
+            let api_key = read_env_non_empty(&primary_api_key_env)
+                .ok_or_else(|| InferError::MissingApiKey(primary_api_key_env.clone()))?;
+            let api_base = primary_endpoint.ok_or(InferError::MissingEndpoint)?;
+            let model = primary_model.ok_or(InferError::MissingModel)?;
+            (
+                Box::new(OpenAiCompatProvider::new(
+                    Secret::new(api_key),
+                    api_base,
+                    model.clone(),
+                )),
+                InferenceProviderKind::OpenAiCompat.as_str().to_owned(),
+                model,
+            )
+        }
+        other => {
+            return Err(InferError::InvalidConfig(format!(
+                "inference.tiered.primary must be 'gemini' or 'openai_compat' (found '{other}')"
+            )));
+        }
+    };
+
+    let fallback = Qwen3LocalProvider::new(
+        tiered.fallback_endpoint.clone(),
+        tiered.fallback_model.clone(),
+    );
+    let fallback_model_name = fallback.model.clone();
+    let threshold = if tiered.primary_threshold.is_finite() {
+        tiered.primary_threshold.clamp(0.0, 1.0)
+    } else {
+        0.8
+    };
+
+    let provider = TieredProvider::new(
+        primary_provider,
+        Box::new(fallback),
+        threshold,
+        tiered.retry_with_fallback,
+        primary_name.clone(),
+    );
+    Ok(LoadedProvider {
+        provider: Box::new(provider),
+        provider_name: InferenceProviderKind::Tiered.as_str().to_owned(),
+        model_name: format!("{primary_model_name}|{fallback_model_name}"),
+    })
+}
+
+async fn summarize_text_with_tiered(
+    tiered: &TieredConfig,
+    score: f64,
+    system_prompt: &str,
+    user_prompt: &str,
+    selected_model: Option<String>,
+    selected_endpoint: Option<String>,
+    selected_api_key_env: String,
+) -> Result<Option<String>, InferError> {
+    let threshold = if tiered.primary_threshold.is_finite() {
+        tiered.primary_threshold.clamp(0.0, 1.0)
+    } else {
+        0.8
+    };
+    let primary_kind = tiered.primary.trim().to_ascii_lowercase();
+    let primary_model = first_non_empty(selected_model, tiered.primary_model.clone());
+    let primary_endpoint = first_non_empty(selected_endpoint, tiered.primary_endpoint.clone());
+    let primary_api_key_env = normalize_optional(Some(selected_api_key_env))
+        .or_else(|| normalize_optional(Some(tiered.primary_api_key_env.clone())))
+        .unwrap_or_else(|| DEFAULT_GEMINI_API_KEY_ENV.to_owned());
+    let fallback_endpoint = normalize_optional(tiered.fallback_endpoint.clone())
+        .unwrap_or_else(|| DEFAULT_QWEN_ENDPOINT.to_owned());
+    let fallback_model = normalize_optional(tiered.fallback_model.clone())
+        .unwrap_or_else(|| DEFAULT_QWEN_MODEL.to_owned());
+
+    if score >= threshold {
+        let primary_result = match primary_kind.as_str() {
+            "gemini" => {
+                if let Some(api_key) = read_env_non_empty(primary_api_key_env.as_str()) {
+                    let model = resolve_gemini_model(primary_model);
+                    request_gemini_summary(
+                        &Secret::new(api_key),
+                        model.as_str(),
+                        system_prompt,
+                        user_prompt,
+                    )
+                    .await
+                } else {
+                    Err(InferError::MissingApiKey(primary_api_key_env))
+                }
+            }
+            "openai_compat" => {
+                let api_key = read_env_non_empty(primary_api_key_env.as_str())
+                    .ok_or_else(|| InferError::MissingApiKey(primary_api_key_env.clone()))?;
+                let api_base = primary_endpoint.ok_or(InferError::MissingEndpoint)?;
+                let model = primary_model.ok_or(InferError::MissingModel)?;
+                OpenAiCompatProvider::new(Secret::new(api_key), api_base, model)
+                    .request_summary(system_prompt, user_prompt)
+                    .await
+            }
+            other => {
+                return Err(InferError::InvalidConfig(format!(
+                    "inference.tiered.primary must be 'gemini' or 'openai_compat' (found '{other}')"
+                )));
+            }
+        };
+
+        match primary_result {
+            Ok(summary) => return Ok(clean_summary(summary)),
+            Err(err) if !tiered.retry_with_fallback => return Err(err),
+            Err(err) => {
+                tracing::warn!(error = %err, "tiered summary primary failed; using fallback");
+            }
+        }
+    }
+
+    let summary = request_qwen_summary(
+        fallback_endpoint.as_str(),
+        fallback_model.as_str(),
+        system_prompt,
+        user_prompt,
+    )
+    .await?;
+    Ok(clean_summary(summary))
+}
+
 pub async fn summarize_text_with_config(
     workspace_root: impl AsRef<Path>,
     system_prompt: &str,
@@ -723,17 +906,37 @@ pub async fn summarize_text_with_config(
     }
 
     match selected_provider {
-        InferenceProviderKind::Mock => Ok(None),
         InferenceProviderKind::Auto => {
-            let Some(api_key) = read_env_non_empty(selected_api_key_env.as_str()) else {
-                return Ok(None);
-            };
+            let api_key = read_env_non_empty(selected_api_key_env.as_str()).ok_or_else(|| {
+                InferError::MissingApiKey(
+                    "No inference API key found. Set GEMINI_API_KEY or configure a provider."
+                        .to_owned(),
+                )
+            })?;
             let model = resolve_gemini_model(selected_model);
             let api_key = Secret::new(api_key);
             let summary =
                 request_gemini_summary(&api_key, model.as_str(), system_prompt, user_prompt)
                     .await?;
             Ok(clean_summary(summary))
+        }
+        InferenceProviderKind::Tiered => {
+            let tiered = config.inference.tiered.as_ref().ok_or_else(|| {
+                InferError::InvalidConfig(
+                    "inference.provider=tiered requires [inference.tiered]".to_owned(),
+                )
+            })?;
+            let score = 1.0;
+            summarize_text_with_tiered(
+                tiered,
+                score,
+                system_prompt,
+                user_prompt,
+                selected_model,
+                selected_endpoint,
+                selected_api_key_env,
+            )
+            .await
         }
         InferenceProviderKind::Gemini => {
             let Some(api_key) = read_env_non_empty(selected_api_key_env.as_str()) else {
@@ -794,11 +997,6 @@ pub fn load_embedding_provider_from_config(
     .map(PathBuf::from);
 
     let loaded = match selected_provider {
-        EmbeddingProviderKind::Mock => LoadedEmbeddingProvider {
-            provider: Box::new(MockEmbeddingProvider),
-            provider_name: EmbeddingProviderKind::Mock.as_str().to_owned(),
-            model_name: format!("mock-{MOCK_EMBEDDING_DIM}d"),
-        },
         EmbeddingProviderKind::Qwen3Local => {
             let provider = Qwen3LocalEmbeddingProvider::new(selected_endpoint, selected_model);
             LoadedEmbeddingProvider {
@@ -1343,40 +1541,6 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn mock_embedding_for_text(text: &str) -> Vec<f32> {
-    let mut embedding = vec![0.0f32; MOCK_EMBEDDING_DIM];
-    let mut saw_token = false;
-
-    for token in tokenize_for_embedding(text) {
-        saw_token = true;
-        let normalized = token.to_ascii_lowercase();
-        let hash = fnv1a_64(normalized.as_bytes());
-        let index = (hash as usize) % MOCK_EMBEDDING_DIM;
-        let sign = if ((hash >> 8) & 1) == 0 { 1.0 } else { -1.0 };
-        embedding[index] += sign;
-    }
-
-    if !saw_token {
-        return embedding;
-    }
-
-    normalize_embedding(embedding).unwrap_or_else(|| vec![0.0f32; MOCK_EMBEDDING_DIM])
-}
-
-fn tokenize_for_embedding(text: &str) -> impl Iterator<Item = &str> {
-    text.split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|token| !token.is_empty())
-}
-
-fn fnv1a_64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
-
 fn normalize_embedding(mut embedding: Vec<f32>) -> Option<Vec<f32>> {
     let norm_sq = embedding
         .iter()
@@ -1450,6 +1614,7 @@ fn read_env_non_empty(name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1461,52 +1626,202 @@ mod tests {
 
     use super::*;
 
+    #[derive(Clone)]
+    struct TestProvider {
+        intent_prefix: String,
+        fail: bool,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl InferenceProvider for TestProvider {
+        async fn generate_sir(
+            &self,
+            _symbol_text: &str,
+            context: &SirContext,
+        ) -> Result<SirAnnotation, InferError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(InferError::InvalidResponse(
+                    "forced provider failure".to_owned(),
+                ));
+            }
+            Ok(SirAnnotation {
+                intent: format!("{} {}", self.intent_prefix, context.qualified_name),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                side_effects: Vec::new(),
+                dependencies: Vec::new(),
+                error_modes: Vec::new(),
+                confidence: 0.9,
+            })
+        }
+    }
+
     #[tokio::test]
-    async fn mock_provider_returns_deterministic_valid_sir() {
-        let provider = MockProvider;
+    async fn test_provider_returns_deterministic_valid_sir() {
+        let provider = TestProvider {
+            intent_prefix: "Test".to_owned(),
+            fail: false,
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
         let context = SirContext {
             language: "rust".to_owned(),
             file_path: "src/lib.rs".to_owned(),
             qualified_name: "demo::run".to_owned(),
+            priority_score: None,
         };
 
         let sir = provider
             .generate_sir("fn run() {}", &context)
             .await
-            .expect("mock provider should succeed");
+            .expect("test provider should succeed");
 
-        assert_eq!(sir.intent, "Mock summary for demo::run");
-        assert!(sir.inputs.is_empty());
-        assert!(sir.outputs.is_empty());
-        assert!(sir.side_effects.is_empty());
-        assert!(sir.dependencies.is_empty());
-        assert!(sir.error_modes.is_empty());
-        assert_eq!(sir.confidence, 1.0);
-
-        validate_sir(&sir).expect("mock sir should validate");
+        assert_eq!(sir.intent, "Test demo::run");
+        validate_sir(&sir).expect("test sir should validate");
     }
 
     #[tokio::test]
-    async fn mock_embedding_provider_is_deterministic_and_normalized() {
-        let provider = MockEmbeddingProvider;
+    async fn tiered_provider_routes_high_score_to_primary() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = TieredProvider::new(
+            Box::new(TestProvider {
+                intent_prefix: "primary".to_owned(),
+                fail: false,
+                calls: primary_calls.clone(),
+            }),
+            Box::new(TestProvider {
+                intent_prefix: "fallback".to_owned(),
+                fail: false,
+                calls: fallback_calls.clone(),
+            }),
+            0.8,
+            true,
+            "primary".to_owned(),
+        );
+        let context = SirContext {
+            language: "rust".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            qualified_name: "demo::run".to_owned(),
+            priority_score: Some(0.95),
+        };
 
-        let first = provider
-            .embed_text("Network retry logic with backoff")
+        let sir = provider
+            .generate_sir("fn run() {}", &context)
             .await
-            .expect("first embedding");
-        let second = provider
-            .embed_text("network RETRY logic with backoff")
+            .expect("tiered should succeed");
+        assert!(sir.intent.starts_with("primary "));
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn tiered_provider_routes_low_score_to_fallback() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = TieredProvider::new(
+            Box::new(TestProvider {
+                intent_prefix: "primary".to_owned(),
+                fail: false,
+                calls: primary_calls.clone(),
+            }),
+            Box::new(TestProvider {
+                intent_prefix: "fallback".to_owned(),
+                fail: false,
+                calls: fallback_calls.clone(),
+            }),
+            0.8,
+            true,
+            "primary".to_owned(),
+        );
+        let context = SirContext {
+            language: "rust".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            qualified_name: "demo::run".to_owned(),
+            priority_score: Some(0.3),
+        };
+
+        let sir = provider
+            .generate_sir("fn run() {}", &context)
             .await
-            .expect("second embedding");
+            .expect("tiered should succeed");
+        assert!(sir.intent.starts_with("fallback "));
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
 
-        assert_eq!(first.len(), MOCK_EMBEDDING_DIM);
-        assert_eq!(first, second);
+    #[tokio::test]
+    async fn tiered_provider_falls_back_on_primary_error_when_enabled() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = TieredProvider::new(
+            Box::new(TestProvider {
+                intent_prefix: "primary".to_owned(),
+                fail: true,
+                calls: primary_calls.clone(),
+            }),
+            Box::new(TestProvider {
+                intent_prefix: "fallback".to_owned(),
+                fail: false,
+                calls: fallback_calls.clone(),
+            }),
+            0.8,
+            true,
+            "primary".to_owned(),
+        );
+        let context = SirContext {
+            language: "rust".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            qualified_name: "demo::run".to_owned(),
+            priority_score: Some(0.9),
+        };
 
-        let norm_sq = first
-            .iter()
-            .map(|value| value * value)
-            .fold(0.0f32, |acc, value| acc + value);
-        assert!((norm_sq - 1.0).abs() < 1e-5);
+        let sir = provider
+            .generate_sir("fn run() {}", &context)
+            .await
+            .expect("tiered fallback should succeed");
+        assert!(sir.intent.starts_with("fallback "));
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn tiered_provider_propagates_primary_error_when_disabled() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = TieredProvider::new(
+            Box::new(TestProvider {
+                intent_prefix: "primary".to_owned(),
+                fail: true,
+                calls: primary_calls.clone(),
+            }),
+            Box::new(TestProvider {
+                intent_prefix: "fallback".to_owned(),
+                fail: false,
+                calls: fallback_calls.clone(),
+            }),
+            0.8,
+            false,
+            "primary".to_owned(),
+        );
+        let context = SirContext {
+            language: "rust".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            qualified_name: "demo::run".to_owned(),
+            priority_score: Some(0.9),
+        };
+
+        let err = provider
+            .generate_sir("fn run() {}", &context)
+            .await
+            .expect_err("tiered should propagate primary error");
+        match err {
+            InferError::InvalidResponse(message) => assert!(message.contains("forced")),
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1736,22 +2051,26 @@ model_dir = ".aether/models"
     }
 
     #[test]
-    fn load_provider_auto_chooses_mock_when_key_missing() {
+    fn load_provider_auto_errors_when_key_missing() {
         let temp = tempdir().expect("tempdir");
         ensure_workspace_config(temp.path()).expect("ensure config");
 
-        let loaded = load_provider_from_env_or_mock(
+        let result = load_provider_from_env_or_mock(
             temp.path(),
             ProviderOverrides {
                 provider: Some(InferenceProviderKind::Auto),
                 api_key_env: Some("AETHER_TEST_NONEXISTENT_KEY_ZZZZZ".to_owned()),
                 ..ProviderOverrides::default()
             },
-        )
-        .expect("load provider");
+        );
 
-        assert_eq!(loaded.provider_name, InferenceProviderKind::Mock.as_str());
-        assert_eq!(loaded.model_name, "mock");
+        match result {
+            Err(InferError::MissingApiKey(message)) => {
+                assert!(message.contains("No inference API key found"))
+            }
+            Ok(_) => panic!("expected missing api key error, got Ok result"),
+            Err(err) => panic!("expected missing api key error, got {err}"),
+        }
     }
 
     #[test]

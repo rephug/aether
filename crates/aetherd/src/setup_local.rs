@@ -180,6 +180,7 @@ async fn run_sir_smoke_test(provider: &dyn InferenceProvider) -> Result<SirAnnot
         language: "rust".to_owned(),
         file_path: SETUP_SMOKE_TEST_FILE_PATH.to_owned(),
         qualified_name: SETUP_SMOKE_TEST_QUALIFIED_NAME.to_owned(),
+        priority_score: None,
     };
     let sir = provider
         .generate_sir(SETUP_SMOKE_TEST_SNIPPET, &context)
@@ -217,19 +218,12 @@ mod tests {
     #[test]
     fn updates_workspace_config_for_qwen_local_provider() {
         let temp = tempdir().expect("tempdir");
-        update_workspace_inference_config(
-            temp.path(),
-            "http://127.0.0.1:11434",
-            "qwen2.5-coder:7b-instruct-q4_K_M",
-        )
-        .expect("update config");
+        update_workspace_inference_config(temp.path(), "http://127.0.0.1:11434", "qwen3.5:9b")
+            .expect("update config");
 
         let config = load_workspace_config(temp.path()).expect("load config");
         assert_eq!(config.inference.provider.as_str(), "qwen3_local");
-        assert_eq!(
-            config.inference.model.as_deref(),
-            Some("qwen2.5-coder:7b-instruct-q4_K_M")
-        );
+        assert_eq!(config.inference.model.as_deref(), Some("qwen3.5:9b"));
         assert_eq!(
             config.inference.endpoint.as_deref(),
             Some("http://127.0.0.1:11434")
@@ -240,7 +234,7 @@ mod tests {
     fn parses_model_names_from_tags_payload() {
         let tags = json!({
             "models": [
-                {"name": "qwen2.5-coder:7b-instruct-q4_K_M"},
+                {"name": "qwen3.5:9b"},
                 {"name": "mistral:7b"},
                 {"digest": "missing-name"}
             ]
@@ -249,10 +243,7 @@ mod tests {
         let models = parse_model_names_from_tags(&tags).expect("parse models");
         assert_eq!(
             models,
-            vec![
-                "mistral:7b".to_owned(),
-                "qwen2.5-coder:7b-instruct-q4_K_M".to_owned()
-            ]
+            vec!["mistral:7b".to_owned(), "qwen3.5:9b".to_owned()]
         );
     }
 

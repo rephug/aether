@@ -9,6 +9,7 @@ pub mod indexer;
 pub mod init_agent;
 pub mod memory;
 pub mod observer;
+pub mod priority_queue;
 pub mod quality;
 pub mod search;
 pub mod setup_local;

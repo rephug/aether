@@ -36,6 +36,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "net"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 walkdir.workspace = true
+gix.workspace = true
+aether-graph-algo = { path = "../aether-graph-algo" }
 
 [dev-dependencies]
 async-trait.workspace = true

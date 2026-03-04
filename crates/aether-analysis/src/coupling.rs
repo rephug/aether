@@ -1027,7 +1027,7 @@ graph_backend = "cozo"
 
 [embeddings]
 enabled = true
-provider = "mock"
+provider = "qwen3_local"
 vector_backend = "sqlite"
 
 [coupling]

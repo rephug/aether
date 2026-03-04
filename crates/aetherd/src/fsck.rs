@@ -569,7 +569,7 @@ mod tests {
         let mut config = AetherConfig::default();
         config.storage.graph_backend = GraphBackend::Sqlite;
         config.embeddings.enabled = true;
-        config.embeddings.provider = EmbeddingProviderKind::Mock;
+        config.embeddings.provider = EmbeddingProviderKind::Qwen3Local;
         config.embeddings.vector_backend = EmbeddingVectorBackend::Sqlite;
         save_workspace_config(workspace, &config).expect("write config");
     }
