@@ -694,7 +694,7 @@ fn resolve_change_metadata(after: &SirHistoryRecord, context: &LookbackContext) 
         commit,
         author: String::new(),
         date: after.created_at.to_string(),
-        timestamp_ms: after.created_at.max(0),
+        timestamp_ms: after.created_at.max(0).saturating_mul(1000),
     }
 }
 
@@ -758,10 +758,32 @@ mod tests {
     use std::process::Command;
 
     use aether_core::EdgeKind;
-    use aether_store::{CozoGraphStore, ResolvedEdge, Store, SymbolRecord};
+    use aether_store::{CozoGraphStore, ResolvedEdge, SirHistoryRecord, Store, SymbolRecord};
     use tempfile::tempdir;
 
-    use super::{CausalAnalyzer, TraceCauseRequest, now_millis};
+    use super::{
+        CausalAnalyzer, LookbackContext, TraceCauseRequest, now_millis, resolve_change_metadata,
+    };
+
+    #[test]
+    fn resolve_change_metadata_fallback_converts_seconds_to_millis() {
+        let after = SirHistoryRecord {
+            symbol_id: "sym-1".to_owned(),
+            version: 2,
+            sir_hash: "hash-2".to_owned(),
+            provider: "mock".to_owned(),
+            model: "mock".to_owned(),
+            created_at: 1_700_123_456,
+            sir_json: "{\"purpose\":\"demo\"}".to_owned(),
+            commit_hash: None,
+        };
+        let context = LookbackContext::Days { cutoff_ms: 0 };
+
+        let metadata = resolve_change_metadata(&after, &context);
+        assert_eq!(metadata.timestamp_ms, 1_700_123_456_000);
+        assert_eq!(metadata.date, "1700123456");
+        assert_eq!(metadata.commit, "");
+    }
 
     #[test]
     fn trace_cause_returns_expected_causal_chain_and_dependency_path() {

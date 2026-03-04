@@ -1220,6 +1220,12 @@ impl Store for SqliteStore {
         }
 
         let conn = self.conn.lock().unwrap();
+        if conn
+            .is_readonly(rusqlite::DatabaseName::Main)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
         {
             let mut stmt = tx.prepare(
@@ -1258,7 +1264,9 @@ impl Store for SqliteStore {
                 "symbol access debounce lock poisoned: {err}"
             )))
         })?;
-        tracker.retain(|_, last_accessed| now.duration_since(*last_accessed) < debounce_window);
+        tracker.retain(|_, last_accessed| {
+            now.saturating_duration_since(*last_accessed) < debounce_window
+        });
 
         let mut symbol_ids_to_increment = Vec::new();
         for symbol_id in symbol_ids {
@@ -2247,6 +2255,12 @@ impl Store for SqliteStore {
         }
 
         let conn = self.conn.lock().unwrap();
+        if conn
+            .is_readonly(rusqlite::DatabaseName::Main)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
         {
             let mut stmt = tx.prepare(
@@ -4557,6 +4571,41 @@ mirror_sir_files = false
     }
 
     #[test]
+    fn increment_symbol_access_debounced_handles_future_timestamps_without_panicking() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        store.upsert_symbol(symbol_record()).expect("upsert symbol");
+
+        {
+            let mut tracker = store
+                .symbol_access_debounce
+                .lock()
+                .expect("lock debounce tracker");
+            tracker.insert(
+                "sym-1".to_owned(),
+                std::time::Instant::now() + std::time::Duration::from_secs(300),
+            );
+        }
+
+        store
+            .increment_symbol_access_debounced(&["sym-1".to_owned()], 1_700_100_200)
+            .expect("debounced increment with future timestamp");
+
+        let conn = store.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT access_count, last_accessed_at FROM symbols WHERE id = ?1")
+            .expect("prepare symbol access lookup");
+        let access = stmt
+            .query_row(params!["sym-1"], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+            })
+            .expect("query access fields");
+
+        assert_eq!(access.0, 0);
+        assert_eq!(access.1, None);
+    }
+
+    #[test]
     fn search_project_notes_lexical_matches_query_terms() {
         let temp = tempdir().expect("tempdir");
         let store = SqliteStore::open(temp.path()).expect("open store");
@@ -4810,6 +4859,52 @@ mirror_sir_files = false
             }
             other => panic!("expected sqlite readonly error, got {other}"),
         }
+    }
+
+    #[test]
+    fn open_readonly_store_access_increments_are_noop() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let store = SqliteStore::open(workspace).expect("open store");
+        store.upsert_symbol(symbol_record()).expect("upsert symbol");
+        store
+            .upsert_project_note(project_note_record(
+                "note-1",
+                "Pinned architecture decision",
+                &["memory"],
+                1_700_200_000,
+            ))
+            .expect("upsert project note");
+        drop(store);
+
+        let readonly = SqliteStore::open_readonly(workspace).expect("open readonly store");
+        readonly
+            .increment_symbol_access(&["sym-1".to_owned()], 1_700_200_100)
+            .expect("readonly symbol increment should noop");
+        readonly
+            .increment_project_note_access(&["note-1".to_owned()], 1_700_200_100)
+            .expect("readonly note increment should noop");
+
+        let conn = readonly.conn.lock().unwrap();
+        let symbol_access = conn
+            .query_row(
+                "SELECT access_count, last_accessed_at FROM symbols WHERE id = ?1",
+                params!["sym-1"],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .expect("query symbol access");
+        assert_eq!(symbol_access.0, 0);
+        assert_eq!(symbol_access.1, None);
+
+        let note_access = conn
+            .query_row(
+                "SELECT access_count, last_accessed_at FROM project_notes WHERE note_id = ?1",
+                params!["note-1"],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .expect("query note access");
+        assert_eq!(note_access.0, 0);
+        assert_eq!(note_access.1, None);
     }
 
     #[test]
