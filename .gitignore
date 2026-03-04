@@ -10,3 +10,8 @@
 # VS Code extension build outputs
 /vscode-extension/node_modules/
 /vscode-extension/dist/
+
+# Stress test artifacts
+tests/stress/reports/*.md
+tests/stress/reports/*.json
+tests/stress/repos/
