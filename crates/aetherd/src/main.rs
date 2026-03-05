@@ -22,7 +22,7 @@ use aetherd::drift::{run_communities_command, run_drift_ack_command, run_drift_r
 use aetherd::fsck::run_fsck;
 use aetherd::health::run_health_command;
 use aetherd::indexer::{
-    IndexerConfig, run_full_index_once, run_indexing_loop, run_initial_index_once,
+    IndexerConfig, run_full_index_once_for_cli, run_indexing_loop, run_initial_index_once_for_cli,
 };
 use aetherd::init_agent::{InitAgentOptions, run_init_agent};
 use aetherd::memory::{
@@ -258,10 +258,15 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     if cli.index_once {
-        if cli.full {
-            return run_full_index_once(&indexer_config);
+        let result = if cli.full {
+            run_full_index_once_for_cli(&indexer_config)
+        } else {
+            run_initial_index_once_for_cli(&indexer_config)
+        };
+        match result {
+            Ok(()) => std::process::exit(0),
+            Err(err) => return Err(err),
         }
-        return run_initial_index_once(&indexer_config);
     }
 
     run_indexing_loop(indexer_config)

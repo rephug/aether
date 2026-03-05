@@ -134,7 +134,7 @@ impl SharedQueueState {
     }
 }
 
-pub fn run_full_index_once(config: &IndexerConfig) -> Result<()> {
+fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Result<()> {
     let (observer, store, sir_pipeline) = initialize_full_indexer(config)?;
     let mut stdout = std::io::stdout();
     for event in observer.initial_symbol_events() {
@@ -151,12 +151,31 @@ pub fn run_full_index_once(config: &IndexerConfig) -> Result<()> {
     if config.lifecycle_logs {
         println!("INDEX: full scan complete");
     }
+
+    if skip_teardown {
+        // In one-shot CLI mode we exit immediately from main; skipping teardown avoids
+        // backend shutdown hangs on certain graph runtimes.
+        std::mem::forget(sir_pipeline);
+        std::mem::forget(store);
+    }
     Ok(())
 }
 
-pub fn run_initial_index_once(config: &IndexerConfig) -> Result<()> {
+pub fn run_full_index_once(config: &IndexerConfig) -> Result<()> {
+    run_full_index_once_inner(config, false)
+}
+
+pub fn run_full_index_once_for_cli(config: &IndexerConfig) -> Result<()> {
+    run_full_index_once_inner(config, true)
+}
+
+fn run_initial_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Result<()> {
     if config.full {
-        return run_full_index_once(config);
+        return if skip_teardown {
+            run_full_index_once_for_cli(config)
+        } else {
+            run_full_index_once(config)
+        };
     }
 
     let (observer, store) = initialize_observer_and_store(config)?;
@@ -176,7 +195,22 @@ pub fn run_initial_index_once(config: &IndexerConfig) -> Result<()> {
     if config.lifecycle_logs {
         println!("INDEX: initial scan complete (pass 1 only)");
     }
+
+    if skip_teardown {
+        // In one-shot CLI mode we exit immediately from main; skipping teardown avoids
+        // backend shutdown hangs on certain graph runtimes.
+        std::mem::forget(structural);
+        std::mem::forget(store);
+    }
     Ok(())
+}
+
+pub fn run_initial_index_once(config: &IndexerConfig) -> Result<()> {
+    run_initial_index_once_inner(config, false)
+}
+
+pub fn run_initial_index_once_for_cli(config: &IndexerConfig) -> Result<()> {
+    run_initial_index_once_inner(config, true)
 }
 
 pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
@@ -725,7 +759,8 @@ impl StructuralIndexer {
         let extractor = SymbolExtractor::new().context("failed to initialize parser")?;
         let test_intent_analyzer = TestIntentAnalyzer::new(&workspace_root)
             .context("failed to initialize test intent analyzer")?;
-        let graph_runtime = tokio::runtime::Builder::new_current_thread()
+        let graph_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()
             .context("failed to build graph sync runtime")?;
