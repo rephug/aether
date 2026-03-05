@@ -296,6 +296,13 @@ run_aether_health() {
 
 check_ollama() {
     curl -sSf --max-time 5 "http://127.0.0.1:11434/api/tags" >/dev/null
+
+    # Pre-warm the model to avoid cold-start timeouts
+    local model_name
+    model_name="${OLLAMA_MODEL:-qwen3.5:9b}"
+    log_info "Pre-warming Ollama model: ${model_name}"
+    curl -s http://127.0.0.1:11434/api/generate \
+        -d "{\"model\":\"${model_name}\",\"prompt\":\"hi\",\"stream\":false}" > /dev/null 2>&1
 }
 
 check_api_key() {

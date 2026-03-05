@@ -633,6 +633,7 @@ for row in "${REPO_ROWS[@]}"; do
     fi
 
     if [ "${repo_status}" = "ok" ]; then
+        rm -rf "${repo_dir}/.aether"
         if ! write_provider_config "${repo_dir}" "${PROVIDER}"; then
             repo_status="error"
             error_message="failed to write provider config"

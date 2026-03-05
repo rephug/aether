@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -136,18 +136,99 @@ impl SharedQueueState {
 
 fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Result<()> {
     let (observer, store, sir_pipeline) = initialize_full_indexer(config)?;
+    let mut structural = StructuralIndexer::new(config.workspace.clone())?;
     let mut stdout = std::io::stdout();
+    let mut symbol_count = 0usize;
+    let mut symbols_by_id = HashMap::<String, Symbol>::new();
+
     for event in observer.initial_symbol_events() {
+        symbol_count += event.added.len() + event.updated.len();
+        for symbol in event.added.iter().chain(event.updated.iter()) {
+            symbols_by_id.insert(symbol.id.clone(), symbol.clone());
+        }
+        structural.process_event(&store, &event)?;
+    }
+    tracing::info!(
+        symbol_count,
+        "Pass 1 complete: {} symbols indexed, lexical search + graph queries available",
+        symbol_count
+    );
+
+    let candidate_symbol_ids = if config.force {
+        store.list_all_symbol_ids()?
+    } else {
+        store.list_symbol_ids_without_sir()?
+    };
+
+    let mut symbols_by_file = BTreeMap::<String, Vec<Symbol>>::new();
+    let mut unresolved = 0usize;
+    for symbol_id in candidate_symbol_ids {
+        if let Some(symbol) = symbols_by_id.get(symbol_id.as_str()) {
+            symbols_by_file
+                .entry(symbol.file_path.clone())
+                .or_default()
+                .push(symbol.clone());
+        } else {
+            unresolved += 1;
+            tracing::warn!(
+                symbol_id = %symbol_id,
+                "Pass 2 symbol missing from initial snapshot; skipping"
+            );
+        }
+    }
+
+    let pass2_symbol_count: usize = symbols_by_file.values().map(Vec::len).sum();
+    tracing::info!(
+        symbol_count = pass2_symbol_count,
+        file_count = symbols_by_file.len(),
+        force = config.force,
+        "Pass 2: generating SIR for {} symbols",
+        pass2_symbol_count
+    );
+    if unresolved > 0 {
+        tracing::warn!(
+            unresolved,
+            "Pass 2 skipped symbols missing from initial snapshot"
+        );
+    }
+
+    for (file_path, symbols) in symbols_by_file {
+        if symbols.is_empty() {
+            continue;
+        }
+        let event = SymbolChangeEvent {
+            file_path,
+            language: symbols[0].language,
+            added: Vec::new(),
+            removed: Vec::new(),
+            updated: symbols,
+        };
         if let Err(err) =
             sir_pipeline.process_event(&store, &event, config.force, config.print_sir, &mut stdout)
         {
             tracing::error!(
                 file_path = %event.file_path,
                 error = %err,
-                "initial SIR processing error"
+                "Pass 2 SIR processing error"
             );
         }
     }
+
+    let (total_symbols, symbols_with_sir) = store
+        .count_symbols_with_sir()
+        .context("failed to compute SIR coverage after pass 2")?;
+    let coverage_pct = if total_symbols > 0 {
+        (symbols_with_sir as f64 / total_symbols as f64) * 100.0
+    } else {
+        0.0
+    };
+    tracing::info!(
+        symbols_with_sir,
+        total_symbols,
+        coverage_pct = coverage_pct,
+        "Pass 2 complete: SIR coverage"
+    );
+
     if config.lifecycle_logs {
         println!("INDEX: full scan complete");
     }
@@ -155,6 +236,7 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
     if skip_teardown {
         // In one-shot CLI mode we exit immediately from main; skipping teardown avoids
         // backend shutdown hangs on certain graph runtimes.
+        std::mem::forget(structural);
         std::mem::forget(sir_pipeline);
         std::mem::forget(store);
     }
