@@ -1126,8 +1126,10 @@ fn build_ollama_generate_body(model: &str, prompt: &str) -> Value {
         "prompt": prompt,
         "stream": false,
         "format": "json",
+        "think": false,
         "options": {
-            "temperature": OLLAMA_SIR_TEMPERATURE
+            "temperature": OLLAMA_SIR_TEMPERATURE,
+            "num_ctx": 4096
         }
     })
 }
