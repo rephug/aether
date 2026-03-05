@@ -181,6 +181,9 @@ async fn run_sir_smoke_test(provider: &dyn InferenceProvider) -> Result<SirAnnot
         file_path: SETUP_SMOKE_TEST_FILE_PATH.to_owned(),
         qualified_name: SETUP_SMOKE_TEST_QUALIFIED_NAME.to_owned(),
         priority_score: None,
+        kind: "function".to_owned(),
+        is_public: true,
+        line_count: SETUP_SMOKE_TEST_SNIPPET.lines().count(),
     };
     let sir = provider
         .generate_sir(SETUP_SMOKE_TEST_SNIPPET, &context)
