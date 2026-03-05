@@ -5,11 +5,13 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aether_analysis::TestIntentAnalyzer;
-use aether_config::InferenceProviderKind;
+use aether_config::{InferenceProviderKind, ensure_workspace_config};
 use aether_core::{GitContext, Symbol, SymbolChangeEvent, content_hash, normalize_path};
 use aether_graph_algo::{GraphAlgorithmEdge, page_rank_sync};
 use aether_infer::ProviderOverrides;
+use aether_infer::sir_prompt::SirEnrichmentContext;
 use aether_parse::{SymbolExtractor, TestIntent};
+use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
 use aether_store::{SqliteStore, Store, SymbolRecord, TestIntentRecord, open_graph_store};
 use anyhow::{Context, Result};
 use gix::traverse::commit::simple::CommitTimeOrder;
@@ -20,7 +22,10 @@ use crate::observer::{DebounceQueue, ObserverState, is_ignored_path};
 use crate::priority_queue::{
     SirPriorityQueue, compute_priority_score, kind_priority_score, size_inverse_score,
 };
-use crate::sir_pipeline::SirPipeline;
+use crate::sir_pipeline::{
+    SIR_GENERATION_PASS_DEEP, SIR_GENERATION_PASS_SINGLE, SIR_GENERATION_PASS_TRIAGE,
+    SirDeepPromptSpec, SirPipeline,
+};
 
 const REQUEST_POLL_BATCH: usize = 128;
 const WORKER_IDLE_SLEEP_MS: u64 = 200;
@@ -33,6 +38,7 @@ pub struct IndexerConfig {
     pub print_sir: bool,
     pub force: bool,
     pub full: bool,
+    pub deep: bool,
     pub sir_concurrency: usize,
     pub lifecycle_logs: bool,
     pub inference_provider: Option<InferenceProviderKind>,
@@ -192,10 +198,27 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
         );
     }
 
+    // Collect all pass-2 symbols for priority scoring so Tiered routing works in batch mode.
+    let all_candidate_symbols: Vec<Symbol> = symbols_by_file
+        .values()
+        .flat_map(|syms| syms.iter().cloned())
+        .collect();
+    let priority_scores =
+        compute_symbol_priority_scores(&config.workspace, &store, &all_candidate_symbols);
+    let triage_generation_pass = if config.deep {
+        SIR_GENERATION_PASS_TRIAGE
+    } else {
+        SIR_GENERATION_PASS_SINGLE
+    };
+
     for (file_path, symbols) in symbols_by_file {
         if symbols.is_empty() {
             continue;
         }
+        let max_priority = symbols
+            .iter()
+            .filter_map(|symbol| priority_scores.get(symbol.id.as_str()).copied())
+            .fold(0.0_f64, f64::max);
         let event = SymbolChangeEvent {
             file_path,
             language: symbols[0].language,
@@ -203,15 +226,31 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
             removed: Vec::new(),
             updated: symbols,
         };
-        if let Err(err) =
-            sir_pipeline.process_event(&store, &event, config.force, config.print_sir, &mut stdout)
-        {
+        if let Err(err) = sir_pipeline.process_event_with_priority_and_pass(
+            &store,
+            &event,
+            config.force,
+            config.print_sir,
+            &mut stdout,
+            Some(max_priority),
+            triage_generation_pass,
+        ) {
             tracing::error!(
                 file_path = %event.file_path,
                 error = %err,
                 "Pass 2 SIR processing error"
             );
         }
+    }
+
+    if config.deep {
+        run_deep_pass(
+            config,
+            &store,
+            &all_candidate_symbols,
+            &priority_scores,
+            &mut stdout,
+        )?;
     }
 
     let (total_symbols, symbols_with_sir) = store
@@ -249,6 +288,278 @@ pub fn run_full_index_once(config: &IndexerConfig) -> Result<()> {
 
 pub fn run_full_index_once_for_cli(config: &IndexerConfig) -> Result<()> {
     run_full_index_once_inner(config, true)
+}
+
+#[derive(Debug, Clone)]
+struct DeepPassCandidate {
+    symbol: Symbol,
+    priority_score: f64,
+    baseline_sir: SirAnnotation,
+}
+
+fn run_deep_pass(
+    config: &IndexerConfig,
+    store: &SqliteStore,
+    triage_symbols: &[Symbol],
+    priority_scores: &HashMap<String, f64>,
+    out: &mut dyn std::io::Write,
+) -> Result<()> {
+    let workspace_config = ensure_workspace_config(&config.workspace)
+        .context("failed to load workspace config for deep pass")?;
+    let quality = workspace_config.sir_quality;
+
+    let mut candidates = Vec::<DeepPassCandidate>::new();
+    for symbol in triage_symbols {
+        let Some(meta) = store.get_sir_meta(symbol.id.as_str())? else {
+            continue;
+        };
+        if !meta
+            .generation_pass
+            .eq_ignore_ascii_case(SIR_GENERATION_PASS_TRIAGE)
+        {
+            continue;
+        }
+
+        let Some(blob) = store.read_sir_blob(symbol.id.as_str())? else {
+            continue;
+        };
+        let Ok(baseline_sir) = serde_json::from_str::<SirAnnotation>(&blob) else {
+            continue;
+        };
+        let priority_score = priority_scores
+            .get(symbol.id.as_str())
+            .copied()
+            .unwrap_or(0.0);
+        let low_confidence = (baseline_sir.confidence as f64) < quality.deep_confidence_threshold;
+        let high_priority = priority_score > quality.deep_priority_threshold;
+        if high_priority || low_confidence {
+            candidates.push(DeepPassCandidate {
+                symbol: symbol.clone(),
+                priority_score,
+                baseline_sir,
+            });
+        }
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .priority_score
+            .total_cmp(&left.priority_score)
+            .then_with(|| left.symbol.id.cmp(&right.symbol.id))
+    });
+    if quality.deep_max_symbols > 0 && candidates.len() > quality.deep_max_symbols {
+        candidates.truncate(quality.deep_max_symbols);
+    }
+    if candidates.is_empty() {
+        tracing::info!("Deep pass: 0 symbols selected");
+        return Ok(());
+    }
+
+    let deep_provider = if let Some(provider_raw) = quality.deep_provider.clone() {
+        Some(
+            provider_raw
+                .parse::<InferenceProviderKind>()
+                .map_err(|error| {
+                    anyhow::anyhow!("invalid sir_quality.deep_provider '{provider_raw}': {error}")
+                })?,
+        )
+    } else {
+        config.inference_provider
+    };
+    let deep_pipeline = SirPipeline::new(
+        config.workspace.clone(),
+        quality.deep_concurrency.max(1),
+        ProviderOverrides {
+            provider: deep_provider,
+            model: quality
+                .deep_model
+                .clone()
+                .or_else(|| config.inference_model.clone()),
+            endpoint: quality
+                .deep_endpoint
+                .clone()
+                .or_else(|| config.inference_endpoint.clone()),
+            api_key_env: quality
+                .deep_api_key_env
+                .clone()
+                .or_else(|| config.inference_api_key_env.clone()),
+        },
+    )
+    .context("failed to initialize deep-pass provider pipeline")?;
+    let use_cot = deep_pipeline.provider_name() == InferenceProviderKind::Qwen3Local.as_str();
+
+    let total = candidates.len();
+    let mut successes = 0usize;
+    let mut failures = 0usize;
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        let enrichment = build_deep_enrichment_context(
+            store,
+            &candidate.symbol,
+            candidate.baseline_sir,
+            priority_scores,
+            quality.deep_max_neighbors,
+            quality.deep_priority_threshold,
+            quality.deep_confidence_threshold,
+            candidate.priority_score,
+        )?;
+        let event = SymbolChangeEvent {
+            file_path: candidate.symbol.file_path.clone(),
+            language: candidate.symbol.language,
+            added: Vec::new(),
+            removed: Vec::new(),
+            updated: vec![candidate.symbol.clone()],
+        };
+        let mut deep_specs = HashMap::new();
+        deep_specs.insert(
+            candidate.symbol.id.clone(),
+            SirDeepPromptSpec {
+                enrichment,
+                use_cot,
+            },
+        );
+
+        match deep_pipeline.process_event_with_deep_specs(
+            store,
+            &event,
+            true,
+            config.print_sir,
+            out,
+            Some(candidate.priority_score),
+            SIR_GENERATION_PASS_DEEP,
+            &deep_specs,
+        ) {
+            Ok(stats) => {
+                successes += stats.success_count;
+                failures += stats.failure_count;
+            }
+            Err(err) => {
+                failures += 1;
+                tracing::warn!(
+                    symbol_id = %candidate.symbol.id,
+                    qualified_name = %candidate.symbol.qualified_name,
+                    error = %err,
+                    "deep pass symbol processing failed"
+                );
+            }
+        }
+
+        tracing::info!(
+            "Deep pass: {}/{} symbols, {} improved, {} failed",
+            index + 1,
+            total,
+            successes,
+            failures
+        );
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_deep_enrichment_context(
+    store: &SqliteStore,
+    symbol: &Symbol,
+    baseline_sir: SirAnnotation,
+    priority_scores: &HashMap<String, f64>,
+    max_neighbors: usize,
+    deep_priority_threshold: f64,
+    deep_confidence_threshold: f64,
+    priority_score: f64,
+) -> Result<SirEnrichmentContext> {
+    let file_rollup_id = synthetic_file_sir_id(symbol.language.as_str(), symbol.file_path.as_str());
+    let file_intent = store
+        .read_sir_blob(file_rollup_id.as_str())?
+        .and_then(|blob| serde_json::from_str::<FileSir>(&blob).ok())
+        .map(|sir| sir.intent);
+
+    let mut neighbors = Vec::<(f64, String, String)>::new();
+    for peer in store.list_symbols_for_file(symbol.file_path.as_str())? {
+        if peer.id == symbol.id {
+            continue;
+        }
+        let Some(blob) = store.read_sir_blob(peer.id.as_str())? else {
+            continue;
+        };
+        let Ok(peer_sir) = serde_json::from_str::<SirAnnotation>(&blob) else {
+            continue;
+        };
+        neighbors.push((
+            priority_scores
+                .get(peer.id.as_str())
+                .copied()
+                .unwrap_or(0.0),
+            peer.qualified_name,
+            peer_sir.intent,
+        ));
+    }
+    neighbors.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    if max_neighbors > 0 && neighbors.len() > max_neighbors {
+        neighbors.truncate(max_neighbors);
+    }
+
+    let neighbor_intents = neighbors
+        .into_iter()
+        .map(|(_, name, intent)| (name, intent))
+        .collect::<Vec<_>>();
+    let priority_reason = format_priority_reason(
+        store,
+        symbol.id.as_str(),
+        priority_score,
+        baseline_sir.confidence as f64,
+        deep_priority_threshold,
+        deep_confidence_threshold,
+    );
+
+    Ok(SirEnrichmentContext {
+        file_intent,
+        neighbor_intents,
+        baseline_sir: Some(baseline_sir),
+        priority_reason,
+    })
+}
+
+fn format_priority_reason(
+    store: &SqliteStore,
+    symbol_id: &str,
+    priority_score: f64,
+    confidence: f64,
+    deep_priority_threshold: f64,
+    deep_confidence_threshold: f64,
+) -> String {
+    let mut reasons = Vec::<String>::new();
+    if priority_score > deep_priority_threshold {
+        reasons.push(format!(
+            "priority {:.2} above threshold {:.2}",
+            priority_score, deep_priority_threshold
+        ));
+    }
+    if confidence < deep_confidence_threshold {
+        reasons.push(format!(
+            "triage confidence {:.2} below threshold {:.2}",
+            confidence, deep_confidence_threshold
+        ));
+    }
+
+    if let Ok(Some(metadata)) = store.get_symbol_metadata(symbol_id) {
+        if metadata.is_public {
+            reasons.push("public API symbol".to_owned());
+        }
+        let kind = metadata.kind.to_ascii_lowercase();
+        if kind == "function" || kind == "method" {
+            reasons.push("function/method".to_owned());
+        }
+    }
+
+    if reasons.is_empty() {
+        "selected for deeper analysis".to_owned()
+    } else {
+        reasons.join(" + ")
+    }
 }
 
 fn run_initial_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Result<()> {
@@ -658,7 +969,7 @@ fn enqueue_changed_symbols(
     Ok(queued)
 }
 
-fn compute_symbol_priority_scores(
+pub fn compute_symbol_priority_scores(
     workspace: &Path,
     store: &SqliteStore,
     symbols: &[Symbol],

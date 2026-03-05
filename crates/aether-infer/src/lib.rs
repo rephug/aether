@@ -20,6 +20,7 @@ use thiserror::Error;
 
 mod embedding;
 mod reranker;
+pub mod sir_prompt;
 
 pub use reranker::{MockRerankerProvider, RerankCandidate, RerankResult, RerankerProvider};
 
@@ -58,6 +59,9 @@ pub struct SirContext {
     pub file_path: String,
     pub qualified_name: String,
     pub priority_score: Option<f64>,
+    pub kind: String,
+    pub is_public: bool,
+    pub line_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -100,6 +104,13 @@ pub struct LoadedRerankerProvider {
     pub provider: Box<dyn RerankerProvider>,
     pub provider_name: String,
     pub model_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InferSirResult {
+    pub sir: SirAnnotation,
+    pub provider: String,
+    pub model: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,11 +165,60 @@ pub enum InferError {
 
 #[async_trait]
 pub trait InferenceProvider: Send + Sync {
+    fn provider_name(&self) -> String {
+        "unknown".to_owned()
+    }
+
+    fn model_name(&self) -> String {
+        "unknown".to_owned()
+    }
+
     async fn generate_sir(
         &self,
         symbol_text: &str,
         context: &SirContext,
     ) -> Result<SirAnnotation, InferError>;
+
+    async fn generate_sir_with_meta(
+        &self,
+        symbol_text: &str,
+        context: &SirContext,
+    ) -> Result<InferSirResult, InferError> {
+        let sir = self.generate_sir(symbol_text, context).await?;
+        Ok(InferSirResult {
+            sir,
+            provider: self.provider_name(),
+            model: self.model_name(),
+        })
+    }
+
+    async fn generate_sir_from_prompt(
+        &self,
+        prompt: &str,
+        context: &SirContext,
+        deep_mode: bool,
+    ) -> Result<SirAnnotation, InferError> {
+        let _ = (prompt, context, deep_mode);
+        Err(InferError::InvalidConfig(
+            "provider does not support custom SIR prompts".to_owned(),
+        ))
+    }
+
+    async fn generate_sir_from_prompt_with_meta(
+        &self,
+        prompt: &str,
+        context: &SirContext,
+        deep_mode: bool,
+    ) -> Result<InferSirResult, InferError> {
+        let sir = self
+            .generate_sir_from_prompt(prompt, context, deep_mode)
+            .await?;
+        Ok(InferSirResult {
+            sir,
+            provider: self.provider_name(),
+            model: self.model_name(),
+        })
+    }
 }
 
 #[async_trait]
@@ -194,15 +254,41 @@ impl TieredProvider {
 
 #[async_trait]
 impl InferenceProvider for TieredProvider {
+    fn provider_name(&self) -> String {
+        InferenceProviderKind::Tiered.as_str().to_owned()
+    }
+
+    fn model_name(&self) -> String {
+        format!(
+            "{}|{}",
+            self.primary.model_name(),
+            self.fallback.model_name()
+        )
+    }
+
     async fn generate_sir(
         &self,
         symbol_text: &str,
         context: &SirContext,
     ) -> Result<SirAnnotation, InferError> {
+        self.generate_sir_with_meta(symbol_text, context)
+            .await
+            .map(|result| result.sir)
+    }
+
+    async fn generate_sir_with_meta(
+        &self,
+        symbol_text: &str,
+        context: &SirContext,
+    ) -> Result<InferSirResult, InferError> {
         let score = context.priority_score.unwrap_or(0.0);
         if score >= self.threshold {
-            match self.primary.generate_sir(symbol_text, context).await {
-                Ok(sir) => return Ok(sir),
+            match self
+                .primary
+                .generate_sir_with_meta(symbol_text, context)
+                .await
+            {
+                Ok(result) => return Ok(result),
                 Err(err) if self.retry_with_fallback => {
                     tracing::warn!(
                         symbol = %context.qualified_name,
@@ -215,7 +301,51 @@ impl InferenceProvider for TieredProvider {
             }
         }
 
-        self.fallback.generate_sir(symbol_text, context).await
+        self.fallback
+            .generate_sir_with_meta(symbol_text, context)
+            .await
+    }
+
+    async fn generate_sir_from_prompt(
+        &self,
+        prompt: &str,
+        context: &SirContext,
+        deep_mode: bool,
+    ) -> Result<SirAnnotation, InferError> {
+        self.generate_sir_from_prompt_with_meta(prompt, context, deep_mode)
+            .await
+            .map(|result| result.sir)
+    }
+
+    async fn generate_sir_from_prompt_with_meta(
+        &self,
+        prompt: &str,
+        context: &SirContext,
+        deep_mode: bool,
+    ) -> Result<InferSirResult, InferError> {
+        let score = context.priority_score.unwrap_or(0.0);
+        if score >= self.threshold {
+            match self
+                .primary
+                .generate_sir_from_prompt_with_meta(prompt, context, deep_mode)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(err) if self.retry_with_fallback => {
+                    tracing::warn!(
+                        symbol = %context.qualified_name,
+                        provider = %self.primary_name,
+                        error = %err,
+                        "Primary provider failed on custom prompt, falling back to local"
+                    );
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        self.fallback
+            .generate_sir_from_prompt_with_meta(prompt, context, deep_mode)
+            .await
     }
 }
 
@@ -250,17 +380,13 @@ impl GeminiProvider {
         format!("{}/models/{}:generateContent", self.api_base, self.model)
     }
 
-    async fn request_candidate_json(
-        &self,
-        symbol_text: &str,
-        context: &SirContext,
-    ) -> Result<String, InferError> {
+    async fn request_candidate_json_with_prompt(&self, prompt: &str) -> Result<String, InferError> {
         let body = json!({
             "contents": [
                 {
                     "parts": [
                         {
-                            "text": build_strict_json_prompt(symbol_text, context)
+                            "text": prompt
                         }
                     ]
                 }
@@ -284,10 +410,28 @@ impl GeminiProvider {
 
         extract_gemini_text_part(&response_value).map(|text| text.to_owned())
     }
+
+    async fn request_candidate_json(
+        &self,
+        symbol_text: &str,
+        context: &SirContext,
+    ) -> Result<String, InferError> {
+        let prompt = sir_prompt::build_sir_prompt_for_kind(symbol_text, context);
+        self.request_candidate_json_with_prompt(prompt.as_str())
+            .await
+    }
 }
 
 #[async_trait]
 impl InferenceProvider for GeminiProvider {
+    fn provider_name(&self) -> String {
+        InferenceProviderKind::Gemini.as_str().to_owned()
+    }
+
+    fn model_name(&self) -> String {
+        self.model.clone()
+    }
+
     async fn generate_sir(
         &self,
         symbol_text: &str,
@@ -295,6 +439,18 @@ impl InferenceProvider for GeminiProvider {
     ) -> Result<SirAnnotation, InferError> {
         run_sir_parse_validation_retries(PARSE_VALIDATION_RETRIES, || async {
             self.request_candidate_json(symbol_text, context).await
+        })
+        .await
+    }
+
+    async fn generate_sir_from_prompt(
+        &self,
+        prompt: &str,
+        _context: &SirContext,
+        _deep_mode: bool,
+    ) -> Result<SirAnnotation, InferError> {
+        run_sir_parse_validation_retries(PARSE_VALIDATION_RETRIES, || async {
+            self.request_candidate_json_with_prompt(prompt).await
         })
         .await
     }
@@ -317,11 +473,8 @@ impl Qwen3LocalProvider {
         }
     }
 
-    async fn request_candidate_json_with_prompt(
-        &self,
-        prompt: String,
-    ) -> Result<String, InferError> {
-        let body = build_ollama_generate_body(&self.model, &prompt);
+    async fn request_candidate_json_with_prompt(&self, prompt: &str) -> Result<String, InferError> {
+        let body = build_ollama_generate_body(&self.model, prompt);
 
         let response_value: Value = self
             .client
@@ -336,33 +489,85 @@ impl Qwen3LocalProvider {
         extract_local_text_part(&response_value)
     }
 
+    async fn request_deep_candidate_json_with_prompt(
+        &self,
+        prompt: String,
+    ) -> Result<String, InferError> {
+        let body = build_ollama_deep_generate_body(&self.model, &prompt);
+
+        let response_value: Value = self
+            .client
+            .post(ollama_generate_endpoint(&self.endpoint))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let raw = extract_local_text_part(&response_value)?;
+        Ok(normalize_candidate_json(raw.as_str()))
+    }
+
     async fn request_candidate_json(
         &self,
         symbol_text: &str,
         context: &SirContext,
     ) -> Result<String, InferError> {
-        self.request_candidate_json_with_prompt(build_strict_json_prompt(symbol_text, context))
+        let prompt = sir_prompt::build_sir_prompt_for_kind(symbol_text, context);
+        self.request_candidate_json_with_prompt(prompt.as_str())
             .await
     }
 }
 
 #[async_trait]
 impl InferenceProvider for Qwen3LocalProvider {
+    fn provider_name(&self) -> String {
+        InferenceProviderKind::Qwen3Local.as_str().to_owned()
+    }
+
+    fn model_name(&self) -> String {
+        self.model.clone()
+    }
+
     async fn generate_sir(
         &self,
         symbol_text: &str,
         context: &SirContext,
     ) -> Result<SirAnnotation, InferError> {
-        let original_prompt = build_strict_json_prompt(symbol_text, context);
+        let original_prompt = sir_prompt::build_sir_prompt_for_kind(symbol_text, context);
         run_sir_parse_validation_retries_with_feedback(
             PARSE_VALIDATION_RETRIES,
             || async { self.request_candidate_json(symbol_text, context).await },
             |previous_output, error| {
                 let prompt = build_retry_prompt(&original_prompt, &error, &previous_output);
-                async move { self.request_candidate_json_with_prompt(prompt).await }
+                async move {
+                    self.request_candidate_json_with_prompt(prompt.as_str())
+                        .await
+                }
             },
         )
         .await
+    }
+
+    async fn generate_sir_from_prompt(
+        &self,
+        prompt: &str,
+        _context: &SirContext,
+        deep_mode: bool,
+    ) -> Result<SirAnnotation, InferError> {
+        if deep_mode {
+            run_sir_parse_validation_retries(PARSE_VALIDATION_RETRIES, || async {
+                self.request_deep_candidate_json_with_prompt(prompt.to_owned())
+                    .await
+            })
+            .await
+        } else {
+            run_sir_parse_validation_retries(PARSE_VALIDATION_RETRIES, || async {
+                self.request_candidate_json_with_prompt(prompt).await
+            })
+            .await
+        }
     }
 }
 
@@ -468,12 +673,20 @@ impl OpenAiCompatProvider {
         symbol_text: &str,
         context: &SirContext,
     ) -> Result<String, InferError> {
-        let user_prompt = build_strict_json_prompt(symbol_text, context);
+        let user_prompt = sir_prompt::build_sir_prompt_for_kind(symbol_text, context);
+        self.request_candidate_json_with_prompt(user_prompt.as_str())
+            .await
+    }
+
+    async fn request_candidate_json_with_prompt(
+        &self,
+        user_prompt: &str,
+    ) -> Result<String, InferError> {
         let json_mode_supported = self.json_mode_supported.load(Ordering::Relaxed);
 
         if json_mode_supported {
             match self
-                .request_chat_completion(OPENAI_COMPAT_SIR_SYSTEM_PROMPT, &user_prompt, true)
+                .request_chat_completion(OPENAI_COMPAT_SIR_SYSTEM_PROMPT, user_prompt, true)
                 .await
             {
                 Ok(content) => Ok(content),
@@ -509,6 +722,14 @@ impl OpenAiCompatProvider {
 
 #[async_trait]
 impl InferenceProvider for OpenAiCompatProvider {
+    fn provider_name(&self) -> String {
+        InferenceProviderKind::OpenAiCompat.as_str().to_owned()
+    }
+
+    fn model_name(&self) -> String {
+        self.model.clone()
+    }
+
     async fn generate_sir(
         &self,
         symbol_text: &str,
@@ -516,6 +737,18 @@ impl InferenceProvider for OpenAiCompatProvider {
     ) -> Result<SirAnnotation, InferError> {
         run_sir_parse_validation_retries(PARSE_VALIDATION_RETRIES, || async {
             self.request_candidate_json(symbol_text, context).await
+        })
+        .await
+    }
+
+    async fn generate_sir_from_prompt(
+        &self,
+        prompt: &str,
+        _context: &SirContext,
+        _deep_mode: bool,
+    ) -> Result<SirAnnotation, InferError> {
+        run_sir_parse_validation_retries(PARSE_VALIDATION_RETRIES, || async {
+            self.request_candidate_json_with_prompt(prompt).await
         })
         .await
     }
@@ -1104,16 +1337,6 @@ fn resolve_candle_model_dir(workspace_root: &Path, model_dir: Option<PathBuf>) -
     }
 }
 
-fn build_strict_json_prompt(symbol_text: &str, context: &SirContext) -> String {
-    format!(
-        "You are generating a Leaf SIR annotation. \
-Respond with STRICT JSON only (no markdown, no prose) and exactly these fields: \
-intent (string), inputs (array of string), outputs (array of string), side_effects (array of string), dependencies (array of string), error_modes (array of string), confidence (number in [0.0,1.0]). \
-Do not add any extra keys.\n\nContext:\n- language: {}\n- file_path: {}\n- qualified_name: {}\n\nSymbol text:\n{}",
-        context.language, context.file_path, context.qualified_name, symbol_text
-    )
-}
-
 fn build_retry_prompt(original_prompt: &str, error: &str, previous_output: &str) -> String {
     format!(
         "{original_prompt}\n\nYour previous response was invalid. Error: {error}. Previous output: {previous_output}. Please respond again with STRICT JSON only, fixing the error above."
@@ -1141,6 +1364,18 @@ fn build_ollama_text_generate_body(model: &str, prompt: &str) -> Value {
         "stream": false,
         "options": {
             "temperature": OLLAMA_SIR_TEMPERATURE
+        }
+    })
+}
+
+fn build_ollama_deep_generate_body(model: &str, prompt: &str) -> Value {
+    json!({
+        "model": model,
+        "prompt": prompt,
+        "stream": false,
+        "options": {
+            "temperature": 0.3,
+            "num_ctx": 8192
         }
     })
 }
@@ -1513,6 +1748,32 @@ fn normalize_candidate_json(candidate_json: &str) -> String {
     let trimmed = candidate_json.trim();
     let lower = trimmed.to_ascii_lowercase();
 
+    let cleanup_trailing_commas = |input: &str| -> String {
+        let chars: Vec<char> = input.chars().collect();
+        let mut out = String::with_capacity(input.len());
+        let mut index = 0usize;
+
+        while index < chars.len() {
+            let current = chars[index];
+            if current == ',' {
+                let mut lookahead = index + 1;
+                while lookahead < chars.len() && chars[lookahead].is_whitespace() {
+                    lookahead += 1;
+                }
+
+                if lookahead < chars.len() && matches!(chars[lookahead], ']' | '}') {
+                    index += 1;
+                    continue;
+                }
+            }
+
+            out.push(current);
+            index += 1;
+        }
+
+        out
+    };
+
     let extract_fenced_body = |input: &str, opening_idx: usize| -> Option<String> {
         let fence_payload = input.get((opening_idx + 3)..)?;
         let newline_idx = fence_payload.find('\n')?;
@@ -1525,13 +1786,23 @@ fn normalize_candidate_json(candidate_json: &str) -> String {
     if let Some(idx) = lower.find("```json")
         && let Some(extracted) = extract_fenced_body(trimmed, idx)
     {
-        return extracted;
+        return cleanup_trailing_commas(extracted.as_str());
     }
 
     if let Some(idx) = trimmed.find("```")
         && let Some(extracted) = extract_fenced_body(trimmed, idx)
     {
-        return extracted;
+        return cleanup_trailing_commas(extracted.as_str());
+    }
+
+    if trimmed.starts_with('{') {
+        return cleanup_trailing_commas(trimmed);
+    }
+
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}'))
+        && start < end
+    {
+        return cleanup_trailing_commas(&trimmed[start..=end]);
     }
 
     trimmed.to_owned()
@@ -1672,6 +1943,9 @@ mod tests {
             file_path: "src/lib.rs".to_owned(),
             qualified_name: "demo::run".to_owned(),
             priority_score: None,
+            kind: "function".to_owned(),
+            is_public: false,
+            line_count: 1,
         };
 
         let sir = provider
@@ -1707,6 +1981,9 @@ mod tests {
             file_path: "src/lib.rs".to_owned(),
             qualified_name: "demo::run".to_owned(),
             priority_score: Some(0.95),
+            kind: "function".to_owned(),
+            is_public: true,
+            line_count: 64,
         };
 
         let sir = provider
@@ -1742,6 +2019,9 @@ mod tests {
             file_path: "src/lib.rs".to_owned(),
             qualified_name: "demo::run".to_owned(),
             priority_score: Some(0.3),
+            kind: "function".to_owned(),
+            is_public: false,
+            line_count: 8,
         };
 
         let sir = provider
@@ -1777,6 +2057,9 @@ mod tests {
             file_path: "src/lib.rs".to_owned(),
             qualified_name: "demo::run".to_owned(),
             priority_score: Some(0.9),
+            kind: "function".to_owned(),
+            is_public: true,
+            line_count: 64,
         };
 
         let sir = provider
@@ -1812,6 +2095,9 @@ mod tests {
             file_path: "src/lib.rs".to_owned(),
             qualified_name: "demo::run".to_owned(),
             priority_score: Some(0.9),
+            kind: "function".to_owned(),
+            is_public: true,
+            line_count: 64,
         };
 
         let err = provider
@@ -1837,9 +2123,12 @@ mod tests {
     }
 
     #[test]
-    fn normalize_candidate_json_extracts_json_after_preamble() {
-        let input = "Here is the data:\n```json\n{\"purpose\":\"test\"}\n```";
-        assert_eq!(normalize_candidate_json(input), "{\"purpose\":\"test\"}");
+    fn qwen3_local_deep_generate_body_enables_larger_context_without_json_format() {
+        let body = build_ollama_deep_generate_body("qwen3.5:4b", "analyze deeply");
+        assert_eq!(body.pointer("/options/temperature"), Some(&json!(0.3)));
+        assert_eq!(body.pointer("/options/num_ctx"), Some(&json!(8192)));
+        assert_eq!(body.pointer("/format"), None);
+        assert_eq!(body.pointer("/think"), None);
     }
 
     #[test]
@@ -1849,15 +2138,45 @@ mod tests {
     }
 
     #[test]
-    fn normalize_candidate_json_returns_raw_json_when_unfenced() {
-        let input = "{\"purpose\":\"test\"}";
+    fn normalize_candidate_json_extracts_json_from_thinking_preamble() {
+        let input = "<thinking>analysis here</thinking>\n{\"intent\":\"test\"}";
+        assert_eq!(normalize_candidate_json(input), "{\"intent\":\"test\"}");
+    }
+
+    #[test]
+    fn normalize_candidate_json_extracts_json_from_plain_preamble() {
+        let input = "Here is the SIR:\n{\"intent\":\"test\",\"inputs\":[]}";
+        assert_eq!(
+            normalize_candidate_json(input),
+            "{\"intent\":\"test\",\"inputs\":[]}"
+        );
+    }
+
+    #[test]
+    fn normalize_candidate_json_strips_trailing_commas() {
+        let input = "{\"inputs\":[\"a\",\"b\",],\"intent\":\"test\"}";
+        assert_eq!(
+            normalize_candidate_json(input),
+            "{\"inputs\":[\"a\",\"b\"],\"intent\":\"test\"}"
+        );
+    }
+
+    #[test]
+    fn normalize_candidate_json_returns_unmodified_when_already_clean() {
+        let input = "{\"intent\":\"test\"}";
         assert_eq!(normalize_candidate_json(input), input);
     }
 
     #[test]
-    fn normalize_candidate_json_returns_trimmed_input_when_fence_is_unclosed() {
-        let input = "```json\n{\"purpose\":\"test\"}";
+    fn normalize_candidate_json_returns_unmodified_when_no_json_is_present() {
+        let input = "no json here at all";
         assert_eq!(normalize_candidate_json(input), input);
+    }
+
+    #[test]
+    fn normalize_candidate_json_falls_back_to_bracket_extraction_when_fence_is_unclosed() {
+        let input = "```json\n{\"purpose\":\"test\"}";
+        assert_eq!(normalize_candidate_json(input), "{\"purpose\":\"test\"}");
     }
 
     #[test]
@@ -1865,6 +2184,129 @@ mod tests {
         let input =
             "```json\n{\"purpose\":\"first\"}\n```\n\n```json\n{\"purpose\":\"second\"}\n```";
         assert_eq!(normalize_candidate_json(input), "{\"purpose\":\"first\"}");
+    }
+
+    #[test]
+    fn normalize_candidate_json_prefers_fenced_block_over_preamble_bracket_fallback() {
+        let input = "<thinking>stuff</thinking>\n```json\n{\"intent\":\"test\"}\n```";
+        assert_eq!(normalize_candidate_json(input), "{\"intent\":\"test\"}");
+    }
+
+    #[test]
+    fn build_sir_prompt_for_kind_includes_type_guidance_for_structs() {
+        let context = SirContext {
+            language: "rust".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            qualified_name: "demo::State".to_owned(),
+            priority_score: None,
+            kind: "struct".to_owned(),
+            is_public: true,
+            line_count: 12,
+        };
+        let prompt = sir_prompt::build_sir_prompt_for_kind("pub struct State {}", &context);
+        assert!(prompt.contains("For type definitions: describe WHY this type exists"));
+    }
+
+    #[test]
+    fn build_sir_prompt_for_kind_includes_complex_public_guidance_for_large_functions() {
+        let context = SirContext {
+            language: "rust".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            qualified_name: "demo::run".to_owned(),
+            priority_score: Some(0.92),
+            kind: "function".to_owned(),
+            is_public: true,
+            line_count: 55,
+        };
+        let prompt =
+            sir_prompt::build_sir_prompt_for_kind("pub fn run() -> Result<()> {}", &context);
+        assert!(prompt.contains("For complex public methods"));
+        assert!(prompt.contains("Bad outputs example"));
+    }
+
+    #[test]
+    fn build_sir_prompt_for_kind_includes_test_guidance_for_tests() {
+        let context = SirContext {
+            language: "rust".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            qualified_name: "demo::test_retry_reset".to_owned(),
+            priority_score: None,
+            kind: "function".to_owned(),
+            is_public: false,
+            line_count: 14,
+        };
+        let prompt = sir_prompt::build_sir_prompt_for_kind("fn test_retry_reset() {}", &context);
+        assert!(prompt.contains("For test functions: describe what behavior is being verified"));
+    }
+
+    #[test]
+    fn build_enriched_prompt_includes_context_sections() {
+        let context = SirContext {
+            language: "rust".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            qualified_name: "demo::run".to_owned(),
+            priority_score: Some(0.9),
+            kind: "function".to_owned(),
+            is_public: true,
+            line_count: 60,
+        };
+        let enrichment = sir_prompt::SirEnrichmentContext {
+            file_intent: Some("Coordinates request lifecycle".to_owned()),
+            neighbor_intents: vec![
+                (
+                    "demo::parse".to_owned(),
+                    "Parses raw bytes into frames".to_owned(),
+                ),
+                (
+                    "demo::flush".to_owned(),
+                    "Flushes pending writes".to_owned(),
+                ),
+            ],
+            baseline_sir: Some(SirAnnotation {
+                intent: "Baseline".to_owned(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                side_effects: Vec::new(),
+                dependencies: Vec::new(),
+                error_modes: Vec::new(),
+                confidence: 0.6,
+            }),
+            priority_reason: "high PageRank + public method".to_owned(),
+        };
+
+        let prompt =
+            sir_prompt::build_enriched_sir_prompt("pub fn run() {}", &context, &enrichment);
+        assert!(prompt.contains("You are improving an existing SIR annotation"));
+        assert!(prompt.contains("high PageRank + public method"));
+        assert!(prompt.contains("Other symbols in this file"));
+        assert!(prompt.contains("Previous SIR (improve upon this):"));
+    }
+
+    #[test]
+    fn build_enriched_prompt_with_cot_contains_thinking_instructions() {
+        let context = SirContext {
+            language: "rust".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            qualified_name: "demo::run".to_owned(),
+            priority_score: Some(0.9),
+            kind: "function".to_owned(),
+            is_public: true,
+            line_count: 60,
+        };
+        let enrichment = sir_prompt::SirEnrichmentContext {
+            file_intent: None,
+            neighbor_intents: Vec::new(),
+            baseline_sir: None,
+            priority_reason: "low confidence triage output".to_owned(),
+        };
+
+        let prompt = sir_prompt::build_enriched_sir_prompt_with_cot(
+            "pub fn run() {}",
+            &context,
+            &enrichment,
+        );
+        assert!(prompt.contains("<thinking>"));
+        assert!(prompt.contains("After closing your </thinking> tag, output the final JSON."));
     }
 
     #[test]

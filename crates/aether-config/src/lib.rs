@@ -16,6 +16,7 @@ pub const OLLAMA_DEFAULT_ENDPOINT: &str = "http://127.0.0.1:11434";
 pub const SIR_QUALITY_FLOOR_CONFIDENCE: f32 = 0.3;
 pub const SIR_QUALITY_FLOOR_WINDOW: usize = 10;
 pub const OLLAMA_SIR_TEMPERATURE: f32 = 0.1;
+pub const DEFAULT_SIR_CONCURRENCY: usize = 2;
 pub const DEFAULT_COHERE_API_KEY_ENV: &str = "COHERE_API_KEY";
 pub const DEFAULT_VERIFY_CONTAINER_RUNTIME: &str = "docker";
 pub const DEFAULT_VERIFY_CONTAINER_IMAGE: &str = "rust:1-bookworm";
@@ -219,6 +220,8 @@ pub struct AetherConfig {
     #[serde(default)]
     pub inference: InferenceConfig,
     #[serde(default)]
+    pub sir_quality: SirQualityConfig,
+    #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
@@ -262,6 +265,8 @@ pub struct InferenceConfig {
     pub endpoint: Option<String>,
     #[serde(default = "default_api_key_env")]
     pub api_key_env: String,
+    #[serde(default = "default_sir_concurrency")]
+    pub concurrency: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tiered: Option<TieredConfig>,
 }
@@ -273,7 +278,58 @@ impl Default for InferenceConfig {
             model: None,
             endpoint: None,
             api_key_env: default_api_key_env(),
+            concurrency: default_sir_concurrency(),
             tiered: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SirQualityConfig {
+    #[serde(default)]
+    pub deep_pass: bool,
+
+    #[serde(default = "default_deep_priority_threshold")]
+    pub deep_priority_threshold: f64,
+
+    #[serde(default = "default_deep_confidence_threshold")]
+    pub deep_confidence_threshold: f64,
+
+    #[serde(default)]
+    pub deep_provider: Option<String>,
+
+    #[serde(default)]
+    pub deep_model: Option<String>,
+
+    #[serde(default)]
+    pub deep_endpoint: Option<String>,
+
+    #[serde(default)]
+    pub deep_api_key_env: Option<String>,
+
+    #[serde(default = "default_deep_max_symbols")]
+    pub deep_max_symbols: usize,
+
+    #[serde(default = "default_deep_max_neighbors")]
+    pub deep_max_neighbors: usize,
+
+    #[serde(default = "default_deep_concurrency")]
+    pub deep_concurrency: usize,
+}
+
+impl Default for SirQualityConfig {
+    fn default() -> Self {
+        Self {
+            deep_pass: false,
+            deep_priority_threshold: default_deep_priority_threshold(),
+            deep_confidence_threshold: default_deep_confidence_threshold(),
+            deep_provider: None,
+            deep_model: None,
+            deep_endpoint: None,
+            deep_api_key_env: None,
+            deep_max_symbols: default_deep_max_symbols(),
+            deep_max_neighbors: default_deep_max_neighbors(),
+            deep_concurrency: default_deep_concurrency(),
         }
     }
 }
@@ -1010,6 +1066,30 @@ fn default_api_key_env() -> String {
     DEFAULT_GEMINI_API_KEY_ENV.to_owned()
 }
 
+fn default_sir_concurrency() -> usize {
+    DEFAULT_SIR_CONCURRENCY
+}
+
+fn default_deep_priority_threshold() -> f64 {
+    0.7
+}
+
+fn default_deep_confidence_threshold() -> f64 {
+    0.85
+}
+
+fn default_deep_max_symbols() -> usize {
+    0
+}
+
+fn default_deep_max_neighbors() -> usize {
+    10
+}
+
+fn default_deep_concurrency() -> usize {
+    4
+}
+
 fn default_tiered_primary_threshold() -> f64 {
     0.8
 }
@@ -1355,6 +1435,9 @@ fn normalize_config(mut config: AetherConfig) -> AetherConfig {
     );
     config.inference.model = normalize_optional(config.inference.model.take());
     config.inference.endpoint = normalize_optional(config.inference.endpoint.take());
+    if config.inference.concurrency == 0 {
+        config.inference.concurrency = default_sir_concurrency();
+    }
     if let Some(tiered) = config.inference.tiered.as_mut() {
         tiered.primary =
             normalize_with_default(std::mem::take(&mut tiered.primary), "gemini".to_owned());
@@ -1372,6 +1455,29 @@ fn normalize_config(mut config: AetherConfig) -> AetherConfig {
             normalize_optional(tiered.fallback_model.take()).or_else(default_tiered_fallback_model);
         tiered.fallback_endpoint = normalize_optional(tiered.fallback_endpoint.take())
             .or_else(default_tiered_fallback_endpoint);
+    }
+    if !config.sir_quality.deep_priority_threshold.is_finite() {
+        config.sir_quality.deep_priority_threshold = default_deep_priority_threshold();
+    } else {
+        config.sir_quality.deep_priority_threshold =
+            config.sir_quality.deep_priority_threshold.clamp(0.0, 1.0);
+    }
+    if !config.sir_quality.deep_confidence_threshold.is_finite() {
+        config.sir_quality.deep_confidence_threshold = default_deep_confidence_threshold();
+    } else {
+        config.sir_quality.deep_confidence_threshold =
+            config.sir_quality.deep_confidence_threshold.clamp(0.0, 1.0);
+    }
+    config.sir_quality.deep_provider = normalize_optional(config.sir_quality.deep_provider.take());
+    config.sir_quality.deep_model = normalize_optional(config.sir_quality.deep_model.take());
+    config.sir_quality.deep_endpoint = normalize_optional(config.sir_quality.deep_endpoint.take());
+    config.sir_quality.deep_api_key_env =
+        normalize_optional(config.sir_quality.deep_api_key_env.take());
+    if config.sir_quality.deep_max_neighbors == 0 {
+        config.sir_quality.deep_max_neighbors = default_deep_max_neighbors();
+    }
+    if config.sir_quality.deep_concurrency == 0 {
+        config.sir_quality.deep_concurrency = default_deep_concurrency();
     }
     config.embeddings.model = normalize_optional(config.embeddings.model.take());
     config.embeddings.endpoint = normalize_optional(config.embeddings.endpoint.take());
@@ -1498,6 +1604,13 @@ mod tests {
         assert_eq!(config.general.log_level, DEFAULT_LOG_LEVEL);
         assert_eq!(config.inference.provider, InferenceProviderKind::Auto);
         assert_eq!(config.inference.api_key_env, DEFAULT_GEMINI_API_KEY_ENV);
+        assert_eq!(config.inference.concurrency, DEFAULT_SIR_CONCURRENCY);
+        assert!(!config.sir_quality.deep_pass);
+        assert_eq!(config.sir_quality.deep_priority_threshold, 0.7);
+        assert_eq!(config.sir_quality.deep_confidence_threshold, 0.85);
+        assert_eq!(config.sir_quality.deep_max_symbols, 0);
+        assert_eq!(config.sir_quality.deep_max_neighbors, 10);
+        assert_eq!(config.sir_quality.deep_concurrency, 4);
         assert!(config.storage.mirror_sir_files);
         assert_eq!(config.storage.graph_backend, GraphBackend::Surreal);
         assert!(!config.embeddings.enabled);
@@ -1620,6 +1733,9 @@ mod tests {
         assert!(content.contains("log_level = \"info\""));
         assert!(content.contains("[inference]"));
         assert!(content.contains("provider = \"auto\""));
+        assert!(content.contains("concurrency = 2"));
+        assert!(content.contains("[sir_quality]"));
+        assert!(content.contains("deep_pass = false"));
         assert!(content.contains("[storage]"));
         assert!(content.contains("mirror_sir_files = true"));
         assert!(content.contains("graph_backend = \"surreal\""));
@@ -2037,6 +2153,34 @@ risk_weights = { pagerank = 2.0, test_gap = 1.0, drift = 1.0, no_sir = 1.0, rece
     }
 
     #[test]
+    fn load_workspace_config_normalizes_sir_quality_and_inference_concurrency() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(aether_dir(workspace)).expect("create .aether");
+
+        let raw = r#"
+[inference]
+provider = "auto"
+concurrency = 0
+
+[sir_quality]
+deep_pass = true
+deep_priority_threshold = 9.9
+deep_confidence_threshold = -3.0
+deep_max_neighbors = 0
+deep_concurrency = 0
+"#;
+        fs::write(config_path(workspace), raw).expect("write config");
+
+        let config = load_workspace_config(workspace).expect("load config");
+        assert_eq!(config.inference.concurrency, DEFAULT_SIR_CONCURRENCY);
+        assert_eq!(config.sir_quality.deep_priority_threshold, 1.0);
+        assert_eq!(config.sir_quality.deep_confidence_threshold, 0.0);
+        assert_eq!(config.sir_quality.deep_max_neighbors, 10);
+        assert_eq!(config.sir_quality.deep_concurrency, 4);
+    }
+
+    #[test]
     fn validate_config_reports_ignored_fields() {
         let config = AetherConfig {
             general: GeneralConfig::default(),
@@ -2045,8 +2189,10 @@ risk_weights = { pagerank = 2.0, test_gap = 1.0, drift = 1.0, no_sir = 1.0, rece
                 model: None,
                 endpoint: Some("http://127.0.0.1:11434".to_owned()),
                 api_key_env: DEFAULT_GEMINI_API_KEY_ENV.to_owned(),
+                concurrency: default_sir_concurrency(),
                 tiered: None,
             },
+            sir_quality: SirQualityConfig::default(),
             storage: StorageConfig {
                 mirror_sir_files: true,
                 graph_backend: GraphBackend::Cozo,

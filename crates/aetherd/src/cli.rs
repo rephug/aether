@@ -8,7 +8,6 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::init_agent::AgentPlatform;
 use crate::search::{SearchMode, SearchOutputFormat};
-use crate::sir_pipeline::DEFAULT_SIR_CONCURRENCY;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LogFormat {
@@ -52,6 +51,27 @@ pub struct InitAgentArgs {
 
     #[arg(long, help = "Overwrite existing files")]
     pub force: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Args)]
+pub struct RegenerateArgs {
+    #[arg(long, default_value_t = 0.5)]
+    pub below_confidence: f32,
+
+    #[arg(long)]
+    pub from_provider: Option<String>,
+
+    #[arg(long)]
+    pub file: Option<String>,
+
+    #[arg(long)]
+    pub deep: bool,
+
+    #[arg(long)]
+    pub max: Option<usize>,
+
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
@@ -358,6 +378,8 @@ pub struct GraphMigrateArgs {
 pub enum Commands {
     /// Generate agent configuration files for AI coding agents
     InitAgent(InitAgentArgs),
+    /// Regenerate low-quality SIR records with optional deep enrichment
+    Regenerate(RegenerateArgs),
     /// Set up local Ollama inference for offline SIR generation
     SetupLocal(SetupLocalArgs),
     /// Show local index health and SIR coverage
@@ -508,6 +530,13 @@ pub struct Cli {
 
     #[arg(
         long,
+        requires = "index_once",
+        help = "When used with --index-once --full, run deep pass after triage generation"
+    )]
+    pub deep: bool,
+
+    #[arg(
+        long,
         help = "Force SIR regeneration during indexing, even when existing SIR data is fresh"
     )]
     pub force: bool,
@@ -562,8 +591,8 @@ pub struct Cli {
     )]
     pub verify_fallback_container_on_unavailable: bool,
 
-    #[arg(long, default_value_t = DEFAULT_SIR_CONCURRENCY)]
-    pub sir_concurrency: usize,
+    #[arg(long)]
+    pub sir_concurrency: Option<usize>,
 
     #[arg(long, value_parser = parse_inference_provider)]
     pub inference_provider: Option<InferenceProviderKind>,
@@ -802,6 +831,39 @@ mod tests {
         let cli =
             Cli::try_parse_from(["aetherd", "--workspace", ".", "status"]).expect("status parse");
         assert!(matches!(cli.command, Some(Commands::Status)));
+    }
+
+    #[test]
+    fn regenerate_subcommand_parses_all_flags() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "regenerate",
+            "--below-confidence",
+            "0.42",
+            "--from-provider",
+            "qwen3.5:4b",
+            "--file",
+            "src/lib.rs",
+            "--deep",
+            "--max",
+            "12",
+            "--dry-run",
+        ])
+        .expect("regenerate should parse");
+
+        match cli.command {
+            Some(Commands::Regenerate(args)) => {
+                assert!((args.below_confidence - 0.42).abs() < f32::EPSILON);
+                assert_eq!(args.from_provider.as_deref(), Some("qwen3.5:4b"));
+                assert_eq!(args.file.as_deref(), Some("src/lib.rs"));
+                assert!(args.deep);
+                assert_eq!(args.max, Some(12));
+                assert!(args.dry_run);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]

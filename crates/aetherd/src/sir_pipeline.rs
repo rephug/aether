@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -6,13 +7,18 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aether_analysis::TestIntentAnalyzer;
-use aether_config::{SIR_QUALITY_FLOOR_CONFIDENCE, SIR_QUALITY_FLOOR_WINDOW};
+use aether_config::{
+    InferenceProviderKind, SIR_QUALITY_FLOOR_CONFIDENCE, SIR_QUALITY_FLOOR_WINDOW,
+    ensure_workspace_config,
+};
 use aether_core::{
     GitContext, Language, Position, SourceRange, Symbol, SymbolChangeEvent, content_hash,
 };
 use aether_infer::{
-    EmbeddingProvider, EmbeddingProviderOverrides, InferenceProvider, ProviderOverrides,
-    SirContext, load_embedding_provider_from_config, load_provider_from_env_or_mock,
+    EmbeddingProvider, EmbeddingProviderOverrides, InferError, InferSirResult, InferenceProvider,
+    ProviderOverrides, Qwen3LocalProvider, SirContext, load_embedding_provider_from_config,
+    load_provider_from_env_or_mock,
+    sir_prompt::{self, SirEnrichmentContext},
 };
 use aether_parse::{SymbolExtractor, TestIntent};
 use aether_sir::{
@@ -41,6 +47,29 @@ const INFERENCE_ATTEMPT_TIMEOUT_SECS: u64 = 90;
 const INFERENCE_BACKOFF_BASE_MS: u64 = 200;
 const INFERENCE_BACKOFF_MAX_MS: u64 = 2_000;
 const MAX_SYMBOL_TEXT_CHARS: usize = 10_000;
+pub const SIR_GENERATION_PASS_SINGLE: &str = "single";
+pub const SIR_GENERATION_PASS_TRIAGE: &str = "triage";
+pub const SIR_GENERATION_PASS_DEEP: &str = "deep";
+pub const SIR_GENERATION_PASS_PREMIUM: &str = "premium";
+pub const SIR_GENERATION_PASS_REGENERATED: &str = "regenerated";
+
+#[derive(Debug, Clone, Default)]
+pub struct ProcessEventStats {
+    pub success_count: usize,
+    pub failure_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SirPromptOverride {
+    pub prompt: String,
+    pub deep_mode: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SirDeepPromptSpec {
+    pub enrichment: SirEnrichmentContext,
+    pub use_cot: bool,
+}
 
 pub struct SirPipeline {
     workspace_root: PathBuf,
@@ -54,6 +83,8 @@ pub struct SirPipeline {
     runtime: Runtime,
     sir_concurrency: usize,
     quality_monitor: Mutex<SirQualityMonitor>,
+    tiered_parse_fallback_provider: Option<Arc<dyn InferenceProvider>>,
+    tiered_parse_fallback_model: Option<String>,
 }
 
 impl SirPipeline {
@@ -62,6 +93,8 @@ impl SirPipeline {
         sir_concurrency: usize,
         provider_overrides: ProviderOverrides,
     ) -> Result<Self> {
+        let parse_fallback =
+            resolve_tiered_parse_fallback_provider(workspace_root.as_path(), &provider_overrides)?;
         let loaded = load_provider_from_env_or_mock(&workspace_root, provider_overrides)
             .context("failed to load inference provider")?;
         let provider = Arc::<dyn InferenceProvider>::from(loaded.provider);
@@ -78,6 +111,13 @@ impl SirPipeline {
                 )
             });
 
+        let (tiered_parse_fallback_provider, tiered_parse_fallback_model) =
+            if let Some((provider, model)) = parse_fallback {
+                (Some(provider), Some(model))
+            } else {
+                (None, None)
+            };
+
         Self::new_with_provider_and_embeddings(
             workspace_root,
             sir_concurrency,
@@ -86,6 +126,8 @@ impl SirPipeline {
             loaded.model_name,
             embedding_provider,
             embedding_identity,
+            tiered_parse_fallback_provider,
+            tiered_parse_fallback_model,
         )
     }
 
@@ -104,9 +146,12 @@ impl SirPipeline {
             model_name,
             None,
             None,
+            None,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_provider_and_embeddings(
         workspace_root: PathBuf,
         sir_concurrency: usize,
@@ -115,6 +160,8 @@ impl SirPipeline {
         model_name: impl Into<String>,
         embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
         embedding_identity: Option<(String, String)>,
+        tiered_parse_fallback_provider: Option<Arc<dyn InferenceProvider>>,
+        tiered_parse_fallback_model: Option<String>,
     ) -> Result<Self> {
         let concurrency = sir_concurrency.max(1);
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -145,6 +192,8 @@ impl SirPipeline {
                 SIR_QUALITY_FLOOR_WINDOW,
                 SIR_QUALITY_FLOOR_CONFIDENCE,
             )),
+            tiered_parse_fallback_provider,
+            tiered_parse_fallback_model,
         })
     }
 
@@ -156,7 +205,16 @@ impl SirPipeline {
         print_sir: bool,
         out: &mut dyn Write,
     ) -> Result<()> {
-        self.process_event_with_priority(store, event, force, print_sir, out, None)
+        let _ = self.process_event_with_priority_and_pass(
+            store,
+            event,
+            force,
+            print_sir,
+            out,
+            None,
+            SIR_GENERATION_PASS_SINGLE,
+        )?;
+        Ok(())
     }
 
     pub fn process_event_with_priority(
@@ -168,6 +226,53 @@ impl SirPipeline {
         out: &mut dyn Write,
         priority_score: Option<f64>,
     ) -> Result<()> {
+        let _ = self.process_event_with_priority_and_pass(
+            store,
+            event,
+            force,
+            print_sir,
+            out,
+            priority_score,
+            SIR_GENERATION_PASS_SINGLE,
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_event_with_priority_and_pass(
+        &self,
+        store: &SqliteStore,
+        event: &SymbolChangeEvent,
+        force: bool,
+        print_sir: bool,
+        out: &mut dyn Write,
+        priority_score: Option<f64>,
+        generation_pass: &str,
+    ) -> Result<ProcessEventStats> {
+        self.process_event_with_priority_and_pass_and_overrides(
+            store,
+            event,
+            force,
+            print_sir,
+            out,
+            priority_score,
+            generation_pass,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_event_with_priority_and_pass_and_overrides(
+        &self,
+        store: &SqliteStore,
+        event: &SymbolChangeEvent,
+        force: bool,
+        print_sir: bool,
+        out: &mut dyn Write,
+        priority_score: Option<f64>,
+        generation_pass: &str,
+        prompt_overrides: Option<&HashMap<String, SirPromptOverride>>,
+    ) -> Result<ProcessEventStats> {
         for symbol in &event.removed {
             store
                 .mark_removed(&symbol.id)
@@ -193,6 +298,8 @@ impl SirPipeline {
             "processing symbol change event"
         );
         let mut intents_ready_for_graph: Vec<String> = Vec::new();
+        let mut success_count: usize = 0;
+        let mut failure_count: usize = 0;
         if !changed_symbols.is_empty() {
             let now_ts = unix_timestamp_secs();
             for (symbol, _) in &changed_symbols {
@@ -227,7 +334,16 @@ impl SirPipeline {
                 }
 
                 match build_job(&self.workspace_root, symbol, priority_score) {
-                    Ok(job) => jobs.push(job),
+                    Ok(mut job) => {
+                        if let Some(prompt_overrides) = prompt_overrides
+                            && let Some(override_spec) =
+                                prompt_overrides.get(job.symbol.id.as_str())
+                        {
+                            job.custom_prompt = Some(override_spec.prompt.clone());
+                            job.deep_mode = override_spec.deep_mode;
+                        }
+                        jobs.push(job);
+                    }
                     Err(err) => {
                         tracing::warn!(
                             file_path = %event.file_path,
@@ -263,12 +379,12 @@ impl SirPipeline {
             );
             let results = self.runtime.block_on(generate_sir_jobs(
                 self.provider.clone(),
+                self.tiered_parse_fallback_provider.clone(),
+                self.tiered_parse_fallback_model.clone(),
                 jobs,
                 self.sir_concurrency,
             ))?;
 
-            let mut success_count: usize = 0;
-            let mut failure_count: usize = 0;
             let mark_intent_failed = |intent_id: &str, message: &str| {
                 if let Err(mark_err) = store.mark_intent_failed(intent_id, message) {
                     tracing::error!(
@@ -297,8 +413,9 @@ impl SirPipeline {
                         let payload = UpsertSirIntentPayload {
                             symbol: generated.symbol.clone(),
                             sir: generated.sir.clone(),
-                            provider_name: self.provider_name.clone(),
-                            model_name: self.model_name.clone(),
+                            provider_name: generated.provider_name.clone(),
+                            model_name: generated.model_name.clone(),
+                            generation_pass: generation_pass.to_owned(),
                             commit_hash: commit_hash.clone(),
                         };
                         let payload_json = match payload.to_json_string() {
@@ -381,8 +498,9 @@ impl SirPipeline {
                             id: generated.symbol.id.clone(),
                             sir_hash: sir_hash_value.clone(),
                             sir_version: version_write.version,
-                            provider: payload.provider_name.clone(),
-                            model: payload.model_name.clone(),
+                            provider: generated.provider_name.clone(),
+                            model: generated.model_name.clone(),
+                            generation_pass: generation_pass.to_owned(),
                             updated_at: version_write.updated_at,
                             sir_status: SIR_STATUS_FRESH.to_owned(),
                             last_error: None,
@@ -446,7 +564,7 @@ impl SirPipeline {
                             writeln!(
                                 out,
                                 "SIR_STORED symbol_id={} sir_hash={} provider={}",
-                                generated.symbol.id, sir_hash_value, self.provider_name
+                                generated.symbol.id, sir_hash_value, generated.provider_name
                             )
                             .context("failed to write SIR print line")?;
                         }
@@ -471,6 +589,7 @@ impl SirPipeline {
                                 sir_version: 1,
                                 provider: self.provider_name.clone(),
                                 model: self.model_name.clone(),
+                                generation_pass: generation_pass.to_owned(),
                                 updated_at: 0,
                                 sir_status: SIR_STATUS_STALE.to_owned(),
                                 last_error: Some(failed.error_message.clone()),
@@ -489,6 +608,11 @@ impl SirPipeline {
                                     self.model_name.clone()
                                 } else {
                                     record.model
+                                },
+                                generation_pass: if record.generation_pass.trim().is_empty() {
+                                    generation_pass.to_owned()
+                                } else {
+                                    record.generation_pass
                                 },
                                 updated_at: record.updated_at,
                                 sir_status: SIR_STATUS_STALE.to_owned(),
@@ -598,9 +722,77 @@ impl SirPipeline {
             print_sir,
             out,
             commit_hash.as_deref(),
+            generation_pass,
         )?;
 
-        Ok(())
+        Ok(ProcessEventStats {
+            success_count,
+            failure_count,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_event_with_deep_specs(
+        &self,
+        store: &SqliteStore,
+        event: &SymbolChangeEvent,
+        force: bool,
+        print_sir: bool,
+        out: &mut dyn Write,
+        priority_score: Option<f64>,
+        generation_pass: &str,
+        deep_specs: &HashMap<String, SirDeepPromptSpec>,
+    ) -> Result<ProcessEventStats> {
+        let mut prompt_overrides = HashMap::new();
+
+        for symbol in event.added.iter().chain(event.updated.iter()) {
+            let Some(spec) = deep_specs.get(symbol.id.as_str()) else {
+                continue;
+            };
+            let job = build_job(&self.workspace_root, symbol.clone(), priority_score)
+                .with_context(|| {
+                    format!("failed to build deep SIR job for {}", symbol.qualified_name)
+                })?;
+            let prompt = if spec.use_cot {
+                sir_prompt::build_enriched_sir_prompt_with_cot(
+                    &job.symbol_text,
+                    &job.context,
+                    &spec.enrichment,
+                )
+            } else {
+                sir_prompt::build_enriched_sir_prompt(
+                    &job.symbol_text,
+                    &job.context,
+                    &spec.enrichment,
+                )
+            };
+            prompt_overrides.insert(
+                symbol.id.clone(),
+                SirPromptOverride {
+                    prompt,
+                    deep_mode: spec.use_cot,
+                },
+            );
+        }
+
+        self.process_event_with_priority_and_pass_and_overrides(
+            store,
+            event,
+            force,
+            print_sir,
+            out,
+            priority_score,
+            generation_pass,
+            Some(&prompt_overrides),
+        )
+    }
+
+    pub fn provider_name(&self) -> &str {
+        self.provider_name.as_str()
+    }
+
+    pub fn model_name(&self) -> &str {
+        self.model_name.as_str()
     }
 
     pub fn replay_incomplete_intents(
@@ -787,6 +979,7 @@ impl SirPipeline {
             sir_version: version_write.version,
             provider: payload.provider_name.clone(),
             model: payload.model_name.clone(),
+            generation_pass: payload.generation_pass.clone(),
             updated_at: version_write.updated_at,
             sir_status: SIR_STATUS_FRESH.to_owned(),
             last_error: None,
@@ -980,6 +1173,7 @@ impl SirPipeline {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn upsert_file_rollup(
         &self,
         store: &SqliteStore,
@@ -988,6 +1182,7 @@ impl SirPipeline {
         print_sir: bool,
         out: &mut dyn Write,
         commit_hash: Option<&str>,
+        generation_pass: &str,
     ) -> Result<()> {
         let rollup_id = synthetic_file_sir_id(language.as_str(), file_path);
         let symbols = store
@@ -1074,6 +1269,7 @@ impl SirPipeline {
                 sir_version: version_write.version,
                 provider: self.provider_name.clone(),
                 model: self.model_name.clone(),
+                generation_pass: generation_pass.to_owned(),
                 updated_at: version_write.updated_at,
                 sir_status: SIR_STATUS_FRESH.to_owned(),
                 last_error: None,
@@ -1176,6 +1372,9 @@ impl SirPipeline {
             file_path: file_path.to_owned(),
             qualified_name: format!("file::{file_path}"),
             priority_score: None,
+            kind: "file".to_owned(),
+            is_public: true,
+            line_count: summary_input.lines().count(),
         };
 
         let summarized = self
@@ -1187,7 +1386,7 @@ impl SirPipeline {
             ))
             .with_context(|| format!("failed to summarize file intent for {file_path}"))?;
 
-        Ok(summarized.intent.trim().to_owned())
+        Ok(summarized.sir.intent.trim().to_owned())
     }
 }
 
@@ -1196,12 +1395,16 @@ struct SirJob {
     symbol: Symbol,
     symbol_text: String,
     context: SirContext,
+    custom_prompt: Option<String>,
+    deep_mode: bool,
 }
 
 #[derive(Debug)]
 struct GeneratedSir {
     symbol: Symbol,
     sir: SirAnnotation,
+    provider_name: String,
+    model_name: String,
 }
 
 #[derive(Debug)]
@@ -1222,6 +1425,7 @@ struct UpsertSirIntentPayload {
     sir: SirAnnotation,
     provider_name: String,
     model_name: String,
+    generation_pass: String,
     commit_hash: Option<String>,
 }
 
@@ -1232,6 +1436,7 @@ impl UpsertSirIntentPayload {
             "sir": self.sir,
             "provider_name": self.provider_name,
             "model_name": self.model_name,
+            "generation_pass": self.generation_pass,
             "commit_hash": self.commit_hash,
         }))
         .context("failed to serialize upsert intent payload")
@@ -1252,6 +1457,8 @@ impl UpsertSirIntentPayload {
             .ok_or_else(|| anyhow!("payload missing field 'sir'"))?;
         let provider_name = payload_required_string(object, "provider_name")?;
         let model_name = payload_required_string(object, "model_name")?;
+        let generation_pass = payload_required_string(object, "generation_pass")
+            .unwrap_or_else(|_| SIR_GENERATION_PASS_SINGLE.to_owned());
         let commit_hash = match object.get("commit_hash") {
             Some(Value::String(value)) => Some(value.clone()),
             Some(Value::Null) | None => None,
@@ -1267,6 +1474,7 @@ impl UpsertSirIntentPayload {
             sir: serde_json::from_value(sir_value).context("invalid payload sir")?,
             provider_name,
             model_name,
+            generation_pass,
             commit_hash,
         })
     }
@@ -1336,13 +1544,26 @@ fn build_job(workspace_root: &Path, symbol: Symbol, priority_score: Option<f64>)
         file_path: symbol.file_path.clone(),
         qualified_name: symbol.qualified_name.clone(),
         priority_score,
+        kind: symbol.kind.as_str().to_owned(),
+        is_public: infer_symbol_text_is_public(&symbol_text),
+        line_count: symbol_text.lines().count(),
     };
 
     Ok(SirJob {
         symbol,
         symbol_text,
         context,
+        custom_prompt: None,
+        deep_mode: false,
     })
+}
+
+fn infer_symbol_text_is_public(symbol_text: &str) -> bool {
+    let trimmed = symbol_text.trim_start();
+    trimmed.starts_with("pub ")
+        || trimmed.starts_with("pub(")
+        || trimmed.starts_with("export ")
+        || trimmed.starts_with("export default ")
 }
 
 fn extract_symbol_source_text(source: &str, range: SourceRange) -> Option<String> {
@@ -1388,8 +1609,36 @@ fn byte_offset_for_position(source: &str, position: Position) -> Option<usize> {
     }
 }
 
+fn resolve_tiered_parse_fallback_provider(
+    workspace_root: &Path,
+    overrides: &ProviderOverrides,
+) -> Result<Option<(Arc<dyn InferenceProvider>, String)>> {
+    let config =
+        ensure_workspace_config(workspace_root).context("failed to load workspace config")?;
+    let selected_provider = overrides.provider.unwrap_or(config.inference.provider);
+    if selected_provider != InferenceProviderKind::Tiered {
+        return Ok(None);
+    }
+
+    let Some(tiered) = config.inference.tiered.as_ref() else {
+        return Ok(None);
+    };
+    if !tiered.retry_with_fallback {
+        return Ok(None);
+    }
+
+    let fallback = Qwen3LocalProvider::new(
+        tiered.fallback_endpoint.clone(),
+        tiered.fallback_model.clone(),
+    );
+    let model_name = fallback.model_name();
+    Ok(Some((Arc::new(fallback), model_name)))
+}
+
 async fn generate_sir_jobs(
     provider: Arc<dyn InferenceProvider>,
+    tiered_parse_fallback_provider: Option<Arc<dyn InferenceProvider>>,
+    tiered_parse_fallback_model: Option<String>,
     jobs: Vec<SirJob>,
     concurrency: usize,
 ) -> Result<Vec<SirGenerationOutcome>> {
@@ -1398,6 +1647,8 @@ async fn generate_sir_jobs(
 
     for job in jobs {
         let provider = provider.clone();
+        let tiered_parse_fallback_provider = tiered_parse_fallback_provider.clone();
+        let tiered_parse_fallback_model = tiered_parse_fallback_model.clone();
         let semaphore = semaphore.clone();
 
         join_set.spawn(async move {
@@ -1405,6 +1656,8 @@ async fn generate_sir_jobs(
                 symbol,
                 symbol_text,
                 context,
+                custom_prompt,
+                deep_mode,
             } = job;
             let qualified_name = symbol.qualified_name.clone();
 
@@ -1419,12 +1672,84 @@ async fn generate_sir_jobs(
                 }
             };
 
-            let generated = generate_sir_with_retries(provider, symbol_text, context)
+            let generated = match custom_prompt.as_ref() {
+                Some(prompt) => generate_sir_from_prompt_with_retries(
+                    provider.clone(),
+                    prompt.clone(),
+                    context.clone(),
+                    deep_mode,
+                )
                 .await
-                .with_context(|| format!("failed to generate SIR for symbol {qualified_name}"));
+                .with_context(|| {
+                    format!("failed to generate deep/custom SIR for symbol {qualified_name}")
+                }),
+                None => generate_sir_with_retries(provider.clone(), symbol_text.clone(), context.clone())
+                    .await
+                    .with_context(|| format!("failed to generate SIR for symbol {qualified_name}")),
+            };
 
             match generated {
-                Ok(sir) => SirGenerationOutcome::Success(GeneratedSir { symbol, sir }),
+                Ok(result) => SirGenerationOutcome::Success(GeneratedSir {
+                    symbol,
+                    sir: result.sir,
+                    provider_name: result.provider,
+                    model_name: result.model,
+                }),
+                Err(err)
+                    if is_parse_validation_exhausted_error(&err)
+                        && tiered_parse_fallback_provider.is_some() =>
+                {
+                    let fallback_model = tiered_parse_fallback_model
+                        .as_deref()
+                        .unwrap_or("fallback");
+                    tracing::warn!(
+                        "WARN: Primary model parse failure for {}. Falling back to {}.",
+                        qualified_name,
+                        fallback_model
+                    );
+
+                    let fallback_provider = tiered_parse_fallback_provider
+                        .as_ref()
+                        .expect("checked is_some above")
+                        .clone();
+                    let fallback_generated = generate_sir_with_retries(
+                        fallback_provider.clone(),
+                        symbol_text.clone(),
+                        context.clone(),
+                    );
+                    let fallback_generated = match custom_prompt {
+                        Some(prompt) => generate_sir_from_prompt_with_retries(
+                            fallback_provider,
+                            prompt,
+                            context,
+                            deep_mode,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed fallback deep/custom SIR generation after primary parse failure for {qualified_name}"
+                            )
+                        }),
+                        None => fallback_generated.await.with_context(|| {
+                            format!(
+                                "failed fallback SIR generation after primary parse failure for {qualified_name}"
+                            )
+                        }),
+                    };
+
+                    match fallback_generated {
+                        Ok(result) => SirGenerationOutcome::Success(GeneratedSir {
+                            symbol,
+                            sir: result.sir,
+                            provider_name: result.provider,
+                            model_name: result.model,
+                        }),
+                        Err(fallback_err) => SirGenerationOutcome::Failure(FailedSirGeneration {
+                            symbol,
+                            error_message: format!("{fallback_err:#}"),
+                        }),
+                    }
+                }
                 Err(err) => SirGenerationOutcome::Failure(FailedSirGeneration {
                     symbol,
                     error_message: format!("{err:#}"),
@@ -1444,18 +1769,70 @@ async fn generate_sir_jobs(
     Ok(results)
 }
 
+fn is_parse_validation_exhausted_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<InferError>()
+            .is_some_and(|inner| matches!(inner, InferError::ParseValidationExhausted(_)))
+    })
+}
+
 async fn generate_sir_with_retries(
     provider: Arc<dyn InferenceProvider>,
     symbol_text: String,
     context: SirContext,
-) -> Result<SirAnnotation> {
+) -> Result<InferSirResult> {
     let total_attempts = INFERENCE_MAX_RETRIES + 1;
     let mut last_error: Option<anyhow::Error> = None;
 
     for attempt in 0..total_attempts {
         let timeout_result = timeout(
             Duration::from_secs(INFERENCE_ATTEMPT_TIMEOUT_SECS),
-            provider.generate_sir(&symbol_text, &context),
+            provider.generate_sir_with_meta(&symbol_text, &context),
+        )
+        .await;
+
+        match timeout_result {
+            Ok(Ok(sir)) => return Ok(sir),
+            Ok(Err(err)) => {
+                last_error = Some(anyhow::Error::new(err).context(format!(
+                    "attempt {}/{} failed",
+                    attempt + 1,
+                    total_attempts
+                )));
+            }
+            Err(_) => {
+                last_error = Some(anyhow!(
+                    "attempt {}/{} timed out after {}s",
+                    attempt + 1,
+                    total_attempts,
+                    INFERENCE_ATTEMPT_TIMEOUT_SECS
+                ));
+            }
+        }
+
+        if attempt + 1 < total_attempts {
+            let backoff_ms = (INFERENCE_BACKOFF_BASE_MS << attempt).min(INFERENCE_BACKOFF_MAX_MS);
+            sleep(Duration::from_millis(backoff_ms)).await;
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("inference failed without an error message")))
+}
+
+async fn generate_sir_from_prompt_with_retries(
+    provider: Arc<dyn InferenceProvider>,
+    prompt: String,
+    context: SirContext,
+    deep_mode: bool,
+) -> Result<InferSirResult> {
+    let total_attempts = INFERENCE_MAX_RETRIES + 1;
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for attempt in 0..total_attempts {
+        let timeout_result = timeout(
+            Duration::from_secs(INFERENCE_ATTEMPT_TIMEOUT_SECS),
+            provider.generate_sir_from_prompt_with_meta(prompt.as_str(), &context, deep_mode),
         )
         .await;
 

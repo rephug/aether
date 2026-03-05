@@ -1,19 +1,26 @@
+use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::Path;
 
 use aether_config::{
-    DEFAULT_LOG_LEVEL, SearchRerankerKind, ensure_workspace_config, validate_config,
+    DEFAULT_LOG_LEVEL, InferenceProviderKind, SearchRerankerKind, ensure_workspace_config,
+    validate_config,
 };
+use aether_core::{Symbol, SymbolChangeEvent};
+use aether_infer::ProviderOverrides;
+use aether_infer::sir_prompt::SirEnrichmentContext;
 use aether_infer::{download_candle_embedding_model, download_candle_reranker_model};
-use aether_store::SqliteStore;
+use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
 #[cfg(feature = "legacy-cozo")]
 use aether_store::migrate_cozo_to_surreal;
+use aether_store::{SqliteStore, Store};
 use aetherd::calibrate::run_calibration_once;
 use aetherd::causal::run_trace_cause_command;
 use aetherd::cli::{
     AskArgs, BlastRadiusArgs, Cli, Commands, CommunitiesArgs, CouplingReportArgs, DriftAckArgs,
     DriftReportArgs, FsckArgs, HealthArgs, InitAgentArgs, LogFormat, MineCouplingArgs, NotesArgs,
-    RecallArgs, RememberArgs, SetupLocalArgs, TestIntentsArgs, TraceCauseArgs, parse_cli,
+    RecallArgs, RegenerateArgs, RememberArgs, SetupLocalArgs, TestIntentsArgs, TraceCauseArgs,
+    parse_cli,
 };
 use aetherd::coupling::{
     run_blast_radius_command, run_coupling_report_command, run_mine_coupling_command,
@@ -22,12 +29,14 @@ use aetherd::drift::{run_communities_command, run_drift_ack_command, run_drift_r
 use aetherd::fsck::run_fsck;
 use aetherd::health::run_health_command;
 use aetherd::indexer::{
-    IndexerConfig, run_full_index_once_for_cli, run_indexing_loop, run_initial_index_once_for_cli,
+    IndexerConfig, compute_symbol_priority_scores, run_full_index_once_for_cli, run_indexing_loop,
+    run_initial_index_once_for_cli,
 };
 use aetherd::init_agent::{InitAgentOptions, run_init_agent};
 use aetherd::memory::{
     run_ask_command, run_notes_command, run_recall_command, run_remember_command,
 };
+use aetherd::observer::ObserverState;
 use aetherd::search::run_search_once;
 use aetherd::setup_local::{SetupLocalOptions, run_setup_local};
 use aetherd::test_intents::run_test_intents_command;
@@ -65,6 +74,20 @@ fn run(cli: Cli) -> Result<()> {
             message = %warning.message,
             "AETHER config warning"
         );
+    }
+
+    if cli.deep && !cli.full {
+        return Err(anyhow!(
+            "--deep requires --full (two-pass pipeline needs full triage first)"
+        ));
+    }
+
+    let selected_provider = cli.inference_provider.unwrap_or(config.inference.provider);
+    if config.sir_quality.deep_pass
+        && selected_provider == InferenceProviderKind::Qwen3Local
+        && config.sir_quality.deep_provider.is_none()
+    {
+        tracing::info!("Deep pass will use local CoT mode (thinking enabled, 8192 context).");
     }
 
     if cli.download_models {
@@ -230,7 +253,11 @@ fn run(cli: Cli) -> Result<()> {
         print_sir: cli.print_sir,
         force: cli.force,
         full: cli.full,
-        sir_concurrency: cli.sir_concurrency,
+        deep: cli.deep,
+        sir_concurrency: cli
+            .sir_concurrency
+            .unwrap_or(config.inference.concurrency)
+            .max(1),
         lifecycle_logs: cli.lsp && cli.index && std::io::stdout().is_terminal(),
         inference_provider: cli.inference_provider,
         inference_model: cli.inference_model,
@@ -275,6 +302,7 @@ fn run(cli: Cli) -> Result<()> {
 fn run_subcommand(workspace: &Path, command: Commands) -> Result<()> {
     match command {
         Commands::InitAgent(args) => run_init_agent_command(workspace, args),
+        Commands::Regenerate(args) => run_regenerate_command(workspace, args),
         Commands::SetupLocal(args) => run_setup_local_command(workspace, args),
         Commands::Status => run_status_subcommand(workspace),
         Commands::Remember(args) => run_remember_note_command(workspace, args),
@@ -327,6 +355,328 @@ fn run_init_agent_command(workspace: &Path, args: InitAgentArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct RegenerateCandidate {
+    symbol: Symbol,
+    provider: String,
+    confidence: f32,
+    priority: f64,
+    baseline_sir: SirAnnotation,
+}
+
+fn run_regenerate_command(workspace: &Path, args: RegenerateArgs) -> Result<()> {
+    let config = ensure_workspace_config(workspace)
+        .context("failed to load workspace config for regenerate command")?;
+    let store = SqliteStore::open(workspace).context("failed to open local store")?;
+
+    let mut observer =
+        ObserverState::new(workspace.to_path_buf()).context("failed to initialize observer")?;
+    observer
+        .seed_from_disk()
+        .context("failed to seed observer from workspace")?;
+    let mut symbols_by_id = HashMap::<String, Symbol>::new();
+    for event in observer.initial_symbol_events() {
+        for symbol in event.added.iter().chain(event.updated.iter()) {
+            symbols_by_id.insert(symbol.id.clone(), symbol.clone());
+        }
+    }
+    let all_symbols = symbols_by_id.values().cloned().collect::<Vec<_>>();
+    let priority_scores = compute_symbol_priority_scores(workspace, &store, &all_symbols);
+
+    let mut candidates = Vec::<RegenerateCandidate>::new();
+    for symbol in all_symbols {
+        if let Some(file_filter) = args.file.as_deref()
+            && symbol.file_path != file_filter
+        {
+            continue;
+        }
+
+        let Some(meta) = store.get_sir_meta(symbol.id.as_str())? else {
+            continue;
+        };
+        if let Some(provider_filter) = args.from_provider.as_deref()
+            && meta.provider != provider_filter
+        {
+            continue;
+        }
+
+        let Some(blob) = store.read_sir_blob(symbol.id.as_str())? else {
+            continue;
+        };
+        let Ok(sir) = serde_json::from_str::<SirAnnotation>(&blob) else {
+            continue;
+        };
+        if sir.confidence >= args.below_confidence {
+            continue;
+        }
+
+        candidates.push(RegenerateCandidate {
+            symbol,
+            provider: meta.provider,
+            confidence: sir.confidence,
+            priority: priority_scores
+                .get(meta.id.as_str())
+                .copied()
+                .unwrap_or(0.0),
+            baseline_sir: sir,
+        });
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .priority
+            .total_cmp(&left.priority)
+            .then_with(|| left.confidence.total_cmp(&right.confidence))
+            .then_with(|| left.symbol.id.cmp(&right.symbol.id))
+    });
+    if let Some(limit) = args.max
+        && candidates.len() > limit
+    {
+        candidates.truncate(limit);
+    }
+
+    if args.dry_run {
+        println!(
+            "{:<32} {:<15} {:<10} {:<8}",
+            "Symbol", "Provider", "Confidence", "Priority"
+        );
+        for candidate in &candidates {
+            println!(
+                "{:<32} {:<15} {:<10.2} {:<8.2}",
+                truncate_display_name(candidate.symbol.qualified_name.as_str(), 32),
+                truncate_display_name(candidate.provider.as_str(), 15),
+                candidate.confidence,
+                candidate.priority,
+            );
+        }
+        println!("({} symbols would be regenerated)", candidates.len());
+        return Ok(());
+    }
+
+    let main_pipeline = SirPipeline::new(
+        workspace.to_path_buf(),
+        config.inference.concurrency.max(1),
+        ProviderOverrides::default(),
+    )
+    .context("failed to initialize primary regeneration pipeline")?;
+
+    let mut owned_deep_pipeline: Option<SirPipeline> = None;
+    if args.deep
+        && let Some(provider_raw) = config.sir_quality.deep_provider.clone()
+    {
+        let deep_provider = provider_raw
+            .parse::<InferenceProviderKind>()
+            .map_err(|error| {
+                anyhow!(
+                    "invalid sir_quality.deep_provider value '{}': {}",
+                    provider_raw,
+                    error
+                )
+            })?;
+        owned_deep_pipeline = Some(
+            SirPipeline::new(
+                workspace.to_path_buf(),
+                config.sir_quality.deep_concurrency.max(1),
+                ProviderOverrides {
+                    provider: Some(deep_provider),
+                    model: config.sir_quality.deep_model.clone(),
+                    endpoint: config.sir_quality.deep_endpoint.clone(),
+                    api_key_env: config.sir_quality.deep_api_key_env.clone(),
+                },
+            )
+            .context("failed to initialize deep regeneration pipeline")?,
+        );
+    }
+    let deep_pipeline = owned_deep_pipeline.as_ref().unwrap_or(&main_pipeline);
+    let use_cot =
+        args.deep && deep_pipeline.provider_name() == InferenceProviderKind::Qwen3Local.as_str();
+
+    let total = candidates.len();
+    let mut successes = 0usize;
+    let mut failures = 0usize;
+    let mut stdout = std::io::stdout();
+    for candidate in candidates {
+        let event = SymbolChangeEvent {
+            file_path: candidate.symbol.file_path.clone(),
+            language: candidate.symbol.language,
+            added: Vec::new(),
+            removed: Vec::new(),
+            updated: vec![candidate.symbol.clone()],
+        };
+        let result = if args.deep {
+            let enrichment = build_regeneration_enrichment_context(
+                &store,
+                &candidate,
+                &priority_scores,
+                config.sir_quality.deep_max_neighbors,
+                config.sir_quality.deep_priority_threshold,
+                config.sir_quality.deep_confidence_threshold,
+            )?;
+            let mut deep_specs = HashMap::new();
+            deep_specs.insert(
+                candidate.symbol.id.clone(),
+                SirDeepPromptSpec {
+                    enrichment,
+                    use_cot,
+                },
+            );
+            deep_pipeline.process_event_with_deep_specs(
+                &store,
+                &event,
+                true,
+                false,
+                &mut stdout,
+                Some(candidate.priority),
+                SIR_GENERATION_PASS_REGENERATED,
+                &deep_specs,
+            )
+        } else {
+            main_pipeline.process_event_with_priority_and_pass(
+                &store,
+                &event,
+                true,
+                false,
+                &mut stdout,
+                Some(candidate.priority),
+                SIR_GENERATION_PASS_REGENERATED,
+            )
+        };
+
+        match result {
+            Ok(stats) => {
+                successes += stats.success_count;
+                failures += stats.failure_count;
+            }
+            Err(err) => {
+                failures += 1;
+                tracing::warn!(
+                    symbol_id = %candidate.symbol.id,
+                    qualified_name = %candidate.symbol.qualified_name,
+                    error = %err,
+                    "regenerate symbol failed"
+                );
+            }
+        }
+    }
+
+    println!(
+        "Regenerated {} symbols. {} succeeded, {} failed.",
+        total, successes, failures
+    );
+    Ok(())
+}
+
+fn build_regeneration_enrichment_context(
+    store: &SqliteStore,
+    candidate: &RegenerateCandidate,
+    priority_scores: &HashMap<String, f64>,
+    max_neighbors: usize,
+    deep_priority_threshold: f64,
+    deep_confidence_threshold: f64,
+) -> Result<SirEnrichmentContext> {
+    let file_rollup_id = synthetic_file_sir_id(
+        candidate.symbol.language.as_str(),
+        candidate.symbol.file_path.as_str(),
+    );
+    let file_intent = store
+        .read_sir_blob(file_rollup_id.as_str())?
+        .and_then(|blob| serde_json::from_str::<FileSir>(&blob).ok())
+        .map(|sir| sir.intent);
+
+    let mut neighbors = Vec::<(f64, String, String)>::new();
+    for peer in store.list_symbols_for_file(candidate.symbol.file_path.as_str())? {
+        if peer.id == candidate.symbol.id {
+            continue;
+        }
+        let Some(blob) = store.read_sir_blob(peer.id.as_str())? else {
+            continue;
+        };
+        let Ok(peer_sir) = serde_json::from_str::<SirAnnotation>(&blob) else {
+            continue;
+        };
+        neighbors.push((
+            priority_scores
+                .get(peer.id.as_str())
+                .copied()
+                .unwrap_or(0.0),
+            peer.qualified_name,
+            peer_sir.intent,
+        ));
+    }
+    neighbors.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    if max_neighbors > 0 && neighbors.len() > max_neighbors {
+        neighbors.truncate(max_neighbors);
+    }
+
+    Ok(SirEnrichmentContext {
+        file_intent,
+        neighbor_intents: neighbors
+            .into_iter()
+            .map(|(_, name, intent)| (name, intent))
+            .collect(),
+        baseline_sir: Some(candidate.baseline_sir.clone()),
+        priority_reason: format_regeneration_priority_reason(
+            store,
+            candidate.symbol.id.as_str(),
+            candidate.priority,
+            candidate.confidence as f64,
+            deep_priority_threshold,
+            deep_confidence_threshold,
+        ),
+    })
+}
+
+fn format_regeneration_priority_reason(
+    store: &SqliteStore,
+    symbol_id: &str,
+    priority_score: f64,
+    confidence: f64,
+    deep_priority_threshold: f64,
+    deep_confidence_threshold: f64,
+) -> String {
+    let mut reasons = Vec::<String>::new();
+    if priority_score > deep_priority_threshold {
+        reasons.push(format!(
+            "priority {:.2} above threshold {:.2}",
+            priority_score, deep_priority_threshold
+        ));
+    }
+    if confidence < deep_confidence_threshold {
+        reasons.push(format!(
+            "confidence {:.2} below threshold {:.2}",
+            confidence, deep_confidence_threshold
+        ));
+    }
+    if let Ok(Some(metadata)) = store.get_symbol_metadata(symbol_id) {
+        if metadata.is_public {
+            reasons.push("public API symbol".to_owned());
+        }
+        let kind = metadata.kind.to_ascii_lowercase();
+        if kind == "function" || kind == "method" {
+            reasons.push("function/method".to_owned());
+        }
+    }
+    if reasons.is_empty() {
+        "selected for regeneration".to_owned()
+    } else {
+        reasons.join(" + ")
+    }
+}
+
+fn truncate_display_name(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_owned();
+    }
+    let keep = width.saturating_sub(3);
+    let truncated = value.chars().take(keep).collect::<String>();
+    format!("{truncated}...")
 }
 
 fn run_setup_local_command(workspace: &Path, args: SetupLocalArgs) -> Result<()> {
@@ -483,3 +833,4 @@ fn build_env_filter(configured_log_level: &str) -> tracing_subscriber::EnvFilter
         .or_else(|_| tracing_subscriber::EnvFilter::try_new(configured_log_level))
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_LEVEL))
 }
+use aetherd::sir_pipeline::{SIR_GENERATION_PASS_REGENERATED, SirDeepPromptSpec, SirPipeline};

@@ -73,6 +73,7 @@ pub struct SirMetaRecord {
     pub sir_version: i64,
     pub provider: String,
     pub model: String,
+    pub generation_pass: String,
     pub updated_at: i64,
     pub sir_status: String,
     pub last_error: Option<String>,
@@ -1928,15 +1929,16 @@ impl Store for SqliteStore {
         self.conn.lock().unwrap().execute(
             r#"
             INSERT INTO sir (
-                id, sir_hash, sir_version, provider, model, updated_at,
+                id, sir_hash, sir_version, provider, model, generation_pass, updated_at,
                 sir_status, last_error, last_attempt_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             ON CONFLICT(id) DO UPDATE SET
                 sir_hash = excluded.sir_hash,
                 sir_version = excluded.sir_version,
                 provider = excluded.provider,
                 model = excluded.model,
+                generation_pass = excluded.generation_pass,
                 updated_at = excluded.updated_at,
                 sir_status = excluded.sir_status,
                 last_error = excluded.last_error,
@@ -1948,6 +1950,7 @@ impl Store for SqliteStore {
                 record.sir_version,
                 record.provider,
                 record.model,
+                record.generation_pass,
                 record.updated_at,
                 record.sir_status,
                 record.last_error,
@@ -1968,6 +1971,7 @@ impl Store for SqliteStore {
                 sir_version,
                 provider,
                 model,
+                generation_pass,
                 updated_at,
                 sir_status,
                 last_error,
@@ -1985,10 +1989,15 @@ impl Store for SqliteStore {
                     sir_version: row.get(2)?,
                     provider: row.get(3)?,
                     model: row.get(4)?,
-                    updated_at: row.get(5)?,
-                    sir_status: row.get(6)?,
-                    last_error: row.get(7)?,
-                    last_attempt_at: row.get(8)?,
+                    generation_pass: row
+                        .get::<_, Option<String>>(5)?
+                        .map(|value| value.trim().to_owned())
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| "single".to_owned()),
+                    updated_at: row.get(6)?,
+                    sir_status: row.get(7)?,
+                    last_error: row.get(8)?,
+                    last_attempt_at: row.get(9)?,
                 })
             })
             .optional()?;
@@ -4055,6 +4064,7 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         ensure_sir_column(conn, "sir_status", "TEXT NOT NULL DEFAULT 'fresh'")?;
         ensure_sir_column(conn, "last_error", "TEXT")?;
         ensure_sir_column(conn, "last_attempt_at", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_sir_column(conn, "generation_pass", "TEXT DEFAULT 'single'")?;
         ensure_sir_history_column(conn, "commit_hash", "TEXT")?;
         ensure_symbols_column(conn, "access_count", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_symbols_column(conn, "last_accessed_at", "INTEGER")?;
@@ -4176,6 +4186,17 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         conn.execute("PRAGMA user_version = 4", [])?;
     }
 
+    if version < 5 {
+        if table_exists(conn, "sir")? {
+            ensure_sir_column(conn, "generation_pass", "TEXT DEFAULT 'single'")?;
+            conn.execute(
+                "UPDATE sir SET generation_pass = 'single' WHERE COALESCE(TRIM(generation_pass), '') = ''",
+                [],
+            )?;
+        }
+        conn.execute("PRAGMA user_version = 5", [])?;
+    }
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -4208,6 +4229,10 @@ fn ensure_sir_column(
     column_name: &str,
     column_definition: &str,
 ) -> Result<(), StoreError> {
+    if !table_exists(conn, "sir")? {
+        return Ok(());
+    }
+
     if table_has_column(conn, "sir", column_name)? {
         return Ok(());
     }
@@ -4261,6 +4286,21 @@ fn table_has_column(
     }
 
     Ok(false)
+}
+
+fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, StoreError> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'table' AND name = ?1
+        LIMIT 1
+        "#,
+    )?;
+    let row = stmt
+        .query_row(params![table_name], |row| row.get::<_, i64>(0))
+        .optional()?;
+    Ok(row.is_some())
 }
 
 fn infer_symbol_is_public(path: &Path, qualified_name: &str) -> bool {
@@ -4352,6 +4392,7 @@ mod tests {
             sir_version: 1,
             provider: "none".to_owned(),
             model: "none".to_owned(),
+            generation_pass: "single".to_owned(),
             updated_at: 1_700_000_100,
             sir_status: "fresh".to_owned(),
             last_error: None,
@@ -4743,6 +4784,7 @@ graph_backend = "cozo"
             sir_version: 3,
             provider: "legacy-provider".to_owned(),
             model: "legacy-model".to_owned(),
+            generation_pass: "single".to_owned(),
             updated_at: 1_700_111_222,
             sir_status: "fresh".to_owned(),
             last_error: None,
@@ -4767,6 +4809,42 @@ graph_backend = "cozo"
             .get_sir_meta("sym-legacy")
             .expect("read metadata after backfill");
         assert_eq!(meta_after, Some(meta));
+    }
+
+    #[test]
+    fn get_sir_meta_defaults_generation_pass_to_single_when_null() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let store = SqliteStore::open(workspace).expect("open store");
+
+        let conn = store.conn.lock().expect("lock sqlite conn");
+        conn.execute(
+            r#"
+            INSERT INTO sir (
+                id, sir_hash, sir_version, provider, model, generation_pass, updated_at,
+                sir_status, last_error, last_attempt_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                "legacy-null-pass",
+                "hash-null",
+                1_i64,
+                "legacy-provider",
+                "legacy-model",
+                1_700_000_500_i64,
+                "fresh",
+                Option::<String>::None,
+                1_700_000_500_i64
+            ],
+        )
+        .expect("insert row with null generation_pass");
+        drop(conn);
+
+        let meta = store
+            .get_sir_meta("legacy-null-pass")
+            .expect("read migrated metadata")
+            .expect("metadata should exist");
+        assert_eq!(meta.generation_pass, "single");
     }
 
     #[test]
@@ -5418,13 +5496,13 @@ mirror_sir_files = false
         let first_version: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("query first user_version");
-        assert_eq!(first_version, 4);
+        assert_eq!(first_version, 5);
 
         run_migrations(&conn).expect("run migrations twice");
         let second_version: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("query second user_version");
-        assert_eq!(second_version, 4);
+        assert_eq!(second_version, 5);
     }
 
     #[test]
@@ -5434,7 +5512,7 @@ mirror_sir_files = false
 
         let schema = store.get_schema_version().expect("get schema version");
         assert_eq!(schema.component, "core");
-        assert_eq!(schema.version, 4);
+        assert_eq!(schema.version, 5);
         assert!(schema.migrated_at > 0);
     }
 
@@ -5624,7 +5702,7 @@ mirror_sir_files = false
         let version: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("query user_version");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
 
         let exists = conn
             .query_row(

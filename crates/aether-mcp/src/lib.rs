@@ -3132,6 +3132,7 @@ impl AetherMcpServer {
             sir_version: version_write.version,
             provider: "rollup".to_owned(),
             model: "deterministic".to_owned(),
+            generation_pass: "single".to_owned(),
             updated_at: version_write.updated_at,
             sir_status: "fresh".to_owned(),
             last_error: None,
