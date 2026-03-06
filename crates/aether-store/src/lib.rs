@@ -4197,6 +4197,10 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         conn.execute("PRAGMA user_version = 5", [])?;
     }
 
+    if version < 6 {
+        conn.execute("PRAGMA user_version = 6", [])?;
+    }
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -5496,13 +5500,13 @@ mirror_sir_files = false
         let first_version: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("query first user_version");
-        assert_eq!(first_version, 5);
+        assert_eq!(first_version, 6);
 
         run_migrations(&conn).expect("run migrations twice");
         let second_version: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("query second user_version");
-        assert_eq!(second_version, 5);
+        assert_eq!(second_version, 6);
     }
 
     #[test]
@@ -5512,7 +5516,7 @@ mirror_sir_files = false
 
         let schema = store.get_schema_version().expect("get schema version");
         assert_eq!(schema.component, "core");
-        assert_eq!(schema.version, 5);
+        assert_eq!(schema.version, 6);
         assert!(schema.migrated_at > 0);
     }
 
@@ -5702,7 +5706,7 @@ mirror_sir_files = false
         let version: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("query user_version");
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
 
         let exists = conn
             .query_row(
