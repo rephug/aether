@@ -26,7 +26,7 @@ pub use reranker::{MockRerankerProvider, RerankCandidate, RerankResult, Reranker
 
 pub const GEMINI_API_KEY_ENV: &str = DEFAULT_GEMINI_API_KEY_ENV;
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
-const GEMINI_DEFAULT_MODEL: &str = "gemini-flash-latest";
+const GEMINI_DEFAULT_MODEL: &str = "gemini-3.1-flash-lite-preview";
 const PARSE_VALIDATION_RETRIES: usize = 2;
 const OLLAMA_PULL_SUCCESS_STATUS: &str = "success";
 const OPENAI_COMPAT_JSON_FALLBACK_SUFFIX: &str =
@@ -51,6 +51,40 @@ pub(crate) fn management_http_client() -> reqwest::Client {
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+async fn is_ollama_reachable(endpoint: &str) -> bool {
+    let url = format!("{}/api/ps", endpoint.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(1))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    client
+        .get(&url)
+        .send()
+        .await
+        .map(|response| response.status().is_success())
+        .unwrap_or(false)
+}
+
+fn is_ollama_reachable_blocking(endpoint: &str) -> bool {
+    let endpoint = endpoint.to_owned();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map(|runtime| runtime.block_on(is_ollama_reachable(&endpoint)))
+            .unwrap_or(false)
+    })
+    .join()
+    .unwrap_or(false)
+}
+
+fn no_provider_available_message(endpoint: &str, api_key_env: &str) -> String {
+    format!(
+        "start Ollama on {} or set {} / configure [inference] provider explicitly in .aether/config.toml",
+        endpoint, api_key_env
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -149,6 +183,8 @@ pub enum InferError {
     Tokenizer(String),
     #[error("invalid inference config: {0}")]
     InvalidConfig(String),
+    #[error("no inference provider available: {0}")]
+    NoProviderAvailable(String),
     #[error("invalid model response: {0}")]
     InvalidResponse(String),
     #[error("SIR validation failed: {0}")]
@@ -906,18 +942,38 @@ pub fn load_inference_provider_from_config(
 
     match selected_provider {
         InferenceProviderKind::Auto => {
-            let api_key = read_env_non_empty(&selected_api_key_env).ok_or_else(|| {
-                InferError::MissingApiKey(
-                    "No inference API key found. Set GEMINI_API_KEY or configure a provider."
-                        .to_owned(),
-                )
-            })?;
-            let model = resolve_gemini_model(selected_model);
-            Ok(LoadedProvider {
-                provider: Box::new(GeminiProvider::new(Secret::new(api_key), model.clone())),
-                provider_name: InferenceProviderKind::Gemini.as_str().to_owned(),
-                model_name: model,
-            })
+            let ollama_endpoint = normalize_optional(selected_endpoint.clone())
+                .unwrap_or_else(|| DEFAULT_QWEN_ENDPOINT.to_owned());
+            if is_ollama_reachable_blocking(&ollama_endpoint) {
+                let provider =
+                    Qwen3LocalProvider::new(Some(ollama_endpoint.clone()), selected_model.clone());
+                tracing::info!(
+                    endpoint = %ollama_endpoint,
+                    model = %provider.model,
+                    "Auto provider selected qwen3_local after reaching Ollama"
+                );
+                Ok(LoadedProvider {
+                    model_name: provider.model.clone(),
+                    provider: Box::new(provider),
+                    provider_name: InferenceProviderKind::Qwen3Local.as_str().to_owned(),
+                })
+            } else if let Some(api_key) = read_env_non_empty(&selected_api_key_env) {
+                let model = resolve_gemini_model(selected_model);
+                tracing::info!(
+                    api_key_env = %selected_api_key_env,
+                    model = %model,
+                    "Auto provider selected gemini after finding API key"
+                );
+                Ok(LoadedProvider {
+                    provider: Box::new(GeminiProvider::new(Secret::new(api_key), model.clone())),
+                    provider_name: InferenceProviderKind::Gemini.as_str().to_owned(),
+                    model_name: model,
+                })
+            } else {
+                Err(InferError::NoProviderAvailable(
+                    no_provider_available_message(&ollama_endpoint, &selected_api_key_env),
+                ))
+            }
         }
         InferenceProviderKind::Tiered => {
             let tiered = config.inference.tiered.as_ref().ok_or_else(|| {
@@ -1140,18 +1196,41 @@ pub async fn summarize_text_with_config(
 
     match selected_provider {
         InferenceProviderKind::Auto => {
-            let api_key = read_env_non_empty(selected_api_key_env.as_str()).ok_or_else(|| {
-                InferError::MissingApiKey(
-                    "No inference API key found. Set GEMINI_API_KEY or configure a provider."
-                        .to_owned(),
+            let endpoint = normalize_optional(selected_endpoint.clone())
+                .unwrap_or_else(|| DEFAULT_QWEN_ENDPOINT.to_owned());
+            if is_ollama_reachable(endpoint.as_str()).await {
+                let model = normalize_optional(selected_model.clone())
+                    .unwrap_or_else(|| DEFAULT_QWEN_MODEL.to_owned());
+                tracing::info!(
+                    endpoint = %endpoint,
+                    model = %model,
+                    "Auto provider selected qwen3_local summary path after reaching Ollama"
+                );
+                let summary = request_qwen_summary(
+                    endpoint.as_str(),
+                    model.as_str(),
+                    system_prompt,
+                    user_prompt,
                 )
-            })?;
-            let model = resolve_gemini_model(selected_model);
-            let api_key = Secret::new(api_key);
-            let summary =
-                request_gemini_summary(&api_key, model.as_str(), system_prompt, user_prompt)
-                    .await?;
-            Ok(clean_summary(summary))
+                .await?;
+                Ok(clean_summary(summary))
+            } else if let Some(api_key) = read_env_non_empty(selected_api_key_env.as_str()) {
+                let model = resolve_gemini_model(selected_model);
+                let api_key = Secret::new(api_key);
+                tracing::info!(
+                    api_key_env = %selected_api_key_env,
+                    model = %model,
+                    "Auto provider selected gemini summary path after finding API key"
+                );
+                let summary =
+                    request_gemini_summary(&api_key, model.as_str(), system_prompt, user_prompt)
+                        .await?;
+                Ok(clean_summary(summary))
+            } else {
+                Err(InferError::NoProviderAvailable(
+                    no_provider_available_message(endpoint.as_str(), selected_api_key_env.as_str()),
+                ))
+            }
         }
         InferenceProviderKind::Tiered => {
             let tiered = config.inference.tiered.as_ref().ok_or_else(|| {
@@ -2503,17 +2582,18 @@ model_dir = ".aether/models"
             temp.path(),
             ProviderOverrides {
                 provider: Some(InferenceProviderKind::Auto),
+                endpoint: Some("http://127.0.0.1:9".to_owned()),
                 api_key_env: Some("AETHER_TEST_NONEXISTENT_KEY_ZZZZZ".to_owned()),
                 ..ProviderOverrides::default()
             },
         );
 
         match result {
-            Err(InferError::MissingApiKey(message)) => {
-                assert!(message.contains("No inference API key found"))
+            Err(InferError::NoProviderAvailable(message)) => {
+                assert!(message.contains("configure [inference] provider explicitly"))
             }
-            Ok(_) => panic!("expected missing api key error, got Ok result"),
-            Err(err) => panic!("expected missing api key error, got {err}"),
+            Ok(_) => panic!("expected no provider available error, got Ok result"),
+            Err(err) => panic!("expected no provider available error, got {err}"),
         }
     }
 
@@ -2540,6 +2620,7 @@ model_dir = ".aether/models"
             temp.path(),
             ProviderOverrides {
                 provider: Some(InferenceProviderKind::Auto),
+                endpoint: Some("http://127.0.0.1:9".to_owned()),
                 api_key_env: Some(env_name.clone()),
                 ..ProviderOverrides::default()
             },
@@ -2553,6 +2634,43 @@ model_dir = ".aether/models"
         unsafe {
             env::remove_var(env_name);
         }
+    }
+
+    #[test]
+    fn load_provider_auto_prefers_qwen_when_ollama_is_reachable() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let temp = tempdir().expect("tempdir");
+        ensure_workspace_config(temp.path()).expect("ensure config");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test ollama listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept health check");
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n[]")
+                .expect("write health response");
+        });
+
+        let loaded = load_provider_from_env_or_mock(
+            temp.path(),
+            ProviderOverrides {
+                provider: Some(InferenceProviderKind::Auto),
+                endpoint: Some(endpoint),
+                ..ProviderOverrides::default()
+            },
+        )
+        .expect("load provider");
+
+        assert_eq!(
+            loaded.provider_name,
+            InferenceProviderKind::Qwen3Local.as_str()
+        );
+        assert_eq!(loaded.model_name, DEFAULT_QWEN_MODEL);
+        server.join().expect("join health server");
     }
 
     #[test]

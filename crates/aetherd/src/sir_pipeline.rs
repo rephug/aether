@@ -47,7 +47,7 @@ const INFERENCE_ATTEMPT_TIMEOUT_SECS: u64 = 90;
 const INFERENCE_BACKOFF_BASE_MS: u64 = 200;
 const INFERENCE_BACKOFF_MAX_MS: u64 = 2_000;
 const MAX_SYMBOL_TEXT_CHARS: usize = 10_000;
-pub const SIR_GENERATION_PASS_SINGLE: &str = "single";
+pub const SIR_GENERATION_PASS_SCAN: &str = "scan";
 pub const SIR_GENERATION_PASS_TRIAGE: &str = "triage";
 pub const SIR_GENERATION_PASS_DEEP: &str = "deep";
 pub const SIR_GENERATION_PASS_PREMIUM: &str = "premium";
@@ -82,6 +82,7 @@ pub struct SirPipeline {
     vector_store: Arc<dyn VectorStore>,
     runtime: Runtime,
     sir_concurrency: usize,
+    inference_timeout_secs: u64,
     quality_monitor: Mutex<SirQualityMonitor>,
     tiered_parse_fallback_provider: Option<Arc<dyn InferenceProvider>>,
     tiered_parse_fallback_model: Option<String>,
@@ -188,6 +189,7 @@ impl SirPipeline {
             vector_store,
             runtime,
             sir_concurrency: concurrency,
+            inference_timeout_secs: INFERENCE_ATTEMPT_TIMEOUT_SECS,
             quality_monitor: Mutex::new(SirQualityMonitor::new(
                 SIR_QUALITY_FLOOR_WINDOW,
                 SIR_QUALITY_FLOOR_CONFIDENCE,
@@ -212,7 +214,7 @@ impl SirPipeline {
             print_sir,
             out,
             None,
-            SIR_GENERATION_PASS_SINGLE,
+            SIR_GENERATION_PASS_SCAN,
         )?;
         Ok(())
     }
@@ -233,7 +235,7 @@ impl SirPipeline {
             print_sir,
             out,
             priority_score,
-            SIR_GENERATION_PASS_SINGLE,
+            SIR_GENERATION_PASS_SCAN,
         )?;
         Ok(())
     }
@@ -383,6 +385,7 @@ impl SirPipeline {
                 self.tiered_parse_fallback_model.clone(),
                 jobs,
                 self.sir_concurrency,
+                self.inference_timeout_secs,
             ))?;
 
             let mark_intent_failed = |intent_id: &str, message: &str| {
@@ -793,6 +796,11 @@ impl SirPipeline {
 
     pub fn model_name(&self) -> &str {
         self.model_name.as_str()
+    }
+
+    pub fn with_inference_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.inference_timeout_secs = timeout_secs.max(1);
+        self
     }
 
     pub fn replay_incomplete_intents(
@@ -1305,7 +1313,7 @@ impl SirPipeline {
                 Ok(summary) if !summary.trim().is_empty() => summary,
                 Ok(_) => concatenate_leaf_intents(&sorted),
                 Err(err) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         file_path = %file_path,
                         error = %err,
                         "file rollup summarization failed, using deterministic concatenation"
@@ -1383,6 +1391,7 @@ impl SirPipeline {
                 self.provider.clone(),
                 summary_input,
                 context,
+                self.inference_timeout_secs,
             ))
             .with_context(|| format!("failed to summarize file intent for {file_path}"))?;
 
@@ -1458,7 +1467,7 @@ impl UpsertSirIntentPayload {
         let provider_name = payload_required_string(object, "provider_name")?;
         let model_name = payload_required_string(object, "model_name")?;
         let generation_pass = payload_required_string(object, "generation_pass")
-            .unwrap_or_else(|_| SIR_GENERATION_PASS_SINGLE.to_owned());
+            .unwrap_or_else(|_| SIR_GENERATION_PASS_SCAN.to_owned());
         let commit_hash = match object.get("commit_hash") {
             Some(Value::String(value)) => Some(value.clone()),
             Some(Value::Null) | None => None,
@@ -1641,6 +1650,7 @@ async fn generate_sir_jobs(
     tiered_parse_fallback_model: Option<String>,
     jobs: Vec<SirJob>,
     concurrency: usize,
+    timeout_secs: u64,
 ) -> Result<Vec<SirGenerationOutcome>> {
     let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut join_set = JoinSet::new();
@@ -1678,14 +1688,20 @@ async fn generate_sir_jobs(
                     prompt.clone(),
                     context.clone(),
                     deep_mode,
+                    timeout_secs,
                 )
                 .await
                 .with_context(|| {
                     format!("failed to generate deep/custom SIR for symbol {qualified_name}")
                 }),
-                None => generate_sir_with_retries(provider.clone(), symbol_text.clone(), context.clone())
-                    .await
-                    .with_context(|| format!("failed to generate SIR for symbol {qualified_name}")),
+                None => generate_sir_with_retries(
+                    provider.clone(),
+                    symbol_text.clone(),
+                    context.clone(),
+                    timeout_secs,
+                )
+                .await
+                .with_context(|| format!("failed to generate SIR for symbol {qualified_name}")),
             };
 
             match generated {
@@ -1716,6 +1732,7 @@ async fn generate_sir_jobs(
                         fallback_provider.clone(),
                         symbol_text.clone(),
                         context.clone(),
+                        timeout_secs,
                     );
                     let fallback_generated = match custom_prompt {
                         Some(prompt) => generate_sir_from_prompt_with_retries(
@@ -1723,6 +1740,7 @@ async fn generate_sir_jobs(
                             prompt,
                             context,
                             deep_mode,
+                            timeout_secs,
                         )
                         .await
                         .with_context(|| {
@@ -1781,13 +1799,14 @@ async fn generate_sir_with_retries(
     provider: Arc<dyn InferenceProvider>,
     symbol_text: String,
     context: SirContext,
+    timeout_secs: u64,
 ) -> Result<InferSirResult> {
     let total_attempts = INFERENCE_MAX_RETRIES + 1;
     let mut last_error: Option<anyhow::Error> = None;
 
     for attempt in 0..total_attempts {
         let timeout_result = timeout(
-            Duration::from_secs(INFERENCE_ATTEMPT_TIMEOUT_SECS),
+            Duration::from_secs(timeout_secs.max(1)),
             provider.generate_sir_with_meta(&symbol_text, &context),
         )
         .await;
@@ -1806,7 +1825,7 @@ async fn generate_sir_with_retries(
                     "attempt {}/{} timed out after {}s",
                     attempt + 1,
                     total_attempts,
-                    INFERENCE_ATTEMPT_TIMEOUT_SECS
+                    timeout_secs.max(1)
                 ));
             }
         }
@@ -1825,13 +1844,14 @@ async fn generate_sir_from_prompt_with_retries(
     prompt: String,
     context: SirContext,
     deep_mode: bool,
+    timeout_secs: u64,
 ) -> Result<InferSirResult> {
     let total_attempts = INFERENCE_MAX_RETRIES + 1;
     let mut last_error: Option<anyhow::Error> = None;
 
     for attempt in 0..total_attempts {
         let timeout_result = timeout(
-            Duration::from_secs(INFERENCE_ATTEMPT_TIMEOUT_SECS),
+            Duration::from_secs(timeout_secs.max(1)),
             provider.generate_sir_from_prompt_with_meta(prompt.as_str(), &context, deep_mode),
         )
         .await;
@@ -1850,7 +1870,7 @@ async fn generate_sir_from_prompt_with_retries(
                     "attempt {}/{} timed out after {}s",
                     attempt + 1,
                     total_attempts,
-                    INFERENCE_ATTEMPT_TIMEOUT_SECS
+                    timeout_secs.max(1)
                 ));
             }
         }

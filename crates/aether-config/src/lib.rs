@@ -17,6 +17,7 @@ pub const SIR_QUALITY_FLOOR_CONFIDENCE: f32 = 0.3;
 pub const SIR_QUALITY_FLOOR_WINDOW: usize = 10;
 pub const OLLAMA_SIR_TEMPERATURE: f32 = 0.1;
 pub const DEFAULT_SIR_CONCURRENCY: usize = 2;
+pub const GEMINI_DEFAULT_CONCURRENCY: usize = 16;
 pub const DEFAULT_COHERE_API_KEY_ENV: &str = "COHERE_API_KEY";
 pub const DEFAULT_VERIFY_CONTAINER_RUNTIME: &str = "docker";
 pub const DEFAULT_VERIFY_CONTAINER_IMAGE: &str = "rust:1-bookworm";
@@ -287,6 +288,36 @@ impl Default for InferenceConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SirQualityConfig {
     #[serde(default)]
+    pub triage_pass: bool,
+
+    #[serde(default = "default_triage_priority_threshold")]
+    pub triage_priority_threshold: f64,
+
+    #[serde(default = "default_triage_confidence_threshold")]
+    pub triage_confidence_threshold: f64,
+
+    #[serde(default)]
+    pub triage_provider: Option<String>,
+
+    #[serde(default)]
+    pub triage_model: Option<String>,
+
+    #[serde(default)]
+    pub triage_endpoint: Option<String>,
+
+    #[serde(default)]
+    pub triage_api_key_env: Option<String>,
+
+    #[serde(default = "default_triage_max_symbols")]
+    pub triage_max_symbols: usize,
+
+    #[serde(default = "default_triage_concurrency")]
+    pub triage_concurrency: usize,
+
+    #[serde(default = "default_triage_timeout_secs")]
+    pub triage_timeout_secs: u64,
+
+    #[serde(default)]
     pub deep_pass: bool,
 
     #[serde(default = "default_deep_priority_threshold")]
@@ -315,11 +346,24 @@ pub struct SirQualityConfig {
 
     #[serde(default = "default_deep_concurrency")]
     pub deep_concurrency: usize,
+
+    #[serde(default = "default_deep_timeout_secs")]
+    pub deep_timeout_secs: u64,
 }
 
 impl Default for SirQualityConfig {
     fn default() -> Self {
         Self {
+            triage_pass: false,
+            triage_priority_threshold: default_triage_priority_threshold(),
+            triage_confidence_threshold: default_triage_confidence_threshold(),
+            triage_provider: None,
+            triage_model: None,
+            triage_endpoint: None,
+            triage_api_key_env: None,
+            triage_max_symbols: default_triage_max_symbols(),
+            triage_concurrency: default_triage_concurrency(),
+            triage_timeout_secs: default_triage_timeout_secs(),
             deep_pass: false,
             deep_priority_threshold: default_deep_priority_threshold(),
             deep_confidence_threshold: default_deep_confidence_threshold(),
@@ -330,6 +374,7 @@ impl Default for SirQualityConfig {
             deep_max_symbols: default_deep_max_symbols(),
             deep_max_neighbors: default_deep_max_neighbors(),
             deep_concurrency: default_deep_concurrency(),
+            deep_timeout_secs: default_deep_timeout_secs(),
         }
     }
 }
@@ -848,7 +893,7 @@ pub fn load_workspace_config(
     }
 
     let raw = fs::read_to_string(path)?;
-    let parsed: AetherConfig = toml::from_str(&raw)?;
+    let parsed = parse_workspace_config_str(&raw)?;
     Ok(normalize_config(parsed))
 }
 
@@ -879,6 +924,45 @@ pub fn save_workspace_config(
     let content = toml::to_string_pretty(&normalized)?;
     fs::write(config_path(workspace_root), content)?;
     Ok(())
+}
+
+fn parse_workspace_config_str(raw: &str) -> Result<AetherConfig, ConfigError> {
+    let mut parsed: toml::Value = toml::from_str(raw)?;
+    rewrite_legacy_sir_quality_keys(&mut parsed);
+    parsed.try_into().map_err(Into::into)
+}
+
+fn rewrite_legacy_sir_quality_keys(parsed: &mut toml::Value) {
+    let Some(root) = parsed.as_table_mut() else {
+        return;
+    };
+    let Some(sir_quality) = root
+        .get_mut("sir_quality")
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return;
+    };
+
+    let has_new_triage_schema = sir_quality.keys().any(|key| key.starts_with("triage_"));
+    if has_new_triage_schema {
+        return;
+    }
+
+    for (legacy_key, triage_key) in [
+        ("deep_pass", "triage_pass"),
+        ("deep_provider", "triage_provider"),
+        ("deep_model", "triage_model"),
+        ("deep_endpoint", "triage_endpoint"),
+        ("deep_api_key_env", "triage_api_key_env"),
+        ("deep_priority_threshold", "triage_priority_threshold"),
+        ("deep_confidence_threshold", "triage_confidence_threshold"),
+        ("deep_max_symbols", "triage_max_symbols"),
+        ("deep_concurrency", "triage_concurrency"),
+    ] {
+        if let Some(value) = sir_quality.remove(legacy_key) {
+            sir_quality.insert(triage_key.to_owned(), value);
+        }
+    }
 }
 
 pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
@@ -953,15 +1037,7 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
     }
 
     match config.inference.provider {
-        InferenceProviderKind::Auto => {
-            if config.inference.endpoint.is_some() {
-                warnings.push(ConfigWarning {
-                    code: "inference_endpoint_ignored_for_auto",
-                    message: "inference.endpoint is ignored when inference.provider=auto"
-                        .to_owned(),
-                });
-            }
-        }
+        InferenceProviderKind::Auto => {}
         InferenceProviderKind::Tiered => {
             if config.inference.tiered.is_none() {
                 warnings.push(ConfigWarning {
@@ -1070,8 +1146,28 @@ fn default_sir_concurrency() -> usize {
     DEFAULT_SIR_CONCURRENCY
 }
 
-fn default_deep_priority_threshold() -> f64 {
+fn default_triage_priority_threshold() -> f64 {
     0.7
+}
+
+fn default_triage_confidence_threshold() -> f64 {
+    0.85
+}
+
+fn default_triage_max_symbols() -> usize {
+    0
+}
+
+fn default_triage_concurrency() -> usize {
+    4
+}
+
+fn default_triage_timeout_secs() -> u64 {
+    180
+}
+
+fn default_deep_priority_threshold() -> f64 {
+    0.9
 }
 
 fn default_deep_confidence_threshold() -> f64 {
@@ -1079,7 +1175,7 @@ fn default_deep_confidence_threshold() -> f64 {
 }
 
 fn default_deep_max_symbols() -> usize {
-    0
+    20
 }
 
 fn default_deep_max_neighbors() -> usize {
@@ -1088,6 +1184,10 @@ fn default_deep_max_neighbors() -> usize {
 
 fn default_deep_concurrency() -> usize {
     4
+}
+
+fn default_deep_timeout_secs() -> u64 {
+    180
 }
 
 fn default_tiered_primary_threshold() -> f64 {
@@ -1330,6 +1430,65 @@ fn normalize_optional_threshold(value: Option<f32>) -> Option<f32> {
     })
 }
 
+fn normalize_probability(value: f64, fallback: f64) -> f64 {
+    if !value.is_finite() {
+        fallback
+    } else {
+        value.clamp(0.0, 1.0)
+    }
+}
+
+fn normalize_provider_concurrency(provider: InferenceProviderKind, concurrency: usize) -> usize {
+    if provider == InferenceProviderKind::Gemini && concurrency == DEFAULT_SIR_CONCURRENCY {
+        GEMINI_DEFAULT_CONCURRENCY
+    } else {
+        concurrency.max(1)
+    }
+}
+
+fn normalize_sir_quality_config(config: &mut SirQualityConfig) {
+    config.triage_priority_threshold = normalize_probability(
+        config.triage_priority_threshold,
+        default_triage_priority_threshold(),
+    );
+    config.triage_confidence_threshold = normalize_probability(
+        config.triage_confidence_threshold,
+        default_triage_confidence_threshold(),
+    );
+    config.triage_provider = normalize_optional(config.triage_provider.take());
+    config.triage_model = normalize_optional(config.triage_model.take());
+    config.triage_endpoint = normalize_optional(config.triage_endpoint.take());
+    config.triage_api_key_env = normalize_optional(config.triage_api_key_env.take());
+    if config.triage_concurrency == 0 {
+        config.triage_concurrency = default_triage_concurrency();
+    }
+    if config.triage_timeout_secs == 0 {
+        config.triage_timeout_secs = default_triage_timeout_secs();
+    }
+
+    config.deep_priority_threshold = normalize_probability(
+        config.deep_priority_threshold,
+        default_deep_priority_threshold(),
+    );
+    config.deep_confidence_threshold = normalize_probability(
+        config.deep_confidence_threshold,
+        default_deep_confidence_threshold(),
+    );
+    config.deep_provider = normalize_optional(config.deep_provider.take());
+    config.deep_model = normalize_optional(config.deep_model.take());
+    config.deep_endpoint = normalize_optional(config.deep_endpoint.take());
+    config.deep_api_key_env = normalize_optional(config.deep_api_key_env.take());
+    if config.deep_max_neighbors == 0 {
+        config.deep_max_neighbors = default_deep_max_neighbors();
+    }
+    if config.deep_concurrency == 0 {
+        config.deep_concurrency = default_deep_concurrency();
+    }
+    if config.deep_timeout_secs == 0 {
+        config.deep_timeout_secs = default_deep_timeout_secs();
+    }
+}
+
 fn normalize_patterns(patterns: Vec<String>) -> Vec<String> {
     let mut normalized = Vec::new();
     for raw in patterns {
@@ -1438,6 +1597,8 @@ fn normalize_config(mut config: AetherConfig) -> AetherConfig {
     if config.inference.concurrency == 0 {
         config.inference.concurrency = default_sir_concurrency();
     }
+    config.inference.concurrency =
+        normalize_provider_concurrency(config.inference.provider, config.inference.concurrency);
     if let Some(tiered) = config.inference.tiered.as_mut() {
         tiered.primary =
             normalize_with_default(std::mem::take(&mut tiered.primary), "gemini".to_owned());
@@ -1456,29 +1617,7 @@ fn normalize_config(mut config: AetherConfig) -> AetherConfig {
         tiered.fallback_endpoint = normalize_optional(tiered.fallback_endpoint.take())
             .or_else(default_tiered_fallback_endpoint);
     }
-    if !config.sir_quality.deep_priority_threshold.is_finite() {
-        config.sir_quality.deep_priority_threshold = default_deep_priority_threshold();
-    } else {
-        config.sir_quality.deep_priority_threshold =
-            config.sir_quality.deep_priority_threshold.clamp(0.0, 1.0);
-    }
-    if !config.sir_quality.deep_confidence_threshold.is_finite() {
-        config.sir_quality.deep_confidence_threshold = default_deep_confidence_threshold();
-    } else {
-        config.sir_quality.deep_confidence_threshold =
-            config.sir_quality.deep_confidence_threshold.clamp(0.0, 1.0);
-    }
-    config.sir_quality.deep_provider = normalize_optional(config.sir_quality.deep_provider.take());
-    config.sir_quality.deep_model = normalize_optional(config.sir_quality.deep_model.take());
-    config.sir_quality.deep_endpoint = normalize_optional(config.sir_quality.deep_endpoint.take());
-    config.sir_quality.deep_api_key_env =
-        normalize_optional(config.sir_quality.deep_api_key_env.take());
-    if config.sir_quality.deep_max_neighbors == 0 {
-        config.sir_quality.deep_max_neighbors = default_deep_max_neighbors();
-    }
-    if config.sir_quality.deep_concurrency == 0 {
-        config.sir_quality.deep_concurrency = default_deep_concurrency();
-    }
+    normalize_sir_quality_config(&mut config.sir_quality);
     config.embeddings.model = normalize_optional(config.embeddings.model.take());
     config.embeddings.endpoint = normalize_optional(config.embeddings.endpoint.take());
     config.embeddings.candle.model_dir =
@@ -1605,12 +1744,19 @@ mod tests {
         assert_eq!(config.inference.provider, InferenceProviderKind::Auto);
         assert_eq!(config.inference.api_key_env, DEFAULT_GEMINI_API_KEY_ENV);
         assert_eq!(config.inference.concurrency, DEFAULT_SIR_CONCURRENCY);
+        assert!(!config.sir_quality.triage_pass);
+        assert_eq!(config.sir_quality.triage_priority_threshold, 0.7);
+        assert_eq!(config.sir_quality.triage_confidence_threshold, 0.85);
+        assert_eq!(config.sir_quality.triage_max_symbols, 0);
+        assert_eq!(config.sir_quality.triage_concurrency, 4);
+        assert_eq!(config.sir_quality.triage_timeout_secs, 180);
         assert!(!config.sir_quality.deep_pass);
-        assert_eq!(config.sir_quality.deep_priority_threshold, 0.7);
+        assert_eq!(config.sir_quality.deep_priority_threshold, 0.9);
         assert_eq!(config.sir_quality.deep_confidence_threshold, 0.85);
-        assert_eq!(config.sir_quality.deep_max_symbols, 0);
+        assert_eq!(config.sir_quality.deep_max_symbols, 20);
         assert_eq!(config.sir_quality.deep_max_neighbors, 10);
         assert_eq!(config.sir_quality.deep_concurrency, 4);
+        assert_eq!(config.sir_quality.deep_timeout_secs, 180);
         assert!(config.storage.mirror_sir_files);
         assert_eq!(config.storage.graph_backend, GraphBackend::Surreal);
         assert!(!config.embeddings.enabled);
@@ -1735,6 +1881,7 @@ mod tests {
         assert!(content.contains("provider = \"auto\""));
         assert!(content.contains("concurrency = 2"));
         assert!(content.contains("[sir_quality]"));
+        assert!(content.contains("triage_pass = false"));
         assert!(content.contains("deep_pass = false"));
         assert!(content.contains("[storage]"));
         assert!(content.contains("mirror_sir_files = true"));
@@ -2160,7 +2307,7 @@ risk_weights = { pagerank = 2.0, test_gap = 1.0, drift = 1.0, no_sir = 1.0, rece
 
         let raw = r#"
 [inference]
-provider = "auto"
+provider = "gemini"
 concurrency = 0
 
 [sir_quality]
@@ -2173,11 +2320,14 @@ deep_concurrency = 0
         fs::write(config_path(workspace), raw).expect("write config");
 
         let config = load_workspace_config(workspace).expect("load config");
-        assert_eq!(config.inference.concurrency, DEFAULT_SIR_CONCURRENCY);
-        assert_eq!(config.sir_quality.deep_priority_threshold, 1.0);
-        assert_eq!(config.sir_quality.deep_confidence_threshold, 0.0);
+        assert_eq!(config.inference.concurrency, GEMINI_DEFAULT_CONCURRENCY);
+        assert!(config.sir_quality.triage_pass);
+        assert_eq!(config.sir_quality.triage_priority_threshold, 1.0);
+        assert_eq!(config.sir_quality.triage_confidence_threshold, 0.0);
+        assert_eq!(config.sir_quality.triage_concurrency, 4);
         assert_eq!(config.sir_quality.deep_max_neighbors, 10);
         assert_eq!(config.sir_quality.deep_concurrency, 4);
+        assert_eq!(config.sir_quality.deep_timeout_secs, 180);
     }
 
     #[test]
@@ -2223,10 +2373,45 @@ deep_concurrency = 0
             .map(|warning| warning.code)
             .collect::<Vec<_>>();
 
-        assert!(codes.contains(&"inference_endpoint_ignored_for_auto"));
         assert!(codes.contains(&"embeddings_model_ignored"));
         assert!(codes.contains(&"embeddings_endpoint_ignored"));
         assert!(codes.contains(&"graph_backend_cozo_deprecated"));
+    }
+
+    #[test]
+    fn load_workspace_config_keeps_new_triage_and_deep_schema_distinct() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(aether_dir(workspace)).expect("create .aether");
+
+        let raw = r#"
+[sir_quality]
+triage_pass = true
+triage_priority_threshold = 0.25
+triage_confidence_threshold = 0.5
+triage_concurrency = 0
+triage_timeout_secs = 0
+deep_pass = true
+deep_priority_threshold = 0.95
+deep_confidence_threshold = 0.8
+deep_max_symbols = 7
+deep_concurrency = 0
+deep_timeout_secs = 0
+"#;
+        fs::write(config_path(workspace), raw).expect("write config");
+
+        let config = load_workspace_config(workspace).expect("load config");
+        assert!(config.sir_quality.triage_pass);
+        assert_eq!(config.sir_quality.triage_priority_threshold, 0.25);
+        assert_eq!(config.sir_quality.triage_confidence_threshold, 0.5);
+        assert_eq!(config.sir_quality.triage_concurrency, 4);
+        assert_eq!(config.sir_quality.triage_timeout_secs, 180);
+        assert!(config.sir_quality.deep_pass);
+        assert_eq!(config.sir_quality.deep_priority_threshold, 0.95);
+        assert_eq!(config.sir_quality.deep_confidence_threshold, 0.8);
+        assert_eq!(config.sir_quality.deep_max_symbols, 7);
+        assert_eq!(config.sir_quality.deep_concurrency, 4);
+        assert_eq!(config.sir_quality.deep_timeout_secs, 180);
     }
 
     #[test]

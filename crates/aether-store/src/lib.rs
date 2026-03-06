@@ -1993,7 +1993,7 @@ impl Store for SqliteStore {
                         .get::<_, Option<String>>(5)?
                         .map(|value| value.trim().to_owned())
                         .filter(|value| !value.is_empty())
-                        .unwrap_or_else(|| "single".to_owned()),
+                        .unwrap_or_else(|| "scan".to_owned()),
                     updated_at: row.get(6)?,
                     sir_status: row.get(7)?,
                     last_error: row.get(8)?,
@@ -4064,7 +4064,7 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         ensure_sir_column(conn, "sir_status", "TEXT NOT NULL DEFAULT 'fresh'")?;
         ensure_sir_column(conn, "last_error", "TEXT")?;
         ensure_sir_column(conn, "last_attempt_at", "INTEGER NOT NULL DEFAULT 0")?;
-        ensure_sir_column(conn, "generation_pass", "TEXT DEFAULT 'single'")?;
+        ensure_sir_column(conn, "generation_pass", "TEXT DEFAULT 'scan'")?;
         ensure_sir_history_column(conn, "commit_hash", "TEXT")?;
         ensure_symbols_column(conn, "access_count", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_symbols_column(conn, "last_accessed_at", "INTEGER")?;
@@ -4188,13 +4188,28 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
 
     if version < 5 {
         if table_exists(conn, "sir")? {
-            ensure_sir_column(conn, "generation_pass", "TEXT DEFAULT 'single'")?;
+            ensure_sir_column(conn, "generation_pass", "TEXT DEFAULT 'scan'")?;
             conn.execute(
-                "UPDATE sir SET generation_pass = 'single' WHERE COALESCE(TRIM(generation_pass), '') = ''",
+                "UPDATE sir SET generation_pass = 'scan' WHERE COALESCE(TRIM(generation_pass), '') = ''",
                 [],
             )?;
         }
         conn.execute("PRAGMA user_version = 5", [])?;
+    }
+
+    if version < 6 {
+        if table_exists(conn, "sir")? {
+            ensure_sir_column(conn, "generation_pass", "TEXT DEFAULT 'scan'")?;
+            conn.execute(
+                "UPDATE sir SET generation_pass = 'scan' WHERE generation_pass IN ('triage', 'single')",
+                [],
+            )?;
+            conn.execute(
+                "UPDATE sir SET generation_pass = 'scan' WHERE COALESCE(TRIM(generation_pass), '') = ''",
+                [],
+            )?;
+        }
+        conn.execute("PRAGMA user_version = 6", [])?;
     }
 
     conn.execute_batch(
@@ -4392,7 +4407,7 @@ mod tests {
             sir_version: 1,
             provider: "none".to_owned(),
             model: "none".to_owned(),
-            generation_pass: "single".to_owned(),
+            generation_pass: "scan".to_owned(),
             updated_at: 1_700_000_100,
             sir_status: "fresh".to_owned(),
             last_error: None,
@@ -4784,7 +4799,7 @@ graph_backend = "cozo"
             sir_version: 3,
             provider: "legacy-provider".to_owned(),
             model: "legacy-model".to_owned(),
-            generation_pass: "single".to_owned(),
+            generation_pass: "scan".to_owned(),
             updated_at: 1_700_111_222,
             sir_status: "fresh".to_owned(),
             last_error: None,
@@ -4812,7 +4827,7 @@ graph_backend = "cozo"
     }
 
     #[test]
-    fn get_sir_meta_defaults_generation_pass_to_single_when_null() {
+    fn get_sir_meta_defaults_generation_pass_to_scan_when_null() {
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();
         let store = SqliteStore::open(workspace).expect("open store");
@@ -4844,7 +4859,56 @@ graph_backend = "cozo"
             .get_sir_meta("legacy-null-pass")
             .expect("read migrated metadata")
             .expect("metadata should exist");
-        assert_eq!(meta.generation_pass, "single");
+        assert_eq!(meta.generation_pass, "scan");
+    }
+
+    #[test]
+    fn migration_v6_renames_legacy_generation_pass_values_to_scan() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
+        let db_path = workspace.join(".aether/meta.sqlite");
+        let conn = Connection::open(&db_path).expect("open sqlite db");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE sir (
+                id TEXT PRIMARY KEY,
+                sir_hash TEXT NOT NULL,
+                sir_version INTEGER NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                generation_pass TEXT DEFAULT 'single',
+                updated_at INTEGER NOT NULL,
+                sir_status TEXT NOT NULL DEFAULT 'fresh',
+                last_error TEXT,
+                last_attempt_at INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO sir (id, sir_hash, sir_version, provider, model, generation_pass, updated_at, sir_status, last_error, last_attempt_at)
+            VALUES
+                ('sym-triage', 'hash-a', 1, 'legacy', 'legacy', 'triage', 1, 'fresh', NULL, 1),
+                ('sym-single', 'hash-b', 1, 'legacy', 'legacy', 'single', 1, 'fresh', NULL, 1);
+            PRAGMA user_version = 5;
+            "#,
+        )
+        .expect("seed legacy schema");
+        drop(conn);
+
+        let store = SqliteStore::open(workspace).expect("open migrated store");
+        let triage_meta = store
+            .get_sir_meta("sym-triage")
+            .expect("load triage meta")
+            .expect("triage meta exists");
+        let single_meta = store
+            .get_sir_meta("sym-single")
+            .expect("load single meta")
+            .expect("single meta exists");
+
+        assert_eq!(triage_meta.generation_pass, "scan");
+        assert_eq!(single_meta.generation_pass, "scan");
+        assert_eq!(
+            store.get_schema_version().expect("schema version").version,
+            6
+        );
     }
 
     #[test]
@@ -5496,13 +5560,13 @@ mirror_sir_files = false
         let first_version: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("query first user_version");
-        assert_eq!(first_version, 5);
+        assert_eq!(first_version, 6);
 
         run_migrations(&conn).expect("run migrations twice");
         let second_version: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("query second user_version");
-        assert_eq!(second_version, 5);
+        assert_eq!(second_version, 6);
     }
 
     #[test]
@@ -5512,7 +5576,7 @@ mirror_sir_files = false
 
         let schema = store.get_schema_version().expect("get schema version");
         assert_eq!(schema.component, "core");
-        assert_eq!(schema.version, 5);
+        assert_eq!(schema.version, 6);
         assert!(schema.migrated_at > 0);
     }
 
@@ -5702,7 +5766,7 @@ mirror_sir_files = false
         let version: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("query user_version");
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
 
         let exists = conn
             .query_row(

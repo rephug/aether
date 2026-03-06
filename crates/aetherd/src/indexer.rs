@@ -23,8 +23,8 @@ use crate::priority_queue::{
     SirPriorityQueue, compute_priority_score, kind_priority_score, size_inverse_score,
 };
 use crate::sir_pipeline::{
-    SIR_GENERATION_PASS_DEEP, SIR_GENERATION_PASS_SINGLE, SIR_GENERATION_PASS_TRIAGE,
-    SirDeepPromptSpec, SirPipeline,
+    SIR_GENERATION_PASS_DEEP, SIR_GENERATION_PASS_REGENERATED, SIR_GENERATION_PASS_SCAN,
+    SIR_GENERATION_PASS_TRIAGE, SirDeepPromptSpec, SirPipeline,
 };
 
 const REQUEST_POLL_BATCH: usize = 128;
@@ -154,9 +154,11 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
         }
         structural.process_event(&store, &event)?;
     }
+    let all_symbols = symbols_by_id.values().cloned().collect::<Vec<_>>();
+    let priority_scores = compute_symbol_priority_scores(&config.workspace, &store, &all_symbols);
     tracing::info!(
         symbol_count,
-        "Pass 1 complete: {} symbols indexed, lexical search + graph queries available",
+        "Structural index complete: {} symbols indexed, lexical search + graph queries available",
         symbol_count
     );
 
@@ -178,38 +180,25 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
             unresolved += 1;
             tracing::warn!(
                 symbol_id = %symbol_id,
-                "Pass 2 symbol missing from initial snapshot; skipping"
+                "Scan pass symbol missing from initial snapshot; skipping"
             );
         }
     }
 
-    let pass2_symbol_count: usize = symbols_by_file.values().map(Vec::len).sum();
+    let scan_symbol_count: usize = symbols_by_file.values().map(Vec::len).sum();
     tracing::info!(
-        symbol_count = pass2_symbol_count,
+        symbol_count = scan_symbol_count,
         file_count = symbols_by_file.len(),
         force = config.force,
-        "Pass 2: generating SIR for {} symbols",
-        pass2_symbol_count
+        "Scan pass: generating SIR for {} symbols",
+        scan_symbol_count
     );
     if unresolved > 0 {
         tracing::warn!(
             unresolved,
-            "Pass 2 skipped symbols missing from initial snapshot"
+            "Scan pass skipped symbols missing from initial snapshot"
         );
     }
-
-    // Collect all pass-2 symbols for priority scoring so Tiered routing works in batch mode.
-    let all_candidate_symbols: Vec<Symbol> = symbols_by_file
-        .values()
-        .flat_map(|syms| syms.iter().cloned())
-        .collect();
-    let priority_scores =
-        compute_symbol_priority_scores(&config.workspace, &store, &all_candidate_symbols);
-    let triage_generation_pass = if config.deep {
-        SIR_GENERATION_PASS_TRIAGE
-    } else {
-        SIR_GENERATION_PASS_SINGLE
-    };
 
     for (file_path, symbols) in symbols_by_file {
         if symbols.is_empty() {
@@ -233,29 +222,46 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
             config.print_sir,
             &mut stdout,
             Some(max_priority),
-            triage_generation_pass,
+            SIR_GENERATION_PASS_SCAN,
         ) {
             tracing::error!(
                 file_path = %event.file_path,
                 error = %err,
-                "Pass 2 SIR processing error"
+                "Scan pass SIR processing error"
             );
         }
     }
 
-    if config.deep {
+    let workspace_config = ensure_workspace_config(&config.workspace)
+        .context("failed to load workspace config for quality passes")?;
+    let quality = workspace_config.sir_quality;
+    let run_triage = quality.triage_pass || config.deep;
+    let run_deep = quality.deep_pass || config.deep;
+
+    if run_triage {
+        run_triage_pass(
+            config,
+            &store,
+            &symbols_by_id,
+            &priority_scores,
+            &quality,
+            &mut stdout,
+        )?;
+    }
+    if run_deep {
         run_deep_pass(
             config,
             &store,
-            &all_candidate_symbols,
+            &symbols_by_id,
             &priority_scores,
+            &quality,
             &mut stdout,
         )?;
     }
 
     let (total_symbols, symbols_with_sir) = store
         .count_symbols_with_sir()
-        .context("failed to compute SIR coverage after pass 2")?;
+        .context("failed to compute SIR coverage after quality pipeline")?;
     let coverage_pct = if total_symbols > 0 {
         (symbols_with_sir as f64 / total_symbols as f64) * 100.0
     } else {
@@ -265,7 +271,7 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
         symbols_with_sir,
         total_symbols,
         coverage_pct = coverage_pct,
-        "Pass 2 complete: SIR coverage"
+        "Quality pipeline complete: SIR coverage"
     );
 
     if config.lifecycle_logs {
@@ -291,81 +297,106 @@ pub fn run_full_index_once_for_cli(config: &IndexerConfig) -> Result<()> {
 }
 
 #[derive(Debug, Clone)]
-struct DeepPassCandidate {
+struct QualityPassCandidate {
     symbol: Symbol,
     priority_score: f64,
     baseline_sir: SirAnnotation,
 }
 
+fn run_triage_pass(
+    config: &IndexerConfig,
+    store: &SqliteStore,
+    symbols_by_id: &HashMap<String, Symbol>,
+    priority_scores: &HashMap<String, f64>,
+    quality: &aether_config::SirQualityConfig,
+    out: &mut dyn std::io::Write,
+) -> Result<()> {
+    let eligible_candidates =
+        collect_quality_pass_candidates(store, symbols_by_id, priority_scores, |pass| {
+            pass == SIR_GENERATION_PASS_TRIAGE
+                || pass == SIR_GENERATION_PASS_DEEP
+                || pass == SIR_GENERATION_PASS_REGENERATED
+        })?;
+    let candidates = select_quality_pass_candidates(
+        "Triage pass",
+        eligible_candidates,
+        quality.triage_priority_threshold,
+        quality.triage_confidence_threshold,
+        quality.triage_max_symbols,
+    );
+    if candidates.is_empty() {
+        tracing::info!("Triage pass: 0 symbols selected");
+        return Ok(());
+    }
+
+    let triage_provider = parse_quality_provider(
+        quality.triage_provider.clone(),
+        "sir_quality.triage_provider",
+    )?
+    .or(config.inference_provider);
+    let triage_pipeline = SirPipeline::new(
+        config.workspace.clone(),
+        quality.triage_concurrency.max(1),
+        ProviderOverrides {
+            provider: triage_provider,
+            model: quality
+                .triage_model
+                .clone()
+                .or_else(|| config.inference_model.clone()),
+            endpoint: quality
+                .triage_endpoint
+                .clone()
+                .or_else(|| config.inference_endpoint.clone()),
+            api_key_env: quality
+                .triage_api_key_env
+                .clone()
+                .or_else(|| config.inference_api_key_env.clone()),
+        },
+    )
+    .map(|pipeline| pipeline.with_inference_timeout_secs(quality.triage_timeout_secs))
+    .context("failed to initialize triage-pass provider pipeline")?;
+    run_quality_pass(
+        "Triage pass",
+        store,
+        &triage_pipeline,
+        candidates,
+        priority_scores,
+        quality.deep_max_neighbors,
+        quality.triage_priority_threshold,
+        quality.triage_confidence_threshold,
+        config.print_sir,
+        out,
+        SIR_GENERATION_PASS_TRIAGE,
+    )
+}
+
 fn run_deep_pass(
     config: &IndexerConfig,
     store: &SqliteStore,
-    triage_symbols: &[Symbol],
+    symbols_by_id: &HashMap<String, Symbol>,
     priority_scores: &HashMap<String, f64>,
+    quality: &aether_config::SirQualityConfig,
     out: &mut dyn std::io::Write,
 ) -> Result<()> {
-    let workspace_config = ensure_workspace_config(&config.workspace)
-        .context("failed to load workspace config for deep pass")?;
-    let quality = workspace_config.sir_quality;
-
-    let mut candidates = Vec::<DeepPassCandidate>::new();
-    for symbol in triage_symbols {
-        let Some(meta) = store.get_sir_meta(symbol.id.as_str())? else {
-            continue;
-        };
-        if !meta
-            .generation_pass
-            .eq_ignore_ascii_case(SIR_GENERATION_PASS_TRIAGE)
-        {
-            continue;
-        }
-
-        let Some(blob) = store.read_sir_blob(symbol.id.as_str())? else {
-            continue;
-        };
-        let Ok(baseline_sir) = serde_json::from_str::<SirAnnotation>(&blob) else {
-            continue;
-        };
-        let priority_score = priority_scores
-            .get(symbol.id.as_str())
-            .copied()
-            .unwrap_or(0.0);
-        let low_confidence = (baseline_sir.confidence as f64) < quality.deep_confidence_threshold;
-        let high_priority = priority_score > quality.deep_priority_threshold;
-        if high_priority || low_confidence {
-            candidates.push(DeepPassCandidate {
-                symbol: symbol.clone(),
-                priority_score,
-                baseline_sir,
-            });
-        }
-    }
-
-    candidates.sort_by(|left, right| {
-        right
-            .priority_score
-            .total_cmp(&left.priority_score)
-            .then_with(|| left.symbol.id.cmp(&right.symbol.id))
-    });
-    if quality.deep_max_symbols > 0 && candidates.len() > quality.deep_max_symbols {
-        candidates.truncate(quality.deep_max_symbols);
-    }
+    let eligible_candidates =
+        collect_quality_pass_candidates(store, symbols_by_id, priority_scores, |pass| {
+            pass == SIR_GENERATION_PASS_DEEP || pass == SIR_GENERATION_PASS_REGENERATED
+        })?;
+    let candidates = select_quality_pass_candidates(
+        "Deep pass",
+        eligible_candidates,
+        quality.deep_priority_threshold,
+        quality.deep_confidence_threshold,
+        quality.deep_max_symbols,
+    );
     if candidates.is_empty() {
         tracing::info!("Deep pass: 0 symbols selected");
         return Ok(());
     }
 
-    let deep_provider = if let Some(provider_raw) = quality.deep_provider.clone() {
-        Some(
-            provider_raw
-                .parse::<InferenceProviderKind>()
-                .map_err(|error| {
-                    anyhow::anyhow!("invalid sir_quality.deep_provider '{provider_raw}': {error}")
-                })?,
-        )
-    } else {
-        config.inference_provider
-    };
+    let deep_provider =
+        parse_quality_provider(quality.deep_provider.clone(), "sir_quality.deep_provider")?
+            .or(config.inference_provider);
     let deep_pipeline = SirPipeline::new(
         config.workspace.clone(),
         quality.deep_concurrency.max(1),
@@ -385,21 +416,149 @@ fn run_deep_pass(
                 .or_else(|| config.inference_api_key_env.clone()),
         },
     )
+    .map(|pipeline| pipeline.with_inference_timeout_secs(quality.deep_timeout_secs))
     .context("failed to initialize deep-pass provider pipeline")?;
-    let use_cot = deep_pipeline.provider_name() == InferenceProviderKind::Qwen3Local.as_str();
+    run_quality_pass(
+        "Deep pass",
+        store,
+        &deep_pipeline,
+        candidates,
+        priority_scores,
+        quality.deep_max_neighbors,
+        quality.deep_priority_threshold,
+        quality.deep_confidence_threshold,
+        config.print_sir,
+        out,
+        SIR_GENERATION_PASS_DEEP,
+    )
+}
 
+fn collect_quality_pass_candidates<F>(
+    store: &SqliteStore,
+    symbols_by_id: &HashMap<String, Symbol>,
+    priority_scores: &HashMap<String, f64>,
+    should_skip_pass: F,
+) -> Result<Vec<QualityPassCandidate>>
+where
+    F: Fn(&str) -> bool,
+{
+    let mut candidates = Vec::new();
+    for symbol_id in store.list_all_symbol_ids()? {
+        let Some(symbol) = symbols_by_id.get(symbol_id.as_str()) else {
+            tracing::warn!(
+                symbol_id = %symbol_id,
+                "Quality pass symbol missing from initial snapshot; skipping"
+            );
+            continue;
+        };
+        let Some(meta) = store.get_sir_meta(symbol.id.as_str())? else {
+            continue;
+        };
+        let pass = meta.generation_pass.to_ascii_lowercase();
+        if should_skip_pass(pass.as_str()) {
+            continue;
+        }
+
+        let Some(blob) = store.read_sir_blob(symbol.id.as_str())? else {
+            continue;
+        };
+        let Ok(baseline_sir) = serde_json::from_str::<SirAnnotation>(&blob) else {
+            continue;
+        };
+        candidates.push(QualityPassCandidate {
+            symbol: symbol.clone(),
+            priority_score: priority_scores
+                .get(symbol.id.as_str())
+                .copied()
+                .unwrap_or(0.0),
+            baseline_sir,
+        });
+    }
+
+    Ok(candidates)
+}
+
+fn select_quality_pass_candidates(
+    pass_label: &str,
+    mut eligible_candidates: Vec<QualityPassCandidate>,
+    priority_threshold: f64,
+    confidence_threshold: f64,
+    max_symbols: usize,
+) -> Vec<QualityPassCandidate> {
+    let mut candidates = eligible_candidates
+        .iter()
+        .filter(|candidate| {
+            let low_confidence = (candidate.baseline_sir.confidence as f64) <= confidence_threshold;
+            let high_priority = candidate.priority_score >= priority_threshold;
+            high_priority || low_confidence
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    sort_quality_pass_candidates(&mut candidates);
+    if candidates.is_empty() && max_symbols > 0 {
+        sort_quality_pass_candidates(&mut eligible_candidates);
+        candidates = eligible_candidates.into_iter().take(max_symbols).collect();
+        tracing::info!(
+            "{pass_label}: threshold selected 0, using top-{max_symbols} by priority as floor"
+        );
+    } else if max_symbols > 0 && candidates.len() > max_symbols {
+        candidates.truncate(max_symbols);
+    }
+
+    candidates
+}
+
+fn sort_quality_pass_candidates(candidates: &mut [QualityPassCandidate]) {
+    candidates.sort_by(|left, right| {
+        right
+            .priority_score
+            .total_cmp(&left.priority_score)
+            .then_with(|| left.symbol.id.cmp(&right.symbol.id))
+    });
+}
+
+fn parse_quality_provider(
+    provider_raw: Option<String>,
+    field_name: &str,
+) -> Result<Option<InferenceProviderKind>> {
+    provider_raw
+        .map(|provider_raw| {
+            provider_raw
+                .parse::<InferenceProviderKind>()
+                .map_err(|error| anyhow::anyhow!("invalid {field_name} '{provider_raw}': {error}"))
+        })
+        .transpose()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_quality_pass(
+    pass_label: &str,
+    store: &SqliteStore,
+    pipeline: &SirPipeline,
+    candidates: Vec<QualityPassCandidate>,
+    priority_scores: &HashMap<String, f64>,
+    max_neighbors: usize,
+    priority_threshold: f64,
+    confidence_threshold: f64,
+    print_sir: bool,
+    out: &mut dyn std::io::Write,
+    generation_pass: &str,
+) -> Result<()> {
+    let use_cot = pipeline.provider_name() == InferenceProviderKind::Qwen3Local.as_str();
     let total = candidates.len();
     let mut successes = 0usize;
     let mut failures = 0usize;
+
     for (index, candidate) in candidates.into_iter().enumerate() {
-        let enrichment = build_deep_enrichment_context(
+        let enrichment = build_enrichment_context(
             store,
             &candidate.symbol,
             candidate.baseline_sir,
             priority_scores,
-            quality.deep_max_neighbors,
-            quality.deep_priority_threshold,
-            quality.deep_confidence_threshold,
+            max_neighbors,
+            priority_threshold,
+            confidence_threshold,
             candidate.priority_score,
         )?;
         let event = SymbolChangeEvent {
@@ -418,14 +577,14 @@ fn run_deep_pass(
             },
         );
 
-        match deep_pipeline.process_event_with_deep_specs(
+        match pipeline.process_event_with_deep_specs(
             store,
             &event,
             true,
-            config.print_sir,
+            print_sir,
             out,
             Some(candidate.priority_score),
-            SIR_GENERATION_PASS_DEEP,
+            generation_pass,
             &deep_specs,
         ) {
             Ok(stats) => {
@@ -438,13 +597,13 @@ fn run_deep_pass(
                     symbol_id = %candidate.symbol.id,
                     qualified_name = %candidate.symbol.qualified_name,
                     error = %err,
-                    "deep pass symbol processing failed"
+                    "{pass_label} symbol processing failed"
                 );
             }
         }
 
         tracing::info!(
-            "Deep pass: {}/{} symbols, {} improved, {} failed",
+            "{pass_label}: {}/{} symbols, {} improved, {} failed",
             index + 1,
             total,
             successes,
@@ -456,21 +615,22 @@ fn run_deep_pass(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_deep_enrichment_context(
+fn build_enrichment_context(
     store: &SqliteStore,
     symbol: &Symbol,
     baseline_sir: SirAnnotation,
     priority_scores: &HashMap<String, f64>,
     max_neighbors: usize,
-    deep_priority_threshold: f64,
-    deep_confidence_threshold: f64,
+    priority_threshold: f64,
+    confidence_threshold: f64,
     priority_score: f64,
 ) -> Result<SirEnrichmentContext> {
     let file_rollup_id = synthetic_file_sir_id(symbol.language.as_str(), symbol.file_path.as_str());
     let file_intent = store
         .read_sir_blob(file_rollup_id.as_str())?
         .and_then(|blob| serde_json::from_str::<FileSir>(&blob).ok())
-        .map(|sir| sir.intent);
+        .map(|sir| sir.intent.trim().to_owned())
+        .unwrap_or_default();
 
     let mut neighbors = Vec::<(f64, String, String)>::new();
     for peer in store.list_symbols_for_file(symbol.file_path.as_str())? {
@@ -511,12 +671,12 @@ fn build_deep_enrichment_context(
         symbol.id.as_str(),
         priority_score,
         baseline_sir.confidence as f64,
-        deep_priority_threshold,
-        deep_confidence_threshold,
+        priority_threshold,
+        confidence_threshold,
     );
 
     Ok(SirEnrichmentContext {
-        file_intent,
+        file_intent: Some(file_intent),
         neighbor_intents,
         baseline_sir: Some(baseline_sir),
         priority_reason,
@@ -528,20 +688,20 @@ fn format_priority_reason(
     symbol_id: &str,
     priority_score: f64,
     confidence: f64,
-    deep_priority_threshold: f64,
-    deep_confidence_threshold: f64,
+    priority_threshold: f64,
+    confidence_threshold: f64,
 ) -> String {
     let mut reasons = Vec::<String>::new();
-    if priority_score > deep_priority_threshold {
+    if priority_score >= priority_threshold {
         reasons.push(format!(
-            "priority {:.2} above threshold {:.2}",
-            priority_score, deep_priority_threshold
+            "priority {:.2} at or above threshold {:.2}",
+            priority_score, priority_threshold
         ));
     }
-    if confidence < deep_confidence_threshold {
+    if confidence <= confidence_threshold {
         reasons.push(format!(
-            "triage confidence {:.2} below threshold {:.2}",
-            confidence, deep_confidence_threshold
+            "baseline confidence {:.2} at or below threshold {:.2}",
+            confidence, confidence_threshold
         ));
     }
 
@@ -582,11 +742,11 @@ fn run_initial_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> 
 
     tracing::info!(
         symbol_count,
-        "Pass 1 complete: {} symbols indexed, lexical search + graph queries available",
+        "Structural index complete: {} symbols indexed, lexical search + graph queries available",
         symbol_count
     );
     if config.lifecycle_logs {
-        println!("INDEX: initial scan complete (pass 1 only)");
+        println!("INDEX: structural scan complete");
     }
 
     if skip_teardown {
@@ -624,7 +784,7 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
     }
     tracing::info!(
         symbol_count,
-        "Pass 1 complete: {} symbols indexed, lexical search + graph queries available",
+        "Structural index complete: {} symbols indexed, lexical search + graph queries available",
         symbol_count
     );
 
@@ -637,7 +797,7 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
     )?;
     tracing::info!(
         queued,
-        "Pass 2 queued: {} symbols for SIR generation",
+        "Scan pass queued: {} symbols for SIR generation",
         queued
     );
 
@@ -651,7 +811,7 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
                 tracing::warn!(
                     worker_id,
                     error = %err,
-                    "failed to start semantic worker; pass 1 will continue without pass 2"
+                    "failed to start semantic worker; structural indexing will continue without scan pass"
                 );
                 break;
             }

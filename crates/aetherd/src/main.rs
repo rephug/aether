@@ -56,10 +56,6 @@ fn run(cli: Cli) -> Result<()> {
         )
     })?;
 
-    if let Some(command) = cli.command.clone() {
-        return run_subcommand(&workspace, command);
-    }
-
     let config = ensure_workspace_config(&workspace).with_context(|| {
         format!(
             "failed to load or create workspace config at {}",
@@ -67,6 +63,10 @@ fn run(cli: Cli) -> Result<()> {
         )
     })?;
     init_tracing_subscriber(cli.log_format, &config.general.log_level)?;
+
+    if let Some(command) = cli.command.clone() {
+        return run_subcommand(&workspace, command);
+    }
 
     for warning in validate_config(&config) {
         tracing::warn!(
@@ -78,12 +78,20 @@ fn run(cli: Cli) -> Result<()> {
 
     if cli.deep && !cli.full {
         return Err(anyhow!(
-            "--deep requires --full (two-pass pipeline needs full triage first)"
+            "--deep requires --full (quality pipeline needs scan + triage before deep)"
         ));
     }
 
     let selected_provider = cli.inference_provider.unwrap_or(config.inference.provider);
-    if config.sir_quality.deep_pass
+    let run_triage = config.sir_quality.triage_pass || cli.deep;
+    let run_deep = config.sir_quality.deep_pass || cli.deep;
+    if run_triage
+        && selected_provider == InferenceProviderKind::Qwen3Local
+        && config.sir_quality.triage_provider.is_none()
+    {
+        tracing::info!("Triage pass will use local CoT mode (thinking enabled, 8192 context).");
+    }
+    if run_deep
         && selected_provider == InferenceProviderKind::Qwen3Local
         && config.sir_quality.deep_provider.is_none()
     {
@@ -302,7 +310,13 @@ fn run(cli: Cli) -> Result<()> {
 fn run_subcommand(workspace: &Path, command: Commands) -> Result<()> {
     match command {
         Commands::InitAgent(args) => run_init_agent_command(workspace, args),
-        Commands::Regenerate(args) => run_regenerate_command(workspace, args),
+        Commands::Regenerate(args) => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed to build tokio runtime for regenerate command")?;
+            runtime.block_on(run_regenerate_command(workspace, args))
+        }
         Commands::SetupLocal(args) => run_setup_local_command(workspace, args),
         Commands::Status => run_status_subcommand(workspace),
         Commands::Remember(args) => run_remember_note_command(workspace, args),
@@ -366,7 +380,7 @@ struct RegenerateCandidate {
     baseline_sir: SirAnnotation,
 }
 
-fn run_regenerate_command(workspace: &Path, args: RegenerateArgs) -> Result<()> {
+async fn run_regenerate_command(workspace: &Path, args: RegenerateArgs) -> Result<()> {
     let config = ensure_workspace_config(workspace)
         .context("failed to load workspace config for regenerate command")?;
     let store = SqliteStore::open(workspace).context("failed to open local store")?;
@@ -463,29 +477,37 @@ fn run_regenerate_command(workspace: &Path, args: RegenerateArgs) -> Result<()> 
     .context("failed to initialize primary regeneration pipeline")?;
 
     let mut owned_deep_pipeline: Option<SirPipeline> = None;
-    if args.deep
-        && let Some(provider_raw) = config.sir_quality.deep_provider.clone()
-    {
-        let deep_provider = provider_raw
-            .parse::<InferenceProviderKind>()
-            .map_err(|error| {
-                anyhow!(
-                    "invalid sir_quality.deep_provider value '{}': {}",
-                    provider_raw,
-                    error
-                )
-            })?;
+    if args.deep {
+        let deep_provider = config
+            .sir_quality
+            .deep_provider
+            .clone()
+            .map(|provider_raw| {
+                provider_raw
+                    .parse::<InferenceProviderKind>()
+                    .map_err(|error| {
+                        anyhow!(
+                            "invalid sir_quality.deep_provider value '{}': {}",
+                            provider_raw,
+                            error
+                        )
+                    })
+            })
+            .transpose()?;
         owned_deep_pipeline = Some(
             SirPipeline::new(
                 workspace.to_path_buf(),
                 config.sir_quality.deep_concurrency.max(1),
                 ProviderOverrides {
-                    provider: Some(deep_provider),
+                    provider: deep_provider,
                     model: config.sir_quality.deep_model.clone(),
                     endpoint: config.sir_quality.deep_endpoint.clone(),
                     api_key_env: config.sir_quality.deep_api_key_env.clone(),
                 },
             )
+            .map(|pipeline| {
+                pipeline.with_inference_timeout_secs(config.sir_quality.deep_timeout_secs)
+            })
             .context("failed to initialize deep regeneration pipeline")?,
         );
     }
@@ -583,7 +605,8 @@ fn build_regeneration_enrichment_context(
     let file_intent = store
         .read_sir_blob(file_rollup_id.as_str())?
         .and_then(|blob| serde_json::from_str::<FileSir>(&blob).ok())
-        .map(|sir| sir.intent);
+        .map(|sir| sir.intent.trim().to_owned())
+        .unwrap_or_default();
 
     let mut neighbors = Vec::<(f64, String, String)>::new();
     for peer in store.list_symbols_for_file(candidate.symbol.file_path.as_str())? {
@@ -616,7 +639,7 @@ fn build_regeneration_enrichment_context(
     }
 
     Ok(SirEnrichmentContext {
-        file_intent,
+        file_intent: Some(file_intent),
         neighbor_intents: neighbors
             .into_iter()
             .map(|(_, name, intent)| (name, intent))
@@ -642,15 +665,15 @@ fn format_regeneration_priority_reason(
     deep_confidence_threshold: f64,
 ) -> String {
     let mut reasons = Vec::<String>::new();
-    if priority_score > deep_priority_threshold {
+    if priority_score >= deep_priority_threshold {
         reasons.push(format!(
-            "priority {:.2} above threshold {:.2}",
+            "priority {:.2} at or above threshold {:.2}",
             priority_score, deep_priority_threshold
         ));
     }
-    if confidence < deep_confidence_threshold {
+    if confidence <= deep_confidence_threshold {
         reasons.push(format!(
-            "confidence {:.2} below threshold {:.2}",
+            "confidence {:.2} at or below threshold {:.2}",
             confidence, deep_confidence_threshold
         ));
     }
@@ -820,12 +843,20 @@ fn init_tracing_subscriber(log_format: LogFormat, configured_log_level: &str) ->
             .try_init(),
     };
 
-    init_result.map_err(|err| {
-        anyhow!(
+    match init_result {
+        Ok(()) => Ok(()),
+        Err(err)
+            if err
+                .to_string()
+                .contains("global default trace dispatcher has already been set") =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(anyhow!(
             "failed to initialize tracing subscriber (format={}): {err}",
             log_format.as_str()
-        )
-    })
+        )),
+    }
 }
 
 fn build_env_filter(configured_log_level: &str) -> tracing_subscriber::EnvFilter {
