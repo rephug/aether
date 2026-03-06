@@ -524,14 +524,14 @@ pub struct Cli {
     #[arg(
         long,
         requires = "index_once",
-        help = "When used with --index-once, run full Pass 1 + Pass 2 indexing before exit"
+        help = "When used with --index-once, run structural indexing plus the full scan/quality pipeline before exit"
     )]
     pub full: bool,
 
     #[arg(
         long,
         requires = "index_once",
-        help = "When used with --index-once --full, run deep pass after triage generation"
+        help = "When used with --index-once --full, force the deep pass after scan/triage generation"
     )]
     pub deep: bool,
 

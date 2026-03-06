@@ -100,13 +100,13 @@ Symbol text:\n{}",
 
 #[derive(Debug, Clone)]
 pub struct SirEnrichmentContext {
-    /// File-level rollup intent from triage pass
+    /// File-level rollup intent available to enriched quality passes
     pub file_intent: Option<String>,
     /// Intents of neighboring symbols in the same file
     pub neighbor_intents: Vec<(String, String)>,
-    /// The triage-pass SIR to improve upon
+    /// The baseline SIR to improve upon
     pub baseline_sir: Option<SirAnnotation>,
-    /// Human-readable explanation of why this symbol was selected for deep pass
+    /// Human-readable explanation of why this symbol was selected for enriched analysis
     pub priority_reason: String,
 }
 

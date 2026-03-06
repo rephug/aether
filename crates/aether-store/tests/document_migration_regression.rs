@@ -2,7 +2,7 @@ use aether_store::{SirMetaRecord, SqliteStore, Store, SymbolRecord};
 use tempfile::tempdir;
 
 #[test]
-fn existing_symbol_and_sir_operations_still_work_after_migration_v4() {
+fn existing_symbol_and_sir_operations_still_work_after_migration_v6() {
     let temp = tempdir().expect("tempdir");
     let store = SqliteStore::open(temp.path()).expect("open store");
 
@@ -27,7 +27,7 @@ fn existing_symbol_and_sir_operations_still_work_after_migration_v4() {
         sir_version: 1,
         provider: "mock".to_owned(),
         model: "mock".to_owned(),
-        generation_pass: "single".to_owned(),
+        generation_pass: "scan".to_owned(),
         updated_at: 1_700_000_100,
         sir_status: "fresh".to_owned(),
         last_error: None,
