@@ -367,6 +367,7 @@ fn run_triage_pass(
         config.print_sir,
         out,
         SIR_GENERATION_PASS_TRIAGE,
+        false,
     )
 }
 
@@ -430,6 +431,7 @@ fn run_deep_pass(
         config.print_sir,
         out,
         SIR_GENERATION_PASS_DEEP,
+        true,
     )
 }
 
@@ -544,8 +546,9 @@ fn run_quality_pass(
     print_sir: bool,
     out: &mut dyn std::io::Write,
     generation_pass: &str,
+    use_cot: bool,
 ) -> Result<()> {
-    let use_cot = pipeline.provider_name() == InferenceProviderKind::Qwen3Local.as_str();
+    let use_cot = use_cot && pipeline.provider_name() == InferenceProviderKind::Qwen3Local.as_str();
     let total = candidates.len();
     let mut successes = 0usize;
     let mut failures = 0usize;
