@@ -310,13 +310,7 @@ fn run(cli: Cli) -> Result<()> {
 fn run_subcommand(workspace: &Path, command: Commands) -> Result<()> {
     match command {
         Commands::InitAgent(args) => run_init_agent_command(workspace, args),
-        Commands::Regenerate(args) => {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("failed to build tokio runtime for regenerate command")?;
-            runtime.block_on(run_regenerate_command(workspace, args))
-        }
+        Commands::Regenerate(args) => run_regenerate_command(workspace, args),
         Commands::SetupLocal(args) => run_setup_local_command(workspace, args),
         Commands::Status => run_status_subcommand(workspace),
         Commands::Remember(args) => run_remember_note_command(workspace, args),
@@ -380,7 +374,7 @@ struct RegenerateCandidate {
     baseline_sir: SirAnnotation,
 }
 
-async fn run_regenerate_command(workspace: &Path, args: RegenerateArgs) -> Result<()> {
+fn run_regenerate_command(workspace: &Path, args: RegenerateArgs) -> Result<()> {
     let config = ensure_workspace_config(workspace)
         .context("failed to load workspace config for regenerate command")?;
     let store = SqliteStore::open(workspace).context("failed to open local store")?;
