@@ -205,6 +205,10 @@ fn run(cli: Cli) -> Result<()> {
         std::process::exit(exit_code);
     }
 
+    if cli.embeddings_only {
+        return run_embeddings_only_command(&workspace, cli.print_sir);
+    }
+
     #[cfg(feature = "dashboard")]
     {
         let dashboard_enabled = config.dashboard.enabled && !cli.no_dashboard;
@@ -709,6 +713,19 @@ fn truncate_display_name(value: &str, width: usize) -> String {
     let keep = width.saturating_sub(3);
     let truncated = value.chars().take(keep).collect::<String>();
     format!("{truncated}...")
+}
+
+fn run_embeddings_only_command(workspace: &Path, print_sir: bool) -> Result<()> {
+    ensure_workspace_config(workspace)
+        .context("failed to load workspace config for embeddings-only command")?;
+    let pipeline = SirPipeline::new_embeddings_only(workspace.to_path_buf())
+        .context("failed to initialize embeddings-only pipeline")?;
+    let store = SqliteStore::open(workspace).context("failed to open local store")?;
+    let mut stdout = std::io::stdout();
+    pipeline
+        .run_embeddings_only_pass(&store, print_sir, &mut stdout)
+        .context("failed to run embeddings-only reindex")?;
+    Ok(())
 }
 
 fn run_setup_local_command(workspace: &Path, args: SetupLocalArgs) -> Result<()> {

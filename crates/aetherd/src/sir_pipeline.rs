@@ -152,6 +152,33 @@ impl SirPipeline {
         )
     }
 
+    pub fn new_embeddings_only(workspace_root: PathBuf) -> Result<Self> {
+        let loaded_embedding = load_embedding_provider_from_config(
+            &workspace_root,
+            EmbeddingProviderOverrides::default(),
+        )
+        .context("failed to load embedding provider")?
+        .ok_or_else(|| anyhow!("embeddings-only reindex requires embeddings.enabled=true"))?;
+        let embedding_provider = Arc::<dyn EmbeddingProvider>::from(loaded_embedding.provider);
+        let embedding_identity =
+            Some((loaded_embedding.provider_name, loaded_embedding.model_name));
+        let placeholder_provider = Qwen3LocalProvider::new(None, None);
+        let placeholder_provider_name = placeholder_provider.provider_name();
+        let placeholder_model_name = placeholder_provider.model_name();
+
+        Self::new_with_provider_and_embeddings(
+            workspace_root,
+            1,
+            Arc::new(placeholder_provider),
+            placeholder_provider_name,
+            placeholder_model_name,
+            Some(embedding_provider),
+            embedding_identity,
+            None,
+            None,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new_with_provider_and_embeddings(
         workspace_root: PathBuf,
@@ -803,6 +830,89 @@ impl SirPipeline {
         self
     }
 
+    pub fn run_embeddings_only_pass(
+        &self,
+        store: &SqliteStore,
+        print_sir: bool,
+        out: &mut dyn Write,
+    ) -> Result<()> {
+        let symbol_ids = store
+            .list_all_symbol_ids()
+            .context("failed to list symbols for embeddings-only pass")?;
+        let total = symbol_ids.len();
+        let mut refreshed = 0usize;
+        let mut skipped = 0usize;
+        let mut errors = 0usize;
+
+        for (index, symbol_id) in symbol_ids.iter().enumerate() {
+            let current = index + 1;
+            if current % 100 == 0 {
+                writeln!(out, "Embedding {current}/{total}...")
+                    .context("failed to write embeddings-only progress")?;
+            }
+
+            let meta = match store.get_sir_meta(symbol_id) {
+                Ok(Some(meta)) => meta,
+                Ok(None) => {
+                    skipped += 1;
+                    continue;
+                }
+                Err(err) => {
+                    errors += 1;
+                    tracing::warn!(symbol_id = %symbol_id, error = %err, "failed to read SIR metadata");
+                    continue;
+                }
+            };
+
+            let blob = match store.read_sir_blob(symbol_id) {
+                Ok(Some(blob)) => blob,
+                Ok(None) => {
+                    skipped += 1;
+                    continue;
+                }
+                Err(err) => {
+                    errors += 1;
+                    tracing::warn!(symbol_id = %symbol_id, error = %err, "failed to read SIR blob");
+                    continue;
+                }
+            };
+
+            let sir = match serde_json::from_str::<SirAnnotation>(&blob) {
+                Ok(sir) => sir,
+                Err(err) => {
+                    let generation_pass = meta.generation_pass.as_str();
+                    skipped += 1;
+                    tracing::warn!(
+                        symbol_id = %symbol_id,
+                        generation_pass,
+                        error = %err,
+                        "skipping symbol with invalid SIR blob during embeddings-only pass"
+                    );
+                    continue;
+                }
+            };
+
+            let canonical = canonicalize_sir_json(&sir);
+            let hash = sir_hash(&sir);
+            match self.refresh_embedding_if_needed(symbol_id, &hash, &canonical, print_sir, out) {
+                Ok(true) => refreshed += 1,
+                Ok(false) => {}
+                Err(err) => {
+                    errors += 1;
+                    tracing::warn!(symbol_id = %symbol_id, error = %err, "failed to refresh embedding");
+                }
+            }
+        }
+
+        writeln!(
+            out,
+            "Embeddings refreshed: {refreshed}/{total} symbols ({skipped} skipped, {errors} errors)"
+        )
+        .context("failed to write embeddings-only summary")?;
+
+        Ok(())
+    }
+
     pub fn replay_incomplete_intents(
         &self,
         store: &SqliteStore,
@@ -1121,9 +1231,9 @@ impl SirPipeline {
         canonical_json: &str,
         print_sir: bool,
         out: &mut dyn Write,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let Some(embedding_provider) = self.embedding_provider.as_ref() else {
-            return Ok(());
+            return Ok(false);
         };
 
         let provider_name = self
@@ -1146,7 +1256,7 @@ impl SirPipeline {
             && existing_meta.provider == provider_name
             && existing_meta.model == model_name
         {
-            return Ok(());
+            return Ok(false);
         }
 
         let embedding = self
@@ -1155,7 +1265,7 @@ impl SirPipeline {
             .with_context(|| format!("failed to generate embedding for {symbol_id}"))?;
 
         if embedding.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         let updated_at = unix_timestamp_secs();
@@ -1178,7 +1288,7 @@ impl SirPipeline {
             .context("failed to write embedding print line")?;
         }
 
-        Ok(())
+        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1957,5 +2067,126 @@ fn to_test_intent_record(intent: TestIntent, now_ms: i64) -> TestIntentRecord {
         symbol_id: intent.symbol_id,
         created_at: now_ms.max(0),
         updated_at: now_ms.max(0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::sync::Arc;
+
+    use super::*;
+    use async_trait::async_trait;
+    use tempfile::tempdir;
+
+    struct TestEmbeddingProvider;
+
+    #[async_trait]
+    impl EmbeddingProvider for TestEmbeddingProvider {
+        async fn embed_text(&self, _text: &str) -> std::result::Result<Vec<f32>, InferError> {
+            Ok(vec![1.0, 0.0])
+        }
+    }
+
+    #[test]
+    fn embeddings_only_skips_symbols_without_sir() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
+        fs::write(
+            workspace.join(".aether/config.toml"),
+            r#"[storage]
+graph_backend = "sqlite"
+
+[embeddings]
+enabled = true
+provider = "qwen3_local"
+vector_backend = "sqlite"
+"#,
+        )
+        .expect("write config");
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        store
+            .upsert_symbol(SymbolRecord {
+                id: "sym-with-sir".to_owned(),
+                file_path: "src/lib.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "demo::with_sir".to_owned(),
+                signature_fingerprint: "sig-1".to_owned(),
+                last_seen_at: 1_700_000_000,
+            })
+            .expect("upsert symbol with sir");
+        store
+            .upsert_symbol(SymbolRecord {
+                id: "sym-without-sir".to_owned(),
+                file_path: "src/lib.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "demo::without_sir".to_owned(),
+                signature_fingerprint: "sig-2".to_owned(),
+                last_seen_at: 1_700_000_000,
+            })
+            .expect("upsert symbol without sir");
+
+        let sir = SirAnnotation {
+            intent: "Demo intent".to_owned(),
+            inputs: vec!["input".to_owned()],
+            outputs: vec!["output".to_owned()],
+            side_effects: Vec::new(),
+            dependencies: Vec::new(),
+            error_modes: Vec::new(),
+            confidence: 0.9,
+        };
+        let canonical = canonicalize_sir_json(&sir);
+        let hash = sir_hash(&sir);
+        store
+            .write_sir_blob("sym-with-sir", &canonical)
+            .expect("write sir blob");
+        store
+            .upsert_sir_meta(SirMetaRecord {
+                id: "sym-with-sir".to_owned(),
+                sir_hash: hash.clone(),
+                sir_version: 1,
+                provider: "test".to_owned(),
+                model: "test".to_owned(),
+                generation_pass: SIR_GENERATION_PASS_SCAN.to_owned(),
+                updated_at: 1_700_000_100,
+                sir_status: SIR_STATUS_FRESH.to_owned(),
+                last_error: None,
+                last_attempt_at: 1_700_000_100,
+            })
+            .expect("upsert sir meta");
+
+        let pipeline = SirPipeline::new_with_provider_and_embeddings(
+            workspace.to_path_buf(),
+            1,
+            Arc::new(Qwen3LocalProvider::new(None, None)),
+            "qwen3_local",
+            "qwen3.5:4b",
+            Some(Arc::new(TestEmbeddingProvider)),
+            Some(("test_embedding".to_owned(), "test-model".to_owned())),
+            None,
+            None,
+        )
+        .expect("build pipeline");
+
+        let mut out = Vec::new();
+        pipeline
+            .run_embeddings_only_pass(&store, false, &mut out)
+            .expect("run embeddings-only pass");
+
+        let stored = store
+            .get_symbol_embedding_meta("sym-with-sir")
+            .expect("read stored embedding meta");
+        assert!(stored.is_some());
+        let missing = store
+            .get_symbol_embedding_meta("sym-without-sir")
+            .expect("read missing embedding meta");
+        assert!(missing.is_none());
+
+        let rendered = String::from_utf8(out).expect("utf8 output");
+        assert!(rendered.contains("Embeddings refreshed: 1/2 symbols (1 skipped, 0 errors)"));
     }
 }
