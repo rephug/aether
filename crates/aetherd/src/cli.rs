@@ -601,6 +601,21 @@ pub struct Cli {
 
     #[arg(
         long,
+        conflicts_with_all = [
+            "search",
+            "lsp",
+            "index",
+            "index_once",
+            "verify",
+            "download_models",
+            "calibrate"
+        ],
+        help = "Re-embed all symbols with existing SIR using the current embedding provider, then exit"
+    )]
+    pub embeddings_only: bool,
+
+    #[arg(
+        long,
         requires = "index_once",
         help = "When used with --index-once, run structural indexing plus the full scan/quality pipeline before exit"
     )]
@@ -827,6 +842,28 @@ mod tests {
             .expect("calibrate should parse");
         assert!(calibrate.command.is_none());
         assert!(calibrate.calibrate);
+    }
+
+    #[test]
+    fn cli_embeddings_only_flag_parses() {
+        let cli = Cli::try_parse_from(["aetherd", "--workspace", ".", "--embeddings-only"])
+            .expect("embeddings-only should parse");
+
+        assert!(cli.command.is_none());
+        assert!(cli.embeddings_only);
+    }
+
+    #[test]
+    fn cli_embeddings_only_conflicts_with_index_once() {
+        let result = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "--embeddings-only",
+            "--index-once",
+        ]);
+
+        assert!(result.is_err());
     }
 
     #[test]

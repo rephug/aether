@@ -113,6 +113,8 @@ pub enum EmbeddingProviderKind {
     #[default]
     Qwen3Local,
     Candle,
+    #[serde(rename = "openai_compat")]
+    OpenAiCompat,
 }
 
 impl EmbeddingProviderKind {
@@ -120,6 +122,7 @@ impl EmbeddingProviderKind {
         match self {
             Self::Qwen3Local => "qwen3_local",
             Self::Candle => "candle",
+            Self::OpenAiCompat => "openai_compat",
         }
     }
 }
@@ -131,8 +134,9 @@ impl std::str::FromStr for EmbeddingProviderKind {
         match value.trim() {
             "qwen3_local" => Ok(Self::Qwen3Local),
             "candle" => Ok(Self::Candle),
+            "openai_compat" => Ok(Self::OpenAiCompat),
             other => Err(format!(
-                "invalid embedding provider '{other}', expected one of: qwen3_local, candle"
+                "invalid embedding provider '{other}', expected one of: qwen3_local, candle, openai_compat"
             )),
         }
     }
@@ -475,6 +479,8 @@ pub struct EmbeddingsConfig {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
     #[serde(default, skip_serializing_if = "CandleEmbeddingsConfig::is_empty")]
     pub candle: CandleEmbeddingsConfig,
 }
@@ -499,6 +505,7 @@ impl Default for EmbeddingsConfig {
             vector_backend: EmbeddingVectorBackend::Lancedb,
             model: None,
             endpoint: None,
+            api_key_env: None,
             candle: CandleEmbeddingsConfig::default(),
         }
     }
@@ -1140,6 +1147,15 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
             code: "embeddings_candle_model_dir_unused_for_qwen3_local",
             message: "embeddings.provider=qwen3_local ignores embeddings.candle.model_dir"
                 .to_owned(),
+        });
+    } else if matches!(
+        config.embeddings.provider,
+        EmbeddingProviderKind::OpenAiCompat
+    ) && config.embeddings.endpoint.is_none()
+    {
+        warnings.push(ConfigWarning {
+            code: "embeddings_endpoint_missing_for_openai_compat",
+            message: "embeddings.provider=openai_compat requires embeddings.endpoint".to_owned(),
         });
     }
 
@@ -1996,6 +2012,7 @@ fn normalize_config(mut config: AetherConfig) -> AetherConfig {
     normalize_sir_quality_config(&mut config.sir_quality);
     config.embeddings.model = normalize_optional(config.embeddings.model.take());
     config.embeddings.endpoint = normalize_optional(config.embeddings.endpoint.take());
+    config.embeddings.api_key_env = normalize_optional(config.embeddings.api_key_env.take());
     config.embeddings.candle.model_dir =
         normalize_optional(config.embeddings.candle.model_dir.take());
     config.search.candle.model_dir = normalize_optional(config.search.candle.model_dir.take());
@@ -2091,6 +2108,12 @@ fn normalize_config(mut config: AetherConfig) -> AetherConfig {
         config.inference.api_key_env = default_api_key_env();
     } else {
         config.inference.api_key_env = api_key_env.to_owned();
+    }
+
+    if config.embeddings.provider == EmbeddingProviderKind::OpenAiCompat
+        && config.embeddings.api_key_env.is_none()
+    {
+        config.embeddings.api_key_env = Some(DEFAULT_OPENAI_COMPAT_API_KEY_ENV.to_owned());
     }
 
     let cohere_api_key_env = config.providers.cohere.api_key_env.trim();
@@ -2981,6 +3004,7 @@ deep_concurrency = 0
                 vector_backend: EmbeddingVectorBackend::Lancedb,
                 model: Some("mock-x".to_owned()),
                 endpoint: Some("http://127.0.0.1:11434/api/embeddings".to_owned()),
+                api_key_env: None,
                 candle: CandleEmbeddingsConfig::default(),
             },
             search: SearchConfig::default(),
@@ -3259,6 +3283,90 @@ endpoint = "https://api.z.ai/api/paas/v4"
         assert_eq!(
             config.inference.provider,
             InferenceProviderKind::OpenAiCompat
+        );
+    }
+
+    #[test]
+    fn embedding_provider_kind_from_str_accepts_openai_compat() {
+        let parsed: EmbeddingProviderKind =
+            "openai_compat".parse().expect("openai_compat should parse");
+        assert_eq!(parsed, EmbeddingProviderKind::OpenAiCompat);
+    }
+
+    #[test]
+    fn embedding_provider_kind_openai_compat_as_str_matches_config_value() {
+        assert_eq!(
+            EmbeddingProviderKind::OpenAiCompat.as_str(),
+            "openai_compat"
+        );
+    }
+
+    #[test]
+    fn load_workspace_config_parses_openai_compat_embedding_provider() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(aether_dir(workspace)).expect("create .aether");
+        fs::write(
+            config_path(workspace),
+            r#"
+[embeddings]
+enabled = true
+provider = "openai_compat"
+model = "text-embedding-3-large"
+endpoint = "https://openrouter.ai/api/v1"
+"#,
+        )
+        .expect("write config");
+
+        let config = load_workspace_config(workspace).expect("load config");
+        assert!(config.embeddings.enabled);
+        assert_eq!(
+            config.embeddings.provider,
+            EmbeddingProviderKind::OpenAiCompat
+        );
+        assert_eq!(
+            config.embeddings.api_key_env.as_deref(),
+            Some(DEFAULT_OPENAI_COMPAT_API_KEY_ENV)
+        );
+    }
+
+    #[test]
+    fn validate_config_warns_on_openai_compat_without_endpoint() {
+        let config = parse_workspace_config_str(
+            r#"
+[embeddings]
+enabled = true
+provider = "openai_compat"
+model = "text-embedding-3-large"
+"#,
+        )
+        .expect("parse config");
+
+        let warnings = validate_config(&config);
+        let codes = warnings
+            .iter()
+            .map(|warning| warning.code)
+            .collect::<Vec<_>>();
+        assert!(codes.contains(&"embeddings_endpoint_missing_for_openai_compat"));
+    }
+
+    #[test]
+    fn normalize_preserves_explicit_api_key_env() {
+        let config = parse_workspace_config_str(
+            r#"
+[embeddings]
+enabled = true
+provider = "openai_compat"
+model = "text-embedding-3-large"
+endpoint = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+"#,
+        )
+        .expect("parse config");
+
+        assert_eq!(
+            config.embeddings.api_key_env.as_deref(),
+            Some("OPENROUTER_API_KEY")
         );
     }
 

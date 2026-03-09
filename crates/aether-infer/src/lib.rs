@@ -12,6 +12,7 @@ use aether_core::Secret;
 use aether_sir::{SirAnnotation, validate_sir};
 use async_trait::async_trait;
 use embedding::candle::CandleEmbeddingProvider;
+use embedding::openai_compat::OpenAiCompatEmbeddingProvider;
 use reranker::candle::CandleRerankerProvider;
 use reranker::cohere::CohereRerankerProvider;
 use serde::Deserialize;
@@ -112,6 +113,7 @@ pub struct EmbeddingProviderOverrides {
     pub provider: Option<EmbeddingProviderKind>,
     pub model: Option<String>,
     pub endpoint: Option<String>,
+    pub api_key_env: Option<String>,
     pub candle_model_dir: Option<String>,
 }
 
@@ -1302,6 +1304,9 @@ pub fn load_embedding_provider_from_config(
     let selected_provider = overrides.provider.unwrap_or(config.embeddings.provider);
     let selected_model = first_non_empty(overrides.model, config.embeddings.model.clone());
     let selected_endpoint = first_non_empty(overrides.endpoint, config.embeddings.endpoint.clone());
+    let selected_api_key_env =
+        first_non_empty(overrides.api_key_env, config.embeddings.api_key_env.clone())
+            .unwrap_or_else(|| DEFAULT_OPENAI_COMPAT_API_KEY_ENV.to_owned());
     let selected_candle_model_dir = first_non_empty(
         overrides.candle_model_dir,
         config.embeddings.candle.model_dir.clone(),
@@ -1320,6 +1325,21 @@ pub fn load_embedding_provider_from_config(
         EmbeddingProviderKind::Candle => {
             let model_dir = resolve_candle_model_dir(workspace_root, selected_candle_model_dir);
             let provider = CandleEmbeddingProvider::new(model_dir);
+            let model_name = provider.model_name().to_owned();
+            let provider_name = provider.provider_name().to_owned();
+            LoadedEmbeddingProvider {
+                model_name,
+                provider: Box::new(provider),
+                provider_name,
+            }
+        }
+        EmbeddingProviderKind::OpenAiCompat => {
+            let api_key = read_env_non_empty(&selected_api_key_env)
+                .ok_or_else(|| InferError::MissingApiKey(selected_api_key_env.clone()))?;
+            let endpoint = selected_endpoint.ok_or(InferError::MissingEndpoint)?;
+            let model = selected_model.ok_or(InferError::MissingModel)?;
+            let provider =
+                OpenAiCompatEmbeddingProvider::new(endpoint, model, Secret::new(api_key));
             let model_name = provider.model_name().to_owned();
             let provider_name = provider.provider_name().to_owned();
             LoadedEmbeddingProvider {
@@ -2571,6 +2591,175 @@ model_dir = ".aether/models"
 
         assert_eq!(loaded.provider_name, EmbeddingProviderKind::Candle.as_str());
         assert_eq!(loaded.model_name, "qwen3-embedding-0.6b");
+    }
+
+    #[test]
+    fn load_embedding_provider_openai_compat_requires_endpoint() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        ensure_workspace_config(workspace).expect("ensure config");
+        let env_name = format!(
+            "AETHER_TEST_OPENAI_COMPAT_EMBED_KEY_ENDPOINT_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        );
+
+        unsafe {
+            env::set_var(&env_name, "test-key");
+        }
+
+        std::fs::write(
+            workspace.join(".aether/config.toml"),
+            format!(
+                r#"[embeddings]
+enabled = true
+provider = "openai_compat"
+model = "text-embedding-3-large"
+api_key_env = "{env_name}"
+"#
+            ),
+        )
+        .expect("write config");
+
+        let result =
+            load_embedding_provider_from_config(workspace, EmbeddingProviderOverrides::default());
+
+        match result {
+            Err(InferError::MissingEndpoint) => {}
+            Ok(_) => panic!("expected missing endpoint"),
+            Err(err) => panic!("expected missing endpoint, got {err}"),
+        }
+
+        unsafe {
+            env::remove_var(env_name);
+        }
+    }
+
+    #[test]
+    fn load_embedding_provider_openai_compat_requires_model() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        ensure_workspace_config(workspace).expect("ensure config");
+        let env_name = format!(
+            "AETHER_TEST_OPENAI_COMPAT_EMBED_KEY_MODEL_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        );
+
+        unsafe {
+            env::set_var(&env_name, "test-key");
+        }
+
+        std::fs::write(
+            workspace.join(".aether/config.toml"),
+            format!(
+                r#"[embeddings]
+enabled = true
+provider = "openai_compat"
+endpoint = "https://api.example.com/v1"
+api_key_env = "{env_name}"
+"#
+            ),
+        )
+        .expect("write config");
+
+        let result =
+            load_embedding_provider_from_config(workspace, EmbeddingProviderOverrides::default());
+
+        match result {
+            Err(InferError::MissingModel) => {}
+            Ok(_) => panic!("expected missing model"),
+            Err(err) => panic!("expected missing model, got {err}"),
+        }
+
+        unsafe {
+            env::remove_var(env_name);
+        }
+    }
+
+    #[test]
+    fn load_embedding_provider_openai_compat_requires_api_key() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        ensure_workspace_config(workspace).expect("ensure config");
+        let env_name = "AETHER_TEST_OPENAI_COMPAT_EMBED_KEY_ZZZZZ".to_owned();
+
+        std::fs::write(
+            workspace.join(".aether/config.toml"),
+            format!(
+                r#"[embeddings]
+enabled = true
+provider = "openai_compat"
+model = "text-embedding-3-large"
+endpoint = "https://api.example.com/v1"
+api_key_env = "{env_name}"
+"#
+            ),
+        )
+        .expect("write config");
+
+        let result =
+            load_embedding_provider_from_config(workspace, EmbeddingProviderOverrides::default());
+
+        match result {
+            Err(InferError::MissingApiKey(name)) => assert_eq!(name, env_name),
+            Ok(_) => panic!("expected missing api key"),
+            Err(err) => panic!("expected missing api key, got {err}"),
+        }
+    }
+
+    #[test]
+    fn load_embedding_provider_openai_compat_constructs_with_valid_config() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        ensure_workspace_config(workspace).expect("ensure config");
+        let env_name = format!(
+            "AETHER_TEST_OPENAI_COMPAT_EMBED_KEY_VALID_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        );
+
+        unsafe {
+            env::set_var(&env_name, "test-key");
+        }
+
+        std::fs::write(
+            workspace.join(".aether/config.toml"),
+            format!(
+                r#"[embeddings]
+enabled = true
+provider = "openai_compat"
+model = "text-embedding-3-large"
+endpoint = "https://api.example.com/v1/embeddings"
+api_key_env = "{env_name}"
+"#
+            ),
+        )
+        .expect("write config");
+
+        let loaded =
+            load_embedding_provider_from_config(workspace, EmbeddingProviderOverrides::default())
+                .expect("load embedding provider")
+                .expect("embedding provider should be enabled");
+
+        assert_eq!(
+            loaded.provider_name,
+            EmbeddingProviderKind::OpenAiCompat.as_str()
+        );
+        assert_eq!(loaded.model_name, "text-embedding-3-large");
+
+        unsafe {
+            env::remove_var(env_name);
+        }
     }
 
     #[test]
