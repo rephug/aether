@@ -167,6 +167,8 @@ pub struct WorkspaceViolation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CrateMetricsSnapshot {
     pub max_file_loc: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_file_path: Option<String>,
     pub trait_method_max: usize,
     pub internal_dep_count: usize,
     pub todo_density: f32,
@@ -268,6 +270,7 @@ impl CrateMetrics {
     pub fn snapshot(&self) -> CrateMetricsSnapshot {
         CrateMetricsSnapshot {
             max_file_loc: self.max_file_loc,
+            max_file_path: self.max_file_path.clone(),
             trait_method_max: self.trait_method_max,
             internal_dep_count: self.internal_dep_count,
             todo_density: self.todo_density,

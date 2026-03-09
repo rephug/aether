@@ -417,6 +417,19 @@ pub struct HealthScoreArgs {
         help = "Enable git and semantic health signals when data is available"
     )]
     pub semantic: bool,
+
+    #[arg(
+        long,
+        help = "Show heuristic split suggestions for qualifying hotspot crates"
+    )]
+    pub suggest_splits: bool,
+
+    #[arg(
+        long,
+        value_name = "HASH|last",
+        help = "Compare the current workspace score against the latest saved report or a specific commit hash"
+    )]
+    pub compare: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
@@ -1278,6 +1291,9 @@ mod tests {
             "--fail-above",
             "30",
             "--semantic",
+            "--suggest-splits",
+            "--compare",
+            "last",
             "--crate",
             "aether-core",
             "--crate",
@@ -1290,6 +1306,8 @@ mod tests {
                 assert_eq!(args.output.as_str(), "json");
                 assert_eq!(args.fail_above, Some(30));
                 assert!(args.semantic);
+                assert!(args.suggest_splits);
+                assert_eq!(args.compare.as_deref(), Some("last"));
                 assert_eq!(
                     args.crate_filter,
                     vec!["aether-core".to_owned(), "aether-store".to_owned()]

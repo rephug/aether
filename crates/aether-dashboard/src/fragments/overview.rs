@@ -143,6 +143,15 @@ pub(crate) async fn overview_fragment(State(state): State<Arc<DashboardState>>) 
                 }
             }
 
+            div
+                id="overview-health-score-panel"
+                class="space-y-3"
+                hx-get="/dashboard/frag/health-score"
+                hx-trigger="load"
+                hx-target="this" {
+                (support::html_empty_state("Loading health score panel...", None))
+            }
+
             div class="rounded-xl border border-surface-3/40 bg-surface-1/40 p-4" {
                 div class="flex flex-wrap items-center gap-2 text-xs" {
                     span class="badge badge-muted" { "Backend" }

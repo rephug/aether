@@ -188,6 +188,7 @@ mod tests {
             total_lines: 10,
             metrics: CrateMetricsSnapshot {
                 max_file_loc: 10,
+                max_file_path: None,
                 trait_method_max: 0,
                 internal_dep_count: 0,
                 todo_density: 0.0,
@@ -210,6 +211,7 @@ mod tests {
             total_lines: 1000,
             metrics: CrateMetricsSnapshot {
                 max_file_loc: 100,
+                max_file_path: None,
                 trait_method_max: 0,
                 internal_dep_count: 0,
                 todo_density: 0.0,

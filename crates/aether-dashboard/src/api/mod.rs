@@ -24,6 +24,7 @@ pub(crate) mod flow;
 pub(crate) mod glossary;
 mod graph;
 pub(crate) mod health;
+pub(crate) mod health_score;
 mod overview;
 pub(crate) mod prompts;
 mod search;
@@ -69,6 +70,10 @@ pub(crate) fn api_router() -> Router<Arc<DashboardState>> {
         .route("/api/v1/drift", get(drift::drift_handler))
         .route("/api/v1/coupling", get(coupling::coupling_handler))
         .route("/api/v1/health", get(health::health_handler))
+        .route(
+            "/api/v1/health-score",
+            get(health_score::health_score_handler),
+        )
         .route("/api/v1/xray", get(xray::xray_handler))
         .route(
             "/api/v1/blast-radius",

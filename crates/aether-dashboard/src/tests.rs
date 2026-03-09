@@ -1,3 +1,4 @@
+use std::fs;
 use std::sync::Arc;
 
 use aether_config::{AetherConfig, GraphBackend, save_workspace_config};
@@ -728,6 +729,88 @@ async fn health_api_returns_dimensions_and_envelope() {
 }
 
 #[tokio::test]
+async fn dashboard_health_score_endpoint() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/health-score?limit=5&min_score=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(body.as_ref())
+    );
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json.get("data").is_some());
+    assert!(json["data"]["workspace_score"].is_number());
+    assert!(json["data"]["severity"].is_string());
+    assert!(json["data"]["delta"].is_number());
+    assert!(json["data"]["crates"].is_array());
+    assert!(json["data"]["archetype_distribution"].is_object());
+    assert!(json["data"]["trend"].is_array());
+}
+
+#[tokio::test]
+async fn health_score_fragment_contains_hotspot_table_and_sparkline_container() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/health-score?limit=5&min_score=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("Workspace Health Score"));
+    assert!(body.contains("Hotspot Crates"));
+    assert!(body.contains("data-health-score-trend"));
+}
+
+#[tokio::test]
+async fn overview_fragment_contains_health_score_loader_below_llm_difficulty() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/overview")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let difficulty_index = body.find("LLM Difficulty Analysis").unwrap();
+    let panel_index = body.find("id=\"overview-health-score-panel\"").unwrap();
+    assert!(panel_index > difficulty_index);
+    assert!(body.contains("hx-get=\"/dashboard/frag/health-score\""));
+}
+
+#[tokio::test]
 async fn xray_api_returns_metrics_hotspots_and_envelope() {
     let (_tmp, app, _ids) = seeded_app().await;
     let response = app
@@ -1130,6 +1213,23 @@ fn seed_workspace(workspace: &std::path::Path) {
     config.storage.graph_backend = GraphBackend::Sqlite;
     config.embeddings.enabled = false;
     save_workspace_config(workspace, &config).unwrap();
+
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[package]\nname = \"dashboard-test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\nmembers = [\".\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "pub fn run_demo() -> i32 {\n    helper()\n}\n\nfn helper() -> i32 {\n    1\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/main.rs"),
+        "fn main() {\n    let _ = dashboard_test::run_demo();\n}\n",
+    )
+    .unwrap();
 
     let store = SqliteStore::open(workspace).unwrap();
 

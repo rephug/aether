@@ -1,3 +1,4 @@
+use std::fs;
 use std::sync::Arc;
 
 use aether_config::{AetherConfig, GraphBackend, save_workspace_config};
@@ -182,6 +183,7 @@ async fn dashboard_router_serves_stage79_routes_and_preserves_existing_endpoints
         "/api/v1/drift",
         "/api/v1/coupling",
         "/api/v1/health",
+        "/api/v1/health-score",
     ] {
         let response = app
             .clone()
@@ -207,6 +209,18 @@ fn seed_workspace(workspace: &std::path::Path) {
     config.storage.graph_backend = GraphBackend::Sqlite;
     config.embeddings.enabled = false;
     save_workspace_config(workspace, &config).unwrap();
+
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[package]\nname = \"dashboard-integration-test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\nmembers = [\".\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "pub fn symbol() -> i32 {\n    1\n}\n",
+    )
+    .unwrap();
 
     let store = SqliteStore::open(workspace).unwrap();
     store

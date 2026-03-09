@@ -444,4 +444,74 @@
         .text((d) => `${Math.round(d[1] * 100)}%`);
     }).catch(() => empty(container, 'Failed to load health'));
   };
+
+  window.initHealthScoreSparkline = function initHealthScoreSparkline() {
+    document.querySelectorAll('[data-health-score-trend]').forEach((container) => {
+      let trend;
+      try {
+        trend = JSON.parse(container.dataset.healthScoreTrend || '[]');
+      } catch (_err) {
+        trend = [];
+      }
+      if (!Array.isArray(trend) || trend.length === 0) {
+        empty(container, 'No score history yet');
+        return;
+      }
+
+      container.innerHTML = '';
+      if (trend.length === 1) {
+        container.innerHTML = `<div class="text-xs text-text-secondary">Current score ${trend[0]}/100. No trend history yet.</div>`;
+        return;
+      }
+
+      const severity = String(container.dataset.healthScoreSeverity || 'moderate').toLowerCase();
+      const color = severity === 'healthy'
+        ? BASE_COLORS.ok
+        : severity === 'watch'
+          ? '#facc15'
+          : severity === 'moderate'
+            ? BASE_COLORS.warn
+            : BASE_COLORS.danger;
+
+      const width = container.clientWidth || 280;
+      const height = 68;
+      const margin = { top: 8, right: 8, bottom: 12, left: 8 };
+      const x = d3.scaleLinear().domain([0, trend.length - 1]).range([margin.left, width - margin.right]);
+      const y = d3.scaleLinear().domain([0, 100]).range([height - margin.bottom, margin.top]);
+      const area = d3.area()
+        .x((_d, index) => x(index))
+        .y0(height - margin.bottom)
+        .y1((value) => y(value));
+      const line = d3.line()
+        .x((_d, index) => x(index))
+        .y((value) => y(value));
+      const svg = d3.select(container).append('svg').attr('width', width).attr('height', height);
+      const gradientId = `health-score-sparkline-${Math.random().toString(36).slice(2)}`;
+      const defs = svg.append('defs');
+      const gradient = defs.append('linearGradient').attr('id', gradientId).attr('x1', '0%').attr('x2', '0%').attr('y1', '0%').attr('y2', '100%');
+      gradient.append('stop').attr('offset', '0%').attr('stop-color', color).attr('stop-opacity', 0.28);
+      gradient.append('stop').attr('offset', '100%').attr('stop-color', color).attr('stop-opacity', 0.03);
+
+      svg.append('path')
+        .datum(trend)
+        .attr('fill', `url(#${gradientId})`)
+        .attr('d', area);
+
+      svg.append('path')
+        .datum(trend)
+        .attr('fill', 'none')
+        .attr('stroke', color)
+        .attr('stroke-width', 2.5)
+        .attr('stroke-linecap', 'round')
+        .attr('stroke-linejoin', 'round')
+        .attr('d', line);
+
+      const latest = trend[trend.length - 1];
+      svg.append('circle')
+        .attr('cx', x(trend.length - 1))
+        .attr('cy', y(latest))
+        .attr('r', 3.5)
+        .attr('fill', color);
+    });
+  };
 })();
