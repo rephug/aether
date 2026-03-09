@@ -129,10 +129,12 @@ dependencies = [
  "aether-config",
  "aether-core",
  "aether-graph-algo",
+ "aether-store",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "toml",
  "walkdir",
 ]
