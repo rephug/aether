@@ -311,6 +311,13 @@ pub fn betweenness_centrality_sync(edges: &[GraphAlgorithmEdge]) -> Vec<(String,
 }
 
 pub fn louvain_sync(edges: &[GraphAlgorithmEdge]) -> Vec<(String, usize)> {
+    louvain_with_resolution_sync(edges, 1.0)
+}
+
+pub fn louvain_with_resolution_sync(
+    edges: &[GraphAlgorithmEdge],
+    resolution: f64,
+) -> Vec<(String, usize)> {
     let (graph, _, names) = build_undirected_weighted_graph(edges);
     if graph.node_count() == 0 {
         return Vec::new();
@@ -385,7 +392,7 @@ pub fn louvain_sync(edges: &[GraphAlgorithmEdge]) -> Vec<(String, usize)> {
             for candidate in candidates {
                 let k_i_in = *neighbor_weight_by_community.get(&candidate).unwrap_or(&0.0);
                 let sum_tot_candidate = *sum_tot.get(&candidate).unwrap_or(&0.0);
-                let gain = k_i_in - (k_i * sum_tot_candidate) / two_m;
+                let gain = k_i_in - resolution.max(0.0) * (k_i * sum_tot_candidate) / two_m;
                 if gain > best_gain + 1e-12
                     || ((gain - best_gain).abs() <= 1e-12 && candidate < best_community)
                 {
@@ -597,6 +604,74 @@ mod tests {
             .collect::<HashSet<_>>()
             .len();
         assert_eq!(community_count, 2);
+    }
+
+    #[test]
+    fn louvain_with_resolution_one_matches_standard_louvain() {
+        let edges = vec![
+            edge("a", "b"),
+            edge("a", "c"),
+            edge("b", "c"),
+            edge("c", "d"),
+            edge("d", "e"),
+            edge("d", "f"),
+            edge("e", "f"),
+        ];
+
+        assert_eq!(
+            louvain_sync(&edges),
+            louvain_with_resolution_sync(&edges, 1.0)
+        );
+    }
+
+    #[test]
+    fn louvain_with_resolution_produces_fewer_communities_at_low_gamma() {
+        let edges = vec![
+            edge("a", "b"),
+            edge("a", "c"),
+            edge("a", "d"),
+            edge("b", "c"),
+        ];
+
+        let low = louvain_with_resolution_sync(&edges, 0.4);
+        let standard = louvain_sync(&edges);
+        let low_count = low
+            .iter()
+            .map(|(_, community)| *community)
+            .collect::<HashSet<_>>()
+            .len();
+        let standard_count = standard
+            .iter()
+            .map(|(_, community)| *community)
+            .collect::<HashSet<_>>()
+            .len();
+
+        assert!(low_count < standard_count);
+    }
+
+    #[test]
+    fn louvain_with_resolution_high_gamma_more_communities() {
+        let edges = vec![
+            edge("a", "b"),
+            edge("a", "c"),
+            edge("a", "d"),
+            edge("a", "e"),
+        ];
+
+        let standard = louvain_sync(&edges);
+        let high = louvain_with_resolution_sync(&edges, 1.8);
+        let standard_count = standard
+            .iter()
+            .map(|(_, community)| *community)
+            .collect::<HashSet<_>>()
+            .len();
+        let high_count = high
+            .iter()
+            .map(|(_, community)| *community)
+            .collect::<HashSet<_>>()
+            .len();
+
+        assert!(high_count > standard_count);
     }
 
     #[test]

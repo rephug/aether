@@ -3,18 +3,23 @@ use std::io::Write;
 use std::path::Path;
 
 use aether_analysis::HealthAnalyzer;
-use aether_config::AetherConfig;
-use aether_core::{GitContext, SIR_STATUS_STALE, normalize_path};
+use aether_config::{AetherConfig, GraphBackend};
+use aether_core::{GitContext, SIR_STATUS_STALE, SymbolKind, normalize_path};
+use aether_graph_algo::GraphAlgorithmEdge;
 use aether_health::history::{
     create_table_if_needed, read_latest_report, read_report_by_commit_prefix, write_score,
 };
 use aether_health::{
-    PlannerCommunityAssignment, PlannerSymbolRecord, ScoreReport, SemanticFileInput, SemanticInput,
-    SplitConfidence, compare_reports, compute_workspace_score, compute_workspace_score_filtered,
-    compute_workspace_score_with_signals, format_compare_json, format_compare_table, format_json,
-    format_table, suggest_split,
+    FileCommunityConfig, FileSymbol, PlannerDiagnostics, ScoreReport, SemanticFileInput,
+    SemanticInput, SplitSuggestion, compare_reports, compute_workspace_score,
+    compute_workspace_score_filtered, compute_workspace_score_with_signals,
+    detect_file_communities, format_compare_json, format_compare_table, format_json, format_table,
+    suggest_split,
 };
-use aether_store::{SqliteStore, Store};
+use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
+use aether_store::{
+    SqliteStore, Store, SurrealGraphStore, SymbolRecord, VectorStore, open_vector_store,
+};
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 
@@ -25,6 +30,16 @@ pub struct HealthScoreExecution {
     pub report: ScoreReport,
     pub rendered: String,
     pub exit_code: i32,
+}
+
+#[derive(Debug, Clone)]
+struct SplitSuggestionEntry {
+    crate_name: String,
+    crate_score: u32,
+    status: String,
+    message: Option<String>,
+    suggestion: Option<SplitSuggestion>,
+    diagnostics: Option<PlannerDiagnostics>,
 }
 
 pub fn run_health_score_command(
@@ -65,6 +80,17 @@ pub fn execute_health_score_command(
         attach_previous_history(workspace, &mut report)?;
     }
 
+    let split_suggestions = if args.suggest_splits && compare_baseline.is_none() {
+        Some(collect_split_suggestion_entries(
+            workspace,
+            config,
+            &report,
+            args.semantic,
+        ))
+    } else {
+        None
+    };
+
     let mut rendered = if let Some(before) = compare_baseline.as_ref() {
         let compare = compare_reports(before, &report);
         match args.output {
@@ -74,13 +100,20 @@ pub fn execute_health_score_command(
     } else {
         match args.output {
             HealthScoreOutputFormat::Table => format_table(&report),
-            HealthScoreOutputFormat::Json => format_json(&report),
+            HealthScoreOutputFormat::Json => {
+                if let Some(entries) = split_suggestions.as_deref() {
+                    render_health_report_json(&report, entries)
+                } else {
+                    format_json(&report)
+                }
+            }
         }
     };
 
     if args.suggest_splits
         && matches!(args.output, HealthScoreOutputFormat::Table)
-        && let Some(section) = render_split_suggestions(workspace, &report, args.semantic)?
+        && let Some(entries) = split_suggestions.as_deref()
+        && let Some(section) = render_split_suggestions(entries)
     {
         rendered.push_str("\n\n");
         rendered.push_str(&section);
@@ -191,113 +224,588 @@ fn open_history_connection(workspace: &Path) -> Result<Option<Connection>> {
     Ok(Some(conn))
 }
 
-fn render_split_suggestions(
+fn render_health_report_json(report: &ScoreReport, entries: &[SplitSuggestionEntry]) -> String {
+    let mut value = match serde_json::to_value(report) {
+        Ok(value) => value,
+        Err(err) => {
+            return format!("{{\"error\":\"failed to serialize health report: {err}\"}}");
+        }
+    };
+
+    let Some(object) = value.as_object_mut() else {
+        return format_json(report);
+    };
+    object.insert(
+        "split_suggestions".to_owned(),
+        serde_json::Value::Array(
+            entries
+                .iter()
+                .map(split_entry_to_json_value)
+                .collect::<Vec<_>>(),
+        ),
+    );
+    serde_json::to_string_pretty(&value)
+        .unwrap_or_else(|err| format!("{{\"error\":\"failed to serialize health report: {err}\"}}"))
+}
+
+fn split_entry_to_json_value(entry: &SplitSuggestionEntry) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    object.insert(
+        "crate_name".to_owned(),
+        serde_json::Value::String(entry.crate_name.clone()),
+    );
+    object.insert(
+        "crate_score".to_owned(),
+        serde_json::Value::Number(entry.crate_score.into()),
+    );
+    object.insert(
+        "status".to_owned(),
+        serde_json::Value::String(entry.status.clone()),
+    );
+    if let Some(message) = entry.message.as_ref() {
+        object.insert(
+            "message".to_owned(),
+            serde_json::Value::String(message.clone()),
+        );
+    }
+    if let Some(suggestion) = entry.suggestion.as_ref()
+        && let Ok(value) = serde_json::to_value(suggestion)
+    {
+        object.insert("suggestion".to_owned(), value);
+    }
+    if let Some(diagnostics) = entry.diagnostics.as_ref()
+        && let Ok(value) = serde_json::to_value(diagnostics)
+    {
+        object.insert("diagnostics".to_owned(), value);
+    }
+    serde_json::Value::Object(object)
+}
+
+fn collect_split_suggestion_entries(
     workspace: &Path,
+    config: &AetherConfig,
     report: &ScoreReport,
     semantic_enabled: bool,
-) -> Result<Option<String>> {
+) -> Vec<SplitSuggestionEntry> {
     let qualifying = report
         .crates
         .iter()
         .filter(|crate_score| crate_score.score >= 50)
         .collect::<Vec<_>>();
     if qualifying.is_empty() {
-        return Ok(None);
+        return Vec::new();
     }
     if !semantic_enabled {
-        return Ok(Some(
-            "Split suggestions: skipped because this feature requires --semantic and indexed community data."
-                .to_owned(),
-        ));
+        return qualifying
+            .into_iter()
+            .map(|crate_score| {
+                split_entry(
+                    crate_score.name.clone(),
+                    crate_score.score,
+                    "skipped",
+                    Some("split suggestions require --semantic".to_owned()),
+                    None,
+                    None,
+                )
+            })
+            .collect();
+    }
+    if config.storage.graph_backend != GraphBackend::Surreal {
+        return qualifying
+            .into_iter()
+            .map(|crate_score| {
+                split_entry(
+                    crate_score.name.clone(),
+                    crate_score.score,
+                    "unavailable",
+                    Some(
+                        "split suggestions require storage.graph_backend = \"surreal\"".to_owned(),
+                    ),
+                    None,
+                    None,
+                )
+            })
+            .collect();
     }
 
     let store = match SqliteStore::open_readonly(workspace) {
         Ok(store) => store,
         Err(_) => {
-            return Ok(Some(
-                "Split suggestions: unavailable because the workspace index is not readable."
-                    .to_owned(),
-            ));
+            return qualifying
+                .into_iter()
+                .map(|crate_score| {
+                    split_entry(
+                        crate_score.name.clone(),
+                        crate_score.score,
+                        "unavailable",
+                        Some("workspace index is not readable".to_owned()),
+                        None,
+                        None,
+                    )
+                })
+                .collect();
         }
     };
-    let community_assignments = store
-        .list_latest_community_snapshot()
-        .context("failed to load latest community snapshot")?
-        .into_iter()
-        .map(|entry| PlannerCommunityAssignment {
-            symbol_id: entry.symbol_id,
-            community_id: entry.community_id,
-        })
-        .collect::<Vec<_>>();
-    if community_assignments.is_empty() {
-        return Ok(Some(
-            "Split suggestions: unavailable because no community snapshot is present.".to_owned(),
-        ));
-    }
 
-    let mut suggestions = Vec::new();
-    for crate_score in qualifying {
-        let Some(file_path) = crate_score.metrics.max_file_path.as_deref() else {
-            continue;
+    let loaded =
+        match load_embedding_provider_from_config(workspace, EmbeddingProviderOverrides::default())
+        {
+            Ok(Some(loaded)) => loaded,
+            Ok(None) => {
+                return qualifying
+                    .into_iter()
+                    .map(|crate_score| {
+                        split_entry(
+                            crate_score.name.clone(),
+                            crate_score.score,
+                            "unavailable",
+                            Some("embeddings are disabled for this workspace".to_owned()),
+                            None,
+                            None,
+                        )
+                    })
+                    .collect();
+            }
+            Err(err) => {
+                return qualifying
+                    .into_iter()
+                    .map(|crate_score| {
+                        split_entry(
+                            crate_score.name.clone(),
+                            crate_score.score,
+                            "unavailable",
+                            Some(format!("failed to load embedding provider: {err}")),
+                            None,
+                            None,
+                        )
+                    })
+                    .collect();
+            }
         };
-        let symbol_records = store
-            .list_symbols_for_file(file_path)
-            .with_context(|| format!("failed to list symbols for {file_path}"))?
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            return qualifying
+                .into_iter()
+                .map(|crate_score| {
+                    split_entry(
+                        crate_score.name.clone(),
+                        crate_score.score,
+                        "unavailable",
+                        Some(format!(
+                            "failed to build runtime for split suggestions: {err}"
+                        )),
+                        None,
+                        None,
+                    )
+                })
+                .collect();
+        }
+    };
+
+    let graph = match runtime.block_on(SurrealGraphStore::open_readonly(workspace)) {
+        Ok(graph) => graph,
+        Err(err) => {
+            return qualifying
+                .into_iter()
+                .map(|crate_score| {
+                    split_entry(
+                        crate_score.name.clone(),
+                        crate_score.score,
+                        "unavailable",
+                        Some(format!("failed to open surreal graph: {err}")),
+                        None,
+                        None,
+                    )
+                })
+                .collect();
+        }
+    };
+    let all_edges = match runtime.block_on(graph.list_dependency_edges()) {
+        Ok(edges) => edges
             .into_iter()
-            .map(|symbol| PlannerSymbolRecord {
-                id: symbol.id,
-                qualified_name: symbol.qualified_name,
-                file_path: symbol.file_path,
+            .map(|edge| GraphAlgorithmEdge {
+                source_id: edge.source_symbol_id,
+                target_id: edge.target_symbol_id,
+                edge_kind: edge.edge_kind,
             })
-            .collect::<Vec<_>>();
-        let Some(suggestion) = suggest_split(
-            file_path,
-            crate_score.score,
-            community_assignments.as_slice(),
-            symbol_records.as_slice(),
-        ) else {
-            continue;
-        };
-        suggestions.push((crate_score.name.as_str(), crate_score.score, suggestion));
+            .collect::<Vec<_>>(),
+        Err(err) => {
+            return qualifying
+                .into_iter()
+                .map(|crate_score| {
+                    split_entry(
+                        crate_score.name.clone(),
+                        crate_score.score,
+                        "unavailable",
+                        Some(format!("failed to load dependency edges: {err}")),
+                        None,
+                        None,
+                    )
+                })
+                .collect();
+        }
+    };
+
+    let vector_store = match runtime.block_on(open_vector_store(workspace)) {
+        Ok(vector_store) => vector_store,
+        Err(err) => {
+            return qualifying
+                .into_iter()
+                .map(|crate_score| {
+                    split_entry(
+                        crate_score.name.clone(),
+                        crate_score.score,
+                        "unavailable",
+                        Some(format!("failed to open vector store: {err}")),
+                        None,
+                        None,
+                    )
+                })
+                .collect();
+        }
+    };
+    let planner_config = FileCommunityConfig {
+        semantic_rescue_threshold: config.planner.semantic_rescue_threshold,
+        semantic_rescue_max_k: config.planner.semantic_rescue_max_k,
+        community_resolution: config.planner.community_resolution,
+        min_community_size: config.planner.min_community_size,
+    };
+
+    qualifying
+        .into_iter()
+        .map(|crate_score| {
+            build_split_suggestion_entry(
+                crate_score.name.as_str(),
+                crate_score.score,
+                crate_score.metrics.max_file_path.as_deref(),
+                &store,
+                all_edges.as_slice(),
+                vector_store.as_ref(),
+                loaded.provider_name.as_str(),
+                loaded.model_name.as_str(),
+                &planner_config,
+                &runtime,
+            )
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_split_suggestion_entry(
+    crate_name: &str,
+    crate_score: u32,
+    file_path: Option<&str>,
+    store: &SqliteStore,
+    all_edges: &[GraphAlgorithmEdge],
+    vector_store: &dyn VectorStore,
+    provider_name: &str,
+    model_name: &str,
+    planner_config: &FileCommunityConfig,
+    runtime: &tokio::runtime::Runtime,
+) -> SplitSuggestionEntry {
+    let Some(file_path) = file_path else {
+        return split_entry(
+            crate_name.to_owned(),
+            crate_score,
+            "no_split",
+            Some("hotspot file path is unavailable".to_owned()),
+            None,
+            None,
+        );
+    };
+
+    let symbol_records = match store.list_symbols_for_file(file_path) {
+        Ok(symbols) => symbols,
+        Err(err) => {
+            return split_entry(
+                crate_name.to_owned(),
+                crate_score,
+                "unavailable",
+                Some(format!("failed to load symbols for {file_path}: {err}")),
+                None,
+                None,
+            );
+        }
+    };
+    if symbol_records.is_empty() {
+        return split_entry(
+            crate_name.to_owned(),
+            crate_score,
+            "unavailable",
+            Some(format!("no indexed symbols were found for {file_path}")),
+            None,
+            None,
+        );
     }
 
-    if suggestions.is_empty() {
-        return Ok(Some(
-            "Split suggestions: no qualifying split heuristics were found for the current hotspots."
-                .to_owned(),
-        ));
+    let symbol_ids = symbol_records
+        .iter()
+        .map(|symbol| symbol.id.clone())
+        .collect::<Vec<_>>();
+    let symbol_id_set = symbol_ids
+        .iter()
+        .map(|symbol_id| symbol_id.as_str())
+        .collect::<HashSet<_>>();
+    let structural_edges = all_edges
+        .iter()
+        .filter(|edge| {
+            symbol_id_set.contains(edge.source_id.as_str())
+                && symbol_id_set.contains(edge.target_id.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let embedding_records = match runtime.block_on(vector_store.list_embeddings_for_symbols(
+        provider_name,
+        model_name,
+        symbol_ids.as_slice(),
+    )) {
+        Ok(records) => records,
+        Err(err) => {
+            return split_entry(
+                crate_name.to_owned(),
+                crate_score,
+                "unavailable",
+                Some(format!("failed to load embeddings for {file_path}: {err}")),
+                None,
+                None,
+            );
+        }
+    };
+    let embedding_by_id = embedding_records
+        .into_iter()
+        .map(|record| (record.symbol_id, record.embedding))
+        .collect::<HashMap<_, _>>();
+
+    let file_symbols = symbol_records
+        .iter()
+        .map(|record| build_file_symbol(store, record, &embedding_by_id))
+        .collect::<Vec<_>>();
+    let (assignments, diagnostics) = detect_file_communities(
+        structural_edges.as_slice(),
+        file_symbols.as_slice(),
+        planner_config,
+    );
+    if assignments.is_empty() {
+        return split_entry(
+            crate_name.to_owned(),
+            crate_score,
+            "no_split",
+            Some("all non-test symbols were loners after rescue passes".to_owned()),
+            None,
+            Some(diagnostics),
+        );
+    }
+
+    let community_count = assignments
+        .iter()
+        .map(|(_, community_id)| *community_id)
+        .collect::<HashSet<_>>()
+        .len();
+    if community_count < 2 {
+        return split_entry(
+            crate_name.to_owned(),
+            crate_score,
+            "no_split",
+            Some("only one actionable community was detected".to_owned()),
+            None,
+            Some(diagnostics),
+        );
+    }
+
+    match suggest_split(
+        file_path,
+        crate_score,
+        structural_edges.as_slice(),
+        file_symbols.as_slice(),
+        planner_config,
+    ) {
+        Some((suggestion, diagnostics)) => split_entry(
+            crate_name.to_owned(),
+            crate_score,
+            "suggested",
+            None,
+            Some(suggestion),
+            Some(diagnostics),
+        ),
+        None => split_entry(
+            crate_name.to_owned(),
+            crate_score,
+            "no_split",
+            Some("no actionable split suggestion was produced".to_owned()),
+            None,
+            Some(diagnostics),
+        ),
+    }
+}
+
+fn build_file_symbol(
+    store: &SqliteStore,
+    record: &SymbolRecord,
+    embedding_by_id: &HashMap<String, Vec<f32>>,
+) -> FileSymbol {
+    FileSymbol {
+        symbol_id: record.id.clone(),
+        name: symbol_leaf_name(record.qualified_name.as_str()).to_owned(),
+        qualified_name: record.qualified_name.clone(),
+        kind: parse_symbol_kind(record.kind.as_str()),
+        is_test: symbol_is_test(store, record),
+        embedding: embedding_by_id.get(record.id.as_str()).cloned(),
+    }
+}
+
+fn split_entry(
+    crate_name: String,
+    crate_score: u32,
+    status: &str,
+    message: Option<String>,
+    suggestion: Option<SplitSuggestion>,
+    diagnostics: Option<PlannerDiagnostics>,
+) -> SplitSuggestionEntry {
+    SplitSuggestionEntry {
+        crate_name,
+        crate_score,
+        status: status.to_owned(),
+        message,
+        suggestion,
+        diagnostics,
+    }
+}
+
+fn render_split_suggestions(entries: &[SplitSuggestionEntry]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
     }
 
     let mut lines = vec!["Split suggestions:".to_owned()];
-    for (crate_name, score, suggestion) in suggestions {
-        lines.push(format!("{crate_name} - {score}/100"));
-        lines.push(format!("  target_file: {}", suggestion.target_file));
-        lines.push(format!(
-            "  confidence: {}",
-            match suggestion.confidence {
-                SplitConfidence::High => "high",
-                SplitConfidence::Medium => "medium",
-                SplitConfidence::Low => "low",
+    for entry in entries {
+        lines.push(format!("{} - {}/100", entry.crate_name, entry.crate_score));
+        lines.push(format!("  status: {}", entry.status));
+        if let Some(message) = &entry.message {
+            lines.push(format!("  message: {message}"));
+        }
+        if let Some(suggestion) = &entry.suggestion {
+            lines.push(format!("  target_file: {}", suggestion.target_file));
+            if let Some(diagnostics) = &entry.diagnostics {
+                lines.push(format!(
+                    "  confidence: {} ({:.2})",
+                    diagnostics.confidence_label, diagnostics.confidence
+                ));
+                lines.push(format!("  stability: {:.2}", diagnostics.stability_score));
             }
-        ));
-        lines.push(format!(
-            "  expected impact: {}",
-            suggestion.expected_score_impact
-        ));
-        for module in suggestion.suggested_modules {
             lines.push(format!(
-                "  - {}: {} ({})",
-                module.name,
-                module.symbols.join(", "),
-                module.reason
+                "  expected impact: {}",
+                suggestion.expected_score_impact
             ));
+            for module in &suggestion.suggested_modules {
+                lines.push(format!(
+                    "  - {} -> {}: {} ({})",
+                    module.name,
+                    module.suggested_file_path,
+                    module.symbols.join(", "),
+                    module.reason
+                ));
+            }
+        }
+        if let Some(diagnostics) = &entry.diagnostics {
+            append_planner_diagnostics(&mut lines, diagnostics);
         }
         lines.push(String::new());
     }
+
     while matches!(lines.last(), Some(last) if last.is_empty()) {
         lines.pop();
     }
-    Ok(Some(lines.join("\n")))
+    Some(lines.join("\n"))
+}
+
+fn append_planner_diagnostics(lines: &mut Vec<String>, diagnostics: &PlannerDiagnostics) {
+    lines.push("  diagnostics:".to_owned());
+    lines.push(format!("    symbols_total: {}", diagnostics.symbols_total));
+    lines.push(format!(
+        "    symbols_filtered_test: {}",
+        diagnostics.symbols_filtered_test
+    ));
+    lines.push(format!(
+        "    symbols_anchored_type: {}",
+        diagnostics.symbols_anchored_type
+    ));
+    lines.push(format!(
+        "    symbols_rescued_container: {}",
+        diagnostics.symbols_rescued_container
+    ));
+    lines.push(format!(
+        "    symbols_rescued_semantic: {}",
+        diagnostics.symbols_rescued_semantic
+    ));
+    lines.push(format!("    symbols_loner: {}", diagnostics.symbols_loner));
+    lines.push(format!(
+        "    communities_before_merge: {}",
+        diagnostics.communities_before_merge
+    ));
+    lines.push(format!(
+        "    communities_after_merge: {}",
+        diagnostics.communities_after_merge
+    ));
+    lines.push(format!(
+        "    embedding_coverage_pct: {:.2}",
+        diagnostics.embedding_coverage_pct
+    ));
+    lines.push(format!("    confidence: {:.2}", diagnostics.confidence));
+    lines.push(format!(
+        "    confidence_label: {}",
+        diagnostics.confidence_label
+    ));
+    lines.push(format!(
+        "    stability_score: {:.2}",
+        diagnostics.stability_score
+    ));
+}
+
+fn parse_symbol_kind(raw: &str) -> SymbolKind {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "function" => SymbolKind::Function,
+        "method" => SymbolKind::Method,
+        "class" => SymbolKind::Class,
+        "variable" => SymbolKind::Variable,
+        "struct" => SymbolKind::Struct,
+        "enum" => SymbolKind::Enum,
+        "trait" => SymbolKind::Trait,
+        "interface" => SymbolKind::Interface,
+        "type_alias" => SymbolKind::TypeAlias,
+        _ => SymbolKind::Function,
+    }
+}
+
+fn symbol_leaf_name(qualified_name: &str) -> &str {
+    qualified_name
+        .rsplit("::")
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(qualified_name)
+}
+
+fn symbol_is_test(store: &SqliteStore, record: &SymbolRecord) -> bool {
+    if store
+        .list_test_intents_for_symbol(record.id.as_str())
+        .map(|records| !records.is_empty())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    let leaf_name = symbol_leaf_name(record.qualified_name.as_str()).to_ascii_lowercase();
+    if leaf_name.starts_with("test_") {
+        return true;
+    }
+
+    let normalized_path = normalize_path(record.file_path.as_str()).to_ascii_lowercase();
+    normalized_path.starts_with("tests/") || normalized_path.contains("/tests/")
 }
 
 fn load_semantic_input(workspace: &Path) -> Result<Option<SemanticInput>> {
@@ -424,14 +932,19 @@ mod tests {
 
     use aether_config::AetherConfig;
     use aether_core::EdgeKind;
+    use aether_graph_algo::GraphAlgorithmEdge;
     use aether_store::{
         CommunitySnapshotRecord, DriftResultRecord, GraphStore, ResolvedEdge, SqliteStore, Store,
-        SurrealGraphStore, SymbolRecord, TestIntentRecord,
+        SurrealGraphStore, SymbolEmbeddingRecord, SymbolRecord, TestIntentRecord,
+        open_vector_store,
     };
     use rusqlite::Connection;
     use tempfile::tempdir;
 
-    use super::execute_health_score_command;
+    use super::{
+        build_split_suggestion_entry, execute_health_score_command, render_health_report_json,
+        render_split_suggestions,
+    };
     use crate::cli::{HealthScoreArgs, HealthScoreOutputFormat};
 
     fn write_file(path: &Path, content: &str) {
@@ -467,9 +980,10 @@ mirror_sir_files = true
 graph_backend = "surreal"
 
 [embeddings]
-enabled = false
+enabled = true
 provider = "qwen3_local"
 vector_backend = "sqlite"
+model = "qwen3-embeddings-4B"
 "#,
         );
     }
@@ -540,17 +1054,22 @@ vector_backend = "sqlite"
         }
     }
 
-    fn copy_dir_all(from: &Path, to: &Path) {
-        fs::create_dir_all(to).expect("create destination dir");
-        for entry in fs::read_dir(from).expect("read source dir") {
-            let entry = entry.expect("dir entry");
-            let source_path = entry.path();
-            let target_path = to.join(entry.file_name());
-            if source_path.is_dir() {
-                copy_dir_all(&source_path, &target_path);
-            } else {
-                fs::copy(&source_path, &target_path).expect("copy file");
-            }
+    fn embedding_record(symbol_id: &str, embedding: Vec<f32>) -> SymbolEmbeddingRecord {
+        SymbolEmbeddingRecord {
+            symbol_id: symbol_id.to_owned(),
+            sir_hash: format!("sir-{symbol_id}"),
+            provider: "qwen3_local".to_owned(),
+            model: "qwen3-embeddings-4B".to_owned(),
+            embedding,
+            updated_at: now_millis(),
+        }
+    }
+
+    fn planner_edge(source_id: &str, target_id: &str) -> GraphAlgorithmEdge {
+        GraphAlgorithmEdge {
+            source_id: source_id.to_owned(),
+            target_id: target_id.to_owned(),
+            edge_kind: "calls".to_owned(),
         }
     }
 
@@ -589,13 +1108,19 @@ vector_backend = "sqlite"
                     .expect("upsert edge");
             }
         });
+        drop(runtime);
 
         let source_graph = seed_workspace.path().join(".aether/graph");
         let target_graph = workspace.join(".aether/graph");
+        fs::create_dir_all(workspace.join(".aether")).expect("create workspace .aether");
         if target_graph.exists() {
             fs::remove_dir_all(&target_graph).expect("remove existing graph dir");
         }
-        copy_dir_all(&source_graph, &target_graph);
+        fs::rename(&source_graph, &target_graph).expect("move surreal graph dir");
+        let lock_file = target_graph.join("LOCK");
+        if lock_file.exists() {
+            fs::remove_file(lock_file).expect("remove stale surreal lock");
+        }
     }
 
     fn default_args() -> HealthScoreArgs {
@@ -920,11 +1445,7 @@ vector_backend = "sqlite"
         let execution = execute_health_score_command(workspace.path(), &hot_health_config(), args)
             .expect("health-score execution");
 
-        assert!(
-            execution
-                .rendered
-                .contains("Split suggestions: skipped because this feature requires --semantic")
-        );
+        assert!(execution.rendered.contains("status: skipped"));
     }
 
     #[test]
@@ -933,13 +1454,15 @@ vector_backend = "sqlite"
         write_semantic_config(workspace.path());
         write_file(
             &workspace.path().join("crates/example/src/lib.rs"),
-            "pub trait Store {\n    fn alpha(&self);\n    fn beta(&self);\n    fn gamma(&self);\n}\n\npub fn sir_alpha() -> i32 { 1 }\npub fn sir_beta() -> i32 { sir_alpha() }\npub fn note_alpha() -> i32 { 3 }\npub fn note_beta() -> i32 { note_alpha() }\n",
+            "pub trait Store {\n    fn alpha(&self);\n    fn beta(&self);\n    fn gamma(&self);\n}\n\npub fn sir_alpha() -> i32 { 1 }\npub fn sir_beta() -> i32 { sir_alpha() }\npub fn sir_gamma() -> i32 { sir_beta() }\npub fn sir_delta() -> i32 { sir_gamma() }\npub fn note_alpha() -> i32 { 3 }\npub fn note_beta() -> i32 { note_alpha() }\npub fn note_gamma() -> i32 { note_beta() }\npub fn note_delta() -> i32 { note_gamma() }\n",
         );
 
         let store = SqliteStore::open(workspace.path()).expect("open sqlite");
         let symbols = vec![
             symbol("sym-sir-a", "crate::sir_alpha", "crates/example/src/lib.rs"),
             symbol("sym-sir-b", "crate::sir_beta", "crates/example/src/lib.rs"),
+            symbol("sym-sir-c", "crate::sir_gamma", "crates/example/src/lib.rs"),
+            symbol("sym-sir-d", "crate::sir_delta", "crates/example/src/lib.rs"),
             symbol(
                 "sym-note-a",
                 "crate::note_alpha",
@@ -950,58 +1473,227 @@ vector_backend = "sqlite"
                 "crate::note_beta",
                 "crates/example/src/lib.rs",
             ),
+            symbol(
+                "sym-note-c",
+                "crate::note_gamma",
+                "crates/example/src/lib.rs",
+            ),
+            symbol(
+                "sym-note-d",
+                "crate::note_delta",
+                "crates/example/src/lib.rs",
+            ),
         ];
         for symbol in &symbols {
             store.upsert_symbol(symbol.clone()).expect("upsert symbol");
         }
         store
-            .replace_community_snapshot(
-                "snapshot-1",
-                now_millis(),
-                &[
-                    CommunitySnapshotRecord {
-                        snapshot_id: "snapshot-1".to_owned(),
-                        symbol_id: "sym-sir-a".to_owned(),
-                        community_id: 1,
-                        captured_at: now_millis(),
-                    },
-                    CommunitySnapshotRecord {
-                        snapshot_id: "snapshot-1".to_owned(),
-                        symbol_id: "sym-sir-b".to_owned(),
-                        community_id: 1,
-                        captured_at: now_millis(),
-                    },
-                    CommunitySnapshotRecord {
-                        snapshot_id: "snapshot-1".to_owned(),
-                        symbol_id: "sym-note-a".to_owned(),
-                        community_id: 2,
-                        captured_at: now_millis(),
-                    },
-                    CommunitySnapshotRecord {
-                        snapshot_id: "snapshot-1".to_owned(),
-                        symbol_id: "sym-note-b".to_owned(),
-                        community_id: 2,
-                        captured_at: now_millis(),
-                    },
-                ],
-            )
-            .expect("seed communities");
+            .upsert_symbol_embedding(embedding_record("sym-sir-a", vec![1.0, 0.0]))
+            .expect("seed sir-a embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-sir-b", vec![0.95, 0.05]))
+            .expect("seed sir-b embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-sir-c", vec![0.92, 0.08]))
+            .expect("seed sir-c embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-sir-d", vec![0.9, 0.1]))
+            .expect("seed sir-d embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-note-a", vec![0.0, 1.0]))
+            .expect("seed note-a embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-note-b", vec![0.05, 0.95]))
+            .expect("seed note-b embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-note-c", vec![0.08, 0.92]))
+            .expect("seed note-c embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-note-d", vec![0.1, 0.9]))
+            .expect("seed note-d embedding");
 
-        seed_surreal_graph_snapshot(
-            workspace.path(),
-            &symbols,
-            &[("sym-sir-a", "sym-sir-b"), ("sym-note-a", "sym-note-b")],
+        let all_edges = vec![
+            planner_edge("sym-sir-a", "sym-sir-b"),
+            planner_edge("sym-sir-b", "sym-sir-c"),
+            planner_edge("sym-sir-c", "sym-sir-d"),
+            planner_edge("sym-note-a", "sym-note-b"),
+            planner_edge("sym-note-b", "sym-note-c"),
+            planner_edge("sym-note-c", "sym-note-d"),
+        ];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let vector_store = runtime
+            .block_on(open_vector_store(workspace.path()))
+            .expect("open vector store");
+        let config = hot_health_config();
+        let planner_config = super::FileCommunityConfig {
+            semantic_rescue_threshold: config.planner.semantic_rescue_threshold,
+            semantic_rescue_max_k: config.planner.semantic_rescue_max_k,
+            community_resolution: config.planner.community_resolution,
+            min_community_size: config.planner.min_community_size,
+        };
+
+        let entry = build_split_suggestion_entry(
+            "example",
+            63,
+            Some("crates/example/src/lib.rs"),
+            &store,
+            all_edges.as_slice(),
+            vector_store.as_ref(),
+            "qwen3_local",
+            "qwen3-embeddings-4B",
+            &planner_config,
+            &runtime,
         );
+        let rendered =
+            render_split_suggestions(std::slice::from_ref(&entry)).expect("render split section");
+
+        assert_eq!(entry.status, "suggested");
+        assert!(rendered.contains("Split suggestions:"));
+        assert!(rendered.contains("sir_ops"));
+        assert!(rendered.contains("note_ops"));
+        assert!(rendered.contains("diagnostics:"));
+        assert!(rendered.contains("stability:"));
+    }
+
+    #[test]
+    fn suggest_splits_reports_unavailable_without_surreal_backend() {
+        let workspace = create_workspace();
+        write_file(
+            &workspace.path().join("crates/example/src/lib.rs"),
+            "pub trait Store {\n    fn alpha(&self);\n    fn beta(&self);\n    fn gamma(&self);\n}\n",
+        );
+
+        let mut config = hot_health_config();
+        config.storage.graph_backend = aether_config::GraphBackend::Sqlite;
 
         let mut args = default_args();
         args.output = HealthScoreOutputFormat::Table;
         args.semantic = true;
         args.suggest_splits = true;
-        let execution = execute_health_score_command(workspace.path(), &hot_health_config(), args)
+        let execution = execute_health_score_command(workspace.path(), &config, args)
             .expect("health-score execution");
 
-        assert!(execution.rendered.contains("Split suggestions:"));
-        assert!(execution.rendered.contains("sir_ops"));
-        assert!(execution.rendered.contains("note_ops"));
+        assert!(execution.rendered.contains("status: unavailable"));
+        assert!(
+            execution
+                .rendered
+                .contains("storage.graph_backend = \"surreal\"")
+        );
+    }
+
+    #[test]
+    fn suggest_splits_json_includes_sidecar_diagnostics() {
+        let workspace = create_workspace();
+        write_semantic_config(workspace.path());
+        write_file(
+            &workspace.path().join("crates/example/src/lib.rs"),
+            "pub trait Store {\n    fn alpha(&self);\n    fn beta(&self);\n    fn gamma(&self);\n}\n\npub fn sir_alpha() -> i32 { 1 }\npub fn sir_beta() -> i32 { sir_alpha() }\npub fn sir_gamma() -> i32 { sir_beta() }\npub fn sir_delta() -> i32 { sir_gamma() }\npub fn note_alpha() -> i32 { 3 }\npub fn note_beta() -> i32 { note_alpha() }\npub fn note_gamma() -> i32 { note_beta() }\npub fn note_delta() -> i32 { note_gamma() }\n",
+        );
+
+        let store = SqliteStore::open(workspace.path()).expect("open sqlite");
+        let symbols = vec![
+            symbol("sym-sir-a", "crate::sir_alpha", "crates/example/src/lib.rs"),
+            symbol("sym-sir-b", "crate::sir_beta", "crates/example/src/lib.rs"),
+            symbol("sym-sir-c", "crate::sir_gamma", "crates/example/src/lib.rs"),
+            symbol("sym-sir-d", "crate::sir_delta", "crates/example/src/lib.rs"),
+            symbol(
+                "sym-note-a",
+                "crate::note_alpha",
+                "crates/example/src/lib.rs",
+            ),
+            symbol(
+                "sym-note-b",
+                "crate::note_beta",
+                "crates/example/src/lib.rs",
+            ),
+            symbol(
+                "sym-note-c",
+                "crate::note_gamma",
+                "crates/example/src/lib.rs",
+            ),
+            symbol(
+                "sym-note-d",
+                "crate::note_delta",
+                "crates/example/src/lib.rs",
+            ),
+        ];
+        for symbol in &symbols {
+            store.upsert_symbol(symbol.clone()).expect("upsert symbol");
+        }
+        store
+            .upsert_symbol_embedding(embedding_record("sym-sir-a", vec![1.0, 0.0]))
+            .expect("seed sir-a embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-sir-b", vec![0.95, 0.05]))
+            .expect("seed sir-b embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-sir-c", vec![0.92, 0.08]))
+            .expect("seed sir-c embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-sir-d", vec![0.9, 0.1]))
+            .expect("seed sir-d embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-note-a", vec![0.0, 1.0]))
+            .expect("seed note-a embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-note-b", vec![0.05, 0.95]))
+            .expect("seed note-b embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-note-c", vec![0.08, 0.92]))
+            .expect("seed note-c embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-note-d", vec![0.1, 0.9]))
+            .expect("seed note-d embedding");
+
+        let all_edges = vec![
+            planner_edge("sym-sir-a", "sym-sir-b"),
+            planner_edge("sym-sir-b", "sym-sir-c"),
+            planner_edge("sym-sir-c", "sym-sir-d"),
+            planner_edge("sym-note-a", "sym-note-b"),
+            planner_edge("sym-note-b", "sym-note-c"),
+            planner_edge("sym-note-c", "sym-note-d"),
+        ];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let vector_store = runtime
+            .block_on(open_vector_store(workspace.path()))
+            .expect("open vector store");
+        let config = hot_health_config();
+        let planner_config = super::FileCommunityConfig {
+            semantic_rescue_threshold: config.planner.semantic_rescue_threshold,
+            semantic_rescue_max_k: config.planner.semantic_rescue_max_k,
+            community_resolution: config.planner.community_resolution,
+            min_community_size: config.planner.min_community_size,
+        };
+        let entry = build_split_suggestion_entry(
+            "example",
+            63,
+            Some("crates/example/src/lib.rs"),
+            &store,
+            all_edges.as_slice(),
+            vector_store.as_ref(),
+            "qwen3_local",
+            "qwen3-embeddings-4B",
+            &planner_config,
+            &runtime,
+        );
+
+        let mut args = default_args();
+        args.output = HealthScoreOutputFormat::Json;
+        args.semantic = false;
+        args.suggest_splits = false;
+        let execution = execute_health_score_command(workspace.path(), &hot_health_config(), args)
+            .expect("health-score execution");
+        let rendered = render_health_report_json(&execution.report, &[entry]);
+
+        assert!(rendered.contains("\"split_suggestions\""));
+        assert!(rendered.contains("\"diagnostics\""));
+        assert!(rendered.contains("\"confidence_label\""));
+        assert!(rendered.contains("\"stability_score\""));
     }
 }

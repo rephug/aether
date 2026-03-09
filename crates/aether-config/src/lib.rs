@@ -262,6 +262,8 @@ pub struct AetherConfig {
     #[serde(default)]
     pub health: HealthConfig,
     #[serde(default)]
+    pub planner: PlannerConfig,
+    #[serde(default)]
     pub health_score: HealthScoreConfig,
     #[serde(default)]
     pub dashboard: DashboardConfig,
@@ -869,6 +871,29 @@ impl Default for RiskWeights {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlannerConfig {
+    #[serde(default = "default_planner_semantic_rescue_threshold")]
+    pub semantic_rescue_threshold: f32,
+    #[serde(default = "default_planner_semantic_rescue_max_k")]
+    pub semantic_rescue_max_k: usize,
+    #[serde(default = "default_planner_community_resolution")]
+    pub community_resolution: f64,
+    #[serde(default = "default_planner_min_community_size")]
+    pub min_community_size: usize,
+}
+
+impl Default for PlannerConfig {
+    fn default() -> Self {
+        Self {
+            semantic_rescue_threshold: default_planner_semantic_rescue_threshold(),
+            semantic_rescue_max_k: default_planner_semantic_rescue_max_k(),
+            community_resolution: default_planner_community_resolution(),
+            min_community_size: default_planner_min_community_size(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HealthScoreConfig {
     #[serde(default = "default_health_score_file_loc_warn")]
     pub file_loc_warn: usize,
@@ -1470,6 +1495,22 @@ fn default_health_recency_weight() -> f64 {
     DEFAULT_HEALTH_RECENCY_WEIGHT
 }
 
+fn default_planner_semantic_rescue_threshold() -> f32 {
+    0.70
+}
+
+fn default_planner_semantic_rescue_max_k() -> usize {
+    3
+}
+
+fn default_planner_community_resolution() -> f64 {
+    0.5
+}
+
+fn default_planner_min_community_size() -> usize {
+    3
+}
+
 fn default_health_score_file_loc_warn() -> usize {
     DEFAULT_HEALTH_SCORE_FILE_LOC_WARN
 }
@@ -1825,6 +1866,28 @@ fn normalize_optional_positive_f64(value: &mut Option<f64>) {
     }
 }
 
+fn normalize_planner_config(config: &mut PlannerConfig) {
+    if !config.semantic_rescue_threshold.is_finite() {
+        config.semantic_rescue_threshold = default_planner_semantic_rescue_threshold();
+    }
+    config.semantic_rescue_threshold = config.semantic_rescue_threshold.clamp(0.3, 0.95);
+
+    if config.semantic_rescue_max_k == 0 {
+        config.semantic_rescue_max_k = default_planner_semantic_rescue_max_k();
+    }
+    config.semantic_rescue_max_k = config.semantic_rescue_max_k.clamp(1, 10);
+
+    if !config.community_resolution.is_finite() {
+        config.community_resolution = default_planner_community_resolution();
+    }
+    config.community_resolution = config.community_resolution.clamp(0.1, 3.0);
+
+    if config.min_community_size == 0 {
+        config.min_community_size = default_planner_min_community_size();
+    }
+    config.min_community_size = config.min_community_size.clamp(1, 20);
+}
+
 fn normalize_health_score_config(config: &mut HealthScoreConfig) {
     normalize_health_score_usize_pair(
         &mut config.file_loc_warn,
@@ -2020,6 +2083,7 @@ fn normalize_config(mut config: AetherConfig) -> AetherConfig {
     }
     config.drift.hub_percentile = config.drift.hub_percentile.clamp(1, 100);
     normalize_health_weights(&mut config.health);
+    normalize_planner_config(&mut config.planner);
     normalize_health_score_config(&mut config.health_score);
 
     let api_key_env = config.inference.api_key_env.trim();
@@ -2184,6 +2248,10 @@ mod tests {
             config.health.risk_weights.recency,
             DEFAULT_HEALTH_RECENCY_WEIGHT
         );
+        assert_eq!(config.planner.semantic_rescue_threshold, 0.70);
+        assert_eq!(config.planner.semantic_rescue_max_k, 3);
+        assert_eq!(config.planner.community_resolution, 0.5);
+        assert_eq!(config.planner.min_community_size, 3);
         assert_eq!(
             config.health_score.file_loc_warn,
             DEFAULT_HEALTH_SCORE_FILE_LOC_WARN
@@ -2335,6 +2403,11 @@ mod tests {
         assert!(content.contains("drift = 0.2"));
         assert!(content.contains("no_sir = 0.15"));
         assert!(content.contains("recency = 0.1"));
+        assert!(content.contains("[planner]"));
+        assert!(content.contains("semantic_rescue_threshold"));
+        assert!(content.contains("semantic_rescue_max_k = 3"));
+        assert!(content.contains("community_resolution"));
+        assert!(content.contains("min_community_size = 3"));
         assert!(content.contains("[health_score]"));
         assert!(content.contains("file_loc_warn = 800"));
         assert!(content.contains("trait_method_fail = 35"));
@@ -2919,6 +2992,7 @@ deep_concurrency = 0
             coupling: CouplingConfig::default(),
             drift: DriftConfig::default(),
             health: HealthConfig::default(),
+            planner: PlannerConfig::default(),
             health_score: HealthScoreConfig::default(),
             dashboard: DashboardConfig::default(),
         };
@@ -3186,5 +3260,45 @@ endpoint = "https://api.z.ai/api/paas/v4"
             config.inference.provider,
             InferenceProviderKind::OpenAiCompat
         );
+    }
+
+    #[test]
+    fn planner_config_normalizes_new_fields() {
+        let config = parse_workspace_config_str(
+            r#"
+[planner]
+semantic_rescue_threshold = 42.0
+semantic_rescue_max_k = 0
+community_resolution = -5.0
+min_community_size = 99
+"#,
+        )
+        .expect("parse config");
+        let normalized = normalize_config(config);
+
+        assert_eq!(normalized.planner.semantic_rescue_threshold, 0.95);
+        assert_eq!(normalized.planner.semantic_rescue_max_k, 3);
+        assert_eq!(normalized.planner.community_resolution, 0.1);
+        assert_eq!(normalized.planner.min_community_size, 20);
+    }
+
+    #[test]
+    fn planner_config_section_parses() {
+        let config = parse_workspace_config_str(
+            r#"
+[planner]
+semantic_rescue_threshold = 0.82
+semantic_rescue_max_k = 5
+community_resolution = 0.65
+min_community_size = 4
+"#,
+        )
+        .expect("parse config");
+        let normalized = normalize_config(config);
+
+        assert_eq!(normalized.planner.semantic_rescue_threshold, 0.82);
+        assert_eq!(normalized.planner.semantic_rescue_max_k, 5);
+        assert_eq!(normalized.planner.community_resolution, 0.65);
+        assert_eq!(normalized.planner.min_community_size, 4);
     }
 }

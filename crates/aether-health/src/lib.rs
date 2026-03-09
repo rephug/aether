@@ -7,6 +7,7 @@ pub mod metrics;
 pub mod models;
 pub mod output;
 pub mod planner;
+pub mod planner_communities;
 mod scanner;
 pub mod scoring;
 pub mod semantic_signals;
@@ -28,9 +29,9 @@ pub use output::{
     format_compare_json, format_compare_table, format_crate_explanation, format_hotspots_text,
     format_json, format_table,
 };
-pub use planner::{
-    PlannerCommunityAssignment, PlannerSymbolRecord, SplitConfidence, SplitSuggestion,
-    SuggestedModule, suggest_split,
+pub use planner::{SplitConfidence, SplitSuggestion, SuggestedModule, suggest_split};
+pub use planner_communities::{
+    FileCommunityConfig, FileSymbol, PlannerDiagnostics, detect_file_communities,
 };
 pub use semantic_signals::{SemanticFileInput, SemanticInput};
 
