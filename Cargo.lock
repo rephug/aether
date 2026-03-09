@@ -122,6 +122,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aether-health"
+version = "0.1.0"
+dependencies = [
+ "aether-config",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "walkdir",
+]
+
+[[package]]
 name = "aether-infer"
 version = "0.1.0"
 dependencies = [
@@ -286,6 +299,7 @@ dependencies = [
  "aether-core",
  "aether-dashboard",
  "aether-graph-algo",
+ "aether-health",
  "aether-infer",
  "aether-lsp",
  "aether-memory",
@@ -299,6 +313,7 @@ dependencies = [
  "gix",
  "ignore",
  "notify",
+ "rusqlite",
  "serde_json",
  "tempfile",
  "tokio",

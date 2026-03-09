@@ -5,6 +5,7 @@ pub mod coupling;
 pub mod drift;
 pub mod fsck;
 pub mod health;
+pub mod health_score;
 pub mod indexer;
 pub mod init_agent;
 pub mod memory;

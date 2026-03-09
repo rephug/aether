@@ -3,8 +3,8 @@ use std::io::IsTerminal;
 use std::path::Path;
 
 use aether_config::{
-    DEFAULT_LOG_LEVEL, InferenceProviderKind, SearchRerankerKind, ensure_workspace_config,
-    validate_config,
+    AetherConfig, DEFAULT_LOG_LEVEL, InferenceProviderKind, SearchRerankerKind,
+    ensure_workspace_config, load_workspace_config, validate_config,
 };
 use aether_core::{Symbol, SymbolChangeEvent};
 use aether_infer::ProviderOverrides;
@@ -18,9 +18,9 @@ use aetherd::calibrate::run_calibration_once;
 use aetherd::causal::run_trace_cause_command;
 use aetherd::cli::{
     AskArgs, BlastRadiusArgs, Cli, Commands, CommunitiesArgs, CouplingReportArgs, DriftAckArgs,
-    DriftReportArgs, FsckArgs, HealthArgs, InitAgentArgs, LogFormat, MineCouplingArgs, NotesArgs,
-    RecallArgs, RegenerateArgs, RememberArgs, SetupLocalArgs, TestIntentsArgs, TraceCauseArgs,
-    parse_cli,
+    DriftReportArgs, FsckArgs, HealthArgs, HealthScoreArgs, InitAgentArgs, LogFormat,
+    MineCouplingArgs, NotesArgs, RecallArgs, RegenerateArgs, RememberArgs, SetupLocalArgs,
+    TestIntentsArgs, TraceCauseArgs, parse_cli,
 };
 use aetherd::coupling::{
     run_blast_radius_command, run_coupling_report_command, run_mine_coupling_command,
@@ -28,6 +28,7 @@ use aetherd::coupling::{
 use aetherd::drift::{run_communities_command, run_drift_ack_command, run_drift_report_command};
 use aetherd::fsck::run_fsck;
 use aetherd::health::run_health_command;
+use aetherd::health_score::run_health_score_command;
 use aetherd::indexer::{
     IndexerConfig, compute_symbol_priority_scores, run_full_index_once_for_cli, run_indexing_loop,
     run_initial_index_once_for_cli,
@@ -55,17 +56,12 @@ fn run(cli: Cli) -> Result<()> {
             cli.workspace.display()
         )
     })?;
-
-    let config = ensure_workspace_config(&workspace).with_context(|| {
-        format!(
-            "failed to load or create workspace config at {}",
-            workspace.join(".aether/config.toml").display()
-        )
-    })?;
+    let command = cli.command.clone();
+    let config = load_config_for_command(&workspace, command.as_ref())?;
     init_tracing_subscriber(cli.log_format, &config.general.log_level)?;
 
-    if let Some(command) = cli.command.clone() {
-        return run_subcommand(&workspace, command);
+    if let Some(command) = command {
+        return run_subcommand(&workspace, &config, command);
     }
 
     for warning in validate_config(&config) {
@@ -307,7 +303,7 @@ fn run(cli: Cli) -> Result<()> {
     run_indexing_loop(indexer_config)
 }
 
-fn run_subcommand(workspace: &Path, command: Commands) -> Result<()> {
+fn run_subcommand(workspace: &Path, config: &AetherConfig, command: Commands) -> Result<()> {
     match command {
         Commands::InitAgent(args) => run_init_agent_command(workspace, args),
         Commands::Regenerate(args) => run_regenerate_command(workspace, args),
@@ -326,10 +322,29 @@ fn run_subcommand(workspace: &Path, command: Commands) -> Result<()> {
         Commands::Communities(args) => run_communities_subcommand(workspace, args),
         Commands::TraceCause(args) => run_trace_cause_subcommand(workspace, args),
         Commands::Health(args) => run_health_subcommand(workspace, args),
+        Commands::HealthScore(args) => run_health_score_subcommand(workspace, config, args),
         Commands::Fsck(args) => run_fsck_subcommand(workspace, args),
         #[cfg(feature = "legacy-cozo")]
         Commands::GraphMigrate(args) => run_graph_migrate_subcommand(workspace, args),
     }
+}
+
+fn load_config_for_command(workspace: &Path, command: Option<&Commands>) -> Result<AetherConfig> {
+    let load_result = match command {
+        Some(Commands::HealthScore(_)) => load_workspace_config(workspace).with_context(|| {
+            format!(
+                "failed to load workspace config at {}",
+                workspace.join(".aether/config.toml").display()
+            )
+        }),
+        _ => ensure_workspace_config(workspace).with_context(|| {
+            format!(
+                "failed to load or create workspace config at {}",
+                workspace.join(".aether/config.toml").display()
+            )
+        }),
+    }?;
+    Ok(load_result)
 }
 
 fn run_init_agent_command(workspace: &Path, args: InitAgentArgs) -> Result<()> {
@@ -783,6 +798,14 @@ fn run_trace_cause_subcommand(workspace: &Path, args: TraceCauseArgs) -> Result<
 
 fn run_health_subcommand(workspace: &Path, args: HealthArgs) -> Result<()> {
     run_health_command(workspace, args).context("health command failed")
+}
+
+fn run_health_score_subcommand(
+    workspace: &Path,
+    config: &AetherConfig,
+    args: HealthScoreArgs,
+) -> Result<()> {
+    run_health_score_command(workspace, config, args).context("health-score command failed")
 }
 
 fn run_fsck_subcommand(workspace: &Path, args: FsckArgs) -> Result<()> {

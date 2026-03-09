@@ -42,6 +42,18 @@ pub const DEFAULT_HEALTH_TEST_GAP_WEIGHT: f64 = 0.25;
 pub const DEFAULT_HEALTH_DRIFT_WEIGHT: f64 = 0.2;
 pub const DEFAULT_HEALTH_NO_SIR_WEIGHT: f64 = 0.15;
 pub const DEFAULT_HEALTH_RECENCY_WEIGHT: f64 = 0.1;
+pub const DEFAULT_HEALTH_SCORE_FILE_LOC_WARN: usize = 800;
+pub const DEFAULT_HEALTH_SCORE_FILE_LOC_FAIL: usize = 1500;
+pub const DEFAULT_HEALTH_SCORE_TRAIT_METHOD_WARN: usize = 20;
+pub const DEFAULT_HEALTH_SCORE_TRAIT_METHOD_FAIL: usize = 35;
+pub const DEFAULT_HEALTH_SCORE_INTERNAL_DEP_WARN: usize = 6;
+pub const DEFAULT_HEALTH_SCORE_INTERNAL_DEP_FAIL: usize = 10;
+pub const DEFAULT_HEALTH_SCORE_TODO_DENSITY_WARN: f32 = 5.0;
+pub const DEFAULT_HEALTH_SCORE_TODO_DENSITY_FAIL: f32 = 15.0;
+pub const DEFAULT_HEALTH_SCORE_DEAD_FEATURE_WARN: usize = 1;
+pub const DEFAULT_HEALTH_SCORE_DEAD_FEATURE_FAIL: usize = 5;
+pub const DEFAULT_HEALTH_SCORE_STALE_REF_WARN: usize = 1;
+pub const DEFAULT_HEALTH_SCORE_STALE_REF_FAIL: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -238,6 +250,8 @@ pub struct AetherConfig {
     pub drift: DriftConfig,
     #[serde(default)]
     pub health: HealthConfig,
+    #[serde(default)]
+    pub health_score: HealthScoreConfig,
     #[serde(default)]
     pub dashboard: DashboardConfig,
 }
@@ -843,6 +857,56 @@ impl Default for RiskWeights {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HealthScoreConfig {
+    #[serde(default = "default_health_score_file_loc_warn")]
+    pub file_loc_warn: usize,
+    #[serde(default = "default_health_score_file_loc_fail")]
+    pub file_loc_fail: usize,
+    #[serde(default = "default_health_score_trait_method_warn")]
+    pub trait_method_warn: usize,
+    #[serde(default = "default_health_score_trait_method_fail")]
+    pub trait_method_fail: usize,
+    #[serde(default = "default_health_score_internal_dep_warn")]
+    pub internal_dep_warn: usize,
+    #[serde(default = "default_health_score_internal_dep_fail")]
+    pub internal_dep_fail: usize,
+    #[serde(default = "default_health_score_todo_density_warn")]
+    pub todo_density_warn: f32,
+    #[serde(default = "default_health_score_todo_density_fail")]
+    pub todo_density_fail: f32,
+    #[serde(default = "default_health_score_dead_feature_warn")]
+    pub dead_feature_warn: usize,
+    #[serde(default = "default_health_score_dead_feature_fail")]
+    pub dead_feature_fail: usize,
+    #[serde(default = "default_health_score_stale_ref_warn")]
+    pub stale_ref_warn: usize,
+    #[serde(default = "default_health_score_stale_ref_fail")]
+    pub stale_ref_fail: usize,
+    #[serde(default = "default_health_score_stale_ref_patterns")]
+    pub stale_ref_patterns: Vec<String>,
+}
+
+impl Default for HealthScoreConfig {
+    fn default() -> Self {
+        Self {
+            file_loc_warn: default_health_score_file_loc_warn(),
+            file_loc_fail: default_health_score_file_loc_fail(),
+            trait_method_warn: default_health_score_trait_method_warn(),
+            trait_method_fail: default_health_score_trait_method_fail(),
+            internal_dep_warn: default_health_score_internal_dep_warn(),
+            internal_dep_fail: default_health_score_internal_dep_fail(),
+            todo_density_warn: default_health_score_todo_density_warn(),
+            todo_density_fail: default_health_score_todo_density_fail(),
+            dead_feature_warn: default_health_score_dead_feature_warn(),
+            dead_feature_fail: default_health_score_dead_feature_fail(),
+            stale_ref_warn: default_health_score_stale_ref_warn(),
+            stale_ref_fail: default_health_score_stale_ref_fail(),
+            stale_ref_patterns: default_health_score_stale_ref_patterns(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DashboardConfig {
     #[serde(default = "default_dashboard_port")]
@@ -1362,6 +1426,62 @@ fn default_health_recency_weight() -> f64 {
     DEFAULT_HEALTH_RECENCY_WEIGHT
 }
 
+fn default_health_score_file_loc_warn() -> usize {
+    DEFAULT_HEALTH_SCORE_FILE_LOC_WARN
+}
+
+fn default_health_score_file_loc_fail() -> usize {
+    DEFAULT_HEALTH_SCORE_FILE_LOC_FAIL
+}
+
+fn default_health_score_trait_method_warn() -> usize {
+    DEFAULT_HEALTH_SCORE_TRAIT_METHOD_WARN
+}
+
+fn default_health_score_trait_method_fail() -> usize {
+    DEFAULT_HEALTH_SCORE_TRAIT_METHOD_FAIL
+}
+
+fn default_health_score_internal_dep_warn() -> usize {
+    DEFAULT_HEALTH_SCORE_INTERNAL_DEP_WARN
+}
+
+fn default_health_score_internal_dep_fail() -> usize {
+    DEFAULT_HEALTH_SCORE_INTERNAL_DEP_FAIL
+}
+
+fn default_health_score_todo_density_warn() -> f32 {
+    DEFAULT_HEALTH_SCORE_TODO_DENSITY_WARN
+}
+
+fn default_health_score_todo_density_fail() -> f32 {
+    DEFAULT_HEALTH_SCORE_TODO_DENSITY_FAIL
+}
+
+fn default_health_score_dead_feature_warn() -> usize {
+    DEFAULT_HEALTH_SCORE_DEAD_FEATURE_WARN
+}
+
+fn default_health_score_dead_feature_fail() -> usize {
+    DEFAULT_HEALTH_SCORE_DEAD_FEATURE_FAIL
+}
+
+fn default_health_score_stale_ref_warn() -> usize {
+    DEFAULT_HEALTH_SCORE_STALE_REF_WARN
+}
+
+fn default_health_score_stale_ref_fail() -> usize {
+    DEFAULT_HEALTH_SCORE_STALE_REF_FAIL
+}
+
+fn default_health_score_stale_ref_patterns() -> Vec<String> {
+    vec![
+        "CozoGraphStore".to_owned(),
+        "cozo".to_owned(),
+        "CozoDB".to_owned(),
+    ]
+}
+
 fn default_dashboard_port() -> u16 {
     DEFAULT_DASHBOARD_PORT
 }
@@ -1587,6 +1707,73 @@ fn normalize_health_weights(config: &mut HealthConfig) {
     eprintln!("AETHER config warning: health risk weights summed to {sum:.3}; normalized to 1.0");
 }
 
+fn normalize_health_score_usize_pair(
+    warn: &mut usize,
+    fail: &mut usize,
+    default_warn: usize,
+    default_fail: usize,
+) {
+    if *warn == 0 || *fail == 0 || *fail <= *warn {
+        *warn = default_warn;
+        *fail = default_fail;
+    }
+}
+
+fn normalize_health_score_f32_pair(
+    warn: &mut f32,
+    fail: &mut f32,
+    default_warn: f32,
+    default_fail: f32,
+) {
+    if !warn.is_finite() || !fail.is_finite() || *warn <= 0.0 || *fail <= *warn {
+        *warn = default_warn;
+        *fail = default_fail;
+    }
+}
+
+fn normalize_health_score_config(config: &mut HealthScoreConfig) {
+    normalize_health_score_usize_pair(
+        &mut config.file_loc_warn,
+        &mut config.file_loc_fail,
+        default_health_score_file_loc_warn(),
+        default_health_score_file_loc_fail(),
+    );
+    normalize_health_score_usize_pair(
+        &mut config.trait_method_warn,
+        &mut config.trait_method_fail,
+        default_health_score_trait_method_warn(),
+        default_health_score_trait_method_fail(),
+    );
+    normalize_health_score_usize_pair(
+        &mut config.internal_dep_warn,
+        &mut config.internal_dep_fail,
+        default_health_score_internal_dep_warn(),
+        default_health_score_internal_dep_fail(),
+    );
+    normalize_health_score_f32_pair(
+        &mut config.todo_density_warn,
+        &mut config.todo_density_fail,
+        default_health_score_todo_density_warn(),
+        default_health_score_todo_density_fail(),
+    );
+    normalize_health_score_usize_pair(
+        &mut config.dead_feature_warn,
+        &mut config.dead_feature_fail,
+        default_health_score_dead_feature_warn(),
+        default_health_score_dead_feature_fail(),
+    );
+    normalize_health_score_usize_pair(
+        &mut config.stale_ref_warn,
+        &mut config.stale_ref_fail,
+        default_health_score_stale_ref_warn(),
+        default_health_score_stale_ref_fail(),
+    );
+    config.stale_ref_patterns = normalize_patterns(std::mem::take(&mut config.stale_ref_patterns));
+    if config.stale_ref_patterns.is_empty() {
+        config.stale_ref_patterns = default_health_score_stale_ref_patterns();
+    }
+}
+
 fn normalize_config(mut config: AetherConfig) -> AetherConfig {
     config.general.log_level = normalize_with_default(
         std::mem::take(&mut config.general.log_level),
@@ -1707,6 +1894,7 @@ fn normalize_config(mut config: AetherConfig) -> AetherConfig {
     }
     config.drift.hub_percentile = config.drift.hub_percentile.clamp(1, 100);
     normalize_health_weights(&mut config.health);
+    normalize_health_score_config(&mut config.health_score);
 
     let api_key_env = config.inference.api_key_env.trim();
     if api_key_env.is_empty() {
@@ -1870,6 +2058,58 @@ mod tests {
             config.health.risk_weights.recency,
             DEFAULT_HEALTH_RECENCY_WEIGHT
         );
+        assert_eq!(
+            config.health_score.file_loc_warn,
+            DEFAULT_HEALTH_SCORE_FILE_LOC_WARN
+        );
+        assert_eq!(
+            config.health_score.file_loc_fail,
+            DEFAULT_HEALTH_SCORE_FILE_LOC_FAIL
+        );
+        assert_eq!(
+            config.health_score.trait_method_warn,
+            DEFAULT_HEALTH_SCORE_TRAIT_METHOD_WARN
+        );
+        assert_eq!(
+            config.health_score.trait_method_fail,
+            DEFAULT_HEALTH_SCORE_TRAIT_METHOD_FAIL
+        );
+        assert_eq!(
+            config.health_score.internal_dep_warn,
+            DEFAULT_HEALTH_SCORE_INTERNAL_DEP_WARN
+        );
+        assert_eq!(
+            config.health_score.internal_dep_fail,
+            DEFAULT_HEALTH_SCORE_INTERNAL_DEP_FAIL
+        );
+        assert_eq!(
+            config.health_score.todo_density_warn,
+            DEFAULT_HEALTH_SCORE_TODO_DENSITY_WARN
+        );
+        assert_eq!(
+            config.health_score.todo_density_fail,
+            DEFAULT_HEALTH_SCORE_TODO_DENSITY_FAIL
+        );
+        assert_eq!(
+            config.health_score.dead_feature_warn,
+            DEFAULT_HEALTH_SCORE_DEAD_FEATURE_WARN
+        );
+        assert_eq!(
+            config.health_score.dead_feature_fail,
+            DEFAULT_HEALTH_SCORE_DEAD_FEATURE_FAIL
+        );
+        assert_eq!(
+            config.health_score.stale_ref_warn,
+            DEFAULT_HEALTH_SCORE_STALE_REF_WARN
+        );
+        assert_eq!(
+            config.health_score.stale_ref_fail,
+            DEFAULT_HEALTH_SCORE_STALE_REF_FAIL
+        );
+        assert_eq!(
+            config.health_score.stale_ref_patterns,
+            default_health_score_stale_ref_patterns()
+        );
         assert_eq!(config.dashboard.port, DEFAULT_DASHBOARD_PORT);
         assert!(config.dashboard.enabled);
         assert!(config_path(workspace).exists());
@@ -1934,6 +2174,12 @@ mod tests {
         assert!(content.contains("drift = 0.2"));
         assert!(content.contains("no_sir = 0.15"));
         assert!(content.contains("recency = 0.1"));
+        assert!(content.contains("[health_score]"));
+        assert!(content.contains("file_loc_warn = 800"));
+        assert!(content.contains("trait_method_fail = 35"));
+        assert!(content.contains("stale_ref_patterns = ["));
+        assert!(content.contains("\"CozoGraphStore\""));
+        assert!(content.contains("\"CozoDB\""));
         assert!(content.contains("[dashboard]"));
         assert!(content.contains("port = 9720"));
         assert!(content.contains("enabled = true"));
@@ -2014,6 +2260,21 @@ hub_percentile = 0
 [health]
 enabled = false
 risk_weights = { pagerank = 3.0, test_gap = 1.0, drift = 1.0, no_sir = 1.0, recency = 2.0 }
+
+[health_score]
+file_loc_warn = 1000
+file_loc_fail = 2000
+trait_method_warn = 25
+trait_method_fail = 40
+internal_dep_warn = 7
+internal_dep_fail = 11
+todo_density_warn = 6.0
+todo_density_fail = 16.0
+dead_feature_warn = 2
+dead_feature_fail = 6
+stale_ref_warn = 2
+stale_ref_fail = 4
+stale_ref_patterns = [" CozoGraphStore ", "", "LegacyStore"]
 
 [dashboard]
 port = 9800
@@ -2118,6 +2379,22 @@ enabled = false
             + config.health.risk_weights.no_sir
             + config.health.risk_weights.recency;
         assert!((health_sum - 1.0).abs() < 1e-6);
+        assert_eq!(config.health_score.file_loc_warn, 1000);
+        assert_eq!(config.health_score.file_loc_fail, 2000);
+        assert_eq!(config.health_score.trait_method_warn, 25);
+        assert_eq!(config.health_score.trait_method_fail, 40);
+        assert_eq!(config.health_score.internal_dep_warn, 7);
+        assert_eq!(config.health_score.internal_dep_fail, 11);
+        assert_eq!(config.health_score.todo_density_warn, 6.0);
+        assert_eq!(config.health_score.todo_density_fail, 16.0);
+        assert_eq!(config.health_score.dead_feature_warn, 2);
+        assert_eq!(config.health_score.dead_feature_fail, 6);
+        assert_eq!(config.health_score.stale_ref_warn, 2);
+        assert_eq!(config.health_score.stale_ref_fail, 4);
+        assert_eq!(
+            config.health_score.stale_ref_patterns,
+            vec!["CozoGraphStore".to_owned(), "LegacyStore".to_owned()]
+        );
         assert_eq!(config.dashboard.port, 9800);
         assert!(!config.dashboard.enabled);
     }
@@ -2252,6 +2529,14 @@ fallback_to_host_on_unavailable = true
             config.health.risk_weights.pagerank,
             DEFAULT_HEALTH_PAGERANK_WEIGHT
         );
+        assert_eq!(
+            config.health_score.file_loc_warn,
+            DEFAULT_HEALTH_SCORE_FILE_LOC_WARN
+        );
+        assert_eq!(
+            config.health_score.file_loc_fail,
+            DEFAULT_HEALTH_SCORE_FILE_LOC_FAIL
+        );
     }
 
     #[test]
@@ -2297,6 +2582,69 @@ risk_weights = { pagerank = 2.0, test_gap = 1.0, drift = 1.0, no_sir = 1.0, rece
             + config.health.risk_weights.no_sir
             + config.health.risk_weights.recency;
         assert!((sum - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn load_workspace_config_normalizes_health_score_values() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(aether_dir(workspace)).expect("create .aether");
+
+        let raw = r#"
+[health_score]
+file_loc_warn = 0
+file_loc_fail = 0
+trait_method_warn = 50
+trait_method_fail = 20
+internal_dep_warn = 9
+internal_dep_fail = 9
+todo_density_warn = 0.0
+todo_density_fail = 0.0
+dead_feature_warn = 0
+dead_feature_fail = 0
+stale_ref_warn = 0
+stale_ref_fail = 0
+stale_ref_patterns = ["", "  "]
+"#;
+        fs::write(config_path(workspace), raw).expect("write config");
+
+        let config = load_workspace_config(workspace).expect("load config");
+        assert_eq!(
+            config.health_score.file_loc_warn,
+            DEFAULT_HEALTH_SCORE_FILE_LOC_WARN
+        );
+        assert_eq!(
+            config.health_score.file_loc_fail,
+            DEFAULT_HEALTH_SCORE_FILE_LOC_FAIL
+        );
+        assert_eq!(
+            config.health_score.trait_method_warn,
+            DEFAULT_HEALTH_SCORE_TRAIT_METHOD_WARN
+        );
+        assert_eq!(
+            config.health_score.trait_method_fail,
+            DEFAULT_HEALTH_SCORE_TRAIT_METHOD_FAIL
+        );
+        assert_eq!(
+            config.health_score.internal_dep_warn,
+            DEFAULT_HEALTH_SCORE_INTERNAL_DEP_WARN
+        );
+        assert_eq!(
+            config.health_score.internal_dep_fail,
+            DEFAULT_HEALTH_SCORE_INTERNAL_DEP_FAIL
+        );
+        assert_eq!(
+            config.health_score.todo_density_warn,
+            DEFAULT_HEALTH_SCORE_TODO_DENSITY_WARN
+        );
+        assert_eq!(
+            config.health_score.todo_density_fail,
+            DEFAULT_HEALTH_SCORE_TODO_DENSITY_FAIL
+        );
+        assert_eq!(
+            config.health_score.stale_ref_patterns,
+            default_health_score_stale_ref_patterns()
+        );
     }
 
     #[test]
@@ -2364,6 +2712,7 @@ deep_concurrency = 0
             coupling: CouplingConfig::default(),
             drift: DriftConfig::default(),
             health: HealthConfig::default(),
+            health_score: HealthScoreConfig::default(),
             dashboard: DashboardConfig::default(),
         };
 
@@ -2569,6 +2918,29 @@ typescript = 0.67
         let rendered = fs::read_to_string(config_path(workspace)).expect("read config");
         assert!(rendered.contains("[search.thresholds]"));
         assert!(rendered.contains("[search.calibrated_thresholds]"));
+    }
+
+    #[test]
+    fn save_workspace_config_writes_health_score_section() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+
+        let mut config = AetherConfig::default();
+        config.health_score.file_loc_warn = 900;
+        config.health_score.stale_ref_patterns =
+            vec!["CozoGraphStore".to_owned(), "LegacyStore".to_owned()];
+
+        save_workspace_config(workspace, &config).expect("save config");
+        let stored = load_workspace_config(workspace).expect("load config");
+        assert_eq!(stored.health_score.file_loc_warn, 900);
+        assert_eq!(
+            stored.health_score.stale_ref_patterns,
+            vec!["CozoGraphStore".to_owned(), "LegacyStore".to_owned()]
+        );
+
+        let rendered = fs::read_to_string(config_path(workspace)).expect("read config");
+        assert!(rendered.contains("[health_score]"));
+        assert!(rendered.contains("file_loc_warn = 900"));
     }
 
     #[test]

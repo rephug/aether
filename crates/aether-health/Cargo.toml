@@ -1,0 +1,17 @@
+[package]
+name = "aether-health"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aether-config = { path = "../aether-config" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -356,6 +356,63 @@ pub struct HealthArgs {
     pub min_risk: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HealthScoreOutputFormat {
+    #[default]
+    Table,
+    Json,
+}
+
+impl HealthScoreOutputFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Json => "json",
+        }
+    }
+}
+
+impl std::str::FromStr for HealthScoreOutputFormat {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "table" => Ok(Self::Table),
+            "json" => Ok(Self::Json),
+            other => Err(format!(
+                "invalid health-score output format '{other}', expected one of: table, json"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct HealthScoreArgs {
+    #[arg(
+        long,
+        default_value = "table",
+        value_parser = parse_health_score_output_format,
+        help = "Output format: table or json"
+    )]
+    pub output: HealthScoreOutputFormat,
+
+    #[arg(
+        long,
+        help = "Exit with code 1 when the workspace score is greater than this value"
+    )]
+    pub fail_above: Option<u32>,
+
+    #[arg(long, help = "Skip reading and writing score history")]
+    pub no_history: bool,
+
+    #[arg(
+        long = "crate",
+        value_name = "NAME",
+        help = "Limit scoring to the named crate (repeatable)"
+    )]
+    pub crate_filter: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct FsckArgs {
     #[arg(long, help = "Attempt to repair detected inconsistencies")]
@@ -410,6 +467,8 @@ pub enum Commands {
     TraceCause(TraceCauseArgs),
     /// Show graph health metrics with risk scoring
     Health(HealthArgs),
+    /// Compute a structural health score for each workspace crate
+    HealthScore(HealthScoreArgs),
     /// Verify and optionally repair cross-store consistency
     Fsck(FsckArgs),
     #[cfg(feature = "legacy-cozo")]
@@ -649,6 +708,10 @@ fn parse_coupling_risk_level(value: &str) -> Result<CouplingRiskLevel, String> {
 }
 
 fn parse_communities_format(value: &str) -> Result<CommunitiesFormat, String> {
+    value.parse()
+}
+
+fn parse_health_score_output_format(value: &str) -> Result<HealthScoreOutputFormat, String> {
     value.parse()
 }
 
@@ -1192,6 +1255,37 @@ mod tests {
                 assert_eq!(args.filter.as_deref(), Some("risk-hotspots"));
                 assert_eq!(args.limit, 25);
                 assert!((args.min_risk - 0.4).abs() < f64::EPSILON);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn health_score_subcommand_parses_output_threshold_and_filters() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "health-score",
+            "--workspace",
+            ".",
+            "--output",
+            "json",
+            "--fail-above",
+            "30",
+            "--crate",
+            "aether-core",
+            "--crate",
+            "aether-store",
+        ])
+        .expect("health-score should parse");
+
+        match cli.command {
+            Some(Commands::HealthScore(args)) => {
+                assert_eq!(args.output.as_str(), "json");
+                assert_eq!(args.fail_above, Some(30));
+                assert_eq!(
+                    args.crate_filter,
+                    vec!["aether-core".to_owned(), "aether-store".to_owned()]
+                );
             }
             other => panic!("unexpected command: {other:?}"),
         }
