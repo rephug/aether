@@ -2,7 +2,10 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aether_config::{AetherConfig, GraphBackend, save_workspace_config};
+use aether_config::{
+    AetherConfig, EmbeddingProviderKind, EmbeddingVectorBackend, GraphBackend,
+    save_workspace_config,
+};
 use aether_core::{
     EdgeKind, SEARCH_FALLBACK_EMBEDDINGS_DISABLED, SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY,
     SearchMode,
@@ -23,7 +26,7 @@ use aether_sir::{
 };
 use aether_store::{
     CommunitySnapshotRecord, GraphStore, ResolvedEdge, SirMetaRecord, SqliteStore, Store,
-    SurrealGraphStore, SymbolRecord, TestIntentRecord,
+    SurrealGraphStore, SymbolEmbeddingRecord, SymbolRecord, TestIntentRecord,
 };
 use aetherd::indexer::{IndexerConfig, run_initial_index_once};
 use anyhow::Result;
@@ -72,7 +75,10 @@ fn now_millis() -> i64 {
 
 fn seed_health_workspace(workspace: &Path, graph_backend: GraphBackend) -> Result<()> {
     let mut config = AetherConfig::default();
-    config.embeddings.enabled = false;
+    config.embeddings.enabled = true;
+    config.embeddings.provider = EmbeddingProviderKind::Qwen3Local;
+    config.embeddings.vector_backend = EmbeddingVectorBackend::Sqlite;
+    config.embeddings.model = Some("qwen3-embeddings-4B".to_owned());
     config.storage.graph_backend = graph_backend;
     config.health_score.file_loc_warn = 1;
     config.health_score.file_loc_fail = 2;
@@ -87,7 +93,7 @@ fn seed_health_workspace(workspace: &Path, graph_backend: GraphBackend) -> Resul
     )?;
     fs::write(
         workspace.join("src/lib.rs"),
-        "pub trait Store {\n    fn alpha(&self);\n    fn beta(&self);\n    fn gamma(&self);\n}\n\npub fn sir_alpha() -> i32 { 1 }\npub fn sir_beta() -> i32 { sir_alpha() }\npub fn note_alpha() -> i32 { 3 }\npub fn note_beta() -> i32 { note_alpha() }\n",
+        "pub trait Store {\n    fn alpha(&self);\n    fn beta(&self);\n    fn gamma(&self);\n}\n\npub fn sir_alpha() -> i32 { 1 }\npub fn sir_beta() -> i32 { sir_alpha() }\npub fn sir_gamma() -> i32 { sir_beta() }\npub fn sir_delta() -> i32 { sir_gamma() }\npub fn note_alpha() -> i32 { 3 }\npub fn note_beta() -> i32 { note_alpha() }\npub fn note_gamma() -> i32 { note_beta() }\npub fn note_delta() -> i32 { note_gamma() }\n",
     )?;
     Ok(())
 }
@@ -104,58 +110,15 @@ fn health_symbol(id: &str, qualified_name: &str) -> SymbolRecord {
     }
 }
 
-fn copy_dir_all(from: &Path, to: &Path) -> Result<()> {
-    fs::create_dir_all(to)?;
-    for entry in fs::read_dir(from)? {
-        let entry = entry?;
-        let source_path = entry.path();
-        let target_path = to.join(entry.file_name());
-        if source_path.is_dir() {
-            copy_dir_all(&source_path, &target_path)?;
-        } else {
-            fs::copy(&source_path, &target_path)?;
-        }
+fn embedding_record(symbol_id: &str, embedding: Vec<f32>) -> SymbolEmbeddingRecord {
+    SymbolEmbeddingRecord {
+        symbol_id: symbol_id.to_owned(),
+        sir_hash: format!("sir-{symbol_id}"),
+        provider: "qwen3_local".to_owned(),
+        model: "qwen3-embeddings-4B".to_owned(),
+        embedding,
+        updated_at: now_millis(),
     }
-    Ok(())
-}
-
-fn seed_surreal_graph_snapshot(
-    workspace: &Path,
-    symbols: &[SymbolRecord],
-    edges: &[(&str, &str)],
-) -> Result<()> {
-    let seed_workspace = tempdir()?;
-    fs::write(seed_workspace.path().join("Cargo.toml"), "[workspace]\n")?;
-    fs::create_dir_all(seed_workspace.path().join(".aether"))?;
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async {
-        let graph = SurrealGraphStore::open(seed_workspace.path()).await?;
-        for symbol in symbols {
-            graph.upsert_symbol_node(symbol).await?;
-        }
-        for (source, target) in edges {
-            graph
-                .upsert_edge(&ResolvedEdge {
-                    source_id: (*source).to_owned(),
-                    target_id: (*target).to_owned(),
-                    edge_kind: EdgeKind::Calls,
-                    file_path: "src/lib.rs".to_owned(),
-                })
-                .await?;
-        }
-        Ok::<(), anyhow::Error>(())
-    })?;
-
-    let source_graph = seed_workspace.path().join(".aether/graph");
-    let target_graph = workspace.join(".aether/graph");
-    if target_graph.exists() {
-        fs::remove_dir_all(&target_graph)?;
-    }
-    copy_dir_all(&source_graph, &target_graph)?;
-    Ok(())
 }
 
 fn run_index_and_seed_sir(workspace: &Path) -> Result<()> {
@@ -668,12 +631,24 @@ fn mcp_health_explain_tool() -> Result<()> {
     let symbols = vec![
         health_symbol("sym-sir-a", "crate::sir_alpha"),
         health_symbol("sym-sir-b", "crate::sir_beta"),
+        health_symbol("sym-sir-c", "crate::sir_gamma"),
+        health_symbol("sym-sir-d", "crate::sir_delta"),
         health_symbol("sym-note-a", "crate::note_alpha"),
         health_symbol("sym-note-b", "crate::note_beta"),
+        health_symbol("sym-note-c", "crate::note_gamma"),
+        health_symbol("sym-note-d", "crate::note_delta"),
     ];
     for symbol in &symbols {
         store.upsert_symbol(symbol.clone())?;
     }
+    store.upsert_symbol_embedding(embedding_record("sym-sir-a", vec![1.0, 0.0]))?;
+    store.upsert_symbol_embedding(embedding_record("sym-sir-b", vec![0.95, 0.05]))?;
+    store.upsert_symbol_embedding(embedding_record("sym-sir-c", vec![0.92, 0.08]))?;
+    store.upsert_symbol_embedding(embedding_record("sym-sir-d", vec![0.9, 0.1]))?;
+    store.upsert_symbol_embedding(embedding_record("sym-note-a", vec![0.0, 1.0]))?;
+    store.upsert_symbol_embedding(embedding_record("sym-note-b", vec![0.05, 0.95]))?;
+    store.upsert_symbol_embedding(embedding_record("sym-note-c", vec![0.08, 0.92]))?;
+    store.upsert_symbol_embedding(embedding_record("sym-note-d", vec![0.1, 0.9]))?;
     store.replace_community_snapshot(
         "snapshot-1",
         now_millis(),
@@ -692,6 +667,18 @@ fn mcp_health_explain_tool() -> Result<()> {
             },
             CommunitySnapshotRecord {
                 snapshot_id: "snapshot-1".to_owned(),
+                symbol_id: "sym-sir-c".to_owned(),
+                community_id: 1,
+                captured_at: now_millis(),
+            },
+            CommunitySnapshotRecord {
+                snapshot_id: "snapshot-1".to_owned(),
+                symbol_id: "sym-sir-d".to_owned(),
+                community_id: 1,
+                captured_at: now_millis(),
+            },
+            CommunitySnapshotRecord {
+                snapshot_id: "snapshot-1".to_owned(),
                 symbol_id: "sym-note-a".to_owned(),
                 community_id: 2,
                 captured_at: now_millis(),
@@ -699,6 +686,18 @@ fn mcp_health_explain_tool() -> Result<()> {
             CommunitySnapshotRecord {
                 snapshot_id: "snapshot-1".to_owned(),
                 symbol_id: "sym-note-b".to_owned(),
+                community_id: 2,
+                captured_at: now_millis(),
+            },
+            CommunitySnapshotRecord {
+                snapshot_id: "snapshot-1".to_owned(),
+                symbol_id: "sym-note-c".to_owned(),
+                community_id: 2,
+                captured_at: now_millis(),
+            },
+            CommunitySnapshotRecord {
+                snapshot_id: "snapshot-1".to_owned(),
+                symbol_id: "sym-note-d".to_owned(),
                 community_id: 2,
                 captured_at: now_millis(),
             },
@@ -719,14 +718,33 @@ fn mcp_health_explain_tool() -> Result<()> {
         }],
     )?;
 
-    seed_surreal_graph_snapshot(
-        workspace,
-        &symbols,
-        &[("sym-sir-a", "sym-sir-b"), ("sym-note-a", "sym-note-b")],
-    )?;
+    let rt = Runtime::new()?;
+    rt.block_on(async {
+        let graph = SurrealGraphStore::open(workspace).await?;
+        for symbol in &symbols {
+            graph.upsert_symbol_node(symbol).await?;
+        }
+        for (source_id, target_id) in [
+            ("sym-sir-a", "sym-sir-b"),
+            ("sym-sir-b", "sym-sir-c"),
+            ("sym-sir-c", "sym-sir-d"),
+            ("sym-note-a", "sym-note-b"),
+            ("sym-note-b", "sym-note-c"),
+            ("sym-note-c", "sym-note-d"),
+        ] {
+            graph
+                .upsert_edge(&ResolvedEdge {
+                    source_id: source_id.to_owned(),
+                    target_id: target_id.to_owned(),
+                    edge_kind: EdgeKind::Calls,
+                    file_path: "src/lib.rs".to_owned(),
+                })
+                .await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    })?;
 
     let server = AetherMcpServer::new(workspace, false)?;
-    let rt = Runtime::new()?;
     let output = rt
         .block_on(
             server.aether_health_explain(Parameters(AetherHealthExplainRequest {

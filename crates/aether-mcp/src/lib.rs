@@ -20,14 +20,15 @@ use aether_core::{
     GitContext, HoverMarkdownSections, Language, NO_SIR_MESSAGE,
     SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR, SEARCH_FALLBACK_EMBEDDINGS_DISABLED,
     SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED, SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY,
-    SIR_STATUS_STALE, SearchEnvelope, SourceRange, format_hover_markdown_sections, normalize_path,
-    stable_symbol_id, stale_warning_message,
+    SIR_STATUS_STALE, SearchEnvelope, SourceRange, SymbolKind, format_hover_markdown_sections,
+    normalize_path, stable_symbol_id, stale_warning_message,
 };
+use aether_graph_algo::GraphAlgorithmEdge;
 use aether_health::{
-    PlannerCommunityAssignment, PlannerSymbolRecord, ScoreReport, SemanticFileInput, SemanticInput,
-    SplitSuggestion, compute_workspace_score, compute_workspace_score_filtered,
-    compute_workspace_score_with_signals, format_crate_explanation, format_hotspots_text,
-    suggest_split,
+    FileCommunityConfig, FileSymbol, PlannerDiagnostics, ScoreReport, SemanticFileInput,
+    SemanticInput, SplitSuggestion, compute_workspace_score, compute_workspace_score_filtered,
+    compute_workspace_score_with_signals, detect_file_communities, format_crate_explanation,
+    format_hotspots_text, suggest_split,
 };
 use aether_infer::{
     EmbeddingProviderOverrides, RerankCandidate, RerankerProvider, RerankerProviderOverrides,
@@ -95,6 +96,14 @@ pub enum AetherMcpError {
     ReadOnly(String),
     #[error("{0}")]
     Message(String),
+}
+
+#[derive(Debug, Clone)]
+struct HealthExplainSplitOutcome {
+    status: String,
+    message: Option<String>,
+    suggestion: Option<SplitSuggestion>,
+    diagnostics: Option<PlannerDiagnostics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -2234,19 +2243,29 @@ impl AetherMcpServer {
             )));
         };
 
-        let split_suggestion = if semantic && crate_score.score >= 50 {
-            self.split_suggestion_for_crate(crate_score)?
+        let split_outcome = if crate_score.score >= 50 {
+            if semantic {
+                self.split_suggestion_for_crate(crate_score).await
+            } else {
+                HealthExplainSplitOutcome {
+                    status: "skipped".to_owned(),
+                    message: Some("split suggestion skipped because semantic=false".to_owned()),
+                    suggestion: None,
+                    diagnostics: None,
+                }
+            }
         } else {
-            None
+            HealthExplainSplitOutcome {
+                status: "not_applicable".to_owned(),
+                message: None,
+                suggestion: None,
+                diagnostics: None,
+            }
         };
 
-        let mut rendered = format_crate_explanation(crate_score, split_suggestion.as_ref());
-        if crate_score.score >= 50 && semantic && split_suggestion.is_none() {
-            rendered.push_str(
-                "\n\nSplit suggestion: unavailable - semantic community data or file symbol data is missing.",
-            );
-        } else if crate_score.score >= 50 && !semantic {
-            rendered.push_str("\n\nSplit suggestion: skipped because semantic=false.");
+        let mut rendered = format_crate_explanation(crate_score, split_outcome.suggestion.as_ref());
+        if crate_score.score >= 50 {
+            append_split_outcome_text(&mut rendered, &split_outcome);
         }
         Ok(rendered)
     }
@@ -2374,49 +2393,244 @@ impl AetherMcpServer {
         }))
     }
 
-    fn split_suggestion_for_crate(
+    async fn split_suggestion_for_crate(
         &self,
         crate_score: &aether_health::CrateScore,
-    ) -> Result<Option<SplitSuggestion>, AetherMcpError> {
+    ) -> HealthExplainSplitOutcome {
         let Some(file_path) = crate_score.metrics.max_file_path.as_deref() else {
-            return Ok(None);
+            return HealthExplainSplitOutcome {
+                status: "no_split".to_owned(),
+                message: Some("hotspot file path is unavailable".to_owned()),
+                suggestion: None,
+                diagnostics: None,
+            };
+        };
+        if self.state.config.storage.graph_backend != GraphBackend::Surreal {
+            return HealthExplainSplitOutcome {
+                status: "unavailable".to_owned(),
+                message: Some(
+                    "split suggestions require storage.graph_backend = \"surreal\"".to_owned(),
+                ),
+                suggestion: None,
+                diagnostics: None,
+            };
+        }
+
+        let loaded = match load_embedding_provider_from_config(
+            self.workspace(),
+            EmbeddingProviderOverrides::default(),
+        ) {
+            Ok(Some(loaded)) => loaded,
+            Ok(None) => {
+                return HealthExplainSplitOutcome {
+                    status: "unavailable".to_owned(),
+                    message: Some("embeddings are disabled for this workspace".to_owned()),
+                    suggestion: None,
+                    diagnostics: None,
+                };
+            }
+            Err(err) => {
+                return HealthExplainSplitOutcome {
+                    status: "unavailable".to_owned(),
+                    message: Some(format!("failed to load embedding provider: {err}")),
+                    suggestion: None,
+                    diagnostics: None,
+                };
+            }
         };
 
-        let community_assignments = self
-            .state
-            .store
-            .list_latest_community_snapshot()?
-            .into_iter()
-            .map(|entry| PlannerCommunityAssignment {
-                symbol_id: entry.symbol_id,
-                community_id: entry.community_id,
-            })
-            .collect::<Vec<_>>();
-        if community_assignments.is_empty() {
-            return Ok(None);
-        }
+        let Some(vector_store) = self.state.vector_store.as_ref().map(Arc::clone) else {
+            return HealthExplainSplitOutcome {
+                status: "unavailable".to_owned(),
+                message: Some("vector store is unavailable".to_owned()),
+                suggestion: None,
+                diagnostics: None,
+            };
+        };
 
-        let symbol_records = self
-            .state
-            .store
-            .list_symbols_for_file(file_path)?
-            .into_iter()
-            .map(|symbol| PlannerSymbolRecord {
-                id: symbol.id,
-                qualified_name: symbol.qualified_name,
-                file_path: symbol.file_path,
-            })
-            .collect::<Vec<_>>();
+        let graph = match self.state.surreal_graph_for_health().await {
+            Ok(graph) => graph,
+            Err(err) => {
+                return HealthExplainSplitOutcome {
+                    status: "unavailable".to_owned(),
+                    message: Some(err.to_string()),
+                    suggestion: None,
+                    diagnostics: None,
+                };
+            }
+        };
+
+        let all_edges = match graph.list_dependency_edges().await {
+            Ok(edges) => edges
+                .into_iter()
+                .map(|edge| GraphAlgorithmEdge {
+                    source_id: edge.source_symbol_id,
+                    target_id: edge.target_symbol_id,
+                    edge_kind: edge.edge_kind,
+                })
+                .collect::<Vec<_>>(),
+            Err(err) => {
+                return HealthExplainSplitOutcome {
+                    status: "unavailable".to_owned(),
+                    message: Some(format!("failed to load dependency edges: {err}")),
+                    suggestion: None,
+                    diagnostics: None,
+                };
+            }
+        };
+
+        let symbol_records = match self.state.store.list_symbols_for_file(file_path) {
+            Ok(symbols) => symbols,
+            Err(err) => {
+                return HealthExplainSplitOutcome {
+                    status: "unavailable".to_owned(),
+                    message: Some(format!("failed to load symbols for {file_path}: {err}")),
+                    suggestion: None,
+                    diagnostics: None,
+                };
+            }
+        };
         if symbol_records.is_empty() {
-            return Ok(None);
+            return HealthExplainSplitOutcome {
+                status: "unavailable".to_owned(),
+                message: Some(format!("no indexed symbols were found for {file_path}")),
+                suggestion: None,
+                diagnostics: None,
+            };
         }
 
-        Ok(suggest_split(
+        let symbol_ids = symbol_records
+            .iter()
+            .map(|symbol| symbol.id.clone())
+            .collect::<Vec<_>>();
+        let symbol_id_set = symbol_ids
+            .iter()
+            .map(|symbol_id| symbol_id.as_str())
+            .collect::<HashSet<_>>();
+        let structural_edges = all_edges
+            .iter()
+            .filter(|edge| {
+                symbol_id_set.contains(edge.source_id.as_str())
+                    && symbol_id_set.contains(edge.target_id.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let embedding_records = match vector_store
+            .list_embeddings_for_symbols(
+                &loaded.provider_name,
+                &loaded.model_name,
+                symbol_ids.as_slice(),
+            )
+            .await
+        {
+            Ok(records) => records,
+            Err(err) => {
+                return HealthExplainSplitOutcome {
+                    status: "unavailable".to_owned(),
+                    message: Some(format!("failed to load embeddings for {file_path}: {err}")),
+                    suggestion: None,
+                    diagnostics: None,
+                };
+            }
+        };
+        let embedding_by_id = embedding_records
+            .into_iter()
+            .map(|record| (record.symbol_id, record.embedding))
+            .collect::<HashMap<_, _>>();
+        let file_symbols = symbol_records
+            .iter()
+            .map(|record| self.build_planner_file_symbol(record, &embedding_by_id))
+            .collect::<Vec<_>>();
+        let planner_config = FileCommunityConfig {
+            semantic_rescue_threshold: self.state.config.planner.semantic_rescue_threshold,
+            semantic_rescue_max_k: self.state.config.planner.semantic_rescue_max_k,
+            community_resolution: self.state.config.planner.community_resolution,
+            min_community_size: self.state.config.planner.min_community_size,
+        };
+
+        let (assignments, diagnostics) = detect_file_communities(
+            structural_edges.as_slice(),
+            file_symbols.as_slice(),
+            &planner_config,
+        );
+        if assignments.is_empty() {
+            return HealthExplainSplitOutcome {
+                status: "no_split".to_owned(),
+                message: Some("all non-test symbols were loners after rescue passes".to_owned()),
+                suggestion: None,
+                diagnostics: Some(diagnostics),
+            };
+        }
+
+        let community_count = assignments
+            .iter()
+            .map(|(_, community_id)| *community_id)
+            .collect::<HashSet<_>>()
+            .len();
+        if community_count < 2 {
+            return HealthExplainSplitOutcome {
+                status: "no_split".to_owned(),
+                message: Some("only one actionable community was detected".to_owned()),
+                suggestion: None,
+                diagnostics: Some(diagnostics),
+            };
+        }
+
+        match suggest_split(
             file_path,
             crate_score.score,
-            community_assignments.as_slice(),
-            symbol_records.as_slice(),
-        ))
+            structural_edges.as_slice(),
+            file_symbols.as_slice(),
+            &planner_config,
+        ) {
+            Some((suggestion, diagnostics)) => HealthExplainSplitOutcome {
+                status: "suggested".to_owned(),
+                message: None,
+                suggestion: Some(suggestion),
+                diagnostics: Some(diagnostics),
+            },
+            None => HealthExplainSplitOutcome {
+                status: "no_split".to_owned(),
+                message: Some("no actionable split suggestion was produced".to_owned()),
+                suggestion: None,
+                diagnostics: Some(diagnostics),
+            },
+        }
+    }
+
+    fn build_planner_file_symbol(
+        &self,
+        record: &SymbolRecord,
+        embedding_by_id: &HashMap<String, Vec<f32>>,
+    ) -> FileSymbol {
+        FileSymbol {
+            symbol_id: record.id.clone(),
+            name: symbol_leaf_name(record.qualified_name.as_str()).to_owned(),
+            qualified_name: record.qualified_name.clone(),
+            kind: parse_symbol_kind(record.kind.as_str()),
+            is_test: self.symbol_is_test(record),
+            embedding: embedding_by_id.get(record.id.as_str()).cloned(),
+        }
+    }
+
+    fn symbol_is_test(&self, record: &SymbolRecord) -> bool {
+        if self
+            .state
+            .store
+            .list_test_intents_for_symbol(record.id.as_str())
+            .map(|records| !records.is_empty())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+
+        let leaf_name = symbol_leaf_name(record.qualified_name.as_str()).to_ascii_lowercase();
+        if leaf_name.starts_with("test_") {
+            return true;
+        }
+
+        let normalized_path = normalize_path(record.file_path.as_str()).to_ascii_lowercase();
+        normalized_path.starts_with("tests/") || normalized_path.contains("/tests/")
     }
 
     pub fn aether_trace_cause_logic(
@@ -3970,14 +4184,15 @@ mod tests {
 
     use aether_core::EdgeKind;
     use aether_store::{
-        CouplingEdgeRecord, CozoGraphStore, DriftResultRecord, ProjectNoteRecord, ResolvedEdge,
-        SqliteStore, Store, SymbolRecord, TestIntentRecord,
+        CouplingEdgeRecord, CozoGraphStore, DriftResultRecord, GraphStore, ProjectNoteRecord,
+        ResolvedEdge, SqliteStore, Store, SurrealGraphStore, SymbolEmbeddingRecord, SymbolRecord,
+        TestIntentRecord,
     };
     use tempfile::tempdir;
 
     use super::{
         AetherAcknowledgeDriftRequest, AetherAskKind, AetherAskRequest, AetherDriftReportRequest,
-        AetherMcpServer, AetherTraceCauseRequest,
+        AetherHealthExplainRequest, AetherMcpServer, AetherTraceCauseRequest,
     };
 
     fn write_test_config(workspace: &Path) {
@@ -3999,6 +4214,54 @@ vector_backend = "sqlite"
 "#,
         )
         .expect("write config");
+    }
+
+    fn write_health_explain_config(workspace: &Path, graph_backend: &str) {
+        fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
+        fs::write(
+            workspace.join(".aether/config.toml"),
+            format!(
+                r#"[storage]
+graph_backend = "{graph_backend}"
+
+[embeddings]
+enabled = true
+provider = "qwen3_local"
+vector_backend = "sqlite"
+model = "qwen3-embeddings-4B"
+
+[health_score]
+file_loc_warn = 1
+file_loc_fail = 2
+trait_method_warn = 1
+trait_method_fail = 2
+"#
+            ),
+        )
+        .expect("write config");
+    }
+
+    fn symbol_record(id: &str, qualified_name: &str, file_path: &str) -> SymbolRecord {
+        SymbolRecord {
+            id: id.to_owned(),
+            file_path: file_path.to_owned(),
+            language: "rust".to_owned(),
+            kind: "function".to_owned(),
+            qualified_name: qualified_name.to_owned(),
+            signature_fingerprint: format!("sig-{id}"),
+            last_seen_at: 1_700_000_000,
+        }
+    }
+
+    fn embedding_record(symbol_id: &str, embedding: Vec<f32>) -> SymbolEmbeddingRecord {
+        SymbolEmbeddingRecord {
+            symbol_id: symbol_id.to_owned(),
+            sir_hash: format!("sir-{symbol_id}"),
+            provider: "qwen3_local".to_owned(),
+            model: "qwen3-embeddings-4B".to_owned(),
+            embedding,
+            updated_at: 1_700_000_000_000,
+        }
     }
 
     #[tokio::test]
@@ -4279,6 +4542,168 @@ api_key_env = "GEMINI_API_KEY"
         assert_eq!(response.schema_version, "1.0");
         assert_eq!(response.target.symbol_id, "sym-a");
     }
+
+    #[tokio::test]
+    async fn aether_health_explain_includes_split_diagnostics() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/example\"]\nresolver = \"2\"\n",
+        )
+        .expect("write workspace Cargo.toml");
+        fs::create_dir_all(workspace.join("crates/example/src")).expect("create src dir");
+        fs::write(
+            workspace.join("crates/example/Cargo.toml"),
+            "[package]\nname = \"example\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("write crate Cargo.toml");
+        fs::write(
+            workspace.join("crates/example/src/lib.rs"),
+            "pub trait Store {\n    fn alpha(&self);\n    fn beta(&self);\n    fn gamma(&self);\n}\n\npub fn sir_alpha() -> i32 { 1 }\npub fn sir_beta() -> i32 { sir_alpha() }\npub fn sir_gamma() -> i32 { sir_beta() }\npub fn sir_delta() -> i32 { sir_gamma() }\npub fn note_alpha() -> i32 { 2 }\npub fn note_beta() -> i32 { note_alpha() }\npub fn note_gamma() -> i32 { note_beta() }\npub fn note_delta() -> i32 { note_gamma() }\n",
+        )
+        .expect("write lib.rs");
+        write_health_explain_config(workspace, "surreal");
+
+        let server = AetherMcpServer::init(workspace, false)
+            .await
+            .expect("init mcp server");
+        let store = SqliteStore::open(workspace).expect("open store");
+        let symbols = vec![
+            symbol_record("sym-sir-a", "crate::sir_alpha", "crates/example/src/lib.rs"),
+            symbol_record("sym-sir-b", "crate::sir_beta", "crates/example/src/lib.rs"),
+            symbol_record("sym-sir-c", "crate::sir_gamma", "crates/example/src/lib.rs"),
+            symbol_record("sym-sir-d", "crate::sir_delta", "crates/example/src/lib.rs"),
+            symbol_record(
+                "sym-note-a",
+                "crate::note_alpha",
+                "crates/example/src/lib.rs",
+            ),
+            symbol_record(
+                "sym-note-b",
+                "crate::note_beta",
+                "crates/example/src/lib.rs",
+            ),
+            symbol_record(
+                "sym-note-c",
+                "crate::note_gamma",
+                "crates/example/src/lib.rs",
+            ),
+            symbol_record(
+                "sym-note-d",
+                "crate::note_delta",
+                "crates/example/src/lib.rs",
+            ),
+        ];
+        for symbol in &symbols {
+            store.upsert_symbol(symbol.clone()).expect("upsert symbol");
+        }
+        store
+            .upsert_symbol_embedding(embedding_record("sym-sir-a", vec![1.0, 0.0]))
+            .expect("seed sir-a embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-sir-b", vec![0.95, 0.05]))
+            .expect("seed sir-b embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-sir-c", vec![0.92, 0.08]))
+            .expect("seed sir-c embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-sir-d", vec![0.9, 0.1]))
+            .expect("seed sir-d embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-note-a", vec![0.0, 1.0]))
+            .expect("seed note-a embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-note-b", vec![0.05, 0.95]))
+            .expect("seed note-b embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-note-c", vec![0.08, 0.92]))
+            .expect("seed note-c embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-note-d", vec![0.1, 0.9]))
+            .expect("seed note-d embedding");
+
+        let graph = SurrealGraphStore::open(workspace)
+            .await
+            .expect("open surreal graph");
+        for symbol in &symbols {
+            graph
+                .upsert_symbol_node(symbol)
+                .await
+                .expect("upsert surreal symbol");
+        }
+        for (source_id, target_id) in [
+            ("sym-sir-a", "sym-sir-b"),
+            ("sym-sir-b", "sym-sir-c"),
+            ("sym-sir-c", "sym-sir-d"),
+            ("sym-note-a", "sym-note-b"),
+            ("sym-note-b", "sym-note-c"),
+            ("sym-note-c", "sym-note-d"),
+        ] {
+            graph
+                .upsert_edge(&ResolvedEdge {
+                    source_id: source_id.to_owned(),
+                    target_id: target_id.to_owned(),
+                    edge_kind: EdgeKind::Calls,
+                    file_path: "crates/example/src/lib.rs".to_owned(),
+                })
+                .await
+                .expect("upsert surreal edge");
+        }
+
+        let rendered = server
+            .aether_health_explain_logic(AetherHealthExplainRequest {
+                crate_name: "example".to_owned(),
+                semantic: Some(true),
+            })
+            .await
+            .expect("health explain");
+
+        assert!(rendered.contains("Split suggestion:"));
+        assert!(rendered.contains("sir_ops"));
+        assert!(rendered.contains("note_ops"));
+        assert!(rendered.contains("Split diagnostics:"));
+        assert!(rendered.contains("stability:"));
+        assert!(rendered.contains("Suggested module files:"));
+    }
+
+    #[tokio::test]
+    async fn aether_health_explain_reports_unavailable_on_non_surreal_backend() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/example\"]\nresolver = \"2\"\n",
+        )
+        .expect("write workspace Cargo.toml");
+        fs::create_dir_all(workspace.join("crates/example/src")).expect("create src dir");
+        fs::write(
+            workspace.join("crates/example/Cargo.toml"),
+            "[package]\nname = \"example\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("write crate Cargo.toml");
+        fs::write(
+            workspace.join("crates/example/src/lib.rs"),
+            "pub trait Store {\n    fn alpha(&self);\n    fn beta(&self);\n    fn gamma(&self);\n}\n",
+        )
+        .expect("write lib.rs");
+        write_health_explain_config(workspace, "sqlite");
+
+        let server = AetherMcpServer::init(workspace, false)
+            .await
+            .expect("init mcp server");
+
+        let rendered = server
+            .aether_health_explain_logic(AetherHealthExplainRequest {
+                crate_name: "example".to_owned(),
+                semantic: Some(true),
+            })
+            .await
+            .expect("health explain");
+
+        assert!(rendered.contains("status: unavailable"));
+        assert!(rendered.contains("storage.graph_backend = \"surreal\""));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4413,12 +4838,100 @@ fn latest_semantic_drift_by_symbol(
     Ok(drift_by_symbol)
 }
 
+fn append_split_outcome_text(rendered: &mut String, outcome: &HealthExplainSplitOutcome) {
+    match outcome.status.as_str() {
+        "suggested" => {
+            if let Some(suggestion) = outcome.suggestion.as_ref() {
+                rendered.push_str("\n\nSuggested module files:");
+                for module in &suggestion.suggested_modules {
+                    rendered.push_str(&format!(
+                        "\n  - {} -> {}",
+                        module.name, module.suggested_file_path
+                    ));
+                }
+            }
+            if let Some(diagnostics) = outcome.diagnostics.as_ref() {
+                rendered.push_str("\n\nSplit diagnostics:");
+                append_planner_diagnostics_text(rendered, diagnostics);
+            }
+        }
+        "not_applicable" => {}
+        _ => {
+            rendered.push_str("\n\nSplit suggestion:");
+            rendered.push_str(&format!("\n  status: {}", outcome.status));
+            if let Some(message) = outcome.message.as_ref() {
+                rendered.push_str(&format!("\n  message: {message}"));
+            }
+            if let Some(diagnostics) = outcome.diagnostics.as_ref() {
+                rendered.push_str("\n\nSplit diagnostics:");
+                append_planner_diagnostics_text(rendered, diagnostics);
+            }
+        }
+    }
+}
+
+fn append_planner_diagnostics_text(rendered: &mut String, diagnostics: &PlannerDiagnostics) {
+    rendered.push_str(&format!(
+        "\n  confidence: {} ({:.2})",
+        diagnostics.confidence_label, diagnostics.confidence
+    ));
+    rendered.push_str(&format!(
+        "\n  stability: {:.2}",
+        diagnostics.stability_score
+    ));
+    rendered.push_str(&format!("\n  symbols_total: {}", diagnostics.symbols_total));
+    rendered.push_str(&format!(
+        "\n  symbols_filtered_test: {}",
+        diagnostics.symbols_filtered_test
+    ));
+    rendered.push_str(&format!(
+        "\n  symbols_anchored_type: {}",
+        diagnostics.symbols_anchored_type
+    ));
+    rendered.push_str(&format!(
+        "\n  symbols_rescued_container: {}",
+        diagnostics.symbols_rescued_container
+    ));
+    rendered.push_str(&format!(
+        "\n  symbols_rescued_semantic: {}",
+        diagnostics.symbols_rescued_semantic
+    ));
+    rendered.push_str(&format!("\n  symbols_loner: {}", diagnostics.symbols_loner));
+    rendered.push_str(&format!(
+        "\n  communities_before_merge: {}",
+        diagnostics.communities_before_merge
+    ));
+    rendered.push_str(&format!(
+        "\n  communities_after_merge: {}",
+        diagnostics.communities_after_merge
+    ));
+    rendered.push_str(&format!(
+        "\n  embedding_coverage_pct: {:.2}",
+        diagnostics.embedding_coverage_pct
+    ));
+}
+
 fn symbol_leaf_name(qualified_name: &str) -> &str {
     qualified_name
         .rsplit("::")
         .next()
         .filter(|value| !value.is_empty())
         .unwrap_or(qualified_name)
+}
+
+fn parse_symbol_kind(raw: &str) -> SymbolKind {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "function" => SymbolKind::Function,
+        "method" => SymbolKind::Method,
+        "class" => SymbolKind::Class,
+        "variable" => SymbolKind::Variable,
+        "struct" => SymbolKind::Struct,
+        "enum" => SymbolKind::Enum,
+        "trait" => SymbolKind::Trait,
+        "interface" => SymbolKind::Interface,
+        "type_alias" => SymbolKind::TypeAlias,
+        _ => SymbolKind::Function,
+    }
 }
 
 fn build_structural_view(

@@ -128,10 +128,13 @@ version = "0.1.0"
 dependencies = [
  "aether-config",
  "aether-core",
+ "aether-graph-algo",
+ "aether-store",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "toml",
  "walkdir",
 ]
@@ -182,6 +185,7 @@ dependencies = [
  "aether-analysis",
  "aether-config",
  "aether-core",
+ "aether-graph-algo",
  "aether-health",
  "aether-infer",
  "aether-memory",

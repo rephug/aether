@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 aether-config = { path = "../aether-config" }
 aether-core = { path = "../aether-core" }
+aether-graph-algo = { path = "../aether-graph-algo" }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -15,4 +16,6 @@ toml.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]
+aether-store = { path = "../aether-store" }
 tempfile.workspace = true
+tokio = { version = "1", features = ["rt"] }
