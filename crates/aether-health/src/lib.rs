@@ -1,10 +1,12 @@
 mod archetypes;
+pub mod compare;
 mod explanations;
 pub mod git_signals;
 pub mod history;
 pub mod metrics;
 pub mod models;
 pub mod output;
+pub mod planner;
 mod scanner;
 pub mod scoring;
 pub mod semantic_signals;
@@ -14,14 +16,22 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aether_config::HealthScoreConfig;
 use aether_core::{GitContext, normalize_path};
 
+pub use aether_config::HealthScoreConfig;
+pub use compare::{CompareReport, CrateDelta, MetricChangeKind, MetricDelta, compare_reports};
 pub use models::{
     Archetype, CrateScore, GitSignals, HealthError, ScoreBreakdown, ScoreReport, SemanticSignals,
     Severity, SignalAvailability, Violation, WorkspaceViolation,
 };
-pub use output::{format_json, format_table};
+pub use output::{
+    format_compare_json, format_compare_table, format_crate_explanation, format_hotspots_text,
+    format_json, format_table,
+};
+pub use planner::{
+    PlannerCommunityAssignment, PlannerSymbolRecord, SplitConfidence, SplitSuggestion,
+    SuggestedModule, suggest_split,
+};
 pub use semantic_signals::{SemanticFileInput, SemanticInput};
 
 use crate::archetypes::{assign_archetypes, assign_combined_archetypes};
@@ -45,6 +55,12 @@ const STRUCTURAL_SCHEMA_VERSION: u32 = 1;
 const SEMANTIC_SCHEMA_VERSION: u32 = 2;
 const LEGACY_FEATURE_PATTERN: &str = "feature = \"legacy-";
 const TOP_VIOLATION_LIMIT: usize = 5;
+
+pub fn workspace_health_config_or_default(path: &Path) -> HealthScoreConfig {
+    aether_config::load_workspace_config(path)
+        .map(|config| config.health_score)
+        .unwrap_or_default()
+}
 
 pub fn compute_workspace_score(path: &Path, config: &HealthScoreConfig) -> Result<ScoreReport> {
     compute_workspace_score_filtered(path, config, &[])
@@ -157,7 +173,7 @@ fn score_workspace_crate(
     semantic_input: Option<&SemanticInput>,
     extended_mode: bool,
 ) -> Result<CrateScore> {
-    let metrics = collect_crate_metrics(crate_info, config)?;
+    let metrics = collect_crate_metrics(crate_info, workspace_root, config)?;
     let penalties = compute_metric_penalties(&metrics, config);
     let structural_score = normalize_to_100(compute_crate_penalty(&metrics, config));
     let git_analysis = git
@@ -233,6 +249,7 @@ fn score_workspace_crate(
 
 fn collect_crate_metrics(
     crate_info: &WorkspaceCrate,
+    workspace_root: &Path,
     config: &HealthScoreConfig,
 ) -> Result<CrateMetrics> {
     let mut metrics = CrateMetrics {
@@ -261,7 +278,8 @@ fn collect_crate_metrics(
 
         if loc > metrics.max_file_loc {
             metrics.max_file_loc = loc;
-            metrics.max_file_path = relative_path(&crate_info.root, source_file);
+            metrics.max_file_path = relative_path(workspace_root, source_file)
+                .or_else(|| relative_path(&crate_info.root, source_file));
         }
 
         if !is_legacy_cozo_file(source_file) {

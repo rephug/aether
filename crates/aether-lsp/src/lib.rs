@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aether_core::{
     HoverMarkdownSections, Language, NO_SIR_MESSAGE, SourceRange, Symbol,
     format_hover_markdown_sections, normalize_path, stable_symbol_id, stale_warning_message,
 };
+use aether_health::{ScoreReport, compute_workspace_score, workspace_health_config_or_default};
 use aether_parse::{RustUsePrefix, language_for_path, rust_use_path_at_cursor};
 use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
 use aether_store::{CouplingEdgeRecord, CozoGraphStore, SqliteStore, Store, StoreError};
@@ -39,10 +40,12 @@ pub struct AetherLspBackend {
     client: Client,
     workspace_root: PathBuf,
     store: Arc<SqliteStore>,
+    health_score_cache: Arc<RwLock<Option<(Instant, ScoreReport)>>>,
 }
 
 static SYMBOL_EXTRACTOR: OnceLock<std::sync::Mutex<aether_parse::SymbolExtractor>> =
     OnceLock::new();
+const HEALTH_SCORE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 fn get_extractor()
 -> Result<std::sync::MutexGuard<'static, aether_parse::SymbolExtractor>, HoverResolveError> {
@@ -62,6 +65,7 @@ impl AetherLspBackend {
             client,
             workspace_root,
             store,
+            health_score_cache: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -108,14 +112,16 @@ impl LanguageServer for AetherLspBackend {
 
         let workspace_root = self.workspace_root.clone();
         let store = Arc::clone(&self.store);
+        let health_score_cache = Arc::clone(&self.health_score_cache);
         let position = text_doc_pos.position;
         let resolution = match tokio::task::spawn_blocking(move || {
-            resolve_hover_markdown_for_source(
+            resolve_hover_markdown_for_source_with_health(
                 &workspace_root,
                 store.as_ref(),
                 &file_path,
                 &source,
                 position,
+                health_score_cache.as_ref(),
             )
         })
         .await
@@ -176,6 +182,30 @@ pub fn resolve_hover_markdown_for_path(
 ) -> Result<Option<String>, HoverResolveError> {
     let source = std::fs::read_to_string(file_path)?;
     resolve_hover_markdown_for_source(workspace_root, store, file_path, &source, position)
+}
+
+fn resolve_hover_markdown_for_source_with_health(
+    workspace_root: &Path,
+    store: &SqliteStore,
+    file_path: &Path,
+    source: &str,
+    position: Position,
+    health_score_cache: &RwLock<Option<(Instant, ScoreReport)>>,
+) -> Result<Option<String>, HoverResolveError> {
+    let Some(mut markdown) =
+        resolve_hover_markdown_for_source(workspace_root, store, file_path, source, position)?
+    else {
+        return Ok(None);
+    };
+
+    if let Some(health_line) =
+        health_summary_markdown(workspace_root, file_path, health_score_cache)
+    {
+        markdown.push_str("\n\n---\n");
+        markdown.push_str(&health_line);
+    }
+
+    Ok(Some(markdown))
 }
 
 pub fn resolve_hover_markdown_for_source(
@@ -864,6 +894,80 @@ fn workspace_relative_display_path(workspace_root: &Path, file_path: &Path) -> S
     normalize_path(&file_path.to_string_lossy())
 }
 
+fn health_summary_markdown(
+    workspace_root: &Path,
+    file_path: &Path,
+    health_score_cache: &RwLock<Option<(Instant, ScoreReport)>>,
+) -> Option<String> {
+    let crate_name = crate_name_for_file(workspace_root, file_path)?;
+    let report = cached_health_report(workspace_root, health_score_cache)?;
+    let crate_score = report
+        .crates
+        .iter()
+        .find(|crate_score| crate_score.name == crate_name)?;
+    let mut markdown = format!(
+        "**Health:** {} — {}/100 ({})",
+        crate_score.name,
+        crate_score.score,
+        crate_score.severity.as_label()
+    );
+    if let Some(archetype) = crate_score.archetypes.first() {
+        markdown.push_str(" · ");
+        markdown.push_str(archetype.as_str());
+    }
+    Some(markdown)
+}
+
+fn cached_health_report(
+    workspace_root: &Path,
+    health_score_cache: &RwLock<Option<(Instant, ScoreReport)>>,
+) -> Option<ScoreReport> {
+    if let Ok(guard) = health_score_cache.read()
+        && let Some((captured_at, report)) = guard.as_ref()
+        && captured_at.elapsed() < HEALTH_SCORE_CACHE_TTL
+    {
+        return Some(report.clone());
+    }
+
+    let config = workspace_health_config_or_default(workspace_root);
+    let report = compute_workspace_score(workspace_root, &config).ok()?;
+    if let Ok(mut guard) = health_score_cache.write() {
+        *guard = Some((Instant::now(), report.clone()));
+    }
+    Some(report)
+}
+
+fn crate_name_for_file(workspace_root: &Path, file_path: &Path) -> Option<String> {
+    let mut current = file_path.parent()?;
+    loop {
+        let manifest_path = current.join("Cargo.toml");
+        if manifest_path.is_file() {
+            return package_name_from_manifest(&manifest_path);
+        }
+        if current == workspace_root {
+            return None;
+        }
+        current = current.parent()?;
+    }
+}
+
+fn package_name_from_manifest(manifest_path: &Path) -> Option<String> {
+    let manifest = std::fs::read_to_string(manifest_path).ok()?;
+    let mut in_package = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_package = trimmed == "[package]";
+            continue;
+        }
+        if in_package && trimmed.starts_with("name") {
+            let value = trimmed.split_once('=')?.1.trim();
+            return Some(value.trim_matches('"').to_owned());
+        }
+    }
+    None
+}
+
 /// Convert an LSP UTF-16 character offset to a UTF-8 byte offset for the given line.
 fn utf16_offset_to_byte_offset(source: &str, line: u32, character: u32) -> usize {
     let target_line = line as usize;
@@ -1240,6 +1344,62 @@ mod tests {
                 .expect("hover markdown");
 
         assert!(markdown.contains("> AETHER WHY: only one recorded SIR version."));
+    }
+
+    #[test]
+    fn lsp_hover_includes_health() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_workspace_manifest(workspace);
+        let source_file = write_source_file(workspace);
+        let source = fs::read_to_string(&source_file).expect("read source");
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        let symbol_id = symbol_id_at(workspace, &source_file, Position::new(0, 4));
+
+        store
+            .write_sir_blob(
+                &symbol_id,
+                r#"{
+                    "intent":"Mock summary for alpha",
+                    "inputs":["x"],
+                    "outputs":["y"],
+                    "side_effects":[],
+                    "dependencies":[],
+                    "error_modes":[],
+                    "confidence":0.75
+                }"#,
+            )
+            .expect("write sir blob");
+        store
+            .upsert_sir_meta(SirMetaRecord {
+                id: symbol_id,
+                sir_hash: "hash-alpha".to_owned(),
+                sir_version: 1,
+                provider: "mock".to_owned(),
+                model: "mock".to_owned(),
+                generation_pass: "single".to_owned(),
+                updated_at: 1_700_000_000,
+                sir_status: "fresh".to_owned(),
+                last_error: None,
+                last_attempt_at: 1_700_000_000,
+            })
+            .expect("upsert sir meta");
+
+        let health_score_cache = RwLock::new(None);
+        let markdown = resolve_hover_markdown_for_source_with_health(
+            workspace,
+            &store,
+            &source_file,
+            &source,
+            Position::new(0, 4),
+            &health_score_cache,
+        )
+        .expect("resolve hover")
+        .expect("hover markdown");
+
+        assert!(markdown.contains("### alpha"));
+        assert!(markdown.contains("**Health:** hover-test —"));
     }
 
     #[test]
@@ -1848,7 +2008,7 @@ mod tests {
     fn write_workspace_manifest(workspace: &Path) {
         fs::write(
             workspace.join("Cargo.toml"),
-            "[package]\nname = \"hover-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            "[package]\nname = \"hover-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\nmembers = [\".\"]\nresolver = \"2\"\n",
         )
         .expect("write manifest");
     }

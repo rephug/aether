@@ -21,6 +21,7 @@ mod flow;
 mod glossary;
 mod graph;
 mod health;
+mod health_score;
 mod overview;
 mod prompts;
 mod search_results;
@@ -95,4 +96,8 @@ pub(crate) fn fragment_router() -> Router<Arc<DashboardState>> {
         )
         .route("/dashboard/frag/coupling", get(coupling::coupling_fragment))
         .route("/dashboard/frag/health", get(health::health_fragment))
+        .route(
+            "/dashboard/frag/health-score",
+            get(health_score::health_score_fragment),
+        )
 }

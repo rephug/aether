@@ -17,10 +17,17 @@ use aether_config::VerifyMode;
 use aether_config::{GraphBackend, SearchRerankerKind};
 pub use aether_core::SearchMode;
 use aether_core::{
-    HoverMarkdownSections, Language, NO_SIR_MESSAGE, SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR,
-    SEARCH_FALLBACK_EMBEDDINGS_DISABLED, SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED,
-    SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY, SearchEnvelope, SourceRange,
-    format_hover_markdown_sections, normalize_path, stable_symbol_id, stale_warning_message,
+    GitContext, HoverMarkdownSections, Language, NO_SIR_MESSAGE,
+    SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR, SEARCH_FALLBACK_EMBEDDINGS_DISABLED,
+    SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED, SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY,
+    SIR_STATUS_STALE, SearchEnvelope, SourceRange, format_hover_markdown_sections, normalize_path,
+    stable_symbol_id, stale_warning_message,
+};
+use aether_health::{
+    PlannerCommunityAssignment, PlannerSymbolRecord, ScoreReport, SemanticFileInput, SemanticInput,
+    SplitSuggestion, compute_workspace_score, compute_workspace_score_filtered,
+    compute_workspace_score_with_signals, format_crate_explanation, format_hotspots_text,
+    suggest_split,
 };
 use aether_infer::{
     EmbeddingProviderOverrides, RerankCandidate, RerankerProvider, RerankerProviderOverrides,
@@ -585,6 +592,24 @@ pub struct AetherHealthRequest {
     pub include: Option<Vec<AetherHealthInclude>>,
     pub limit: Option<u32>,
     pub min_risk: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherHealthHotspotsRequest {
+    pub limit: Option<u32>,
+    pub min_score: Option<u32>,
+    pub semantic: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherHealthExplainRequest {
+    pub crate_name: String,
+    pub semantic: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherTextResponse {
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -2175,6 +2200,225 @@ impl AetherMcpServer {
         })
     }
 
+    pub async fn aether_health_hotspots_logic(
+        &self,
+        request: AetherHealthHotspotsRequest,
+    ) -> Result<String, AetherMcpError> {
+        let limit = request.limit.unwrap_or(5).clamp(1, 100) as usize;
+        let min_score = request.min_score.unwrap_or(25).min(100);
+        let semantic = request.semantic.unwrap_or(true);
+        let report = self.compute_health_score_report(semantic, &[]).await?;
+        Ok(format_hotspots_text(&report, limit, min_score))
+    }
+
+    pub async fn aether_health_explain_logic(
+        &self,
+        request: AetherHealthExplainRequest,
+    ) -> Result<String, AetherMcpError> {
+        let semantic = request.semantic.unwrap_or(true);
+        let report = self.compute_health_score_report(semantic, &[]).await?;
+        let crate_name = request.crate_name.trim();
+        let Some(crate_score) = report
+            .crates
+            .iter()
+            .find(|crate_score| crate_score.name == crate_name)
+        else {
+            let available = report
+                .crates
+                .iter()
+                .map(|crate_score| crate_score.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(AetherMcpError::Message(format!(
+                "unknown crate '{crate_name}'. Available crates: {available}"
+            )));
+        };
+
+        let split_suggestion = if semantic && crate_score.score >= 50 {
+            self.split_suggestion_for_crate(crate_score)?
+        } else {
+            None
+        };
+
+        let mut rendered = format_crate_explanation(crate_score, split_suggestion.as_ref());
+        if crate_score.score >= 50 && semantic && split_suggestion.is_none() {
+            rendered.push_str(
+                "\n\nSplit suggestion: unavailable - semantic community data or file symbol data is missing.",
+            );
+        } else if crate_score.score >= 50 && !semantic {
+            rendered.push_str("\n\nSplit suggestion: skipped because semantic=false.");
+        }
+        Ok(rendered)
+    }
+
+    async fn compute_health_score_report(
+        &self,
+        semantic: bool,
+        crate_filter: &[String],
+    ) -> Result<ScoreReport, AetherMcpError> {
+        if semantic {
+            let git = GitContext::open(self.workspace());
+            let semantic_input = match self.load_health_semantic_input().await {
+                Ok(input) => input,
+                Err(err) => {
+                    tracing::warn!("mcp health semantic bridge unavailable: {err}");
+                    None
+                }
+            };
+            compute_workspace_score_with_signals(
+                self.workspace(),
+                &self.state.config.health_score,
+                crate_filter,
+                git.as_ref(),
+                semantic_input.as_ref(),
+            )
+            .map_err(|err| {
+                AetherMcpError::Message(format!("failed to compute health score: {err}"))
+            })
+        } else if crate_filter.is_empty() {
+            compute_workspace_score(self.workspace(), &self.state.config.health_score).map_err(
+                |err| AetherMcpError::Message(format!("failed to compute health score: {err}")),
+            )
+        } else {
+            compute_workspace_score_filtered(
+                self.workspace(),
+                &self.state.config.health_score,
+                crate_filter,
+            )
+            .map_err(|err| {
+                AetherMcpError::Message(format!("failed to compute health score: {err}"))
+            })
+        }
+    }
+
+    async fn load_health_semantic_input(&self) -> Result<Option<SemanticInput>, AetherMcpError> {
+        let analyzer = HealthAnalyzer::new(self.workspace())?;
+        let centrality = analyzer.centrality_by_file().await?;
+        if centrality.files.is_empty() && !centrality.notes.is_empty() {
+            return Ok(None);
+        }
+
+        let drift_by_symbol = latest_semantic_drift_by_symbol(self.state.store.as_ref())?;
+        let community_by_symbol = self
+            .state
+            .store
+            .list_latest_community_snapshot()?
+            .into_iter()
+            .map(|entry| (entry.symbol_id, entry.community_id))
+            .collect::<HashMap<_, _>>();
+
+        let mut files = HashMap::new();
+        for entry in centrality.files {
+            let path = normalize_path(entry.file.as_str());
+            let symbols = self.state.store.list_symbols_for_file(path.as_str())?;
+            if symbols.is_empty() {
+                continue;
+            }
+
+            let drifted_symbol_count = symbols
+                .iter()
+                .filter(|symbol| {
+                    drift_by_symbol
+                        .get(symbol.id.as_str())
+                        .is_some_and(|magnitude| *magnitude > 0.3)
+                })
+                .count();
+            let stale_or_missing_sir_count = symbols
+                .iter()
+                .filter(|symbol| {
+                    self.state
+                        .store
+                        .get_sir_meta(symbol.id.as_str())
+                        .ok()
+                        .flatten()
+                        .is_none_or(|meta| {
+                            meta.sir_status
+                                .trim()
+                                .eq_ignore_ascii_case(SIR_STATUS_STALE)
+                        })
+                })
+                .count();
+            let community_count = symbols
+                .iter()
+                .filter_map(|symbol| community_by_symbol.get(symbol.id.as_str()).copied())
+                .collect::<HashSet<_>>()
+                .len();
+            let has_test_coverage = symbols.iter().any(|symbol| {
+                self.state
+                    .store
+                    .list_test_intents_for_symbol(symbol.id.as_str())
+                    .map(|records| !records.is_empty())
+                    .unwrap_or(false)
+            });
+
+            files.insert(
+                path,
+                SemanticFileInput {
+                    max_pagerank: entry.max_pagerank,
+                    symbol_count: symbols.len(),
+                    drifted_symbol_count,
+                    stale_or_missing_sir_count,
+                    community_count,
+                    has_test_coverage,
+                },
+            );
+        }
+
+        if files.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(SemanticInput {
+            workspace_max_pagerank: centrality.workspace_max_pagerank,
+            files,
+        }))
+    }
+
+    fn split_suggestion_for_crate(
+        &self,
+        crate_score: &aether_health::CrateScore,
+    ) -> Result<Option<SplitSuggestion>, AetherMcpError> {
+        let Some(file_path) = crate_score.metrics.max_file_path.as_deref() else {
+            return Ok(None);
+        };
+
+        let community_assignments = self
+            .state
+            .store
+            .list_latest_community_snapshot()?
+            .into_iter()
+            .map(|entry| PlannerCommunityAssignment {
+                symbol_id: entry.symbol_id,
+                community_id: entry.community_id,
+            })
+            .collect::<Vec<_>>();
+        if community_assignments.is_empty() {
+            return Ok(None);
+        }
+
+        let symbol_records = self
+            .state
+            .store
+            .list_symbols_for_file(file_path)?
+            .into_iter()
+            .map(|symbol| PlannerSymbolRecord {
+                id: symbol.id,
+                qualified_name: symbol.qualified_name,
+                file_path: symbol.file_path,
+            })
+            .collect::<Vec<_>>();
+        if symbol_records.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(suggest_split(
+            file_path,
+            crate_score.score,
+            community_assignments.as_slice(),
+            symbol_records.as_slice(),
+        ))
+    }
+
     pub fn aether_trace_cause_logic(
         &self,
         request: AetherTraceCauseRequest,
@@ -3538,6 +3782,36 @@ impl AetherMcpServer {
     }
 
     #[tool(
+        name = "aether_health_hotspots",
+        description = "Return the hottest workspace crates by health score with archetypes and top violations."
+    )]
+    pub async fn aether_health_hotspots(
+        &self,
+        Parameters(request): Parameters<AetherHealthHotspotsRequest>,
+    ) -> Result<Json<AetherTextResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_health_hotspots");
+        self.aether_health_hotspots_logic(request)
+            .await
+            .map(|text| Json(AetherTextResponse { text }))
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_health_explain",
+        description = "Explain one crate's health score, signals, violations, and split suggestions."
+    )]
+    pub async fn aether_health_explain(
+        &self,
+        Parameters(request): Parameters<AetherHealthExplainRequest>,
+    ) -> Result<Json<AetherTextResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_health_explain");
+        self.aether_health_explain_logic(request)
+            .await
+            .map(|text| Json(AetherTextResponse { text }))
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
         name = "aether_trace_cause",
         description = "Trace likely upstream semantic causes of a downstream breakage"
     )]
@@ -4119,6 +4393,24 @@ fn sort_and_dedup(values: &mut Vec<String>) {
 
 fn effective_limit(limit: Option<u32>) -> u32 {
     limit.unwrap_or(20).clamp(1, 100)
+}
+
+fn latest_semantic_drift_by_symbol(
+    store: &SqliteStore,
+) -> Result<HashMap<String, f64>, AetherMcpError> {
+    let mut drift_by_symbol = HashMap::new();
+    for record in store.list_drift_results(true)? {
+        if record.drift_type != "semantic" {
+            continue;
+        }
+        let Some(magnitude) = record.drift_magnitude else {
+            continue;
+        };
+        drift_by_symbol
+            .entry(record.symbol_id)
+            .or_insert((magnitude as f64).clamp(0.0, 1.0));
+    }
+    Ok(drift_by_symbol)
 }
 
 fn symbol_leaf_name(qualified_name: &str) -> &str {

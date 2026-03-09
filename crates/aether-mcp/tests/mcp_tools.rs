@@ -2,13 +2,16 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use aether_config::{AetherConfig, GraphBackend, save_workspace_config};
 use aether_core::{
-    SEARCH_FALLBACK_EMBEDDINGS_DISABLED, SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY, SearchMode,
+    EdgeKind, SEARCH_FALLBACK_EMBEDDINGS_DISABLED, SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY,
+    SearchMode,
 };
 use aether_mcp::{
     AetherBlastRadiusRequest, AetherCallChainRequest, AetherDependenciesRequest,
-    AetherExplainRequest, AetherGetSirRequest, AetherHealthRequest, AetherMcpServer,
-    AetherRecallRequest, AetherRememberRequest, AetherSearchRequest, AetherSymbolLookupRequest,
+    AetherExplainRequest, AetherGetSirRequest, AetherHealthExplainRequest,
+    AetherHealthHotspotsRequest, AetherHealthRequest, AetherMcpServer, AetherRecallRequest,
+    AetherRememberRequest, AetherSearchRequest, AetherSymbolLookupRequest,
     AetherSymbolTimelineRequest, AetherTestIntentsRequest, AetherWhyChangedReason,
     AetherWhyChangedRequest, AetherWhySelectorMode, MCP_SCHEMA_VERSION, MEMORY_SCHEMA_VERSION,
     SirLevelRequest,
@@ -18,7 +21,10 @@ use aether_mcp::{AetherVerifyMode, AetherVerifyRequest};
 use aether_sir::{
     FileSir, SirAnnotation, file_sir_hash, sir_hash, synthetic_file_sir_id, synthetic_module_sir_id,
 };
-use aether_store::{SirMetaRecord, SqliteStore, Store, TestIntentRecord};
+use aether_store::{
+    CommunitySnapshotRecord, GraphStore, ResolvedEdge, SirMetaRecord, SqliteStore, Store,
+    SurrealGraphStore, SymbolRecord, TestIntentRecord,
+};
 use aetherd::indexer::{IndexerConfig, run_initial_index_once};
 use anyhow::Result;
 use rmcp::handler::server::wrapper::Parameters;
@@ -55,6 +61,101 @@ vector_backend = "sqlite"
 "#,
     )
     .expect("write config");
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn seed_health_workspace(workspace: &Path, graph_backend: GraphBackend) -> Result<()> {
+    let mut config = AetherConfig::default();
+    config.embeddings.enabled = false;
+    config.storage.graph_backend = graph_backend;
+    config.health_score.file_loc_warn = 1;
+    config.health_score.file_loc_fail = 2;
+    config.health_score.trait_method_warn = 1;
+    config.health_score.trait_method_fail = 2;
+    save_workspace_config(workspace, &config)?;
+
+    fs::create_dir_all(workspace.join("src"))?;
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[package]\nname = \"mcp-health-test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\nmembers = [\".\"]\nresolver = \"2\"\n",
+    )?;
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "pub trait Store {\n    fn alpha(&self);\n    fn beta(&self);\n    fn gamma(&self);\n}\n\npub fn sir_alpha() -> i32 { 1 }\npub fn sir_beta() -> i32 { sir_alpha() }\npub fn note_alpha() -> i32 { 3 }\npub fn note_beta() -> i32 { note_alpha() }\n",
+    )?;
+    Ok(())
+}
+
+fn health_symbol(id: &str, qualified_name: &str) -> SymbolRecord {
+    SymbolRecord {
+        id: id.to_owned(),
+        file_path: "src/lib.rs".to_owned(),
+        language: "rust".to_owned(),
+        kind: "function".to_owned(),
+        qualified_name: qualified_name.to_owned(),
+        signature_fingerprint: format!("sig-{id}"),
+        last_seen_at: now_millis(),
+    }
+}
+
+fn copy_dir_all(from: &Path, to: &Path) -> Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = to.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_dir_all(&source_path, &target_path)?;
+        } else {
+            fs::copy(&source_path, &target_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn seed_surreal_graph_snapshot(
+    workspace: &Path,
+    symbols: &[SymbolRecord],
+    edges: &[(&str, &str)],
+) -> Result<()> {
+    let seed_workspace = tempdir()?;
+    fs::write(seed_workspace.path().join("Cargo.toml"), "[workspace]\n")?;
+    fs::create_dir_all(seed_workspace.path().join(".aether"))?;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let graph = SurrealGraphStore::open(seed_workspace.path()).await?;
+        for symbol in symbols {
+            graph.upsert_symbol_node(symbol).await?;
+        }
+        for (source, target) in edges {
+            graph
+                .upsert_edge(&ResolvedEdge {
+                    source_id: (*source).to_owned(),
+                    target_id: (*target).to_owned(),
+                    edge_kind: EdgeKind::Calls,
+                    file_path: "src/lib.rs".to_owned(),
+                })
+                .await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    let source_graph = seed_workspace.path().join(".aether/graph");
+    let target_graph = workspace.join(".aether/graph");
+    if target_graph.exists() {
+        fs::remove_dir_all(&target_graph)?;
+    }
+    copy_dir_all(&source_graph, &target_graph)?;
+    Ok(())
 }
 
 fn run_index_and_seed_sir(workspace: &Path) -> Result<()> {
@@ -526,6 +627,122 @@ vector_backend = "sqlite"
 
     let after = store.read_sir_blob(&module_id)?;
     assert!(after.is_some());
+
+    Ok(())
+}
+
+#[test]
+fn mcp_health_hotspots_tool() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    seed_health_workspace(workspace, GraphBackend::Sqlite)?;
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+    let output = rt
+        .block_on(
+            server.aether_health_hotspots(Parameters(AetherHealthHotspotsRequest {
+                limit: Some(5),
+                min_score: Some(0),
+                semantic: Some(false),
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0
+        .text;
+
+    assert!(output.contains("Workspace Health:"));
+    assert!(output.contains("mcp-health-test"));
+    assert!(output.matches("mcp-health-test - ").count() <= 1);
+
+    Ok(())
+}
+
+#[test]
+fn mcp_health_explain_tool() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    seed_health_workspace(workspace, GraphBackend::Surreal)?;
+
+    let store = SqliteStore::open(workspace)?;
+    let symbols = vec![
+        health_symbol("sym-sir-a", "crate::sir_alpha"),
+        health_symbol("sym-sir-b", "crate::sir_beta"),
+        health_symbol("sym-note-a", "crate::note_alpha"),
+        health_symbol("sym-note-b", "crate::note_beta"),
+    ];
+    for symbol in &symbols {
+        store.upsert_symbol(symbol.clone())?;
+    }
+    store.replace_community_snapshot(
+        "snapshot-1",
+        now_millis(),
+        &[
+            CommunitySnapshotRecord {
+                snapshot_id: "snapshot-1".to_owned(),
+                symbol_id: "sym-sir-a".to_owned(),
+                community_id: 1,
+                captured_at: now_millis(),
+            },
+            CommunitySnapshotRecord {
+                snapshot_id: "snapshot-1".to_owned(),
+                symbol_id: "sym-sir-b".to_owned(),
+                community_id: 1,
+                captured_at: now_millis(),
+            },
+            CommunitySnapshotRecord {
+                snapshot_id: "snapshot-1".to_owned(),
+                symbol_id: "sym-note-a".to_owned(),
+                community_id: 2,
+                captured_at: now_millis(),
+            },
+            CommunitySnapshotRecord {
+                snapshot_id: "snapshot-1".to_owned(),
+                symbol_id: "sym-note-b".to_owned(),
+                community_id: 2,
+                captured_at: now_millis(),
+            },
+        ],
+    )?;
+    store.replace_test_intents_for_file(
+        "tests/health_test.rs",
+        &[TestIntentRecord {
+            intent_id: "intent-sir".to_owned(),
+            file_path: "tests/health_test.rs".to_owned(),
+            test_name: "test_sir_alpha".to_owned(),
+            intent_text: "covers sir alpha behavior".to_owned(),
+            group_label: None,
+            language: "rust".to_owned(),
+            symbol_id: Some("sym-sir-a".to_owned()),
+            created_at: now_millis(),
+            updated_at: now_millis(),
+        }],
+    )?;
+
+    seed_surreal_graph_snapshot(
+        workspace,
+        &symbols,
+        &[("sym-sir-a", "sym-sir-b"), ("sym-note-a", "sym-note-b")],
+    )?;
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+    let output = rt
+        .block_on(
+            server.aether_health_explain(Parameters(AetherHealthExplainRequest {
+                crate_name: "mcp-health-test".to_owned(),
+                semantic: Some(true),
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0
+        .text;
+
+    assert!(output.contains("Health Score: mcp-health-test"));
+    assert!(output.contains("Violations:"));
+    assert!(output.contains("Semantic signals:"));
+    assert!(output.contains("Split suggestion:"));
+    assert!(output.contains("sir_ops"));
 
     Ok(())
 }

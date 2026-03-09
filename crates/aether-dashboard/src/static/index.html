@@ -48,6 +48,9 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/htmx/2.0.4/htmx.min.js"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/tippy.js/6.3.7/tippy.css" />
   <script src="https://cdnjs.cloudflare.com/ajax/libs/tippy.js/6.3.7/tippy-bundle.umd.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 
   <link rel="stylesheet" href="/dashboard/static/style.css" />
   <link rel="stylesheet" href="/dashboard/static/css/aether-dashboard.css" />
@@ -302,6 +305,7 @@
       if (window.initDriftChart && document.getElementById('drift-chart')) window.initDriftChart();
       if (window.initHeatmap && document.getElementById('heatmap-container')) window.initHeatmap();
       if (window.initHealthChart && document.getElementById('health-chart')) window.initHealthChart();
+      if (window.initHealthScoreSparkline && document.querySelector('[data-health-score-trend]')) window.initHealthScoreSparkline();
 
       if (window.initXrayCards && document.getElementById('xray-metrics-grid')) window.initXrayCards();
       if (window.initXrayHotspots && document.getElementById('xray-hotspots-body')) window.initXrayHotspots();
@@ -341,7 +345,7 @@
     });
 
     document.body.addEventListener('htmx:afterSwap', function(evt) {
-      if (evt.detail.target.id === 'main-content') {
+      if (evt.detail.target.id === 'main-content' || evt.detail.target.id === 'overview-health-score-panel') {
         requestAnimationFrame(() => {
           initPageModules();
           initComplexitySelector();

@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 
 use aether_config::{AetherConfig, EmbeddingVectorBackend, GraphBackend, load_workspace_config};
+use aether_health::ScoreReport;
 use aether_store::{
     GraphStore, SchemaVersion, SqliteGraphStore, SqliteStore, SqliteVectorStore, SurrealGraphStore,
     VectorStore, open_vector_store,
@@ -15,6 +17,7 @@ pub type DashboardStateError = Box<dyn std::error::Error + Send + Sync>;
 pub struct DashboardCaches {
     pub project_summary: Mutex<Option<(i64, String)>>,
     pub layer_assignments: Mutex<Option<(i64, LayerAssignmentsCache)>>,
+    pub health_score_report: RwLock<Option<(Instant, ScoreReport)>>,
 }
 
 #[derive(Clone)]
