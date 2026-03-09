@@ -103,6 +103,12 @@ pub enum Archetype {
     ChurnMagnet,
     #[serde(rename = "Legacy Residue")]
     LegacyResidue,
+    #[serde(rename = "Boundary Leaker")]
+    BoundaryLeaker,
+    #[serde(rename = "Zombie File")]
+    ZombieFile,
+    #[serde(rename = "False Stable")]
+    FalseStable,
 }
 
 impl Archetype {
@@ -112,6 +118,9 @@ impl Archetype {
             Self::BrittleHub => "Brittle Hub",
             Self::ChurnMagnet => "Churn Magnet",
             Self::LegacyResidue => "Legacy Residue",
+            Self::BoundaryLeaker => "Boundary Leaker",
+            Self::ZombieFile => "Zombie File",
+            Self::FalseStable => "False Stable",
         }
     }
 }
@@ -165,6 +174,42 @@ pub struct CrateMetricsSnapshot {
     pub stale_backend_refs: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GitSignals {
+    pub churn_30d: f64,
+    pub churn_90d: f64,
+    pub author_count: f64,
+    pub blame_age_spread: f64,
+    pub git_pressure: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SemanticSignals {
+    pub max_centrality: f64,
+    pub drift_density: f64,
+    pub stale_sir_ratio: f64,
+    pub test_gap: f64,
+    pub boundary_leakage: f64,
+    pub semantic_pressure: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignalAvailability {
+    pub git_available: bool,
+    pub semantic_available: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScoreBreakdown {
+    pub structural: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CrateScore {
     pub name: String,
@@ -176,6 +221,14 @@ pub struct CrateScore {
     pub total_lines: usize,
     pub metrics: CrateMetricsSnapshot,
     pub violations: Vec<Violation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_signals: Option<GitSignals>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_signals: Option<SemanticSignals>,
+    #[serde(default, skip_serializing_if = "signal_availability_is_default")]
+    pub signal_availability: SignalAvailability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_breakdown: Option<ScoreBreakdown>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -243,4 +296,8 @@ impl MetricPenalties {
             + self.dead_feature_flags
             + self.stale_backend_refs
     }
+}
+
+fn signal_availability_is_default(value: &SignalAvailability) -> bool {
+    !value.git_available && !value.semantic_available && value.notes.is_empty()
 }

@@ -1,26 +1,32 @@
 mod archetypes;
 mod explanations;
+pub mod git_signals;
 pub mod history;
 pub mod metrics;
 pub mod models;
 pub mod output;
 mod scanner;
 pub mod scoring;
+pub mod semantic_signals;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aether_config::HealthScoreConfig;
+use aether_core::{GitContext, normalize_path};
 
 pub use models::{
-    Archetype, CrateScore, HealthError, ScoreReport, Severity, Violation, WorkspaceViolation,
+    Archetype, CrateScore, GitSignals, HealthError, ScoreBreakdown, ScoreReport, SemanticSignals,
+    Severity, SignalAvailability, Violation, WorkspaceViolation,
 };
 pub use output::{format_json, format_table};
+pub use semantic_signals::{SemanticFileInput, SemanticInput};
 
-use crate::archetypes::assign_archetypes;
+use crate::archetypes::{assign_archetypes, assign_combined_archetypes};
 use crate::explanations::explain_violation;
+use crate::git_signals::{GitSignalAnalysis, analyze_crate_git_signals};
 use crate::metrics::{
     count_feature_flags, count_internal_deps, count_loc, count_stale_refs, count_todo_markers,
     trait_method_max,
@@ -28,12 +34,15 @@ use crate::metrics::{
 use crate::models::{CrateMetrics, MetricPenalties, ViolationLevel};
 use crate::scanner::{WorkspaceCrate, scan_crate, scan_workspace};
 use crate::scoring::{
-    compute_crate_penalty, compute_metric_penalties, compute_workspace_aggregate, normalize_to_100,
+    combined_score, compute_crate_penalty, compute_metric_penalties, compute_workspace_aggregate,
+    normalize_to_100, raw_penalty,
 };
+use crate::semantic_signals::{SemanticSignalAnalysis, analyze_semantic_signals};
 
 pub type Result<T> = std::result::Result<T, HealthError>;
 
-const SCHEMA_VERSION: u32 = 1;
+const STRUCTURAL_SCHEMA_VERSION: u32 = 1;
+const SEMANTIC_SCHEMA_VERSION: u32 = 2;
 const LEGACY_FEATURE_PATTERN: &str = "feature = \"legacy-";
 const TOP_VIOLATION_LIMIT: usize = 5;
 
@@ -46,6 +55,41 @@ pub fn compute_workspace_score_filtered(
     config: &HealthScoreConfig,
     crate_filter: &[String],
 ) -> Result<ScoreReport> {
+    compute_workspace_score_internal(
+        path,
+        config,
+        crate_filter,
+        None,
+        None,
+        STRUCTURAL_SCHEMA_VERSION,
+    )
+}
+
+pub fn compute_workspace_score_with_signals(
+    path: &Path,
+    config: &HealthScoreConfig,
+    crate_filter: &[String],
+    git: Option<&GitContext>,
+    semantic_input: Option<&SemanticInput>,
+) -> Result<ScoreReport> {
+    compute_workspace_score_internal(
+        path,
+        config,
+        crate_filter,
+        git,
+        semantic_input,
+        SEMANTIC_SCHEMA_VERSION,
+    )
+}
+
+fn compute_workspace_score_internal(
+    path: &Path,
+    config: &HealthScoreConfig,
+    crate_filter: &[String],
+    git: Option<&GitContext>,
+    semantic_input: Option<&SemanticInput>,
+    schema_version: u32,
+) -> Result<ScoreReport> {
     let workspace_root = path.canonicalize().map_err(|err| {
         HealthError::Message(format!(
             "failed to resolve workspace path {}: {err}",
@@ -56,7 +100,14 @@ pub fn compute_workspace_score_filtered(
     let selected_crates = filter_crates(scanned_crates, crate_filter)?;
     let mut crate_scores = Vec::new();
     for crate_info in &selected_crates {
-        crate_scores.push(score_workspace_crate(crate_info, config)?);
+        crate_scores.push(score_workspace_crate(
+            crate_info,
+            &workspace_root,
+            config,
+            git,
+            semantic_input,
+            schema_version >= SEMANTIC_SCHEMA_VERSION,
+        )?);
     }
     crate_scores.sort_by(|left, right| {
         right
@@ -71,7 +122,7 @@ pub fn compute_workspace_score_filtered(
     let top_violations = collect_top_violations(&crate_scores);
 
     Ok(ScoreReport {
-        schema_version: SCHEMA_VERSION,
+        schema_version,
         run_at: current_unix_time(),
         git_commit: detect_git_commit(&workspace_root),
         workspace_score,
@@ -89,18 +140,79 @@ pub fn compute_workspace_score_filtered(
 
 pub fn compute_crate_score(path: &Path, config: &HealthScoreConfig) -> Result<CrateScore> {
     let crate_info = scan_crate(path)?;
-    score_workspace_crate(&crate_info, config)
+    let workspace_root = crate_info
+        .root
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or(crate_info.root.as_path())
+        .to_path_buf();
+    score_workspace_crate(&crate_info, &workspace_root, config, None, None, false)
 }
 
 fn score_workspace_crate(
     crate_info: &WorkspaceCrate,
+    workspace_root: &Path,
     config: &HealthScoreConfig,
+    git: Option<&GitContext>,
+    semantic_input: Option<&SemanticInput>,
+    extended_mode: bool,
 ) -> Result<CrateScore> {
     let metrics = collect_crate_metrics(crate_info, config)?;
     let penalties = compute_metric_penalties(&metrics, config);
-    let score = normalize_to_100(compute_crate_penalty(&metrics, config));
-    let archetypes = assign_archetypes(&metrics, &penalties);
-    let violations = build_violations(crate_info, &metrics, &penalties, config);
+    let structural_score = normalize_to_100(compute_crate_penalty(&metrics, config));
+    let git_analysis = git
+        .map(|context| analyze_crate_git_signals(crate_info, workspace_root, context, config))
+        .transpose()?;
+    let git_signals = git_analysis
+        .as_ref()
+        .map(|analysis| analysis.signals.clone());
+    let semantic_analysis = semantic_input.map(|input| {
+        analyze_semantic_signals(
+            &filter_semantic_input(input, crate_info, workspace_root),
+            config,
+        )
+    });
+    let semantic_signals = semantic_analysis
+        .as_ref()
+        .map(|analysis| analysis.signals.clone());
+    let score_data = if extended_mode {
+        Some(combined_score(
+            structural_score,
+            git_signals.as_ref(),
+            semantic_signals.as_ref(),
+            config,
+        ))
+    } else {
+        None
+    };
+    let score = score_data
+        .as_ref()
+        .map(|combined| combined.score)
+        .unwrap_or(structural_score);
+    let archetypes = if extended_mode {
+        assign_combined_archetypes(
+            &metrics,
+            &penalties,
+            git_signals.as_ref(),
+            semantic_signals.as_ref(),
+        )
+    } else {
+        assign_archetypes(&metrics, &penalties)
+    };
+    let availability = if extended_mode {
+        build_signal_availability(git.is_some(), semantic_input.is_some())
+    } else {
+        SignalAvailability::default()
+    };
+    let violations = build_violations(
+        crate_info,
+        &metrics,
+        &penalties,
+        config,
+        git_analysis.as_ref(),
+        semantic_analysis.as_ref(),
+        &archetypes,
+    );
 
     Ok(CrateScore {
         name: crate_info.name.clone(),
@@ -112,6 +224,10 @@ fn score_workspace_crate(
         total_lines: metrics.total_lines,
         metrics: metrics.snapshot(),
         violations,
+        git_signals,
+        semantic_signals,
+        signal_availability: availability,
+        score_breakdown: score_data.map(|combined| combined.breakdown),
     })
 }
 
@@ -165,6 +281,9 @@ fn build_violations(
     metrics: &CrateMetrics,
     penalties: &MetricPenalties,
     config: &HealthScoreConfig,
+    git_analysis: Option<&GitSignalAnalysis>,
+    semantic_analysis: Option<&SemanticSignalAnalysis>,
+    archetypes: &[Archetype],
 ) -> Vec<Violation> {
     let mut violations = Vec::new();
     push_violation(
@@ -227,6 +346,102 @@ fn build_violations(
         config.stale_ref_fail as f64,
         crate_info.name.clone(),
     );
+    if let Some(analysis) = git_analysis {
+        if let Some(hotspot) = analysis
+            .files
+            .iter()
+            .max_by(|left, right| left.raw.commits_30d.cmp(&right.raw.commits_30d))
+            && hotspot.raw.commits_30d > 0
+        {
+            push_violation(
+                &mut violations,
+                "git_churn_30d",
+                hotspot.raw.commits_30d as f64,
+                raw_penalty(
+                    hotspot.raw.commits_30d as f64,
+                    (config.churn_30d_high as f64 / 2.0).max(1.0),
+                    config.churn_30d_high as f64,
+                ) * 100.0,
+                (config.churn_30d_high as f64 / 2.0).max(1.0),
+                config.churn_30d_high as f64,
+                hotspot.path.clone(),
+            );
+        }
+
+        if let Some(hotspot) = analysis
+            .files
+            .iter()
+            .max_by(|left, right| left.raw.author_count.cmp(&right.raw.author_count))
+            && hotspot.raw.author_count > 1
+        {
+            push_violation(
+                &mut violations,
+                "git_author_count",
+                hotspot.raw.author_count as f64,
+                raw_penalty(
+                    hotspot.raw.author_count as f64,
+                    (config.author_count_high as f64 / 2.0).max(2.0),
+                    config.author_count_high as f64,
+                ) * 100.0,
+                (config.author_count_high as f64 / 2.0).max(2.0),
+                config.author_count_high as f64,
+                hotspot.path.clone(),
+            );
+        }
+    }
+
+    if let Some(analysis) = semantic_analysis {
+        if let Some(hotspot) = analysis
+            .files
+            .iter()
+            .max_by(|left, right| left.community_count.cmp(&right.community_count))
+            && hotspot.community_count > 1
+        {
+            push_violation(
+                &mut violations,
+                "boundary_leakage",
+                hotspot.community_count as f64,
+                raw_penalty(hotspot.community_count as f64, 2.0, 3.0) * 100.0,
+                2.0,
+                3.0,
+                hotspot.path.clone(),
+            );
+        }
+
+        if archetypes.contains(&Archetype::FalseStable) && analysis.total_symbols > 0 {
+            let percentage =
+                analysis.drifted_symbols as f64 * 100.0 / analysis.total_symbols as f64;
+            violations.push(Violation {
+                metric: "false_stable".to_owned(),
+                value: percentage,
+                threshold: 50.0,
+                severity: ViolationLevel::Warn,
+                reason: explain_violation("false_stable", percentage, 50.0, &crate_info.name),
+            });
+        }
+
+        if archetypes.contains(&Archetype::ZombieFile) {
+            let commits = git_analysis
+                .zip(semantic_analysis)
+                .and_then(|(git_analysis, semantic_analysis)| {
+                    let candidate_path = semantic_analysis.files.first()?.path.as_str();
+                    git_analysis
+                        .files
+                        .iter()
+                        .find(|entry| entry.path == candidate_path)
+                        .map(|entry| entry.raw.commits_30d)
+                })
+                .unwrap_or_default();
+
+            violations.push(Violation {
+                metric: "zombie_file".to_owned(),
+                value: commits as f64,
+                threshold: (config.churn_30d_high as f64 * 0.1).max(1.0),
+                severity: ViolationLevel::Warn,
+                reason: explain_violation("zombie_file", commits as f64, 0.0, &crate_info.name),
+            });
+        }
+    }
 
     violations.sort_by(|left, right| {
         severity_sort_key(right.severity)
@@ -299,6 +514,47 @@ fn collect_top_violations(crate_scores: &[CrateScore]) -> Vec<WorkspaceViolation
     });
     top_violations.truncate(TOP_VIOLATION_LIMIT);
     top_violations
+}
+
+fn filter_semantic_input(
+    semantic_input: &SemanticInput,
+    crate_info: &WorkspaceCrate,
+    workspace_root: &Path,
+) -> SemanticInput {
+    let mut files = HashMap::new();
+    for source_file in &crate_info.source_files {
+        let Ok(relative) = source_file.strip_prefix(workspace_root) else {
+            continue;
+        };
+        let key = normalize_path(relative.to_string_lossy().as_ref());
+        if let Some(entry) = semantic_input.files.get(&key) {
+            files.insert(key, entry.clone());
+        }
+    }
+
+    SemanticInput {
+        workspace_max_pagerank: semantic_input.workspace_max_pagerank,
+        files,
+    }
+}
+
+fn build_signal_availability(git_available: bool, semantic_available: bool) -> SignalAvailability {
+    let mut notes = Vec::new();
+    if !git_available {
+        notes.push("Git data unavailable - git signals skipped".to_owned());
+    }
+    if !semantic_available {
+        notes.push(
+            "Indexed workspace not found - semantic signals skipped. Run aetherd --index-once first."
+                .to_owned(),
+        );
+    }
+
+    SignalAvailability {
+        git_available,
+        semantic_available,
+        notes,
+    }
 }
 
 fn filter_crates(

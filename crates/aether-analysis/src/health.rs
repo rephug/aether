@@ -88,6 +88,21 @@ pub struct SymbolHealthEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileCentralityEntry {
+    pub file: String,
+    pub max_pagerank: f64,
+    pub symbol_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileCentralityReport {
+    pub workspace_max_pagerank: f64,
+    pub files: Vec<FileCentralityEntry>,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BottleneckEntry {
     pub symbol_id: String,
     pub symbol_name: String,
@@ -193,6 +208,148 @@ impl HealthAnalyzer {
 
     pub async fn analyze(&self, request: &HealthRequest) -> Result<HealthReport, AnalysisError> {
         self.analyze_internal(request, None).await
+    }
+
+    pub async fn centrality_by_file(&self) -> Result<FileCentralityReport, AnalysisError> {
+        let mut notes = Vec::new();
+
+        if !self.config.enabled {
+            notes.push(
+                "Health analysis disabled by configuration ([health].enabled = false)".to_owned(),
+            );
+            return Ok(FileCentralityReport {
+                workspace_max_pagerank: 0.0,
+                files: Vec::new(),
+                notes,
+            });
+        }
+
+        if self.graph_backend != GraphBackend::Surreal {
+            notes.push(format!(
+                "Health analysis currently requires Surreal graph backend; configured backend is {}",
+                self.graph_backend.as_str()
+            ));
+            return Ok(FileCentralityReport {
+                workspace_max_pagerank: 0.0,
+                files: Vec::new(),
+                notes,
+            });
+        }
+
+        let sqlite_path = self.workspace.join(".aether").join("meta.sqlite");
+        if !sqlite_path.exists() {
+            notes.push(
+                "SQLite metadata store unavailable; returning empty centrality report".to_owned(),
+            );
+            return Ok(FileCentralityReport {
+                workspace_max_pagerank: 0.0,
+                files: Vec::new(),
+                notes,
+            });
+        }
+
+        let store = SqliteStore::open_readonly(&self.workspace)?;
+        let graph = match SurrealGraphStore::open_readonly(&self.workspace).await {
+            Ok(graph) => graph,
+            Err(err) => {
+                notes.push(format!(
+                    "Surreal graph store unavailable; returning empty centrality report: {err}"
+                ));
+                return Ok(FileCentralityReport {
+                    workspace_max_pagerank: 0.0,
+                    files: Vec::new(),
+                    notes,
+                });
+            }
+        };
+
+        let dependency_edges = match query_dependency_edges(&graph).await {
+            Ok(edges) => edges,
+            Err(err) => {
+                notes.push(format!(
+                    "Dependency edge query failed; returning empty centrality report: {err}"
+                ));
+                return Ok(FileCentralityReport {
+                    workspace_max_pagerank: 0.0,
+                    files: Vec::new(),
+                    notes,
+                });
+            }
+        };
+        let symbol_rows = match query_symbol_rows(&graph).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                notes.push(format!(
+                    "Symbol query failed; returning empty centrality report: {err}"
+                ));
+                return Ok(FileCentralityReport {
+                    workspace_max_pagerank: 0.0,
+                    files: Vec::new(),
+                    notes,
+                });
+            }
+        };
+
+        let algo_edges = dependency_edges.clone();
+        let pagerank_scores = tokio::task::spawn_blocking(move || page_rank(&algo_edges, 0.85, 25))
+            .await
+            .map_err(|err| AnalysisError::Message(format!("spawn_blocking failed: {err}")))?;
+
+        let mut symbol_ids = BTreeSet::<String>::new();
+        for symbol in &symbol_rows {
+            symbol_ids.insert(symbol.id.clone());
+        }
+        for edge in &dependency_edges {
+            symbol_ids.insert(edge.source_id.clone());
+            symbol_ids.insert(edge.target_id.clone());
+        }
+
+        let symbol_ids_vec = symbol_ids.into_iter().collect::<Vec<_>>();
+        let sqlite_rows = store.get_symbol_search_results_batch(symbol_ids_vec.as_slice())?;
+        let mut symbol_graph_by_id = HashMap::<String, SymbolGraphRow>::new();
+        for row in symbol_rows {
+            symbol_graph_by_id.insert(row.id.clone(), row);
+        }
+
+        let mut files = HashMap::<String, FileCentralityEntry>::new();
+        for symbol_id in &symbol_ids_vec {
+            let sqlite = sqlite_rows.get(symbol_id);
+            let graph_row = symbol_graph_by_id.get(symbol_id);
+            let fallback = store.get_symbol_record(symbol_id)?;
+            let file = sqlite
+                .map(|row| row.file_path.clone())
+                .or_else(|| graph_row.map(|row| row.file_path.clone()))
+                .or_else(|| fallback.as_ref().map(|row| row.file_path.clone()))
+                .unwrap_or_default();
+            if file.is_empty() {
+                continue;
+            }
+
+            let entry = files.entry(file.clone()).or_insert(FileCentralityEntry {
+                file,
+                max_pagerank: 0.0,
+                symbol_count: 0,
+            });
+            entry.symbol_count += 1;
+            entry.max_pagerank = entry
+                .max_pagerank
+                .max(pagerank_scores.get(symbol_id).copied().unwrap_or(0.0));
+        }
+
+        let mut files = files.into_values().collect::<Vec<_>>();
+        files.sort_by(|left, right| {
+            right
+                .max_pagerank
+                .partial_cmp(&left.max_pagerank)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.file.cmp(&right.file))
+        });
+
+        Ok(FileCentralityReport {
+            workspace_max_pagerank: pagerank_scores.values().copied().fold(0.0, f64::max),
+            files,
+            notes,
+        })
     }
 
     pub async fn analyze_with_graph(
@@ -1202,5 +1359,46 @@ vector_backend = "sqlite"
         assert!(report.cycles.is_empty());
         assert!(report.orphans.is_empty());
         assert!(report.risk_hotspots.is_empty());
+    }
+
+    #[test]
+    fn health_analyzer_exposes_exact_file_centrality() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_test_config(workspace);
+
+        let store = SqliteStore::open(workspace).expect("open sqlite");
+        let symbols = vec![
+            symbol("sym-a", "crate::alpha", "src/a.rs"),
+            symbol("sym-b", "crate::beta", "src/a.rs"),
+            symbol("sym-c", "crate::gamma", "src/b.rs"),
+        ];
+        for symbol in &symbols {
+            store.upsert_symbol(symbol.clone()).expect("upsert symbol");
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(seed_surreal_graph(
+            workspace,
+            &symbols,
+            &[("sym-a", "sym-b"), ("sym-b", "sym-c")],
+        ));
+
+        let analyzer = HealthAnalyzer::new(workspace).expect("analyzer");
+        let report = runtime
+            .block_on(analyzer.centrality_by_file())
+            .expect("centrality report");
+
+        assert!(report.workspace_max_pagerank > 0.0);
+        assert_eq!(report.files.len(), 2);
+        let entry = report
+            .files
+            .iter()
+            .find(|entry| entry.file == "src/a.rs")
+            .expect("src/a.rs entry");
+        assert_eq!(entry.symbol_count, 2);
     }
 }

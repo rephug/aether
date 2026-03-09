@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use crate::models::{ScoreReport, WorkspaceViolation};
 
 pub fn format_table(report: &ScoreReport) -> String {
@@ -24,12 +26,27 @@ pub fn format_table(report: &ScoreReport) -> String {
         report.workspace_score,
         report.severity.as_label()
     ));
+    let extended_mode = report
+        .crates
+        .iter()
+        .any(|crate_score| crate_score.score_breakdown.is_some());
+    if extended_mode {
+        lines.push("Mode: structural + git + semantic".to_owned());
+    }
     lines.push(String::new());
-    lines.push(format!(
-        "{:<22} {:>5} {:>6} {:>6}  {}",
-        "Crate", "Score", "LOC", "Files", "Archetype"
-    ));
-    lines.push("-".repeat(74));
+    if extended_mode {
+        lines.push(format!(
+            "{:<22} {:>5} {:>6} {:>5} {:>8}  {}",
+            "Crate", "Score", "Struct", "Git", "Semantic", "Archetype"
+        ));
+        lines.push("-".repeat(82));
+    } else {
+        lines.push(format!(
+            "{:<22} {:>5} {:>6} {:>6}  {}",
+            "Crate", "Score", "LOC", "Files", "Archetype"
+        ));
+        lines.push("-".repeat(74));
+    }
 
     for crate_score in &report.crates {
         let archetypes = if crate_score.archetypes.is_empty() {
@@ -42,14 +59,49 @@ pub fn format_table(report: &ScoreReport) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        lines.push(format!(
-            "{:<22} {:>5} {:>6} {:>6}  {}",
-            crate_score.name,
-            crate_score.score,
-            crate_score.total_loc,
-            crate_score.file_count,
-            archetypes
-        ));
+        if let Some(breakdown) = &crate_score.score_breakdown {
+            let git = breakdown
+                .git
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            let semantic = breakdown
+                .semantic
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            lines.push(format!(
+                "{:<22} {:>5} {:>6} {:>5} {:>8}  {}",
+                crate_score.name,
+                crate_score.score,
+                breakdown.structural,
+                git,
+                semantic,
+                archetypes
+            ));
+        } else {
+            lines.push(format!(
+                "{:<22} {:>5} {:>6} {:>6}  {}",
+                crate_score.name,
+                crate_score.score,
+                crate_score.total_loc,
+                crate_score.file_count,
+                archetypes
+            ));
+        }
+    }
+
+    if extended_mode {
+        let notes = report
+            .crates
+            .iter()
+            .flat_map(|crate_score| crate_score.signal_availability.notes.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        if !notes.is_empty() {
+            lines.push(String::new());
+            lines.push("Notes:".to_owned());
+            for note in notes {
+                lines.push(format!("  - {note}"));
+            }
+        }
     }
 
     lines.push(String::new());

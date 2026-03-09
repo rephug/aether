@@ -411,6 +411,12 @@ pub struct HealthScoreArgs {
         help = "Limit scoring to the named crate (repeatable)"
     )]
     pub crate_filter: Vec<String>,
+
+    #[arg(
+        long,
+        help = "Enable git and semantic health signals when data is available"
+    )]
+    pub semantic: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
@@ -1271,6 +1277,7 @@ mod tests {
             "json",
             "--fail-above",
             "30",
+            "--semantic",
             "--crate",
             "aether-core",
             "--crate",
@@ -1282,6 +1289,7 @@ mod tests {
             Some(Commands::HealthScore(args)) => {
                 assert_eq!(args.output.as_str(), "json");
                 assert_eq!(args.fail_above, Some(30));
+                assert!(args.semantic);
                 assert_eq!(
                     args.crate_filter,
                     vec!["aether-core".to_owned(), "aether-store".to_owned()]

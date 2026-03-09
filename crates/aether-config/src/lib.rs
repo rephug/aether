@@ -54,6 +54,17 @@ pub const DEFAULT_HEALTH_SCORE_DEAD_FEATURE_WARN: usize = 1;
 pub const DEFAULT_HEALTH_SCORE_DEAD_FEATURE_FAIL: usize = 5;
 pub const DEFAULT_HEALTH_SCORE_STALE_REF_WARN: usize = 1;
 pub const DEFAULT_HEALTH_SCORE_STALE_REF_FAIL: usize = 3;
+pub const DEFAULT_HEALTH_SCORE_CHURN_30D_HIGH: usize = 15;
+pub const DEFAULT_HEALTH_SCORE_CHURN_90D_HIGH: usize = 30;
+pub const DEFAULT_HEALTH_SCORE_AUTHOR_COUNT_HIGH: usize = 6;
+pub const DEFAULT_HEALTH_SCORE_BLAME_AGE_SPREAD_HIGH_SECS: u64 = 15_552_000;
+pub const DEFAULT_HEALTH_SCORE_DRIFT_DENSITY_HIGH: f32 = 0.30;
+pub const DEFAULT_HEALTH_SCORE_STALE_SIR_HIGH: f32 = 0.40;
+pub const DEFAULT_HEALTH_SCORE_TEST_GAP_HIGH: f32 = 0.50;
+pub const DEFAULT_HEALTH_SCORE_BOUNDARY_LEAKAGE_HIGH: f32 = 0.50;
+pub const DEFAULT_HEALTH_SCORE_STRUCTURAL_WEIGHT: f64 = 0.40;
+pub const DEFAULT_HEALTH_SCORE_GIT_WEIGHT: f64 = 0.25;
+pub const DEFAULT_HEALTH_SCORE_SEMANTIC_WEIGHT: f64 = 0.35;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -885,6 +896,28 @@ pub struct HealthScoreConfig {
     pub stale_ref_fail: usize,
     #[serde(default = "default_health_score_stale_ref_patterns")]
     pub stale_ref_patterns: Vec<String>,
+    #[serde(default = "default_health_score_churn_30d_high")]
+    pub churn_30d_high: usize,
+    #[serde(default = "default_health_score_churn_90d_high")]
+    pub churn_90d_high: usize,
+    #[serde(default = "default_health_score_author_count_high")]
+    pub author_count_high: usize,
+    #[serde(default = "default_health_score_blame_age_spread_high_secs")]
+    pub blame_age_spread_high_secs: u64,
+    #[serde(default = "default_health_score_drift_density_high")]
+    pub drift_density_high: f32,
+    #[serde(default = "default_health_score_stale_sir_high")]
+    pub stale_sir_high: f32,
+    #[serde(default = "default_health_score_test_gap_high")]
+    pub test_gap_high: f32,
+    #[serde(default = "default_health_score_boundary_leakage_high")]
+    pub boundary_leakage_high: f32,
+    #[serde(default)]
+    pub structural_weight: Option<f64>,
+    #[serde(default)]
+    pub git_weight: Option<f64>,
+    #[serde(default)]
+    pub semantic_weight: Option<f64>,
 }
 
 impl Default for HealthScoreConfig {
@@ -903,6 +936,17 @@ impl Default for HealthScoreConfig {
             stale_ref_warn: default_health_score_stale_ref_warn(),
             stale_ref_fail: default_health_score_stale_ref_fail(),
             stale_ref_patterns: default_health_score_stale_ref_patterns(),
+            churn_30d_high: default_health_score_churn_30d_high(),
+            churn_90d_high: default_health_score_churn_90d_high(),
+            author_count_high: default_health_score_author_count_high(),
+            blame_age_spread_high_secs: default_health_score_blame_age_spread_high_secs(),
+            drift_density_high: default_health_score_drift_density_high(),
+            stale_sir_high: default_health_score_stale_sir_high(),
+            test_gap_high: default_health_score_test_gap_high(),
+            boundary_leakage_high: default_health_score_boundary_leakage_high(),
+            structural_weight: None,
+            git_weight: None,
+            semantic_weight: None,
         }
     }
 }
@@ -1482,6 +1526,38 @@ fn default_health_score_stale_ref_patterns() -> Vec<String> {
     ]
 }
 
+fn default_health_score_churn_30d_high() -> usize {
+    DEFAULT_HEALTH_SCORE_CHURN_30D_HIGH
+}
+
+fn default_health_score_churn_90d_high() -> usize {
+    DEFAULT_HEALTH_SCORE_CHURN_90D_HIGH
+}
+
+fn default_health_score_author_count_high() -> usize {
+    DEFAULT_HEALTH_SCORE_AUTHOR_COUNT_HIGH
+}
+
+fn default_health_score_blame_age_spread_high_secs() -> u64 {
+    DEFAULT_HEALTH_SCORE_BLAME_AGE_SPREAD_HIGH_SECS
+}
+
+fn default_health_score_drift_density_high() -> f32 {
+    DEFAULT_HEALTH_SCORE_DRIFT_DENSITY_HIGH
+}
+
+fn default_health_score_stale_sir_high() -> f32 {
+    DEFAULT_HEALTH_SCORE_STALE_SIR_HIGH
+}
+
+fn default_health_score_test_gap_high() -> f32 {
+    DEFAULT_HEALTH_SCORE_TEST_GAP_HIGH
+}
+
+fn default_health_score_boundary_leakage_high() -> f32 {
+    DEFAULT_HEALTH_SCORE_BOUNDARY_LEAKAGE_HIGH
+}
+
 fn default_dashboard_port() -> u16 {
     DEFAULT_DASHBOARD_PORT
 }
@@ -1731,6 +1807,24 @@ fn normalize_health_score_f32_pair(
     }
 }
 
+fn normalize_health_score_positive_f32(value: &mut f32, default_value: f32) {
+    if !value.is_finite() || *value <= 0.0 {
+        *value = default_value;
+    }
+}
+
+fn normalize_health_score_positive_u64(value: &mut u64, default_value: u64) {
+    if *value == 0 {
+        *value = default_value;
+    }
+}
+
+fn normalize_optional_positive_f64(value: &mut Option<f64>) {
+    if value.is_some_and(|raw| !raw.is_finite() || raw <= 0.0) {
+        *value = None;
+    }
+}
+
 fn normalize_health_score_config(config: &mut HealthScoreConfig) {
     normalize_health_score_usize_pair(
         &mut config.file_loc_warn,
@@ -1772,6 +1866,38 @@ fn normalize_health_score_config(config: &mut HealthScoreConfig) {
     if config.stale_ref_patterns.is_empty() {
         config.stale_ref_patterns = default_health_score_stale_ref_patterns();
     }
+    normalize_health_score_usize_pair(
+        &mut config.churn_30d_high,
+        &mut config.churn_90d_high,
+        default_health_score_churn_30d_high(),
+        default_health_score_churn_90d_high(),
+    );
+    if config.author_count_high <= 1 {
+        config.author_count_high = default_health_score_author_count_high();
+    }
+    normalize_health_score_positive_u64(
+        &mut config.blame_age_spread_high_secs,
+        default_health_score_blame_age_spread_high_secs(),
+    );
+    normalize_health_score_positive_f32(
+        &mut config.drift_density_high,
+        default_health_score_drift_density_high(),
+    );
+    normalize_health_score_positive_f32(
+        &mut config.stale_sir_high,
+        default_health_score_stale_sir_high(),
+    );
+    normalize_health_score_positive_f32(
+        &mut config.test_gap_high,
+        default_health_score_test_gap_high(),
+    );
+    normalize_health_score_positive_f32(
+        &mut config.boundary_leakage_high,
+        default_health_score_boundary_leakage_high(),
+    );
+    normalize_optional_positive_f64(&mut config.structural_weight);
+    normalize_optional_positive_f64(&mut config.git_weight);
+    normalize_optional_positive_f64(&mut config.semantic_weight);
 }
 
 fn normalize_config(mut config: AetherConfig) -> AetherConfig {
@@ -2110,6 +2236,41 @@ mod tests {
             config.health_score.stale_ref_patterns,
             default_health_score_stale_ref_patterns()
         );
+        assert_eq!(
+            config.health_score.churn_30d_high,
+            DEFAULT_HEALTH_SCORE_CHURN_30D_HIGH
+        );
+        assert_eq!(
+            config.health_score.churn_90d_high,
+            DEFAULT_HEALTH_SCORE_CHURN_90D_HIGH
+        );
+        assert_eq!(
+            config.health_score.author_count_high,
+            DEFAULT_HEALTH_SCORE_AUTHOR_COUNT_HIGH
+        );
+        assert_eq!(
+            config.health_score.blame_age_spread_high_secs,
+            DEFAULT_HEALTH_SCORE_BLAME_AGE_SPREAD_HIGH_SECS
+        );
+        assert_eq!(
+            config.health_score.drift_density_high,
+            DEFAULT_HEALTH_SCORE_DRIFT_DENSITY_HIGH
+        );
+        assert_eq!(
+            config.health_score.stale_sir_high,
+            DEFAULT_HEALTH_SCORE_STALE_SIR_HIGH
+        );
+        assert_eq!(
+            config.health_score.test_gap_high,
+            DEFAULT_HEALTH_SCORE_TEST_GAP_HIGH
+        );
+        assert_eq!(
+            config.health_score.boundary_leakage_high,
+            DEFAULT_HEALTH_SCORE_BOUNDARY_LEAKAGE_HIGH
+        );
+        assert!(config.health_score.structural_weight.is_none());
+        assert!(config.health_score.git_weight.is_none());
+        assert!(config.health_score.semantic_weight.is_none());
         assert_eq!(config.dashboard.port, DEFAULT_DASHBOARD_PORT);
         assert!(config.dashboard.enabled);
         assert!(config_path(workspace).exists());
@@ -2605,6 +2766,17 @@ dead_feature_fail = 0
 stale_ref_warn = 0
 stale_ref_fail = 0
 stale_ref_patterns = ["", "  "]
+churn_30d_high = 0
+churn_90d_high = 0
+author_count_high = 1
+blame_age_spread_high_secs = 0
+drift_density_high = 0.0
+stale_sir_high = 0.0
+test_gap_high = 0.0
+boundary_leakage_high = 0.0
+structural_weight = -1.0
+git_weight = 0.0
+semantic_weight = -2.0
 "#;
         fs::write(config_path(workspace), raw).expect("write config");
 
@@ -2645,6 +2817,41 @@ stale_ref_patterns = ["", "  "]
             config.health_score.stale_ref_patterns,
             default_health_score_stale_ref_patterns()
         );
+        assert_eq!(
+            config.health_score.churn_30d_high,
+            DEFAULT_HEALTH_SCORE_CHURN_30D_HIGH
+        );
+        assert_eq!(
+            config.health_score.churn_90d_high,
+            DEFAULT_HEALTH_SCORE_CHURN_90D_HIGH
+        );
+        assert_eq!(
+            config.health_score.author_count_high,
+            DEFAULT_HEALTH_SCORE_AUTHOR_COUNT_HIGH
+        );
+        assert_eq!(
+            config.health_score.blame_age_spread_high_secs,
+            DEFAULT_HEALTH_SCORE_BLAME_AGE_SPREAD_HIGH_SECS
+        );
+        assert_eq!(
+            config.health_score.drift_density_high,
+            DEFAULT_HEALTH_SCORE_DRIFT_DENSITY_HIGH
+        );
+        assert_eq!(
+            config.health_score.stale_sir_high,
+            DEFAULT_HEALTH_SCORE_STALE_SIR_HIGH
+        );
+        assert_eq!(
+            config.health_score.test_gap_high,
+            DEFAULT_HEALTH_SCORE_TEST_GAP_HIGH
+        );
+        assert_eq!(
+            config.health_score.boundary_leakage_high,
+            DEFAULT_HEALTH_SCORE_BOUNDARY_LEAKAGE_HIGH
+        );
+        assert!(config.health_score.structural_weight.is_none());
+        assert!(config.health_score.git_weight.is_none());
+        assert!(config.health_score.semantic_weight.is_none());
     }
 
     #[test]
