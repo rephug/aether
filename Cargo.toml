@@ -3,6 +3,7 @@ members = [
     "crates/aether-analysis",
     "crates/aether-dashboard",
     "crates/aetherd",
+    "crates/aether-health",
     "crates/aether-core",
     "crates/aether-config",
     "crates/aether-document",

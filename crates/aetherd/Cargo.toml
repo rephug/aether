@@ -20,6 +20,7 @@ aether-analysis = { path = "../aether-analysis" }
 aether-dashboard = { path = "../aether-dashboard", optional = true }
 aether-config = { path = "../aether-config" }
 aether-core = { path = "../aether-core" }
+aether-health = { path = "../aether-health" }
 aether-memory = { path = "../aether-memory" }
 aether-infer = { path = "../aether-infer" }
 aether-lsp = { path = "../aether-lsp" }
@@ -31,6 +32,7 @@ axum.workspace = true
 clap.workspace = true
 ignore = "0.4"
 notify.workspace = true
+rusqlite.workspace = true
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net"] }
 tracing.workspace = true
