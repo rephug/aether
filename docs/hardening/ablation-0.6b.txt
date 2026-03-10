@@ -1,0 +1,33 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.44s
+     Running unittests src/lib.rs (/home/rephu/aether-target/debug/deps/aether_health-435fb807a5e06fd9)
+
+running 3 tests
+ablation skipped for aether-config: failed to open surreal graph: graph error: SurrealDB open failed: There was a problem with the datastore: Other error: Database at /home/rephu/projects/aether/.aether/graph/LOCK is already locked by another process
+ablation skipped for aether-mcp: failed to open surreal graph: graph error: SurrealDB open failed: There was a problem with the datastore: Other error: Database at /home/rephu/projects/aether/.aether/graph/LOCK is already locked by another process
+test planner_communities::tests::ablation_aether_config ... ok
+test planner_communities::tests::ablation_aether_mcp ... ok
+
+Ablation for aether-store (crates/aether-store/src/lib.rs)
+configuration                communities  largest  smallest   loners     conf  stability top modules
+1. baseline                           18       41         2      134     0.68       1.00 history_ops, intents_ops, lexical_ops
+2. + test filtering                   17       40         2      134     0.67       1.00 history_ops, column_ops, column_3_ops
+3. + type-anchor                       7      141         2       48     0.76       1.00 graph_ops, column_ops, json_ops
+4. + rescue                            2      155        59        0     0.73       1.00 sir_ops, project_ops
+5. + lower gamma                       2      155        59        0     0.73       1.00 sir_ops, project_ops
+6. full pipeline                       2      155        59        0     0.73       1.00 sir_ops, project_ops
+test planner_communities::tests::ablation_aether_store ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 52 filtered out; finished in 2.40s
+
+     Running tests/real_workspace.rs (/home/rephu/aether-target/debug/deps/real_workspace-7adf17035cbd72da)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+   Doc-tests aether_health
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
