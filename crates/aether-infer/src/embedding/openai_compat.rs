@@ -1,11 +1,14 @@
+use std::time::Duration;
+
 use aether_config::EmbeddingProviderKind;
 use aether_core::Secret;
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+use tokio::time::sleep;
 
 use crate::{
-    EmbeddingProvider, InferError, extract_embedding_vector, inference_http_client,
-    normalize_openai_api_base,
+    EmbeddingProvider, InferError, extract_embedding_vector, extract_openai_error_message,
+    inference_http_client, normalize_openai_api_base,
 };
 
 #[derive(Debug, Clone)]
@@ -14,15 +17,27 @@ pub struct OpenAiCompatEmbeddingProvider {
     endpoint: String,
     model: String,
     api_key: Secret,
+    task_type: Option<String>,
+    dimensions: Option<u32>,
 }
 
 impl OpenAiCompatEmbeddingProvider {
-    pub fn new(endpoint: String, model: String, api_key: Secret) -> Self {
+    pub fn new(
+        endpoint: String,
+        model: String,
+        api_key: Secret,
+        task_type: Option<String>,
+        dimensions: Option<u32>,
+    ) -> Self {
         Self {
             client: inference_http_client(),
             endpoint: normalize_embedding_endpoint(&endpoint),
             model: model.trim().to_owned(),
             api_key,
+            task_type: task_type
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty()),
+            dimensions,
         }
     }
 
@@ -34,25 +49,63 @@ impl OpenAiCompatEmbeddingProvider {
         self.model.as_str()
     }
 
-    async fn request_embedding(&self, text: &str) -> Result<Vec<f32>, InferError> {
+    async fn request_embedding_once(&self, text: &str) -> Result<Vec<f32>, InferError> {
         let url = format!("{}/embeddings", self.endpoint);
-        let body = json!({
-            "model": self.model,
-            "input": text,
-        });
+        let mut body = Map::new();
+        body.insert("model".to_owned(), Value::String(self.model.clone()));
+        body.insert("input".to_owned(), Value::String(text.to_owned()));
+        if let Some(task_type) = &self.task_type {
+            body.insert("task_type".to_owned(), Value::String(task_type.clone()));
+        }
+        if let Some(dimensions) = self.dimensions {
+            body.insert("dimensions".to_owned(), json!(dimensions));
+        }
 
-        let response: Value = self
+        let response = self
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key.expose()))
+            .header("Content-Type", "application/json")
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?
-            .json()
             .await?;
+        let status = response.status();
+        let response_body = response.text().await?;
+        if !status.is_success() {
+            let provider_message = extract_openai_error_message(&response_body)
+                .unwrap_or_else(|| response_body.trim().to_owned());
+            let provider_message = if provider_message.is_empty() {
+                "unknown provider error".to_owned()
+            } else {
+                provider_message
+            };
+            return Err(InferError::InvalidResponse(format!(
+                "openai_compat request failed with status {status}: {provider_message}"
+            )));
+        }
+        let response: Value = serde_json::from_str(&response_body)?;
 
         extract_embedding_vector(&response)
+    }
+
+    async fn request_embedding(&self, text: &str) -> Result<Vec<f32>, InferError> {
+        let mut backoff = Duration::from_secs(1);
+        for attempt in 0..3 {
+            match self.request_embedding_once(text).await {
+                Ok(embedding) => return Ok(embedding),
+                Err(err) if attempt == 2 => return Err(err),
+                Err(err) => {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        error = %err,
+                        "openai_compat embedding request failed; retrying"
+                    );
+                    sleep(backoff).await;
+                    backoff = backoff.saturating_mul(2);
+                }
+            }
+        }
+        unreachable!("embedding retry loop must return on success or final failure");
     }
 }
 
@@ -98,6 +151,8 @@ mod tests {
             assert!(request_lower.contains("authorization: bearer test-key"));
             assert!(request.contains("\"model\":\"text-embedding-3-large\""));
             assert!(request.contains("\"input\":\"hello embeddings\""));
+            assert!(request.contains("\"task_type\":\"CODE_RETRIEVAL\""));
+            assert!(request.contains("\"dimensions\":3072"));
 
             let response_body = "{\"data\":[{\"embedding\":[3,4]}]}";
             let response = format!(
@@ -115,6 +170,8 @@ mod tests {
             endpoint,
             "text-embedding-3-large".to_owned(),
             Secret::new("test-key".to_owned()),
+            Some("CODE_RETRIEVAL".to_owned()),
+            Some(3072),
         );
 
         let runtime = tokio::runtime::Builder::new_current_thread()

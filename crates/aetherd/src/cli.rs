@@ -601,16 +601,9 @@ pub struct Cli {
 
     #[arg(
         long,
-        conflicts_with_all = [
-            "search",
-            "lsp",
-            "index",
-            "index_once",
-            "verify",
-            "download_models",
-            "calibrate"
-        ],
-        help = "Re-embed all symbols with existing SIR using the current embedding provider, then exit"
+        requires = "index_once",
+        conflicts_with_all = ["force", "download_models", "calibrate"],
+        help = "When used with --index-once, re-embed all symbols with existing SIR using the current embedding provider without regenerating SIR"
     )]
     pub embeddings_only: bool,
 
@@ -853,21 +846,36 @@ mod tests {
 
     #[test]
     fn cli_embeddings_only_flag_parses() {
-        let cli = Cli::try_parse_from(["aetherd", "--workspace", ".", "--embeddings-only"])
-            .expect("embeddings-only should parse");
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "--index-once",
+            "--embeddings-only",
+        ])
+        .expect("embeddings-only should parse");
 
         assert!(cli.command.is_none());
+        assert!(cli.index_once);
         assert!(cli.embeddings_only);
     }
 
     #[test]
-    fn cli_embeddings_only_conflicts_with_index_once() {
+    fn cli_embeddings_only_rejects_without_index_once() {
+        let result = Cli::try_parse_from(["aetherd", "--workspace", ".", "--embeddings-only"]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_embeddings_only_rejects_with_force() {
         let result = Cli::try_parse_from([
             "aetherd",
             "--workspace",
             ".",
-            "--embeddings-only",
             "--index-once",
+            "--embeddings-only",
+            "--force",
         ]);
 
         assert!(result.is_err());

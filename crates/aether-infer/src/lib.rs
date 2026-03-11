@@ -114,6 +114,8 @@ pub struct EmbeddingProviderOverrides {
     pub model: Option<String>,
     pub endpoint: Option<String>,
     pub api_key_env: Option<String>,
+    pub task_type: Option<String>,
+    pub dimensions: Option<u32>,
     pub candle_model_dir: Option<String>,
 }
 
@@ -1307,6 +1309,9 @@ pub fn load_embedding_provider_from_config(
     let selected_api_key_env =
         first_non_empty(overrides.api_key_env, config.embeddings.api_key_env.clone())
             .unwrap_or_else(|| DEFAULT_OPENAI_COMPAT_API_KEY_ENV.to_owned());
+    let selected_task_type =
+        first_non_empty(overrides.task_type, config.embeddings.task_type.clone());
+    let selected_dimensions = overrides.dimensions.or(config.embeddings.dimensions);
     let selected_candle_model_dir = first_non_empty(
         overrides.candle_model_dir,
         config.embeddings.candle.model_dir.clone(),
@@ -1338,8 +1343,13 @@ pub fn load_embedding_provider_from_config(
                 .ok_or_else(|| InferError::MissingApiKey(selected_api_key_env.clone()))?;
             let endpoint = selected_endpoint.ok_or(InferError::MissingEndpoint)?;
             let model = selected_model.ok_or(InferError::MissingModel)?;
-            let provider =
-                OpenAiCompatEmbeddingProvider::new(endpoint, model, Secret::new(api_key));
+            let provider = OpenAiCompatEmbeddingProvider::new(
+                endpoint,
+                model,
+                Secret::new(api_key),
+                selected_task_type,
+                selected_dimensions,
+            );
             let model_name = provider.model_name().to_owned();
             let provider_name = provider.provider_name().to_owned();
             LoadedEmbeddingProvider {
@@ -2741,6 +2751,8 @@ provider = "openai_compat"
 model = "text-embedding-3-large"
 endpoint = "https://api.example.com/v1/embeddings"
 api_key_env = "{env_name}"
+task_type = "CODE_RETRIEVAL"
+dimensions = 3072
 "#
             ),
         )

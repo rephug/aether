@@ -136,6 +136,7 @@ fn run_index_and_seed_sir(workspace: &Path) -> Result<()> {
         inference_provider: None,
         inference_model: None,
         inference_endpoint: None,
+        embeddings_only: false,
         inference_api_key_env: None,
     })?;
 
@@ -809,6 +810,7 @@ vector_backend = "sqlite"
         inference_model: None,
         inference_endpoint: None,
         inference_api_key_env: None,
+        embeddings_only: false,
     })?;
 
     let store = SqliteStore::open(workspace)?;

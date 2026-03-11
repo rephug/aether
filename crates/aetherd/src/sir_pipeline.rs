@@ -158,7 +158,9 @@ impl SirPipeline {
             EmbeddingProviderOverrides::default(),
         )
         .context("failed to load embedding provider")?
-        .ok_or_else(|| anyhow!("embeddings-only reindex requires embeddings.enabled=true"))?;
+        .ok_or_else(|| {
+            anyhow!("Embedding provider is not configured. Set [embeddings] in config.")
+        })?;
         let embedding_provider = Arc::<dyn EmbeddingProvider>::from(loaded_embedding.provider);
         let embedding_identity =
             Some((loaded_embedding.provider_name, loaded_embedding.model_name));
@@ -839,22 +841,39 @@ impl SirPipeline {
         let symbol_ids = store
             .list_all_symbol_ids()
             .context("failed to list symbols for embeddings-only pass")?;
-        let total = symbol_ids.len();
+        let processed = symbol_ids.len();
         let mut refreshed = 0usize;
-        let mut skipped = 0usize;
+        let mut skipped_no_sir = 0usize;
+        let mut skipped_up_to_date = 0usize;
         let mut errors = 0usize;
+        let provider_name = self
+            .embedding_provider_name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("mock");
+        let model_name = self
+            .embedding_model_name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("mock");
+
+        writeln!(
+            out,
+            "Re-embedding {processed} symbols with {provider_name}/{model_name}..."
+        )
+        .context("failed to write embeddings-only start line")?;
 
         for (index, symbol_id) in symbol_ids.iter().enumerate() {
             let current = index + 1;
             if current % 100 == 0 {
-                writeln!(out, "Embedding {current}/{total}...")
+                writeln!(out, "Embedding {current}/{processed}...")
                     .context("failed to write embeddings-only progress")?;
             }
 
             let meta = match store.get_sir_meta(symbol_id) {
                 Ok(Some(meta)) => meta,
                 Ok(None) => {
-                    skipped += 1;
+                    skipped_no_sir += 1;
                     continue;
                 }
                 Err(err) => {
@@ -867,7 +886,7 @@ impl SirPipeline {
             let blob = match store.read_sir_blob(symbol_id) {
                 Ok(Some(blob)) => blob,
                 Ok(None) => {
-                    skipped += 1;
+                    skipped_no_sir += 1;
                     continue;
                 }
                 Err(err) => {
@@ -881,7 +900,7 @@ impl SirPipeline {
                 Ok(sir) => sir,
                 Err(err) => {
                     let generation_pass = meta.generation_pass.as_str();
-                    skipped += 1;
+                    skipped_no_sir += 1;
                     tracing::warn!(
                         symbol_id = %symbol_id,
                         generation_pass,
@@ -896,7 +915,7 @@ impl SirPipeline {
             let hash = sir_hash(&sir);
             match self.refresh_embedding_if_needed(symbol_id, &hash, &canonical, print_sir, out) {
                 Ok(true) => refreshed += 1,
-                Ok(false) => {}
+                Ok(false) => skipped_up_to_date += 1,
                 Err(err) => {
                     errors += 1;
                     tracing::warn!(symbol_id = %symbol_id, error = %err, "failed to refresh embedding");
@@ -906,7 +925,7 @@ impl SirPipeline {
 
         writeln!(
             out,
-            "Embeddings refreshed: {refreshed}/{total} symbols ({skipped} skipped, {errors} errors)"
+            "Re-embedded {refreshed} of {processed} symbols with {provider_name}/{model_name} ({skipped_no_sir} skipped: no current SIR, {skipped_up_to_date} already up to date, {errors} errors)"
         )
         .context("failed to write embeddings-only summary")?;
 
@@ -2080,24 +2099,49 @@ fn to_test_intent_record(intent: TestIntent, now_ms: i64) -> TestIntentRecord {
 mod tests {
     use std::fs;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use aether_core::{EdgeKind, SymbolEdge};
     use async_trait::async_trait;
+    use rusqlite::Connection;
     use tempfile::tempdir;
 
-    struct TestEmbeddingProvider;
+    #[derive(Clone)]
+    struct CountingEmbeddingProvider {
+        calls: Arc<AtomicUsize>,
+    }
 
     #[async_trait]
-    impl EmbeddingProvider for TestEmbeddingProvider {
+    impl EmbeddingProvider for CountingEmbeddingProvider {
         async fn embed_text(&self, _text: &str) -> std::result::Result<Vec<f32>, InferError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(vec![1.0, 0.0])
         }
     }
 
-    #[test]
-    fn embeddings_only_skips_symbols_without_sir() {
-        let temp = tempdir().expect("tempdir");
-        let workspace = temp.path();
+    struct PanicInferenceProvider;
+
+    #[async_trait]
+    impl InferenceProvider for PanicInferenceProvider {
+        fn provider_name(&self) -> String {
+            "panic".to_owned()
+        }
+
+        fn model_name(&self) -> String {
+            "panic".to_owned()
+        }
+
+        async fn generate_sir(
+            &self,
+            _symbol_text: &str,
+            _context: &SirContext,
+        ) -> std::result::Result<SirAnnotation, InferError> {
+            panic!("embeddings-only pass must not call inference providers");
+        }
+    }
+
+    fn write_embeddings_only_config(workspace: &Path) {
         fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
         fs::write(
             workspace.join(".aether/config.toml"),
@@ -2111,32 +2155,22 @@ vector_backend = "sqlite"
 "#,
         )
         .expect("write config");
+    }
 
-        let store = SqliteStore::open(workspace).expect("open store");
-        store
-            .upsert_symbol(SymbolRecord {
-                id: "sym-with-sir".to_owned(),
-                file_path: "src/lib.rs".to_owned(),
-                language: "rust".to_owned(),
-                kind: "function".to_owned(),
-                qualified_name: "demo::with_sir".to_owned(),
-                signature_fingerprint: "sig-1".to_owned(),
-                last_seen_at: 1_700_000_000,
-            })
-            .expect("upsert symbol with sir");
-        store
-            .upsert_symbol(SymbolRecord {
-                id: "sym-without-sir".to_owned(),
-                file_path: "src/lib.rs".to_owned(),
-                language: "rust".to_owned(),
-                kind: "function".to_owned(),
-                qualified_name: "demo::without_sir".to_owned(),
-                signature_fingerprint: "sig-2".to_owned(),
-                last_seen_at: 1_700_000_000,
-            })
-            .expect("upsert symbol without sir");
+    fn demo_symbol(symbol_id: &str, qualified_name: &str) -> SymbolRecord {
+        SymbolRecord {
+            id: symbol_id.to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            language: "rust".to_owned(),
+            kind: "function".to_owned(),
+            qualified_name: qualified_name.to_owned(),
+            signature_fingerprint: format!("sig-{symbol_id}"),
+            last_seen_at: 1_700_000_000,
+        }
+    }
 
-        let sir = SirAnnotation {
+    fn demo_sir() -> SirAnnotation {
+        SirAnnotation {
             intent: "Demo intent".to_owned(),
             inputs: vec!["input".to_owned()],
             outputs: vec!["output".to_owned()],
@@ -2144,15 +2178,18 @@ vector_backend = "sqlite"
             dependencies: Vec::new(),
             error_modes: Vec::new(),
             confidence: 0.9,
-        };
-        let canonical = canonicalize_sir_json(&sir);
-        let hash = sir_hash(&sir);
+        }
+    }
+
+    fn seed_sir(store: &SqliteStore, symbol_id: &str, sir: &SirAnnotation) -> String {
+        let canonical = canonicalize_sir_json(sir);
+        let hash = sir_hash(sir);
         store
-            .write_sir_blob("sym-with-sir", &canonical)
+            .write_sir_blob(symbol_id, &canonical)
             .expect("write sir blob");
         store
             .upsert_sir_meta(SirMetaRecord {
-                id: "sym-with-sir".to_owned(),
+                id: symbol_id.to_owned(),
                 sir_hash: hash.clone(),
                 sir_version: 1,
                 provider: "test".to_owned(),
@@ -2164,19 +2201,190 @@ vector_backend = "sqlite"
                 last_attempt_at: 1_700_000_100,
             })
             .expect("upsert sir meta");
+        hash
+    }
 
-        let pipeline = SirPipeline::new_with_provider_and_embeddings(
+    fn build_embeddings_only_pipeline(
+        workspace: &Path,
+        embedding_provider: Arc<dyn EmbeddingProvider>,
+    ) -> SirPipeline {
+        SirPipeline::new_with_provider_and_embeddings(
             workspace.to_path_buf(),
             1,
-            Arc::new(Qwen3LocalProvider::new(None, None)),
-            "qwen3_local",
-            "qwen3.5:4b",
-            Some(Arc::new(TestEmbeddingProvider)),
+            Arc::new(PanicInferenceProvider),
+            "panic",
+            "panic",
+            Some(embedding_provider),
             Some(("test_embedding".to_owned(), "test-model".to_owned())),
             None,
             None,
         )
-        .expect("build pipeline");
+        .expect("build pipeline")
+    }
+
+    fn upsert_existing_embedding(workspace: &Path, symbol_id: &str, sir_hash: &str) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let vector_store = runtime
+            .block_on(open_vector_store(workspace))
+            .expect("open vector store");
+        runtime
+            .block_on(vector_store.upsert_embedding(SymbolEmbeddingRecord {
+                symbol_id: symbol_id.to_owned(),
+                sir_hash: sir_hash.to_owned(),
+                provider: "test_embedding".to_owned(),
+                model: "test-model".to_owned(),
+                embedding: vec![1.0, 0.0],
+                updated_at: 1_700_000_200,
+            }))
+            .expect("seed embedding");
+    }
+
+    fn count_table_rows(workspace: &Path, table: &str) -> i64 {
+        let conn =
+            Connection::open(workspace.join(".aether/meta.sqlite")).expect("open sqlite database");
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .expect("count rows")
+    }
+
+    #[test]
+    fn new_embeddings_only_errors_when_provider_is_not_configured() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
+        fs::write(
+            workspace.join(".aether/config.toml"),
+            r#"[storage]
+graph_backend = "sqlite"
+
+[embeddings]
+enabled = false
+"#,
+        )
+        .expect("write config");
+
+        let err = match SirPipeline::new_embeddings_only(workspace.to_path_buf()) {
+            Ok(_) => panic!("missing embedding config should error"),
+            Err(err) => err,
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "Embedding provider is not configured. Set [embeddings] in config."
+        );
+    }
+
+    #[test]
+    fn embeddings_only_calls_embedding_provider_not_inference() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_only_config(workspace);
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        let sir = demo_sir();
+        for (symbol_id, qualified_name) in [
+            ("sym-a", "demo::a"),
+            ("sym-b", "demo::b"),
+            ("sym-c", "demo::c"),
+        ] {
+            store
+                .upsert_symbol(demo_symbol(symbol_id, qualified_name))
+                .expect("upsert symbol");
+            seed_sir(&store, symbol_id, &sir);
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pipeline = build_embeddings_only_pipeline(
+            workspace,
+            Arc::new(CountingEmbeddingProvider {
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        let mut out = Vec::new();
+        pipeline
+            .run_embeddings_only_pass(&store, false, &mut out)
+            .expect("run embeddings-only pass");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let rendered = String::from_utf8(out).expect("utf8 output");
+        assert!(rendered.contains("Re-embedding 3 symbols with test_embedding/test-model..."));
+        assert!(rendered.contains(
+            "Re-embedded 3 of 3 symbols with test_embedding/test-model (0 skipped: no current SIR, 0 already up to date, 0 errors)"
+        ));
+    }
+
+    #[test]
+    fn embeddings_only_respects_skip_logic() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_only_config(workspace);
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        let sir = demo_sir();
+        let mut hashes = HashMap::new();
+        for (symbol_id, qualified_name) in [
+            ("sym-a", "demo::a"),
+            ("sym-b", "demo::b"),
+            ("sym-c", "demo::c"),
+        ] {
+            store
+                .upsert_symbol(demo_symbol(symbol_id, qualified_name))
+                .expect("upsert symbol");
+            hashes.insert(symbol_id.to_owned(), seed_sir(&store, symbol_id, &sir));
+        }
+
+        upsert_existing_embedding(workspace, "sym-a", hashes["sym-a"].as_str());
+        upsert_existing_embedding(workspace, "sym-b", hashes["sym-b"].as_str());
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pipeline = build_embeddings_only_pipeline(
+            workspace,
+            Arc::new(CountingEmbeddingProvider {
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        let mut out = Vec::new();
+        pipeline
+            .run_embeddings_only_pass(&store, false, &mut out)
+            .expect("run embeddings-only pass");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let rendered = String::from_utf8(out).expect("utf8 output");
+        assert!(rendered.contains(
+            "Re-embedded 1 of 3 symbols with test_embedding/test-model (0 skipped: no current SIR, 2 already up to date, 0 errors)"
+        ));
+    }
+
+    #[test]
+    fn embeddings_only_skips_symbols_without_sir() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_only_config(workspace);
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        store
+            .upsert_symbol(demo_symbol("sym-with-sir", "demo::with_sir"))
+            .expect("upsert symbol with sir");
+        store
+            .upsert_symbol(demo_symbol("sym-without-sir", "demo::without_sir"))
+            .expect("upsert symbol without sir");
+
+        let sir = demo_sir();
+        seed_sir(&store, "sym-with-sir", &sir);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pipeline = build_embeddings_only_pipeline(
+            workspace,
+            Arc::new(CountingEmbeddingProvider {
+                calls: Arc::clone(&calls),
+            }),
+        );
 
         let mut out = Vec::new();
         pipeline
@@ -2191,8 +2399,57 @@ vector_backend = "sqlite"
             .get_symbol_embedding_meta("sym-without-sir")
             .expect("read missing embedding meta");
         assert!(missing.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let rendered = String::from_utf8(out).expect("utf8 output");
-        assert!(rendered.contains("Embeddings refreshed: 1/2 symbols (1 skipped, 0 errors)"));
+        assert!(rendered.contains(
+            "Re-embedded 1 of 2 symbols with test_embedding/test-model (1 skipped: no current SIR, 0 already up to date, 0 errors)"
+        ));
+    }
+
+    #[test]
+    fn embeddings_only_does_not_mutate_non_embedding_state() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_only_config(workspace);
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        let sir = demo_sir();
+        for (symbol_id, qualified_name) in [("sym-a", "demo::a"), ("sym-b", "demo::b")] {
+            store
+                .upsert_symbol(demo_symbol(symbol_id, qualified_name))
+                .expect("upsert symbol");
+            seed_sir(&store, symbol_id, &sir);
+        }
+        store
+            .upsert_edges(&[SymbolEdge {
+                source_id: "sym-a".to_owned(),
+                target_qualified_name: "demo::b".to_owned(),
+                edge_kind: EdgeKind::Calls,
+                file_path: "src/lib.rs".to_owned(),
+            }])
+            .expect("upsert edges");
+
+        let before_symbols = count_table_rows(workspace, "symbols");
+        let before_sir = count_table_rows(workspace, "sir");
+        let before_edges = count_table_rows(workspace, "symbol_edges");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pipeline = build_embeddings_only_pipeline(
+            workspace,
+            Arc::new(CountingEmbeddingProvider {
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        let mut out = Vec::new();
+        pipeline
+            .run_embeddings_only_pass(&store, false, &mut out)
+            .expect("run embeddings-only pass");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(count_table_rows(workspace, "symbols"), before_symbols);
+        assert_eq!(count_table_rows(workspace, "sir"), before_sir);
+        assert_eq!(count_table_rows(workspace, "symbol_edges"), before_edges);
     }
 }

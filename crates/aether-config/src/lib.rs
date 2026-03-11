@@ -481,6 +481,10 @@ pub struct EmbeddingsConfig {
     pub endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<u32>,
     #[serde(default, skip_serializing_if = "CandleEmbeddingsConfig::is_empty")]
     pub candle: CandleEmbeddingsConfig,
 }
@@ -506,6 +510,8 @@ impl Default for EmbeddingsConfig {
             model: None,
             endpoint: None,
             api_key_env: None,
+            task_type: None,
+            dimensions: None,
             candle: CandleEmbeddingsConfig::default(),
         }
     }
@@ -2013,6 +2019,7 @@ fn normalize_config(mut config: AetherConfig) -> AetherConfig {
     config.embeddings.model = normalize_optional(config.embeddings.model.take());
     config.embeddings.endpoint = normalize_optional(config.embeddings.endpoint.take());
     config.embeddings.api_key_env = normalize_optional(config.embeddings.api_key_env.take());
+    config.embeddings.task_type = normalize_optional(config.embeddings.task_type.take());
     config.embeddings.candle.model_dir =
         normalize_optional(config.embeddings.candle.model_dir.take());
     config.search.candle.model_dir = normalize_optional(config.search.candle.model_dir.take());
@@ -3005,6 +3012,8 @@ deep_concurrency = 0
                 model: Some("mock-x".to_owned()),
                 endpoint: Some("http://127.0.0.1:11434/api/embeddings".to_owned()),
                 api_key_env: None,
+                task_type: None,
+                dimensions: None,
                 candle: CandleEmbeddingsConfig::default(),
             },
             search: SearchConfig::default(),
@@ -3314,6 +3323,8 @@ enabled = true
 provider = "openai_compat"
 model = "text-embedding-3-large"
 endpoint = "https://openrouter.ai/api/v1"
+task_type = " CODE_RETRIEVAL "
+dimensions = 3072
 "#,
         )
         .expect("write config");
@@ -3328,6 +3339,11 @@ endpoint = "https://openrouter.ai/api/v1"
             config.embeddings.api_key_env.as_deref(),
             Some(DEFAULT_OPENAI_COMPAT_API_KEY_ENV)
         );
+        assert_eq!(
+            config.embeddings.task_type.as_deref(),
+            Some("CODE_RETRIEVAL")
+        );
+        assert_eq!(config.embeddings.dimensions, Some(3072));
     }
 
     #[test]

@@ -30,7 +30,7 @@ use aetherd::fsck::run_fsck;
 use aetherd::health::run_health_command;
 use aetherd::health_score::run_health_score_command;
 use aetherd::indexer::{
-    IndexerConfig, compute_symbol_priority_scores, run_full_index_once_for_cli, run_indexing_loop,
+    IndexerConfig, compute_symbol_priority_scores, run_indexing_loop,
     run_initial_index_once_for_cli,
 };
 use aetherd::init_agent::{InitAgentOptions, run_init_agent};
@@ -205,10 +205,6 @@ fn run(cli: Cli) -> Result<()> {
         std::process::exit(exit_code);
     }
 
-    if cli.embeddings_only {
-        return run_embeddings_only_command(&workspace, cli.print_sir);
-    }
-
     #[cfg(feature = "dashboard")]
     {
         let dashboard_enabled = config.dashboard.enabled && !cli.no_dashboard;
@@ -259,6 +255,7 @@ fn run(cli: Cli) -> Result<()> {
         debounce_ms: cli.debounce_ms,
         print_events: cli.print_events,
         print_sir: cli.print_sir,
+        embeddings_only: cli.embeddings_only,
         force: cli.force,
         full: cli.full,
         deep: cli.deep,
@@ -294,11 +291,7 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     if cli.index_once {
-        let result = if cli.full {
-            run_full_index_once_for_cli(&indexer_config)
-        } else {
-            run_initial_index_once_for_cli(&indexer_config)
-        };
+        let result = run_initial_index_once_for_cli(&indexer_config);
         match result {
             Ok(()) => std::process::exit(0),
             Err(err) => return Err(err),
@@ -714,19 +707,6 @@ fn truncate_display_name(value: &str, width: usize) -> String {
     let keep = width.saturating_sub(3);
     let truncated = value.chars().take(keep).collect::<String>();
     format!("{truncated}...")
-}
-
-fn run_embeddings_only_command(workspace: &Path, print_sir: bool) -> Result<()> {
-    ensure_workspace_config(workspace)
-        .context("failed to load workspace config for embeddings-only command")?;
-    let pipeline = SirPipeline::new_embeddings_only(workspace.to_path_buf())
-        .context("failed to initialize embeddings-only pipeline")?;
-    let store = SqliteStore::open(workspace).context("failed to open local store")?;
-    let mut stdout = std::io::stdout();
-    pipeline
-        .run_embeddings_only_pass(&store, print_sir, &mut stdout)
-        .context("failed to run embeddings-only reindex")?;
-    Ok(())
 }
 
 fn run_setup_local_command(workspace: &Path, args: SetupLocalArgs) -> Result<()> {

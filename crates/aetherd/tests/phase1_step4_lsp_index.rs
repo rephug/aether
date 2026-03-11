@@ -48,6 +48,7 @@ vector_backend = "sqlite"
         debounce_ms: 300,
         print_events: false,
         print_sir: false,
+        embeddings_only: false,
         force: false,
         full: false,
         deep: false,
