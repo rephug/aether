@@ -328,17 +328,11 @@ fn run_detection(
         .cloned()
         .collect::<Vec<_>>();
 
-    let (mut union_find, rep_to_members) = build_anchor_groups(entries.as_slice());
-    let symbols_anchored_type = rep_to_members
-        .iter()
-        .filter(|members| {
-            members.len() > 1
-                && members
-                    .iter()
-                    .any(|index| is_type_anchor(entries[*index].symbol.kind))
-        })
-        .map(Vec::len)
-        .sum();
+    let (_anchor_union_find, anchor_groups) = build_anchor_groups(entries.as_slice());
+    let (anchor_groups, split_anchor_exclusions) =
+        split_large_anchor_groups(entries.as_slice(), anchor_groups);
+    let symbols_anchored_type = count_type_anchored_symbols(entries.as_slice(), &anchor_groups);
+    let mut union_find = rebuild_union_find_from_groups(entries.len(), anchor_groups.as_slice());
 
     let structural_graph = collapse_structural_edges(
         filtered_structural_edges.as_slice(),
@@ -352,11 +346,12 @@ fn run_detection(
         .map(|index| union_find.find(index))
         .collect::<Vec<_>>();
 
-    let symbols_rescued_container = apply_container_rescue(
+    let symbols_rescued_container = apply_container_rescue_with_exclusions(
         entries.as_slice(),
         rep_by_index.as_slice(),
         rep_to_members.as_slice(),
         &mut enriched_graph,
+        &split_anchor_exclusions,
     );
     let symbols_rescued_semantic = apply_semantic_rescue(
         entries.as_slice(),
@@ -496,6 +491,280 @@ fn run_detection(
     }
 }
 
+const ANCHOR_SPLIT_THRESHOLD: usize = 20;
+const ANCHOR_MIN_BUCKET: usize = 3;
+const ANCHOR_STOPWORDS: &[&str] = &[
+    "get",
+    "set",
+    "list",
+    "find",
+    "read",
+    "write",
+    "upsert",
+    "delete",
+    "remove",
+    "insert",
+    "update",
+    "create",
+    "mark",
+    "clear",
+    "prune",
+    "count",
+    "increment",
+    "record",
+    "load",
+    "save",
+    "search",
+    "open",
+    "close",
+    "new",
+    "default",
+    "from",
+    "into",
+    "with",
+    "for",
+    "the",
+    "and",
+    "is",
+    "has",
+    "all",
+    "batch",
+    "by",
+    "if",
+    "or",
+    "run",
+    "do",
+    "try",
+    "check",
+    "ensure",
+    "acknowledge",
+    "resolve",
+    "as",
+    "to",
+    "sync",
+    "test",
+];
+
+fn normalize_anchor_token(token: &str) -> String {
+    let normalized = token
+        .strip_prefix("r#")
+        .unwrap_or(token)
+        .to_ascii_lowercase();
+    match normalized.as_str() {
+        "note" | "notes" => "note".to_owned(),
+        "project" | "projects" => "project".to_owned(),
+        "migration" | "migrate" | "migrations" => "migration".to_owned(),
+        "embedding" | "embeddings" => "embedding".to_owned(),
+        "symbol" | "symbols" => "symbol".to_owned(),
+        "intent" | "intents" => "intent".to_owned(),
+        "store" | "stores" => "store".to_owned(),
+        "edge" | "edges" => "edge".to_owned(),
+        "version" | "versions" => "version".to_owned(),
+        "request" | "requests" => "request".to_owned(),
+        "result" | "results" => "result".to_owned(),
+        "graph" | "graphs" => "graph".to_owned(),
+        "schema" | "schemas" => "schema".to_owned(),
+        "module" | "modules" => "module".to_owned(),
+        "provider" | "providers" => "provider".to_owned(),
+        "model" | "models" => "model".to_owned(),
+        "meta" | "metas" => "meta".to_owned(),
+        "history" | "histories" => "history".to_owned(),
+        other => {
+            if other.len() > 3 {
+                other.strip_suffix('s').unwrap_or(other).to_owned()
+            } else {
+                other.to_owned()
+            }
+        }
+    }
+}
+
+fn informative_tokens(name: &str) -> Vec<String> {
+    let leaf_name = name.rsplit("::").next().unwrap_or(name);
+    leaf_name
+        .split('_')
+        .filter_map(|token| {
+            let normalized = normalize_anchor_token(token);
+            if normalized.len() <= 1 || ANCHOR_STOPWORDS.contains(&normalized.as_str()) {
+                None
+            } else {
+                Some(normalized)
+            }
+        })
+        .collect()
+}
+
+fn split_large_anchor_groups(
+    entries: &[SymbolEntry],
+    original_groups: Vec<Vec<usize>>,
+) -> (Vec<Vec<usize>>, HashSet<usize>) {
+    let mut split_groups = Vec::new();
+    let mut split_members = HashSet::new();
+
+    for mut group in original_groups {
+        if group.is_empty() {
+            continue;
+        }
+        group.sort_unstable();
+
+        if group.len() <= ANCHOR_SPLIT_THRESHOLD {
+            split_groups.push(group);
+            continue;
+        }
+        if !group
+            .iter()
+            .any(|index| is_type_anchor(entries[*index].symbol.kind))
+        {
+            split_groups.push(group);
+            continue;
+        }
+
+        let mut anchor_indices = Vec::new();
+        let mut method_indices = Vec::new();
+        for index in &group {
+            if is_type_anchor(entries[*index].symbol.kind) {
+                anchor_indices.push(*index);
+            } else {
+                method_indices.push(*index);
+            }
+        }
+        if method_indices.len() < ANCHOR_SPLIT_THRESHOLD {
+            split_groups.push(group);
+            continue;
+        }
+
+        let mut method_tokens = HashMap::<usize, Vec<String>>::new();
+        for index in &method_indices {
+            let name = entries[*index].symbol.qualified_name.as_str();
+            let tokens = informative_tokens(name);
+            method_tokens.insert(*index, tokens);
+        }
+
+        let mut bucket_members = BTreeMap::<String, Vec<usize>>::new();
+        for index in &method_indices {
+            let bucket_key = method_tokens
+                .get(index)
+                .and_then(|tokens| tokens.first())
+                .cloned()
+                .unwrap_or_else(|| "misc".to_owned());
+            bucket_members.entry(bucket_key).or_default().push(*index);
+        }
+
+        let has_large_bucket = bucket_members
+            .values()
+            .any(|members| members.len() >= ANCHOR_MIN_BUCKET);
+        if !has_large_bucket {
+            split_groups.push(group);
+            continue;
+        }
+
+        let mut bucket_tokens = bucket_members
+            .iter()
+            .map(|(key, members)| {
+                let tokens = members
+                    .iter()
+                    .filter_map(|member| method_tokens.get(member))
+                    .flat_map(|tokens| tokens.iter().cloned())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                (key.clone(), tokens)
+            })
+            .collect::<HashMap<_, _>>();
+        let small_bucket_keys = bucket_members
+            .iter()
+            .filter_map(|(key, members)| (members.len() < ANCHOR_MIN_BUCKET).then_some(key.clone()))
+            .collect::<Vec<_>>();
+        for small_key in small_bucket_keys {
+            let Some(small_members) = bucket_members.remove(&small_key) else {
+                continue;
+            };
+            let small_tokens = bucket_tokens.remove(&small_key).unwrap_or_default();
+            let target_key = bucket_members
+                .iter()
+                .filter(|(_, members)| members.len() >= ANCHOR_MIN_BUCKET)
+                .map(|(key, members)| {
+                    let target_tokens = bucket_tokens
+                        .get(key)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    let target_tokens = target_tokens.iter().collect::<HashSet<_>>();
+                    (
+                        key.clone(),
+                        small_tokens
+                            .iter()
+                            .filter(|token| target_tokens.contains(token))
+                            .count(),
+                        members.len(),
+                    )
+                })
+                .max_by(|left, right| {
+                    left.1
+                        .cmp(&right.1)
+                        .then_with(|| left.2.cmp(&right.2))
+                        .then_with(|| right.0.cmp(&left.0))
+                })
+                .map(|(key, _, _)| key);
+
+            let Some(target_key) = target_key else {
+                bucket_members.insert(small_key, small_members);
+                continue;
+            };
+
+            if let Some(target_members) = bucket_members.get_mut(&target_key) {
+                target_members.extend(small_members);
+            }
+            if let Some(target_tokens) = bucket_tokens.get_mut(&target_key) {
+                let mut merged_tokens = target_tokens.iter().cloned().collect::<BTreeSet<_>>();
+                merged_tokens.extend(small_tokens);
+                *target_tokens = merged_tokens.into_iter().collect();
+            }
+        }
+
+        if bucket_members.len() <= 1 {
+            split_groups.push(group);
+            continue;
+        }
+
+        split_members.extend(group.iter().copied());
+
+        if !anchor_indices.is_empty()
+            && let Some(target_key) = bucket_members
+                .iter()
+                .max_by(|left, right| {
+                    left.1
+                        .len()
+                        .cmp(&right.1.len())
+                        .then_with(|| right.0.cmp(left.0))
+                })
+                .map(|(key, _)| key.clone())
+            && let Some(target_members) = bucket_members.get_mut(&target_key)
+        {
+            target_members.extend(anchor_indices);
+        }
+
+        for (_, mut members) in bucket_members {
+            members.sort_unstable();
+            split_groups.push(members);
+        }
+    }
+
+    (split_groups, split_members)
+}
+
+fn count_type_anchored_symbols(entries: &[SymbolEntry], groups: &[Vec<usize>]) -> usize {
+    groups
+        .iter()
+        .filter(|members| {
+            members.len() > 1
+                && members
+                    .iter()
+                    .any(|index| is_type_anchor(entries[*index].symbol.kind))
+        })
+        .map(Vec::len)
+        .sum()
+}
+
 fn build_anchor_groups(entries: &[SymbolEntry]) -> (DisjointSet, Vec<Vec<usize>>) {
     let mut union_find = DisjointSet::new(entries.len());
     let mut stem_to_indices = HashMap::<String, Vec<usize>>::new();
@@ -531,6 +800,19 @@ fn build_anchor_groups(entries: &[SymbolEntry]) -> (DisjointSet, Vec<Vec<usize>>
     (union_find, rep_to_members)
 }
 
+fn rebuild_union_find_from_groups(num_entries: usize, groups: &[Vec<usize>]) -> DisjointSet {
+    let mut union_find = DisjointSet::new(num_entries);
+    for group in groups {
+        let Some(anchor) = group.first().copied() else {
+            continue;
+        };
+        for member in group.iter().copied().skip(1) {
+            union_find.union(anchor, member);
+        }
+    }
+    union_find
+}
+
 fn collapse_structural_edges(
     edges: &[GraphAlgorithmEdge],
     id_to_index: &HashMap<String, usize>,
@@ -551,16 +833,40 @@ fn collapse_structural_edges(
     graph
 }
 
+#[allow(dead_code)]
 fn apply_container_rescue(
     entries: &[SymbolEntry],
     rep_by_index: &[usize],
     rep_to_members: &[Vec<usize>],
     graph: &mut WeightedGraph,
 ) -> usize {
+    let split_exclusions = HashSet::new();
+    apply_container_rescue_with_exclusions(
+        entries,
+        rep_by_index,
+        rep_to_members,
+        graph,
+        &split_exclusions,
+    )
+}
+
+fn apply_container_rescue_with_exclusions(
+    entries: &[SymbolEntry],
+    rep_by_index: &[usize],
+    rep_to_members: &[Vec<usize>],
+    graph: &mut WeightedGraph,
+    split_exclusions: &HashSet<usize>,
+) -> usize {
     let mut stem_to_singleton_reps = HashMap::<String, Vec<usize>>::new();
     for (index, entry) in entries.iter().enumerate() {
         let rep = rep_by_index.get(index).copied().unwrap_or(index);
         if rep_to_members.get(rep).map(Vec::len).unwrap_or_default() != 1 {
+            continue;
+        }
+        if split_exclusions.contains(&index) {
+            continue;
+        }
+        if entry.stem.is_empty() {
             continue;
         }
         stem_to_singleton_reps
@@ -1119,10 +1425,12 @@ fn cosine_similarity(left: Option<&[f32]>, right: Option<&[f32]>) -> Option<f32>
 mod tests {
     use super::{
         DetectionRun, DisjointSet, FileCommunityConfig, FileSymbol, PlannerDiagnostics,
-        SymbolEntry, WeightedGraph, apply_container_rescue, apply_semantic_rescue,
-        build_anchor_groups, build_rep_members, collapse_structural_edges, compute_confidence,
-        confidence_label, detect_file_communities, diagnostics_from_run, finalize_assignments,
-        has_embedding, merge_small_communities, pairwise_jaccard, qualified_name_stem,
+        SymbolEntry, WeightedGraph, apply_container_rescue, apply_container_rescue_with_exclusions,
+        apply_semantic_rescue, build_anchor_groups, build_rep_members, collapse_structural_edges,
+        compute_confidence, confidence_label, count_type_anchored_symbols, detect_file_communities,
+        diagnostics_from_run, finalize_assignments, has_embedding, merge_small_communities,
+        pairwise_jaccard, qualified_name_stem, rebuild_union_find_from_groups,
+        split_large_anchor_groups,
     };
     use aether_config::load_workspace_config;
     use aether_core::SymbolKind;
@@ -1219,6 +1527,115 @@ mod tests {
             .map(|index| union_find.find(index))
             .collect::<Vec<_>>();
         (rep_by_index, rep_to_members)
+    }
+
+    fn count_components_and_largest(
+        graph: &WeightedGraph,
+        rep_to_members: &[Vec<usize>],
+        entries: &[SymbolEntry],
+    ) -> (usize, usize) {
+        let active_reps: Vec<usize> = rep_to_members
+            .iter()
+            .enumerate()
+            .filter_map(
+                |(rep, members)| {
+                    if members.is_empty() { None } else { Some(rep) }
+                },
+            )
+            .collect();
+        if active_reps.is_empty() {
+            return (0, 0);
+        }
+        let components = graph.connected_components(&active_reps, entries);
+        let largest = components
+            .iter()
+            .map(|component| {
+                component
+                    .iter()
+                    .map(|rep| rep_to_members.get(*rep).map(Vec::len).unwrap_or(0))
+                    .sum::<usize>()
+            })
+            .max()
+            .unwrap_or(0);
+        (components.len(), largest)
+    }
+
+    fn non_empty_groups(groups: &[Vec<usize>]) -> Vec<Vec<usize>> {
+        groups
+            .iter()
+            .filter(|members| !members.is_empty())
+            .cloned()
+            .collect()
+    }
+
+    fn split_anchor_groups(entries: &[SymbolEntry]) -> (Vec<Vec<usize>>, HashSet<usize>) {
+        let (_, anchor_groups) = build_anchor_groups(entries);
+        split_large_anchor_groups(entries, anchor_groups)
+    }
+
+    fn group_index_for_symbol_id(
+        groups: &[Vec<usize>],
+        entries: &[SymbolEntry],
+        symbol_id: &str,
+    ) -> Option<usize> {
+        groups.iter().position(|members| {
+            members.iter().any(|index| {
+                entries
+                    .get(*index)
+                    .map(|entry| entry.symbol.symbol_id.as_str() == symbol_id)
+                    .unwrap_or(false)
+            })
+        })
+    }
+
+    fn large_anchor_symbols() -> Vec<FileSymbol> {
+        let mut symbols = vec![symbol(
+            "sym-store",
+            "SqliteStore",
+            "crate::SqliteStore",
+            SymbolKind::Struct,
+        )];
+        let methods = [
+            ("sym-project-note-upsert", "upsert_project_note"),
+            ("sym-project-note-list", "list_project_notes"),
+            ("sym-project-note-delete", "delete_project_note"),
+            ("sym-project-note-find", "find_project_note"),
+            ("sym-project-note-read", "read_project_notes"),
+            ("sym-project-note-write", "write_project_note"),
+            ("sym-project-note-save", "save_project_note"),
+            ("sym-project-note-load", "load_project_notes"),
+            ("sym-project-note-count", "count_project_notes"),
+            ("sym-sir-get", "get_sir"),
+            ("sym-sir-save", "save_sir"),
+            ("sym-sir-load", "load_sir"),
+            ("sym-sir-list", "list_sirs"),
+            ("sym-sir-meta", "upsert_sir_meta"),
+            ("sym-sir-history", "list_sir_history"),
+            ("sym-sir-version", "get_sir_version"),
+            ("sym-sir-schema", "read_sir_schema"),
+            ("sym-migration-run", "run_migrations"),
+            ("sym-migration-list", "list_migrations"),
+            ("sym-migration-delete", "delete_migrations"),
+            ("sym-migration-clear", "clear_migrations"),
+            ("sym-migration-rename", "migration_v6_renames"),
+            ("sym-migration-from", "migration_from_v2"),
+            ("sym-intent-list", "list_intents"),
+            ("sym-intent-find", "find_intents"),
+            ("sym-intent-delete", "delete_intents"),
+            ("sym-intent-write", "create_write_intent"),
+            ("sym-intent-status", "update_intent_status"),
+            ("sym-intent-failed", "mark_intent_failed"),
+            ("sym-intent-count", "count_intents"),
+        ];
+        for (symbol_id, method_name) in methods {
+            symbols.push(symbol(
+                symbol_id,
+                method_name,
+                &format!("crate::SqliteStore::{method_name}"),
+                SymbolKind::Method,
+            ));
+        }
+        symbols
     }
 
     #[test]
@@ -1391,6 +1808,208 @@ mod tests {
     }
 
     #[test]
+    fn split_large_anchor_skips_small_groups() {
+        let mut symbols = vec![symbol(
+            "sym-store",
+            "SqliteStore",
+            "crate::SqliteStore",
+            SymbolKind::Struct,
+        )];
+        for index in 0..9 {
+            symbols.push(symbol(
+                &format!("sym-method-{index}"),
+                &format!("op_{index}"),
+                &format!("crate::SqliteStore::op_{index}"),
+                SymbolKind::Method,
+            ));
+        }
+
+        let entries = entries(&symbols);
+        let (_, anchor_groups) = build_anchor_groups(entries.as_slice());
+        let expected_groups = non_empty_groups(anchor_groups.as_slice());
+        let (split_groups, split_members) =
+            split_large_anchor_groups(entries.as_slice(), anchor_groups);
+
+        assert_eq!(split_groups, expected_groups);
+        assert!(split_members.is_empty());
+    }
+
+    #[test]
+    fn split_large_anchor_partitions_by_domain_token() {
+        let entries = entries(&large_anchor_symbols());
+        let (split_groups, split_members) = split_anchor_groups(entries.as_slice());
+
+        assert!(split_groups.len() > 1);
+        assert_eq!(split_members.len(), entries.len());
+
+        let sir_group =
+            group_index_for_symbol_id(split_groups.as_slice(), entries.as_slice(), "sym-sir-meta");
+        assert_eq!(
+            sir_group,
+            group_index_for_symbol_id(
+                split_groups.as_slice(),
+                entries.as_slice(),
+                "sym-sir-history"
+            )
+        );
+        assert_eq!(
+            sir_group,
+            group_index_for_symbol_id(
+                split_groups.as_slice(),
+                entries.as_slice(),
+                "sym-sir-version"
+            )
+        );
+
+        let project_group = group_index_for_symbol_id(
+            split_groups.as_slice(),
+            entries.as_slice(),
+            "sym-project-note-upsert",
+        );
+        assert_eq!(
+            project_group,
+            group_index_for_symbol_id(
+                split_groups.as_slice(),
+                entries.as_slice(),
+                "sym-project-note-list",
+            )
+        );
+        assert_eq!(
+            project_group,
+            group_index_for_symbol_id(
+                split_groups.as_slice(),
+                entries.as_slice(),
+                "sym-project-note-delete",
+            )
+        );
+
+        let migration_group = group_index_for_symbol_id(
+            split_groups.as_slice(),
+            entries.as_slice(),
+            "sym-migration-run",
+        );
+        assert_eq!(
+            migration_group,
+            group_index_for_symbol_id(
+                split_groups.as_slice(),
+                entries.as_slice(),
+                "sym-migration-rename",
+            )
+        );
+        assert_eq!(
+            migration_group,
+            group_index_for_symbol_id(
+                split_groups.as_slice(),
+                entries.as_slice(),
+                "sym-migration-from",
+            )
+        );
+
+        assert_ne!(sir_group, project_group);
+        assert_ne!(sir_group, migration_group);
+        assert_eq!(
+            group_index_for_symbol_id(split_groups.as_slice(), entries.as_slice(), "sym-store"),
+            project_group
+        );
+    }
+
+    #[test]
+    fn split_large_anchor_type_not_singleton() {
+        let entries = entries(&large_anchor_symbols());
+        let (split_groups, _) = split_anchor_groups(entries.as_slice());
+        let store_group =
+            group_index_for_symbol_id(split_groups.as_slice(), entries.as_slice(), "sym-store");
+
+        assert!(store_group.is_some());
+        if let Some(group_index) = store_group {
+            assert!(
+                split_groups
+                    .get(group_index)
+                    .map(Vec::len)
+                    .unwrap_or_default()
+                    > 1
+            );
+        }
+    }
+
+    #[test]
+    fn split_large_anchor_preserves_small_anchor_behavior() {
+        let symbols = vec![
+            symbol("sym-type", "Widget", "crate::Widget", SymbolKind::Struct),
+            symbol(
+                "sym-render",
+                "render",
+                "crate::Widget::render",
+                SymbolKind::Method,
+            ),
+            symbol(
+                "sym-load",
+                "load",
+                "crate::Widget::load",
+                SymbolKind::Method,
+            ),
+            symbol(
+                "sym-save",
+                "save",
+                "crate::Widget::save",
+                SymbolKind::Method,
+            ),
+            symbol(
+                "sym-sync",
+                "sync",
+                "crate::Widget::sync",
+                SymbolKind::Method,
+            ),
+            symbol(
+                "sym-clear",
+                "clear",
+                "crate::Widget::clear",
+                SymbolKind::Method,
+            ),
+            symbol(
+                "sym-helper-a",
+                "helper_a",
+                "crate::helpers::helper_a",
+                SymbolKind::Function,
+            ),
+            symbol(
+                "sym-helper-b",
+                "helper_b",
+                "crate::helpers::helper_b",
+                SymbolKind::Function,
+            ),
+        ];
+        let edges = vec![
+            edge("sym-render", "sym-helper-a"),
+            edge("sym-helper-a", "sym-helper-b"),
+        ];
+
+        let (assignments, _) = detect_file_communities(&edges, &symbols, &config());
+        let assignment_map = assignment_map(&assignments);
+
+        assert_eq!(
+            assignment_map.get("sym-type"),
+            assignment_map.get("sym-render")
+        );
+        assert_eq!(
+            assignment_map.get("sym-type"),
+            assignment_map.get("sym-load")
+        );
+        assert_eq!(
+            assignment_map.get("sym-type"),
+            assignment_map.get("sym-save")
+        );
+        assert_eq!(
+            assignment_map.get("sym-type"),
+            assignment_map.get("sym-sync")
+        );
+        assert_eq!(
+            assignment_map.get("sym-type"),
+            assignment_map.get("sym-clear")
+        );
+    }
+
+    #[test]
     fn container_rescue_connects_same_stem_after_anchor() {
         let symbols = vec![
             symbol(
@@ -1415,6 +2034,83 @@ mod tests {
         assert_eq!(rescued, 2);
         assert_eq!(graph.degree(rep_by_index[0]), 1);
         assert_eq!(graph.degree(rep_by_index[1]), 1);
+    }
+
+    #[test]
+    fn container_rescue_skips_split_anchor_members() {
+        let symbols = vec![
+            symbol(
+                "sym-a",
+                "sir_alpha",
+                "crate::SqliteStore::sir_alpha",
+                SymbolKind::Method,
+            ),
+            symbol(
+                "sym-b",
+                "sir_beta",
+                "crate::SqliteStore::sir_beta",
+                SymbolKind::Method,
+            ),
+        ];
+        let entries = entries(&symbols);
+        let rep_by_index = vec![0, 1];
+        let rep_to_members = vec![vec![0], vec![1]];
+        let mut graph = WeightedGraph::default();
+        let split_exclusions = HashSet::from([0usize, 1usize]);
+
+        let rescued = apply_container_rescue_with_exclusions(
+            entries.as_slice(),
+            rep_by_index.as_slice(),
+            rep_to_members.as_slice(),
+            &mut graph,
+            &split_exclusions,
+        );
+
+        assert_eq!(rescued, 0);
+        assert_eq!(graph.degree(0), 0);
+        assert_eq!(graph.degree(1), 0);
+    }
+
+    #[test]
+    fn container_rescue_still_works_for_non_split_symbols() {
+        let symbols = vec![
+            symbol(
+                "sym-a",
+                "sir_alpha",
+                "crate::SqliteStore::sir_alpha",
+                SymbolKind::Method,
+            ),
+            symbol(
+                "sym-b",
+                "sir_beta",
+                "crate::SqliteStore::sir_beta",
+                SymbolKind::Method,
+            ),
+            symbol(
+                "sym-c",
+                "sir_gamma",
+                "crate::SqliteStore::sir_gamma",
+                SymbolKind::Method,
+            ),
+        ];
+        let entries = entries(&symbols);
+        let rep_by_index = vec![0, 1, 2];
+        let rep_to_members = vec![vec![0], vec![1], vec![2]];
+        let mut graph = WeightedGraph::default();
+        let split_exclusions = HashSet::from([0usize]);
+
+        let rescued = apply_container_rescue_with_exclusions(
+            entries.as_slice(),
+            rep_by_index.as_slice(),
+            rep_to_members.as_slice(),
+            &mut graph,
+            &split_exclusions,
+        );
+
+        assert_eq!(rescued, 2);
+        assert_eq!(graph.degree(0), 0);
+        assert_eq!(graph.degree(1), 1);
+        assert_eq!(graph.degree(2), 1);
     }
 
     #[test]
@@ -2259,33 +2955,31 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>();
 
-        let (mut union_find, initial_rep_to_members) = if options.type_anchor {
-            build_anchor_groups(entries.as_slice())
-        } else {
-            let mut union_find = DisjointSet::new(entries.len());
-            let rep_to_members = build_rep_members(entries.len(), &mut union_find);
-            (union_find, rep_to_members)
-        };
+        let (mut union_find, initial_anchor_groups, split_anchor_exclusions) =
+            if options.type_anchor {
+                let (_anchor_union_find, anchor_groups) = build_anchor_groups(entries.as_slice());
+                let (anchor_groups, split_anchor_exclusions) =
+                    split_large_anchor_groups(entries.as_slice(), anchor_groups);
+                let union_find =
+                    rebuild_union_find_from_groups(entries.len(), anchor_groups.as_slice());
+                (union_find, anchor_groups, split_anchor_exclusions)
+            } else {
+                let mut union_find = DisjointSet::new(entries.len());
+                let anchor_groups = build_rep_members(entries.len(), &mut union_find);
+                (union_find, anchor_groups, HashSet::new())
+            };
         let symbols_anchored_type = if options.type_anchor {
-            initial_rep_to_members
-                .iter()
-                .filter(|members| {
-                    members.len() > 1
-                        && members.iter().any(|index| {
-                            matches!(
-                                entries[*index].symbol.kind,
-                                SymbolKind::Struct
-                                    | SymbolKind::Enum
-                                    | SymbolKind::Trait
-                                    | SymbolKind::TypeAlias
-                            )
-                        })
-                })
-                .map(Vec::len)
-                .sum()
+            count_type_anchored_symbols(entries.as_slice(), initial_anchor_groups.as_slice())
         } else {
             0
         };
+        let rep_to_members_diag = build_rep_members(entries.len(), &mut union_find);
+        let (nc, nl) =
+            count_components_and_largest(&WeightedGraph::default(), &rep_to_members_diag, &entries);
+        eprintln!(
+            "[diag] after_anchor_split: groups={} largest_group={}",
+            nc, nl
+        );
 
         let structural_graph = collapse_structural_edges(
             filtered_structural_edges.as_slice(),
@@ -2297,17 +2991,28 @@ mod tests {
         let rep_by_index = (0..entries.len())
             .map(|index| union_find.find(index))
             .collect::<Vec<_>>();
+        let (nc, nl) = count_components_and_largest(&enriched_graph, &rep_to_members, &entries);
+        eprintln!(
+            "[diag] after_structural_edges: components={} largest_component={}",
+            nc, nl
+        );
 
         let symbols_rescued_container = if options.container_rescue {
-            apply_container_rescue(
+            apply_container_rescue_with_exclusions(
                 entries.as_slice(),
                 rep_by_index.as_slice(),
                 rep_to_members.as_slice(),
                 &mut enriched_graph,
+                &split_anchor_exclusions,
             )
         } else {
             0
         };
+        let (nc, nl) = count_components_and_largest(&enriched_graph, &rep_to_members, &entries);
+        eprintln!(
+            "[diag] after_container_rescue: components={} largest_component={} rescued={}",
+            nc, nl, symbols_rescued_container
+        );
         let symbols_rescued_semantic = if options.semantic_rescue {
             apply_semantic_rescue(
                 entries.as_slice(),
@@ -2318,6 +3023,11 @@ mod tests {
         } else {
             0
         };
+        let (nc, nl) = count_components_and_largest(&enriched_graph, &rep_to_members, &entries);
+        eprintln!(
+            "[diag] after_semantic_rescue: components={} largest_component={} rescued={}",
+            nc, nl, symbols_rescued_semantic
+        );
 
         let loner_reps = rep_to_members
             .iter()
@@ -2375,6 +3085,12 @@ mod tests {
 
         let components =
             enriched_graph.connected_components(active_reps.as_slice(), entries.as_slice());
+        let component_sizes: Vec<usize> = components.iter().map(Vec::len).collect();
+        eprintln!(
+            "[diag] connected_components: count={} sizes={:?}",
+            components.len(),
+            component_sizes
+        );
         let component_of_rep = components
             .iter()
             .enumerate()
@@ -2416,6 +3132,10 @@ mod tests {
             .copied()
             .collect::<HashSet<_>>()
             .len();
+        eprintln!(
+            "[diag] after_louvain: communities={}",
+            communities_before_merge
+        );
 
         let (rep_to_community, unmerged_small_penalty, communities_after_merge) =
             if options.merge_small {
