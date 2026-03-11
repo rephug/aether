@@ -866,6 +866,9 @@ fn apply_container_rescue_with_exclusions(
         if split_exclusions.contains(&index) {
             continue;
         }
+        if entry.stem.is_empty() {
+            continue;
+        }
         stem_to_singleton_reps
             .entry(entry.stem.clone())
             .or_default()
