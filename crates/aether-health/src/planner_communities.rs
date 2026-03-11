@@ -933,7 +933,7 @@ fn apply_semantic_rescue(
                 return None;
             }
             let rep = rep_by_index.get(index).copied().unwrap_or(index);
-            if graph.degree(rep) <= 1 {
+            if graph.degree(rep) == 0 {
                 Some(index)
             } else {
                 None
@@ -953,6 +953,9 @@ fn apply_semantic_rescue(
             .get(source_index)
             .copied()
             .unwrap_or(source_index);
+        if graph.degree(source_rep) > 0 {
+            continue;
+        }
         let mut candidates = entries
             .iter()
             .enumerate()
@@ -988,7 +991,7 @@ fn apply_semantic_rescue(
         }
 
         let mut added = false;
-        for (_, _, target_rep) in candidates.into_iter().take(config.semantic_rescue_max_k) {
+        for (_, _, target_rep) in candidates.into_iter().take(1) {
             graph.add_edge(source_rep, target_rep, 1);
             added = true;
         }
@@ -2188,7 +2191,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_rescue_respects_top_k() {
+    fn semantic_rescue_limits_orphans_to_single_edge() {
         let config = FileCommunityConfig {
             semantic_rescue_max_k: 2,
             ..config()
@@ -2232,7 +2235,7 @@ mod tests {
         );
 
         assert!(rescued >= 1);
-        assert_eq!(graph.neighbors(0).len(), 2);
+        assert_eq!(graph.neighbors(0).len(), 1);
     }
 
     #[test]
