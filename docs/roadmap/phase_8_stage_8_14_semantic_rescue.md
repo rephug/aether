@@ -168,8 +168,10 @@ crates/aether-health/src/archetypes.rs           — BoundaryLeaker assignment
 
 - **#72**: Semantic rescue must not reduce connected components by more
   than 30% (prevents catastrophic bridging while allowing local densification)
-- **#73**: Component-bounded rescue vs degree-0+take(2) — decide after
-  ablation comparison
+- **#73**: Component-bounded rescue is the locked approach. Degree-0+take(2)
+  was considered and rejected — component bounding is more principled and
+  surgically prevents cross-component bridges while preserving within-component
+  rescue at full strength.
 - **#74**: Global community snapshot update strategy (full rebuild vs
   incremental)
 
