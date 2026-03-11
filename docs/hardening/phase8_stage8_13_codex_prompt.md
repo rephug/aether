@@ -18,6 +18,10 @@ Read these files before writing any code:
 - `crates/aether-store/src/graph_surreal.rs` (graph edge storage)
 - `crates/aetherd/src/cli.rs` (CLI arguments)
 
+Also inspect these to understand the vector store and indexer architecture:
+- `crates/aether-store/src/vector.rs` (VectorStore trait, backends)
+- `crates/aetherd/src/indexer.rs` (Pass 1 and Pass 2 loops, if it exists)
+
 ## PREFLIGHT
 
 ```bash
@@ -33,98 +37,146 @@ git worktree add ../aether-phase8-reconciliation -b feature/phase8-stage8-13-rec
 cd /home/rephu/projects/aether-phase8-reconciliation
 ```
 
+## SOURCE INSPECTION (do this BEFORE writing code)
+
+Before implementing, inspect the actual source to answer these questions.
+Report your findings. Do not assume anything from the spec alone.
+
+1. **Schema check:** Does the `symbols` table have `access_count` and
+   `last_accessed_at` columns? Check `crates/aether-store/src/lib.rs`
+   for the CREATE TABLE statement or migration that defines the schema.
+
+2. **Graph cascade check:** In `crates/aether-store/src/graph_surreal.rs`,
+   does deleting a symbol node automatically cascade to delete connected
+   edges? Or do edges need explicit deletion? Check the SurrealDB schema
+   definitions and any existing delete methods.
+
+3. **Vector backend check:** What vector store backends exist? Check the
+   `VectorStore` trait and its implementations. The active backend may be
+   SQLite or LanceDB depending on config — cleanup must target whichever
+   backend is active, not hardcode one.
+
+4. **Indexer location:** Is the main indexing/SIR pipeline entry point in
+   `sir_pipeline.rs`, `indexer.rs`, or somewhere else? Find where `--full`
+   is handled and where the parse snapshot is built.
+
+5. **Matching key:** Confirm that `qualified_name` (not just `symbol_name`)
+   is available on `SymbolRecord`. This is critical — matching by leaf name
+   alone (`new`, `build`, `process`) will cause collisions across impl blocks.
+
 ## IMPLEMENTATION
 
 ### 1. Add new Store methods to `crates/aether-store/src/lib.rs`
 
-Add these methods to the `SqliteStore` impl:
+**a) `list_stale_symbols(snapshot_ids: &HashSet<String>) -> Result<Vec<SymbolRecord>>`**
 
-**a) `list_symbols_not_in_snapshot(snapshot_ids: &[String]) -> Result<Vec<SymbolRecord>>`**
-Returns all stored symbols whose IDs are NOT in the provided snapshot.
-Use a temporary table or `NOT IN` clause. These are candidates for
-reconciliation or pruning.
+CRITICAL: Do NOT use `WHERE id NOT IN (?, ?, ...)` SQL clause. SQLite has
+parameter limits that will crash on large repos. Instead: query all symbols
+from the table and filter in Rust using the HashSet. This is O(N) and takes
+milliseconds.
 
-**b) `reconcile_symbol_id(old_id: &str, new_id: &str) -> Result<()>`**
-Inside a single transaction:
-- Copy the `sir` row from old_id to new_id (update symbol_id, keep all other fields)
-- Copy `sir_history` rows from old_id to new_id
-- Delete the old `sir` row
-- Delete old `sir_history` rows
-- Update the `symbols` table: delete the old record
-- Log at INFO: "Reconciled symbol: {old_id} → {new_id}"
+**b) `reconcile_and_prune(migrations: &[(String, String)], prunes: &[String]) -> Result<(usize, usize)>`**
 
-If old_id has no SIR, just delete the old symbol record.
+Execute ALL mutations inside a SINGLE SQLite transaction.
 
-**c) `prune_orphaned_symbols(orphan_ids: &[String]) -> Result<usize>`**
-Inside a single transaction:
-- Delete from `symbols` where id IN orphan_ids
-- Delete from `sir` where id IN orphan_ids
-- Delete from `sir_history` where symbol_id IN orphan_ids
-- Return the count of deleted symbols
-- Log at INFO: "Pruned {count} orphaned symbols"
+For each `(old_id, new_id)` in migrations:
+- Check if `new_id` already has a SIR record:
+  - If yes: compare `updated_at` timestamps. Keep the newer SIR. If old is
+    newer, migrate it to new_id (overwrite). If new is newer, skip the SIR
+    migration but still clean up the old record. Log the conflict resolution
+    at WARN level.
+  - If no: copy the SIR row from old_id to new_id.
+- Migrate `sir_history` rows from old_id to new_id.
+- If `symbols` table tracks access metadata (`access_count`, `last_accessed_at`),
+  transfer it to the new symbol record (add old counts to new counts, keep
+  the more recent `last_accessed_at`).
+- Delete the old `sir`, `sir_history`, and `symbols` rows for old_id.
 
-### 2. Add graph edge cleanup to `crates/aether-store/src/graph_surreal.rs`
+For prunes, chunk the orphan_ids into batches of 500 to avoid SQLite
+parameter limits:
+- Delete from `symbols`, `sir`, `sir_history` where id/symbol_id matches.
+- Also clean up `write_intents` and `sir_requests` if those tables reference
+  symbol IDs.
 
-**`delete_edges_for_symbols(symbol_ids: &[String]) -> Result<()>`**
-Delete all edges where source_symbol_id OR target_symbol_id is in the list.
-This runs after SQLite reconciliation.
+Return `(migrated_count, pruned_count)`.
 
-### 3. Add reconciliation logic to `crates/aetherd/src/sir_pipeline.rs`
+### 2. Add vector store cleanup
+
+Add a `delete_embeddings(symbol_ids: &[String])` method to the `VectorStore`
+trait (or equivalent). Implement it for ALL active backends:
+- If SQLite vector backend: chunked DELETE.
+- If LanceDB vector backend: chunked `table.delete(predicate)`.
+
+The cleanup must target whichever backend is active — do not hardcode one.
+Chunk IDs into batches of 500 to prevent parser/parameter limits.
+
+This is best-effort: log errors but do not fail the reconciliation if
+vector cleanup fails (the next `--embeddings-only` run will regenerate).
+
+### 3. Add graph store cleanup
+
+Inspect `graph_surreal.rs` to determine whether symbol node deletion
+cascades to edges automatically.
+
+- If cascade: add `delete_symbols_batch(symbol_ids: &[String])` that deletes
+  the symbol nodes. Chunk into batches of 500.
+- If no cascade: add explicit edge deletion for source/target matches,
+  then delete the symbol nodes. Chunk into batches of 500.
+
+### 4. Add reconciliation logic to the SIR pipeline
 
 Add a `reconcile_stale_symbols` function that runs AFTER the parse snapshot
-is built but BEFORE SIR generation, when `--full` is set.
+is built but BEFORE SIR generation, only when `--full` is set.
 
 Logic:
-1. Get the current parse snapshot's symbol IDs
-2. Call `list_symbols_not_in_snapshot` to find stale symbols
-3. For each stale symbol, attempt to match by `(file_path, symbol_name, symbol_kind)` tuple:
-   - Look for a new symbol in the snapshot with the same tuple
-   - If exactly one match: call `reconcile_symbol_id(old_id, new_id)`
-   - If multiple old IDs match the same new symbol: pick the one with the
-     most recent SIR (`updated_at`), reconcile it, mark the rest for pruning
-   - If no match: mark for pruning
-4. Call `prune_orphaned_symbols` with all unmatched old IDs
-5. Call `delete_edges_for_symbols` on SurrealDB for all pruned + reconciled old IDs
-6. Log summary: "Reconciliation complete: {reconciled} migrated, {pruned} pruned"
+1. Build a `HashSet` of current parse snapshot symbol IDs.
+2. Call `list_stale_symbols` to find symbols not in the current snapshot.
+3. For each stale symbol, match by `(file_path, qualified_name, kind)` tuple
+   against new symbols in the snapshot.
+   CRITICAL: Use `qualified_name`, not `symbol_name`. Leaf names like `new`
+   collide across impl blocks.
+   - Exactly one match → push to `migrations` as `(old_id, new_id)`
+   - Multiple old IDs match same new symbol → pick by most recent
+     `updated_at`, migrate that one, push the rest to `prunes`
+   - No match → push to `prunes`
+4. Call `reconcile_and_prune(&migrations, &prunes)` on SQLite.
+5. Collect ALL old_ids (both migrated and pruned) into `cleanup_ids`.
+6. Call graph store cleanup with `cleanup_ids` (SurrealDB).
+7. Call vector store cleanup with `cleanup_ids` (best-effort, log on error).
+   Delete embeddings for BOTH pruned AND reconciled old IDs — reconciled
+   old IDs leak ghost vectors that cause search failures if not cleaned up.
+   The new ID will get embedded naturally during the next pipeline pass.
+8. Log: "Reconciliation complete: {migrated} migrated, {pruned} pruned"
 
-**Important:** Reconciliation only runs when `--full` is set. Normal incremental
-scans do NOT reconcile or prune.
+### 5. Add `--dry-run` flag to CLI
 
-### 4. Add `--dry-run` flag to CLI
+In `crates/aetherd/src/cli.rs`, add `--dry-run` alongside `--full`.
 
-In `crates/aetherd/src/cli.rs`, add a `--dry-run` bool to the appropriate args struct
-(probably alongside `--full`).
-
-When `--dry-run` is set with `--full`:
-- Run the reconciliation matching logic
-- Print what WOULD be reconciled and pruned
-- Do NOT actually modify the store
+When set:
+- Run the matching logic (steps 1-3 above)
+- Print what WOULD be migrated and pruned (with symbol names and paths)
+- Do NOT call any mutation methods
 - Exit after the report
-
-### 5. Embedding cleanup (best-effort)
-
-After SQLite reconciliation and SurrealDB edge cleanup, attempt to delete
-embeddings for pruned symbol IDs from the vector store. LanceDB doesn't
-support transactions, so this is best-effort — if it fails, the next
-`--embeddings-only` run will regenerate.
 
 ### 6. Tests
 
-Add these tests to `crates/aether-store` and `crates/aetherd`:
+**aether-store:**
+- `reconcile_migrates_sir_to_new_id` — old symbol with SIR, new symbol with
+  same (file, qualified_name, kind) but different ID → SIR moved to new ID
+- `reconcile_picks_most_recent_on_ambiguity` — two old IDs match same new
+  symbol → most recent SIR wins, other pruned
+- `prune_removes_orphans_not_in_snapshot` — old symbols with no match →
+  deleted from symbols, sir, sir_history
+- `reconcile_preserves_sir_history` — sir_history rows migrated with SIR
+- `reconcile_handles_new_id_already_has_sir` — if new_id already has SIR,
+  keep the newer one by updated_at, log the conflict
 
-**aether-store tests:**
-- `reconcile_migrates_sir_to_new_id` — old symbol with SIR, new symbol
-  with same (file, name, kind) but different ID → SIR moved to new ID
-- `reconcile_picks_most_recent_on_ambiguity` — two old IDs match same
-  new symbol → most recent SIR wins
-- `prune_removes_orphans_not_in_snapshot` — old symbols with no match
-  → deleted from symbols, sir, sir_history tables
-- `reconcile_preserves_sir_history` — sir_history rows migrated
-
-**aetherd tests:**
+**aetherd:**
 - `dry_run_reports_without_mutating` — with --dry-run, store unchanged
 - `coverage_reaches_100_after_reconcile` — simulate partial run → content
   change → --full re-index → coverage 100%
+- `full_reconcile_is_idempotent` — run reconciliation twice on an
+  already-clean state: zero migrations, zero prunes, no corruption
 
 ## SCOPE GUARD
 
@@ -152,14 +204,15 @@ cargo test -p aetherd
 git add -A
 git commit -m "Add symbol reconciliation and orphan cleanup for --full re-index
 
-- reconcile_symbol_id() migrates SIR and history when symbol ID changes
-  due to content hash differences across re-index runs
-- prune_orphaned_symbols() removes stale symbols not in current snapshot
-- Reconciliation matches by (file_path, symbol_name, symbol_kind) tuple
-- Only runs on --full, never on incremental scans
-- --dry-run flag shows what would be reconciled/pruned without mutating
-- All SQLite mutations in single transaction
-- SurrealDB edge cleanup and LanceDB embedding cleanup (best-effort)"
+- Match stale symbols by (file_path, qualified_name, kind) tuple to preserve
+  SIR across content-hash ID changes between re-index runs
+- reconcile_and_prune() migrates SIR, history, and access metadata inside a
+  single SQLite transaction
+- Prune orphaned symbols not in current snapshot
+- Vector store cleanup targets active backend (SQLite or LanceDB), chunked
+- SurrealDB graph cleanup for reconciled and pruned symbol IDs
+- Only runs on --full flag, supports --dry-run for safe preview
+- Idempotent: running reconciliation on clean state produces no changes"
 ```
 
 Do NOT push. Robert will review.
