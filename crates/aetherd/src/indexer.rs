@@ -41,6 +41,7 @@ pub struct IndexerConfig {
     pub debounce_ms: u64,
     pub print_events: bool,
     pub print_sir: bool,
+    pub embeddings_only: bool,
     pub force: bool,
     pub full: bool,
     pub deep: bool,
@@ -1040,7 +1041,23 @@ fn format_priority_reason(
     }
 }
 
+fn run_embeddings_only_once(config: &IndexerConfig) -> Result<()> {
+    ensure_workspace_config(&config.workspace)
+        .context("failed to load workspace config for embeddings-only command")?;
+    let pipeline = SirPipeline::new_embeddings_only(config.workspace.clone())
+        .context("failed to initialize embeddings-only pipeline")?;
+    let store = SqliteStore::open(&config.workspace).context("failed to open local store")?;
+    let mut stdout = std::io::stdout();
+    pipeline
+        .run_embeddings_only_pass(&store, config.print_sir, &mut stdout)
+        .context("failed to run embeddings-only reindex")
+}
+
 fn run_initial_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Result<()> {
+    if config.embeddings_only {
+        return run_embeddings_only_once(config);
+    }
+
     if config.full {
         return if skip_teardown {
             run_full_index_once_for_cli(config)
