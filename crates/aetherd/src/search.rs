@@ -13,8 +13,8 @@ use aether_core::{
     SearchEnvelope,
 };
 use aether_infer::{
-    EmbeddingProviderOverrides, LoadedEmbeddingProvider, RerankCandidate, RerankerProvider,
-    RerankerProviderOverrides, load_embedding_provider_from_config,
+    EmbeddingProviderOverrides, EmbeddingPurpose, LoadedEmbeddingProvider, RerankCandidate,
+    RerankerProvider, RerankerProviderOverrides, load_embedding_provider_from_config,
     load_reranker_provider_from_config,
 };
 use aether_store::{
@@ -332,7 +332,11 @@ fn semantic_search(
         .enable_all()
         .build()
         .context("failed to build runtime for semantic search")?;
-    let query_embedding = match runtime.block_on(loaded.provider.embed_text(query)) {
+    let query_embedding = match runtime.block_on(
+        loaded
+            .provider
+            .embed_text_with_purpose(query, EmbeddingPurpose::Query),
+    ) {
         Ok(embedding) => embedding,
         Err(err) => {
             return Ok((Vec::new(), Some(format!("embedding provider error: {err}"))));
@@ -747,11 +751,11 @@ impl From<SymbolSearchResult> for SearchResultRow {
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::fs;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use aether_infer::{
-        EmbeddingProvider, InferError, InferenceProvider, LoadedEmbeddingProvider,
-        MockRerankerProvider, SirContext,
+        EmbeddingProvider, EmbeddingPurpose, InferError, InferenceProvider,
+        LoadedEmbeddingProvider, MockRerankerProvider, SirContext,
     };
     use aether_sir::SirAnnotation;
     use async_trait::async_trait;
@@ -772,6 +776,26 @@ mod tests {
     #[async_trait]
     impl EmbeddingProvider for TestEmbeddingProvider {
         async fn embed_text(&self, text: &str) -> std::result::Result<Vec<f32>, InferError> {
+            Ok(keyword_embedding(text))
+        }
+    }
+
+    struct RecordingEmbeddingProvider {
+        purposes: Arc<Mutex<Vec<EmbeddingPurpose>>>,
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for RecordingEmbeddingProvider {
+        async fn embed_text(&self, text: &str) -> std::result::Result<Vec<f32>, InferError> {
+            Ok(keyword_embedding(text))
+        }
+
+        async fn embed_text_with_purpose(
+            &self,
+            text: &str,
+            purpose: EmbeddingPurpose,
+        ) -> std::result::Result<Vec<f32>, InferError> {
+            self.purposes.lock().expect("purposes mutex").push(purpose);
             Ok(keyword_embedding(text))
         }
     }
@@ -812,6 +836,16 @@ mod tests {
     fn test_loaded_embedding_provider() -> LoadedEmbeddingProvider {
         LoadedEmbeddingProvider {
             provider: Box::new(TestEmbeddingProvider),
+            provider_name: TEST_EMBED_PROVIDER.to_owned(),
+            model_name: TEST_EMBED_MODEL.to_owned(),
+        }
+    }
+
+    fn recording_loaded_embedding_provider(
+        purposes: Arc<Mutex<Vec<EmbeddingPurpose>>>,
+    ) -> LoadedEmbeddingProvider {
+        LoadedEmbeddingProvider {
+            provider: Box::new(RecordingEmbeddingProvider { purposes }),
             provider_name: TEST_EMBED_PROVIDER.to_owned(),
             model_name: TEST_EMBED_MODEL.to_owned(),
         }
@@ -1005,6 +1039,71 @@ mod tests {
         assert_eq!(hybrid.mode_used, SearchMode::Hybrid);
         assert!(!hybrid.matches.is_empty());
         assert_eq!(hybrid.matches[0].symbol_id, "sym-auth");
+    }
+
+    #[test]
+    fn semantic_search_passes_query_purpose_to_embedding_provider() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_enabled_config_with_thresholds(
+            workspace,
+            "sqlite",
+            SearchThresholdsConfig {
+                default: 0.65,
+                rust: 0.50,
+                typescript: 0.65,
+                python: 0.60,
+            },
+        );
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        store
+            .upsert_symbol(SymbolRecord {
+                id: "sym-auth".to_owned(),
+                file_path: "src/auth.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "demo::auth_token_refresh".to_owned(),
+                signature_fingerprint: "sig-auth".to_owned(),
+                last_seen_at: 1_700_000_000,
+            })
+            .expect("upsert auth symbol");
+
+        let provider = TestEmbeddingProvider;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let auth_embedding = runtime
+            .block_on(provider.embed_text("oauth token refresh session auth"))
+            .expect("auth embedding");
+
+        store
+            .upsert_symbol_embedding(SymbolEmbeddingRecord {
+                symbol_id: "sym-auth".to_owned(),
+                sir_hash: "hash-auth".to_owned(),
+                provider: TEST_EMBED_PROVIDER.to_owned(),
+                model: TEST_EMBED_MODEL.to_owned(),
+                embedding: auth_embedding,
+                updated_at: 1_700_000_100,
+            })
+            .expect("upsert auth embedding");
+
+        let purposes = Arc::new(Mutex::new(Vec::new()));
+        let result = execute_search_with_provider_override(
+            workspace,
+            "oauth refresh token",
+            10,
+            SearchMode::Semantic,
+            Some(recording_loaded_embedding_provider(Arc::clone(&purposes))),
+        )
+        .expect("semantic execution");
+
+        assert_eq!(result.mode_used, SearchMode::Semantic);
+        assert_eq!(
+            purposes.lock().expect("purposes mutex").as_slice(),
+            &[EmbeddingPurpose::Query]
+        );
     }
 
     #[test]

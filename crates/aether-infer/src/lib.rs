@@ -12,6 +12,7 @@ use aether_core::Secret;
 use aether_sir::{SirAnnotation, validate_sir};
 use async_trait::async_trait;
 use embedding::candle::CandleEmbeddingProvider;
+use embedding::gemini_native::GeminiNativeEmbeddingProvider;
 use embedding::openai_compat::OpenAiCompatEmbeddingProvider;
 use reranker::candle::CandleRerankerProvider;
 use reranker::cohere::CohereRerankerProvider;
@@ -23,10 +24,11 @@ mod embedding;
 mod reranker;
 pub mod sir_prompt;
 
+pub use embedding::EmbeddingPurpose;
 pub use reranker::{MockRerankerProvider, RerankCandidate, RerankResult, RerankerProvider};
 
 pub const GEMINI_API_KEY_ENV: &str = DEFAULT_GEMINI_API_KEY_ENV;
-const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
+pub(crate) const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 const GEMINI_DEFAULT_MODEL: &str = "gemini-3.1-flash-lite-preview";
 const PARSE_VALIDATION_RETRIES: usize = 2;
 const OLLAMA_PULL_SUCCESS_STATUS: &str = "success";
@@ -165,9 +167,9 @@ pub enum InferError {
     MissingApiKey(String),
     #[error("missing Cohere API key in {0}")]
     MissingCohereApiKey(String),
-    #[error("openai_compat provider requires endpoint to be set in config")]
+    #[error("provider requires endpoint to be set in config")]
     MissingEndpoint,
-    #[error("openai_compat provider requires model to be set in config")]
+    #[error("provider requires model to be set in config")]
     MissingModel,
     #[error("provider rejected response_format")]
     ProviderRejectedFormat,
@@ -264,6 +266,14 @@ pub trait InferenceProvider: Send + Sync {
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>, InferError>;
+
+    async fn embed_text_with_purpose(
+        &self,
+        text: &str,
+        _purpose: EmbeddingPurpose,
+    ) -> Result<Vec<f32>, InferError> {
+        self.embed_text(text).await
+    }
 }
 
 pub struct TieredProvider {
@@ -1307,8 +1317,7 @@ pub fn load_embedding_provider_from_config(
     let selected_model = first_non_empty(overrides.model, config.embeddings.model.clone());
     let selected_endpoint = first_non_empty(overrides.endpoint, config.embeddings.endpoint.clone());
     let selected_api_key_env =
-        first_non_empty(overrides.api_key_env, config.embeddings.api_key_env.clone())
-            .unwrap_or_else(|| DEFAULT_OPENAI_COMPAT_API_KEY_ENV.to_owned());
+        first_non_empty(overrides.api_key_env, config.embeddings.api_key_env.clone());
     let selected_task_type =
         first_non_empty(overrides.task_type, config.embeddings.task_type.clone());
     let selected_dimensions = overrides.dimensions.or(config.embeddings.dimensions);
@@ -1339,6 +1348,8 @@ pub fn load_embedding_provider_from_config(
             }
         }
         EmbeddingProviderKind::OpenAiCompat => {
+            let selected_api_key_env = selected_api_key_env
+                .unwrap_or_else(|| DEFAULT_OPENAI_COMPAT_API_KEY_ENV.to_owned());
             let api_key = read_env_non_empty(&selected_api_key_env)
                 .ok_or_else(|| InferError::MissingApiKey(selected_api_key_env.clone()))?;
             let endpoint = selected_endpoint.ok_or(InferError::MissingEndpoint)?;
@@ -1348,6 +1359,28 @@ pub fn load_embedding_provider_from_config(
                 model,
                 Secret::new(api_key),
                 selected_task_type,
+                selected_dimensions,
+            );
+            let model_name = provider.model_name().to_owned();
+            let provider_name = provider.provider_name().to_owned();
+            LoadedEmbeddingProvider {
+                model_name,
+                provider: Box::new(provider),
+                provider_name,
+            }
+        }
+        EmbeddingProviderKind::GeminiNative => {
+            let api_key_env = selected_api_key_env.ok_or_else(|| {
+                InferError::InvalidConfig(
+                    "gemini_native provider requires embeddings.api_key_env".to_owned(),
+                )
+            })?;
+            let api_key = read_env_non_empty(&api_key_env)
+                .ok_or_else(|| InferError::MissingApiKey(api_key_env.clone()))?;
+            let model = selected_model.ok_or(InferError::MissingModel)?;
+            let provider = GeminiNativeEmbeddingProvider::new(
+                model,
+                Secret::new(api_key),
                 selected_dimensions,
             );
             let model_name = provider.model_name().to_owned();
@@ -1923,7 +1956,7 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn normalize_embedding(mut embedding: Vec<f32>) -> Option<Vec<f32>> {
+pub(crate) fn normalize_embedding(mut embedding: Vec<f32>) -> Option<Vec<f32>> {
     let norm_sq = embedding
         .iter()
         .map(|value| value * value)
@@ -2768,6 +2801,126 @@ dimensions = 3072
             EmbeddingProviderKind::OpenAiCompat.as_str()
         );
         assert_eq!(loaded.model_name, "text-embedding-3-large");
+
+        unsafe {
+            env::remove_var(env_name);
+        }
+    }
+
+    #[test]
+    fn load_embedding_provider_gemini_native_requires_model() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        ensure_workspace_config(workspace).expect("ensure config");
+        let env_name = format!(
+            "AETHER_TEST_GEMINI_NATIVE_EMBED_KEY_MODEL_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        );
+
+        unsafe {
+            env::set_var(&env_name, "test-key");
+        }
+
+        std::fs::write(
+            workspace.join(".aether/config.toml"),
+            format!(
+                r#"[embeddings]
+enabled = true
+provider = "gemini_native"
+api_key_env = "{env_name}"
+"#
+            ),
+        )
+        .expect("write config");
+
+        let result =
+            load_embedding_provider_from_config(workspace, EmbeddingProviderOverrides::default());
+
+        match result {
+            Err(InferError::MissingModel) => {}
+            Ok(_) => panic!("expected missing model"),
+            Err(err) => panic!("expected missing model, got {err}"),
+        }
+
+        unsafe {
+            env::remove_var(env_name);
+        }
+    }
+
+    #[test]
+    fn load_embedding_provider_gemini_native_requires_api_key_env() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        ensure_workspace_config(workspace).expect("ensure config");
+
+        std::fs::write(
+            workspace.join(".aether/config.toml"),
+            r#"[embeddings]
+enabled = true
+provider = "gemini_native"
+model = "gemini-embedding-2-preview"
+"#,
+        )
+        .expect("write config");
+
+        let result =
+            load_embedding_provider_from_config(workspace, EmbeddingProviderOverrides::default());
+
+        match result {
+            Err(InferError::InvalidConfig(message)) => {
+                assert!(message.contains("embeddings.api_key_env"));
+            }
+            Ok(_) => panic!("expected invalid config"),
+            Err(err) => panic!("expected invalid config, got {err}"),
+        }
+    }
+
+    #[test]
+    fn load_embedding_provider_gemini_native_constructs_with_valid_config() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        ensure_workspace_config(workspace).expect("ensure config");
+        let env_name = format!(
+            "AETHER_TEST_GEMINI_NATIVE_EMBED_KEY_VALID_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        );
+
+        unsafe {
+            env::set_var(&env_name, "test-key");
+        }
+
+        std::fs::write(
+            workspace.join(".aether/config.toml"),
+            format!(
+                r#"[embeddings]
+enabled = true
+provider = "gemini_native"
+model = "gemini-embedding-2-preview"
+api_key_env = "{env_name}"
+dimensions = 3072
+"#
+            ),
+        )
+        .expect("write config");
+
+        let loaded =
+            load_embedding_provider_from_config(workspace, EmbeddingProviderOverrides::default())
+                .expect("load embedding provider")
+                .expect("embedding provider should be enabled");
+
+        assert_eq!(
+            loaded.provider_name,
+            EmbeddingProviderKind::GeminiNative.as_str()
+        );
+        assert_eq!(loaded.model_name, "gemini-embedding-2-preview");
 
         unsafe {
             env::remove_var(env_name);

@@ -113,6 +113,7 @@ pub enum EmbeddingProviderKind {
     #[default]
     Qwen3Local,
     Candle,
+    GeminiNative,
     #[serde(rename = "openai_compat")]
     OpenAiCompat,
 }
@@ -122,6 +123,7 @@ impl EmbeddingProviderKind {
         match self {
             Self::Qwen3Local => "qwen3_local",
             Self::Candle => "candle",
+            Self::GeminiNative => "gemini_native",
             Self::OpenAiCompat => "openai_compat",
         }
     }
@@ -134,9 +136,10 @@ impl std::str::FromStr for EmbeddingProviderKind {
         match value.trim() {
             "qwen3_local" => Ok(Self::Qwen3Local),
             "candle" => Ok(Self::Candle),
+            "gemini_native" => Ok(Self::GeminiNative),
             "openai_compat" => Ok(Self::OpenAiCompat),
             other => Err(format!(
-                "invalid embedding provider '{other}', expected one of: qwen3_local, candle, openai_compat"
+                "invalid embedding provider '{other}', expected one of: qwen3_local, candle, gemini_native, openai_compat"
             )),
         }
     }
@@ -1157,12 +1160,31 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
     } else if matches!(
         config.embeddings.provider,
         EmbeddingProviderKind::OpenAiCompat
-    ) && config.embeddings.endpoint.is_none()
-    {
-        warnings.push(ConfigWarning {
-            code: "embeddings_endpoint_missing_for_openai_compat",
-            message: "embeddings.provider=openai_compat requires embeddings.endpoint".to_owned(),
-        });
+    ) {
+        if config.embeddings.endpoint.is_none() {
+            warnings.push(ConfigWarning {
+                code: "embeddings_endpoint_missing_for_openai_compat",
+                message: "embeddings.provider=openai_compat requires embeddings.endpoint"
+                    .to_owned(),
+            });
+        }
+    } else if matches!(
+        config.embeddings.provider,
+        EmbeddingProviderKind::GeminiNative
+    ) {
+        if config.embeddings.endpoint.is_some() {
+            warnings.push(ConfigWarning {
+                code: "embeddings_endpoint_unused_for_gemini_native",
+                message: "embeddings.provider=gemini_native ignores embeddings.endpoint".to_owned(),
+            });
+        }
+        if config.embeddings.task_type.is_some() {
+            warnings.push(ConfigWarning {
+                code: "embeddings_task_type_unused_for_gemini_native",
+                message: "embeddings.provider=gemini_native ignores embeddings.task_type"
+                    .to_owned(),
+            });
+        }
     }
 
     if matches!(config.search.reranker, SearchRerankerKind::None)
@@ -3311,6 +3333,21 @@ endpoint = "https://api.z.ai/api/paas/v4"
     }
 
     #[test]
+    fn embedding_provider_kind_from_str_accepts_gemini_native() {
+        let parsed: EmbeddingProviderKind =
+            "gemini_native".parse().expect("gemini_native should parse");
+        assert_eq!(parsed, EmbeddingProviderKind::GeminiNative);
+    }
+
+    #[test]
+    fn embedding_provider_kind_gemini_native_as_str_matches_config_value() {
+        assert_eq!(
+            EmbeddingProviderKind::GeminiNative.as_str(),
+            "gemini_native"
+        );
+    }
+
+    #[test]
     fn load_workspace_config_parses_openai_compat_embedding_provider() {
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();
@@ -3347,6 +3384,41 @@ dimensions = 3072
     }
 
     #[test]
+    fn load_workspace_config_parses_gemini_native_embedding_provider() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(aether_dir(workspace)).expect("create .aether");
+        fs::write(
+            config_path(workspace),
+            r#"
+[embeddings]
+enabled = true
+provider = "gemini_native"
+model = "gemini-embedding-2-preview"
+api_key_env = " GEMINI_API_KEY "
+dimensions = 3072
+"#,
+        )
+        .expect("write config");
+
+        let config = load_workspace_config(workspace).expect("load config");
+        assert!(config.embeddings.enabled);
+        assert_eq!(
+            config.embeddings.provider,
+            EmbeddingProviderKind::GeminiNative
+        );
+        assert_eq!(
+            config.embeddings.model.as_deref(),
+            Some("gemini-embedding-2-preview")
+        );
+        assert_eq!(
+            config.embeddings.api_key_env.as_deref(),
+            Some("GEMINI_API_KEY")
+        );
+        assert_eq!(config.embeddings.dimensions, Some(3072));
+    }
+
+    #[test]
     fn validate_config_warns_on_openai_compat_without_endpoint() {
         let config = parse_workspace_config_str(
             r#"
@@ -3364,6 +3436,30 @@ model = "text-embedding-3-large"
             .map(|warning| warning.code)
             .collect::<Vec<_>>();
         assert!(codes.contains(&"embeddings_endpoint_missing_for_openai_compat"));
+    }
+
+    #[test]
+    fn validate_config_warns_on_unused_gemini_native_fields() {
+        let config = parse_workspace_config_str(
+            r#"
+[embeddings]
+enabled = true
+provider = "gemini_native"
+model = "gemini-embedding-2-preview"
+api_key_env = "GEMINI_API_KEY"
+endpoint = "https://ignored.example/v1"
+task_type = "RETRIEVAL_DOCUMENT"
+"#,
+        )
+        .expect("parse config");
+
+        let warnings = validate_config(&config);
+        let codes = warnings
+            .iter()
+            .map(|warning| warning.code)
+            .collect::<Vec<_>>();
+        assert!(codes.contains(&"embeddings_endpoint_unused_for_gemini_native"));
+        assert!(codes.contains(&"embeddings_task_type_unused_for_gemini_native"));
     }
 
     #[test]

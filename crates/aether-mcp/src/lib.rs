@@ -31,8 +31,9 @@ use aether_health::{
     format_hotspots_text, suggest_split,
 };
 use aether_infer::{
-    EmbeddingProviderOverrides, RerankCandidate, RerankerProvider, RerankerProviderOverrides,
-    load_embedding_provider_from_config, load_reranker_provider_from_config,
+    EmbeddingProviderOverrides, EmbeddingPurpose, RerankCandidate, RerankerProvider,
+    RerankerProviderOverrides, load_embedding_provider_from_config,
+    load_reranker_provider_from_config,
 };
 use aether_memory::{
     AskInclude as MemoryAskInclude, AskQueryRequest as MemoryAskQueryRequest,
@@ -1546,7 +1547,11 @@ impl AetherMcpServer {
             ) {
                 Ok(Some(loaded)) => {
                     let content = truncate_content_for_embedding(remember.note.content.as_str());
-                    match loaded.provider.embed_text(content.as_str()).await {
+                    match loaded
+                        .provider
+                        .embed_text_with_purpose(content.as_str(), EmbeddingPurpose::Document)
+                        .await
+                    {
                         Ok(embedding) if !embedding.is_empty() => {
                             if let Err(err) = memory
                                 .upsert_note_embedding(MemoryNoteEmbeddingRequest {
@@ -1637,7 +1642,11 @@ impl AetherMcpServer {
                 EmbeddingProviderOverrides::default(),
             ) {
                 Ok(Some(loaded)) => {
-                    match loaded.provider.embed_text(request.query.as_str()).await {
+                    match loaded
+                        .provider
+                        .embed_text_with_purpose(request.query.as_str(), EmbeddingPurpose::Query)
+                        .await
+                    {
                         Ok(embedding) if !embedding.is_empty() => {
                             semantic_query = Some(MemorySemanticQuery {
                                 provider: loaded.provider_name,
@@ -1728,7 +1737,11 @@ impl AetherMcpServer {
             self.workspace(),
             EmbeddingProviderOverrides::default(),
         ) {
-            Ok(Some(loaded)) => match loaded.provider.embed_text(request.query.as_str()).await {
+            Ok(Some(loaded)) => match loaded
+                .provider
+                .embed_text_with_purpose(request.query.as_str(), EmbeddingPurpose::Query)
+                .await
+            {
                 Ok(embedding) if !embedding.is_empty() => {
                     semantic_query = Some(MemorySemanticQuery {
                         provider: loaded.provider_name,
@@ -3044,7 +3057,11 @@ impl AetherMcpServer {
             ));
         };
 
-        let query_embedding = match loaded.provider.embed_text(query).await {
+        let query_embedding = match loaded
+            .provider
+            .embed_text_with_purpose(query, EmbeddingPurpose::Query)
+            .await
+        {
             Ok(embedding) => embedding,
             Err(err) => {
                 return Ok((Vec::new(), Some(format!("embedding provider error: {err}"))));

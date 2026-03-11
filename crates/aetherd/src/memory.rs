@@ -5,7 +5,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aether_core::{
     SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR, SEARCH_FALLBACK_EMBEDDINGS_DISABLED, SearchMode,
 };
-use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
+use aether_infer::{
+    EmbeddingProviderOverrides, EmbeddingPurpose, load_embedding_provider_from_config,
+};
 use aether_memory::{
     AskInclude, AskQueryRequest, ListNotesRequest, NoteEmbeddingRequest, NoteSourceType,
     ProjectMemoryService, RecallRequest, RememberRequest, SemanticQuery,
@@ -39,7 +41,12 @@ pub fn run_remember_command(workspace: &Path, args: RememberArgs) -> Result<()> 
         {
             Ok(Some(loaded)) => {
                 let embedding_text = truncate_content_for_embedding(remember.note.content.as_str());
-                match runtime.block_on(loaded.provider.embed_text(embedding_text.as_str())) {
+                match runtime.block_on(
+                    loaded.provider.embed_text_with_purpose(
+                        embedding_text.as_str(),
+                        EmbeddingPurpose::Document,
+                    ),
+                ) {
                     Ok(embedding) if !embedding.is_empty() => {
                         if let Err(err) =
                             runtime.block_on(service.upsert_note_embedding(NoteEmbeddingRequest {
@@ -97,7 +104,11 @@ pub fn run_recall_command(workspace: &Path, args: RecallArgs) -> Result<()> {
         {
             Ok(Some(loaded)) => {
                 let runtime = build_runtime().context("failed to build runtime for recall")?;
-                match runtime.block_on(loaded.provider.embed_text(args.query.as_str())) {
+                match runtime.block_on(
+                    loaded
+                        .provider
+                        .embed_text_with_purpose(args.query.as_str(), EmbeddingPurpose::Query),
+                ) {
                     Ok(embedding) if !embedding.is_empty() => {
                         semantic_query = Some(SemanticQuery {
                             provider: loaded.provider_name,
@@ -175,7 +186,11 @@ pub fn run_ask_command(workspace: &Path, args: AskArgs) -> Result<()> {
     match load_embedding_provider_from_config(workspace, EmbeddingProviderOverrides::default()) {
         Ok(Some(loaded)) => {
             let runtime = build_runtime().context("failed to build runtime for ask query")?;
-            match runtime.block_on(loaded.provider.embed_text(args.query.as_str())) {
+            match runtime.block_on(
+                loaded
+                    .provider
+                    .embed_text_with_purpose(args.query.as_str(), EmbeddingPurpose::Query),
+            ) {
                 Ok(embedding) if !embedding.is_empty() => {
                     semantic_query = Some(SemanticQuery {
                         provider: loaded.provider_name,
