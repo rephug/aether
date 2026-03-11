@@ -229,6 +229,17 @@ fn extract_edges(
     config: &LanguageConfig,
     symbols: &[Symbol],
 ) -> Vec<SymbolEdge> {
+    if language == Language::Rust && config.id == "rust" {
+        return crate::languages::rust::extract_rust_edges(
+            language,
+            file_path,
+            source,
+            root,
+            &config.edge_query,
+            symbols,
+        );
+    }
+
     let mut cursor = QueryCursor::new();
     let mut edges = Vec::new();
 
@@ -434,6 +445,8 @@ fn parse_edge_kind(value: &str) -> Option<EdgeKind> {
     match value {
         "calls" => Some(EdgeKind::Calls),
         "depends_on" => Some(EdgeKind::DependsOn),
+        "type_ref" => Some(EdgeKind::TypeRef),
+        "implements" => Some(EdgeKind::Implements),
         _ => None,
     }
 }
@@ -442,6 +455,8 @@ fn edge_kind_from_capture_name(capture_name: &str) -> Option<EdgeKind> {
     match capture_name.strip_prefix("edge.")? {
         "call" => Some(EdgeKind::Calls),
         "depends_on" => Some(EdgeKind::DependsOn),
+        "type_ref" => Some(EdgeKind::TypeRef),
+        "implements" => Some(EdgeKind::Implements),
         _ => None,
     }
 }
@@ -747,7 +762,9 @@ pub(crate) fn rust_source_function_id(
 ) -> Option<String> {
     let function_node = nearest_ancestor(node, "function_item")?;
     let name = named_child_text(function_node, "name", source)?;
-    let kind = if has_ancestor_kind(function_node, "impl_item") {
+    let kind = if has_ancestor_kind(function_node, "impl_item")
+        || has_ancestor_kind(function_node, "trait_item")
+    {
         SymbolKind::Method
     } else {
         SymbolKind::Function
@@ -922,7 +939,7 @@ fn find_smallest_scoped_identifier_at_point<'a>(node: Node<'a>, point: Point) ->
     best
 }
 
-fn collect_scoped_identifier_segments<'a>(
+pub(crate) fn collect_scoped_identifier_segments<'a>(
     node: Node<'a>,
     source: &[u8],
 ) -> Vec<(String, Node<'a>)> {
@@ -965,6 +982,26 @@ mod tests {
         extractor
             .extract_with_edges_from_source(language, path, source)
             .expect("extract with edges")
+    }
+
+    fn edge_targets_for_source(
+        extracted: &ExtractedFile,
+        source_qualified_name: &str,
+        edge_kind: EdgeKind,
+    ) -> Vec<String> {
+        let source_symbol = extracted
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == source_qualified_name)
+            .unwrap_or_else(|| panic!("missing source symbol {source_qualified_name}"));
+        let mut targets = extracted
+            .edges
+            .iter()
+            .filter(|edge| edge.edge_kind == edge_kind && edge.source_id == source_symbol.id)
+            .map(|edge| edge.target_qualified_name.clone())
+            .collect::<Vec<_>>();
+        targets.sort();
+        targets
     }
 
     #[test]
@@ -1166,6 +1203,277 @@ fn example(obj: Worker) {
         assert!(targets.iter().any(|target| target == "run_free"));
         assert!(targets.iter().any(|target| target == "process"));
         assert!(targets.iter().any(|target| target == "String::from"));
+    }
+
+    #[test]
+    fn type_ref_extracted_from_function_parameter() {
+        let source = r#"
+struct MyStruct {}
+
+fn foo(bar: MyStruct) {}
+"#;
+
+        let targets = edge_targets_for_source(
+            &extract_with_edges(Language::Rust, "src/lib.rs", source),
+            "foo",
+            EdgeKind::TypeRef,
+        );
+        assert_eq!(targets, vec!["MyStruct".to_owned()]);
+    }
+
+    #[test]
+    fn type_ref_extracted_from_return_type() {
+        let source = r#"
+struct MyStruct {}
+
+fn foo() -> MyStruct { todo!() }
+"#;
+
+        let targets = edge_targets_for_source(
+            &extract_with_edges(Language::Rust, "src/lib.rs", source),
+            "foo",
+            EdgeKind::TypeRef,
+        );
+        assert_eq!(targets, vec!["MyStruct".to_owned()]);
+    }
+
+    #[test]
+    fn type_ref_extracted_from_generic() {
+        let source = r#"
+struct MyStruct {}
+
+fn foo() -> Vec<MyStruct> { todo!() }
+"#;
+
+        let targets = edge_targets_for_source(
+            &extract_with_edges(Language::Rust, "src/lib.rs", source),
+            "foo",
+            EdgeKind::TypeRef,
+        );
+        assert_eq!(targets, vec!["MyStruct".to_owned()]);
+    }
+
+    #[test]
+    fn type_ref_extracted_from_reference() {
+        let source = r#"
+struct MyStruct {}
+
+fn foo(bar: &MyStruct) {}
+"#;
+
+        let targets = edge_targets_for_source(
+            &extract_with_edges(Language::Rust, "src/lib.rs", source),
+            "foo",
+            EdgeKind::TypeRef,
+        );
+        assert_eq!(targets, vec!["MyStruct".to_owned()]);
+    }
+
+    #[test]
+    fn type_ref_extracted_to_enum() {
+        let source = r#"
+enum MyEnum { A, B }
+
+fn foo(e: MyEnum) {}
+"#;
+
+        let targets = edge_targets_for_source(
+            &extract_with_edges(Language::Rust, "src/lib.rs", source),
+            "foo",
+            EdgeKind::TypeRef,
+        );
+        assert_eq!(targets, vec!["MyEnum".to_owned()]);
+    }
+
+    #[test]
+    fn type_ref_extracted_to_type_alias() {
+        let source = r#"
+type MyAlias = u32;
+
+fn foo(x: MyAlias) {}
+"#;
+
+        let targets = edge_targets_for_source(
+            &extract_with_edges(Language::Rust, "src/lib.rs", source),
+            "foo",
+            EdgeKind::TypeRef,
+        );
+        assert_eq!(targets, vec!["MyAlias".to_owned()]);
+    }
+
+    #[test]
+    fn type_ref_extracted_to_trait_object() {
+        let source = r#"
+trait MyTrait {}
+
+fn foo(t: &dyn MyTrait) {}
+"#;
+
+        let targets = edge_targets_for_source(
+            &extract_with_edges(Language::Rust, "src/lib.rs", source),
+            "foo",
+            EdgeKind::TypeRef,
+        );
+        assert_eq!(targets, vec!["MyTrait".to_owned()]);
+    }
+
+    #[test]
+    fn type_ref_resolves_scoped_type() {
+        let source = r#"
+mod models {
+    pub struct MyStruct {}
+}
+
+use models::MyStruct as ImportedStruct;
+
+fn foo(value: ImportedStruct) {}
+"#;
+
+        let targets = edge_targets_for_source(
+            &extract_with_edges(Language::Rust, "src/lib.rs", source),
+            "foo",
+            EdgeKind::TypeRef,
+        );
+        assert_eq!(targets, vec!["models::MyStruct".to_owned()]);
+    }
+
+    #[test]
+    fn type_ref_extracts_inner_from_nested_generic() {
+        let source = r#"
+struct MyStruct {}
+
+fn foo() -> Option<Result<MyStruct, String>> { todo!() }
+"#;
+
+        let targets = edge_targets_for_source(
+            &extract_with_edges(Language::Rust, "src/lib.rs", source),
+            "foo",
+            EdgeKind::TypeRef,
+        );
+        assert_eq!(targets, vec!["MyStruct".to_owned()]);
+    }
+
+    #[test]
+    fn type_ref_dedupes_repeated_same_type() {
+        let source = r#"
+struct MyType {}
+
+fn foo(a: MyType, b: MyType) -> MyType { todo!() }
+"#;
+
+        let targets = edge_targets_for_source(
+            &extract_with_edges(Language::Rust, "src/lib.rs", source),
+            "foo",
+            EdgeKind::TypeRef,
+        );
+        assert_eq!(targets, vec!["MyType".to_owned()]);
+    }
+
+    #[test]
+    fn type_ref_skips_stdlib_types() {
+        let source = r#"
+fn foo(s: String, n: u32) {}
+"#;
+
+        let extracted = extract_with_edges(Language::Rust, "src/lib.rs", source);
+        assert!(
+            extracted
+                .edges
+                .iter()
+                .all(|edge| edge.edge_kind != EdgeKind::TypeRef)
+        );
+    }
+
+    #[test]
+    fn type_ref_skips_unresolved_types() {
+        let source = r#"
+fn foo(x: SomeExternalType) {}
+"#;
+
+        let extracted = extract_with_edges(Language::Rust, "src/lib.rs", source);
+        assert!(
+            extracted
+                .edges
+                .iter()
+                .all(|edge| edge.edge_kind != EdgeKind::TypeRef)
+        );
+    }
+
+    #[test]
+    fn multiple_type_refs_from_one_function() {
+        let source = r#"
+struct A {}
+struct B {}
+struct C {}
+
+fn foo(a: A, b: B) -> C { todo!() }
+"#;
+
+        let targets = edge_targets_for_source(
+            &extract_with_edges(Language::Rust, "src/lib.rs", source),
+            "foo",
+            EdgeKind::TypeRef,
+        );
+        assert_eq!(
+            targets,
+            vec!["A".to_owned(), "B".to_owned(), "C".to_owned()]
+        );
+    }
+
+    #[test]
+    fn type_ref_and_calls_coexist() {
+        let source = r#"
+struct Input {}
+
+fn helper() {}
+
+fn foo(value: Input) {
+    helper();
+}
+"#;
+
+        let extracted = extract_with_edges(Language::Rust, "src/lib.rs", source);
+        let type_targets = edge_targets_for_source(&extracted, "foo", EdgeKind::TypeRef);
+        let call_targets = edge_targets_for_source(&extracted, "foo", EdgeKind::Calls);
+
+        assert_eq!(type_targets, vec!["Input".to_owned()]);
+        assert_eq!(call_targets, vec!["helper".to_owned()]);
+    }
+
+    #[test]
+    fn implements_extracted_from_impl_trait() {
+        let source = r#"
+trait Store {}
+struct SqliteStore {}
+
+impl Store for SqliteStore {}
+"#;
+
+        let targets = edge_targets_for_source(
+            &extract_with_edges(Language::Rust, "src/lib.rs", source),
+            "SqliteStore",
+            EdgeKind::Implements,
+        );
+        assert_eq!(targets, vec!["Store".to_owned()]);
+    }
+
+    #[test]
+    fn implements_no_edge_for_bare_impl() {
+        let source = r#"
+struct Foo {}
+
+impl Foo {
+    fn bar(&self) {}
+}
+"#;
+
+        let extracted = extract_with_edges(Language::Rust, "src/lib.rs", source);
+        assert!(
+            extracted
+                .edges
+                .iter()
+                .all(|edge| edge.edge_kind != EdgeKind::Implements)
+        );
     }
 
     #[test]

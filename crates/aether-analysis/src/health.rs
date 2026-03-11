@@ -986,7 +986,7 @@ async fn query_dependency_edges(
                 edge_kind: edge_kind
             }
             FROM depends_on
-            WHERE edge_kind INSIDE ["calls", "depends_on"];
+            WHERE edge_kind INSIDE ["calls", "depends_on", "type_ref", "implements"];
             "#,
         )
         .await

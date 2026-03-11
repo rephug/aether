@@ -1223,7 +1223,7 @@ impl SirPipeline {
                 file_path = %file_path,
                 resolved_edges = stats.resolved_edges,
                 unresolved_edges = stats.unresolved_edges,
-                "graph sync skipped unresolved call edges"
+                "graph sync skipped unresolved structural edges"
             );
         }
 

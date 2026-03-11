@@ -94,7 +94,7 @@ pub(crate) fn load_dependency_algo_edges(
             SELECT e.source_id, t.id, e.edge_kind
             FROM symbol_edges e
             JOIN symbols t ON t.qualified_name = e.target_qualified_name
-            WHERE e.edge_kind IN ('calls', 'depends_on')
+            WHERE e.edge_kind IN ('calls', 'depends_on', 'type_ref', 'implements')
             "#,
         )
         .map_err(|e| e.to_string())?;

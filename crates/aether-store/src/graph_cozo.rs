@@ -8,8 +8,9 @@ use async_trait::async_trait;
 use cozo::{DataValue, DbInstance, NamedRows, ScriptMutability};
 
 use super::{
-    CouplingEdgeRecord, GraphStore, ResolvedEdge, StoreError, SymbolRecord, TestedByRecord,
-    UpstreamDependencyEdgeRecord, UpstreamDependencyNodeRecord, UpstreamDependencyTraversal,
+    CouplingEdgeRecord, GraphStore, ResolvedEdge, STRUCTURAL_EDGE_KINDS, StoreError, SymbolRecord,
+    TestedByRecord, UpstreamDependencyEdgeRecord, UpstreamDependencyNodeRecord,
+    UpstreamDependencyTraversal, edge_kind_from_str,
 };
 
 pub struct CozoGraphStore {
@@ -305,7 +306,7 @@ impl CozoGraphStore {
                 .ok_or_else(|| StoreError::Cozo("invalid edge_kind value".to_owned()))?
                 .to_owned();
 
-            if !matches!(edge_kind.as_str(), "calls" | "depends_on") {
+            if !STRUCTURAL_EDGE_KINDS.contains(&edge_kind.as_str()) {
                 continue;
             }
 
@@ -372,10 +373,8 @@ impl CozoGraphStore {
             let edge_kind_str = row[2]
                 .get_str()
                 .ok_or_else(|| StoreError::Cozo("invalid migration edge_kind value".to_owned()))?;
-            let edge_kind = match edge_kind_str {
-                "calls" => aether_core::EdgeKind::Calls,
-                "depends_on" => aether_core::EdgeKind::DependsOn,
-                _ => continue,
+            let Some(edge_kind) = edge_kind_from_str(edge_kind_str) else {
+                continue;
             };
             edges.push(ResolvedEdge {
                 source_id: row[0]
@@ -411,6 +410,12 @@ impl CozoGraphStore {
             dep_edges[source, target] :=
                 *edges{source_id: source, target_id: target, edge_kind},
                 edge_kind = "depends_on"
+            dep_edges[source, target] :=
+                *edges{source_id: source, target_id: target, edge_kind},
+                edge_kind = "type_ref"
+            dep_edges[source, target] :=
+                *edges{source_id: source, target_id: target, edge_kind},
+                edge_kind = "implements"
 
             ?[node, community] := community_detection_louvain(*dep_edges[], node, community)
             :order node
@@ -444,6 +449,12 @@ impl CozoGraphStore {
             dep_edges[source, target] :=
                 *edges{source_id: source, target_id: target, edge_kind},
                 edge_kind = "depends_on"
+            dep_edges[source, target] :=
+                *edges{source_id: source, target_id: target, edge_kind},
+                edge_kind = "type_ref"
+            dep_edges[source, target] :=
+                *edges{source_id: source, target_id: target, edge_kind},
+                edge_kind = "implements"
 
             ?[node, rank] := pagerank(*dep_edges[], node, rank)
             :order node
@@ -482,6 +493,12 @@ impl CozoGraphStore {
             dep_edges[source, target] :=
                 *edges{source_id: source, target_id: target, edge_kind},
                 edge_kind = "depends_on"
+            dep_edges[source, target] :=
+                *edges{source_id: source, target_id: target, edge_kind},
+                edge_kind = "type_ref"
+            dep_edges[source, target] :=
+                *edges{source_id: source, target_id: target, edge_kind},
+                edge_kind = "implements"
 
             ?[node, component] := strongly_connected_components(*dep_edges[], node, component)
             :order component, node
@@ -515,6 +532,12 @@ impl CozoGraphStore {
             dep_edges[source, target] :=
                 *edges{source_id: source, target_id: target, edge_kind},
                 edge_kind = "depends_on"
+            dep_edges[source, target] :=
+                *edges{source_id: source, target_id: target, edge_kind},
+                edge_kind = "type_ref"
+            dep_edges[source, target] :=
+                *edges{source_id: source, target_id: target, edge_kind},
+                edge_kind = "implements"
 
             ?[node, component] := connected_components(*dep_edges[], node, component)
             :order component, node
@@ -887,6 +910,10 @@ impl CozoGraphStore {
                 *edges{source_id: source, target_id: target, edge_kind: "calls"}
             dep_edges[source, target] :=
                 *edges{source_id: source, target_id: target, edge_kind: "depends_on"}
+            dep_edges[source, target] :=
+                *edges{source_id: source, target_id: target, edge_kind: "type_ref"}
+            dep_edges[source, target] :=
+                *edges{source_id: source, target_id: target, edge_kind: "implements"}
 
             reachable[source, target, depth] :=
                 dep_edges[$start, target],
@@ -2114,5 +2141,49 @@ mod tests {
             .expect("upstream traversal");
         assert!(traversal.nodes.iter().all(|node| node.depth <= 3));
         assert!(traversal.edges.iter().all(|edge| edge.depth <= 3));
+    }
+
+    #[test]
+    fn cozo_graph_round_trips_new_structural_edge_kinds() {
+        let temp = tempdir().expect("tempdir");
+        let graph = CozoGraphStore::open(temp.path()).expect("open cozo graph store");
+
+        let alpha = symbol("sym-alpha", "alpha");
+        let target = symbol("sym-target", "Target");
+        let store_trait = symbol("sym-store", "Store");
+        let impl_type = symbol("sym-impl", "SqliteStore");
+        for row in [&alpha, &target, &store_trait, &impl_type] {
+            graph.upsert_symbol_node(row).expect("upsert symbol");
+        }
+        for edge in [
+            ResolvedEdge {
+                source_id: alpha.id.clone(),
+                target_id: target.id.clone(),
+                edge_kind: EdgeKind::TypeRef,
+                file_path: "src/lib.rs".to_owned(),
+            },
+            ResolvedEdge {
+                source_id: impl_type.id.clone(),
+                target_id: store_trait.id.clone(),
+                edge_kind: EdgeKind::Implements,
+                file_path: "src/lib.rs".to_owned(),
+            },
+        ] {
+            graph.upsert_edge(&edge).expect("upsert edge");
+        }
+
+        let edges = graph
+            .list_all_edges_for_migration()
+            .expect("list all edges for migration");
+        assert!(edges.iter().any(|edge| {
+            edge.source_id == alpha.id
+                && edge.target_id == target.id
+                && edge.edge_kind == EdgeKind::TypeRef
+        }));
+        assert!(edges.iter().any(|edge| {
+            edge.source_id == impl_type.id
+                && edge.target_id == store_trait.id
+                && edge.edge_kind == EdgeKind::Implements
+        }));
     }
 }

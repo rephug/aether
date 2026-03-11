@@ -414,6 +414,19 @@ pub struct GraphSyncStats {
     pub unresolved_edges: usize,
 }
 
+pub(crate) const STRUCTURAL_EDGE_KINDS: &[&str] =
+    &["calls", "depends_on", "type_ref", "implements"];
+
+pub(crate) fn edge_kind_from_str(value: &str) -> Option<EdgeKind> {
+    match value {
+        "calls" => Some(EdgeKind::Calls),
+        "depends_on" => Some(EdgeKind::DependsOn),
+        "type_ref" => Some(EdgeKind::TypeRef),
+        "implements" => Some(EdgeKind::Implements),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamDependencyNodeRecord {
     pub symbol_id: String,
@@ -1586,7 +1599,7 @@ impl SqliteStore {
             FROM symbol_edges e
             JOIN symbols target
               ON target.qualified_name = e.target_qualified_name
-            WHERE e.edge_kind IN ('calls', 'depends_on')
+            WHERE e.edge_kind IN ('calls', 'depends_on', 'type_ref', 'implements')
             ORDER BY e.source_id ASC, target.id ASC, e.edge_kind ASC
             "#,
         )?;
@@ -1735,48 +1748,69 @@ impl SqliteStore {
             let mut unresolved_edges = 0usize;
             let mut unresolved_stmt = conn.prepare(
                 r#"
-                SELECT e.source_id, e.target_qualified_name
+                SELECT e.source_id, e.target_qualified_name, e.edge_kind
                 FROM symbol_edges e
-                LEFT JOIN symbols s ON s.qualified_name = e.target_qualified_name
+                JOIN symbols source ON source.id = e.source_id
+                LEFT JOIN symbols target ON target.qualified_name = e.target_qualified_name
                 WHERE e.file_path = ?1
-                  AND e.edge_kind = 'calls'
-                  AND s.id IS NULL
-                ORDER BY e.source_id ASC, e.target_qualified_name ASC
+                  AND e.edge_kind IN ('calls', 'type_ref', 'implements')
+                  AND target.id IS NULL
+                ORDER BY e.source_id ASC, e.target_qualified_name ASC, e.edge_kind ASC
                 "#,
             )?;
             let unresolved_rows = unresolved_stmt.query_map(params![file_path], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })?;
             for row in unresolved_rows {
-                let (source_id, target_qualified_name) = row?;
+                let (source_id, target_qualified_name, edge_kind) = row?;
                 unresolved_edges += 1;
                 tracing::debug!(
                     source_id = %source_id,
                     target_qualified_name = %target_qualified_name,
+                    edge_kind = %edge_kind,
                     file_path = %file_path,
-                    "unresolved call edge skipped during graph sync"
+                    "unresolved structural edge skipped during graph sync"
                 );
             }
 
             let mut resolved_stmt = conn.prepare(
                 r#"
-                SELECT e.source_id, s.id, e.file_path
+                SELECT e.source_id, target.id, e.edge_kind, e.file_path
                 FROM symbol_edges e
-                JOIN symbols s ON s.qualified_name = e.target_qualified_name
+                JOIN symbols source ON source.id = e.source_id
+                JOIN symbols target ON target.qualified_name = e.target_qualified_name
                 WHERE e.file_path = ?1
-                  AND e.edge_kind = 'calls'
-                ORDER BY e.source_id ASC, s.id ASC
+                  AND e.edge_kind IN ('calls', 'type_ref', 'implements')
+                ORDER BY e.source_id ASC, target.id ASC, e.edge_kind ASC
                 "#,
             )?;
             let resolved_rows = resolved_stmt.query_map(params![file_path], |row| {
-                Ok(ResolvedEdge {
-                    source_id: row.get(0)?,
-                    target_id: row.get(1)?,
-                    edge_kind: EdgeKind::Calls,
-                    file_path: row.get(2)?,
-                })
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
             })?;
-            let resolved: Vec<ResolvedEdge> = resolved_rows.collect::<Result<Vec<_>, _>>()?;
+            let mut resolved = Vec::new();
+            for row in resolved_rows {
+                let (source_id, target_id, edge_kind, file_path) = row?;
+                let edge_kind = edge_kind_from_str(edge_kind.as_str()).ok_or_else(|| {
+                    StoreError::Compatibility(format!(
+                        "unsupported edge kind during graph sync: {edge_kind}"
+                    ))
+                })?;
+                resolved.push(ResolvedEdge {
+                    source_id,
+                    target_id,
+                    edge_kind,
+                    file_path,
+                });
+            }
             (unresolved_edges, resolved)
         };
 
@@ -3620,7 +3654,7 @@ impl Store for SqliteStore {
                 FROM symbol_edges e
                 JOIN symbols s_source ON s_source.id = e.source_id
                 JOIN symbols s_target ON s_target.qualified_name = e.target_qualified_name
-                WHERE e.edge_kind IN ('calls', 'depends_on')
+                WHERE e.edge_kind IN ('calls', 'depends_on', 'type_ref', 'implements')
                   AND (
                       (s_source.file_path = ?1 AND s_target.file_path = ?2)
                       OR
@@ -4197,7 +4231,7 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         CREATE TABLE IF NOT EXISTS symbol_edges (
             source_id TEXT NOT NULL,
             target_qualified_name TEXT NOT NULL,
-            edge_kind TEXT NOT NULL CHECK (edge_kind IN ('calls', 'depends_on')),
+            edge_kind TEXT NOT NULL CHECK (edge_kind IN ('calls', 'depends_on', 'type_ref', 'implements')),
             file_path TEXT NOT NULL,
             PRIMARY KEY (source_id, target_qualified_name, edge_kind)
         );
@@ -4432,6 +4466,11 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         conn.execute("PRAGMA user_version = 6", [])?;
     }
 
+    if version < 7 {
+        upgrade_symbol_edges_table(conn)?;
+        conn.execute("PRAGMA user_version = 7", [])?;
+    }
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -4502,6 +4541,40 @@ fn ensure_symbols_column(
 
     let sql = format!("ALTER TABLE symbols ADD COLUMN {column_name} {column_definition}");
     conn.execute(&sql, [])?;
+    Ok(())
+}
+
+fn upgrade_symbol_edges_table(conn: &Connection) -> Result<(), StoreError> {
+    if !table_exists(conn, "symbol_edges")? {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        r#"
+        ALTER TABLE symbol_edges RENAME TO symbol_edges_old;
+
+        CREATE TABLE symbol_edges (
+            source_id TEXT NOT NULL,
+            target_qualified_name TEXT NOT NULL,
+            edge_kind TEXT NOT NULL CHECK (edge_kind IN ('calls', 'depends_on', 'type_ref', 'implements')),
+            file_path TEXT NOT NULL,
+            PRIMARY KEY (source_id, target_qualified_name, edge_kind)
+        );
+
+        INSERT INTO symbol_edges (source_id, target_qualified_name, edge_kind, file_path)
+        SELECT source_id, target_qualified_name, edge_kind, file_path
+        FROM symbol_edges_old;
+
+        DROP TABLE symbol_edges_old;
+
+        CREATE INDEX IF NOT EXISTS idx_edges_target
+            ON symbol_edges(target_qualified_name);
+
+        CREATE INDEX IF NOT EXISTS idx_edges_file
+            ON symbol_edges(file_path);
+        "#,
+    )?;
+
     Ok(())
 }
 
@@ -5099,6 +5172,24 @@ mod tests {
         }
     }
 
+    fn type_ref_edge(source_id: &str, target: &str, file_path: &str) -> SymbolEdge {
+        SymbolEdge {
+            source_id: source_id.to_owned(),
+            target_qualified_name: target.to_owned(),
+            edge_kind: EdgeKind::TypeRef,
+            file_path: file_path.to_owned(),
+        }
+    }
+
+    fn implements_edge(source_id: &str, target: &str, file_path: &str) -> SymbolEdge {
+        SymbolEdge {
+            source_id: source_id.to_owned(),
+            target_qualified_name: target.to_owned(),
+            edge_kind: EdgeKind::Implements,
+            file_path: file_path.to_owned(),
+        }
+    }
+
     #[test]
     fn store_creates_layout_and_persists_data_without_duplicates() {
         let temp = tempdir().expect("tempdir");
@@ -5264,6 +5355,84 @@ mod tests {
             .await
             .expect("query dependencies");
         assert!(deps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_graph_for_file_syncs_type_ref_and_implements_edges() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        let graph = SurrealGraphStore::open(temp.path())
+            .await
+            .expect("open surreal graph store");
+
+        let alpha = SymbolRecord {
+            id: "sym-alpha".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            language: "rust".to_owned(),
+            kind: "function".to_owned(),
+            qualified_name: "alpha".to_owned(),
+            signature_fingerprint: "sig-alpha".to_owned(),
+            last_seen_at: 1_700_000_000,
+        };
+        let target = SymbolRecord {
+            id: "sym-target".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            language: "rust".to_owned(),
+            kind: "struct".to_owned(),
+            qualified_name: "Target".to_owned(),
+            signature_fingerprint: "sig-target".to_owned(),
+            last_seen_at: 1_700_000_000,
+        };
+        let store_trait = SymbolRecord {
+            id: "sym-store".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            language: "rust".to_owned(),
+            kind: "trait".to_owned(),
+            qualified_name: "Store".to_owned(),
+            signature_fingerprint: "sig-store".to_owned(),
+            last_seen_at: 1_700_000_000,
+        };
+        let impl_type = SymbolRecord {
+            id: "sym-impl".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            language: "rust".to_owned(),
+            kind: "struct".to_owned(),
+            qualified_name: "SqliteStore".to_owned(),
+            signature_fingerprint: "sig-impl".to_owned(),
+            last_seen_at: 1_700_000_000,
+        };
+
+        for symbol in [&alpha, &target, &store_trait, &impl_type] {
+            store.upsert_symbol(symbol.clone()).expect("upsert symbol");
+        }
+        store
+            .upsert_edges(&[
+                type_ref_edge(&alpha.id, "Target", "src/lib.rs"),
+                implements_edge(&impl_type.id, "Store", "src/lib.rs"),
+            ])
+            .expect("upsert structural edges");
+
+        let stats = store
+            .sync_graph_for_file(&graph, "src/lib.rs")
+            .await
+            .expect("sync graph for file");
+        assert_eq!(stats.resolved_edges, 2);
+        assert_eq!(stats.unresolved_edges, 0);
+
+        let edges = graph
+            .list_dependency_edges()
+            .await
+            .expect("list dependency edges");
+        assert!(edges.iter().any(|edge| {
+            edge.source_symbol_id == alpha.id
+                && edge.target_symbol_id == target.id
+                && edge.edge_kind == "type_ref"
+        }));
+        assert!(edges.iter().any(|edge| {
+            edge.source_symbol_id == impl_type.id
+                && edge.target_symbol_id == store_trait.id
+                && edge.edge_kind == "implements"
+        }));
     }
 
     #[cfg(feature = "legacy-cozo")]
@@ -5489,8 +5658,49 @@ graph_backend = "cozo"
         assert_eq!(single_meta.generation_pass, "scan");
         assert_eq!(
             store.get_schema_version().expect("schema version").version,
-            6
+            7
         );
+    }
+
+    #[test]
+    fn migration_v7_expands_symbol_edge_kinds() {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE symbol_edges (
+                source_id TEXT NOT NULL,
+                target_qualified_name TEXT NOT NULL,
+                edge_kind TEXT NOT NULL CHECK (edge_kind IN ('calls', 'depends_on')),
+                file_path TEXT NOT NULL,
+                PRIMARY KEY (source_id, target_qualified_name, edge_kind)
+            );
+            INSERT INTO symbol_edges (source_id, target_qualified_name, edge_kind, file_path)
+            VALUES ('sym-a', 'beta', 'calls', 'src/lib.rs');
+            PRAGMA user_version = 6;
+            "#,
+        )
+        .expect("seed v6 symbol_edges schema");
+
+        run_migrations(&conn).expect("run migrations");
+
+        let version: i32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("query migrated version");
+        assert_eq!(version, 7);
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_edges", [], |row| row.get(0))
+            .expect("count migrated edges");
+        assert_eq!(count, 1);
+
+        conn.execute(
+            r#"
+            INSERT INTO symbol_edges (source_id, target_qualified_name, edge_kind, file_path)
+            VALUES (?1, ?2, ?3, ?4)
+            "#,
+            params!["sym-b", "TargetType", "type_ref", "src/lib.rs"],
+        )
+        .expect("insert type_ref edge after migration");
     }
 
     #[test]
@@ -6142,13 +6352,13 @@ mirror_sir_files = false
         let first_version: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("query first user_version");
-        assert_eq!(first_version, 6);
+        assert_eq!(first_version, 7);
 
         run_migrations(&conn).expect("run migrations twice");
         let second_version: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("query second user_version");
-        assert_eq!(second_version, 6);
+        assert_eq!(second_version, 7);
     }
 
     #[test]
@@ -6158,7 +6368,7 @@ mirror_sir_files = false
 
         let schema = store.get_schema_version().expect("get schema version");
         assert_eq!(schema.component, "core");
-        assert_eq!(schema.version, 6);
+        assert_eq!(schema.version, 7);
         assert!(schema.migrated_at > 0);
     }
 
@@ -6348,7 +6558,7 @@ mirror_sir_files = false
         let version: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("query user_version");
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
 
         let exists = conn
             .query_row(
