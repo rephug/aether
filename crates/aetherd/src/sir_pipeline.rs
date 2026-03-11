@@ -15,9 +15,9 @@ use aether_core::{
     GitContext, Language, Position, SourceRange, Symbol, SymbolChangeEvent, content_hash,
 };
 use aether_infer::{
-    EmbeddingProvider, EmbeddingProviderOverrides, InferError, InferSirResult, InferenceProvider,
-    ProviderOverrides, Qwen3LocalProvider, SirContext, load_embedding_provider_from_config,
-    load_provider_from_env_or_mock,
+    EmbeddingProvider, EmbeddingProviderOverrides, EmbeddingPurpose, InferError, InferSirResult,
+    InferenceProvider, ProviderOverrides, Qwen3LocalProvider, SirContext,
+    load_embedding_provider_from_config, load_provider_from_env_or_mock,
     sir_prompt::{self, SirEnrichmentContext},
 };
 use aether_parse::{SymbolExtractor, TestIntent};
@@ -1286,7 +1286,10 @@ impl SirPipeline {
 
         let embedding = self
             .runtime
-            .block_on(embedding_provider.embed_text(canonical_json))
+            .block_on(
+                embedding_provider
+                    .embed_text_with_purpose(canonical_json, EmbeddingPurpose::Document),
+            )
             .with_context(|| format!("failed to generate embedding for {symbol_id}"))?;
 
         if embedding.is_empty() {
@@ -2099,6 +2102,7 @@ fn to_test_intent_record(intent: TestIntent, now_ms: i64) -> TestIntentRecord {
 mod tests {
     use std::fs;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -2110,12 +2114,27 @@ mod tests {
     #[derive(Clone)]
     struct CountingEmbeddingProvider {
         calls: Arc<AtomicUsize>,
+        purposes: Arc<Mutex<Vec<EmbeddingPurpose>>>,
     }
 
     #[async_trait]
     impl EmbeddingProvider for CountingEmbeddingProvider {
         async fn embed_text(&self, _text: &str) -> std::result::Result<Vec<f32>, InferError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.purposes
+                .lock()
+                .expect("purposes mutex")
+                .push(EmbeddingPurpose::Document);
+            Ok(vec![1.0, 0.0])
+        }
+
+        async fn embed_text_with_purpose(
+            &self,
+            _text: &str,
+            purpose: EmbeddingPurpose,
+        ) -> std::result::Result<Vec<f32>, InferError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.purposes.lock().expect("purposes mutex").push(purpose);
             Ok(vec![1.0, 0.0])
         }
     }
@@ -2298,10 +2317,12 @@ enabled = false
         }
 
         let calls = Arc::new(AtomicUsize::new(0));
+        let purposes = Arc::new(Mutex::new(Vec::new()));
         let pipeline = build_embeddings_only_pipeline(
             workspace,
             Arc::new(CountingEmbeddingProvider {
                 calls: Arc::clone(&calls),
+                purposes: Arc::clone(&purposes),
             }),
         );
 
@@ -2311,6 +2332,14 @@ enabled = false
             .expect("run embeddings-only pass");
 
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            purposes.lock().expect("purposes mutex").as_slice(),
+            &[
+                EmbeddingPurpose::Document,
+                EmbeddingPurpose::Document,
+                EmbeddingPurpose::Document,
+            ]
+        );
         let rendered = String::from_utf8(out).expect("utf8 output");
         assert!(rendered.contains("Re-embedding 3 symbols with test_embedding/test-model..."));
         assert!(rendered.contains(
@@ -2342,10 +2371,12 @@ enabled = false
         upsert_existing_embedding(workspace, "sym-b", hashes["sym-b"].as_str());
 
         let calls = Arc::new(AtomicUsize::new(0));
+        let purposes = Arc::new(Mutex::new(Vec::new()));
         let pipeline = build_embeddings_only_pipeline(
             workspace,
             Arc::new(CountingEmbeddingProvider {
                 calls: Arc::clone(&calls),
+                purposes: Arc::clone(&purposes),
             }),
         );
 
@@ -2355,6 +2386,10 @@ enabled = false
             .expect("run embeddings-only pass");
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            purposes.lock().expect("purposes mutex").as_slice(),
+            &[EmbeddingPurpose::Document]
+        );
         let rendered = String::from_utf8(out).expect("utf8 output");
         assert!(rendered.contains(
             "Re-embedded 1 of 3 symbols with test_embedding/test-model (0 skipped: no current SIR, 2 already up to date, 0 errors)"
@@ -2379,10 +2414,12 @@ enabled = false
         seed_sir(&store, "sym-with-sir", &sir);
 
         let calls = Arc::new(AtomicUsize::new(0));
+        let purposes = Arc::new(Mutex::new(Vec::new()));
         let pipeline = build_embeddings_only_pipeline(
             workspace,
             Arc::new(CountingEmbeddingProvider {
                 calls: Arc::clone(&calls),
+                purposes: Arc::clone(&purposes),
             }),
         );
 
@@ -2400,6 +2437,10 @@ enabled = false
             .expect("read missing embedding meta");
         assert!(missing.is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            purposes.lock().expect("purposes mutex").as_slice(),
+            &[EmbeddingPurpose::Document]
+        );
 
         let rendered = String::from_utf8(out).expect("utf8 output");
         assert!(rendered.contains(
@@ -2435,10 +2476,12 @@ enabled = false
         let before_edges = count_table_rows(workspace, "symbol_edges");
 
         let calls = Arc::new(AtomicUsize::new(0));
+        let purposes = Arc::new(Mutex::new(Vec::new()));
         let pipeline = build_embeddings_only_pipeline(
             workspace,
             Arc::new(CountingEmbeddingProvider {
                 calls: Arc::clone(&calls),
+                purposes: Arc::clone(&purposes),
             }),
         );
 
@@ -2448,6 +2491,10 @@ enabled = false
             .expect("run embeddings-only pass");
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            purposes.lock().expect("purposes mutex").as_slice(),
+            &[EmbeddingPurpose::Document, EmbeddingPurpose::Document]
+        );
         assert_eq!(count_table_rows(workspace, "symbols"), before_symbols);
         assert_eq!(count_table_rows(workspace, "sir"), before_sir);
         assert_eq!(count_table_rows(workspace, "symbol_edges"), before_edges);

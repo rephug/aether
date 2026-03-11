@@ -187,4 +187,54 @@ mod tests {
         assert!((embedding[1] - 0.8).abs() < 1e-6);
         server.join().expect("join server");
     }
+
+    #[test]
+    fn openai_compat_embedding_provider_ignores_purpose_parameter() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!(
+            "http://{}/v1/embeddings/",
+            listener.local_addr().expect("local addr")
+        );
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut buffer = [0_u8; 4096];
+            let bytes_read = stream.read(&mut buffer).expect("read request");
+            let request = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+            assert!(request.contains("\"task_type\":\"CODE_RETRIEVAL\""));
+
+            let response_body = "{\"data\":[{\"embedding\":[1,0]}]}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+
+        let provider = OpenAiCompatEmbeddingProvider::new(
+            endpoint,
+            "text-embedding-3-large".to_owned(),
+            Secret::new("test-key".to_owned()),
+            Some("CODE_RETRIEVAL".to_owned()),
+            None,
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let embedding = runtime
+            .block_on(
+                provider
+                    .embed_text_with_purpose("hello embeddings", crate::EmbeddingPurpose::Query),
+            )
+            .expect("request embedding");
+
+        assert_eq!(embedding, vec![1.0, 0.0]);
+        server.join().expect("join server");
+    }
 }
