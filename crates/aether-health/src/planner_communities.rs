@@ -514,6 +514,7 @@ const ANCHOR_STOPWORDS: &[&str] = &[
     "record",
     "load",
     "save",
+    "search",
     "open",
     "close",
     "new",
@@ -536,10 +537,12 @@ const ANCHOR_STOPWORDS: &[&str] = &[
     "try",
     "check",
     "ensure",
+    "acknowledge",
     "resolve",
     "as",
     "to",
     "sync",
+    "test",
 ];
 
 fn normalize_anchor_token(token: &str) -> String {
@@ -591,18 +594,6 @@ fn informative_tokens(name: &str) -> Vec<String> {
         .collect()
 }
 
-fn informative_compound(name: &str) -> Option<String> {
-    let tokens = informative_tokens(name);
-    (tokens.len() >= 2).then(|| format!("{}_{}", tokens[0], tokens[1]))
-}
-
-fn token_overlap(left: &[String], right: &[String]) -> usize {
-    let right_tokens = right.iter().collect::<HashSet<_>>();
-    left.iter()
-        .filter(|token| right_tokens.contains(token))
-        .count()
-}
-
 fn split_large_anchor_groups(
     entries: &[SymbolEntry],
     original_groups: Vec<Vec<usize>>,
@@ -643,51 +634,19 @@ fn split_large_anchor_groups(
         }
 
         let mut method_tokens = HashMap::<usize, Vec<String>>::new();
-        let mut method_compounds = HashMap::<usize, Option<String>>::new();
-        let mut token_freq = HashMap::<String, usize>::new();
-        let mut compound_freq = HashMap::<String, usize>::new();
         for index in &method_indices {
             let name = entries[*index].symbol.qualified_name.as_str();
             let tokens = informative_tokens(name);
-            let compound = informative_compound(name);
-            let unique_tokens = tokens.iter().cloned().collect::<BTreeSet<_>>();
-            for token in unique_tokens {
-                *token_freq.entry(token).or_default() += 1;
-            }
-            if let Some(compound_key) = compound.clone() {
-                *compound_freq.entry(compound_key).or_default() += 1;
-            }
             method_tokens.insert(*index, tokens);
-            method_compounds.insert(*index, compound);
         }
 
         let mut bucket_members = BTreeMap::<String, Vec<usize>>::new();
-        let method_count = method_indices.len();
         for index in &method_indices {
-            let tokens = method_tokens.get(index).cloned().unwrap_or_default();
-            let bucket_key = if let Some(compound) = method_compounds.get(index).cloned().flatten()
-                && compound_freq.get(&compound).copied().unwrap_or_default() >= 2
-            {
-                compound
-            } else if tokens.is_empty() {
-                "misc".to_owned()
-            } else {
-                let mut ranked_tokens = tokens
-                    .iter()
-                    .cloned()
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .map(|token| (token_freq.get(&token).copied().unwrap_or_default(), token))
-                    .collect::<Vec<_>>();
-                ranked_tokens
-                    .sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-                ranked_tokens
-                    .iter()
-                    .find(|(freq, _)| freq * 2 <= method_count)
-                    .or_else(|| ranked_tokens.first())
-                    .map(|(_, token)| token.clone())
-                    .unwrap_or_else(|| "misc".to_owned())
-            };
+            let bucket_key = method_tokens
+                .get(index)
+                .and_then(|tokens| tokens.first())
+                .cloned()
+                .unwrap_or_else(|| "misc".to_owned());
             bucket_members.entry(bucket_key).or_default().push(*index);
         }
 
@@ -725,15 +684,17 @@ fn split_large_anchor_groups(
                 .iter()
                 .filter(|(_, members)| members.len() >= ANCHOR_MIN_BUCKET)
                 .map(|(key, members)| {
+                    let target_tokens = bucket_tokens
+                        .get(key)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    let target_tokens = target_tokens.iter().collect::<HashSet<_>>();
                     (
                         key.clone(),
-                        token_overlap(
-                            small_tokens.as_slice(),
-                            bucket_tokens
-                                .get(key)
-                                .map(Vec::as_slice)
-                                .unwrap_or_default(),
-                        ),
+                        small_tokens
+                            .iter()
+                            .filter(|token| target_tokens.contains(token))
+                            .count(),
                         members.len(),
                     )
                 })
@@ -1563,6 +1524,37 @@ mod tests {
             .map(|index| union_find.find(index))
             .collect::<Vec<_>>();
         (rep_by_index, rep_to_members)
+    }
+
+    fn count_components_and_largest(
+        graph: &WeightedGraph,
+        rep_to_members: &[Vec<usize>],
+        entries: &[SymbolEntry],
+    ) -> (usize, usize) {
+        let active_reps: Vec<usize> = rep_to_members
+            .iter()
+            .enumerate()
+            .filter_map(
+                |(rep, members)| {
+                    if members.is_empty() { None } else { Some(rep) }
+                },
+            )
+            .collect();
+        if active_reps.is_empty() {
+            return (0, 0);
+        }
+        let components = graph.connected_components(&active_reps, entries);
+        let largest = components
+            .iter()
+            .map(|component| {
+                component
+                    .iter()
+                    .map(|rep| rep_to_members.get(*rep).map(Vec::len).unwrap_or(0))
+                    .sum::<usize>()
+            })
+            .max()
+            .unwrap_or(0);
+        (components.len(), largest)
     }
 
     fn non_empty_groups(groups: &[Vec<usize>]) -> Vec<Vec<usize>> {
@@ -2978,6 +2970,13 @@ mod tests {
         } else {
             0
         };
+        let rep_to_members_diag = build_rep_members(entries.len(), &mut union_find);
+        let (nc, nl) =
+            count_components_and_largest(&WeightedGraph::default(), &rep_to_members_diag, &entries);
+        eprintln!(
+            "[diag] after_anchor_split: groups={} largest_group={}",
+            nc, nl
+        );
 
         let structural_graph = collapse_structural_edges(
             filtered_structural_edges.as_slice(),
@@ -2989,6 +2988,11 @@ mod tests {
         let rep_by_index = (0..entries.len())
             .map(|index| union_find.find(index))
             .collect::<Vec<_>>();
+        let (nc, nl) = count_components_and_largest(&enriched_graph, &rep_to_members, &entries);
+        eprintln!(
+            "[diag] after_structural_edges: components={} largest_component={}",
+            nc, nl
+        );
 
         let symbols_rescued_container = if options.container_rescue {
             apply_container_rescue_with_exclusions(
@@ -3001,6 +3005,11 @@ mod tests {
         } else {
             0
         };
+        let (nc, nl) = count_components_and_largest(&enriched_graph, &rep_to_members, &entries);
+        eprintln!(
+            "[diag] after_container_rescue: components={} largest_component={} rescued={}",
+            nc, nl, symbols_rescued_container
+        );
         let symbols_rescued_semantic = if options.semantic_rescue {
             apply_semantic_rescue(
                 entries.as_slice(),
@@ -3011,6 +3020,11 @@ mod tests {
         } else {
             0
         };
+        let (nc, nl) = count_components_and_largest(&enriched_graph, &rep_to_members, &entries);
+        eprintln!(
+            "[diag] after_semantic_rescue: components={} largest_component={} rescued={}",
+            nc, nl, symbols_rescued_semantic
+        );
 
         let loner_reps = rep_to_members
             .iter()
@@ -3068,6 +3082,12 @@ mod tests {
 
         let components =
             enriched_graph.connected_components(active_reps.as_slice(), entries.as_slice());
+        let component_sizes: Vec<usize> = components.iter().map(Vec::len).collect();
+        eprintln!(
+            "[diag] connected_components: count={} sizes={:?}",
+            components.len(),
+            component_sizes
+        );
         let component_of_rep = components
             .iter()
             .enumerate()
@@ -3109,6 +3129,10 @@ mod tests {
             .copied()
             .collect::<HashSet<_>>()
             .len();
+        eprintln!(
+            "[diag] after_louvain: communities={}",
+            communities_before_merge
+        );
 
         let (rep_to_community, unmerged_small_penalty, communities_after_merge) =
             if options.merge_small {
