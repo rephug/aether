@@ -249,6 +249,8 @@ pub struct Symbol {
 pub enum EdgeKind {
     Calls,
     DependsOn,
+    TypeRef,
+    Implements,
 }
 
 impl EdgeKind {
@@ -256,6 +258,8 @@ impl EdgeKind {
         match self {
             Self::Calls => "calls",
             Self::DependsOn => "depends_on",
+            Self::TypeRef => "type_ref",
+            Self::Implements => "implements",
         }
     }
 }

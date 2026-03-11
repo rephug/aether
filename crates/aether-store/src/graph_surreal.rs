@@ -16,9 +16,9 @@ use surrealdb::Surreal;
 use surrealdb::engine::local::{Db, SurrealKv};
 
 use super::{
-    CouplingEdgeRecord, GraphDependencyEdgeRecord, GraphStore, ResolvedEdge, StoreError,
-    SymbolRecord, TestedByRecord, UpstreamDependencyEdgeRecord, UpstreamDependencyNodeRecord,
-    UpstreamDependencyTraversal,
+    CouplingEdgeRecord, GraphDependencyEdgeRecord, GraphStore, ResolvedEdge, STRUCTURAL_EDGE_KINDS,
+    StoreError, SymbolRecord, TestedByRecord, UpstreamDependencyEdgeRecord,
+    UpstreamDependencyNodeRecord, UpstreamDependencyTraversal,
 };
 
 pub type CrossCommunityEdge = (String, String, String, i64, i64);
@@ -486,7 +486,7 @@ impl SurrealGraphStore {
             let edges = self
                 .list_dependency_edges_for_sources_by_kind(
                     sources.as_slice(),
-                    &["calls", "depends_on"],
+                    STRUCTURAL_EDGE_KINDS,
                 )
                 .await?;
             if edges.is_empty() {
@@ -910,6 +910,8 @@ impl GraphStore for SurrealGraphStore {
         let edge_kind = match edge.edge_kind {
             EdgeKind::Calls => "calls",
             EdgeKind::DependsOn => "depends_on",
+            EdgeKind::TypeRef => "type_ref",
+            EdgeKind::Implements => "implements",
         }
         .to_owned();
         self.db
@@ -1244,7 +1246,7 @@ impl SurrealGraphStore {
     }
 
     async fn list_dependency_edges_raw(&self) -> Result<Vec<DependencyEdgeRow>, StoreError> {
-        self.list_dependency_edges_by_kind(&["calls", "depends_on"])
+        self.list_dependency_edges_by_kind(STRUCTURAL_EDGE_KINDS)
             .await
     }
 
@@ -1300,7 +1302,7 @@ impl SurrealGraphStore {
         })?;
         let mut edges = decode_rows::<DependencyEdgeRow>(rows)?;
         edges.retain(|edge| !edge.source_id.is_empty() && !edge.target_id.is_empty());
-        edges.retain(|edge| matches!(edge.edge_kind.as_str(), "calls" | "depends_on"));
+        edges.retain(|edge| STRUCTURAL_EDGE_KINDS.contains(&edge.edge_kind.as_str()));
         edges.sort_by(|left, right| {
             left.source_id
                 .cmp(&right.source_id)
@@ -1343,7 +1345,7 @@ impl SurrealGraphStore {
         })?;
         let mut edges = decode_rows::<DependencyEdgeRow>(rows)?;
         edges.retain(|edge| !edge.source_id.is_empty() && !edge.target_id.is_empty());
-        edges.retain(|edge| matches!(edge.edge_kind.as_str(), "calls" | "depends_on"));
+        edges.retain(|edge| STRUCTURAL_EDGE_KINDS.contains(&edge.edge_kind.as_str()));
         edges.sort_by(|left, right| {
             left.source_id
                 .cmp(&right.source_id)
@@ -1519,6 +1521,54 @@ mod tests {
             matching, 1,
             "expected exactly one edge after three upserts, got {matching}"
         );
+    }
+
+    #[tokio::test]
+    async fn surreal_graph_round_trips_new_structural_edge_kinds() {
+        let temp = tempdir().expect("tempdir");
+        let graph = SurrealGraphStore::open(temp.path())
+            .await
+            .expect("open graph");
+
+        let alpha = symbol("sym-alpha", "alpha", "src/a.rs");
+        let target = symbol("sym-target", "Target", "src/a.rs");
+        let store_trait = symbol("sym-store", "Store", "src/a.rs");
+        let impl_type = symbol("sym-impl", "SqliteStore", "src/a.rs");
+        for row in [&alpha, &target, &store_trait, &impl_type] {
+            graph.upsert_symbol_node(row).await.expect("upsert symbol");
+        }
+
+        for edge in [
+            ResolvedEdge {
+                source_id: alpha.id.clone(),
+                target_id: target.id.clone(),
+                edge_kind: EdgeKind::TypeRef,
+                file_path: "src/a.rs".to_owned(),
+            },
+            ResolvedEdge {
+                source_id: impl_type.id.clone(),
+                target_id: store_trait.id.clone(),
+                edge_kind: EdgeKind::Implements,
+                file_path: "src/a.rs".to_owned(),
+            },
+        ] {
+            graph.upsert_edge(&edge).await.expect("upsert edge");
+        }
+
+        let edges = graph
+            .list_dependency_edges()
+            .await
+            .expect("list dependency edges");
+        assert!(edges.iter().any(|edge| {
+            edge.source_symbol_id == alpha.id
+                && edge.target_symbol_id == target.id
+                && edge.edge_kind == "type_ref"
+        }));
+        assert!(edges.iter().any(|edge| {
+            edge.source_symbol_id == impl_type.id
+                && edge.target_symbol_id == store_trait.id
+                && edge.edge_kind == "implements"
+        }));
     }
 
     #[tokio::test]
