@@ -45,6 +45,7 @@ pub use vector::{
 const SYMBOL_ACCESS_COUNTER_MAX: i64 = i64::MAX;
 const SYMBOL_ACCESS_DEBOUNCE_SECONDS: u64 = 60;
 const SQLITE_PARAM_CHUNK: usize = 900;
+const RECONCILE_PARAM_CHUNK: usize = 500;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolRecord {
@@ -439,6 +440,36 @@ pub struct SchemaVersion {
     pub migrated_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SymbolAccessState {
+    access_count: i64,
+    last_accessed_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SirRowState {
+    sir_hash: String,
+    sir_version: i64,
+    provider: String,
+    model: String,
+    generation_pass: String,
+    updated_at: i64,
+    sir_status: String,
+    last_error: Option<String>,
+    last_attempt_at: i64,
+    sir_json: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SirHistoryTransferRecord {
+    sir_hash: String,
+    provider: String,
+    model: String,
+    created_at: i64,
+    sir_json: String,
+    commit_hash: Option<String>,
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("io error: {0}")]
@@ -647,6 +678,7 @@ pub trait GraphStore: Send + Sync {
         depth: u32,
     ) -> Result<Vec<Vec<SymbolRecord>>, StoreError>;
     async fn delete_edges_for_file(&self, file_path: &str) -> Result<(), StoreError>;
+    async fn delete_symbols_batch(&self, symbol_ids: &[String]) -> Result<(), StoreError>;
 }
 
 pub async fn open_graph_store(
@@ -757,6 +789,194 @@ impl SqliteStore {
 
     pub fn mirror_sir_files_enabled(&self) -> bool {
         self.mirror_sir_files
+    }
+
+    pub fn list_stale_symbols(
+        &self,
+        snapshot_ids: &HashSet<String>,
+    ) -> Result<Vec<SymbolRecord>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, file_path, language, kind, qualified_name, signature_fingerprint, last_seen_at
+            FROM symbols
+            ORDER BY file_path ASC, qualified_name ASC, id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SymbolRecord {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                language: row.get(2)?,
+                kind: row.get(3)?,
+                qualified_name: row.get(4)?,
+                signature_fingerprint: row.get(5)?,
+                last_seen_at: row.get(6)?,
+            })
+        })?;
+
+        let mut stale = Vec::new();
+        for row in rows {
+            let record = row?;
+            if !snapshot_ids.contains(record.id.as_str()) {
+                stale.push(record);
+            }
+        }
+        Ok(stale)
+    }
+
+    pub fn delete_symbol_embeddings(&self, symbol_ids: &[String]) -> Result<(), StoreError> {
+        let normalized = normalize_symbol_ids(symbol_ids);
+        if normalized.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        delete_symbol_embeddings_batch(&tx, &normalized)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn reconcile_and_prune(
+        &self,
+        migrations: &[(String, String)],
+        prunes: &[String],
+    ) -> Result<(usize, usize), StoreError> {
+        let migrations = normalize_reconcile_pairs(migrations);
+        let prunes = normalize_symbol_ids(prunes);
+        if migrations.is_empty() && prunes.is_empty() {
+            return Ok((0, 0));
+        }
+
+        let mut mirror_writes = Vec::<(String, String)>::new();
+        let mut mirror_deletes = Vec::<String>::new();
+
+        let (migrated_count, pruned_count) = {
+            let conn = self.conn.lock().unwrap();
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+            let mut migrated_count = 0usize;
+
+            for (old_id, new_id) in &migrations {
+                let Some(old_access) = load_symbol_access_state(&tx, old_id)? else {
+                    continue;
+                };
+                let Some(new_access) = load_symbol_access_state(&tx, new_id)? else {
+                    return Err(StoreError::Compatibility(format!(
+                        "reconciliation target symbol missing from symbols table: {new_id}"
+                    )));
+                };
+
+                let old_sir = load_sir_row_state(&tx, old_id)?;
+                let new_sir = load_sir_row_state(&tx, new_id)?;
+
+                let move_current_sir = match (old_sir.as_ref(), new_sir.as_ref()) {
+                    (Some(_), None) => true,
+                    (Some(old_row), Some(new_row)) if old_row.updated_at > new_row.updated_at => {
+                        tracing::warn!(
+                            old_id = %old_id,
+                            new_id = %new_id,
+                            old_updated_at = old_row.updated_at,
+                            new_updated_at = new_row.updated_at,
+                            "reconciliation conflict: migrated older target SIR to newer symbol ID"
+                        );
+                        true
+                    }
+                    (Some(old_row), Some(new_row)) => {
+                        tracing::warn!(
+                            old_id = %old_id,
+                            new_id = %new_id,
+                            old_updated_at = old_row.updated_at,
+                            new_updated_at = new_row.updated_at,
+                            "reconciliation conflict: keeping target SIR and discarding stale branch history"
+                        );
+                        false
+                    }
+                    (None, _) => false,
+                };
+
+                let mut old_history = load_sir_history_transfer_records(&tx, old_id)?;
+                if old_history.is_empty()
+                    && let Some(row) = old_sir.as_ref()
+                {
+                    old_history.push(SirHistoryTransferRecord {
+                        sir_hash: row.sir_hash.clone(),
+                        provider: row.provider.clone(),
+                        model: row.model.clone(),
+                        created_at: row.updated_at.max(0),
+                        sir_json: row.sir_json.clone().unwrap_or_default(),
+                        commit_hash: None,
+                    });
+                }
+
+                let append_old_history = new_sir.is_none() || move_current_sir;
+                let mut latest_migrated_version = None::<i64>;
+                if append_old_history && !old_history.is_empty() {
+                    let base_version = load_max_sir_history_version(&tx, new_id)?;
+                    latest_migrated_version =
+                        append_sir_history_records(&tx, new_id, base_version, &old_history)?;
+                }
+
+                if move_current_sir && let Some(row) = old_sir.as_ref() {
+                    let sir_version =
+                        latest_migrated_version.unwrap_or_else(|| row.sir_version.max(1));
+                    upsert_sir_row_state(&tx, new_id, row, sir_version)?;
+                    if let Some(sir_json) = row.sir_json.as_ref() {
+                        mirror_writes.push((new_id.clone(), sir_json.clone()));
+                    }
+                }
+
+                let merged_access = merge_symbol_access_state(new_access, old_access);
+                update_symbol_access_state(&tx, new_id, &merged_access)?;
+                delete_symbol_records_for_ids(&tx, std::slice::from_ref(old_id))?;
+                mirror_deletes.push(old_id.clone());
+                migrated_count += 1;
+            }
+
+            for chunk in prunes.chunks(RECONCILE_PARAM_CHUNK) {
+                delete_symbol_records_for_ids(&tx, chunk)?;
+                mirror_deletes.extend(chunk.iter().cloned());
+            }
+
+            tx.commit()?;
+            (migrated_count, prunes.len())
+        };
+
+        let mut deleted = HashSet::new();
+        for symbol_id in mirror_deletes {
+            if !deleted.insert(symbol_id.clone()) {
+                continue;
+            }
+            match fs::remove_file(self.sir_blob_path(symbol_id.as_str())) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => {
+                    tracing::warn!(
+                        symbol_id = %symbol_id,
+                        error = %err,
+                        "failed to remove stale mirrored SIR file during reconciliation"
+                    );
+                }
+            }
+        }
+
+        if self.mirror_sir_files {
+            let mut written = HashSet::new();
+            for (symbol_id, sir_json) in mirror_writes {
+                if !written.insert(symbol_id.clone()) {
+                    continue;
+                }
+                if let Err(err) = fs::write(self.sir_blob_path(symbol_id.as_str()), sir_json) {
+                    tracing::warn!(
+                        symbol_id = %symbol_id,
+                        error = %err,
+                        "failed to write mirrored SIR file during reconciliation"
+                    );
+                }
+            }
+        }
+
+        Ok((migrated_count, pruned_count))
     }
 
     pub fn get_schema_version(&self) -> Result<SchemaVersion, StoreError> {
@@ -4380,6 +4600,314 @@ fn resolve_history_selector_index(
     }
 }
 
+fn normalize_symbol_ids(symbol_ids: &[String]) -> Vec<String> {
+    let mut normalized = symbol_ids
+        .iter()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized
+}
+
+fn normalize_reconcile_pairs(migrations: &[(String, String)]) -> Vec<(String, String)> {
+    let mut normalized = migrations
+        .iter()
+        .map(|(old_id, new_id)| (old_id.trim().to_owned(), new_id.trim().to_owned()))
+        .filter(|(old_id, new_id)| !old_id.is_empty() && !new_id.is_empty() && old_id != new_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized
+}
+
+fn load_symbol_access_state(
+    tx: &Transaction<'_>,
+    symbol_id: &str,
+) -> Result<Option<SymbolAccessState>, StoreError> {
+    tx.query_row(
+        r#"
+        SELECT access_count, last_accessed_at
+        FROM symbols
+        WHERE id = ?1
+        "#,
+        params![symbol_id],
+        |row| {
+            Ok(SymbolAccessState {
+                access_count: row.get::<_, Option<i64>>(0)?.unwrap_or(0).max(0),
+                last_accessed_at: row.get(1)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn load_sir_row_state(
+    tx: &Transaction<'_>,
+    symbol_id: &str,
+) -> Result<Option<SirRowState>, StoreError> {
+    tx.query_row(
+        r#"
+        SELECT
+            sir_hash,
+            sir_version,
+            provider,
+            model,
+            generation_pass,
+            updated_at,
+            sir_status,
+            last_error,
+            last_attempt_at,
+            sir_json
+        FROM sir
+        WHERE id = ?1
+        "#,
+        params![symbol_id],
+        |row| {
+            Ok(SirRowState {
+                sir_hash: row.get(0)?,
+                sir_version: row.get::<_, i64>(1)?.max(1),
+                provider: row.get(2)?,
+                model: row.get(3)?,
+                generation_pass: row
+                    .get::<_, Option<String>>(4)?
+                    .map(|value| value.trim().to_owned())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "scan".to_owned()),
+                updated_at: row.get::<_, i64>(5)?.max(0),
+                sir_status: row
+                    .get::<_, Option<String>>(6)?
+                    .map(|value| value.trim().to_owned())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "fresh".to_owned()),
+                last_error: row.get(7)?,
+                last_attempt_at: row.get::<_, i64>(8)?.max(0),
+                sir_json: row
+                    .get::<_, Option<String>>(9)?
+                    .filter(|value| !value.trim().is_empty()),
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn load_sir_history_transfer_records(
+    tx: &Transaction<'_>,
+    symbol_id: &str,
+) -> Result<Vec<SirHistoryTransferRecord>, StoreError> {
+    let mut stmt = tx.prepare(
+        r#"
+        SELECT sir_hash, provider, model, created_at, sir_json, commit_hash
+        FROM sir_history
+        WHERE symbol_id = ?1
+        ORDER BY version ASC, created_at ASC
+        "#,
+    )?;
+    let rows = stmt.query_map(params![symbol_id], |row| {
+        Ok(SirHistoryTransferRecord {
+            sir_hash: row.get(0)?,
+            provider: row.get(1)?,
+            model: row.get(2)?,
+            created_at: row.get::<_, i64>(3)?.max(0),
+            sir_json: row.get(4)?,
+            commit_hash: row.get(5)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn load_max_sir_history_version(tx: &Transaction<'_>, symbol_id: &str) -> Result<i64, StoreError> {
+    tx.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM sir_history WHERE symbol_id = ?1",
+        params![symbol_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|value| value.max(0))
+    .map_err(Into::into)
+}
+
+fn append_sir_history_records(
+    tx: &Transaction<'_>,
+    symbol_id: &str,
+    base_version: i64,
+    records: &[SirHistoryTransferRecord],
+) -> Result<Option<i64>, StoreError> {
+    if records.is_empty() {
+        return Ok(None);
+    }
+
+    let mut stmt = tx.prepare(
+        r#"
+        INSERT INTO sir_history (
+            symbol_id, version, sir_hash, provider, model, created_at, sir_json, commit_hash
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )?;
+
+    let mut latest_version = None;
+    for (offset, record) in records.iter().enumerate() {
+        let version = base_version + offset as i64 + 1;
+        stmt.execute(params![
+            symbol_id,
+            version,
+            &record.sir_hash,
+            &record.provider,
+            &record.model,
+            record.created_at,
+            &record.sir_json,
+            &record.commit_hash,
+        ])?;
+        latest_version = Some(version);
+    }
+
+    Ok(latest_version)
+}
+
+fn upsert_sir_row_state(
+    tx: &Transaction<'_>,
+    symbol_id: &str,
+    row: &SirRowState,
+    sir_version: i64,
+) -> Result<(), StoreError> {
+    tx.execute(
+        r#"
+        INSERT INTO sir (
+            id, sir_hash, sir_version, provider, model, generation_pass, updated_at,
+            sir_status, last_error, last_attempt_at, sir_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        ON CONFLICT(id) DO UPDATE SET
+            sir_hash = excluded.sir_hash,
+            sir_version = excluded.sir_version,
+            provider = excluded.provider,
+            model = excluded.model,
+            generation_pass = excluded.generation_pass,
+            updated_at = excluded.updated_at,
+            sir_status = excluded.sir_status,
+            last_error = excluded.last_error,
+            last_attempt_at = excluded.last_attempt_at,
+            sir_json = excluded.sir_json
+        "#,
+        params![
+            symbol_id,
+            &row.sir_hash,
+            sir_version.max(1),
+            &row.provider,
+            &row.model,
+            &row.generation_pass,
+            row.updated_at,
+            &row.sir_status,
+            &row.last_error,
+            row.last_attempt_at,
+            &row.sir_json,
+        ],
+    )?;
+    Ok(())
+}
+
+fn merge_symbol_access_state(
+    current: SymbolAccessState,
+    stale: SymbolAccessState,
+) -> SymbolAccessState {
+    SymbolAccessState {
+        access_count: current
+            .access_count
+            .max(0)
+            .saturating_add(stale.access_count.max(0)),
+        last_accessed_at: match (current.last_accessed_at, stale.last_accessed_at) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (Some(left), None) => Some(left),
+            (None, Some(right)) => Some(right),
+            (None, None) => None,
+        },
+    }
+}
+
+fn update_symbol_access_state(
+    tx: &Transaction<'_>,
+    symbol_id: &str,
+    access: &SymbolAccessState,
+) -> Result<(), StoreError> {
+    tx.execute(
+        r#"
+        UPDATE symbols
+        SET access_count = ?2,
+            last_accessed_at = ?3
+        WHERE id = ?1
+        "#,
+        params![
+            symbol_id,
+            access.access_count.max(0),
+            access.last_accessed_at
+        ],
+    )?;
+    Ok(())
+}
+
+fn delete_symbol_embeddings_batch(
+    tx: &Transaction<'_>,
+    symbol_ids: &[String],
+) -> Result<(), StoreError> {
+    if symbol_ids.is_empty() {
+        return Ok(());
+    }
+
+    for chunk in symbol_ids.chunks(RECONCILE_PARAM_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("DELETE FROM sir_embeddings WHERE symbol_id IN ({placeholders})");
+        let params_vec = chunk
+            .iter()
+            .cloned()
+            .map(SqlValue::Text)
+            .collect::<Vec<_>>();
+        tx.execute(sql.as_str(), params_from_iter(params_vec))?;
+    }
+    Ok(())
+}
+
+fn delete_symbol_records_for_ids(
+    tx: &Transaction<'_>,
+    symbol_ids: &[String],
+) -> Result<(), StoreError> {
+    if symbol_ids.is_empty() {
+        return Ok(());
+    }
+
+    for chunk in symbol_ids.chunks(RECONCILE_PARAM_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let tables = [
+            ("write_intents", "symbol_id"),
+            ("sir_requests", "symbol_id"),
+            ("sir_history", "symbol_id"),
+            ("sir", "id"),
+            ("symbol_edges", "source_id"),
+            ("symbols", "id"),
+        ];
+
+        for (table, column) in tables {
+            let sql = format!("DELETE FROM {table} WHERE {column} IN ({placeholders})");
+            let params_vec = chunk
+                .iter()
+                .cloned()
+                .map(SqlValue::Text)
+                .collect::<Vec<_>>();
+            tx.execute(sql.as_str(), params_from_iter(params_vec))?;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -4440,6 +4968,60 @@ mod tests {
             embedding,
             updated_at: 1_700_000_500,
         }
+    }
+
+    fn upsert_sir_state(
+        store: &SqliteStore,
+        symbol_id: &str,
+        sir_hash: &str,
+        sir_json: &str,
+        updated_at: i64,
+    ) {
+        let version = store
+            .record_sir_version_if_changed(
+                symbol_id,
+                sir_hash,
+                "mock",
+                "mock-model",
+                sir_json,
+                updated_at,
+                None,
+            )
+            .expect("record SIR history");
+        store
+            .write_sir_blob(symbol_id, sir_json)
+            .expect("write SIR blob");
+        store
+            .upsert_sir_meta(SirMetaRecord {
+                id: symbol_id.to_owned(),
+                sir_hash: sir_hash.to_owned(),
+                sir_version: version.version,
+                provider: "mock".to_owned(),
+                model: "mock-model".to_owned(),
+                generation_pass: "scan".to_owned(),
+                updated_at: version.updated_at,
+                sir_status: "fresh".to_owned(),
+                last_error: None,
+                last_attempt_at: version.updated_at,
+            })
+            .expect("upsert SIR metadata");
+    }
+
+    fn set_symbol_access(
+        store: &SqliteStore,
+        symbol_id: &str,
+        access_count: i64,
+        last_accessed_at: Option<i64>,
+    ) {
+        store
+            .conn
+            .lock()
+            .expect("lock store connection")
+            .execute(
+                "UPDATE symbols SET access_count = ?2, last_accessed_at = ?3 WHERE id = ?1",
+                params![symbol_id, access_count, last_accessed_at],
+            )
+            .expect("update symbol access metadata");
     }
 
     fn project_note_record(
@@ -6395,6 +6977,253 @@ mirror_sir_files = false
             .expect("count symbols with sir");
         assert_eq!(total, 2);
         assert_eq!(with_sir, 1);
+    }
+
+    #[test]
+    fn reconcile_migrates_sir_to_new_id() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        let mut old_symbol = symbol_record();
+        old_symbol.id = "sym-old".to_owned();
+        old_symbol.signature_fingerprint = "sig-old".to_owned();
+        let mut new_symbol = old_symbol.clone();
+        new_symbol.id = "sym-new".to_owned();
+        new_symbol.signature_fingerprint = "sig-new".to_owned();
+        new_symbol.last_seen_at += 10;
+
+        store
+            .upsert_symbol(old_symbol.clone())
+            .expect("upsert old symbol");
+        store
+            .upsert_symbol(new_symbol.clone())
+            .expect("upsert new symbol");
+        upsert_sir_state(
+            &store,
+            old_symbol.id.as_str(),
+            "hash-old",
+            r#"{"intent":"old"}"#,
+            1_700_000_200,
+        );
+        set_symbol_access(&store, old_symbol.id.as_str(), 2, Some(1_700_000_400));
+        set_symbol_access(&store, new_symbol.id.as_str(), 3, Some(1_700_000_300));
+
+        let (migrated, pruned) = store
+            .reconcile_and_prune(&[(old_symbol.id.clone(), new_symbol.id.clone())], &[])
+            .expect("reconcile old -> new");
+        assert_eq!((migrated, pruned), (1, 0));
+
+        assert!(
+            store
+                .get_symbol_record(old_symbol.id.as_str())
+                .expect("query old symbol")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .read_sir_blob(new_symbol.id.as_str())
+                .expect("read migrated SIR")
+                .as_deref(),
+            Some(r#"{"intent":"old"}"#)
+        );
+
+        let meta = store
+            .get_sir_meta(new_symbol.id.as_str())
+            .expect("load new SIR meta")
+            .expect("new SIR meta exists");
+        assert_eq!(meta.sir_hash, "hash-old");
+
+        let history = store
+            .list_sir_history(new_symbol.id.as_str())
+            .expect("list migrated history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].sir_hash, "hash-old");
+
+        let search = store
+            .get_symbol_search_result(new_symbol.id.as_str())
+            .expect("load search result")
+            .expect("search result exists");
+        assert_eq!(search.access_count, 5);
+        assert_eq!(search.last_accessed_at, Some(1_700_000_400));
+    }
+
+    #[test]
+    fn prune_removes_orphans_not_in_snapshot() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        let mut orphan = symbol_record();
+        orphan.id = "sym-orphan".to_owned();
+        let mut target = symbol_record_ts();
+        target.id = "sym-target".to_owned();
+        target.qualified_name = "demo::target".to_owned();
+
+        store.upsert_symbol(orphan.clone()).expect("upsert orphan");
+        store.upsert_symbol(target.clone()).expect("upsert target");
+        upsert_sir_state(
+            &store,
+            orphan.id.as_str(),
+            "hash-orphan",
+            r#"{"intent":"orphan"}"#,
+            1_700_000_200,
+        );
+        store
+            .upsert_edges(&[calls_edge(
+                orphan.id.as_str(),
+                target.qualified_name.as_str(),
+                orphan.file_path.as_str(),
+            )])
+            .expect("upsert orphan edge");
+        store
+            .enqueue_sir_request(orphan.id.as_str())
+            .expect("enqueue sir request");
+
+        let mut intent = write_intent_record("intent-orphan", WriteIntentStatus::Pending);
+        intent.symbol_id = orphan.id.clone();
+        store.create_write_intent(&intent).expect("create intent");
+
+        let (migrated, pruned) = store
+            .reconcile_and_prune(&[], &[orphan.id.clone()])
+            .expect("prune orphan");
+        assert_eq!((migrated, pruned), (0, 1));
+
+        assert!(
+            store
+                .get_symbol_record(orphan.id.as_str())
+                .expect("query orphan")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_sir_meta(orphan.id.as_str())
+                .expect("query orphan meta")
+                .is_none()
+        );
+        assert!(
+            store
+                .list_sir_history(orphan.id.as_str())
+                .expect("query orphan history")
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_sir_request_symbol_ids(10)
+                .expect("list pending requests")
+                .is_empty()
+        );
+        assert!(
+            store
+                .get_incomplete_intents()
+                .expect("list incomplete intents")
+                .is_empty()
+        );
+
+        let edge_count: i64 = store
+            .conn
+            .lock()
+            .expect("lock store connection")
+            .query_row(
+                "SELECT COUNT(*) FROM symbol_edges WHERE source_id = ?1",
+                params![orphan.id],
+                |row| row.get(0),
+            )
+            .expect("count orphan edges");
+        assert_eq!(edge_count, 0);
+    }
+
+    #[test]
+    fn reconcile_preserves_sir_history() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        let mut old_symbol = symbol_record();
+        old_symbol.id = "sym-history-old".to_owned();
+        let mut new_symbol = old_symbol.clone();
+        new_symbol.id = "sym-history-new".to_owned();
+        new_symbol.signature_fingerprint = "sig-history-new".to_owned();
+
+        store.upsert_symbol(old_symbol.clone()).expect("upsert old");
+        store.upsert_symbol(new_symbol.clone()).expect("upsert new");
+        upsert_sir_state(
+            &store,
+            old_symbol.id.as_str(),
+            "hash-v1",
+            r#"{"intent":"v1"}"#,
+            1_700_000_100,
+        );
+        upsert_sir_state(
+            &store,
+            old_symbol.id.as_str(),
+            "hash-v2",
+            r#"{"intent":"v2"}"#,
+            1_700_000_200,
+        );
+
+        store
+            .reconcile_and_prune(&[(old_symbol.id.clone(), new_symbol.id.clone())], &[])
+            .expect("reconcile history");
+
+        let history = store
+            .list_sir_history(new_symbol.id.as_str())
+            .expect("list new history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].version, 1);
+        assert_eq!(history[0].sir_hash, "hash-v1");
+        assert_eq!(history[1].version, 2);
+        assert_eq!(history[1].sir_hash, "hash-v2");
+    }
+
+    #[test]
+    fn reconcile_handles_new_id_already_has_sir() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        let mut old_symbol = symbol_record();
+        old_symbol.id = "sym-conflict-old".to_owned();
+        let mut new_symbol = old_symbol.clone();
+        new_symbol.id = "sym-conflict-new".to_owned();
+        new_symbol.signature_fingerprint = "sig-conflict-new".to_owned();
+
+        store.upsert_symbol(old_symbol.clone()).expect("upsert old");
+        store.upsert_symbol(new_symbol.clone()).expect("upsert new");
+        upsert_sir_state(
+            &store,
+            old_symbol.id.as_str(),
+            "hash-old",
+            r#"{"intent":"old"}"#,
+            1_700_000_100,
+        );
+        upsert_sir_state(
+            &store,
+            new_symbol.id.as_str(),
+            "hash-new",
+            r#"{"intent":"new"}"#,
+            1_700_000_300,
+        );
+
+        let (migrated, pruned) = store
+            .reconcile_and_prune(&[(old_symbol.id.clone(), new_symbol.id.clone())], &[])
+            .expect("reconcile conflicting SIR");
+        assert_eq!((migrated, pruned), (1, 0));
+
+        assert_eq!(
+            store
+                .read_sir_blob(new_symbol.id.as_str())
+                .expect("read winning SIR")
+                .as_deref(),
+            Some(r#"{"intent":"new"}"#)
+        );
+        let history = store
+            .list_sir_history(new_symbol.id.as_str())
+            .expect("list retained history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].sir_hash, "hash-new");
+        assert!(
+            store
+                .list_sir_history(old_symbol.id.as_str())
+                .expect("query stale history")
+                .is_empty()
+        );
     }
 
     #[test]

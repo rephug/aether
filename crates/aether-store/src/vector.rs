@@ -72,6 +72,7 @@ pub trait VectorStore: Send + Sync {
         symbol_id: &str,
     ) -> Result<Option<VectorEmbeddingMetaRecord>, StoreError>;
     async fn delete_embedding(&self, symbol_id: &str) -> Result<(), StoreError>;
+    async fn delete_embeddings(&self, symbol_ids: &[String]) -> Result<(), StoreError>;
     async fn search_nearest(
         &self,
         query_embedding: &[f32],
@@ -140,6 +141,10 @@ impl VectorStore for SqliteVectorStore {
 
     async fn delete_embedding(&self, symbol_id: &str) -> Result<(), StoreError> {
         self.store.delete_symbol_embedding(symbol_id)
+    }
+
+    async fn delete_embeddings(&self, symbol_ids: &[String]) -> Result<(), StoreError> {
+        self.store.delete_symbol_embeddings(symbol_ids)
     }
 
     async fn search_nearest(
@@ -725,6 +730,43 @@ impl VectorStore for LanceVectorStore {
                 .delete(predicate.as_str())
                 .await
                 .map_err(map_lancedb_err)?;
+        }
+
+        Ok(())
+    }
+
+    async fn delete_embeddings(&self, symbol_ids: &[String]) -> Result<(), StoreError> {
+        self.migrate_from_sqlite_if_needed().await?;
+        let requested = symbol_ids
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if requested.is_empty() {
+            return Ok(());
+        }
+
+        let connection = self.connect().await?;
+        for name in connection
+            .table_names()
+            .execute()
+            .await
+            .map_err(map_lancedb_err)?
+            .into_iter()
+            .filter(|name| name.starts_with(VECTOR_TABLE_PREFIX))
+        {
+            let Ok(table) = connection.open_table(&name).execute().await else {
+                continue;
+            };
+            for chunk in requested.chunks(PUSHDOWN_CHUNK_SIZE) {
+                let predicate = build_in_predicate(chunk);
+                table
+                    .delete(predicate.as_str())
+                    .await
+                    .map_err(map_lancedb_err)?;
+            }
         }
 
         Ok(())
@@ -1433,4 +1475,116 @@ fn embedding_at(
 
 fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+
+    fn vector_record(symbol_id: &str, hash: &str) -> VectorRecord {
+        VectorRecord {
+            symbol_id: symbol_id.to_owned(),
+            sir_hash: hash.to_owned(),
+            provider: "mock".to_owned(),
+            model: "mock-2d".to_owned(),
+            embedding: vec![1.0, 0.0],
+            updated_at: 1_700_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_vector_store_deletes_embeddings_in_batch() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteVectorStore::new(temp.path()).expect("open sqlite vector store");
+
+        store
+            .upsert_embedding(vector_record("sym-a", "hash-a"))
+            .await
+            .expect("upsert sym-a");
+        store
+            .upsert_embedding(vector_record("sym-b", "hash-b"))
+            .await
+            .expect("upsert sym-b");
+        store
+            .upsert_embedding(vector_record("sym-c", "hash-c"))
+            .await
+            .expect("upsert sym-c");
+
+        store
+            .delete_embeddings(&["sym-a".to_owned(), "sym-b".to_owned()])
+            .await
+            .expect("delete embeddings batch");
+
+        assert!(
+            store
+                .get_embedding_meta("sym-a")
+                .await
+                .expect("lookup sym-a")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_embedding_meta("sym-b")
+                .await
+                .expect("lookup sym-b")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_embedding_meta("sym-c")
+                .await
+                .expect("lookup sym-c")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn lance_vector_store_deletes_embeddings_in_batch() {
+        let temp = tempdir().expect("tempdir");
+        let store = LanceVectorStore::open(temp.path())
+            .await
+            .expect("open LanceDB vector store");
+
+        store
+            .upsert_embedding(vector_record("sym-a", "hash-a"))
+            .await
+            .expect("upsert sym-a");
+        store
+            .upsert_embedding(vector_record("sym-b", "hash-b"))
+            .await
+            .expect("upsert sym-b");
+        store
+            .upsert_embedding(vector_record("sym-c", "hash-c"))
+            .await
+            .expect("upsert sym-c");
+
+        store
+            .delete_embeddings(&["sym-a".to_owned(), "sym-b".to_owned()])
+            .await
+            .expect("delete embeddings batch");
+
+        assert!(
+            store
+                .get_embedding_meta("sym-a")
+                .await
+                .expect("lookup sym-a")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_embedding_meta("sym-b")
+                .await
+                .expect("lookup sym-b")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_embedding_meta("sym-c")
+                .await
+                .expect("lookup sym-c")
+                .is_some()
+        );
+    }
 }

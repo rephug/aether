@@ -171,6 +171,10 @@ impl CozoGraphStore {
     pub fn delete_edges_for_file(&self, file_path: &str) -> Result<(), StoreError> {
         Self::block_on_runtime(<Self as GraphStore>::delete_edges_for_file(self, file_path))
     }
+
+    pub fn delete_symbols_batch(&self, symbol_ids: &[String]) -> Result<(), StoreError> {
+        Self::block_on_runtime(<Self as GraphStore>::delete_symbols_batch(self, symbol_ids))
+    }
 }
 
 #[async_trait]
@@ -201,5 +205,9 @@ impl GraphStore for CozoGraphStore {
 
     async fn delete_edges_for_file(&self, file_path: &str) -> Result<(), StoreError> {
         self.inner.delete_edges_for_file(file_path).await
+    }
+
+    async fn delete_symbols_batch(&self, symbol_ids: &[String]) -> Result<(), StoreError> {
+        self.inner.delete_symbols_batch(symbol_ids).await
     }
 }

@@ -630,6 +630,13 @@ pub struct Cli {
 
     #[arg(
         long,
+        requires_all = ["index_once", "full"],
+        help = "With --index-once --full, report stale symbol reconciliations and prunes without mutating the store"
+    )]
+    pub dry_run: bool,
+
+    #[arg(
+        long,
         help = "Force SIR regeneration during indexing, even when existing SIR data is fresh"
     )]
     pub force: bool,
@@ -863,6 +870,29 @@ mod tests {
             "--index-once",
         ]);
 
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_full_dry_run_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "--index-once",
+            "--full",
+            "--dry-run",
+        ])
+        .expect("full dry-run should parse");
+
+        assert!(cli.index_once);
+        assert!(cli.full);
+        assert!(cli.dry_run);
+    }
+
+    #[test]
+    fn cli_dry_run_requires_full_index_once() {
+        let result = Cli::try_parse_from(["aetherd", "--workspace", ".", "--dry-run"]);
         assert!(result.is_err());
     }
 

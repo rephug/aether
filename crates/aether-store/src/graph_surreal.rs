@@ -366,6 +366,39 @@ impl SurrealGraphStore {
         Ok(())
     }
 
+    pub async fn delete_symbols_batch(&self, symbol_ids: &[String]) -> Result<(), StoreError> {
+        let mut ids = symbol_ids
+            .iter()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        for chunk in ids.chunks(500) {
+            let symbol_ids = chunk.to_vec();
+            self.db
+                .query(
+                    r#"
+                    DELETE depends_on
+                    WHERE source_symbol_id INSIDE $symbol_ids
+                       OR target_symbol_id INSIDE $symbol_ids;
+                    DELETE symbol WHERE symbol_id INSIDE $symbol_ids;
+                    "#,
+                )
+                .bind(("symbol_ids", symbol_ids))
+                .await
+                .map_err(|err| {
+                    StoreError::Graph(format!("SurrealDB delete symbols batch failed: {err}"))
+                })?;
+        }
+
+        Ok(())
+    }
+
     pub async fn delete_dependency_edges_by_pair(
         &self,
         source_symbol_id: &str,
@@ -1179,6 +1212,10 @@ impl GraphStore for SurrealGraphStore {
             .map_err(|err| StoreError::Graph(format!("SurrealDB delete edges failed: {err}")))?;
         Ok(())
     }
+
+    async fn delete_symbols_batch(&self, symbol_ids: &[String]) -> Result<(), StoreError> {
+        SurrealGraphStore::delete_symbols_batch(self, symbol_ids).await
+    }
 }
 
 fn symbol_name(qualified_name: &str) -> &str {
@@ -1540,5 +1577,52 @@ mod tests {
             .expect("list tested_by");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].test_file, tested.test_file);
+    }
+
+    #[tokio::test]
+    async fn delete_symbols_batch_removes_nodes_and_edges() {
+        let temp = tempdir().expect("tempdir");
+        let graph = SurrealGraphStore::open(temp.path())
+            .await
+            .expect("open graph");
+
+        let alpha = symbol("sym-alpha", "alpha", "src/a.rs");
+        let beta = symbol("sym-beta", "beta", "src/b.rs");
+        let gamma = symbol("sym-gamma", "gamma", "src/c.rs");
+        for row in [&alpha, &beta, &gamma] {
+            graph.upsert_symbol_node(row).await.expect("upsert symbol");
+        }
+        graph
+            .upsert_edge(&ResolvedEdge {
+                source_id: alpha.id.clone(),
+                target_id: beta.id.clone(),
+                edge_kind: EdgeKind::Calls,
+                file_path: "src/a.rs".to_owned(),
+            })
+            .await
+            .expect("edge alpha -> beta");
+        graph
+            .upsert_edge(&ResolvedEdge {
+                source_id: gamma.id.clone(),
+                target_id: alpha.id.clone(),
+                edge_kind: EdgeKind::Calls,
+                file_path: "src/c.rs".to_owned(),
+            })
+            .await
+            .expect("edge gamma -> alpha");
+
+        graph
+            .delete_symbols_batch(&[alpha.id.clone(), beta.id.clone()])
+            .await
+            .expect("delete symbol batch");
+
+        let remaining_ids = graph.list_all_symbol_ids().await.expect("list symbol ids");
+        assert_eq!(remaining_ids, vec![gamma.id]);
+
+        let edges = graph
+            .list_dependency_edges_by_kind(&["calls"])
+            .await
+            .expect("list edges");
+        assert!(edges.is_empty());
     }
 }

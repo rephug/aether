@@ -913,6 +913,12 @@ impl SirPipeline {
         Ok(())
     }
 
+    pub fn delete_embeddings(&self, symbol_ids: &[String]) -> Result<()> {
+        self.runtime
+            .block_on(self.vector_store.delete_embeddings(symbol_ids))
+            .context("failed to delete symbol embeddings")
+    }
+
     pub fn replay_incomplete_intents(
         &self,
         store: &SqliteStore,

@@ -1723,6 +1723,38 @@ impl GraphStore for CozoGraphStore {
 
         Ok(())
     }
+
+    async fn delete_symbols_batch(&self, symbol_ids: &[String]) -> Result<(), StoreError> {
+        let mut normalized = symbol_ids
+            .iter()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        normalized.sort();
+        normalized.dedup();
+
+        for symbol_id in normalized {
+            let mut params = BTreeMap::new();
+            params.insert("symbol_id".to_owned(), DataValue::from(symbol_id));
+            self.run_script(
+                r#"
+                ?[source_id, target_id, edge_kind] :=
+                    *edges{source_id: $symbol_id, target_id, edge_kind}
+                ?[source_id, target_id, edge_kind] :=
+                    *edges{source_id, target_id: $symbol_id, edge_kind}
+                ?[symbol_id] :=
+                    *symbols{symbol_id: $symbol_id}
+
+                :rm edges { source_id, target_id, edge_kind }
+                :rm symbols { symbol_id }
+                "#,
+                params,
+                ScriptMutability::Mutable,
+            )?;
+        }
+
+        Ok(())
+    }
 }
 
 fn data_value_to_i64(value: &DataValue) -> Option<i64> {
