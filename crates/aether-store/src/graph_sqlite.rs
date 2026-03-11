@@ -216,6 +216,10 @@ impl GraphStore for SqliteGraphStore {
     async fn delete_edges_for_file(&self, _file_path: &str) -> Result<(), StoreError> {
         Ok(())
     }
+
+    async fn delete_symbols_batch(&self, _symbol_ids: &[String]) -> Result<(), StoreError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

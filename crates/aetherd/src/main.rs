@@ -262,6 +262,7 @@ fn run(cli: Cli) -> Result<()> {
         force: cli.force,
         full: cli.full,
         deep: cli.deep,
+        dry_run: cli.dry_run,
         sir_concurrency: cli
             .sir_concurrency
             .unwrap_or(config.inference.concurrency)
