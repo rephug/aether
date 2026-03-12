@@ -6,10 +6,11 @@ use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use tokio::time::sleep;
 
-use crate::{
-    EmbeddingProvider, InferError, extract_embedding_vector, extract_openai_error_message,
-    inference_http_client, normalize_openai_api_base,
+use crate::http::{
+    extract_embedding_vector, extract_openai_error_message, inference_http_client,
+    normalize_openai_api_base,
 };
+use crate::types::{EmbeddingProvider, InferError};
 
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatEmbeddingProvider {

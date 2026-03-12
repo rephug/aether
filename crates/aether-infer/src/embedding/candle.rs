@@ -14,7 +14,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
-use crate::{EmbeddingProvider, InferError};
+use crate::types::{EmbeddingProvider, InferError};
 
 pub const CANDLE_PROVIDER_NAME: &str = "candle";
 pub const CANDLE_MODEL_REPO: &str = "Qwen/Qwen3-Embedding-0.6B";

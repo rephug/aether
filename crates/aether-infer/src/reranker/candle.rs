@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use tokenizers::{Encoding, Tokenizer};
 
 use super::{RerankCandidate, RerankResult, RerankerProvider};
-use crate::InferError;
+use crate::types::InferError;
 
 pub const CANDLE_RERANKER_PROVIDER_NAME: &str = "candle";
 pub const CANDLE_RERANKER_MODEL_REPO: &str = "Qwen/Qwen3-Reranker-0.6B";

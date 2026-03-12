@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use super::{RerankCandidate, RerankResult, RerankerProvider};
-use crate::InferError;
+use crate::http::inference_http_client;
+use crate::types::InferError;
 
 const COHERE_ENDPOINT: &str = "https://api.cohere.com/v2/rerank";
 pub const COHERE_PROVIDER_NAME: &str = "cohere";
@@ -25,7 +26,7 @@ impl CohereRerankerProvider {
             .ok_or_else(|| InferError::MissingCohereApiKey(api_key_env.to_owned()))?;
 
         Ok(Self {
-            client: crate::inference_http_client(),
+            client: inference_http_client(),
             api_key,
             model: COHERE_MODEL_NAME.to_owned(),
         })

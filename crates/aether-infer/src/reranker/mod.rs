@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 
-use crate::InferError;
+use crate::types::InferError;
 
 pub mod candle;
 pub mod cohere;

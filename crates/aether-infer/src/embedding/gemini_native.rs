@@ -6,10 +6,8 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::time::sleep;
 
-use crate::{
-    EmbeddingProvider, EmbeddingPurpose, GEMINI_API_BASE, InferError, inference_http_client,
-    normalize_embedding,
-};
+use crate::http::{GEMINI_API_BASE, inference_http_client, normalize_embedding};
+use crate::types::{EmbeddingProvider, EmbeddingPurpose, InferError};
 
 #[derive(Debug, Clone)]
 pub struct GeminiNativeEmbeddingProvider {

@@ -1,6 +1,6 @@
 use aether_sir::SirAnnotation;
 
-use crate::SirContext;
+use crate::types::SirContext;
 
 const FEW_SHOT_EXAMPLES: &str = r#"Few-shot examples:
 1) function
@@ -193,4 +193,122 @@ pub fn build_enriched_sir_prompt_with_cot(
     enrichment: &SirEnrichmentContext,
 ) -> String {
     build_enriched_prompt_core(symbol_text, context, enrichment, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use aether_sir::SirAnnotation;
+
+    use super::*;
+
+    #[test]
+    fn build_sir_prompt_for_kind_includes_type_guidance_for_structs() {
+        let context = SirContext {
+            language: "rust".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            qualified_name: "demo::State".to_owned(),
+            priority_score: None,
+            kind: "struct".to_owned(),
+            is_public: true,
+            line_count: 12,
+        };
+        let prompt = build_sir_prompt_for_kind("pub struct State {}", &context);
+        assert!(prompt.contains("For type definitions: describe WHY this type exists"));
+    }
+
+    #[test]
+    fn build_sir_prompt_for_kind_includes_complex_public_guidance_for_large_functions() {
+        let context = SirContext {
+            language: "rust".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            qualified_name: "demo::run".to_owned(),
+            priority_score: Some(0.92),
+            kind: "function".to_owned(),
+            is_public: true,
+            line_count: 55,
+        };
+        let prompt = build_sir_prompt_for_kind("pub fn run() -> Result<()> {}", &context);
+        assert!(prompt.contains("For complex public methods"));
+        assert!(prompt.contains("Bad outputs example"));
+    }
+
+    #[test]
+    fn build_sir_prompt_for_kind_includes_test_guidance_for_tests() {
+        let context = SirContext {
+            language: "rust".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            qualified_name: "demo::test_retry_reset".to_owned(),
+            priority_score: None,
+            kind: "function".to_owned(),
+            is_public: false,
+            line_count: 14,
+        };
+        let prompt = build_sir_prompt_for_kind("fn test_retry_reset() {}", &context);
+        assert!(prompt.contains("For test functions: describe what behavior is being verified"));
+    }
+
+    #[test]
+    fn build_enriched_prompt_includes_context_sections() {
+        let context = SirContext {
+            language: "rust".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            qualified_name: "demo::run".to_owned(),
+            priority_score: Some(0.9),
+            kind: "function".to_owned(),
+            is_public: true,
+            line_count: 60,
+        };
+        let enrichment = SirEnrichmentContext {
+            file_intent: Some("Coordinates request lifecycle".to_owned()),
+            neighbor_intents: vec![
+                (
+                    "demo::parse".to_owned(),
+                    "Parses raw bytes into frames".to_owned(),
+                ),
+                (
+                    "demo::flush".to_owned(),
+                    "Flushes pending writes".to_owned(),
+                ),
+            ],
+            baseline_sir: Some(SirAnnotation {
+                intent: "Baseline".to_owned(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                side_effects: Vec::new(),
+                dependencies: Vec::new(),
+                error_modes: Vec::new(),
+                confidence: 0.6,
+            }),
+            priority_reason: "high PageRank + public method".to_owned(),
+        };
+
+        let prompt = build_enriched_sir_prompt("pub fn run() {}", &context, &enrichment);
+        assert!(prompt.contains("You are improving an existing SIR annotation"));
+        assert!(prompt.contains("high PageRank + public method"));
+        assert!(prompt.contains("Other symbols in this file"));
+        assert!(prompt.contains("Previous SIR (improve upon this):"));
+    }
+
+    #[test]
+    fn build_enriched_prompt_with_cot_contains_thinking_instructions() {
+        let context = SirContext {
+            language: "rust".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            qualified_name: "demo::run".to_owned(),
+            priority_score: Some(0.9),
+            kind: "function".to_owned(),
+            is_public: true,
+            line_count: 60,
+        };
+        let enrichment = SirEnrichmentContext {
+            file_intent: None,
+            neighbor_intents: Vec::new(),
+            baseline_sir: None,
+            priority_reason: "low confidence triage output".to_owned(),
+        };
+
+        let prompt = build_enriched_sir_prompt_with_cot("pub fn run() {}", &context, &enrichment);
+        assert!(prompt.contains("<thinking>"));
+        assert!(prompt.contains("After closing your </thinking> tag, output the final JSON."));
+    }
 }
