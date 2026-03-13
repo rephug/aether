@@ -27,8 +27,9 @@ use aether_sir::{
 #[cfg(test)]
 use aether_store::SymbolRecord;
 use aether_store::{
-    IntentOperation, SirMetaRecord, SqliteStore, Store, SymbolEmbeddingRecord, VectorStore,
-    WriteIntent, WriteIntentStatus, open_graph_store, open_vector_store,
+    IntentOperation, SirMetaRecord, SqliteStore, Store, SymbolEmbeddingRecord,
+    VectorEmbeddingMetaRecord, VectorStore, WriteIntent, WriteIntentStatus, open_graph_store,
+    open_vector_store,
 };
 use anyhow::{Context, Result, anyhow};
 use tokio::runtime::Runtime;
@@ -810,6 +811,7 @@ impl SirPipeline {
             &canonical_json,
             print_sir,
             out,
+            None,
         ) {
             let message = format!("{err:#}");
             self.mark_intent_failed_safely(store, intent.intent_id.as_str(), message.as_str());
@@ -1103,6 +1105,12 @@ impl SirPipeline {
         )
         .context("failed to write embeddings-only start line")?;
 
+        // Pre-fetch embedding metadata to avoid N+1 vector store round trips.
+        let existing_metas = self
+            .runtime
+            .block_on(self.vector_store.get_embedding_metas_batch(&symbol_ids))
+            .context("failed to batch-fetch embedding metadata")?;
+
         for (index, symbol_id) in symbol_ids.iter().enumerate() {
             let current = index + 1;
             if current % 100 == 0 {
@@ -1153,7 +1161,14 @@ impl SirPipeline {
 
             let canonical = canonicalize_sir_json(&sir);
             let hash = sir_hash(&sir);
-            match self.refresh_embedding_if_needed(symbol_id, &hash, &canonical, print_sir, out) {
+            match self.refresh_embedding_if_needed(
+                symbol_id,
+                &hash,
+                &canonical,
+                print_sir,
+                out,
+                existing_metas.get(symbol_id),
+            ) {
                 Ok(true) => refreshed += 1,
                 Ok(false) => skipped_up_to_date += 1,
                 Err(err) => {
@@ -1296,6 +1311,7 @@ impl SirPipeline {
                 canonical_json.as_str(),
                 false,
                 &mut std::io::sink(),
+                None,
             )
             .with_context(|| format!("failed vector write stage for intent {intent_id}"))?;
             store
@@ -1496,6 +1512,7 @@ impl SirPipeline {
         canonical_json: &str,
         print_sir: bool,
         out: &mut dyn Write,
+        prefetched_meta: Option<&VectorEmbeddingMetaRecord>,
     ) -> Result<bool> {
         let Some(embedding_provider) = self.embedding_provider.as_ref() else {
             return Ok(false);
@@ -1512,10 +1529,13 @@ impl SirPipeline {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("mock");
 
-        let existing_meta = self
-            .runtime
-            .block_on(self.vector_store.get_embedding_meta(symbol_id))
-            .with_context(|| format!("failed to read embedding metadata for {symbol_id}"))?;
+        let existing_meta = match prefetched_meta {
+            Some(meta) => Some(meta.clone()),
+            None => self
+                .runtime
+                .block_on(self.vector_store.get_embedding_meta(symbol_id))
+                .with_context(|| format!("failed to read embedding metadata for {symbol_id}"))?,
+        };
         if let Some(existing_meta) = existing_meta
             && existing_meta.sir_hash == sir_hash_value
             && existing_meta.provider == provider_name
