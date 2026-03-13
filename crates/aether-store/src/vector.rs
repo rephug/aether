@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -71,6 +71,10 @@ pub trait VectorStore: Send + Sync {
         &self,
         symbol_id: &str,
     ) -> Result<Option<VectorEmbeddingMetaRecord>, StoreError>;
+    async fn get_embedding_metas_batch(
+        &self,
+        symbol_ids: &[String],
+    ) -> Result<HashMap<String, VectorEmbeddingMetaRecord>, StoreError>;
     async fn delete_embedding(&self, symbol_id: &str) -> Result<(), StoreError>;
     async fn delete_embeddings(&self, symbol_ids: &[String]) -> Result<(), StoreError>;
     async fn search_nearest(
@@ -137,6 +141,19 @@ impl VectorStore for SqliteVectorStore {
         symbol_id: &str,
     ) -> Result<Option<VectorEmbeddingMetaRecord>, StoreError> {
         self.store.get_symbol_embedding_meta(symbol_id)
+    }
+
+    async fn get_embedding_metas_batch(
+        &self,
+        symbol_ids: &[String],
+    ) -> Result<HashMap<String, VectorEmbeddingMetaRecord>, StoreError> {
+        let mut result = HashMap::new();
+        for symbol_id in symbol_ids {
+            if let Some(meta) = self.store.get_symbol_embedding_meta(symbol_id)? {
+                result.insert(symbol_id.clone(), meta);
+            }
+        }
+        Ok(result)
     }
 
     async fn delete_embedding(&self, symbol_id: &str) -> Result<(), StoreError> {
@@ -703,6 +720,85 @@ impl VectorStore for LanceVectorStore {
                 match latest.as_ref() {
                     Some(existing) if existing.updated_at >= record.updated_at => {}
                     _ => latest = Some(record),
+                }
+            }
+        }
+
+        Ok(latest)
+    }
+
+    async fn get_embedding_metas_batch(
+        &self,
+        symbol_ids: &[String],
+    ) -> Result<HashMap<String, VectorEmbeddingMetaRecord>, StoreError> {
+        self.migrate_from_sqlite_if_needed().await?;
+
+        let requested = symbol_ids
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if requested.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let connection = self.connect().await?;
+        let mut latest = HashMap::<String, VectorEmbeddingMetaRecord>::new();
+        for name in connection
+            .table_names()
+            .execute()
+            .await
+            .map_err(map_lancedb_err)?
+            .into_iter()
+            .filter(|name| name.starts_with(VECTOR_TABLE_PREFIX))
+        {
+            let Ok(table) = connection.open_table(&name).execute().await else {
+                continue;
+            };
+            let schema = table.schema().await.map_err(map_lancedb_err)?;
+            let Some(embedding_dim) = embedding_dim_from_schema(schema.as_ref()) else {
+                continue;
+            };
+
+            for chunk in requested.chunks(PUSHDOWN_CHUNK_SIZE) {
+                let predicate = build_in_predicate(chunk);
+                let batches = table
+                    .query()
+                    .select(Select::columns(&[
+                        "symbol_id",
+                        "sir_hash",
+                        "provider",
+                        "model",
+                        "updated_at",
+                    ]))
+                    .only_if(predicate.as_str())
+                    .execute()
+                    .await
+                    .map_err(map_lancedb_err)?
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .map_err(map_lancedb_err)?;
+
+                for batch in batches {
+                    for row in 0..batch.num_rows() {
+                        let record = VectorEmbeddingMetaRecord {
+                            symbol_id: string_at(&batch, "symbol_id", row)?,
+                            sir_hash: string_at(&batch, "sir_hash", row)?,
+                            provider: string_at(&batch, "provider", row)?,
+                            model: string_at(&batch, "model", row)?,
+                            embedding_dim: i64::from(embedding_dim),
+                            updated_at: int64_at(&batch, "updated_at", row)?,
+                        };
+
+                        match latest.get(record.symbol_id.as_str()) {
+                            Some(existing) if existing.updated_at >= record.updated_at => {}
+                            _ => {
+                                latest.insert(record.symbol_id.clone(), record);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1494,6 +1590,24 @@ mod tests {
         }
     }
 
+    fn vector_record_with_meta(
+        symbol_id: &str,
+        hash: &str,
+        provider: &str,
+        model: &str,
+        embedding: Vec<f32>,
+        updated_at: i64,
+    ) -> VectorRecord {
+        VectorRecord {
+            symbol_id: symbol_id.to_owned(),
+            sir_hash: hash.to_owned(),
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            embedding,
+            updated_at,
+        }
+    }
+
     #[tokio::test]
     async fn sqlite_vector_store_deletes_embeddings_in_batch() {
         let temp = tempdir().expect("tempdir");
@@ -1537,6 +1651,40 @@ mod tests {
                 .await
                 .expect("lookup sym-c")
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_vector_store_gets_embedding_metas_in_batch() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteVectorStore::new(temp.path()).expect("open sqlite vector store");
+
+        store
+            .upsert_embedding(vector_record("sym-a", "hash-a"))
+            .await
+            .expect("upsert sym-a");
+        store
+            .upsert_embedding(vector_record("sym-b", "hash-b"))
+            .await
+            .expect("upsert sym-b");
+
+        let metas = store
+            .get_embedding_metas_batch(&[
+                "sym-a".to_owned(),
+                "sym-missing".to_owned(),
+                "sym-b".to_owned(),
+            ])
+            .await
+            .expect("batch lookup");
+
+        assert_eq!(metas.len(), 2);
+        assert_eq!(
+            metas.get("sym-a").map(|meta| meta.sir_hash.as_str()),
+            Some("hash-a")
+        );
+        assert_eq!(
+            metas.get("sym-b").map(|meta| meta.sir_hash.as_str()),
+            Some("hash-b")
         );
     }
 
@@ -1585,6 +1733,67 @@ mod tests {
                 .await
                 .expect("lookup sym-c")
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn lance_vector_store_gets_latest_embedding_metas_in_batch() {
+        let temp = tempdir().expect("tempdir");
+        let store = LanceVectorStore::open(temp.path())
+            .await
+            .expect("open LanceDB vector store");
+
+        store
+            .upsert_embedding(vector_record_with_meta(
+                "sym-a",
+                "hash-old",
+                "mock",
+                "model-2d",
+                vec![1.0, 0.0],
+                100,
+            ))
+            .await
+            .expect("upsert old sym-a");
+        store
+            .upsert_embedding(vector_record_with_meta(
+                "sym-a",
+                "hash-new",
+                "mock-alt",
+                "model-3d",
+                vec![1.0, 0.0, 0.0],
+                200,
+            ))
+            .await
+            .expect("upsert new sym-a");
+        store
+            .upsert_embedding(vector_record("sym-b", "hash-b"))
+            .await
+            .expect("upsert sym-b");
+
+        let metas = store
+            .get_embedding_metas_batch(&[
+                "sym-a".to_owned(),
+                "sym-missing".to_owned(),
+                "sym-b".to_owned(),
+            ])
+            .await
+            .expect("batch lookup");
+
+        assert_eq!(metas.len(), 2);
+        assert_eq!(
+            metas.get("sym-a"),
+            Some(&VectorEmbeddingMetaRecord {
+                symbol_id: "sym-a".to_owned(),
+                sir_hash: "hash-new".to_owned(),
+                provider: "mock-alt".to_owned(),
+                model: "model-3d".to_owned(),
+                embedding_dim: 3,
+                updated_at: 200,
+            })
+        );
+        assert_eq!(
+            metas.get("sym-b").map(|meta| meta.sir_hash.as_str()),
+            Some("hash-b")
         );
     }
 }
