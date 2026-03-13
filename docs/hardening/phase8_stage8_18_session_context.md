@@ -1,4 +1,4 @@
-# Phase 8.18 — Boundary Leaker Fix — Session Context
+# Phase 8.18 — Boundary Leaker Fix (Global Pipeline) — Session Context
 
 **Date:** 2026-03-13
 **Branch:** `feature/phase8-stage8-18-boundary-leaker-fix` (to be created)
@@ -8,10 +8,8 @@
 ## CRITICAL: Read actual source, not this document
 
 ```bash
-# The live repo is at:
 /home/rephu/projects/aether
-
-# Always grep/read actual source before making claims about what exists
+# Always grep/read actual source before making claims
 ```
 
 ## Build environment (MUST be set for ALL cargo commands)
@@ -27,125 +25,73 @@ mkdir -p $TMPDIR
 
 **Never run `cargo test --workspace`** — OOM risk. Always per-crate.
 
-## What just merged (recent history)
+## What was tried and failed
 
-| Commit | What |
-|--------|------|
-| f5bd037 | Batch embedding meta lookup (ARCH-2 N+1 fix) |
-| b9834e4 | Batch progress logging for SIR generation |
-| f6150b8 | Triage/deep pass concurrency fix (14x speedup) |
-| 4e0917c | Refactor aether-mcp (last of 5 God File refactors) |
-| 9f07651 | Phase 8.17 — Gemini native embedding provider |
-| 02b5d61 | Phase 8.16 — --embeddings-only + OpenAI-compat provider |
-| 50c174e | Phase 8.15 — TYPE_REF + IMPLEMENTS edge extraction |
-| 1f94993 | Phase 8.14 — Component-bounded semantic rescue |
+A prior attempt replaced the global community_snapshot lookup in
+load_semantic_input with per-file detect_file_communities calls. Result:
+36/100 overall score (was 43), 13/16 Boundary Leakers (was 11).
 
-## The problem being solved
+Root cause: the file-scoped planner only sees intra-file edges. Most
+files have 10 symbols with 2-3 intra-file edges, so the planner
+fragments them into multiple tiny "communities." Cross-file edges
+(which unify symbols architecturally) are invisible to the planner.
 
-The `boundary_leakage` metric in health scoring is producing false
-positives. 11/16 crates are flagged as Boundary Leakers.
+## The correct fix: improve the global Louvain pipeline
 
-Root cause: `community_count` per file is derived from the
-`community_snapshot` SQLite table, which stores global Louvain community
-assignments computed by the drift pipeline. Global Louvain has none of
-the file-scoped planner improvements — no test filtering, no rescue
-passes, no γ=0.5 tuning. Symbols in the same file get assigned to
-different global communities, inflating boundary_leakage.
+The global Louvain in `list_louvain_communities()` runs at γ=1.0 with
+no test filtering. The file-scoped planner runs at γ=0.5 with test
+symbols excluded. Porting these two improvements to the global pipeline
+produces architecturally-meaningful communities that correctly reflect
+whether a file crosses module boundaries.
 
-### How boundary_leakage feeds the score
+### Key existing code
+
+- `louvain_with_resolution_sync(edges, resolution)` — already exists
+  in `aether-graph-algo`, is `pub`, but NOT imported in `graph_surreal.rs`
+- `list_louvain_communities()` in `graph_surreal.rs` — calls
+  `louvain_sync` (which wraps `louvain_with_resolution_sync(edges, 1.0)`)
+- `list_dependency_edges_raw()` — returns all structural edges
+- `to_algo_edges()` — converts DependencyEdgeRow to GraphAlgorithmEdge
+- SurrealDB symbol table has `symbol_id`, `qualified_name`, `file_path`
+- `compute_boundary_records` in `drift.rs` calls
+  `cozo.list_louvain_communities()` and writes `community_snapshot`
+- `load_semantic_input` in `health_score.rs` reads `community_snapshot`
+
+### Files to modify
 
 ```
-load_semantic_input (health_score.rs)
-  → reads community_snapshot from SQLite
-  → community_count = distinct community IDs per file's symbols
-semantic_signals.rs
-  → boundary_leakage = multi_community_files / indexed_file_count
-  → normalized against boundary_leakage_high (0.50)
-  → weighted at 20% of semantic_pressure
-scoring.rs
-  → semantic_pressure → semantic bucket (30% of overall score)
+crates/aether-store/src/graph_surreal.rs     — new method + import
+crates/aether-store/src/graph_cozo_compat.rs — compat wrapper
+crates/aether-analysis/src/drift.rs          — update call site
+crates/aetherd/src/health_score.rs           — compute communities on the fly
 ```
-
-With 11/16 crates flagged, boundary_leakage is near-max for most crates,
-dragging the workspace score from an estimated ~50 down to 43.
-
-### Key data points
-
-- Overall score: 43/100 (Watch)
-- aether-store: 77/100 after refactor (God File resolved)
-- Boundary Leaker archetype: 11/16 crates
-- Global Louvain: runs on full workspace graph, γ=1.0, no planner features
-- File-scoped planner: 11 communities / 131 largest / 3 loners / 0.93
-  confidence / 0.82 stability on aether-store
-
-## The fix
-
-Replace the global `community_snapshot` lookup in `load_semantic_input()`
-with file-scoped `detect_file_communities()` calls.
-
-For each file:
-1. Get symbols from SQLite
-2. Filter structural edges to that file's symbol set
-3. Build FileSymbol entries (without embeddings — pass empty map)
-4. Call `detect_file_communities()` with the file's edges and symbols
-5. Count distinct community IDs in the result
-6. Use that as `community_count` in SemanticFileInput
-
-Remove the `community_by_symbol` read from
-`store.list_latest_community_snapshot()`.
 
 ## Scope guard (must NOT be modified)
 
-- `community_snapshot` SQLite table schema
-- `drift.rs` or `coupling.rs` (global community pipeline)
-- `semantic_signals.rs` (formula is correct, input was wrong)
-- `archetypes.rs` (Boundary Leaker threshold 0.6 is fine)
-- `planner_communities.rs` or any file in `planner_communities/`
+- `aether-graph-algo` crate
 - `aether-health` crate
-- `aether-analysis` crate
 - `aether-config` crate
-- `aether-store` crate
-
-## Key file
-
-```
-crates/aetherd/src/health_score.rs — THE ONLY FILE TO MODIFY
-```
-
-## How to run health score
-
-```bash
-pkill -f aetherd
-rm -f /home/rephu/projects/aether/.aether/graph/LOCK
-cargo build -p aetherd --release
-
-$CARGO_TARGET_DIR/release/aetherd health-score \
-  --workspace /home/rephu/projects/aether \
-  --semantic --output table
-```
+- `community_snapshot` SQLite table schema
+- `semantic_signals.rs`, `archetypes.rs`, `scoring.rs`
+- The existing `list_louvain_communities()` method (keep for compat)
+- The file-scoped planner in `planner_communities/`
 
 ## Acceptance criteria
 
 After the change:
-- `cargo test -p aetherd` passes (all existing tests)
+- `cargo test -p aether-store` passes
+- `cargo test -p aether-analysis` passes
+- `cargo test -p aetherd` passes
 - Health score on real workspace: Boundary Leaker count drops from 11
-  to at most 4-5 (only files with genuine multi-community structure)
-- Overall score improves (estimated 48-55, was 43)
+  to at most 5
+- Overall score improves above 43
 - No regression in structural or git scores
+- If score doesn't improve, STOP and report output
 
-## Decision register note
+## Decision register
 
-Highest confirmed decision: #89 (Phase 8.15/8.16 addendum, Gemini
-native provider). This fix takes #89.1.
-
-Phase 9 decisions start at #90:
-- #90: Tauri 2.x as desktop framework
-- #91: Frontend stays HTMX + D3
-- #92: Single binary embeds daemon
-- #93: System tray as primary status surface
-- #94: Platform installers via cargo tauri build
-- #95: Auto-update via Tauri updater plugin
-- #96: Alert tray state (reserved for Phase 11 Sentinel)
+Highest confirmed: #89. This fix takes #89.1.
+Phase 9 decisions start at #90 (Tauri 2.x) through #96.
 
 ## End-of-stage git sequence
 
