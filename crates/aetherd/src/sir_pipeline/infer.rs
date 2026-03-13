@@ -157,6 +157,7 @@ pub(super) async fn generate_sir_jobs(
     concurrency: usize,
     timeout_secs: u64,
 ) -> Result<Vec<SirGenerationOutcome>> {
+    let total_jobs = jobs.len();
     let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut join_set = JoinSet::new();
 
@@ -280,10 +281,54 @@ pub(super) async fn generate_sir_jobs(
         });
     }
 
-    let mut results = Vec::new();
+    let log_thresholds: Vec<usize> = if total_jobs < 20 {
+        (1..=total_jobs).collect()
+    } else {
+        let pcts = [
+            1usize, 2, 3, 4, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90,
+            95, 100,
+        ];
+        let mut thresholds = pcts
+            .iter()
+            .map(|pct| (total_jobs * pct / 100).max(1))
+            .collect::<Vec<_>>();
+        thresholds.dedup();
+        if thresholds.last().copied() != Some(total_jobs) {
+            thresholds.push(total_jobs);
+        }
+        thresholds
+    };
+
+    let mut results = Vec::with_capacity(total_jobs);
+    let mut completed = 0usize;
+    let mut successes = 0usize;
+    let mut failures = 0usize;
+    let mut next_threshold_index = 0usize;
+
     while let Some(joined) = join_set.join_next().await {
         match joined {
-            Ok(result) => results.push(result),
+            Ok(result) => {
+                completed += 1;
+                match &result {
+                    SirGenerationOutcome::Success(_) => successes += 1,
+                    SirGenerationOutcome::Failure(_) => failures += 1,
+                }
+
+                if log_thresholds.get(next_threshold_index).copied() == Some(completed) {
+                    let pct = (completed * 100) / total_jobs.max(1);
+                    tracing::info!(
+                        completed,
+                        total_jobs,
+                        successes,
+                        failures,
+                        pct,
+                        "SIR batch progress: {completed}/{total_jobs} ({pct}%) - {successes} ok, {failures} failed"
+                    );
+                    next_threshold_index += 1;
+                }
+
+                results.push(result);
+            }
             Err(err) => return Err(anyhow!("inference task join error: {err}")),
         }
     }
