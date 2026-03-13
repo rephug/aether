@@ -7,7 +7,6 @@ authors.workspace = true
 
 [features]
 default = []
-legacy-cozo = ["dep:cozo"]
 
 [dependencies]
 aether-config = { path = "../aether-config" }
@@ -17,7 +16,6 @@ aether-graph-algo = { path = "../aether-graph-algo" }
 arrow-array.workspace = true
 arrow-schema.workspace = true
 async-trait.workspace = true
-cozo = { workspace = true, optional = true }
 futures = "0.3"
 lancedb.workspace = true
 lzma-sys.workspace = true

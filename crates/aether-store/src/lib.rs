@@ -33,24 +33,14 @@ mod write_intents;
 
 pub mod document_store;
 pub mod document_vector_store;
-#[cfg(feature = "legacy-cozo")]
-mod graph_cozo;
-#[cfg(not(feature = "legacy-cozo"))]
 mod graph_cozo_compat;
-#[cfg(feature = "legacy-cozo")]
-mod graph_migrate;
 mod graph_sqlite;
 mod graph_surreal;
 #[cfg(test)]
 mod tests;
 mod vector;
 
-#[cfg(feature = "legacy-cozo")]
-pub use graph_cozo::CozoGraphStore;
-#[cfg(not(feature = "legacy-cozo"))]
 pub use graph_cozo_compat::CozoGraphStore;
-#[cfg(feature = "legacy-cozo")]
-pub use graph_migrate::{GraphMigrationOptions, GraphMigrationResult, migrate_cozo_to_surreal};
 pub use graph_sqlite::SqliteGraphStore;
 pub use graph_surreal::SurrealGraphStore;
 pub use vector::{
@@ -82,8 +72,6 @@ pub use thresholds::{CalibrationEmbeddingRecord, ThresholdCalibrationRecord};
 pub use write_intents::{IntentOperation, WriteIntent, WriteIntentStatus};
 
 pub(crate) use graph::STRUCTURAL_EDGE_KINDS;
-#[cfg(feature = "legacy-cozo")]
-pub(crate) use graph::edge_kind_from_str;
 pub(crate) use lexical::project_note_lexical_terms;
 pub(crate) use schema::run_migrations;
 pub(crate) use sir_history::{
@@ -319,17 +307,9 @@ pub async fn open_graph_store(
     match config.storage.graph_backend {
         GraphBackend::Surreal => Ok(Box::new(SurrealGraphStore::open(workspace_root).await?)),
         GraphBackend::Cozo => {
-            #[cfg(feature = "legacy-cozo")]
-            {
-                tracing::warn!("CozoDB backend is deprecated. Run 'aether graph-migrate'");
-                Ok(Box::new(CozoGraphStore::open(workspace_root)?))
-            }
-            #[cfg(not(feature = "legacy-cozo"))]
-            {
-                Err(StoreError::Graph(
-                    "graph_backend=cozo requires building with feature `legacy-cozo`; run `aether graph-migrate`".to_owned(),
-                ))
-            }
+            Err(StoreError::Graph(
+                "CozoDB backend removed; run `aether graph-migrate` to convert to SurrealDB".to_owned(),
+            ))
         }
         GraphBackend::Sqlite => Ok(Box::new(SqliteGraphStore::open(workspace_root)?)),
     }

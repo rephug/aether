@@ -11,8 +11,6 @@ use aether_infer::ProviderOverrides;
 use aether_infer::sir_prompt::SirEnrichmentContext;
 use aether_infer::{download_candle_embedding_model, download_candle_reranker_model};
 use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
-#[cfg(feature = "legacy-cozo")]
-use aether_store::migrate_cozo_to_surreal;
 use aether_store::{SqliteStore, Store};
 use aetherd::calibrate::run_calibration_once;
 use aetherd::causal::run_trace_cause_command;
@@ -322,8 +320,6 @@ fn run_subcommand(workspace: &Path, config: &AetherConfig, command: Commands) ->
         Commands::Health(args) => run_health_subcommand(workspace, args),
         Commands::HealthScore(args) => run_health_score_subcommand(workspace, config, args),
         Commands::Fsck(args) => run_fsck_subcommand(workspace, args),
-        #[cfg(feature = "legacy-cozo")]
-        Commands::GraphMigrate(args) => run_graph_migrate_subcommand(workspace, args),
     }
 }
 
@@ -812,36 +808,6 @@ fn run_fsck_subcommand(workspace: &Path, args: FsckArgs) -> Result<()> {
         .context("fsck command failed")
 }
 
-#[cfg(feature = "legacy-cozo")]
-fn run_graph_migrate_subcommand(
-    _workspace_from_global: &Path,
-    args: aetherd::cli::GraphMigrateArgs,
-) -> Result<()> {
-    let workspace = args.workspace.canonicalize().with_context(|| {
-        format!(
-            "failed to resolve workspace path {}",
-            args.workspace.display()
-        )
-    })?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("failed to build tokio runtime for graph migration")?;
-    let result = runtime
-        .block_on(migrate_cozo_to_surreal(&workspace, args.dry_run))
-        .context("graph migration failed")?;
-    eprintln!(
-        "graph migration {}: symbols={}, edges={}",
-        if result.dry_run {
-            "dry-run"
-        } else {
-            "completed"
-        },
-        result.symbols_migrated,
-        result.edges_migrated
-    );
-    Ok(())
-}
 
 fn init_tracing_subscriber(log_format: LogFormat, configured_log_level: &str) -> Result<()> {
     let init_result = match log_format {

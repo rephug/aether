@@ -441,14 +441,6 @@ pub struct FsckArgs {
     pub verbose: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Args)]
-pub struct GraphMigrateArgs {
-    #[arg(long, help = "Preview migration actions without writing changes")]
-    pub dry_run: bool,
-
-    #[arg(long, default_value = ".", help = "Workspace root to migrate")]
-    pub workspace: PathBuf,
-}
 
 #[derive(Debug, Clone, PartialEq, Subcommand)]
 pub enum Commands {
@@ -490,9 +482,6 @@ pub enum Commands {
     HealthScore(HealthScoreArgs),
     /// Verify and optionally repair cross-store consistency
     Fsck(FsckArgs),
-    #[cfg(feature = "legacy-cozo")]
-    /// Migrate graph backend data from CozoDB to SurrealDB
-    GraphMigrate(GraphMigrateArgs),
 }
 
 #[derive(Debug, Clone, Parser)]
