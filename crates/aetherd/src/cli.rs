@@ -441,7 +441,6 @@ pub struct FsckArgs {
     pub verbose: bool,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Subcommand)]
 pub enum Commands {
     /// Generate agent configuration files for AI coding agents

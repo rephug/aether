@@ -306,11 +306,9 @@ pub async fn open_graph_store(
     let config = load_workspace_config(workspace_root)?;
     match config.storage.graph_backend {
         GraphBackend::Surreal => Ok(Box::new(SurrealGraphStore::open(workspace_root).await?)),
-        GraphBackend::Cozo => {
-            Err(StoreError::Graph(
-                "CozoDB backend removed; run `aether graph-migrate` to convert to SurrealDB".to_owned(),
-            ))
-        }
+        GraphBackend::Cozo => Err(StoreError::Graph(
+            "CozoDB backend removed; run `aether graph-migrate` to convert to SurrealDB".to_owned(),
+        )),
         GraphBackend::Sqlite => Ok(Box::new(SqliteGraphStore::open(workspace_root)?)),
     }
 }

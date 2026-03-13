@@ -808,7 +808,6 @@ fn run_fsck_subcommand(workspace: &Path, args: FsckArgs) -> Result<()> {
         .context("fsck command failed")
 }
 
-
 fn init_tracing_subscriber(log_format: LogFormat, configured_log_level: &str) -> Result<()> {
     let init_result = match log_format {
         LogFormat::Human => tracing_subscriber::fmt()
