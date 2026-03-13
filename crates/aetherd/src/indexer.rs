@@ -24,8 +24,8 @@ use crate::priority_queue::{
     SirPriorityQueue, compute_priority_score, kind_priority_score, size_inverse_score,
 };
 use crate::sir_pipeline::{
-    SIR_GENERATION_PASS_DEEP, SIR_GENERATION_PASS_REGENERATED, SIR_GENERATION_PASS_SCAN,
-    SIR_GENERATION_PASS_TRIAGE, SirDeepPromptSpec, SirPipeline,
+    QualityBatchItem, SIR_GENERATION_PASS_DEEP, SIR_GENERATION_PASS_REGENERATED,
+    SIR_GENERATION_PASS_SCAN, SIR_GENERATION_PASS_TRIAGE, SirPipeline,
 };
 
 const REQUEST_POLL_BATCH: usize = 128;
@@ -866,10 +866,9 @@ fn run_quality_pass(
 ) -> Result<()> {
     let use_cot = use_cot && pipeline.provider_name() == InferenceProviderKind::Qwen3Local.as_str();
     let total = candidates.len();
-    let mut successes = 0usize;
-    let mut failures = 0usize;
+    let mut batch_items = Vec::with_capacity(total);
 
-    for (index, candidate) in candidates.into_iter().enumerate() {
+    for candidate in candidates {
         let enrichment = build_enrichment_context(
             store,
             &candidate.symbol,
@@ -880,55 +879,25 @@ fn run_quality_pass(
             confidence_threshold,
             candidate.priority_score,
         )?;
-        let event = SymbolChangeEvent {
-            file_path: candidate.symbol.file_path.clone(),
-            language: candidate.symbol.language,
-            added: Vec::new(),
-            removed: Vec::new(),
-            updated: vec![candidate.symbol.clone()],
-        };
-        let mut deep_specs = HashMap::new();
-        deep_specs.insert(
-            candidate.symbol.id.clone(),
-            SirDeepPromptSpec {
-                enrichment,
-                use_cot,
-            },
-        );
-
-        match pipeline.process_event_with_deep_specs(
-            store,
-            &event,
-            true,
-            print_sir,
-            out,
-            Some(candidate.priority_score),
-            generation_pass,
-            &deep_specs,
-        ) {
-            Ok(stats) => {
-                successes += stats.success_count;
-                failures += stats.failure_count;
-            }
-            Err(err) => {
-                failures += 1;
-                tracing::warn!(
-                    symbol_id = %candidate.symbol.id,
-                    qualified_name = %candidate.symbol.qualified_name,
-                    error = %err,
-                    "{pass_label} symbol processing failed"
-                );
-            }
-        }
-
-        tracing::info!(
-            "{pass_label}: {}/{} symbols, {} improved, {} failed",
-            index + 1,
-            total,
-            successes,
-            failures
-        );
+        batch_items.push(QualityBatchItem {
+            symbol: candidate.symbol,
+            priority_score: candidate.priority_score,
+            enrichment,
+            use_cot,
+        });
     }
+
+    tracing::info!("{pass_label}: submitting {total} symbols for concurrent inference");
+
+    let stats =
+        pipeline.process_quality_batch(store, batch_items, generation_pass, print_sir, out)?;
+
+    tracing::info!(
+        "{pass_label}: complete - {} improved, {} failed out of {} total",
+        stats.success_count,
+        stats.failure_count,
+        total
+    );
 
     Ok(())
 }

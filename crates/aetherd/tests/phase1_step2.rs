@@ -2,13 +2,16 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use aether_config::{AetherConfig, VerifyConfig, VerifyMode};
+use aether_infer::sir_prompt::SirEnrichmentContext;
 use aether_infer::{InferError, InferenceProvider, Qwen3LocalProvider, SirContext};
 use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id, validate_sir};
-use aether_store::{SqliteStore, Store, SymbolEmbeddingRecord};
+use aether_store::{SqliteStore, Store, SymbolEmbeddingRecord, SymbolRecord};
 use aetherd::observer::ObserverState;
-use aetherd::sir_pipeline::SirPipeline;
+use aetherd::sir_pipeline::{QualityBatchItem, SIR_GENERATION_PASS_TRIAGE, SirPipeline};
 use aetherd::verification::{VerificationRequest, run_host_verification, run_verification};
 use tempfile::tempdir;
 
@@ -80,6 +83,57 @@ impl InferenceProvider for RollupUnionMockProvider {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PromptTrackingProvider {
+    inflight: Arc<AtomicUsize>,
+    max_inflight: Arc<AtomicUsize>,
+    delay_ms: u64,
+}
+
+#[async_trait::async_trait]
+impl InferenceProvider for PromptTrackingProvider {
+    fn provider_name(&self) -> String {
+        "prompt_tracking".to_owned()
+    }
+
+    fn model_name(&self) -> String {
+        "prompt_tracking".to_owned()
+    }
+
+    async fn generate_sir(
+        &self,
+        _symbol_text: &str,
+        context: &SirContext,
+    ) -> Result<SirAnnotation, InferError> {
+        Ok(prompt_tracking_sir(context))
+    }
+
+    async fn generate_sir_from_prompt(
+        &self,
+        _prompt: &str,
+        context: &SirContext,
+        _deep_mode: bool,
+    ) -> Result<SirAnnotation, InferError> {
+        let current = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_inflight.fetch_max(current, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+        self.inflight.fetch_sub(1, Ordering::SeqCst);
+        Ok(prompt_tracking_sir(context))
+    }
+}
+
+fn prompt_tracking_sir(context: &SirContext) -> SirAnnotation {
+    SirAnnotation {
+        intent: format!("Prompt summary for {}", context.qualified_name),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        side_effects: Vec::new(),
+        dependencies: Vec::new(),
+        error_modes: Vec::new(),
+        confidence: 0.95,
+    }
+}
+
 fn run_git(workspace: &Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
     let output = Command::new("git")
         .args(args)
@@ -134,6 +188,60 @@ fn commit_all(workspace: &Path, message: &str) -> Result<String, Box<dyn std::er
     run_git(workspace, &["add", "."])?;
     run_git(workspace, &["commit", "-m", message])?;
     run_git(workspace, &["rev-parse", "--verify", "HEAD"])
+}
+
+fn collect_initial_symbols(
+    workspace: &Path,
+    target_file: &str,
+) -> Result<Vec<aether_core::Symbol>, Box<dyn std::error::Error>> {
+    let mut observer = ObserverState::new(workspace.to_path_buf())?;
+    observer.seed_from_disk()?;
+
+    let symbols = observer
+        .initial_symbol_events()
+        .into_iter()
+        .filter(|event| event.file_path == target_file)
+        .flat_map(|event| event.added.into_iter().chain(event.updated))
+        .collect::<Vec<_>>();
+
+    Ok(symbols)
+}
+
+fn upsert_symbol_snapshots(
+    store: &SqliteStore,
+    symbols: &[aether_core::Symbol],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for symbol in symbols {
+        store.upsert_symbol(SymbolRecord {
+            id: symbol.id.clone(),
+            file_path: symbol.file_path.clone(),
+            language: symbol.language.as_str().to_owned(),
+            kind: symbol.kind.as_str().to_owned(),
+            qualified_name: symbol.qualified_name.clone(),
+            signature_fingerprint: symbol.signature_fingerprint.clone(),
+            last_seen_at: 1_700_000_000,
+        })?;
+    }
+
+    Ok(())
+}
+
+fn make_quality_batch_items(symbols: &[aether_core::Symbol]) -> Vec<QualityBatchItem> {
+    symbols
+        .iter()
+        .cloned()
+        .map(|symbol| QualityBatchItem {
+            symbol,
+            priority_score: 0.9,
+            enrichment: SirEnrichmentContext {
+                file_intent: None,
+                neighbor_intents: Vec::new(),
+                baseline_sir: None,
+                priority_reason: "test batch".to_owned(),
+            },
+            use_cot: false,
+        })
+        .collect()
 }
 
 #[test]
@@ -318,6 +426,157 @@ fn step2_file_rollup_aggregates_side_effects_and_concatenates_intent_for_small_f
 
     let file_meta = store.get_sir_meta(&file_rollup_id)?;
     assert!(file_meta.is_some());
+
+    Ok(())
+}
+
+#[test]
+fn step2_quality_batch_runs_prompt_inference_concurrently_and_rolls_up_once()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    write_pipeline_config(workspace, false, "sqlite")?;
+
+    fs::create_dir_all(workspace.join("src"))?;
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "fn alpha() -> i32 { 1 }\nfn beta() -> i32 { 2 }\nfn gamma() -> i32 { 3 }\n",
+    )?;
+
+    let symbols = collect_initial_symbols(workspace, "src/lib.rs")?;
+    assert_eq!(symbols.len(), 3);
+
+    let store = SqliteStore::open(workspace)?;
+    upsert_symbol_snapshots(&store, &symbols)?;
+
+    let inflight = Arc::new(AtomicUsize::new(0));
+    let max_inflight = Arc::new(AtomicUsize::new(0));
+    let pipeline = SirPipeline::new_with_provider(
+        workspace.to_path_buf(),
+        3,
+        Arc::new(PromptTrackingProvider {
+            inflight: Arc::clone(&inflight),
+            max_inflight: Arc::clone(&max_inflight),
+            delay_ms: 75,
+        }),
+        "prompt_tracking",
+        "prompt_tracking",
+    )?;
+
+    let mut out = Vec::new();
+    let stats = pipeline.process_quality_batch(
+        &store,
+        make_quality_batch_items(&symbols),
+        SIR_GENERATION_PASS_TRIAGE,
+        false,
+        &mut out,
+    )?;
+
+    assert_eq!(stats.success_count, symbols.len());
+    assert_eq!(stats.failure_count, 0);
+    assert!(
+        max_inflight.load(Ordering::SeqCst) > 1,
+        "expected batched inference to overlap"
+    );
+
+    for symbol in &symbols {
+        let blob = store
+            .read_sir_blob(&symbol.id)?
+            .expect("quality batch should persist symbol SIR");
+        let sir: SirAnnotation = serde_json::from_str(&blob)?;
+        validate_sir(&sir)?;
+    }
+
+    let file_rollup_id = synthetic_file_sir_id("rust", "src/lib.rs");
+    let file_blob = store
+        .read_sir_blob(&file_rollup_id)?
+        .expect("quality batch should refresh file rollup");
+    let file_sir: FileSir = serde_json::from_str(&file_blob)?;
+    assert_eq!(file_sir.symbol_count, symbols.len());
+
+    let file_meta = store
+        .get_sir_meta(&file_rollup_id)?
+        .expect("quality batch should store file rollup metadata");
+    assert_eq!(file_meta.sir_version, 1);
+
+    Ok(())
+}
+
+#[test]
+fn step2_quality_batch_counts_build_failures_and_cleans_touched_rollups()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    write_pipeline_config(workspace, false, "sqlite")?;
+
+    fs::create_dir_all(workspace.join("src"))?;
+    fs::write(workspace.join("src/lib.rs"), "fn alpha() -> i32 { 1 }\n")?;
+
+    let mut valid_symbols = collect_initial_symbols(workspace, "src/lib.rs")?;
+    assert_eq!(valid_symbols.len(), 1);
+
+    let missing_symbol = {
+        let mut symbol = valid_symbols[0].clone();
+        symbol.id = "sym-missing".to_owned();
+        symbol.file_path = "src/missing.rs".to_owned();
+        symbol.name = "missing".to_owned();
+        symbol.qualified_name = "missing".to_owned();
+        symbol
+    };
+
+    let store = SqliteStore::open(workspace)?;
+    upsert_symbol_snapshots(&store, &valid_symbols)?;
+    upsert_symbol_snapshots(&store, std::slice::from_ref(&missing_symbol))?;
+
+    let missing_rollup_id = synthetic_file_sir_id("rust", "src/missing.rs");
+    store.write_sir_blob(
+        &missing_rollup_id,
+        r#"{"intent":"stale","exports":[],"side_effects":[],"dependencies":[],"error_modes":[],"symbol_count":1,"confidence":0.5}"#,
+    )?;
+    assert!(store.read_sir_blob(&missing_rollup_id)?.is_some());
+
+    valid_symbols.push(missing_symbol.clone());
+    let pipeline = SirPipeline::new_with_provider(
+        workspace.to_path_buf(),
+        2,
+        Arc::new(PromptTrackingProvider {
+            inflight: Arc::new(AtomicUsize::new(0)),
+            max_inflight: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 25,
+        }),
+        "prompt_tracking",
+        "prompt_tracking",
+    )?;
+
+    let mut out = Vec::new();
+    let stats = pipeline.process_quality_batch(
+        &store,
+        make_quality_batch_items(&valid_symbols),
+        SIR_GENERATION_PASS_TRIAGE,
+        false,
+        &mut out,
+    )?;
+
+    assert_eq!(stats.success_count, 1);
+    assert_eq!(stats.failure_count, 1);
+
+    let valid_blob = store
+        .read_sir_blob(&valid_symbols[0].id)?
+        .expect("valid symbol should still persist SIR");
+    let valid_sir: SirAnnotation = serde_json::from_str(&valid_blob)?;
+    validate_sir(&valid_sir)?;
+
+    assert!(store.read_sir_blob(&missing_symbol.id)?.is_none());
+    assert!(
+        store.read_sir_blob(&missing_rollup_id)?.is_none(),
+        "touched missing-file rollup should be cleaned up"
+    );
+
+    let valid_rollup_id = synthetic_file_sir_id("rust", "src/lib.rs");
+    let valid_rollup_meta = store
+        .get_sir_meta(&valid_rollup_id)?
+        .expect("valid file rollup should be refreshed");
+    assert_eq!(valid_rollup_meta.sir_version, 1);
 
     Ok(())
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -72,6 +72,15 @@ pub struct SirPromptOverride {
 
 #[derive(Debug, Clone)]
 pub struct SirDeepPromptSpec {
+    pub enrichment: SirEnrichmentContext,
+    pub use_cot: bool,
+}
+
+/// A pre-built quality pass candidate ready for batched inference.
+#[derive(Debug, Clone)]
+pub struct QualityBatchItem {
+    pub symbol: Symbol,
+    pub priority_score: f64,
     pub enrichment: SirEnrichmentContext,
     pub use_cot: bool,
 }
@@ -415,6 +424,128 @@ impl SirPipeline {
             commit_hash.as_deref(),
             generation_pass,
         )?;
+
+        Ok(stats)
+    }
+
+    pub fn process_quality_batch(
+        &self,
+        store: &SqliteStore,
+        items: Vec<QualityBatchItem>,
+        generation_pass: &str,
+        print_sir: bool,
+        out: &mut dyn Write,
+    ) -> Result<ProcessEventStats> {
+        let commit_hash = resolve_workspace_head_commit(&self.workspace_root);
+        let mut touched_files = BTreeMap::<String, Language>::new();
+        let mut intents_by_file = BTreeMap::<String, Vec<String>>::new();
+        let mut jobs = Vec::with_capacity(items.len());
+        let mut stats = ProcessEventStats::default();
+
+        for item in items {
+            let symbol_id = item.symbol.id.clone();
+            let qualified_name = item.symbol.qualified_name.clone();
+            let file_path = item.symbol.file_path.clone();
+            let language = item.symbol.language;
+            touched_files.entry(file_path.clone()).or_insert(language);
+
+            match build_job(&self.workspace_root, item.symbol, Some(item.priority_score)) {
+                Ok(mut job) => {
+                    let prompt = if item.use_cot {
+                        sir_prompt::build_enriched_sir_prompt_with_cot(
+                            &job.symbol_text,
+                            &job.context,
+                            &item.enrichment,
+                        )
+                    } else {
+                        sir_prompt::build_enriched_sir_prompt(
+                            &job.symbol_text,
+                            &job.context,
+                            &item.enrichment,
+                        )
+                    };
+                    job.custom_prompt = Some(prompt);
+                    job.deep_mode = item.use_cot;
+                    jobs.push(job);
+                }
+                Err(err) => {
+                    stats.failure_count += 1;
+                    tracing::warn!(
+                        symbol_id = %symbol_id,
+                        qualified_name = %qualified_name,
+                        file_path = %file_path,
+                        error = %err,
+                        "failed to build batched quality SIR job; skipping symbol"
+                    );
+                }
+            }
+        }
+
+        tracing::info!(
+            job_count = jobs.len(),
+            file_count = touched_files.len(),
+            provider = %self.provider_name,
+            model = %self.model_name,
+            "submitting batched quality SIR generation jobs"
+        );
+
+        let results = if jobs.is_empty() {
+            Vec::new()
+        } else {
+            self.runtime.block_on(generate_sir_jobs(
+                self.provider.clone(),
+                self.tiered_parse_fallback_provider.clone(),
+                self.tiered_parse_fallback_model.clone(),
+                jobs,
+                self.sir_concurrency,
+                self.inference_timeout_secs,
+            ))?
+        };
+
+        for result in results {
+            match result {
+                SirGenerationOutcome::Success(generated) => {
+                    let file_path = generated.symbol.file_path.clone();
+                    match self.commit_successful_generation(
+                        store,
+                        generated,
+                        generation_pass,
+                        commit_hash.as_deref(),
+                        print_sir,
+                        out,
+                    )? {
+                        Some(intent_id) => {
+                            intents_by_file
+                                .entry(file_path)
+                                .or_default()
+                                .push(intent_id);
+                            stats.success_count += 1;
+                        }
+                        None => stats.failure_count += 1,
+                    }
+                }
+                SirGenerationOutcome::Failure(failed) => {
+                    stats.failure_count += 1;
+                    self.handle_failed_generation(store, failed, generation_pass, print_sir, out)?;
+                }
+            }
+        }
+
+        for (file_path, mut intent_ids) in intents_by_file {
+            self.finalize_graph_stage(store, file_path.as_str(), &mut intent_ids);
+        }
+
+        for (file_path, language) in touched_files {
+            self.upsert_file_rollup(
+                store,
+                file_path.as_str(),
+                language,
+                print_sir,
+                out,
+                commit_hash.as_deref(),
+                generation_pass,
+            )?;
+        }
 
         Ok(stats)
     }
