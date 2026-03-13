@@ -74,10 +74,10 @@ pub enum Severity {
 impl Severity {
     pub fn from_score(score: u32) -> Self {
         match score {
-            0..=24 => Self::Healthy,
-            25..=49 => Self::Watch,
-            50..=69 => Self::Moderate,
-            70..=84 => Self::High,
+            76..=100 => Self::Healthy,
+            51..=75 => Self::Watch,
+            31..=50 => Self::Moderate,
+            16..=30 => Self::High,
             _ => Self::Critical,
         }
     }

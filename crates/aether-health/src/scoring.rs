@@ -86,7 +86,8 @@ pub fn normalize_to_100(penalty: f64) -> u32 {
         return 0;
     }
 
-    penalty.round().clamp(0.0, 100.0) as u32
+    let p = penalty.round().clamp(0.0, 100.0) as u32;
+    100u32.saturating_sub(p)
 }
 
 pub fn combined_score(
@@ -126,7 +127,7 @@ pub fn combined_score(
     let score = if available_weight <= f64::EPSILON {
         structural_bucket
     } else {
-        normalize_to_100(weighted_sum / available_weight)
+        (weighted_sum / available_weight).round().clamp(0.0, 100.0) as u32
     };
 
     CombinedScore {
@@ -142,14 +143,14 @@ pub fn combined_score(
 pub fn compute_workspace_aggregate(crate_scores: &[CrateScore]) -> u32 {
     let total_loc: usize = crate_scores.iter().map(|score| score.total_loc).sum();
     if total_loc == 0 {
-        return 0;
+        return 100;
     }
 
     let weighted_score = crate_scores.iter().fold(0.0, |acc, crate_score| {
         let weight = crate_score.total_loc as f64 / total_loc as f64;
         acc + crate_score.score as f64 * weight
     });
-    normalize_to_100(weighted_score)
+    weighted_score.round().clamp(0.0, 100.0) as u32
 }
 
 fn weighted_penalty(value: f64, warn: f64, fail: f64, weight: f64) -> f64 {
@@ -173,14 +174,14 @@ mod tests {
 
     #[test]
     fn score_clamped_to_100() {
-        assert_eq!(normalize_to_100(150.0), 100);
+        assert_eq!(normalize_to_100(150.0), 0);
     }
 
     #[test]
     fn workspace_score_is_loc_weighted() {
         let small_bad = CrateScore {
             name: "small-bad".to_owned(),
-            score: 100,
+            score: 0,
             severity: Severity::Critical,
             archetypes: vec![Archetype::GodFile],
             total_loc: 10,
@@ -203,7 +204,7 @@ mod tests {
         };
         let large_good = CrateScore {
             name: "large-good".to_owned(),
-            score: 10,
+            score: 100,
             severity: Severity::Healthy,
             archetypes: Vec::new(),
             total_loc: 1000,
@@ -226,14 +227,14 @@ mod tests {
         };
 
         let score = compute_workspace_aggregate(&[small_bad, large_good]);
-        assert!(score <= 11);
+        assert!(score >= 89);
     }
 
     #[test]
     fn combined_score_reweights_available_buckets() {
         let config = aether_config::HealthScoreConfig::default();
         let combined = combined_score(
-            60,
+            40,
             Some(&GitSignals {
                 git_pressure: 0.8,
                 ..GitSignals::default()
@@ -242,9 +243,9 @@ mod tests {
             &config,
         );
 
-        assert_eq!(combined.breakdown.structural, 60);
-        assert_eq!(combined.breakdown.git, Some(80));
-        assert_eq!(combined.score, 68);
+        assert_eq!(combined.breakdown.structural, 40);
+        assert_eq!(combined.breakdown.git, Some(20));
+        assert_eq!(combined.score, 32);
     }
 
     #[test]
@@ -264,8 +265,8 @@ mod tests {
         );
 
         assert_eq!(combined.breakdown.structural, 50);
-        assert_eq!(combined.breakdown.git, Some(40));
-        assert_eq!(combined.breakdown.semantic, Some(80));
-        assert_eq!(combined.score, 58);
+        assert_eq!(combined.breakdown.git, Some(60));
+        assert_eq!(combined.breakdown.semantic, Some(20));
+        assert_eq!(combined.score, 42);
     }
 }

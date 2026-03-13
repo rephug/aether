@@ -608,7 +608,7 @@ fn mcp_health_hotspots_tool() -> Result<()> {
         .block_on(
             server.aether_health_hotspots(Parameters(AetherHealthHotspotsRequest {
                 limit: Some(5),
-                min_score: Some(0),
+                max_score: Some(100),
                 semantic: Some(false),
             })),
         )

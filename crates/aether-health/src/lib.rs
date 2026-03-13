@@ -127,9 +127,8 @@ fn compute_workspace_score_internal(
         )?);
     }
     crate_scores.sort_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
+        left.score
+            .cmp(&right.score)
             .then_with(|| left.name.cmp(&right.name))
     });
 
@@ -694,7 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn score_zero_for_clean_crate() {
+    fn score_100_for_clean_crate() {
         let workspace = create_workspace("\"crates/clean\"");
         create_crate(
             workspace.path(),
@@ -706,8 +705,8 @@ mod tests {
         let report = compute_workspace_score(workspace.path(), &HealthScoreConfig::default())
             .expect("workspace score");
 
-        assert_eq!(report.workspace_score, 0);
-        assert_eq!(report.crates[0].score, 0);
+        assert_eq!(report.workspace_score, 100);
+        assert_eq!(report.crates[0].score, 100);
     }
 
     #[test]

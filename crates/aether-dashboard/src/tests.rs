@@ -734,7 +734,7 @@ async fn dashboard_health_score_endpoint() {
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/api/v1/health-score?limit=5&min_score=0")
+                .uri("/api/v1/health-score?limit=5&max_score=100")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -764,7 +764,7 @@ async fn health_score_fragment_contains_hotspot_table_and_sparkline_container() 
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/dashboard/frag/health-score?limit=5&min_score=0")
+                .uri("/dashboard/frag/health-score?limit=5&max_score=100")
                 .body(Body::empty())
                 .unwrap(),
         )

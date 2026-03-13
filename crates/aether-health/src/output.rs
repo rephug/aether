@@ -189,11 +189,11 @@ pub fn format_compare_json(report: &CompareReport) -> String {
     }
 }
 
-pub fn format_hotspots_text(report: &ScoreReport, limit: usize, min_score: u32) -> String {
+pub fn format_hotspots_text(report: &ScoreReport, limit: usize, max_score: u32) -> String {
     let crates = report
         .crates
         .iter()
-        .filter(|crate_score| crate_score.score >= min_score)
+        .filter(|crate_score| crate_score.score <= max_score)
         .take(limit.max(1))
         .collect::<Vec<_>>();
 

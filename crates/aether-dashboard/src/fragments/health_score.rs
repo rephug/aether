@@ -42,10 +42,10 @@ pub(crate) async fn health_score_fragment(
         div class="rounded-2xl border border-surface-3/40 bg-surface-1/60 p-5 shadow-sm space-y-5" style="font-family: 'IBM Plex Sans', sans-serif;" {
             div class="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between" {
                 div class="space-y-2" {
-                    div class="text-[11px] uppercase tracking-[0.24em] text-text-muted" { "Pressure Gauge" }
+                    div class="text-[11px] uppercase tracking-[0.24em] text-text-muted" { "Health Gauge" }
                     h3 class="text-xl font-semibold text-text-primary" { "Workspace Health Score" }
                     p class="text-sm text-text-secondary max-w-2xl" {
-                        "Structural, git, and semantic hotspot scoring across workspace crates. Lower scores are healthier."
+                        "Structural, git, and semantic hotspot scoring across workspace crates. Higher scores are healthier."
                     }
                 }
                 div class={ "rounded-2xl border px-5 py-4 min-w-[220px] " (severity_panel_class(data.severity)) } {
@@ -53,7 +53,7 @@ pub(crate) async fn health_score_fragment(
                         div {
                             div class="text-[11px] uppercase tracking-[0.22em] opacity-80" { (data.severity.as_label()) }
                             div class="text-5xl font-semibold leading-none mt-1" { (data.workspace_score) }
-                            div class="text-xs mt-2 opacity-85" { "Current workspace pressure" }
+                            div class="text-xs mt-2 opacity-85" { "Current workspace health" }
                         }
                         span class={ "rounded-full px-2.5 py-1 text-xs font-semibold " (delta_class(data.delta)) } {
                             (delta_label)
@@ -182,9 +182,9 @@ fn severity_panel_class(severity: Severity) -> &'static str {
 
 fn delta_class(delta: i32) -> &'static str {
     match delta.cmp(&0) {
-        std::cmp::Ordering::Less => "bg-emerald-500/20 text-emerald-200",
+        std::cmp::Ordering::Less => "bg-red-500/20 text-red-200",
         std::cmp::Ordering::Equal => "bg-surface-3/50 text-text-secondary",
-        std::cmp::Ordering::Greater => "bg-red-500/20 text-red-200",
+        std::cmp::Ordering::Greater => "bg-emerald-500/20 text-emerald-200",
     }
 }
 

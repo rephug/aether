@@ -56,7 +56,7 @@ pub struct AetherHealthRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherHealthHotspotsRequest {
     pub limit: Option<u32>,
-    pub min_score: Option<u32>,
+    pub max_score: Option<u32>,
     pub semantic: Option<bool>,
 }
 
@@ -273,10 +273,10 @@ impl AetherMcpServer {
         request: AetherHealthHotspotsRequest,
     ) -> Result<String, AetherMcpError> {
         let limit = request.limit.unwrap_or(5).clamp(1, 100) as usize;
-        let min_score = request.min_score.unwrap_or(25).min(100);
+        let max_score = request.max_score.unwrap_or(75).min(100);
         let semantic = request.semantic.unwrap_or(true);
         let report = self.compute_health_score_report(semantic, &[]).await?;
-        Ok(format_hotspots_text(&report, limit, min_score))
+        Ok(format_hotspots_text(&report, limit, max_score))
     }
 
     pub async fn aether_health_explain_logic(
@@ -302,7 +302,7 @@ impl AetherMcpServer {
             )));
         };
 
-        let split_outcome = if crate_score.score >= 50 {
+        let split_outcome = if crate_score.score <= 50 {
             if semantic {
                 self.split_suggestion_for_crate(crate_score).await
             } else {
@@ -323,7 +323,7 @@ impl AetherMcpServer {
         };
 
         let mut rendered = format_crate_explanation(crate_score, split_outcome.suggestion.as_ref());
-        if crate_score.score >= 50 {
+        if crate_score.score <= 50 {
             append_split_outcome_text(&mut rendered, &split_outcome);
         }
         Ok(rendered)
@@ -416,11 +416,17 @@ impl AetherMcpServer {
                         })
                 })
                 .count();
-            let community_count = symbols
-                .iter()
-                .filter_map(|symbol| community_by_symbol.get(symbol.id.as_str()).copied())
-                .collect::<HashSet<_>>()
-                .len();
+            let mut community_freq = HashMap::new();
+            for symbol in &symbols {
+                if let Some(community_id) = community_by_symbol.get(symbol.id.as_str()).copied() {
+                    *community_freq.entry(community_id).or_insert(0usize) += 1;
+                }
+            }
+            let threshold = 3_usize.max((symbols.len() as f64 * 0.2).ceil() as usize);
+            let community_count = community_freq
+                .values()
+                .filter(|&&count| count >= threshold)
+                .count();
             let has_test_coverage = symbols.iter().any(|symbol| {
                 self.state
                     .store

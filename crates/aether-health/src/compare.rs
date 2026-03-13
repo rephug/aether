@@ -92,16 +92,16 @@ pub fn compare_reports(before: &ScoreReport, after: &ScoreReport) -> CompareRepo
     }
 
     crate_deltas.sort_by(|left, right| {
-        let left_hottest = left
+        let left_worst = left
             .before_score
-            .unwrap_or(0)
-            .max(left.after_score.unwrap_or(0));
-        let right_hottest = right
+            .unwrap_or(100)
+            .min(left.after_score.unwrap_or(100));
+        let right_worst = right
             .before_score
-            .unwrap_or(0)
-            .max(right.after_score.unwrap_or(0));
-        right_hottest
-            .cmp(&left_hottest)
+            .unwrap_or(100)
+            .min(right.after_score.unwrap_or(100));
+        left_worst
+            .cmp(&right_worst)
             .then_with(|| left.name.cmp(&right.name))
     });
     improvements.sort_by(metric_delta_sort);
@@ -318,18 +318,18 @@ mod tests {
 
     #[test]
     fn compare_report_computes_delta() {
-        let before = report(60, 70, 300, 8);
-        let after = report(50, 64, 220, 3);
+        let before = report(40, 30, 300, 8);
+        let after = report(50, 36, 220, 3);
 
         let compare = compare_reports(&before, &after);
-        assert_eq!(compare.delta, -10);
-        assert_eq!(compare.crate_deltas[0].delta, -6);
+        assert_eq!(compare.delta, 10);
+        assert_eq!(compare.crate_deltas[0].delta, 6);
     }
 
     #[test]
     fn compare_identifies_improvements() {
-        let before = report(60, 70, 300, 8);
-        let after = report(50, 64, 220, 3);
+        let before = report(40, 30, 300, 8);
+        let after = report(50, 36, 220, 3);
 
         let compare = compare_reports(&before, &after);
         assert!(compare.improvements.iter().any(|delta| {

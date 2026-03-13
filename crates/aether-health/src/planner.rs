@@ -51,7 +51,7 @@ pub fn suggest_split(
     symbols: &[FileSymbol],
     config: &FileCommunityConfig,
 ) -> Option<(SplitSuggestion, PlannerDiagnostics)> {
-    if crate_score < 50 {
+    if crate_score > 50 {
         return None;
     }
 
@@ -435,7 +435,7 @@ mod tests {
 
         let suggestion = suggest_split(
             "crates/example/src/lib.rs",
-            70,
+            30,
             &[edge("sym-a", "sym-b")],
             &symbols,
             &config(),
@@ -480,7 +480,7 @@ mod tests {
 
         let (suggestion, diagnostics) = suggest_split(
             "crates/example/src/lib.rs",
-            70,
+            30,
             &[edge("sym-a", "sym-b"), edge("sym-c", "sym-d")],
             &symbols,
             &planner_config,

@@ -124,8 +124,8 @@ pub fn execute_health_score_command(
     }
 
     let exit_code = if args
-        .fail_above
-        .is_some_and(|threshold| report.workspace_score > threshold)
+        .fail_below
+        .is_some_and(|threshold| report.workspace_score < threshold)
     {
         1
     } else {
@@ -290,7 +290,7 @@ fn collect_split_suggestion_entries(
     let qualifying = report
         .crates
         .iter()
-        .filter(|crate_score| crate_score.score >= 50)
+        .filter(|crate_score| crate_score.score <= 50)
         .collect::<Vec<_>>();
     if qualifying.is_empty() {
         return Vec::new();
@@ -872,11 +872,17 @@ fn load_semantic_input(workspace: &Path) -> Result<Option<SemanticInput>> {
                     })
             })
             .count();
-        let community_count = symbols
-            .iter()
-            .filter_map(|symbol| community_by_symbol.get(symbol.id.as_str()).copied())
-            .collect::<HashSet<_>>()
-            .len();
+        let mut community_freq = HashMap::new();
+        for symbol in &symbols {
+            if let Some(community_id) = community_by_symbol.get(symbol.id.as_str()).copied() {
+                *community_freq.entry(community_id).or_insert(0usize) += 1;
+            }
+        }
+        let threshold = 3_usize.max((symbols.len() as f64 * 0.2).ceil() as usize);
+        let community_count = community_freq
+            .values()
+            .filter(|&&count| count >= threshold)
+            .count();
         let has_test_coverage = symbols.iter().any(|symbol| {
             store
                 .list_test_intents_for_symbol(symbol.id.as_str())
@@ -1126,7 +1132,7 @@ model = "qwen3-embeddings-4B"
     fn default_args() -> HealthScoreArgs {
         HealthScoreArgs {
             output: HealthScoreOutputFormat::Json,
-            fail_above: None,
+            fail_below: None,
             no_history: false,
             crate_filter: Vec::new(),
             semantic: false,
@@ -1136,7 +1142,7 @@ model = "qwen3-embeddings-4B"
     }
 
     #[test]
-    fn fail_above_exit_code() {
+    fn fail_below_exit_code() {
         let workspace = create_workspace();
         write_file(
             &workspace.path().join("crates/example/src/lib.rs"),
@@ -1144,7 +1150,7 @@ model = "qwen3-embeddings-4B"
         );
 
         let mut args = default_args();
-        args.fail_above = Some(0);
+        args.fail_below = Some(100);
         let execution =
             execute_health_score_command(workspace.path(), &AetherConfig::default(), args)
                 .expect("health-score execution");
@@ -1537,7 +1543,7 @@ model = "qwen3-embeddings-4B"
 
         let entry = build_split_suggestion_entry(
             "example",
-            63,
+            37,
             Some("crates/example/src/lib.rs"),
             &store,
             all_edges.as_slice(),
@@ -1672,7 +1678,7 @@ model = "qwen3-embeddings-4B"
         };
         let entry = build_split_suggestion_entry(
             "example",
-            63,
+            37,
             Some("crates/example/src/lib.rs"),
             &store,
             all_edges.as_slice(),

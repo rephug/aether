@@ -398,9 +398,9 @@ pub struct HealthScoreArgs {
 
     #[arg(
         long,
-        help = "Exit with code 1 when the workspace score is greater than this value"
+        help = "Exit with code 1 when the workspace score is less than this value"
     )]
-    pub fail_above: Option<u32>,
+    pub fail_below: Option<u32>,
 
     #[arg(long, help = "Skip reading and writing score history")]
     pub no_history: bool,
@@ -1351,8 +1351,8 @@ mod tests {
             ".",
             "--output",
             "json",
-            "--fail-above",
-            "30",
+            "--fail-below",
+            "70",
             "--semantic",
             "--suggest-splits",
             "--compare",
@@ -1367,7 +1367,7 @@ mod tests {
         match cli.command {
             Some(Commands::HealthScore(args)) => {
                 assert_eq!(args.output.as_str(), "json");
-                assert_eq!(args.fail_above, Some(30));
+                assert_eq!(args.fail_below, Some(70));
                 assert!(args.semantic);
                 assert!(args.suggest_splits);
                 assert_eq!(args.compare.as_deref(), Some("last"));

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,13 +21,13 @@ use crate::support::{self, DashboardState};
 
 const DEFAULT_LIMIT: usize = 10;
 const MAX_LIMIT: usize = 200;
-const DEFAULT_MIN_SCORE: u32 = 25;
+const DEFAULT_MAX_SCORE: u32 = 75;
 const HEALTH_SCORE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct HealthScoreQuery {
     pub limit: Option<usize>,
-    pub min_score: Option<u32>,
+    pub max_score: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -78,7 +78,7 @@ pub(crate) async fn load_health_score_data(
     query: &HealthScoreQuery,
 ) -> Result<HealthScoreData, String> {
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    let min_score = query.min_score.unwrap_or(DEFAULT_MIN_SCORE).min(100);
+    let max_score = query.max_score.unwrap_or(DEFAULT_MAX_SCORE).min(100);
     let report = load_health_score_report(shared).await?;
     let recent_reports = read_score_history(shared)?;
     let delta = recent_reports
@@ -90,7 +90,7 @@ pub(crate) async fn load_health_score_data(
     let filtered_crates = report
         .crates
         .iter()
-        .filter(|crate_score| crate_score.score >= min_score)
+        .filter(|crate_score| crate_score.score <= max_score)
         .collect::<Vec<_>>();
     let mut archetype_distribution = BTreeMap::new();
     for crate_score in &filtered_crates {
@@ -224,11 +224,17 @@ async fn load_semantic_input(shared: &SharedState) -> Result<Option<SemanticInpu
                     })
             })
             .count();
-        let community_count = symbols
-            .iter()
-            .filter_map(|symbol| community_by_symbol.get(symbol.id.as_str()).copied())
-            .collect::<HashSet<_>>()
-            .len();
+        let mut community_freq = HashMap::new();
+        for symbol in &symbols {
+            if let Some(community_id) = community_by_symbol.get(symbol.id.as_str()).copied() {
+                *community_freq.entry(community_id).or_insert(0usize) += 1;
+            }
+        }
+        let threshold = 3_usize.max((symbols.len() as f64 * 0.2).ceil() as usize);
+        let community_count = community_freq
+            .values()
+            .filter(|&&count| count >= threshold)
+            .count();
         let has_test_coverage = symbols.iter().any(|symbol| {
             shared
                 .store
