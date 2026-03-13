@@ -1,0 +1,397 @@
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
+use rmcp::{ErrorData as McpError, Json, ServerHandler, tool, tool_handler, tool_router};
+
+use super::{
+    AetherAcknowledgeDriftRequest, AetherAcknowledgeDriftResponse, AetherAskRequest,
+    AetherAskResponse, AetherBlastRadiusRequest, AetherBlastRadiusResponse, AetherCallChainRequest,
+    AetherCallChainResponse, AetherDependenciesRequest, AetherDependenciesResponse,
+    AetherDriftReportRequest, AetherDriftReportResponse, AetherExplainRequest,
+    AetherExplainResponse, AetherGetSirRequest, AetherGetSirResponse, AetherHealthExplainRequest,
+    AetherHealthHotspotsRequest, AetherHealthRequest, AetherHealthResponse, AetherMcpServer,
+    AetherRecallRequest, AetherRecallResponse, AetherRememberRequest, AetherRememberResponse,
+    AetherSearchRequest, AetherSearchResponse, AetherSessionNoteResponse, AetherStatusResponse,
+    AetherSymbolLookupRequest, AetherSymbolLookupResponse, AetherSymbolTimelineRequest,
+    AetherSymbolTimelineResponse, AetherTestIntentsRequest, AetherTestIntentsResponse,
+    AetherTextResponse, AetherTraceCauseRequest, AetherTraceCauseResponse, AetherWhyChangedRequest,
+    AetherWhyChangedResponse, SERVER_DESCRIPTION, SERVER_NAME, SERVER_VERSION,
+};
+#[cfg(feature = "verification")]
+use super::{AetherVerifyRequest, AetherVerifyResponse};
+use crate::AetherMcpError;
+
+fn to_mcp_error(err: AetherMcpError) -> McpError {
+    McpError::internal_error(err.to_string(), None)
+}
+
+#[tool_router(router = tool_router, vis = "pub(crate)")]
+impl AetherMcpServer {
+    #[tool(name = "aether_status", description = "Get AETHER local store status")]
+    pub async fn aether_status(&self) -> Result<Json<AetherStatusResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_status");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_status_logic())
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_symbol_lookup",
+        description = "Lookup symbols by qualified name or file path"
+    )]
+    pub async fn aether_symbol_lookup(
+        &self,
+        Parameters(request): Parameters<AetherSymbolLookupRequest>,
+    ) -> Result<Json<AetherSymbolLookupResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_symbol_lookup");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_symbol_lookup_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_dependencies",
+        description = "Get resolved callers and call dependencies for a symbol"
+    )]
+    pub async fn aether_dependencies(
+        &self,
+        Parameters(request): Parameters<AetherDependenciesRequest>,
+    ) -> Result<Json<AetherDependenciesResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_dependencies");
+        self.aether_dependencies_logic(request)
+            .await
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_call_chain",
+        description = "Get transitive call-chain levels for a symbol"
+    )]
+    pub async fn aether_call_chain(
+        &self,
+        Parameters(request): Parameters<AetherCallChainRequest>,
+    ) -> Result<Json<AetherCallChainResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_call_chain");
+        self.aether_call_chain_logic(request)
+            .await
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_search",
+        description = "Search symbols by name, path, language, or kind"
+    )]
+    pub async fn aether_search(
+        &self,
+        Parameters(request): Parameters<AetherSearchRequest>,
+    ) -> Result<Json<AetherSearchResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_search");
+        self.aether_search_logic(request)
+            .await
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_remember",
+        description = "Store project memory note content with deterministic deduplication"
+    )]
+    pub async fn aether_remember(
+        &self,
+        Parameters(request): Parameters<AetherRememberRequest>,
+    ) -> Result<Json<AetherRememberResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_remember");
+        self.aether_remember_logic(request)
+            .await
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_session_note",
+        description = "Capture an in-session project note with source_type=session"
+    )]
+    pub async fn aether_session_note(
+        &self,
+        Parameters(request): Parameters<AetherRememberRequest>,
+    ) -> Result<Json<AetherSessionNoteResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_session_note");
+        self.aether_session_note_logic(request)
+            .await
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_recall",
+        description = "Recall project memory notes using lexical, semantic, or hybrid retrieval"
+    )]
+    pub async fn aether_recall(
+        &self,
+        Parameters(request): Parameters<AetherRecallRequest>,
+    ) -> Result<Json<AetherRecallResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_recall");
+        self.aether_recall_logic(request)
+            .await
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_ask",
+        description = "Search symbols, notes, coupling, and test intents with unified ranking"
+    )]
+    pub async fn aether_ask(
+        &self,
+        Parameters(request): Parameters<AetherAskRequest>,
+    ) -> Result<Json<AetherAskResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_ask");
+        self.aether_ask_logic(request)
+            .await
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_blast_radius",
+        description = "Analyze coupled files and risk levels for blast-radius impact"
+    )]
+    pub async fn aether_blast_radius(
+        &self,
+        Parameters(request): Parameters<AetherBlastRadiusRequest>,
+    ) -> Result<Json<AetherBlastRadiusResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_blast_radius");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_blast_radius_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_test_intents",
+        description = "Query extracted behavioral test intents for a file or symbol"
+    )]
+    pub async fn aether_test_intents(
+        &self,
+        Parameters(request): Parameters<AetherTestIntentsRequest>,
+    ) -> Result<Json<AetherTestIntentsResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_test_intents");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_test_intents_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_drift_report",
+        description = "Run semantic drift analysis with boundary and structural anomaly detection"
+    )]
+    pub async fn aether_drift_report(
+        &self,
+        Parameters(request): Parameters<AetherDriftReportRequest>,
+    ) -> Result<Json<AetherDriftReportResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_drift_report");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_drift_report_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_health",
+        description = "Get codebase health metrics including critical symbols, bottlenecks, dependency cycles, orphaned code, and risk hotspots."
+    )]
+    pub async fn aether_health(
+        &self,
+        Parameters(request): Parameters<AetherHealthRequest>,
+    ) -> Result<Json<AetherHealthResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_health");
+        self.aether_health_logic(request)
+            .await
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_health_hotspots",
+        description = "Return the hottest workspace crates by health score with archetypes and top violations."
+    )]
+    pub async fn aether_health_hotspots(
+        &self,
+        Parameters(request): Parameters<AetherHealthHotspotsRequest>,
+    ) -> Result<Json<AetherTextResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_health_hotspots");
+        self.aether_health_hotspots_logic(request)
+            .await
+            .map(|text| Json(AetherTextResponse { text }))
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_health_explain",
+        description = "Explain one crate's health score, signals, violations, and split suggestions."
+    )]
+    pub async fn aether_health_explain(
+        &self,
+        Parameters(request): Parameters<AetherHealthExplainRequest>,
+    ) -> Result<Json<AetherTextResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_health_explain");
+        self.aether_health_explain_logic(request)
+            .await
+            .map(|text| Json(AetherTextResponse { text }))
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_trace_cause",
+        description = "Trace likely upstream semantic causes of a downstream breakage"
+    )]
+    pub async fn aether_trace_cause(
+        &self,
+        Parameters(request): Parameters<AetherTraceCauseRequest>,
+    ) -> Result<Json<AetherTraceCauseResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_trace_cause");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_trace_cause_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_acknowledge_drift",
+        description = "Acknowledge drift findings and create a project note"
+    )]
+    pub async fn aether_acknowledge_drift(
+        &self,
+        Parameters(request): Parameters<AetherAcknowledgeDriftRequest>,
+    ) -> Result<Json<AetherAcknowledgeDriftResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_acknowledge_drift");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_acknowledge_drift_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_symbol_timeline",
+        description = "Get ordered SIR timeline entries for a symbol"
+    )]
+    pub async fn aether_symbol_timeline(
+        &self,
+        Parameters(request): Parameters<AetherSymbolTimelineRequest>,
+    ) -> Result<Json<AetherSymbolTimelineResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_symbol_timeline");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_symbol_timeline_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_why_changed",
+        description = "Explain why a symbol changed between two SIR versions or timestamps"
+    )]
+    pub async fn aether_why_changed(
+        &self,
+        Parameters(request): Parameters<AetherWhyChangedRequest>,
+    ) -> Result<Json<AetherWhyChangedResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_why_changed");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_why_changed_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_get_sir",
+        description = "Get SIR for leaf/file/module level"
+    )]
+    pub async fn aether_get_sir(
+        &self,
+        Parameters(request): Parameters<AetherGetSirRequest>,
+    ) -> Result<Json<AetherGetSirResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_get_sir");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_get_sir_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_explain",
+        description = "Explain symbol at a file position using local SIR"
+    )]
+    pub async fn aether_explain(
+        &self,
+        Parameters(request): Parameters<AetherExplainRequest>,
+    ) -> Result<Json<AetherExplainResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_explain");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_explain_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+}
+
+#[cfg(feature = "verification")]
+impl AetherMcpServer {
+    #[tool(
+        name = "aether_verify",
+        description = "Run allowlisted verification commands in host, container, or microvm mode"
+    )]
+    pub async fn aether_verify(
+        &self,
+        Parameters(request): Parameters<AetherVerifyRequest>,
+    ) -> Result<Json<AetherVerifyResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_verify");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_verify_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for AetherMcpServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            server_info: Implementation {
+                name: SERVER_NAME.to_owned(),
+                title: None,
+                version: SERVER_VERSION.to_owned(),
+                icons: None,
+                website_url: None,
+            },
+            instructions: Some(SERVER_DESCRIPTION.to_owned()),
+            ..Default::default()
+        }
+    }
+}
