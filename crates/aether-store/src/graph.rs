@@ -103,6 +103,65 @@ impl SqliteStore {
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    pub fn list_symbol_edges_for_source_and_kinds(
+        &self,
+        source_id: &str,
+        edge_kinds: &[EdgeKind],
+    ) -> Result<Vec<SymbolEdge>, StoreError> {
+        let source_id = source_id.trim();
+        if source_id.is_empty() || edge_kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = (0..edge_kinds.len())
+            .map(|index| format!("?{}", index + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT source_id, target_qualified_name, edge_kind, file_path
+            FROM symbol_edges
+            WHERE source_id = ?1
+              AND edge_kind IN ({placeholders})
+            ORDER BY source_id ASC, target_qualified_name ASC, edge_kind ASC, file_path ASC
+            "#
+        );
+
+        let params = std::iter::once(source_id.to_owned())
+            .chain(edge_kinds.iter().map(|kind| kind.as_str().to_owned()))
+            .collect::<Vec<_>>();
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let (source_id, target_qualified_name, edge_kind, file_path) = row?;
+            let edge_kind = edge_kind_from_str(edge_kind.as_str()).ok_or_else(|| {
+                StoreError::Compatibility(format!(
+                    "unsupported edge kind while reading symbol edges: {edge_kind}"
+                ))
+            })?;
+            records.push(SymbolEdge {
+                source_id,
+                target_qualified_name,
+                edge_kind,
+                file_path,
+            });
+        }
+
+        Ok(records)
+    }
+
     pub async fn sync_graph_for_file(
         &self,
         graph_store: &dyn GraphStore,

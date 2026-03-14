@@ -6,7 +6,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use aether_core::{EdgeKind, SymbolEdge};
+    use aether_core::{
+        EdgeKind, Language, Position, SourceRange, Symbol, SymbolEdge, SymbolKind, content_hash,
+    };
     use aether_store::SemanticIndexStore;
     use async_trait::async_trait;
     use rusqlite::Connection;
@@ -42,6 +44,11 @@ mod tests {
 
     struct PanicInferenceProvider;
 
+    #[derive(Clone)]
+    struct FixedInferenceProvider {
+        sir: SirAnnotation,
+    }
+
     #[async_trait]
     impl InferenceProvider for PanicInferenceProvider {
         fn provider_name(&self) -> String {
@@ -58,6 +65,25 @@ mod tests {
             _context: &SirContext,
         ) -> std::result::Result<SirAnnotation, InferError> {
             panic!("embeddings-only pass must not call inference providers");
+        }
+    }
+
+    #[async_trait]
+    impl InferenceProvider for FixedInferenceProvider {
+        fn provider_name(&self) -> String {
+            "fixed".to_owned()
+        }
+
+        fn model_name(&self) -> String {
+            "fixed-model".to_owned()
+        }
+
+        async fn generate_sir(
+            &self,
+            _symbol_text: &str,
+            _context: &SirContext,
+        ) -> std::result::Result<SirAnnotation, InferError> {
+            Ok(self.sir.clone())
         }
     }
 
@@ -86,6 +112,52 @@ vector_backend = "sqlite"
             qualified_name: qualified_name.to_owned(),
             signature_fingerprint: format!("sig-{symbol_id}"),
             last_seen_at: 1_700_000_000,
+        }
+    }
+
+    fn demo_symbol_record_with_kind(
+        symbol_id: &str,
+        qualified_name: &str,
+        kind: &str,
+        file_path: &str,
+    ) -> SymbolRecord {
+        SymbolRecord {
+            id: symbol_id.to_owned(),
+            file_path: file_path.to_owned(),
+            language: "rust".to_owned(),
+            kind: kind.to_owned(),
+            qualified_name: qualified_name.to_owned(),
+            signature_fingerprint: format!("sig-{symbol_id}"),
+            last_seen_at: 1_700_000_000,
+        }
+    }
+
+    fn demo_type_symbol(
+        symbol_id: &str,
+        name: &str,
+        qualified_name: &str,
+        file_path: &str,
+        kind: SymbolKind,
+        source: &str,
+    ) -> Symbol {
+        Symbol {
+            id: symbol_id.to_owned(),
+            language: Language::Rust,
+            file_path: file_path.to_owned(),
+            kind,
+            name: name.to_owned(),
+            qualified_name: qualified_name.to_owned(),
+            signature_fingerprint: format!("sig-{symbol_id}"),
+            content_hash: content_hash(source),
+            range: SourceRange {
+                start: Position { line: 1, column: 1 },
+                end: Position {
+                    line: source.lines().count().max(1),
+                    column: source.lines().last().map(|line| line.len() + 1).unwrap_or(1),
+                },
+                start_byte: Some(0),
+                end_byte: Some(source.len()),
+            },
         }
     }
 
@@ -143,6 +215,21 @@ vector_backend = "sqlite"
         .expect("build pipeline")
     }
 
+    fn build_write_pipeline(workspace: &Path, provider: Arc<dyn InferenceProvider>) -> SirPipeline {
+        SirPipeline::new_with_provider_and_embeddings(
+            workspace.to_path_buf(),
+            1,
+            provider,
+            "test_provider",
+            "test_model",
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("build pipeline")
+    }
+
     fn upsert_existing_embedding(workspace: &Path, symbol_id: &str, sir_hash: &str) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -170,6 +257,119 @@ vector_backend = "sqlite"
             row.get(0)
         })
         .expect("count rows")
+    }
+
+    #[test]
+    fn commit_successful_generation_injects_method_dependencies_from_symbol_edges() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_only_config(workspace);
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        for symbol in [
+            demo_symbol_record_with_kind("sym-store", "Store", "trait", "src/lib.rs"),
+            demo_symbol_record_with_kind("sym-load", "Store::load", "method", "src/lib.rs"),
+            demo_symbol_record_with_kind("sym-save", "Store::save", "method", "src/lib.rs"),
+        ] {
+            store.upsert_symbol(symbol).expect("upsert symbol");
+        }
+        store
+            .upsert_edges(&[
+                SymbolEdge {
+                    source_id: "sym-load".to_owned(),
+                    target_qualified_name: "Helper".to_owned(),
+                    edge_kind: EdgeKind::Calls,
+                    file_path: "src/lib.rs".to_owned(),
+                },
+                SymbolEdge {
+                    source_id: "sym-load".to_owned(),
+                    target_qualified_name: "Record".to_owned(),
+                    edge_kind: EdgeKind::TypeRef,
+                    file_path: "src/lib.rs".to_owned(),
+                },
+                SymbolEdge {
+                    source_id: "sym-load".to_owned(),
+                    target_qualified_name: "StoreError".to_owned(),
+                    edge_kind: EdgeKind::TypeRef,
+                    file_path: "src/lib.rs".to_owned(),
+                },
+                SymbolEdge {
+                    source_id: "sym-save".to_owned(),
+                    target_qualified_name: "Record".to_owned(),
+                    edge_kind: EdgeKind::TypeRef,
+                    file_path: "src/lib.rs".to_owned(),
+                },
+            ])
+            .expect("upsert edges");
+
+        let pipeline = build_write_pipeline(workspace, Arc::new(PanicInferenceProvider));
+        let parent_symbol = demo_type_symbol(
+            "sym-store",
+            "Store",
+            "Store",
+            "src/lib.rs",
+            SymbolKind::Trait,
+            "pub trait Store {\n    fn load(&self) -> Record;\n    fn save(&self, record: Record);\n}\n",
+        );
+        let generated = infer::GeneratedSir {
+            symbol: parent_symbol.clone(),
+            sir: SirAnnotation {
+                intent: "Storage interface".to_owned(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                side_effects: Vec::new(),
+                dependencies: vec!["stale".to_owned()],
+                error_modes: Vec::new(),
+                confidence: 0.9,
+                method_dependencies: Some(HashMap::from([(
+                    "stale".to_owned(),
+                    vec!["stale".to_owned()],
+                )])),
+            },
+            provider_name: "test_provider".to_owned(),
+            model_name: "test_model".to_owned(),
+        };
+
+        let mut out = Vec::new();
+        let intent_id = pipeline
+            .commit_successful_generation(
+                &store,
+                generated,
+                SIR_GENERATION_PASS_SCAN,
+                None,
+                false,
+                &mut out,
+            )
+            .expect("commit successful generation")
+            .expect("intent id");
+
+        let stored_blob = store
+            .read_sir_blob(parent_symbol.id.as_str())
+            .expect("read sir blob")
+            .expect("sir blob should exist");
+        let stored_sir: SirAnnotation =
+            serde_json::from_str(&stored_blob).expect("stored sir should deserialize");
+        let method_dependencies = stored_sir
+            .method_dependencies
+            .expect("method dependencies should be injected");
+        assert_eq!(
+            method_dependencies.get("load"),
+            Some(&vec![
+                "Helper".to_owned(),
+                "Record".to_owned(),
+                "StoreError".to_owned(),
+            ])
+        );
+        assert_eq!(
+            method_dependencies.get("save"),
+            Some(&vec!["Record".to_owned()])
+        );
+
+        let intent = store
+            .get_intent(intent_id.as_str())
+            .expect("read intent")
+            .expect("intent should exist");
+        assert_eq!(intent.status, WriteIntentStatus::VectorDone);
     }
 
     #[test]
@@ -400,5 +600,122 @@ enabled = false
         assert_eq!(count_table_rows(workspace, "symbols"), before_symbols);
         assert_eq!(count_table_rows(workspace, "sir"), before_sir);
         assert_eq!(count_table_rows(workspace, "symbol_edges"), before_edges);
+    }
+
+    #[test]
+    fn process_event_with_skip_graph_sync_reuses_seeded_edges_and_completes_intents() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_only_config(workspace);
+        fs::create_dir_all(workspace.join("src")).expect("create src");
+        let source =
+            "pub trait Store {\n    fn load(&self) -> Record;\n    fn save(&self, record: Record);\n}\n";
+        fs::write(workspace.join("src/lib.rs"), source).expect("write source");
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        for symbol in [
+            demo_symbol_record_with_kind("sym-load", "Store::load", "method", "src/lib.rs"),
+            demo_symbol_record_with_kind("sym-save", "Store::save", "method", "src/lib.rs"),
+        ] {
+            store.upsert_symbol(symbol).expect("upsert symbol");
+        }
+        store
+            .upsert_edges(&[
+                SymbolEdge {
+                    source_id: "sym-load".to_owned(),
+                    target_qualified_name: "Record".to_owned(),
+                    edge_kind: EdgeKind::TypeRef,
+                    file_path: "src/lib.rs".to_owned(),
+                },
+                SymbolEdge {
+                    source_id: "sym-load".to_owned(),
+                    target_qualified_name: "Loader".to_owned(),
+                    edge_kind: EdgeKind::Calls,
+                    file_path: "src/lib.rs".to_owned(),
+                },
+                SymbolEdge {
+                    source_id: "sym-save".to_owned(),
+                    target_qualified_name: "Record".to_owned(),
+                    edge_kind: EdgeKind::TypeRef,
+                    file_path: "src/lib.rs".to_owned(),
+                },
+            ])
+            .expect("upsert edges");
+        let before_edges = count_table_rows(workspace, "symbol_edges");
+
+        let provider = Arc::new(FixedInferenceProvider {
+            sir: SirAnnotation {
+                intent: "Storage interface".to_owned(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                side_effects: Vec::new(),
+                dependencies: Vec::new(),
+                error_modes: Vec::new(),
+                confidence: 0.9,
+                method_dependencies: None,
+            },
+        });
+        let pipeline = build_write_pipeline(workspace, provider).with_skip_graph_sync(true);
+        let parent_symbol = demo_type_symbol(
+            "sym-store",
+            "Store",
+            "Store",
+            "src/lib.rs",
+            SymbolKind::Trait,
+            source,
+        );
+        let event = SymbolChangeEvent {
+            file_path: "src/lib.rs".to_owned(),
+            language: Language::Rust,
+            added: Vec::new(),
+            removed: Vec::new(),
+            updated: vec![parent_symbol.clone()],
+        };
+
+        let mut out = Vec::new();
+        let stats = pipeline
+            .process_event_with_priority_and_pass(
+                &store,
+                &event,
+                true,
+                false,
+                &mut out,
+                None,
+                SIR_GENERATION_PASS_REGENERATED,
+            )
+            .expect("process event");
+
+        assert_eq!(stats.success_count, 1);
+        assert_eq!(stats.failure_count, 0);
+        assert_eq!(count_table_rows(workspace, "symbol_edges"), before_edges);
+        assert!(store
+            .get_incomplete_intents()
+            .expect("load incomplete intents")
+            .is_empty());
+        assert_eq!(
+            store
+                .count_intents_by_status()
+                .expect("count intents")
+                .get("complete"),
+            Some(&1usize)
+        );
+
+        let stored_blob = store
+            .read_sir_blob(parent_symbol.id.as_str())
+            .expect("read sir blob")
+            .expect("sir blob should exist");
+        let stored_sir: SirAnnotation =
+            serde_json::from_str(&stored_blob).expect("stored sir should deserialize");
+        let method_dependencies = stored_sir
+            .method_dependencies
+            .expect("method dependencies should be injected");
+        assert_eq!(
+            method_dependencies.get("load"),
+            Some(&vec!["Loader".to_owned(), "Record".to_owned()])
+        );
+        assert_eq!(
+            method_dependencies.get("save"),
+            Some(&vec!["Record".to_owned()])
+        );
     }
 }

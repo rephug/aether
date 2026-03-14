@@ -1212,6 +1212,42 @@ fn mcp_suggest_trait_split_returns_clusters() -> Result<()> {
             edge_kind: EdgeKind::Calls,
             file_path: "src/consumer_b.rs".to_owned(),
         },
+        SymbolEdge {
+            source_id: "trait-method-alpha".to_owned(),
+            target_qualified_name: "SirMetaRecord".to_owned(),
+            edge_kind: EdgeKind::TypeRef,
+            file_path: "src/store.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "trait-method-alpha".to_owned(),
+            target_qualified_name: "SirBlob".to_owned(),
+            edge_kind: EdgeKind::TypeRef,
+            file_path: "src/store.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "trait-method-beta".to_owned(),
+            target_qualified_name: "SirMetaRecord".to_owned(),
+            edge_kind: EdgeKind::TypeRef,
+            file_path: "src/store.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "trait-method-beta".to_owned(),
+            target_qualified_name: "SirBlob".to_owned(),
+            edge_kind: EdgeKind::TypeRef,
+            file_path: "src/store.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "trait-method-gamma".to_owned(),
+            target_qualified_name: "SymbolRecord".to_owned(),
+            edge_kind: EdgeKind::TypeRef,
+            file_path: "src/store.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "trait-method-delta".to_owned(),
+            target_qualified_name: "SymbolRecord".to_owned(),
+            edge_kind: EdgeKind::TypeRef,
+            file_path: "src/store.rs".to_owned(),
+        },
     ])?;
 
     let trait_sir = SirAnnotation {
@@ -1222,18 +1258,7 @@ fn mcp_suggest_trait_split_returns_clusters() -> Result<()> {
         dependencies: Vec::new(),
         error_modes: Vec::new(),
         confidence: 0.9,
-        method_dependencies: Some(HashMap::from([
-            (
-                "alpha".to_owned(),
-                vec!["SirMetaRecord".to_owned(), "SirBlob".to_owned()],
-            ),
-            (
-                "beta".to_owned(),
-                vec!["SirMetaRecord".to_owned(), "SirBlob".to_owned()],
-            ),
-            ("gamma".to_owned(), vec!["SymbolRecord".to_owned()]),
-            ("delta".to_owned(), vec!["SymbolRecord".to_owned()]),
-        ])),
+        method_dependencies: None,
     };
     store.write_sir_blob(
         "trait-example-store",
@@ -1350,6 +1375,42 @@ fn mcp_suggest_trait_split_accepts_struct_targets() -> Result<()> {
             edge_kind: EdgeKind::Calls,
             file_path: "src/consumer_b.rs".to_owned(),
         },
+        SymbolEdge {
+            source_id: "struct-method-alpha".to_owned(),
+            target_qualified_name: "SirMetaRecord".to_owned(),
+            edge_kind: EdgeKind::TypeRef,
+            file_path: "src/store.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "struct-method-alpha".to_owned(),
+            target_qualified_name: "SirBlob".to_owned(),
+            edge_kind: EdgeKind::TypeRef,
+            file_path: "src/store.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "struct-method-beta".to_owned(),
+            target_qualified_name: "SirMetaRecord".to_owned(),
+            edge_kind: EdgeKind::TypeRef,
+            file_path: "src/store.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "struct-method-beta".to_owned(),
+            target_qualified_name: "SirBlob".to_owned(),
+            edge_kind: EdgeKind::TypeRef,
+            file_path: "src/store.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "struct-method-gamma".to_owned(),
+            target_qualified_name: "SymbolRecord".to_owned(),
+            edge_kind: EdgeKind::TypeRef,
+            file_path: "src/store.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "struct-method-delta".to_owned(),
+            target_qualified_name: "SymbolRecord".to_owned(),
+            edge_kind: EdgeKind::TypeRef,
+            file_path: "src/store.rs".to_owned(),
+        },
     ])?;
 
     let struct_sir = SirAnnotation {
@@ -1360,18 +1421,7 @@ fn mcp_suggest_trait_split_accepts_struct_targets() -> Result<()> {
         dependencies: Vec::new(),
         error_modes: Vec::new(),
         confidence: 0.9,
-        method_dependencies: Some(HashMap::from([
-            (
-                "alpha".to_owned(),
-                vec!["SirMetaRecord".to_owned(), "SirBlob".to_owned()],
-            ),
-            (
-                "beta".to_owned(),
-                vec!["SirMetaRecord".to_owned(), "SirBlob".to_owned()],
-            ),
-            ("gamma".to_owned(), vec!["SymbolRecord".to_owned()]),
-            ("delta".to_owned(), vec!["SymbolRecord".to_owned()]),
-        ])),
+        method_dependencies: None,
     };
     store.write_sir_blob(
         "struct-example-store",
@@ -1490,6 +1540,42 @@ fn mcp_suggest_trait_split_falls_back_to_same_file_implementor_methods() -> Resu
             edge_kind: EdgeKind::Calls,
             file_path: "src/consumer_b.rs".to_owned(),
         },
+        SymbolEdge {
+            source_id: "sqlite-method-alpha".to_owned(),
+            target_qualified_name: "SirMetaRecord".to_owned(),
+            edge_kind: EdgeKind::TypeRef,
+            file_path: "src/lib.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "sqlite-method-alpha".to_owned(),
+            target_qualified_name: "SirBlob".to_owned(),
+            edge_kind: EdgeKind::TypeRef,
+            file_path: "src/lib.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "sqlite-method-beta".to_owned(),
+            target_qualified_name: "SirMetaRecord".to_owned(),
+            edge_kind: EdgeKind::TypeRef,
+            file_path: "src/lib.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "sqlite-method-beta".to_owned(),
+            target_qualified_name: "SirBlob".to_owned(),
+            edge_kind: EdgeKind::TypeRef,
+            file_path: "src/lib.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "sqlite-method-gamma".to_owned(),
+            target_qualified_name: "SymbolRecord".to_owned(),
+            edge_kind: EdgeKind::TypeRef,
+            file_path: "src/lib.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "sqlite-method-delta".to_owned(),
+            target_qualified_name: "SymbolRecord".to_owned(),
+            edge_kind: EdgeKind::TypeRef,
+            file_path: "src/lib.rs".to_owned(),
+        },
     ])?;
 
     let sqlite_sir = SirAnnotation {
@@ -1500,18 +1586,7 @@ fn mcp_suggest_trait_split_falls_back_to_same_file_implementor_methods() -> Resu
         dependencies: Vec::new(),
         error_modes: Vec::new(),
         confidence: 0.9,
-        method_dependencies: Some(HashMap::from([
-            (
-                "alpha".to_owned(),
-                vec!["SirMetaRecord".to_owned(), "SirBlob".to_owned()],
-            ),
-            (
-                "beta".to_owned(),
-                vec!["SirMetaRecord".to_owned(), "SirBlob".to_owned()],
-            ),
-            ("gamma".to_owned(), vec!["SymbolRecord".to_owned()]),
-            ("delta".to_owned(), vec!["SymbolRecord".to_owned()]),
-        ])),
+        method_dependencies: None,
     };
     store.write_sir_blob(
         "struct-sqlite-store",

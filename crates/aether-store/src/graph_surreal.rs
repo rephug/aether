@@ -40,19 +40,31 @@ impl SurrealGraphStore {
             let mut open_error = None;
             let mut db_opt = None;
             for attempt in 0..10 {
-                match Surreal::new::<SurrealKv>(graph_dir.clone()).await {
-                    Ok(db) => {
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    Surreal::new::<SurrealKv>(graph_dir.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(db)) => {
                         db_opt = Some(db);
                         break;
                     }
-                    Err(err) => {
+                    Ok(Err(err)) => {
                         let message = err.to_string();
                         if message.contains("LOCK is already locked") && attempt < 9 {
-                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            tokio::time::sleep(Duration::from_millis(500)).await;
                             continue;
                         }
                         open_error =
                             Some(StoreError::Graph(format!("SurrealDB open failed: {err}")));
+                        break;
+                    }
+                    Err(_) => {
+                        open_error = Some(StoreError::Graph(
+                            "SurrealDB open timed out (is another aetherd process holding the lock?)"
+                                .to_owned(),
+                        ));
                         break;
                     }
                 }

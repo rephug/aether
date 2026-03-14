@@ -10,7 +10,7 @@ use aether_config::{
     InferenceProviderKind, SIR_QUALITY_FLOOR_CONFIDENCE, SIR_QUALITY_FLOOR_WINDOW,
     ensure_workspace_config,
 };
-use aether_core::{GitContext, Language, Symbol, SymbolChangeEvent, content_hash};
+use aether_core::{EdgeKind, GitContext, Language, Symbol, SymbolChangeEvent, content_hash};
 use aether_infer::{
     EmbeddingProvider, EmbeddingProviderOverrides, EmbeddingPurpose, InferenceProvider,
     ProviderOverrides, Qwen3LocalProvider, load_embedding_provider_from_config,
@@ -102,6 +102,7 @@ pub struct SirPipeline {
     quality_monitor: Mutex<SirQualityMonitor>,
     tiered_parse_fallback_provider: Option<Arc<dyn InferenceProvider>>,
     tiered_parse_fallback_model: Option<String>,
+    skip_graph_sync: bool,
 }
 
 struct PreparedCandidateJobs {
@@ -246,7 +247,13 @@ impl SirPipeline {
             )),
             tiered_parse_fallback_provider,
             tiered_parse_fallback_model,
+            skip_graph_sync: false,
         })
+    }
+
+    pub fn with_skip_graph_sync(mut self, skip_graph_sync: bool) -> Self {
+        self.skip_graph_sync = skip_graph_sync;
+        self
     }
 
     pub fn process_event(
@@ -326,7 +333,9 @@ impl SirPipeline {
         prompt_overrides: Option<&HashMap<String, SirPromptOverride>>,
     ) -> Result<ProcessEventStats> {
         self.process_removed_symbols(store, event)?;
-        self.replace_edges_for_file(store, event)?;
+        if !self.skip_graph_sync {
+            self.replace_edges_for_file(store, event)?;
+        }
 
         let changed_symbols = self.collect_changed_symbols(event);
         let commit_hash = resolve_workspace_head_commit(&self.workspace_root);
@@ -403,13 +412,19 @@ impl SirPipeline {
                 }
             }
 
-            self.finalize_graph_stage(
-                store,
-                event.file_path.as_str(),
-                &mut intents_ready_for_graph,
-            );
+            if self.skip_graph_sync {
+                self.complete_graph_stage_without_sync(store, &mut intents_ready_for_graph);
+            } else {
+                self.finalize_graph_stage(
+                    store,
+                    event.file_path.as_str(),
+                    &mut intents_ready_for_graph,
+                );
+            }
             self.log_processing_summary(event.file_path.as_str(), &stats);
-        } else if let Err(err) = self.sync_graph_for_file(store, &event.file_path) {
+        } else if !self.skip_graph_sync
+            && let Err(err) = self.sync_graph_for_file(store, &event.file_path)
+        {
             tracing::warn!(
                 file_path = %event.file_path,
                 error = %err,
@@ -534,7 +549,11 @@ impl SirPipeline {
         }
 
         for (file_path, mut intent_ids) in intents_by_file {
-            self.finalize_graph_stage(store, file_path.as_str(), &mut intent_ids);
+            if self.skip_graph_sync {
+                self.complete_graph_stage_without_sync(store, &mut intent_ids);
+            } else {
+                self.finalize_graph_stage(store, file_path.as_str(), &mut intent_ids);
+            }
         }
 
         for (file_path, language) in touched_files {
@@ -668,6 +687,77 @@ impl SirPipeline {
         }
     }
 
+    fn prepare_sir_for_persistence(
+        &self,
+        store: &SqliteStore,
+        symbol: &Symbol,
+        sir: &SirAnnotation,
+    ) -> Result<(SirAnnotation, String, String)> {
+        let mut sir = sir.clone();
+        self.inject_method_dependencies(store, symbol, &mut sir)?;
+        let canonical_json = canonicalize_sir_json(&sir);
+        let sir_hash_value = sir_hash(&sir);
+        Ok((sir, canonical_json, sir_hash_value))
+    }
+
+    fn inject_method_dependencies(
+        &self,
+        store: &SqliteStore,
+        symbol: &Symbol,
+        sir: &mut SirAnnotation,
+    ) -> Result<()> {
+        if !matches!(
+            symbol.kind.as_str(),
+            "trait" | "struct" | "enum" | "type_alias"
+        ) {
+            sir.method_dependencies = None;
+            return Ok(());
+        }
+
+        let prefix = format!("{}::", symbol.qualified_name);
+        let mut method_dependencies = HashMap::new();
+        let file_symbols = store.list_symbols_for_file(symbol.file_path.as_str())?;
+
+        for child in file_symbols.into_iter().filter(|child| {
+            child.qualified_name.starts_with(prefix.as_str())
+                && matches!(child.kind.as_str(), "function" | "method")
+        }) {
+            let Some(method_name) = child.qualified_name.strip_prefix(prefix.as_str()) else {
+                continue;
+            };
+
+            let edges = store.list_symbol_edges_for_source_and_kinds(
+                child.id.as_str(),
+                &[EdgeKind::Calls, EdgeKind::TypeRef],
+            )?;
+            let mut dependencies = edges
+                .into_iter()
+                .map(|edge| {
+                    edge.target_qualified_name
+                        .rsplit("::")
+                        .next()
+                        .unwrap_or(edge.target_qualified_name.as_str())
+                        .trim_start_matches("r#")
+                        .to_owned()
+                })
+                .filter(|dependency| !dependency.is_empty())
+                .collect::<Vec<_>>();
+            dependencies.sort();
+            dependencies.dedup();
+
+            if !dependencies.is_empty() {
+                method_dependencies.insert(method_name.to_owned(), dependencies);
+            }
+        }
+
+        sir.method_dependencies = if method_dependencies.is_empty() {
+            None
+        } else {
+            Some(method_dependencies)
+        };
+        Ok(())
+    }
+
     fn record_generation_quality(&self, confidence: f32) {
         match self.quality_monitor.lock() {
             Ok(mut monitor) => {
@@ -691,9 +781,22 @@ impl SirPipeline {
     ) -> Result<Option<String>> {
         self.record_generation_quality(generated.sir.confidence);
 
+        let (sir, canonical_json, sir_hash_value) =
+            match self.prepare_sir_for_persistence(store, &generated.symbol, &generated.sir) {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    tracing::error!(
+                        symbol_id = %generated.symbol.id,
+                        error = %err,
+                        "failed to prepare SIR for persistence"
+                    );
+                    return Ok(None);
+                }
+            };
+
         let payload = UpsertSirIntentPayload {
             symbol: generated.symbol.clone(),
-            sir: generated.sir.clone(),
+            sir,
             provider_name: generated.provider_name.clone(),
             model_name: generated.model_name.clone(),
             generation_pass: generation_pass.to_owned(),
@@ -733,8 +836,6 @@ impl SirPipeline {
             return Ok(None);
         }
 
-        let canonical_json = canonicalize_sir_json(&generated.sir);
-        let sir_hash_value = sir_hash(&generated.sir);
         let attempted_at = unix_timestamp_secs();
         let version_write = match store.record_sir_version_if_changed(
             &generated.symbol.id,
@@ -975,6 +1076,34 @@ impl SirPipeline {
                     error = %error_text,
                     "graph sync failed after vector stage"
                 );
+            }
+        }
+    }
+
+    fn complete_graph_stage_without_sync(
+        &self,
+        store: &SqliteStore,
+        intents_ready_for_graph: &mut Vec<String>,
+    ) {
+        for intent_id in intents_ready_for_graph.drain(..) {
+            if let Err(err) = store.update_intent_status(&intent_id, WriteIntentStatus::GraphDone) {
+                let message = format!("graph_done update failed: {err:#}");
+                tracing::error!(
+                    intent_id = %intent_id,
+                    error = %err,
+                    "failed to update write intent status to graph_done"
+                );
+                self.mark_intent_failed_safely(store, intent_id.as_str(), message.as_str());
+                continue;
+            }
+            if let Err(err) = store.mark_intent_complete(&intent_id) {
+                let message = format!("intent completion failed: {err:#}");
+                tracing::error!(
+                    intent_id = %intent_id,
+                    error = %err,
+                    "failed to mark write intent complete"
+                );
+                self.mark_intent_failed_safely(store, intent_id.as_str(), message.as_str());
             }
         }
     }
@@ -1287,23 +1416,50 @@ impl SirPipeline {
         };
         let intent_id = intent.intent_id.as_str();
 
-        let (canonical_json, sir_hash_value) = if status == WriteIntentStatus::Pending {
-            let (canonical_json, sir_hash_value) = self
+        let (prepared_sir, _, _) = self
+            .prepare_sir_for_persistence(store, &payload.symbol, &payload.sir)
+            .with_context(|| format!("failed to prepare SIR for intent {intent_id}"))?;
+        let mut canonical_json = canonicalize_sir_json(&prepared_sir);
+        let mut sir_hash_value = sir_hash(&prepared_sir);
+
+        if status == WriteIntentStatus::Pending {
+            let persisted = self
                 .persist_sir_payload_into_sqlite(store, payload)
                 .with_context(|| format!("failed sqlite write stage for intent {intent_id}"))?;
+            canonical_json = persisted.0;
+            sir_hash_value = persisted.1;
             store
                 .update_intent_status(intent_id, WriteIntentStatus::SqliteDone)
                 .with_context(|| {
                     format!("failed to update status sqlite_done for intent {intent_id}")
                 })?;
             status = WriteIntentStatus::SqliteDone;
-            (canonical_json, sir_hash_value)
         } else {
-            (
-                canonicalize_sir_json(&payload.sir),
-                sir_hash(&payload.sir).to_owned(),
-            )
-        };
+            let stored_blob = store
+                .read_sir_blob(payload.symbol.id.as_str())
+                .with_context(|| {
+                    format!("failed to read sqlite SIR blob for intent {intent_id}")
+                })?;
+            let needs_sqlite_refresh = match stored_blob.as_deref() {
+                Some(stored_blob) => stored_blob != canonical_json,
+                None => true,
+            };
+            if needs_sqlite_refresh {
+                let persisted = self
+                    .persist_sir_payload_into_sqlite(store, payload)
+                    .with_context(|| {
+                        format!("failed sqlite refresh stage for intent {intent_id}")
+                    })?;
+                canonical_json = persisted.0;
+                sir_hash_value = persisted.1;
+                store
+                    .update_intent_status(intent_id, WriteIntentStatus::SqliteDone)
+                    .with_context(|| {
+                        format!("failed to update status sqlite_done for intent {intent_id}")
+                    })?;
+                status = WriteIntentStatus::SqliteDone;
+            }
+        }
 
         if status == WriteIntentStatus::SqliteDone {
             self.refresh_embedding_if_needed(
@@ -1324,13 +1480,21 @@ impl SirPipeline {
         }
 
         if status == WriteIntentStatus::VectorDone {
-            self.sync_graph_for_file(store, payload.symbol.file_path.as_str())
-                .with_context(|| format!("failed graph write stage for intent {intent_id}"))?;
-            store
-                .update_intent_status(intent_id, WriteIntentStatus::GraphDone)
-                .with_context(|| {
-                    format!("failed to update status graph_done for intent {intent_id}")
-                })?;
+            if self.skip_graph_sync {
+                store
+                    .update_intent_status(intent_id, WriteIntentStatus::GraphDone)
+                    .with_context(|| {
+                        format!("failed to update status graph_done for intent {intent_id}")
+                    })?;
+            } else {
+                self.sync_graph_for_file(store, payload.symbol.file_path.as_str())
+                    .with_context(|| format!("failed graph write stage for intent {intent_id}"))?;
+                store
+                    .update_intent_status(intent_id, WriteIntentStatus::GraphDone)
+                    .with_context(|| {
+                        format!("failed to update status graph_done for intent {intent_id}")
+                    })?;
+            }
             status = WriteIntentStatus::GraphDone;
         }
 
@@ -1356,8 +1520,8 @@ impl SirPipeline {
         store: &SqliteStore,
         payload: &UpsertSirIntentPayload,
     ) -> Result<(String, String)> {
-        let canonical_json = canonicalize_sir_json(&payload.sir);
-        let sir_hash_value = sir_hash(&payload.sir);
+        let (_, canonical_json, sir_hash_value) =
+            self.prepare_sir_for_persistence(store, &payload.symbol, &payload.sir)?;
         let attempted_at = unix_timestamp_secs();
         let version_write = store.record_sir_version_if_changed(
             payload.symbol.id.as_str(),

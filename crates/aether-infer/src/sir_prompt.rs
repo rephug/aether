@@ -13,7 +13,7 @@ const FEW_SHOT_EXAMPLES: &str = r#"Few-shot examples:
 {"intent":"Verifies that reconnect backoff resets after a successful request to avoid compounding delay across healthy periods","inputs":["mock clock","flaky transport stub"],"outputs":["Pass when next delay equals initial backoff after success"],"side_effects":["Advances simulated clock","Mutates retry state in fixture"],"dependencies":["retry::BackoffPolicy","transport::MockClient"],"error_modes":["Assertion failure when delay is not reset"],"confidence":0.9}
 
 4) trait
-{"intent":"Storage abstraction providing typed persistence operations for domain records","inputs":[],"outputs":[],"side_effects":["Persists records to underlying storage backend"],"dependencies":["Record","StorageError"],"error_modes":["Storage backend unavailable","Serialization failure"],"method_dependencies":{"delete":["StorageError"],"load":["Record","StorageError"],"save":["Record","StorageError"]},"confidence":0.91}"#;
+{"intent":"Storage abstraction providing typed persistence operations for domain records","inputs":[],"outputs":[],"side_effects":["Persists records to underlying storage backend"],"dependencies":["Record","StorageError"],"error_modes":["Storage backend unavailable","Serialization failure"],"confidence":0.91}"#;
 
 fn is_type_definition(kind: &str) -> bool {
     matches!(kind, "struct" | "enum" | "trait" | "type_alias")
@@ -41,19 +41,6 @@ List contained or extended types as dependencies.\n\
 Inputs and outputs should be empty arrays for type definitions.\n\
 Good intent example: 'Database handle struct that holds a reference-counted pointer to shared database state, enabling multiple owners including a background task'\n\
 Bad intent example: 'Define a database structure'"
-                .to_owned(),
-        );
-        sections.push(
-            "If this type has methods (trait methods, impl methods): you MUST include a \
-\"method_dependencies\" field that maps each method name to its specific \
-dependencies as an array of strings. The flat \"dependencies\" array must \
-still contain the union of all method dependencies. Example:\n\
-\"method_dependencies\": {\n\
-  \"upsert_symbol\": [\"SymbolRecord\", \"StoreError\"],\n\
-  \"read_sir_blob\": [\"StoreError\"]\n\
-}\n\
-If the type has no methods (pure data struct, fieldless enum), omit \
-\"method_dependencies\" entirely."
                 .to_owned(),
         );
     }
@@ -93,31 +80,16 @@ For dependencies, list the production code under test."
     }
 }
 
-fn strict_response_contract(context: &SirContext) -> &'static str {
-    if is_type_definition(context.kind.as_str()) {
-        "Respond with STRICT JSON only (no markdown, no prose) and these fields: \
-intent (string), inputs (array of string), outputs (array of string), side_effects (array of string), dependencies (array of string), error_modes (array of string), confidence (number in [0.0,1.0]).\n\
-For type definitions, you MUST include method_dependencies (object mapping method names to arrays of string) when the type has methods.\n\
-Do not add any other keys.\n\n\
-"
-    } else {
-        "Respond with STRICT JSON only (no markdown, no prose) and exactly these fields: \
+fn strict_response_contract(_context: &SirContext) -> &'static str {
+    "Respond with STRICT JSON only (no markdown, no prose) and exactly these fields: \
 intent (string), inputs (array of string), outputs (array of string), side_effects (array of string), dependencies (array of string), error_modes (array of string), confidence (number in [0.0,1.0]).\n\
 Do not add any extra keys.\n\n\
 "
-    }
 }
 
-fn enriched_response_contract(context: &SirContext) -> &'static str {
-    if is_type_definition(context.kind.as_str()) {
-        "\n\nRespond with STRICT JSON only. Use fields intent, inputs, outputs,\n\
-side_effects, dependencies, error_modes, confidence. For type definitions,\n\
-you MUST include method_dependencies when the type has methods.\n\
-Do not add any other keys."
-    } else {
-        "\n\nRespond with STRICT JSON only. Exactly these fields: intent, inputs, outputs,\n\
+fn enriched_response_contract(_context: &SirContext) -> &'static str {
+    "\n\nRespond with STRICT JSON only. Exactly these fields: intent, inputs, outputs,\n\
 side_effects, dependencies, error_modes, confidence."
-    }
 }
 
 pub fn build_sir_prompt_for_kind(symbol_text: &str, context: &SirContext) -> String {
@@ -253,8 +225,6 @@ mod tests {
         };
         let prompt = build_sir_prompt_for_kind("pub struct State {}", &context);
         assert!(prompt.contains("For type definitions: describe WHY this type exists"));
-        assert!(prompt.contains("\"method_dependencies\" field"));
-        assert!(prompt.contains("you MUST include method_dependencies"));
     }
 
     #[test]
@@ -271,8 +241,6 @@ mod tests {
 
         let prompt = build_sir_prompt_for_kind("pub fn run() {}", &context);
         assert!(prompt.contains("exactly these fields"));
-        assert!(!prompt.contains("you MUST include method_dependencies"));
-        assert!(!prompt.contains("If this type has methods (trait methods, impl methods)"));
     }
 
     #[test]
@@ -350,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn build_enriched_prompt_allows_method_dependencies_for_type_definitions() {
+    fn build_enriched_prompt_keeps_type_definition_guidance() {
         let context = SirContext {
             language: "rust".to_owned(),
             file_path: "src/lib.rs".to_owned(),
@@ -368,8 +336,8 @@ mod tests {
         };
 
         let prompt = build_enriched_sir_prompt("pub trait Store {}", &context, &enrichment);
-        assert!(prompt.contains("you MUST include method_dependencies"));
-        assert!(prompt.contains("\"method_dependencies\" field"));
+        assert!(prompt.contains("For type definitions: describe WHY this type exists"));
+        assert!(!prompt.contains("you MUST include method_dependencies"));
     }
 
     #[test]

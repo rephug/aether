@@ -47,7 +47,12 @@ use anyhow::{Context, Result, anyhow};
 
 fn main() -> Result<()> {
     let cli = parse_cli();
-    run(cli)
+    if let Err(err) = run(cli) {
+        eprintln!("Error: {err:?}");
+        std::process::exit(1);
+    }
+
+    std::process::exit(0);
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -482,6 +487,7 @@ fn run_regenerate_command(workspace: &Path, args: RegenerateArgs) -> Result<()> 
         config.inference.concurrency.max(1),
         ProviderOverrides::default(),
     )
+    .map(|pipeline| pipeline.with_skip_graph_sync(true))
     .context("failed to initialize primary regeneration pipeline")?;
 
     let mut owned_deep_pipeline: Option<SirPipeline> = None;
@@ -514,7 +520,9 @@ fn run_regenerate_command(workspace: &Path, args: RegenerateArgs) -> Result<()> 
                 },
             )
             .map(|pipeline| {
-                pipeline.with_inference_timeout_secs(config.sir_quality.deep_timeout_secs)
+                pipeline
+                    .with_inference_timeout_secs(config.sir_quality.deep_timeout_secs)
+                    .with_skip_graph_sync(true)
             })
             .context("failed to initialize deep regeneration pipeline")?,
         );

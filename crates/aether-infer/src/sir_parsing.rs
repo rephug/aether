@@ -149,19 +149,6 @@ fn parse_and_validate_sir(candidate_json: &str) -> Result<SirAnnotation, String>
 
     validate_sir(&sir).map_err(|err| format!("sir validation error: {err}"))?;
 
-    if let Some(ref md) = sir.method_dependencies {
-        for (method_name, deps) in md {
-            if method_name.is_empty() {
-                return Err("method_dependencies contains empty method name".to_owned());
-            }
-            if deps.iter().any(|d| d.is_empty()) {
-                return Err(format!(
-                    "method_dependencies[{method_name}] contains empty dependency string"
-                ));
-            }
-        }
-    }
-
     Ok(sir)
 }
 
@@ -308,25 +295,6 @@ mod tests {
         assert_eq!(
             method_dependencies.get("load"),
             Some(&vec!["Record".to_owned(), "StoreError".to_owned()])
-        );
-    }
-
-    #[test]
-    fn parse_and_validate_sir_rejects_empty_method_name() {
-        let candidate = r#"{"intent":"valid","inputs":[],"outputs":[],"side_effects":[],"dependencies":["Foo"],"error_modes":[],"confidence":0.9,"method_dependencies":{"":["Foo"]}}"#;
-
-        let err = parse_and_validate_sir(candidate).expect_err("candidate should fail");
-        assert_eq!(err, "method_dependencies contains empty method name");
-    }
-
-    #[test]
-    fn parse_and_validate_sir_rejects_empty_method_dependency_string() {
-        let candidate = r#"{"intent":"valid","inputs":[],"outputs":[],"side_effects":[],"dependencies":["Foo"],"error_modes":[],"confidence":0.9,"method_dependencies":{"save":[""]}}"#;
-
-        let err = parse_and_validate_sir(candidate).expect_err("candidate should fail");
-        assert_eq!(
-            err,
-            "method_dependencies[save] contains empty dependency string"
         );
     }
 
