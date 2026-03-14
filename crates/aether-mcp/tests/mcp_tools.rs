@@ -28,8 +28,8 @@ use aether_sir::{
 use aether_store::{
     CommunitySnapshotRecord, DriftStore, GraphStore, ProjectNoteStore, ResolvedEdge,
     SemanticIndexStore, SirHistoryStore, SirMetaRecord, SirStateStore, SqliteStore,
-    SurrealGraphStore, SymbolCatalogStore, SymbolEmbeddingRecord, SymbolRecord, TestIntentRecord,
-    TestIntentStore,
+    SurrealGraphStore, SymbolCatalogStore, SymbolEmbeddingRecord, SymbolRecord,
+    SymbolRelationStore, TestIntentRecord, TestIntentStore,
 };
 use aetherd::indexer::{IndexerConfig, run_initial_index_once};
 use anyhow::Result;
@@ -976,19 +976,19 @@ fn mcp_usage_matrix_reports_consumers_clusters_and_uncalled_methods() -> Result<
     )?;
     fs::write(
         workspace.join("src/store.rs"),
-        "pub struct ExampleStore;\n\nimpl ExampleStore {\n    pub fn alpha() -> i32 { 1 }\n    pub fn beta() -> i32 { 2 }\n    pub fn gamma() -> i32 { 3 }\n    pub fn delta() -> i32 { 4 }\n}\n",
+        "pub struct ExampleStore;\n\nimpl ExampleStore {\n    pub fn alpha(&self) -> i32 { 1 }\n    pub fn beta(&self) -> i32 { 2 }\n    pub fn gamma(&self) -> i32 { 3 }\n    pub fn delta(&self) -> i32 { 4 }\n}\n",
     )?;
     fs::write(
         workspace.join("src/consumer_a.rs"),
-        "use crate::store::ExampleStore;\n\npub fn run_a() -> i32 {\n    ExampleStore::alpha() + ExampleStore::beta()\n}\n",
+        "use crate::store::ExampleStore;\n\npub fn run_a() -> i32 {\n    let store = ExampleStore;\n    store.alpha() + store.beta()\n}\n",
     )?;
     fs::write(
         workspace.join("src/consumer_b.rs"),
-        "use crate::store::ExampleStore;\n\npub fn run_b() -> i32 {\n    ExampleStore::alpha() + ExampleStore::beta()\n}\n",
+        "use crate::store::ExampleStore;\n\npub fn run_b() -> i32 {\n    let store = ExampleStore;\n    store.alpha() + store.beta()\n}\n",
     )?;
     fs::write(
         workspace.join("src/consumer_c.rs"),
-        "use crate::store::ExampleStore;\n\npub fn run_c() -> i32 {\n    ExampleStore::gamma()\n}\n",
+        "use crate::store::ExampleStore;\n\npub fn run_c() -> i32 {\n    let store = ExampleStore;\n    store.gamma()\n}\n",
     )?;
 
     run_index_and_seed_sir(workspace)?;
@@ -1000,6 +1000,16 @@ fn mcp_usage_matrix_reports_consumers_clusters_and_uncalled_methods() -> Result<
         .find(|symbol| symbol.qualified_name == "ExampleStore")
         .expect("ExampleStore symbol should exist")
         .id;
+    let alpha_qualified_callers = store.get_callers("ExampleStore::alpha")?;
+    assert!(alpha_qualified_callers.is_empty());
+
+    let alpha_bare_callers = store.get_callers("alpha")?;
+    assert_eq!(alpha_bare_callers.len(), 2);
+    assert!(
+        alpha_bare_callers
+            .iter()
+            .all(|edge| edge.target_qualified_name == "alpha")
+    );
 
     let server = AetherMcpServer::new(workspace, false)?;
     let rt = Runtime::new()?;
@@ -1156,7 +1166,7 @@ fn mcp_dependencies_aggregate_type_level_call_relationships() -> Result<()> {
     fs::create_dir_all(workspace.join("src"))?;
     fs::write(
         workspace.join("src/lib.rs"),
-        "pub struct Calc;\n\nimpl Calc {\n    pub fn alpha() -> i32 { helper_one() }\n    pub fn beta() -> i32 { helper_one() + helper_two() }\n    pub fn gamma() -> i32 { helper_two() }\n}\n\npub fn helper_one() -> i32 { 1 }\npub fn helper_two() -> i32 { 2 }\n\npub fn run_x() -> i32 {\n    Calc::alpha() + Calc::beta()\n}\n\npub fn run_y() -> i32 {\n    Calc::beta()\n}\n",
+        "pub struct Calc;\n\nimpl Calc {\n    pub fn alpha(&self) -> i32 { helper_one() }\n    pub fn beta(&self) -> i32 { helper_one() + helper_two() }\n    pub fn gamma(&self) -> i32 { helper_two() }\n}\n\npub fn helper_one() -> i32 { 1 }\npub fn helper_two() -> i32 { 2 }\n\npub fn run_x() -> i32 {\n    let calc = Calc;\n    calc.alpha() + calc.beta()\n}\n\npub fn run_y() -> i32 {\n    let calc = Calc;\n    calc.beta()\n}\n",
     )?;
 
     run_index_and_seed_sir(workspace)?;

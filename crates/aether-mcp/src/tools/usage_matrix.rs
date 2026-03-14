@@ -146,14 +146,27 @@ impl AetherMcpServer {
 
         for method in &child_methods {
             let method_name = symbol_leaf_name(method.qualified_name.as_str()).to_owned();
-            let edges = store
-                .get_callers(method.qualified_name.as_str())?
-                .into_iter()
-                .map(|edge| {
+            let mut seen_source_ids = HashSet::<String>::new();
+            let mut edges = Vec::new();
+
+            for edge in store.get_callers(method.qualified_name.as_str())? {
+                if !seen_source_ids.insert(edge.source_id.clone()) {
+                    continue;
+                }
+                caller_symbol_ids.insert(edge.source_id.clone());
+                edges.push((edge.source_id, edge.file_path));
+            }
+
+            if method_name != method.qualified_name {
+                for edge in store.get_callers(method_name.as_str())? {
+                    if !seen_source_ids.insert(edge.source_id.clone()) {
+                        continue;
+                    }
                     caller_symbol_ids.insert(edge.source_id.clone());
-                    (edge.source_id, edge.file_path)
-                })
-                .collect::<Vec<_>>();
+                    edges.push((edge.source_id, edge.file_path));
+                }
+            }
+
             method_edges.insert(method_name, edges);
         }
 
