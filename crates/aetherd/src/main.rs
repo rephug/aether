@@ -11,7 +11,7 @@ use aether_infer::ProviderOverrides;
 use aether_infer::sir_prompt::SirEnrichmentContext;
 use aether_infer::{download_candle_embedding_model, download_candle_reranker_model};
 use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
-use aether_store::{SqliteStore, Store};
+use aether_store::{SirStateStore, SqliteStore, SymbolCatalogStore};
 use aetherd::calibrate::run_calibration_once;
 use aetherd::causal::run_trace_cause_command;
 use aetherd::cli::{

@@ -3,7 +3,10 @@ use std::sync::Arc;
 
 use aether_config::{AetherConfig, GraphBackend, save_workspace_config};
 use aether_core::{EdgeKind, SymbolEdge};
-use aether_store::{DriftAnalysisStateRecord, SirMetaRecord, SqliteStore, Store, SymbolRecord};
+use aether_store::{
+    DriftAnalysisStateRecord, DriftStore, SirMetaRecord, SirStateStore, SqliteStore,
+    SymbolCatalogStore, SymbolRecord, SymbolRelationStore,
+};
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::Value;

@@ -7,6 +7,7 @@ mod tests {
 
     use super::*;
     use aether_core::{EdgeKind, SymbolEdge};
+    use aether_store::SemanticIndexStore;
     use async_trait::async_trait;
     use rusqlite::Connection;
     use tempfile::tempdir;

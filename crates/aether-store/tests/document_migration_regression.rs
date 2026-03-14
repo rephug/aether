@@ -1,4 +1,4 @@
-use aether_store::{SirMetaRecord, SqliteStore, Store, SymbolRecord};
+use aether_store::{SirMetaRecord, SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord};
 use tempfile::tempdir;
 
 #[test]

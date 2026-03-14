@@ -1,4 +1,4 @@
-use aether_store::{SirHistorySelector, Store};
+use aether_store::{SirHistorySelector, SirHistoryStore};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

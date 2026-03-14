@@ -451,8 +451,8 @@ mod tests {
     use std::path::Path;
 
     use aether_store::{
-        CouplingEdgeRecord, CozoGraphStore, ProjectNoteRecord, Store, SymbolRecord,
-        TestIntentRecord,
+        CouplingEdgeRecord, CozoGraphStore, ProjectNoteRecord, ProjectNoteStore, SirStateStore,
+        SymbolCatalogStore, SymbolRecord, TestIntentRecord, TestIntentStore,
     };
     use tempfile::tempdir;
 

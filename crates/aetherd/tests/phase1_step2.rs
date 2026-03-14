@@ -9,7 +9,10 @@ use aether_config::{AetherConfig, VerifyConfig, VerifyMode};
 use aether_infer::sir_prompt::SirEnrichmentContext;
 use aether_infer::{InferError, InferenceProvider, Qwen3LocalProvider, SirContext};
 use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id, validate_sir};
-use aether_store::{SqliteStore, Store, SymbolEmbeddingRecord, SymbolRecord};
+use aether_store::{
+    SemanticIndexStore, SirHistoryStore, SirStateStore, SqliteStore, SymbolCatalogStore,
+    SymbolEmbeddingRecord, SymbolRecord, SymbolRelationStore,
+};
 use aetherd::observer::ObserverState;
 use aetherd::sir_pipeline::{QualityBatchItem, SIR_GENERATION_PASS_TRIAGE, SirPipeline};
 use aetherd::verification::{VerificationRequest, run_host_verification, run_verification};

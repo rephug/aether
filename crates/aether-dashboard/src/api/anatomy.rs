@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use aether_store::Store;
+use aether_store::SirStateStore;
 use axum::extract::State;
 use axum::response::IntoResponse;
 use serde::Serialize;

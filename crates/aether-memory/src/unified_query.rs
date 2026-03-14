@@ -8,7 +8,10 @@ use crate::note::{ProjectMemoryService, project_note_from_store};
 use crate::ranking::{apply_recency_access_boost, rrf_score};
 use crate::search::SemanticQuery;
 use crate::{MemoryError, current_unix_timestamp_millis};
-use aether_store::{CouplingEdgeRecord, CozoGraphStore, SqliteStore, Store};
+use aether_store::{
+    CouplingEdgeRecord, CozoGraphStore, ProjectNoteStore, SirStateStore, SqliteStore,
+    SymbolCatalogStore, TestIntentStore,
+};
 
 const SYMBOL_COUPLING_SEED_LIMIT: usize = 10;
 

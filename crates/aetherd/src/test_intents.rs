@@ -3,7 +3,7 @@ use std::path::Path;
 
 use aether_analysis::TestIntentAnalyzer;
 use aether_core::normalize_path;
-use aether_store::{SqliteStore, Store};
+use aether_store::{SqliteStore, TestIntentStore};
 use anyhow::{Context, Result};
 use serde_json::json;
 

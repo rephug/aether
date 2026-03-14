@@ -18,7 +18,8 @@ use aether_health::{
 };
 use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
 use aether_store::{
-    SqliteStore, Store, SurrealGraphStore, SymbolRecord, VectorStore, open_vector_store,
+    DriftStore, SirStateStore, SqliteStore, SurrealGraphStore, SymbolCatalogStore, SymbolRecord,
+    TestIntentStore, VectorStore, open_vector_store,
 };
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
@@ -940,9 +941,9 @@ mod tests {
     use aether_core::EdgeKind;
     use aether_graph_algo::GraphAlgorithmEdge;
     use aether_store::{
-        CommunitySnapshotRecord, DriftResultRecord, GraphStore, ResolvedEdge, SqliteStore, Store,
-        SurrealGraphStore, SymbolEmbeddingRecord, SymbolRecord, TestIntentRecord,
-        open_vector_store,
+        CommunitySnapshotRecord, DriftResultRecord, DriftStore, GraphStore, ResolvedEdge,
+        SemanticIndexStore, SqliteStore, SurrealGraphStore, SymbolCatalogStore,
+        SymbolEmbeddingRecord, SymbolRecord, TestIntentRecord, TestIntentStore, open_vector_store,
     };
     use rusqlite::Connection;
     use tempfile::tempdir;

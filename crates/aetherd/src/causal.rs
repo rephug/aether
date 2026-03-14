@@ -3,7 +3,7 @@ use std::path::Path;
 
 use aether_analysis::{CausalAnalyzer, TraceCauseRequest};
 use aether_core::normalize_path;
-use aether_store::{SqliteStore, Store};
+use aether_store::{SqliteStore, SymbolCatalogStore};
 use anyhow::{Context, Result, anyhow};
 
 use crate::cli::TraceCauseArgs;

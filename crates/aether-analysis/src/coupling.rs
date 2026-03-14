@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aether_config::{CouplingConfig, GraphBackend, load_workspace_config};
 use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
 use aether_store::{
-    CouplingEdgeRecord, CouplingMiningStateRecord, CozoGraphStore, SqliteStore, Store, StoreError,
-    open_vector_store,
+    CouplingEdgeRecord, CouplingMiningStateRecord, CouplingStateStore, CozoGraphStore, SqliteStore,
+    StoreError, SymbolCatalogStore, SymbolRelationStore, open_vector_store,
 };
 use gix::bstr::ByteSlice;
 use serde::{Deserialize, Serialize};

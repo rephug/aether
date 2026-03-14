@@ -227,7 +227,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{Store, SymbolRecord};
+    use crate::{SymbolCatalogStore, SymbolRecord, SymbolRelationStore};
     use aether_core::{EdgeKind, SymbolEdge};
 
     fn symbol(id: &str, qualified_name: &str) -> SymbolRecord {

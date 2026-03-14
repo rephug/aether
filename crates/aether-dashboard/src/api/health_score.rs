@@ -14,7 +14,7 @@ use aether_health::{
     ScoreReport, SemanticFileInput, SemanticInput, Severity, compute_workspace_score,
     compute_workspace_score_with_signals,
 };
-use aether_store::{SqliteStore, Store};
+use aether_store::{DriftStore, SirStateStore, SqliteStore, SymbolCatalogStore, TestIntentStore};
 
 use crate::state::SharedState;
 use crate::support::{self, DashboardState};

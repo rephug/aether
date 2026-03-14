@@ -18,7 +18,8 @@ use aether_infer::{
     load_reranker_provider_from_config,
 };
 use aether_store::{
-    SqliteStore, Store, SymbolSearchResult, ThresholdCalibrationRecord, open_vector_store,
+    SirStateStore, SqliteStore, SymbolCatalogStore, SymbolSearchResult, ThresholdCalibrationRecord,
+    ThresholdStore, open_vector_store,
 };
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -765,7 +766,8 @@ mod tests {
     use crate::observer::ObserverState;
     use crate::sir_pipeline::SirPipeline;
     use aether_store::{
-        SymbolEmbeddingRecord, SymbolRecord, ThresholdCalibrationRecord, open_vector_store,
+        SemanticIndexStore, SymbolEmbeddingRecord, SymbolRecord, ThresholdCalibrationRecord,
+        open_vector_store,
     };
 
     const TEST_EMBED_PROVIDER: &str = "test_embedding";

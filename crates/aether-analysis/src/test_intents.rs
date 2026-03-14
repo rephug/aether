@@ -3,7 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use aether_core::{file_source_id, normalize_path};
-use aether_store::{CozoGraphStore, SqliteStore, Store, TestedByRecord};
+use aether_store::{
+    CozoGraphStore, SqliteStore, SymbolRelationStore, TestIntentStore, TestedByRecord,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::coupling::AnalysisError;

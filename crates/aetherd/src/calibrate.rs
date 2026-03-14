@@ -6,7 +6,10 @@ use aether_config::{
     MAX_SEARCH_THRESHOLD, MIN_SEARCH_THRESHOLD, ensure_workspace_config, save_workspace_config,
 };
 use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
-use aether_store::{CalibrationEmbeddingRecord, SqliteStore, Store, ThresholdCalibrationRecord};
+use aether_store::{
+    CalibrationEmbeddingRecord, SemanticIndexStore, SqliteStore, ThresholdCalibrationRecord,
+    ThresholdStore,
+};
 use anyhow::{Result, anyhow};
 
 const MIN_SYMBOLS_PER_LANGUAGE: usize = 20;

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use aether_config::load_workspace_config;
 use aether_core::SymbolKind;
 use aether_graph_algo::GraphAlgorithmEdge;
-use aether_store::{SqliteStore, Store, SurrealGraphStore, open_vector_store};
+use aether_store::{SqliteStore, SurrealGraphStore, SymbolCatalogStore, open_vector_store};
 
 use super::anchors::{
     build_anchor_groups, count_type_anchored_symbols, rebuild_union_find_from_groups,

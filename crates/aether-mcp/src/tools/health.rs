@@ -8,7 +8,9 @@ use aether_health::{
     format_hotspots_text, suggest_split,
 };
 use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
-use aether_store::{SqliteStore, Store, SymbolRecord};
+use aether_store::{
+    DriftStore, SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord, TestIntentStore,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -815,8 +817,8 @@ mod tests {
     use crate::AetherMcpServer;
     use aether_core::EdgeKind;
     use aether_store::{
-        GraphStore, ResolvedEdge, SqliteStore, Store, SurrealGraphStore, SymbolEmbeddingRecord,
-        SymbolRecord,
+        GraphStore, ResolvedEdge, SemanticIndexStore, SqliteStore, SurrealGraphStore,
+        SymbolCatalogStore, SymbolEmbeddingRecord, SymbolRecord,
     };
     use tempfile::tempdir;
 

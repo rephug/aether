@@ -10,7 +10,10 @@ use aether_sir::{
     FileSir, SirAnnotation, SirLevel, canonicalize_file_sir_json, canonicalize_sir_json,
     file_sir_hash, sir_hash, synthetic_file_sir_id, synthetic_module_sir_id, validate_sir,
 };
-use aether_store::{SirMetaRecord, SqliteStore, Store, SymbolRecord};
+use aether_store::{
+    SirHistoryStore, SirMetaRecord, SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord,
+    SymbolRelationStore,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 

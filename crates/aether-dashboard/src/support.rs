@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aether_core::normalize_path;
-use aether_store::{Store, SurrealGraphStore};
+use aether_store::{DriftStore, SirStateStore, SurrealGraphStore};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, response::Html};

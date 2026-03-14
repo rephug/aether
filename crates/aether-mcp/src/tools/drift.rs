@@ -3,7 +3,7 @@ use aether_analysis::{
     DriftInclude as AnalysisDriftInclude, DriftReportRequest as AnalysisDriftReportRequest,
     TraceCauseRequest as AnalysisTraceCauseRequest,
 };
-use aether_store::{SqliteStore, Store, SymbolRecord};
+use aether_store::{SqliteStore, SymbolCatalogStore, SymbolRecord};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -463,7 +463,10 @@ mod tests {
     use std::path::Path;
 
     use aether_core::EdgeKind;
-    use aether_store::{DriftResultRecord, ResolvedEdge, SqliteStore, Store, SymbolRecord};
+    use aether_store::{
+        DriftResultRecord, DriftStore, ResolvedEdge, SirHistoryStore, SqliteStore,
+        SymbolCatalogStore, SymbolRecord,
+    };
     use tempfile::tempdir;
 
     use super::{AetherAcknowledgeDriftRequest, AetherDriftReportRequest, AetherTraceCauseRequest};

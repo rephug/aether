@@ -3,7 +3,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use aether_config::{GraphBackend, HealthConfig, load_workspace_config};
-use aether_store::{SqliteStore, Store, SurrealGraphStore, TestedByRecord};
+use aether_store::{
+    DriftStore, SirStateStore, SqliteStore, SurrealGraphStore, TestIntentStore, TestedByRecord,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -1080,8 +1082,9 @@ mod tests {
 
     use aether_core::EdgeKind;
     use aether_store::{
-        DriftResultRecord, GraphStore, ResolvedEdge, SirMetaRecord, SqliteStore, Store,
-        SurrealGraphStore, SymbolRecord, TestIntentRecord,
+        DriftResultRecord, DriftStore, GraphStore, ResolvedEdge, SirMetaRecord, SirStateStore,
+        SqliteStore, SurrealGraphStore, SymbolCatalogStore, SymbolRecord, TestIntentRecord,
+        TestIntentStore,
     };
     use tempfile::tempdir;
 

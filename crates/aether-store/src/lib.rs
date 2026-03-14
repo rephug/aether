@@ -108,7 +108,7 @@ pub enum StoreError {
     Compatibility(String),
 }
 
-pub trait Store {
+pub trait SymbolCatalogStore {
     fn upsert_symbol(&self, record: SymbolRecord) -> Result<(), StoreError>;
     fn mark_removed(&self, symbol_id: &str) -> Result<(), StoreError>;
     fn list_symbols_for_file(&self, file_path: &str) -> Result<Vec<SymbolRecord>, StoreError>;
@@ -127,16 +127,25 @@ pub trait Store {
         symbol_ids: &[String],
         accessed_at: i64,
     ) -> Result<(), StoreError>;
+}
+
+pub trait SymbolRelationStore {
     fn upsert_edges(&self, edges: &[SymbolEdge]) -> Result<(), StoreError>;
     fn get_callers(&self, target_qualified_name: &str) -> Result<Vec<SymbolEdge>, StoreError>;
     fn get_dependencies(&self, source_id: &str) -> Result<Vec<SymbolEdge>, StoreError>;
     fn delete_edges_for_file(&self, file_path: &str) -> Result<(), StoreError>;
+    fn has_dependency_between_files(&self, file_a: &str, file_b: &str) -> Result<bool, StoreError>;
+}
 
+pub trait SirStateStore {
     fn write_sir_blob(&self, symbol_id: &str, sir_json_string: &str) -> Result<(), StoreError>;
     fn read_sir_blob(&self, symbol_id: &str) -> Result<Option<String>, StoreError>;
 
     fn upsert_sir_meta(&self, record: SirMetaRecord) -> Result<(), StoreError>;
     fn get_sir_meta(&self, symbol_id: &str) -> Result<Option<SirMetaRecord>, StoreError>;
+}
+
+pub trait SirHistoryStore {
     fn list_sir_history(&self, symbol_id: &str) -> Result<Vec<SirHistoryRecord>, StoreError>;
     fn latest_sir_history_pair(
         &self,
@@ -159,7 +168,14 @@ pub trait Store {
         created_at: i64,
         commit_hash: Option<&str>,
     ) -> Result<SirVersionWriteResult, StoreError>;
+    fn resolve_sir_baseline_by_selector(
+        &self,
+        symbol_id: &str,
+        selector: SirHistoryBaselineSelector,
+    ) -> Result<Option<SirHistoryRecord>, StoreError>;
+}
 
+pub trait SemanticIndexStore {
     fn upsert_symbol_embedding(&self, record: SymbolEmbeddingRecord) -> Result<(), StoreError>;
     fn get_symbol_embedding_meta(
         &self,
@@ -173,6 +189,14 @@ pub trait Store {
         model: &str,
         limit: u32,
     ) -> Result<Vec<SemanticSearchResult>, StoreError>;
+    fn list_embeddings_for_provider_model(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Result<Vec<CalibrationEmbeddingRecord>, StoreError>;
+}
+
+pub trait ThresholdStore {
     fn upsert_threshold_calibration(
         &self,
         record: ThresholdCalibrationRecord,
@@ -182,12 +206,9 @@ pub trait Store {
         language: &str,
     ) -> Result<Option<ThresholdCalibrationRecord>, StoreError>;
     fn list_threshold_calibrations(&self) -> Result<Vec<ThresholdCalibrationRecord>, StoreError>;
-    fn list_embeddings_for_provider_model(
-        &self,
-        provider: &str,
-        model: &str,
-    ) -> Result<Vec<CalibrationEmbeddingRecord>, StoreError>;
+}
 
+pub trait ProjectNoteStore {
     fn upsert_project_note(&self, record: ProjectNoteRecord) -> Result<(), StoreError>;
     fn find_project_note_by_content_hash(
         &self,
@@ -218,6 +239,9 @@ pub trait Store {
         note_ids: &[String],
         accessed_at: i64,
     ) -> Result<(), StoreError>;
+}
+
+pub trait ProjectNoteEmbeddingStore {
     fn upsert_project_note_embedding(
         &self,
         record: ProjectNoteEmbeddingRecord,
@@ -230,12 +254,17 @@ pub trait Store {
         model: &str,
         limit: u32,
     ) -> Result<Vec<ProjectNoteSemanticSearchResult>, StoreError>;
+}
 
+pub trait CouplingStateStore {
     fn get_coupling_mining_state(&self) -> Result<Option<CouplingMiningStateRecord>, StoreError>;
     fn upsert_coupling_mining_state(
         &self,
         state: CouplingMiningStateRecord,
     ) -> Result<(), StoreError>;
+}
+
+pub trait DriftStore {
     fn get_drift_analysis_state(&self) -> Result<Option<DriftAnalysisStateRecord>, StoreError>;
     fn upsert_drift_analysis_state(
         &self,
@@ -258,12 +287,9 @@ pub trait Store {
         assignments: &[CommunitySnapshotRecord],
     ) -> Result<(), StoreError>;
     fn list_latest_community_snapshot(&self) -> Result<Vec<CommunitySnapshotRecord>, StoreError>;
-    fn resolve_sir_baseline_by_selector(
-        &self,
-        symbol_id: &str,
-        selector: SirHistoryBaselineSelector,
-    ) -> Result<Option<SirHistoryRecord>, StoreError>;
-    fn has_dependency_between_files(&self, file_a: &str, file_b: &str) -> Result<bool, StoreError>;
+}
+
+pub trait TestIntentStore {
     fn replace_test_intents_for_file(
         &self,
         file_path: &str,
@@ -282,6 +308,36 @@ pub trait Store {
         query: &str,
         limit: u32,
     ) -> Result<Vec<TestIntentRecord>, StoreError>;
+}
+
+pub trait Store:
+    SymbolCatalogStore
+    + SymbolRelationStore
+    + SirStateStore
+    + SirHistoryStore
+    + SemanticIndexStore
+    + ThresholdStore
+    + ProjectNoteStore
+    + ProjectNoteEmbeddingStore
+    + CouplingStateStore
+    + DriftStore
+    + TestIntentStore
+{
+}
+
+impl<T> Store for T where
+    T: SymbolCatalogStore
+        + SymbolRelationStore
+        + SirStateStore
+        + SirHistoryStore
+        + SemanticIndexStore
+        + ThresholdStore
+        + ProjectNoteStore
+        + ProjectNoteEmbeddingStore
+        + CouplingStateStore
+        + DriftStore
+        + TestIntentStore
+{
 }
 
 #[async_trait]
@@ -394,7 +450,7 @@ impl SqliteStore {
     }
 }
 
-impl Store for SqliteStore {
+impl SymbolCatalogStore for SqliteStore {
     fn upsert_symbol(&self, record: SymbolRecord) -> Result<(), StoreError> {
         self.store_upsert_symbol(record)
     }
@@ -430,7 +486,9 @@ impl Store for SqliteStore {
     ) -> Result<(), StoreError> {
         self.store_increment_symbol_access_debounced(symbol_ids, accessed_at)
     }
+}
 
+impl SymbolRelationStore for SqliteStore {
     fn upsert_edges(&self, edges: &[SymbolEdge]) -> Result<(), StoreError> {
         self.store_upsert_edges(edges)
     }
@@ -447,6 +505,12 @@ impl Store for SqliteStore {
         self.store_delete_edges_for_file(file_path)
     }
 
+    fn has_dependency_between_files(&self, file_a: &str, file_b: &str) -> Result<bool, StoreError> {
+        self.store_has_dependency_between_files(file_a, file_b)
+    }
+}
+
+impl SirStateStore for SqliteStore {
     fn write_sir_blob(&self, symbol_id: &str, sir_json_string: &str) -> Result<(), StoreError> {
         self.store_write_sir_blob(symbol_id, sir_json_string)
     }
@@ -462,7 +526,9 @@ impl Store for SqliteStore {
     fn get_sir_meta(&self, symbol_id: &str) -> Result<Option<SirMetaRecord>, StoreError> {
         self.store_get_sir_meta(symbol_id)
     }
+}
 
+impl SirHistoryStore for SqliteStore {
     fn list_sir_history(&self, symbol_id: &str) -> Result<Vec<SirHistoryRecord>, StoreError> {
         self.store_list_sir_history(symbol_id)
     }
@@ -505,6 +571,16 @@ impl Store for SqliteStore {
         )
     }
 
+    fn resolve_sir_baseline_by_selector(
+        &self,
+        symbol_id: &str,
+        selector: SirHistoryBaselineSelector,
+    ) -> Result<Option<SirHistoryRecord>, StoreError> {
+        self.store_resolve_sir_baseline_by_selector(symbol_id, selector)
+    }
+}
+
+impl SemanticIndexStore for SqliteStore {
     fn upsert_symbol_embedding(&self, record: SymbolEmbeddingRecord) -> Result<(), StoreError> {
         self.store_upsert_symbol_embedding(record)
     }
@@ -530,6 +606,16 @@ impl Store for SqliteStore {
         self.store_search_symbols_semantic(query_embedding, provider, model, limit)
     }
 
+    fn list_embeddings_for_provider_model(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Result<Vec<CalibrationEmbeddingRecord>, StoreError> {
+        self.store_list_embeddings_for_provider_model(provider, model)
+    }
+}
+
+impl ThresholdStore for SqliteStore {
     fn upsert_threshold_calibration(
         &self,
         record: ThresholdCalibrationRecord,
@@ -547,15 +633,9 @@ impl Store for SqliteStore {
     fn list_threshold_calibrations(&self) -> Result<Vec<ThresholdCalibrationRecord>, StoreError> {
         self.store_list_threshold_calibrations()
     }
+}
 
-    fn list_embeddings_for_provider_model(
-        &self,
-        provider: &str,
-        model: &str,
-    ) -> Result<Vec<CalibrationEmbeddingRecord>, StoreError> {
-        self.store_list_embeddings_for_provider_model(provider, model)
-    }
-
+impl ProjectNoteStore for SqliteStore {
     fn upsert_project_note(&self, record: ProjectNoteRecord) -> Result<(), StoreError> {
         self.store_upsert_project_note(record)
     }
@@ -606,7 +686,9 @@ impl Store for SqliteStore {
     ) -> Result<(), StoreError> {
         self.store_increment_project_note_access(note_ids, accessed_at)
     }
+}
 
+impl ProjectNoteEmbeddingStore for SqliteStore {
     fn upsert_project_note_embedding(
         &self,
         record: ProjectNoteEmbeddingRecord,
@@ -627,7 +709,9 @@ impl Store for SqliteStore {
     ) -> Result<Vec<ProjectNoteSemanticSearchResult>, StoreError> {
         self.store_search_project_notes_semantic(query_embedding, provider, model, limit)
     }
+}
 
+impl CouplingStateStore for SqliteStore {
     fn get_coupling_mining_state(&self) -> Result<Option<CouplingMiningStateRecord>, StoreError> {
         self.store_get_coupling_mining_state()
     }
@@ -638,7 +722,9 @@ impl Store for SqliteStore {
     ) -> Result<(), StoreError> {
         self.store_upsert_coupling_mining_state(state)
     }
+}
 
+impl DriftStore for SqliteStore {
     fn get_drift_analysis_state(&self) -> Result<Option<DriftAnalysisStateRecord>, StoreError> {
         self.store_get_drift_analysis_state()
     }
@@ -684,19 +770,9 @@ impl Store for SqliteStore {
     fn list_latest_community_snapshot(&self) -> Result<Vec<CommunitySnapshotRecord>, StoreError> {
         self.store_list_latest_community_snapshot()
     }
+}
 
-    fn resolve_sir_baseline_by_selector(
-        &self,
-        symbol_id: &str,
-        selector: SirHistoryBaselineSelector,
-    ) -> Result<Option<SirHistoryRecord>, StoreError> {
-        self.store_resolve_sir_baseline_by_selector(symbol_id, selector)
-    }
-
-    fn has_dependency_between_files(&self, file_a: &str, file_b: &str) -> Result<bool, StoreError> {
-        self.store_has_dependency_between_files(file_a, file_b)
-    }
-
+impl TestIntentStore for SqliteStore {
     fn replace_test_intents_for_file(
         &self,
         file_path: &str,

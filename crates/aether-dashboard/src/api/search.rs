@@ -6,7 +6,7 @@ use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
-use aether_store::Store;
+use aether_store::SymbolCatalogStore;
 
 use crate::api::common;
 use crate::state::SharedState;

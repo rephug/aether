@@ -12,7 +12,9 @@ use aether_infer::{
     RerankerProviderOverrides, load_embedding_provider_from_config,
     load_reranker_provider_from_config,
 };
-use aether_store::{SqliteStore, Store, SymbolRecord, SymbolSearchResult};
+use aether_store::{
+    SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord, SymbolSearchResult,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

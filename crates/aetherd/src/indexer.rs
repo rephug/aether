@@ -13,7 +13,12 @@ use aether_infer::ProviderOverrides;
 use aether_infer::sir_prompt::SirEnrichmentContext;
 use aether_parse::{SymbolExtractor, TestIntent};
 use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
-use aether_store::{SqliteStore, Store, SymbolRecord, TestIntentRecord, open_graph_store};
+#[cfg(test)]
+use aether_store::SirHistoryStore;
+use aether_store::{
+    SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord, SymbolRelationStore,
+    TestIntentRecord, TestIntentStore, open_graph_store,
+};
 use anyhow::{Context, Result};
 use gix::traverse::commit::simple::CommitTimeOrder;
 use ignore::WalkBuilder;

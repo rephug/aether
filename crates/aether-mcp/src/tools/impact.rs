@@ -5,7 +5,7 @@ use aether_analysis::{
     BlastRadiusRequest, CouplingAnalyzer, RiskLevel as CouplingRiskLevel, TestIntentAnalyzer,
 };
 use aether_core::normalize_path;
-use aether_store::{SqliteStore, Store};
+use aether_store::{ProjectNoteStore, SqliteStore, SymbolCatalogStore, TestIntentStore};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 

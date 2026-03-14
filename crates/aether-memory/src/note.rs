@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{MemoryError, compute_content_hash, compute_note_id, current_unix_timestamp_millis};
 use aether_store::{
-    ProjectEntityRefRecord, ProjectNoteRecord, ProjectNoteVectorRecord, SqliteStore, Store,
-    VectorStore, open_vector_store,
+    ProjectEntityRefRecord, ProjectNoteRecord, ProjectNoteStore, ProjectNoteVectorRecord,
+    SqliteStore, VectorStore, open_vector_store,
 };
 
 const EMBEDDING_CONTENT_MAX_BYTES: usize = 2 * 1024;

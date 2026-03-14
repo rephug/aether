@@ -7,7 +7,7 @@ use aether_core::{Language, Position, SourceRange, Symbol, SymbolKind, content_h
 use aether_infer::ProviderOverrides;
 use aether_sir::SirAnnotation;
 use aether_store::{
-    IntentOperation, LanceVectorStore, SqliteStore, Store, SurrealGraphStore, WriteIntent,
+    IntentOperation, LanceVectorStore, SirStateStore, SqliteStore, SurrealGraphStore, WriteIntent,
     WriteIntentStatus, open_vector_store,
 };
 use anyhow::{Context, Result};
@@ -472,7 +472,10 @@ mod tests {
         AetherConfig, EmbeddingProviderKind, EmbeddingVectorBackend, GraphBackend,
         save_workspace_config,
     };
-    use aether_store::{SqliteStore, Store, SymbolEmbeddingRecord, SymbolRecord};
+    use aether_store::{
+        SemanticIndexStore, SirStateStore, SqliteStore, SymbolCatalogStore, SymbolEmbeddingRecord,
+        SymbolRecord,
+    };
     use tempfile::tempdir;
 
     use super::run_fsck;

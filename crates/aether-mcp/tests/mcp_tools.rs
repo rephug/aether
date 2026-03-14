@@ -25,8 +25,10 @@ use aether_sir::{
     FileSir, SirAnnotation, file_sir_hash, sir_hash, synthetic_file_sir_id, synthetic_module_sir_id,
 };
 use aether_store::{
-    CommunitySnapshotRecord, GraphStore, ResolvedEdge, SirMetaRecord, SqliteStore, Store,
-    SurrealGraphStore, SymbolEmbeddingRecord, SymbolRecord, TestIntentRecord,
+    CommunitySnapshotRecord, DriftStore, GraphStore, ProjectNoteStore, ResolvedEdge,
+    SemanticIndexStore, SirHistoryStore, SirMetaRecord, SirStateStore, SqliteStore,
+    SurrealGraphStore, SymbolCatalogStore, SymbolEmbeddingRecord, SymbolRecord, TestIntentRecord,
+    TestIntentStore,
 };
 use aetherd::indexer::{IndexerConfig, run_initial_index_once};
 use anyhow::Result;

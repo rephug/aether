@@ -206,3 +206,24 @@ mod notes_and_analysis;
 mod reconcile;
 mod schema_and_intents;
 mod sir;
+
+#[test]
+fn sqlite_store_implements_split_store_traits() {
+    fn assert_store_traits<
+        T: SymbolCatalogStore
+            + SymbolRelationStore
+            + SirStateStore
+            + SirHistoryStore
+            + SemanticIndexStore
+            + ThresholdStore
+            + ProjectNoteStore
+            + ProjectNoteEmbeddingStore
+            + CouplingStateStore
+            + DriftStore
+            + TestIntentStore
+            + Store,
+    >() {
+    }
+
+    assert_store_traits::<SqliteStore>();
+}

@@ -27,7 +27,8 @@ use aether_sir::{
 #[cfg(test)]
 use aether_store::SymbolRecord;
 use aether_store::{
-    IntentOperation, SirMetaRecord, SqliteStore, Store, SymbolEmbeddingRecord,
+    IntentOperation, SirHistoryStore, SirMetaRecord, SirStateStore, SqliteStore,
+    SymbolCatalogStore, SymbolEmbeddingRecord, SymbolRelationStore, TestIntentStore,
     VectorEmbeddingMetaRecord, VectorStore, WriteIntent, WriteIntentStatus, open_graph_store,
     open_vector_store,
 };

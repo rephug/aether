@@ -5,7 +5,7 @@ use std::sync::Arc;
 use aether_infer::{InferError, InferenceProvider, SirContext};
 use aether_lsp::resolve_hover_markdown_for_path;
 use aether_sir::SirAnnotation;
-use aether_store::{SqliteStore, Store};
+use aether_store::{SirStateStore, SqliteStore, SymbolCatalogStore};
 use aetherd::observer::ObserverState;
 use aetherd::sir_pipeline::SirPipeline;
 use async_trait::async_trait;

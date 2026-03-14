@@ -1,0 +1,40 @@
+AETHER CODE INTELLIGENCE INSTRUCTIONS
+
+Agent schema version: 1
+Inference provider: gemini
+MCP binary hint: ./target/debug/aether-mcp
+
+Available tools:
+- aether_status: check local index/store freshness and symbol/SIR counts
+- aether_symbol_lookup: find symbols by name/path/language using lexical lookup
+- aether_search: search symbols using lexical, semantic, or hybrid ranking
+- aether_symbol_timeline: inspect how a symbol changed across SIR versions
+- aether_why_changed: compare symbol versions and summarize what changed
+- aether_get_sir: fetch canonical SIR for symbol/file/module before edits
+- aether_dependencies: list direct callers and dependencies for a symbol
+- aether_call_chain: trace call-chain levels to understand blast radius
+- aether_verify: run configured verification commands after code changes
+- aether_explain: summarize intent for a symbol or file-level rollup
+
+Available languages: Rust, TypeScript/JavaScript, Python
+Search modes: lexical, semantic, hybrid (semantic search is enabled)
+
+Required actions (mandatory):
+1. Always call `aether_get_sir` before reverting, deleting, or refactoring symbols
+2. Always call `aether_why_changed` before reverting recent changes
+3. Always call `aether_verify` after modifying code
+4. If `aether_verify` fails, fix the issue before proceeding
+
+Recommended actions (advisory):
+1. Consider `aether_search` with hybrid mode when exploring unfamiliar code
+2. Consider `aether_symbol_timeline` when reviewing recent changes
+3. Consider `aether_call_chain` when tracing dependencies and downstream impact
+4. Call `aether_status` at task start to confirm index freshness
+
+Staleness guidance:
+If you have made many rapid edits, call aether_status before trusting retrieval results. If counts look stale, wait for indexing or trigger aether_index_once.
+
+Verify commands:
+- cargo fmt --all --check
+- cargo clippy --workspace -- -D warnings
+- cargo test --workspace

@@ -11,7 +11,8 @@ use aether_infer::{
 use aether_memory::{EntityRef, NoteSourceType, ProjectMemoryService, RememberRequest};
 use aether_store::{
     CommunitySnapshotRecord, CozoGraphStore, DriftAnalysisStateRecord, DriftResultRecord,
-    SirHistoryBaselineSelector, SqliteStore, Store, open_vector_store,
+    DriftStore, SirHistoryBaselineSelector, SirHistoryStore, SirStateStore, SqliteStore,
+    SymbolCatalogStore, SymbolRelationStore, TestIntentStore, open_vector_store,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1757,7 +1758,8 @@ mod tests {
     use std::process::Command;
 
     use aether_store::{
-        CozoGraphStore, DriftResultRecord, SirMetaRecord, SqliteStore, Store, SymbolRecord,
+        CozoGraphStore, DriftResultRecord, DriftStore, SirHistoryStore, SirMetaRecord,
+        SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord,
     };
     use tempfile::tempdir;
 

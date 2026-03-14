@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aether_sir::{SirAnnotation, validate_sir};
-use aether_store::{SirMetaRecord, Store};
+use aether_store::{SirMetaRecord, SirStateStore};
 use anyhow::Result;
 use rmcp::ServiceExt;
 use rmcp::handler::server::router::tool::ToolRouter;

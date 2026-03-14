@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::note::{ProjectMemoryService, ProjectNote, normalize_tags, project_note_from_store};
 use crate::ranking::{apply_recency_access_boost, rrf_score};
 use crate::{MemoryError, current_unix_timestamp_millis};
-use aether_store::Store;
+use aether_store::ProjectNoteStore;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticQuery {

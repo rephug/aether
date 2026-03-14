@@ -5,7 +5,7 @@ use axum::response::Html;
 use maud::html;
 use serde::Deserialize;
 
-use aether_store::Store;
+use aether_store::SymbolCatalogStore;
 
 use crate::support::{self, DashboardState};
 

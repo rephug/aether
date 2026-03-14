@@ -5,7 +5,7 @@ use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
-use aether_store::{Store, SymbolRecord};
+use aether_store::{SymbolCatalogStore, SymbolRecord};
 
 use crate::api::common;
 use crate::api::difficulty::difficulty_for_symbol;

@@ -6,7 +6,7 @@ use aether_config::load_workspace_config;
 use aether_infer::{
     EmbeddingProviderOverrides, LoadedEmbeddingProvider, load_embedding_provider_from_config,
 };
-use aether_store::{CozoGraphStore, SirHistoryRecord, SqliteStore, Store};
+use aether_store::{CozoGraphStore, SirHistoryRecord, SirHistoryStore, SqliteStore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -758,7 +758,10 @@ mod tests {
     use std::process::Command;
 
     use aether_core::EdgeKind;
-    use aether_store::{CozoGraphStore, ResolvedEdge, SirHistoryRecord, Store, SymbolRecord};
+    use aether_store::{
+        CozoGraphStore, ResolvedEdge, SirHistoryRecord, SirHistoryStore, SymbolCatalogStore,
+        SymbolRecord,
+    };
     use tempfile::tempdir;
 
     use super::{

@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use aether_store::Store;
+use aether_store::SirStateStore;
 use serde_json::Value;
 
 use crate::api::common;

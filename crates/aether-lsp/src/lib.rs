@@ -9,7 +9,10 @@ use aether_core::{
 use aether_health::{ScoreReport, compute_workspace_score, workspace_health_config_or_default};
 use aether_parse::{RustUsePrefix, language_for_path, rust_use_path_at_cursor};
 use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
-use aether_store::{CouplingEdgeRecord, CozoGraphStore, SqliteStore, Store, StoreError};
+use aether_store::{
+    CouplingEdgeRecord, CozoGraphStore, ProjectNoteStore, SirHistoryStore, SirStateStore,
+    SqliteStore, StoreError, SymbolCatalogStore, SymbolRelationStore, TestIntentStore,
+};
 use serde_json::Value;
 use thiserror::Error;
 use tower_lsp::lsp_types::{
@@ -1033,8 +1036,9 @@ mod tests {
 
     use aether_parse::SymbolExtractor;
     use aether_store::{
-        CouplingEdgeRecord, CozoGraphStore, ProjectNoteRecord, SirMetaRecord, Store, SymbolRecord,
-        TestIntentRecord,
+        CouplingEdgeRecord, CozoGraphStore, ProjectNoteRecord, ProjectNoteStore, SirHistoryStore,
+        SirMetaRecord, SirStateStore, SymbolCatalogStore, SymbolRecord, TestIntentRecord,
+        TestIntentStore,
     };
     use tempfile::tempdir;
     use tower_lsp::lsp_types::Position;

@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aether_mcp::{AetherMcpServer, SharedState};
 use aether_query::config::QueryConfig;
 use aether_query::server::build_router;
-use aether_store::{SqliteStore, Store, SymbolRecord};
+use aether_store::{SqliteStore, SymbolCatalogStore, SymbolRecord};
 use reqwest::Client;
 use reqwest::header;
 use serde_json::{Value, json};

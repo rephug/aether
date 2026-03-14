@@ -4,7 +4,7 @@ use axum::extract::{Path, State};
 use axum::response::Html;
 use maud::{Markup, html};
 
-use aether_store::Store;
+use aether_store::SirStateStore;
 
 use crate::support::{self, DashboardState};
 

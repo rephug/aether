@@ -6,7 +6,7 @@ use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_conf
 use aether_memory::{
     AskInclude, AskQueryRequest, AskResultItem, AskResultKind, ProjectMemoryService, SemanticQuery,
 };
-use aether_store::Store;
+use aether_store::SirStateStore;
 use axum::Json;
 use axum::extract::State;
 use axum::response::IntoResponse;
