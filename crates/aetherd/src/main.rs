@@ -487,7 +487,7 @@ fn run_regenerate_command(workspace: &Path, args: RegenerateArgs) -> Result<()> 
         config.inference.concurrency.max(1),
         ProviderOverrides::default(),
     )
-    .map(|pipeline| pipeline.with_skip_graph_sync(true))
+    .map(|pipeline| pipeline.with_skip_surreal_sync(true))
     .context("failed to initialize primary regeneration pipeline")?;
 
     let mut owned_deep_pipeline: Option<SirPipeline> = None;
@@ -522,7 +522,7 @@ fn run_regenerate_command(workspace: &Path, args: RegenerateArgs) -> Result<()> 
             .map(|pipeline| {
                 pipeline
                     .with_inference_timeout_secs(config.sir_quality.deep_timeout_secs)
-                    .with_skip_graph_sync(true)
+                    .with_skip_surreal_sync(true)
             })
             .context("failed to initialize deep regeneration pipeline")?,
         );

@@ -260,16 +260,16 @@ vector_backend = "sqlite"
     }
 
     #[test]
-    fn commit_successful_generation_injects_method_dependencies_from_symbol_edges() {
+    fn commit_successful_generation_injects_method_dependencies_from_symbol_edges_across_files() {
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();
         write_embeddings_only_config(workspace);
 
         let store = SqliteStore::open(workspace).expect("open store");
         for symbol in [
-            demo_symbol_record_with_kind("sym-store", "Store", "trait", "src/lib.rs"),
-            demo_symbol_record_with_kind("sym-load", "Store::load", "method", "src/lib.rs"),
-            demo_symbol_record_with_kind("sym-save", "Store::save", "method", "src/lib.rs"),
+            demo_symbol_record_with_kind("sym-store", "Store", "trait", "src/store.rs"),
+            demo_symbol_record_with_kind("sym-load", "Store::load", "method", "src/load.rs"),
+            demo_symbol_record_with_kind("sym-save", "Store::save", "method", "src/save.rs"),
         ] {
             store.upsert_symbol(symbol).expect("upsert symbol");
         }
@@ -279,25 +279,25 @@ vector_backend = "sqlite"
                     source_id: "sym-load".to_owned(),
                     target_qualified_name: "Helper".to_owned(),
                     edge_kind: EdgeKind::Calls,
-                    file_path: "src/lib.rs".to_owned(),
+                    file_path: "src/load.rs".to_owned(),
                 },
                 SymbolEdge {
                     source_id: "sym-load".to_owned(),
                     target_qualified_name: "Record".to_owned(),
                     edge_kind: EdgeKind::TypeRef,
-                    file_path: "src/lib.rs".to_owned(),
+                    file_path: "src/load.rs".to_owned(),
                 },
                 SymbolEdge {
                     source_id: "sym-load".to_owned(),
                     target_qualified_name: "StoreError".to_owned(),
                     edge_kind: EdgeKind::TypeRef,
-                    file_path: "src/lib.rs".to_owned(),
+                    file_path: "src/load.rs".to_owned(),
                 },
                 SymbolEdge {
                     source_id: "sym-save".to_owned(),
                     target_qualified_name: "Record".to_owned(),
                     edge_kind: EdgeKind::TypeRef,
-                    file_path: "src/lib.rs".to_owned(),
+                    file_path: "src/save.rs".to_owned(),
                 },
             ])
             .expect("upsert edges");
@@ -307,7 +307,7 @@ vector_backend = "sqlite"
             "sym-store",
             "Store",
             "Store",
-            "src/lib.rs",
+            "src/store.rs",
             SymbolKind::Trait,
             "pub trait Store {\n    fn load(&self) -> Record;\n    fn save(&self, record: Record);\n}\n",
         );
@@ -363,6 +363,15 @@ vector_backend = "sqlite"
         assert_eq!(
             method_dependencies.get("save"),
             Some(&vec!["Record".to_owned()])
+        );
+        assert_eq!(
+            stored_sir.dependencies,
+            vec![
+                "Helper".to_owned(),
+                "Record".to_owned(),
+                "StoreError".to_owned(),
+                "stale".to_owned(),
+            ]
         );
 
         let intent = store
@@ -603,45 +612,77 @@ enabled = false
     }
 
     #[test]
-    fn process_event_with_skip_graph_sync_reuses_seeded_edges_and_completes_intents() {
+    fn process_event_with_skip_surreal_sync_refreshes_local_edges_and_completes_intents() {
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();
         write_embeddings_only_config(workspace);
         fs::create_dir_all(workspace.join("src")).expect("create src");
-        let source =
-            "pub trait Store {\n    fn load(&self) -> Record;\n    fn save(&self, record: Record);\n}\n";
+        let source = r#"
+pub struct Store;
+pub struct Record;
+
+fn helper(record: &Record) {}
+
+impl Store {
+    pub fn load(&self) -> Record {
+        helper(&Record);
+        Record
+    }
+
+    pub fn save(&self, record: Record) {
+        helper(&record);
+    }
+}
+"#;
         fs::write(workspace.join("src/lib.rs"), source).expect("write source");
 
         let store = SqliteStore::open(workspace).expect("open store");
-        for symbol in [
-            demo_symbol_record_with_kind("sym-load", "Store::load", "method", "src/lib.rs"),
-            demo_symbol_record_with_kind("sym-save", "Store::save", "method", "src/lib.rs"),
-        ] {
-            store.upsert_symbol(symbol).expect("upsert symbol");
+        let mut extractor = SymbolExtractor::new().expect("symbol extractor");
+        let extracted = extractor
+            .extract_with_edges_from_path(Path::new("src/lib.rs"), source)
+            .expect("extract source");
+        for symbol in &extracted.symbols {
+            store
+                .upsert_symbol(demo_symbol_record_with_kind(
+                    symbol.id.as_str(),
+                    symbol.qualified_name.as_str(),
+                    symbol.kind.as_str(),
+                    symbol.file_path.as_str(),
+                ))
+                .expect("upsert symbol");
         }
+        let parent_symbol = extracted
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "Store")
+            .expect("store symbol")
+            .clone();
+        let load_symbol = extracted
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "Store::load")
+            .expect("load symbol");
+        let save_symbol = extracted
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "Store::save")
+            .expect("save symbol");
         store
             .upsert_edges(&[
                 SymbolEdge {
-                    source_id: "sym-load".to_owned(),
-                    target_qualified_name: "Record".to_owned(),
-                    edge_kind: EdgeKind::TypeRef,
-                    file_path: "src/lib.rs".to_owned(),
-                },
-                SymbolEdge {
-                    source_id: "sym-load".to_owned(),
-                    target_qualified_name: "Loader".to_owned(),
+                    source_id: load_symbol.id.clone(),
+                    target_qualified_name: "StaleLoader".to_owned(),
                     edge_kind: EdgeKind::Calls,
                     file_path: "src/lib.rs".to_owned(),
                 },
                 SymbolEdge {
-                    source_id: "sym-save".to_owned(),
-                    target_qualified_name: "Record".to_owned(),
+                    source_id: save_symbol.id.clone(),
+                    target_qualified_name: "StaleRecord".to_owned(),
                     edge_kind: EdgeKind::TypeRef,
                     file_path: "src/lib.rs".to_owned(),
                 },
             ])
             .expect("upsert edges");
-        let before_edges = count_table_rows(workspace, "symbol_edges");
 
         let provider = Arc::new(FixedInferenceProvider {
             sir: SirAnnotation {
@@ -655,15 +696,7 @@ enabled = false
                 method_dependencies: None,
             },
         });
-        let pipeline = build_write_pipeline(workspace, provider).with_skip_graph_sync(true);
-        let parent_symbol = demo_type_symbol(
-            "sym-store",
-            "Store",
-            "Store",
-            "src/lib.rs",
-            SymbolKind::Trait,
-            source,
-        );
+        let pipeline = build_write_pipeline(workspace, provider).with_skip_surreal_sync(true);
         let event = SymbolChangeEvent {
             file_path: "src/lib.rs".to_owned(),
             language: Language::Rust,
@@ -687,7 +720,27 @@ enabled = false
 
         assert_eq!(stats.success_count, 1);
         assert_eq!(stats.failure_count, 0);
-        assert_eq!(count_table_rows(workspace, "symbol_edges"), before_edges);
+        let refreshed_edges = store
+            .list_symbol_edges_for_source_and_kinds(
+                load_symbol.id.as_str(),
+                &[EdgeKind::Calls, EdgeKind::TypeRef],
+            )
+            .expect("read refreshed edges");
+        assert!(
+            refreshed_edges
+                .iter()
+                .any(|edge| edge.target_qualified_name == "helper")
+        );
+        assert!(
+            refreshed_edges
+                .iter()
+                .any(|edge| edge.target_qualified_name == "Record")
+        );
+        assert!(
+            refreshed_edges
+                .iter()
+                .all(|edge| edge.target_qualified_name != "StaleLoader")
+        );
         assert!(store
             .get_incomplete_intents()
             .expect("load incomplete intents")
@@ -711,11 +764,15 @@ enabled = false
             .expect("method dependencies should be injected");
         assert_eq!(
             method_dependencies.get("load"),
-            Some(&vec!["Loader".to_owned(), "Record".to_owned()])
+            Some(&vec!["Record".to_owned(), "helper".to_owned()])
         );
         assert_eq!(
             method_dependencies.get("save"),
-            Some(&vec!["Record".to_owned()])
+            Some(&vec!["Record".to_owned(), "helper".to_owned()])
+        );
+        assert_eq!(
+            stored_sir.dependencies,
+            vec!["Record".to_owned(), "helper".to_owned()]
         );
     }
 }

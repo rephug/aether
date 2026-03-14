@@ -80,6 +80,87 @@ pub struct UpstreamDependencyTraversal {
 }
 
 impl SqliteStore {
+    pub fn list_method_dependency_edges_for_type(
+        &self,
+        type_qualified_name: &str,
+        edge_kinds: &[EdgeKind],
+    ) -> Result<Vec<(SymbolRecord, SymbolEdge)>, StoreError> {
+        let type_qualified_name = type_qualified_name.trim();
+        if type_qualified_name.is_empty() || edge_kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = (0..edge_kinds.len())
+            .map(|index| format!("?{}", index + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT
+                s.id,
+                s.file_path,
+                s.language,
+                s.kind,
+                s.qualified_name,
+                s.signature_fingerprint,
+                s.last_seen_at,
+                e.target_qualified_name,
+                e.edge_kind,
+                e.file_path
+            FROM symbol_edges e
+            JOIN symbols s ON s.id = e.source_id
+            WHERE instr(s.qualified_name, ?1) = 1
+              AND s.kind IN ('function', 'method')
+              AND e.edge_kind IN ({placeholders})
+            ORDER BY s.qualified_name ASC, s.id ASC, e.target_qualified_name ASC, e.edge_kind ASC, e.file_path ASC
+            "#
+        );
+
+        let params = std::iter::once(format!("{type_qualified_name}::"))
+            .chain(edge_kinds.iter().map(|kind| kind.as_str().to_owned()))
+            .collect::<Vec<_>>();
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params), |row| {
+            Ok((
+                SymbolRecord {
+                    id: row.get(0)?,
+                    file_path: row.get(1)?,
+                    language: row.get(2)?,
+                    kind: row.get(3)?,
+                    qualified_name: row.get(4)?,
+                    signature_fingerprint: row.get(5)?,
+                    last_seen_at: row.get(6)?,
+                },
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+            ))
+        })?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let (source_symbol, target_qualified_name, edge_kind, file_path) = row?;
+            let edge_kind = edge_kind_from_str(edge_kind.as_str()).ok_or_else(|| {
+                StoreError::Compatibility(format!(
+                    "unsupported edge kind while reading method dependency edges: {edge_kind}"
+                ))
+            })?;
+            records.push((
+                source_symbol.clone(),
+                SymbolEdge {
+                    source_id: source_symbol.id,
+                    target_qualified_name,
+                    edge_kind,
+                    file_path,
+                },
+            ));
+        }
+
+        Ok(records)
+    }
+
     pub fn list_graph_dependency_edges(
         &self,
     ) -> Result<Vec<GraphDependencyEdgeRecord>, StoreError> {

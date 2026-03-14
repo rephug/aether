@@ -102,7 +102,8 @@ pub struct SirPipeline {
     quality_monitor: Mutex<SirQualityMonitor>,
     tiered_parse_fallback_provider: Option<Arc<dyn InferenceProvider>>,
     tiered_parse_fallback_model: Option<String>,
-    skip_graph_sync: bool,
+    skip_surreal_sync: bool,
+    skip_local_edges: bool,
 }
 
 struct PreparedCandidateJobs {
@@ -247,12 +248,24 @@ impl SirPipeline {
             )),
             tiered_parse_fallback_provider,
             tiered_parse_fallback_model,
-            skip_graph_sync: false,
+            skip_surreal_sync: false,
+            skip_local_edges: false,
         })
     }
 
+    pub fn with_skip_surreal_sync(mut self, skip_surreal_sync: bool) -> Self {
+        self.skip_surreal_sync = skip_surreal_sync;
+        self
+    }
+
+    pub fn with_skip_local_edges(mut self, skip_local_edges: bool) -> Self {
+        self.skip_local_edges = skip_local_edges;
+        self
+    }
+
     pub fn with_skip_graph_sync(mut self, skip_graph_sync: bool) -> Self {
-        self.skip_graph_sync = skip_graph_sync;
+        self.skip_surreal_sync = skip_graph_sync;
+        self.skip_local_edges = skip_graph_sync;
         self
     }
 
@@ -333,7 +346,7 @@ impl SirPipeline {
         prompt_overrides: Option<&HashMap<String, SirPromptOverride>>,
     ) -> Result<ProcessEventStats> {
         self.process_removed_symbols(store, event)?;
-        if !self.skip_graph_sync {
+        if !self.skip_local_edges {
             self.replace_edges_for_file(store, event)?;
         }
 
@@ -412,7 +425,7 @@ impl SirPipeline {
                 }
             }
 
-            if self.skip_graph_sync {
+            if self.skip_surreal_sync {
                 self.complete_graph_stage_without_sync(store, &mut intents_ready_for_graph);
             } else {
                 self.finalize_graph_stage(
@@ -422,7 +435,7 @@ impl SirPipeline {
                 );
             }
             self.log_processing_summary(event.file_path.as_str(), &stats);
-        } else if !self.skip_graph_sync
+        } else if !self.skip_surreal_sync
             && let Err(err) = self.sync_graph_for_file(store, &event.file_path)
         {
             tracing::warn!(
@@ -549,7 +562,7 @@ impl SirPipeline {
         }
 
         for (file_path, mut intent_ids) in intents_by_file {
-            if self.skip_graph_sync {
+            if self.skip_surreal_sync {
                 self.complete_graph_stage_without_sync(store, &mut intent_ids);
             } else {
                 self.finalize_graph_stage(store, file_path.as_str(), &mut intent_ids);
@@ -715,46 +728,64 @@ impl SirPipeline {
         }
 
         let prefix = format!("{}::", symbol.qualified_name);
-        let mut method_dependencies = HashMap::new();
-        let file_symbols = store.list_symbols_for_file(symbol.file_path.as_str())?;
+        let mut method_dependencies = BTreeMap::new();
 
-        for child in file_symbols.into_iter().filter(|child| {
-            child.qualified_name.starts_with(prefix.as_str())
-                && matches!(child.kind.as_str(), "function" | "method")
-        }) {
+        for (child, edge) in store.list_method_dependency_edges_for_type(
+            symbol.qualified_name.as_str(),
+            &[EdgeKind::Calls, EdgeKind::TypeRef],
+        )? {
             let Some(method_name) = child.qualified_name.strip_prefix(prefix.as_str()) else {
                 continue;
             };
 
-            let edges = store.list_symbol_edges_for_source_and_kinds(
-                child.id.as_str(),
-                &[EdgeKind::Calls, EdgeKind::TypeRef],
-            )?;
-            let mut dependencies = edges
-                .into_iter()
-                .map(|edge| {
-                    edge.target_qualified_name
-                        .rsplit("::")
-                        .next()
-                        .unwrap_or(edge.target_qualified_name.as_str())
-                        .trim_start_matches("r#")
-                        .to_owned()
-                })
-                .filter(|dependency| !dependency.is_empty())
-                .collect::<Vec<_>>();
-            dependencies.sort();
-            dependencies.dedup();
+            let dependency = edge
+                .target_qualified_name
+                .rsplit("::")
+                .next()
+                .unwrap_or(edge.target_qualified_name.as_str())
+                .trim_start_matches("r#")
+                .trim()
+                .to_owned();
 
-            if !dependencies.is_empty() {
-                method_dependencies.insert(method_name.to_owned(), dependencies);
+            if !dependency.is_empty() {
+                method_dependencies
+                    .entry(method_name.to_owned())
+                    .or_insert_with(Vec::new)
+                    .push(dependency);
             }
         }
 
-        sir.method_dependencies = if method_dependencies.is_empty() {
-            None
-        } else {
-            Some(method_dependencies)
-        };
+        let method_dependencies = method_dependencies
+            .into_iter()
+            .filter_map(|(method_name, mut dependencies)| {
+                dependencies.sort();
+                dependencies.dedup();
+                if dependencies.is_empty() {
+                    None
+                } else {
+                    Some((method_name, dependencies))
+                }
+            })
+            .collect::<HashMap<_, _>>();
+
+        if method_dependencies.is_empty() {
+            sir.method_dependencies = None;
+            return Ok(());
+        }
+
+        let mut dependencies = sir.dependencies.clone();
+        dependencies.extend(
+            method_dependencies
+                .values()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        dependencies.sort();
+        dependencies.dedup();
+
+        sir.dependencies = dependencies;
+        sir.method_dependencies = Some(method_dependencies);
         Ok(())
     }
 
@@ -1480,7 +1511,7 @@ impl SirPipeline {
         }
 
         if status == WriteIntentStatus::VectorDone {
-            if self.skip_graph_sync {
+            if self.skip_surreal_sync {
                 store
                     .update_intent_status(intent_id, WriteIntentStatus::GraphDone)
                     .with_context(|| {
