@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use aether_config::{AetherConfig, EmbeddingVectorBackend, GraphBackend, load_workspace_config};
+use aether_config::{
+    AetherConfig, DEFAULT_OPENAI_COMPAT_API_KEY_ENV, EmbeddingProviderKind, EmbeddingVectorBackend,
+    GraphBackend, load_workspace_config,
+};
 use aether_store::{
     GraphStore, SchemaVersion, SqliteGraphStore, SqliteStore, SqliteVectorStore, SurrealGraphStore,
     VectorStore, open_vector_store,
@@ -17,15 +20,114 @@ pub struct SharedState {
     pub graph: Arc<dyn GraphStore>,
     pub surreal_graph: Arc<Mutex<Option<Arc<SurrealGraphStore>>>>,
     pub vector_store: Option<Arc<dyn VectorStore>>,
+    pub semantic_search_available: bool,
     pub config: Arc<AetherConfig>,
     pub read_only: bool,
     pub schema_version: SchemaVersion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SemanticSearchUnavailability {
+    EmbeddingsDisabled,
+    MissingApiKey { key_env: String },
+    MissingApiKeyConfig { provider: &'static str },
+}
+
+impl SemanticSearchUnavailability {
+    pub(crate) fn fallback_reason(&self) -> String {
+        match self {
+            Self::EmbeddingsDisabled => "embeddings are disabled in .aether/config.toml".to_owned(),
+            Self::MissingApiKey { key_env } => format!(
+                "Embedding API key not configured. Register MCP server with --env {key_env}=<value> to enable semantic search."
+            ),
+            Self::MissingApiKeyConfig { provider } => format!(
+                "Embedding provider {provider} requires embeddings.api_key_env to be configured before semantic search can be used."
+            ),
+        }
+    }
+
+    fn warn(&self) {
+        match self {
+            Self::EmbeddingsDisabled => {}
+            Self::MissingApiKey { key_env } => tracing::warn!(
+                "Embedding provider requires {} but it is not set. Semantic search will be unavailable. Register the MCP server with --env {}=<value> to enable it.",
+                key_env,
+                key_env
+            ),
+            Self::MissingApiKeyConfig { provider } => tracing::warn!(
+                "Embedding provider {} requires embeddings.api_key_env to be configured. Semantic search will be unavailable.",
+                provider
+            ),
+        }
+    }
+}
+
+pub(crate) fn semantic_search_unavailability(
+    config: &AetherConfig,
+) -> Option<SemanticSearchUnavailability> {
+    if !config.embeddings.enabled {
+        return Some(SemanticSearchUnavailability::EmbeddingsDisabled);
+    }
+
+    match config.embeddings.provider {
+        EmbeddingProviderKind::Qwen3Local | EmbeddingProviderKind::Candle => None,
+        EmbeddingProviderKind::OpenAiCompat => {
+            let key_env = config
+                .embeddings
+                .api_key_env
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(DEFAULT_OPENAI_COMPAT_API_KEY_ENV);
+            if env_var_configured(key_env) {
+                None
+            } else {
+                Some(SemanticSearchUnavailability::MissingApiKey {
+                    key_env: key_env.to_owned(),
+                })
+            }
+        }
+        EmbeddingProviderKind::GeminiNative => {
+            let Some(key_env) = config
+                .embeddings
+                .api_key_env
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return Some(SemanticSearchUnavailability::MissingApiKeyConfig {
+                    provider: EmbeddingProviderKind::GeminiNative.as_str(),
+                });
+            };
+
+            if env_var_configured(key_env) {
+                None
+            } else {
+                Some(SemanticSearchUnavailability::MissingApiKey {
+                    key_env: key_env.to_owned(),
+                })
+            }
+        }
+    }
+}
+
+fn env_var_configured(key_env: &str) -> bool {
+    std::env::var(key_env)
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
 }
 
 impl SharedState {
     pub fn open_readwrite(workspace: &Path) -> Result<Self, AetherMcpError> {
         let workspace = workspace.canonicalize()?;
         let config = Arc::new(load_config(&workspace)?);
+        let semantic_search_available = match semantic_search_unavailability(config.as_ref()) {
+            Some(unavailability) => {
+                unavailability.warn();
+                false
+            }
+            None => true,
+        };
         let store = Arc::new(SqliteStore::open(&workspace)?);
         store.check_compatibility("core", 7)?;
         let graph = open_shared_graph(&workspace, &config, false)?;
@@ -39,6 +141,7 @@ impl SharedState {
             graph,
             surreal_graph,
             vector_store,
+            semantic_search_available,
             config,
             read_only: false,
             schema_version,
@@ -48,6 +151,13 @@ impl SharedState {
     pub async fn open_readwrite_async(workspace: &Path) -> Result<Self, AetherMcpError> {
         let workspace = workspace.canonicalize()?;
         let config = Arc::new(load_config(&workspace)?);
+        let semantic_search_available = match semantic_search_unavailability(config.as_ref()) {
+            Some(unavailability) => {
+                unavailability.warn();
+                false
+            }
+            None => true,
+        };
         let store = Arc::new(SqliteStore::open(&workspace)?);
         store.check_compatibility("core", 7)?;
         let (graph, surreal_graph) = open_shared_graph_async(&workspace, &config, false).await?;
@@ -61,6 +171,7 @@ impl SharedState {
             graph,
             surreal_graph,
             vector_store,
+            semantic_search_available,
             config,
             read_only: false,
             schema_version,
@@ -71,6 +182,13 @@ impl SharedState {
         let workspace = workspace.canonicalize()?;
         ensure_workspace_store_ready(&workspace)?;
         let config = Arc::new(load_config(&workspace)?);
+        let semantic_search_available = match semantic_search_unavailability(config.as_ref()) {
+            Some(unavailability) => {
+                unavailability.warn();
+                false
+            }
+            None => true,
+        };
         let store = Arc::new(SqliteStore::open_readonly(&workspace)?);
         store.check_compatibility("core", 7)?;
         let (graph, surreal_graph) = open_shared_graph_async(&workspace, &config, true).await?;
@@ -84,6 +202,7 @@ impl SharedState {
             graph,
             surreal_graph,
             vector_store,
+            semantic_search_available,
             config,
             read_only: true,
             schema_version,
@@ -94,6 +213,13 @@ impl SharedState {
         let workspace = workspace.canonicalize()?;
         ensure_workspace_store_ready(&workspace)?;
         let config = Arc::new(load_config(&workspace)?);
+        let semantic_search_available = match semantic_search_unavailability(config.as_ref()) {
+            Some(unavailability) => {
+                unavailability.warn();
+                false
+            }
+            None => true,
+        };
         let store = Arc::new(SqliteStore::open_readonly(&workspace)?);
         store.check_compatibility("core", 7)?;
         let graph = open_shared_graph(&workspace, &config, true)?;
@@ -107,6 +233,7 @@ impl SharedState {
             graph,
             surreal_graph,
             vector_store,
+            semantic_search_available,
             config,
             read_only: true,
             schema_version,
@@ -247,8 +374,10 @@ async fn open_shared_graph_async(
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::fs;
     use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use tempfile::tempdir;
 
@@ -272,6 +401,32 @@ enabled = false
 provider = "qwen3_local"
 vector_backend = "sqlite"
 "#,
+        )
+        .expect("write config");
+    }
+
+    fn write_remote_embedding_config(workspace: &Path, api_key_env: &str) {
+        fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
+        fs::write(
+            workspace.join(".aether/config.toml"),
+            format!(
+                r#"[inference]
+provider = "qwen3_local"
+api_key_env = "GEMINI_API_KEY"
+
+[storage]
+mirror_sir_files = true
+graph_backend = "sqlite"
+
+[embeddings]
+enabled = true
+provider = "openai_compat"
+vector_backend = "sqlite"
+endpoint = "https://example.invalid/v1"
+model = "text-embedding-3-large"
+api_key_env = "{api_key_env}"
+"#
+            ),
         )
         .expect("write config");
     }
@@ -305,5 +460,27 @@ vector_backend = "sqlite"
             AetherMcpError::ReadOnly(_) => {}
             other => panic!("expected ReadOnly error, got {other}"),
         }
+    }
+
+    #[test]
+    fn shared_state_marks_semantic_search_unavailable_when_remote_api_key_is_missing() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let env_name = format!(
+            "AETHER_TEST_MCP_MISSING_EMBED_KEY_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        );
+        write_remote_embedding_config(workspace, &env_name);
+
+        unsafe {
+            env::remove_var(&env_name);
+        }
+
+        let state = SharedState::open_readwrite(workspace).expect("open readwrite state");
+        assert!(!state.semantic_search_available);
     }
 }
