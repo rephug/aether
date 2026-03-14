@@ -755,6 +755,70 @@ impl SirPipeline {
             }
         }
 
+        // Trait method declarations are indexed without the trait:: prefix.
+        // Fall back to same-file implementor methods when the direct prefix lookup is empty.
+        if method_dependencies.is_empty() && symbol.kind.as_str() == "trait" {
+            let mut candidates = store
+                .list_symbols_for_file(symbol.file_path.as_str())?
+                .into_iter()
+                .filter(|candidate| {
+                    candidate.qualified_name != symbol.qualified_name
+                        && matches!(candidate.kind.as_str(), "struct" | "enum")
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_by(|left, right| {
+                left.qualified_name
+                    .cmp(&right.qualified_name)
+                    .then(left.id.cmp(&right.id))
+            });
+
+            for candidate in candidates {
+                let implementor_edges = store.list_method_dependency_edges_for_type(
+                    candidate.qualified_name.as_str(),
+                    &[EdgeKind::Calls, EdgeKind::TypeRef],
+                )?;
+                if implementor_edges.is_empty() {
+                    continue;
+                }
+
+                let implementor_prefix = format!("{}::", candidate.qualified_name);
+                for (child, edge) in implementor_edges {
+                    let Some(method_name) = child
+                        .qualified_name
+                        .strip_prefix(implementor_prefix.as_str())
+                    else {
+                        continue;
+                    };
+
+                    let dependency = edge
+                        .target_qualified_name
+                        .rsplit("::")
+                        .next()
+                        .unwrap_or(edge.target_qualified_name.as_str())
+                        .trim_start_matches("r#")
+                        .trim()
+                        .to_owned();
+
+                    if !dependency.is_empty() {
+                        method_dependencies
+                            .entry(method_name.to_owned())
+                            .or_insert_with(Vec::new)
+                            .push(dependency);
+                    }
+                }
+
+                if !method_dependencies.is_empty() {
+                    tracing::debug!(
+                        trait_name = %symbol.qualified_name,
+                        implementor = %candidate.qualified_name,
+                        method_count = method_dependencies.len(),
+                        "used implementor fallback for trait method_dependencies"
+                    );
+                    break;
+                }
+            }
+        }
+
         let method_dependencies = method_dependencies
             .into_iter()
             .filter_map(|(method_name, mut dependencies)| {
