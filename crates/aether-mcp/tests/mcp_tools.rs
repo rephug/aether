@@ -15,11 +15,11 @@ use aether_mcp::{
     AetherBlastRadiusRequest, AetherCallChainRequest, AetherDependenciesRequest,
     AetherExplainRequest, AetherGetSirRequest, AetherHealthExplainRequest,
     AetherHealthHotspotsRequest, AetherHealthRequest, AetherMcpServer, AetherRecallRequest,
-    AetherRememberRequest, AetherSearchRequest, AetherSuggestTraitSplitRequest,
-    AetherSymbolLookupRequest, AetherSymbolTimelineRequest, AetherTestIntentsRequest,
-    AetherTraitSplitResolutionMode, AetherUsageMatrixRequest, AetherWhyChangedReason,
-    AetherWhyChangedRequest, AetherWhySelectorMode, MCP_SCHEMA_VERSION, MEMORY_SCHEMA_VERSION,
-    SharedState, SirLevelRequest,
+    AetherRefactorPrepRequest, AetherRememberRequest, AetherSearchRequest,
+    AetherSuggestTraitSplitRequest, AetherSymbolLookupRequest, AetherSymbolTimelineRequest,
+    AetherTestIntentsRequest, AetherTraitSplitResolutionMode, AetherUsageMatrixRequest,
+    AetherVerifyIntentRequest, AetherWhyChangedReason, AetherWhyChangedRequest,
+    AetherWhySelectorMode, MCP_SCHEMA_VERSION, MEMORY_SCHEMA_VERSION, SharedState, SirLevelRequest,
 };
 #[cfg(feature = "verification")]
 use aether_mcp::{AetherVerifyMode, AetherVerifyRequest};
@@ -255,6 +255,24 @@ fn run_index_and_seed_sir(workspace: &Path) -> Result<()> {
             last_error: None,
             last_attempt_at: now,
         })?;
+    }
+    Ok(())
+}
+
+fn mark_leaf_sir_deep(workspace: &Path) -> Result<()> {
+    let store = SqliteStore::open(workspace)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    for symbol_id in store.list_all_symbol_ids()? {
+        let Some(mut meta) = store.get_sir_meta(symbol_id.as_str())? else {
+            continue;
+        };
+        meta.generation_pass = "deep".to_owned();
+        meta.updated_at = now;
+        meta.last_attempt_at = now;
+        store.upsert_sir_meta(meta)?;
     }
     Ok(())
 }
@@ -2137,6 +2155,70 @@ fn mcp_why_changed_supports_timestamp_selector_mode() -> Result<()> {
         vec!["intent".to_owned(), "outputs".to_owned()]
     );
 
+    Ok(())
+}
+
+#[test]
+fn mcp_refactor_prep_and_verify_intent_tools_round_trip() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    fs::create_dir_all(workspace.join(".aether"))?;
+    write_test_config(workspace);
+    fs::create_dir_all(workspace.join("src"))?;
+    fs::write(
+        workspace.join("Cargo.toml"),
+        r#"[package]
+name = "mcp-refactor-test"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+members = ["."]
+resolver = "2"
+"#,
+    )?;
+    fs::write(
+        workspace.join("src/lib.rs"),
+        r#"pub fn alpha() -> i32 { 1 }
+pub fn beta() -> i32 { alpha() }
+"#,
+    )?;
+    run_index_and_seed_sir(workspace)?;
+    mark_leaf_sir_deep(workspace)?;
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+    let prep = rt
+        .block_on(
+            server.aether_refactor_prep(Parameters(AetherRefactorPrepRequest {
+                file: Some("src/lib.rs".to_owned()),
+                crate_name: None,
+                top_n: Some(2),
+                local: Some(false),
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+
+    assert_eq!(prep.schema_version, MCP_SCHEMA_VERSION);
+    assert_eq!(prep.scope, "file:src/lib.rs");
+    let snapshot_id = prep.snapshot_id.clone();
+    assert_eq!(prep.deep_failed, 0);
+
+    let verify = rt
+        .block_on(
+            server.aether_verify_intent(Parameters(AetherVerifyIntentRequest {
+                snapshot: snapshot_id,
+                threshold: Some(0.85),
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+
+    assert_eq!(verify.schema_version, MCP_SCHEMA_VERSION);
+    assert_eq!(verify.scope, "file:src/lib.rs");
+    assert!(verify.passed);
+    assert_eq!(verify.failed_entries, 0);
     Ok(())
 }
 

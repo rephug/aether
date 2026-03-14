@@ -877,7 +877,7 @@ fn run_quality_pass(
         let enrichment = build_enrichment_context(
             store,
             &candidate.symbol,
-            candidate.baseline_sir,
+            Some(candidate.baseline_sir),
             priority_scores,
             max_neighbors,
             priority_threshold,
@@ -908,10 +908,10 @@ fn run_quality_pass(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_enrichment_context(
+pub fn build_enrichment_context(
     store: &SqliteStore,
     symbol: &Symbol,
-    baseline_sir: SirAnnotation,
+    baseline_sir: Option<SirAnnotation>,
     priority_scores: &HashMap<String, f64>,
     max_neighbors: usize,
     priority_threshold: f64,
@@ -959,11 +959,15 @@ fn build_enrichment_context(
         .into_iter()
         .map(|(_, name, intent)| (name, intent))
         .collect::<Vec<_>>();
+    let baseline_confidence = baseline_sir
+        .as_ref()
+        .map(|sir| sir.confidence as f64)
+        .unwrap_or(0.0);
     let priority_reason = format_priority_reason(
         store,
         symbol.id.as_str(),
         priority_score,
-        baseline_sir.confidence as f64,
+        baseline_confidence,
         priority_threshold,
         confidence_threshold,
     );
@@ -971,7 +975,7 @@ fn build_enrichment_context(
     Ok(SirEnrichmentContext {
         file_intent: Some(file_intent),
         neighbor_intents,
-        baseline_sir: Some(baseline_sir),
+        baseline_sir,
         priority_reason,
     })
 }

@@ -375,6 +375,41 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         conn.execute("PRAGMA user_version = 7", [])?;
     }
 
+    if version < 8 {
+        conn.execute_batch(
+            r#"
+        CREATE TABLE IF NOT EXISTS intent_snapshots (
+            snapshot_id   TEXT PRIMARY KEY,
+            git_commit    TEXT NOT NULL,
+            created_at    INTEGER NOT NULL,
+            scope         TEXT NOT NULL,
+            symbol_count  INTEGER NOT NULL,
+            deep_count    INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_intent_snapshots_created
+            ON intent_snapshots(created_at DESC, snapshot_id DESC);
+
+        CREATE TABLE IF NOT EXISTS intent_snapshot_entries (
+            snapshot_id           TEXT NOT NULL,
+            symbol_id             TEXT NOT NULL,
+            qualified_name        TEXT NOT NULL,
+            file_path             TEXT NOT NULL,
+            signature_fingerprint TEXT NOT NULL,
+            sir_json              TEXT NOT NULL,
+            generation_pass       TEXT NOT NULL,
+            was_deep_scanned      INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (snapshot_id, symbol_id),
+            FOREIGN KEY (snapshot_id) REFERENCES intent_snapshots(snapshot_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_intent_snapshot_entries_snapshot
+            ON intent_snapshot_entries(snapshot_id, file_path, qualified_name, symbol_id);
+        "#,
+        )?;
+        conn.execute("PRAGMA user_version = 8", [])?;
+    }
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_version (

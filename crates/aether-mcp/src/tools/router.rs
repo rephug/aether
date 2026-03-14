@@ -9,14 +9,16 @@ use super::{
     AetherDriftReportRequest, AetherDriftReportResponse, AetherExplainRequest,
     AetherExplainResponse, AetherGetSirRequest, AetherGetSirResponse, AetherHealthExplainRequest,
     AetherHealthHotspotsRequest, AetherHealthRequest, AetherHealthResponse, AetherMcpServer,
-    AetherRecallRequest, AetherRecallResponse, AetherRememberRequest, AetherRememberResponse,
-    AetherSearchRequest, AetherSearchResponse, AetherSessionNoteResponse, AetherStatusResponse,
+    AetherRecallRequest, AetherRecallResponse, AetherRefactorPrepRequest,
+    AetherRefactorPrepResponse, AetherRememberRequest, AetherRememberResponse, AetherSearchRequest,
+    AetherSearchResponse, AetherSessionNoteResponse, AetherStatusResponse,
     AetherSuggestTraitSplitRequest, AetherSuggestTraitSplitResponse, AetherSymbolLookupRequest,
     AetherSymbolLookupResponse, AetherSymbolTimelineRequest, AetherSymbolTimelineResponse,
     AetherTestIntentsRequest, AetherTestIntentsResponse, AetherTextResponse,
     AetherTraceCauseRequest, AetherTraceCauseResponse, AetherUsageMatrixRequest,
-    AetherUsageMatrixResponse, AetherWhyChangedRequest, AetherWhyChangedResponse,
-    SERVER_DESCRIPTION, SERVER_NAME, SERVER_VERSION,
+    AetherUsageMatrixResponse, AetherVerifyIntentRequest, AetherVerifyIntentResponse,
+    AetherWhyChangedRequest, AetherWhyChangedResponse, SERVER_DESCRIPTION, SERVER_NAME,
+    SERVER_VERSION,
 };
 #[cfg(feature = "verification")]
 use super::{AetherVerifyRequest, AetherVerifyResponse};
@@ -288,6 +290,40 @@ impl AetherMcpServer {
         self.aether_health_explain_logic(request)
             .await
             .map(|text| Json(AetherTextResponse { text }))
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_refactor_prep",
+        description = "Prepare a file or crate for refactoring by deep-scanning the highest-risk symbols and saving an intent snapshot"
+    )]
+    pub async fn aether_refactor_prep(
+        &self,
+        Parameters(request): Parameters<AetherRefactorPrepRequest>,
+    ) -> Result<Json<AetherRefactorPrepResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_refactor_prep");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_refactor_prep_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_verify_intent",
+        description = "Compare current SIR against a saved refactor-prep snapshot and flag semantic drift"
+    )]
+    pub async fn aether_verify_intent(
+        &self,
+        Parameters(request): Parameters<AetherVerifyIntentRequest>,
+    ) -> Result<Json<AetherVerifyIntentResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_verify_intent");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_verify_intent_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
             .map_err(to_mcp_error)
     }
 

@@ -26,6 +26,7 @@ mod project_notes;
 mod schema;
 mod sir_history;
 mod sir_meta;
+mod snapshots;
 mod symbols;
 mod test_intents;
 mod thresholds;
@@ -66,6 +67,7 @@ pub use sir_history::{
     SirVersionWriteResult,
 };
 pub use sir_meta::SirMetaRecord;
+pub use snapshots::{IntentSnapshot, IntentSnapshotSummary, SnapshotEntry};
 pub use symbols::{SymbolMetadata, SymbolRecord, SymbolSearchResult};
 pub use test_intents::TestIntentRecord;
 pub use thresholds::{CalibrationEmbeddingRecord, ThresholdCalibrationRecord};
@@ -173,6 +175,14 @@ pub trait SirHistoryStore {
         symbol_id: &str,
         selector: SirHistoryBaselineSelector,
     ) -> Result<Option<SirHistoryRecord>, StoreError>;
+}
+
+pub trait SnapshotStore {
+    fn create_snapshot(&self, snapshot: &IntentSnapshot) -> Result<(), StoreError>;
+    fn get_snapshot(&self, snapshot_id: &str) -> Result<Option<IntentSnapshot>, StoreError>;
+    fn list_snapshots(&self) -> Result<Vec<IntentSnapshotSummary>, StoreError>;
+    fn get_snapshot_entries(&self, snapshot_id: &str) -> Result<Vec<SnapshotEntry>, StoreError>;
+    fn delete_snapshot(&self, snapshot_id: &str) -> Result<(), StoreError>;
 }
 
 pub trait SemanticIndexStore {
@@ -315,6 +325,7 @@ pub trait Store:
     + SymbolRelationStore
     + SirStateStore
     + SirHistoryStore
+    + SnapshotStore
     + SemanticIndexStore
     + ThresholdStore
     + ProjectNoteStore
@@ -330,6 +341,7 @@ impl<T> Store for T where
         + SymbolRelationStore
         + SirStateStore
         + SirHistoryStore
+        + SnapshotStore
         + SemanticIndexStore
         + ThresholdStore
         + ProjectNoteStore
@@ -577,6 +589,28 @@ impl SirHistoryStore for SqliteStore {
         selector: SirHistoryBaselineSelector,
     ) -> Result<Option<SirHistoryRecord>, StoreError> {
         self.store_resolve_sir_baseline_by_selector(symbol_id, selector)
+    }
+}
+
+impl SnapshotStore for SqliteStore {
+    fn create_snapshot(&self, snapshot: &IntentSnapshot) -> Result<(), StoreError> {
+        self.store_create_snapshot(snapshot)
+    }
+
+    fn get_snapshot(&self, snapshot_id: &str) -> Result<Option<IntentSnapshot>, StoreError> {
+        self.store_get_snapshot(snapshot_id)
+    }
+
+    fn list_snapshots(&self) -> Result<Vec<IntentSnapshotSummary>, StoreError> {
+        self.store_list_snapshots()
+    }
+
+    fn get_snapshot_entries(&self, snapshot_id: &str) -> Result<Vec<SnapshotEntry>, StoreError> {
+        self.store_get_snapshot_entries(snapshot_id)
+    }
+
+    fn delete_snapshot(&self, snapshot_id: &str) -> Result<(), StoreError> {
+        self.store_delete_snapshot(snapshot_id)
     }
 }
 

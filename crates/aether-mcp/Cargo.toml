@@ -7,7 +7,7 @@ authors.workspace = true
 
 [features]
 default = []
-verification = ["dep:aetherd"]
+verification = []
 
 [dependencies]
 aether-analysis = { path = "../aether-analysis" }
@@ -16,7 +16,7 @@ aether-core = { path = "../aether-core" }
 aether-graph-algo = { path = "../aether-graph-algo" }
 aether-health = { path = "../aether-health" }
 aether-memory = { path = "../aether-memory" }
-aetherd = { path = "../aetherd", optional = true }
+aetherd = { path = "../aetherd" }
 aether-infer = { path = "../aether-infer" }
 aether-parse = { path = "../aether-parse" }
 aether-sir = { path = "../aether-sir" }
