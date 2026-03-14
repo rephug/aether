@@ -41,6 +41,7 @@ impl InferenceProvider for HashingMockProvider {
             dependencies: Vec::new(),
             error_modes: Vec::new(),
             confidence: 1.0,
+            method_dependencies: None,
         })
     }
 }
@@ -82,6 +83,7 @@ impl InferenceProvider for RollupUnionMockProvider {
             dependencies: Vec::new(),
             error_modes: Vec::new(),
             confidence: 0.9,
+            method_dependencies: None,
         })
     }
 }
@@ -134,6 +136,7 @@ fn prompt_tracking_sir(context: &SirContext) -> SirAnnotation {
         dependencies: Vec::new(),
         error_modes: Vec::new(),
         confidence: 0.95,
+        method_dependencies: None,
     }
 }
 

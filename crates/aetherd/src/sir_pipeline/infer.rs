@@ -41,8 +41,8 @@ pub(super) struct FailedSirGeneration {
 
 #[derive(Debug)]
 pub(super) enum SirGenerationOutcome {
-    Success(GeneratedSir),
-    Failure(FailedSirGeneration),
+    Success(Box<GeneratedSir>),
+    Failure(Box<FailedSirGeneration>),
 }
 
 pub(super) fn build_job(
@@ -181,10 +181,10 @@ pub(super) async fn generate_sir_jobs(
             let _permit = match permit {
                 Ok(permit) => permit,
                 Err(_) => {
-                    return SirGenerationOutcome::Failure(FailedSirGeneration {
+                    return SirGenerationOutcome::Failure(Box::new(FailedSirGeneration {
                         symbol,
                         error_message: "inference semaphore closed".to_owned(),
-                    });
+                    }));
                 }
             };
 
@@ -211,12 +211,12 @@ pub(super) async fn generate_sir_jobs(
             };
 
             match generated {
-                Ok(result) => SirGenerationOutcome::Success(GeneratedSir {
+                Ok(result) => SirGenerationOutcome::Success(Box::new(GeneratedSir {
                     symbol,
                     sir: result.sir,
                     provider_name: result.provider,
                     model_name: result.model,
-                }),
+                })),
                 Err(err)
                     if is_parse_validation_exhausted_error(&err)
                         && tiered_parse_fallback_provider.is_some() =>
@@ -261,22 +261,24 @@ pub(super) async fn generate_sir_jobs(
                     };
 
                     match fallback_generated {
-                        Ok(result) => SirGenerationOutcome::Success(GeneratedSir {
+                        Ok(result) => SirGenerationOutcome::Success(Box::new(GeneratedSir {
                             symbol,
                             sir: result.sir,
                             provider_name: result.provider,
                             model_name: result.model,
-                        }),
-                        Err(fallback_err) => SirGenerationOutcome::Failure(FailedSirGeneration {
+                        })),
+                        Err(fallback_err) => {
+                            SirGenerationOutcome::Failure(Box::new(FailedSirGeneration {
                             symbol,
                             error_message: format!("{fallback_err:#}"),
-                        }),
+                            }))
+                        }
                     }
                 }
-                Err(err) => SirGenerationOutcome::Failure(FailedSirGeneration {
+                Err(err) => SirGenerationOutcome::Failure(Box::new(FailedSirGeneration {
                     symbol,
                     error_message: format!("{err:#}"),
-                }),
+                })),
             }
         });
     }

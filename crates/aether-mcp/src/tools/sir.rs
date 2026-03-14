@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -123,6 +124,7 @@ pub struct SirAnnotationView {
     pub dependencies: Vec<String>,
     pub error_modes: Vec<String>,
     pub confidence: f32,
+    pub method_dependencies: Option<HashMap<String, Vec<String>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -146,6 +148,7 @@ impl From<aether_sir::SirAnnotation> for SirAnnotationView {
             dependencies: value.dependencies,
             error_modes: value.error_modes,
             confidence: value.confidence,
+            method_dependencies: value.method_dependencies,
         }
     }
 }

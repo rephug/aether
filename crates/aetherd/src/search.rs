@@ -819,6 +819,7 @@ mod tests {
                 dependencies: Vec::new(),
                 error_modes: Vec::new(),
                 confidence: 0.9,
+                method_dependencies: None,
             })
         }
     }

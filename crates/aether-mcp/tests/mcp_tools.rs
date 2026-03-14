@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -181,6 +181,7 @@ fn run_index_and_seed_sir(workspace: &Path) -> Result<()> {
             dependencies: Vec::new(),
             error_modes: Vec::new(),
             confidence: 0.9,
+            method_dependencies: None,
         };
         let sir_json = serde_json::to_string(&sir)?;
         let hash = sir_hash(&sir);
@@ -435,6 +436,7 @@ vector_backend = "sqlite"
     assert_eq!(sir.level, SirLevelRequest::Leaf);
     let sir_annotation = sir.sir.expect("sir should be present");
     assert!(sir_annotation.intent.contains("Mock summary for"));
+    assert_eq!(sir_annotation.method_dependencies, None);
     assert_eq!(sir.sir_status.as_deref(), Some("fresh"));
     assert_eq!(sir.last_error, None);
     assert!(sir.last_attempt_at.unwrap_or_default() > 0);
@@ -507,6 +509,65 @@ vector_backend = "sqlite"
         .0;
     assert!(sir_without_mirror.found);
     assert!(!sir_without_mirror.sir_json.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn mcp_get_sir_returns_method_dependencies_when_present() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    write_test_config(workspace);
+    fs::create_dir_all(workspace.join("src"))?;
+    fs::write(workspace.join("src/lib.rs"), "fn alpha() -> i32 { 1 }\n")?;
+
+    run_index_and_seed_sir(workspace)?;
+
+    let store = SqliteStore::open(workspace)?;
+    let symbol = store
+        .list_symbols_for_file("src/lib.rs")?
+        .into_iter()
+        .find(|symbol| symbol.qualified_name == "alpha")
+        .expect("alpha symbol should exist");
+
+    let sir = SirAnnotation {
+        intent: "Mock summary for alpha".to_owned(),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        side_effects: Vec::new(),
+        dependencies: vec!["StoreError".to_owned(), "SymbolRecord".to_owned()],
+        error_modes: Vec::new(),
+        confidence: 0.9,
+        method_dependencies: Some(HashMap::from([(
+            "load".to_owned(),
+            vec!["StoreError".to_owned(), "SymbolRecord".to_owned()],
+        )])),
+    };
+    store.write_sir_blob(symbol.id.as_str(), serde_json::to_string(&sir)?.as_str())?;
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+    let response = rt
+        .block_on(server.aether_get_sir(Parameters(AetherGetSirRequest {
+            level: None,
+            symbol_id: Some(symbol.id.clone()),
+            file_path: None,
+            module_path: None,
+            language: None,
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+
+    let method_dependencies = response
+        .sir
+        .expect("sir should be present")
+        .method_dependencies
+        .expect("method dependencies should be present");
+    assert_eq!(
+        method_dependencies.get("load"),
+        Some(&vec!["StoreError".to_owned(), "SymbolRecord".to_owned()])
+    );
+    assert!(response.sir_json.contains("\"method_dependencies\""));
 
     Ok(())
 }
