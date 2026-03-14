@@ -11,11 +11,12 @@ use super::{
     AetherHealthHotspotsRequest, AetherHealthRequest, AetherHealthResponse, AetherMcpServer,
     AetherRecallRequest, AetherRecallResponse, AetherRememberRequest, AetherRememberResponse,
     AetherSearchRequest, AetherSearchResponse, AetherSessionNoteResponse, AetherStatusResponse,
-    AetherSymbolLookupRequest, AetherSymbolLookupResponse, AetherSymbolTimelineRequest,
-    AetherSymbolTimelineResponse, AetherTestIntentsRequest, AetherTestIntentsResponse,
-    AetherTextResponse, AetherTraceCauseRequest, AetherTraceCauseResponse,
-    AetherUsageMatrixRequest, AetherUsageMatrixResponse, AetherWhyChangedRequest,
-    AetherWhyChangedResponse, SERVER_DESCRIPTION, SERVER_NAME, SERVER_VERSION,
+    AetherSuggestTraitSplitRequest, AetherSuggestTraitSplitResponse, AetherSymbolLookupRequest,
+    AetherSymbolLookupResponse, AetherSymbolTimelineRequest, AetherSymbolTimelineResponse,
+    AetherTestIntentsRequest, AetherTestIntentsResponse, AetherTextResponse,
+    AetherTraceCauseRequest, AetherTraceCauseResponse, AetherUsageMatrixRequest,
+    AetherUsageMatrixResponse, AetherWhyChangedRequest, AetherWhyChangedResponse,
+    SERVER_DESCRIPTION, SERVER_NAME, SERVER_VERSION,
 };
 #[cfg(feature = "verification")]
 use super::{AetherVerifyRequest, AetherVerifyResponse};
@@ -81,6 +82,23 @@ impl AetherMcpServer {
         self.verbose_log("MCP tool called: aether_usage_matrix");
         let server = self.clone();
         tokio::task::spawn_blocking(move || server.aether_usage_matrix_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_suggest_trait_split",
+        description = "Suggest how to decompose a large trait into smaller sub-traits based on consumer usage patterns"
+    )]
+    pub async fn aether_suggest_trait_split(
+        &self,
+        Parameters(request): Parameters<AetherSuggestTraitSplitRequest>,
+    ) -> Result<Json<AetherSuggestTraitSplitResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_suggest_trait_split");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_suggest_trait_split_logic(request))
             .await
             .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)

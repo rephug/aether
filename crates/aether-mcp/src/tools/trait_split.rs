@@ -1,0 +1,181 @@
+use aether_health::{
+    ConsumerMethodUsage, CrossCuttingMethod, SplitConfidence, SuggestedSubTrait, TraitMethod,
+    TraitSplitSuggestion, suggest_trait_split,
+};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use super::{AetherMcpServer, MEMORY_SCHEMA_VERSION, symbol_leaf_name};
+use crate::AetherMcpError;
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherSuggestTraitSplitRequest {
+    pub trait_name: String,
+    pub file: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherSuggestTraitSplitResponse {
+    pub schema_version: String,
+    pub suggestion: Option<AetherTraitSplitSuggestion>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AetherSplitConfidence {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherTraitSplitSuggestion {
+    pub trait_name: String,
+    pub trait_file: String,
+    pub method_count: usize,
+    pub suggested_traits: Vec<AetherSuggestedSubTrait>,
+    pub cross_cutting_methods: Vec<AetherCrossCuttingMethod>,
+    pub uncalled_methods: Vec<String>,
+    pub confidence: AetherSplitConfidence,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherSuggestedSubTrait {
+    pub name: String,
+    pub methods: Vec<String>,
+    pub consumer_files: Vec<String>,
+    pub consumer_isolation: f32,
+    pub dominant_dependencies: Vec<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherCrossCuttingMethod {
+    pub method: String,
+    pub overlapping_clusters: Vec<String>,
+    pub reason: String,
+}
+
+impl AetherMcpServer {
+    pub fn aether_suggest_trait_split_logic(
+        &self,
+        request: AetherSuggestTraitSplitRequest,
+    ) -> Result<AetherSuggestTraitSplitResponse, AetherMcpError> {
+        let trait_name = request.trait_name.trim();
+        if trait_name.is_empty() {
+            return Err(AetherMcpError::Message(
+                "trait_name must not be empty".to_owned(),
+            ));
+        }
+
+        let file_filter = self.normalize_usage_matrix_file(request.file.as_deref())?;
+        let target = self.resolve_usage_matrix_target(
+            trait_name,
+            None,
+            file_filter.as_deref(),
+            Some("trait"),
+        )?;
+
+        let store = self.state.store.as_ref();
+        let Some(target_record) = store.get_symbol_record(target.symbol_id.as_str())? else {
+            return Err(AetherMcpError::Message(format!(
+                "trait '{}' could not be resolved after selection",
+                target.symbol_id
+            )));
+        };
+
+        let data = self.build_usage_matrix_data(store, &target_record)?;
+        let methods = data
+            .child_methods
+            .iter()
+            .map(|method| TraitMethod {
+                name: symbol_leaf_name(method.qualified_name.as_str()).to_owned(),
+                qualified_name: method.qualified_name.clone(),
+                symbol_id: method.id.clone(),
+            })
+            .collect::<Vec<_>>();
+        let consumer_matrix = data
+            .matrix
+            .iter()
+            .map(|row| ConsumerMethodUsage {
+                consumer_file: row.consumer_file.clone(),
+                methods_used: row.methods_used.clone(),
+            })
+            .collect::<Vec<_>>();
+        let method_dependencies = self
+            .read_valid_sir_blob(target_record.id.as_str())?
+            .and_then(|sir| sir.method_dependencies);
+
+        let suggestion = suggest_trait_split(
+            symbol_leaf_name(target_record.qualified_name.as_str()),
+            target_record.file_path.as_str(),
+            methods.as_slice(),
+            consumer_matrix.as_slice(),
+            method_dependencies.as_ref(),
+        );
+
+        let message = if suggestion.is_none() {
+            Some("no actionable trait split suggestion was produced".to_owned())
+        } else {
+            None
+        };
+
+        Ok(AetherSuggestTraitSplitResponse {
+            schema_version: MEMORY_SCHEMA_VERSION.to_owned(),
+            suggestion: suggestion.map(Into::into),
+            message,
+        })
+    }
+}
+
+impl From<SplitConfidence> for AetherSplitConfidence {
+    fn from(value: SplitConfidence) -> Self {
+        match value {
+            SplitConfidence::High => Self::High,
+            SplitConfidence::Medium => Self::Medium,
+            SplitConfidence::Low => Self::Low,
+        }
+    }
+}
+
+impl From<TraitSplitSuggestion> for AetherTraitSplitSuggestion {
+    fn from(value: TraitSplitSuggestion) -> Self {
+        Self {
+            trait_name: value.trait_name,
+            trait_file: value.trait_file,
+            method_count: value.method_count,
+            suggested_traits: value.suggested_traits.into_iter().map(Into::into).collect(),
+            cross_cutting_methods: value
+                .cross_cutting_methods
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            uncalled_methods: value.uncalled_methods,
+            confidence: value.confidence.into(),
+        }
+    }
+}
+
+impl From<SuggestedSubTrait> for AetherSuggestedSubTrait {
+    fn from(value: SuggestedSubTrait) -> Self {
+        Self {
+            name: value.name,
+            methods: value.methods,
+            consumer_files: value.consumer_files,
+            consumer_isolation: value.consumer_isolation,
+            dominant_dependencies: value.dominant_dependencies,
+            reason: value.reason,
+        }
+    }
+}
+
+impl From<CrossCuttingMethod> for AetherCrossCuttingMethod {
+    fn from(value: CrossCuttingMethod) -> Self {
+        Self {
+            method: value.method,
+            overlapping_clusters: value.overlapping_clusters,
+            reason: value.reason,
+        }
+    }
+}

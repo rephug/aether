@@ -9,16 +9,16 @@ use aether_config::{
 };
 use aether_core::{
     EdgeKind, SEARCH_FALLBACK_EMBEDDINGS_DISABLED, SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY,
-    SearchMode,
+    SearchMode, SymbolEdge,
 };
 use aether_mcp::{
     AetherBlastRadiusRequest, AetherCallChainRequest, AetherDependenciesRequest,
     AetherExplainRequest, AetherGetSirRequest, AetherHealthExplainRequest,
     AetherHealthHotspotsRequest, AetherHealthRequest, AetherMcpServer, AetherRecallRequest,
-    AetherRememberRequest, AetherSearchRequest, AetherSymbolLookupRequest,
-    AetherSymbolTimelineRequest, AetherTestIntentsRequest, AetherUsageMatrixRequest,
-    AetherWhyChangedReason, AetherWhyChangedRequest, AetherWhySelectorMode, MCP_SCHEMA_VERSION,
-    MEMORY_SCHEMA_VERSION, SharedState, SirLevelRequest,
+    AetherRememberRequest, AetherSearchRequest, AetherSuggestTraitSplitRequest,
+    AetherSymbolLookupRequest, AetherSymbolTimelineRequest, AetherTestIntentsRequest,
+    AetherUsageMatrixRequest, AetherWhyChangedReason, AetherWhyChangedRequest,
+    AetherWhySelectorMode, MCP_SCHEMA_VERSION, MEMORY_SCHEMA_VERSION, SharedState, SirLevelRequest,
 };
 #[cfg(feature = "verification")]
 use aether_mcp::{AetherVerifyMode, AetherVerifyRequest};
@@ -132,6 +132,23 @@ fn embedding_record(symbol_id: &str, embedding: Vec<f32>) -> SymbolEmbeddingReco
         model: "qwen3-embeddings-4B".to_owned(),
         embedding,
         updated_at: now_millis(),
+    }
+}
+
+fn custom_symbol_record(
+    id: &str,
+    qualified_name: &str,
+    file_path: &str,
+    kind: &str,
+) -> SymbolRecord {
+    SymbolRecord {
+        id: id.to_owned(),
+        file_path: file_path.to_owned(),
+        language: "rust".to_owned(),
+        kind: kind.to_owned(),
+        qualified_name: qualified_name.to_owned(),
+        signature_fingerprint: format!("sig-{id}"),
+        last_seen_at: now_millis(),
     }
 }
 
@@ -1103,6 +1120,138 @@ fn mcp_usage_matrix_reports_consumers_clusters_and_uncalled_methods() -> Result<
     assert_eq!(by_id.target, "ExampleStore");
     assert_eq!(by_id.target_file, "src/store.rs");
     assert_eq!(by_id.method_count, 4);
+
+    Ok(())
+}
+
+#[test]
+fn mcp_suggest_trait_split_returns_clusters() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    write_test_config(workspace);
+
+    let store = SqliteStore::open(workspace)?;
+    for symbol in [
+        custom_symbol_record(
+            "trait-example-store",
+            "ExampleStore",
+            "src/store.rs",
+            "trait",
+        ),
+        custom_symbol_record(
+            "trait-method-alpha",
+            "ExampleStore::alpha",
+            "src/store.rs",
+            "method",
+        ),
+        custom_symbol_record(
+            "trait-method-beta",
+            "ExampleStore::beta",
+            "src/store.rs",
+            "method",
+        ),
+        custom_symbol_record(
+            "trait-method-gamma",
+            "ExampleStore::gamma",
+            "src/store.rs",
+            "method",
+        ),
+        custom_symbol_record(
+            "trait-method-delta",
+            "ExampleStore::delta",
+            "src/store.rs",
+            "method",
+        ),
+        custom_symbol_record("consumer-a", "run_a", "src/consumer_a.rs", "function"),
+        custom_symbol_record("consumer-b", "run_b", "src/consumer_b.rs", "function"),
+    ] {
+        store.upsert_symbol(symbol)?;
+    }
+
+    store.upsert_edges(&[
+        SymbolEdge {
+            source_id: "consumer-a".to_owned(),
+            target_qualified_name: "alpha".to_owned(),
+            edge_kind: EdgeKind::Calls,
+            file_path: "src/consumer_a.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "consumer-a".to_owned(),
+            target_qualified_name: "beta".to_owned(),
+            edge_kind: EdgeKind::Calls,
+            file_path: "src/consumer_a.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "consumer-b".to_owned(),
+            target_qualified_name: "gamma".to_owned(),
+            edge_kind: EdgeKind::Calls,
+            file_path: "src/consumer_b.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "consumer-b".to_owned(),
+            target_qualified_name: "delta".to_owned(),
+            edge_kind: EdgeKind::Calls,
+            file_path: "src/consumer_b.rs".to_owned(),
+        },
+    ])?;
+
+    let trait_sir = SirAnnotation {
+        intent: "Mock summary for ExampleStore".to_owned(),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        side_effects: Vec::new(),
+        dependencies: Vec::new(),
+        error_modes: Vec::new(),
+        confidence: 0.9,
+        method_dependencies: Some(HashMap::from([
+            (
+                "alpha".to_owned(),
+                vec!["SirMetaRecord".to_owned(), "SirBlob".to_owned()],
+            ),
+            (
+                "beta".to_owned(),
+                vec!["SirMetaRecord".to_owned(), "SirBlob".to_owned()],
+            ),
+            ("gamma".to_owned(), vec!["SymbolRecord".to_owned()]),
+            ("delta".to_owned(), vec!["SymbolRecord".to_owned()]),
+        ])),
+    };
+    store.write_sir_blob(
+        "trait-example-store",
+        serde_json::to_string(&trait_sir)?.as_str(),
+    )?;
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+    let response = rt
+        .block_on(
+            server.aether_suggest_trait_split(Parameters(AetherSuggestTraitSplitRequest {
+                trait_name: "ExampleStore".to_owned(),
+                file: Some("src/store.rs".to_owned()),
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+
+    assert_eq!(response.schema_version, MEMORY_SCHEMA_VERSION);
+    assert_eq!(response.message, None);
+    let suggestion = response.suggestion.expect("trait split suggestion");
+    assert_eq!(suggestion.trait_name, "ExampleStore");
+    assert_eq!(suggestion.trait_file, "src/store.rs");
+    assert_eq!(suggestion.method_count, 4);
+    assert_eq!(suggestion.suggested_traits.len(), 2);
+    assert!(
+        suggestion
+            .suggested_traits
+            .iter()
+            .any(|cluster| cluster.methods == vec!["alpha".to_owned(), "beta".to_owned()])
+    );
+    assert!(
+        suggestion
+            .suggested_traits
+            .iter()
+            .any(|cluster| cluster.methods == vec!["delta".to_owned(), "gamma".to_owned()])
+    );
 
     Ok(())
 }

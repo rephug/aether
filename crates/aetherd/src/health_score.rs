@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aether_analysis::HealthAnalyzer;
 use aether_config::{AetherConfig, GraphBackend};
@@ -10,19 +11,21 @@ use aether_health::history::{
     create_table_if_needed, read_latest_report, read_report_by_commit_prefix, write_score,
 };
 use aether_health::{
-    FileCommunityConfig, FileSymbol, PlannerDiagnostics, ScoreReport, SemanticFileInput,
-    SemanticInput, SplitSuggestion, compare_reports, compute_workspace_score,
-    compute_workspace_score_filtered, compute_workspace_score_with_signals,
-    detect_file_communities, format_compare_json, format_compare_table, format_json, format_table,
-    suggest_split,
+    ConsumerMethodUsage, FileCommunityConfig, FileSymbol, PlannerDiagnostics, ScoreReport,
+    SemanticFileInput, SemanticInput, SplitSuggestion, TraitMethod, TraitSplitSuggestion,
+    compare_reports, compute_workspace_score, compute_workspace_score_filtered,
+    compute_workspace_score_with_signals, detect_file_communities, format_compare_json,
+    format_compare_table, format_json, format_table, suggest_split, suggest_trait_split,
 };
 use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
+use aether_sir::{SirAnnotation, validate_sir};
 use aether_store::{
     DriftStore, SirStateStore, SqliteStore, SurrealGraphStore, SymbolCatalogStore, SymbolRecord,
-    TestIntentStore, VectorStore, open_vector_store,
+    SymbolRelationStore, TestIntentStore, VectorStore, open_vector_store,
 };
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
+use walkdir::WalkDir;
 
 use crate::cli::{HealthScoreArgs, HealthScoreOutputFormat};
 
@@ -41,6 +44,14 @@ struct SplitSuggestionEntry {
     message: Option<String>,
     suggestion: Option<SplitSuggestion>,
     diagnostics: Option<PlannerDiagnostics>,
+}
+
+#[derive(Debug, Clone)]
+struct TraitSplitSuggestionEntry {
+    crate_name: String,
+    status: String,
+    message: Option<String>,
+    suggestion: Option<TraitSplitSuggestion>,
 }
 
 pub fn run_health_score_command(
@@ -91,6 +102,13 @@ pub fn execute_health_score_command(
     } else {
         None
     };
+    let trait_split_suggestions = if args.suggest_splits && compare_baseline.is_none() {
+        Some(collect_trait_split_suggestion_entries(
+            workspace, config, &report,
+        ))
+    } else {
+        None
+    };
 
     let mut rendered = if let Some(before) = compare_baseline.as_ref() {
         let compare = compare_reports(before, &report);
@@ -102,8 +120,12 @@ pub fn execute_health_score_command(
         match args.output {
             HealthScoreOutputFormat::Table => format_table(&report),
             HealthScoreOutputFormat::Json => {
-                if let Some(entries) = split_suggestions.as_deref() {
-                    render_health_report_json(&report, entries)
+                if split_suggestions.is_some() || trait_split_suggestions.is_some() {
+                    render_health_report_json(
+                        &report,
+                        split_suggestions.as_deref().unwrap_or(&[]),
+                        trait_split_suggestions.as_deref().unwrap_or(&[]),
+                    )
                 } else {
                     format_json(&report)
                 }
@@ -111,13 +133,19 @@ pub fn execute_health_score_command(
         }
     };
 
-    if args.suggest_splits
-        && matches!(args.output, HealthScoreOutputFormat::Table)
-        && let Some(entries) = split_suggestions.as_deref()
-        && let Some(section) = render_split_suggestions(entries)
-    {
-        rendered.push_str("\n\n");
-        rendered.push_str(&section);
+    if args.suggest_splits && matches!(args.output, HealthScoreOutputFormat::Table) {
+        if let Some(entries) = split_suggestions.as_deref()
+            && let Some(section) = render_split_suggestions(entries)
+        {
+            rendered.push_str("\n\n");
+            rendered.push_str(&section);
+        }
+        if let Some(entries) = trait_split_suggestions.as_deref()
+            && let Some(section) = render_trait_split_suggestions(entries)
+        {
+            rendered.push_str("\n\n");
+            rendered.push_str(&section);
+        }
     }
 
     if history_allowed {
@@ -225,7 +253,11 @@ fn open_history_connection(workspace: &Path) -> Result<Option<Connection>> {
     Ok(Some(conn))
 }
 
-fn render_health_report_json(report: &ScoreReport, entries: &[SplitSuggestionEntry]) -> String {
+fn render_health_report_json(
+    report: &ScoreReport,
+    entries: &[SplitSuggestionEntry],
+    trait_entries: &[TraitSplitSuggestionEntry],
+) -> String {
     let mut value = match serde_json::to_value(report) {
         Ok(value) => value,
         Err(err) => {
@@ -242,6 +274,15 @@ fn render_health_report_json(report: &ScoreReport, entries: &[SplitSuggestionEnt
             entries
                 .iter()
                 .map(split_entry_to_json_value)
+                .collect::<Vec<_>>(),
+        ),
+    );
+    object.insert(
+        "trait_split_suggestions".to_owned(),
+        serde_json::Value::Array(
+            trait_entries
+                .iter()
+                .map(trait_split_entry_to_json_value)
                 .collect::<Vec<_>>(),
         ),
     );
@@ -278,6 +319,30 @@ fn split_entry_to_json_value(entry: &SplitSuggestionEntry) -> serde_json::Value 
         && let Ok(value) = serde_json::to_value(diagnostics)
     {
         object.insert("diagnostics".to_owned(), value);
+    }
+    serde_json::Value::Object(object)
+}
+
+fn trait_split_entry_to_json_value(entry: &TraitSplitSuggestionEntry) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    object.insert(
+        "crate_name".to_owned(),
+        serde_json::Value::String(entry.crate_name.clone()),
+    );
+    object.insert(
+        "status".to_owned(),
+        serde_json::Value::String(entry.status.clone()),
+    );
+    if let Some(message) = entry.message.as_ref() {
+        object.insert(
+            "message".to_owned(),
+            serde_json::Value::String(message.clone()),
+        );
+    }
+    if let Some(suggestion) = entry.suggestion.as_ref()
+        && let Ok(value) = serde_json::to_value(suggestion)
+    {
+        object.insert("suggestion".to_owned(), value);
     }
     serde_json::Value::Object(object)
 }
@@ -496,6 +561,399 @@ fn collect_split_suggestion_entries(
         .collect()
 }
 
+fn collect_trait_split_suggestion_entries(
+    workspace: &Path,
+    config: &AetherConfig,
+    report: &ScoreReport,
+) -> Vec<TraitSplitSuggestionEntry> {
+    let qualifying = report
+        .crates
+        .iter()
+        .filter(|crate_score| {
+            crate_score.metrics.trait_method_max >= config.health_score.trait_method_warn
+        })
+        .collect::<Vec<_>>();
+    if qualifying.is_empty() {
+        return Vec::new();
+    }
+
+    let store = match SqliteStore::open_readonly(workspace) {
+        Ok(store) => store,
+        Err(_) => {
+            return qualifying
+                .into_iter()
+                .map(|crate_score| {
+                    trait_split_entry(
+                        crate_score.name.clone(),
+                        "unavailable",
+                        Some("workspace index is not readable".to_owned()),
+                        None,
+                    )
+                })
+                .collect();
+        }
+    };
+
+    let mut entries = Vec::new();
+    for crate_score in qualifying {
+        entries.extend(build_trait_split_entries_for_crate(
+            workspace,
+            config,
+            crate_score,
+            &store,
+        ));
+    }
+    entries
+}
+
+fn build_trait_split_entries_for_crate(
+    workspace: &Path,
+    config: &AetherConfig,
+    crate_score: &aether_health::CrateScore,
+    store: &SqliteStore,
+) -> Vec<TraitSplitSuggestionEntry> {
+    let crate_root = match find_crate_root_by_name(workspace, crate_score.name.as_str()) {
+        Ok(Some(crate_root)) => crate_root,
+        Ok(None) => {
+            return vec![trait_split_entry(
+                crate_score.name.clone(),
+                "unavailable",
+                Some("crate root could not be resolved".to_owned()),
+                None,
+            )];
+        }
+        Err(err) => {
+            return vec![trait_split_entry(
+                crate_score.name.clone(),
+                "unavailable",
+                Some(format!("failed to resolve crate root: {err}")),
+                None,
+            )];
+        }
+    };
+
+    let trait_symbols = match list_trait_symbols_for_crate(workspace, &crate_root, store) {
+        Ok(symbols) => symbols,
+        Err(err) => {
+            return vec![trait_split_entry(
+                crate_score.name.clone(),
+                "unavailable",
+                Some(format!("failed to load trait symbols: {err}")),
+                None,
+            )];
+        }
+    };
+
+    let mut entries = Vec::new();
+    for trait_symbol in trait_symbols {
+        let child_methods = match child_methods_for_trait(store, &trait_symbol) {
+            Ok(methods) => methods,
+            Err(err) => {
+                entries.push(trait_split_entry(
+                    crate_score.name.clone(),
+                    "unavailable",
+                    Some(format!(
+                        "failed to load methods for {}: {err}",
+                        trait_symbol.qualified_name
+                    )),
+                    None,
+                ));
+                continue;
+            }
+        };
+        if child_methods.len() < config.health_score.trait_method_warn {
+            continue;
+        }
+
+        let consumer_matrix = match build_trait_consumer_matrix(store, child_methods.as_slice()) {
+            Ok(matrix) => matrix,
+            Err(err) => {
+                entries.push(trait_split_entry(
+                    crate_score.name.clone(),
+                    "unavailable",
+                    Some(format!(
+                        "failed to build consumer matrix for {}: {err}",
+                        trait_symbol.qualified_name
+                    )),
+                    None,
+                ));
+                continue;
+            }
+        };
+        let trait_methods = child_methods
+            .iter()
+            .map(|method| TraitMethod {
+                name: symbol_leaf_name(method.qualified_name.as_str()).to_owned(),
+                qualified_name: method.qualified_name.clone(),
+                symbol_id: method.id.clone(),
+            })
+            .collect::<Vec<_>>();
+        let method_dependencies = match read_valid_trait_sir(store, trait_symbol.id.as_str()) {
+            Ok(sir) => sir.and_then(|sir| sir.method_dependencies),
+            Err(err) => {
+                entries.push(trait_split_entry(
+                    crate_score.name.clone(),
+                    "unavailable",
+                    Some(format!(
+                        "failed to read SIR for {}: {err}",
+                        trait_symbol.qualified_name
+                    )),
+                    None,
+                ));
+                continue;
+            }
+        };
+
+        let suggestion = suggest_trait_split(
+            symbol_leaf_name(trait_symbol.qualified_name.as_str()),
+            trait_symbol.file_path.as_str(),
+            trait_methods.as_slice(),
+            consumer_matrix.as_slice(),
+            method_dependencies.as_ref(),
+        );
+        let message = if suggestion.is_none() {
+            Some("no actionable trait split suggestion was produced".to_owned())
+        } else {
+            None
+        };
+        entries.push(trait_split_entry(
+            crate_score.name.clone(),
+            if suggestion.is_some() {
+                "suggested"
+            } else {
+                "no_split"
+            },
+            message,
+            suggestion,
+        ));
+    }
+
+    if entries.is_empty() {
+        vec![trait_split_entry(
+            crate_score.name.clone(),
+            "no_split",
+            Some("no indexed traits matched the split threshold".to_owned()),
+            None,
+        )]
+    } else {
+        entries
+    }
+}
+
+fn find_crate_root_by_name(workspace: &Path, crate_name: &str) -> Result<Option<PathBuf>> {
+    for entry in WalkDir::new(workspace)
+        .into_iter()
+        .filter_entry(|entry| !is_ignored_walk_path(entry.path()))
+    {
+        let entry = entry?;
+        if !entry.file_type().is_file() || entry.file_name() != "Cargo.toml" {
+            continue;
+        }
+
+        let content = fs::read_to_string(entry.path())
+            .with_context(|| format!("failed to read {}", entry.path().display()))?;
+        if cargo_package_name(content.as_str()).as_deref() == Some(crate_name) {
+            return Ok(entry.path().parent().map(Path::to_path_buf));
+        }
+    }
+
+    Ok(None)
+}
+
+fn cargo_package_name(content: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_package = trimmed == "[package]";
+            continue;
+        }
+        if !in_package || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "name" {
+            continue;
+        }
+        return Some(value.trim().trim_matches('"').to_owned());
+    }
+    None
+}
+
+fn is_ignored_walk_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component.as_os_str().to_str(),
+            Some(".git") | Some(".aether") | Some("target")
+        )
+    })
+}
+
+fn list_trait_symbols_for_crate(
+    workspace: &Path,
+    crate_root: &Path,
+    store: &SqliteStore,
+) -> Result<Vec<SymbolRecord>> {
+    let src_root = crate_root.join("src");
+    if !src_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut symbols = Vec::new();
+    for entry in WalkDir::new(&src_root)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        if !entry.file_type().is_file()
+            || entry.path().extension().and_then(|value| value.to_str()) != Some("rs")
+        {
+            continue;
+        }
+
+        let Some(relative_path) = workspace_relative_path(workspace, entry.path()) else {
+            continue;
+        };
+        let mut file_symbols = store
+            .list_symbols_for_file(relative_path.as_str())
+            .with_context(|| format!("failed to load symbols for {relative_path}"))?
+            .into_iter()
+            .filter(|symbol| symbol.kind == "trait")
+            .collect::<Vec<_>>();
+        symbols.append(&mut file_symbols);
+    }
+
+    symbols.sort_by(|left, right| {
+        left.file_path
+            .cmp(&right.file_path)
+            .then_with(|| left.qualified_name.cmp(&right.qualified_name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    symbols.dedup_by(|left, right| left.id == right.id);
+    Ok(symbols)
+}
+
+fn workspace_relative_path(workspace: &Path, path: &Path) -> Option<String> {
+    path.strip_prefix(workspace)
+        .ok()
+        .map(|relative| normalize_path(&relative.to_string_lossy()))
+}
+
+fn child_methods_for_trait(
+    store: &SqliteStore,
+    trait_symbol: &SymbolRecord,
+) -> Result<Vec<SymbolRecord>> {
+    let prefix = format!("{}::", trait_symbol.qualified_name);
+    let mut methods = store
+        .list_symbols_for_file(trait_symbol.file_path.as_str())?
+        .into_iter()
+        .filter(|candidate| {
+            candidate.qualified_name.starts_with(prefix.as_str())
+                && matches!(candidate.kind.as_str(), "function" | "method")
+        })
+        .collect::<Vec<_>>();
+    methods.sort_by(|left, right| {
+        left.qualified_name
+            .cmp(&right.qualified_name)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(methods)
+}
+
+fn build_trait_consumer_matrix(
+    store: &SqliteStore,
+    child_methods: &[SymbolRecord],
+) -> Result<Vec<ConsumerMethodUsage>> {
+    let mut method_edges = HashMap::<String, Vec<(String, String)>>::new();
+    let mut caller_symbol_ids = HashSet::<String>::new();
+
+    for method in child_methods {
+        let method_name = symbol_leaf_name(method.qualified_name.as_str()).to_owned();
+        let mut seen_source_ids = HashSet::<String>::new();
+        let mut edges = Vec::new();
+
+        for edge in store.get_callers(method.qualified_name.as_str())? {
+            if !seen_source_ids.insert(edge.source_id.clone()) {
+                continue;
+            }
+            caller_symbol_ids.insert(edge.source_id.clone());
+            edges.push((edge.source_id, edge.file_path));
+        }
+
+        if method_name != method.qualified_name {
+            for edge in store.get_callers(method_name.as_str())? {
+                if !seen_source_ids.insert(edge.source_id.clone()) {
+                    continue;
+                }
+                caller_symbol_ids.insert(edge.source_id.clone());
+                edges.push((edge.source_id, edge.file_path));
+            }
+        }
+
+        method_edges.insert(method_name, edges);
+    }
+
+    let caller_symbol_ids = caller_symbol_ids.into_iter().collect::<Vec<_>>();
+    let caller_records = store.get_symbol_search_results_batch(caller_symbol_ids.as_slice())?;
+    let mut method_to_consumers = HashMap::<String, HashSet<String>>::new();
+    for method in child_methods {
+        let method_name = symbol_leaf_name(method.qualified_name.as_str()).to_owned();
+        let consumers = method_to_consumers.entry(method_name.clone()).or_default();
+        for (source_id, fallback_file) in
+            method_edges.get(method_name.as_str()).into_iter().flatten()
+        {
+            let consumer_file = caller_records
+                .get(source_id)
+                .map(|record| record.file_path.clone())
+                .unwrap_or_else(|| fallback_file.clone());
+            if !consumer_file.trim().is_empty() {
+                consumers.insert(consumer_file);
+            }
+        }
+    }
+
+    let mut consumer_to_methods = HashMap::<String, HashSet<String>>::new();
+    for (method_name, consumer_files) in &method_to_consumers {
+        for consumer_file in consumer_files {
+            consumer_to_methods
+                .entry(consumer_file.clone())
+                .or_default()
+                .insert(method_name.clone());
+        }
+    }
+
+    let mut matrix = consumer_to_methods
+        .into_iter()
+        .map(|(consumer_file, methods_used)| {
+            let mut methods_used = methods_used.into_iter().collect::<Vec<_>>();
+            methods_used.sort();
+            ConsumerMethodUsage {
+                consumer_file,
+                methods_used,
+            }
+        })
+        .collect::<Vec<_>>();
+    matrix.sort_by(|left, right| {
+        right
+            .methods_used
+            .len()
+            .cmp(&left.methods_used.len())
+            .then_with(|| left.consumer_file.cmp(&right.consumer_file))
+    });
+    Ok(matrix)
+}
+
+fn read_valid_trait_sir(store: &SqliteStore, symbol_id: &str) -> Result<Option<SirAnnotation>> {
+    let Some(blob) = store.read_sir_blob(symbol_id)? else {
+        return Ok(None);
+    };
+    let sir: SirAnnotation =
+        serde_json::from_str(&blob).with_context(|| format!("invalid SIR for {symbol_id}"))?;
+    validate_sir(&sir).with_context(|| format!("invalid SIR annotation for {symbol_id}"))?;
+    Ok(Some(sir))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_split_suggestion_entry(
     crate_name: &str,
@@ -678,6 +1136,20 @@ fn split_entry(
     }
 }
 
+fn trait_split_entry(
+    crate_name: String,
+    status: &str,
+    message: Option<String>,
+    suggestion: Option<TraitSplitSuggestion>,
+) -> TraitSplitSuggestionEntry {
+    TraitSplitSuggestionEntry {
+        crate_name,
+        status: status.to_owned(),
+        message,
+        suggestion,
+    }
+}
+
 fn render_split_suggestions(entries: &[SplitSuggestionEntry]) -> Option<String> {
     if entries.is_empty() {
         return None;
@@ -722,6 +1194,54 @@ fn render_split_suggestions(entries: &[SplitSuggestionEntry]) -> Option<String> 
     while matches!(lines.last(), Some(last) if last.is_empty()) {
         lines.pop();
     }
+    Some(lines.join("\n"))
+}
+
+fn render_trait_split_suggestions(entries: &[TraitSplitSuggestionEntry]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut lines = vec!["Trait split suggestions:".to_owned()];
+    for entry in entries {
+        if let Some(suggestion) = entry.suggestion.as_ref() {
+            lines.push(format!(
+                "  {} ({}) - {} methods -> {} clusters",
+                suggestion.trait_name,
+                suggestion.trait_file,
+                suggestion.method_count,
+                suggestion.suggested_traits.len()
+            ));
+            for sub_trait in &suggestion.suggested_traits {
+                lines.push(format!(
+                    "    {} ({} methods, {:.0}% isolation): {}",
+                    sub_trait.name,
+                    sub_trait.methods.len(),
+                    sub_trait.consumer_isolation * 100.0,
+                    sub_trait.methods.join(", ")
+                ));
+            }
+            for cross_cutting in &suggestion.cross_cutting_methods {
+                lines.push(format!(
+                    "    Cross-cutting: {} (spans {} clusters)",
+                    cross_cutting.method,
+                    cross_cutting.overlapping_clusters.len()
+                ));
+            }
+            if !suggestion.uncalled_methods.is_empty() {
+                lines.push(format!(
+                    "    Uncalled: {}",
+                    suggestion.uncalled_methods.join(", ")
+                ));
+            }
+        } else {
+            lines.push(format!("  {} - status: {}", entry.crate_name, entry.status));
+            if let Some(message) = entry.message.as_ref() {
+                lines.push(format!("    message: {message}"));
+            }
+        }
+    }
+
     Some(lines.join("\n"))
 }
 
@@ -932,6 +1452,7 @@ fn latest_semantic_drift_by_symbol(store: &SqliteStore) -> Result<HashMap<String
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
     use std::path::Path;
     use std::process::Command;
@@ -940,10 +1461,12 @@ mod tests {
     use aether_config::AetherConfig;
     use aether_core::EdgeKind;
     use aether_graph_algo::GraphAlgorithmEdge;
+    use aether_sir::SirAnnotation;
     use aether_store::{
         CommunitySnapshotRecord, DriftResultRecord, DriftStore, GraphStore, ResolvedEdge,
-        SemanticIndexStore, SqliteStore, SurrealGraphStore, SymbolCatalogStore,
-        SymbolEmbeddingRecord, SymbolRecord, TestIntentRecord, TestIntentStore, open_vector_store,
+        SemanticIndexStore, SirStateStore, SqliteStore, SurrealGraphStore, SymbolCatalogStore,
+        SymbolEmbeddingRecord, SymbolRecord, SymbolRelationStore, TestIntentRecord,
+        TestIntentStore, open_vector_store,
     };
     use rusqlite::Connection;
     use tempfile::tempdir;
@@ -1061,6 +1584,18 @@ model = "qwen3-embeddings-4B"
         }
     }
 
+    fn typed_symbol(id: &str, qualified_name: &str, file_path: &str, kind: &str) -> SymbolRecord {
+        SymbolRecord {
+            id: id.to_owned(),
+            file_path: file_path.to_owned(),
+            language: "rust".to_owned(),
+            kind: kind.to_owned(),
+            qualified_name: qualified_name.to_owned(),
+            signature_fingerprint: format!("sig-{id}"),
+            last_seen_at: now_millis(),
+        }
+    }
+
     fn embedding_record(symbol_id: &str, embedding: Vec<f32>) -> SymbolEmbeddingRecord {
         SymbolEmbeddingRecord {
             symbol_id: symbol_id.to_owned(),
@@ -1078,6 +1613,105 @@ model = "qwen3-embeddings-4B"
             target_id: target_id.to_owned(),
             edge_kind: "calls".to_owned(),
         }
+    }
+
+    fn seed_trait_split_workspace(workspace: &Path) {
+        write_file(
+            &workspace.join("crates/example/src/lib.rs"),
+            "pub trait Store {\n    fn alpha(&self);\n    fn beta(&self);\n    fn gamma(&self);\n    fn delta(&self);\n}\n",
+        );
+
+        let store = SqliteStore::open(workspace).expect("open sqlite");
+        for symbol in [
+            typed_symbol("trait-store", "Store", "crates/example/src/lib.rs", "trait"),
+            typed_symbol(
+                "trait-alpha",
+                "Store::alpha",
+                "crates/example/src/lib.rs",
+                "method",
+            ),
+            typed_symbol(
+                "trait-beta",
+                "Store::beta",
+                "crates/example/src/lib.rs",
+                "method",
+            ),
+            typed_symbol(
+                "trait-gamma",
+                "Store::gamma",
+                "crates/example/src/lib.rs",
+                "method",
+            ),
+            typed_symbol(
+                "trait-delta",
+                "Store::delta",
+                "crates/example/src/lib.rs",
+                "method",
+            ),
+            symbol("consumer-a", "run_a", "crates/example/src/consumer_a.rs"),
+            symbol("consumer-b", "run_b", "crates/example/src/consumer_b.rs"),
+        ] {
+            store.upsert_symbol(symbol).expect("upsert symbol");
+        }
+
+        store
+            .upsert_edges(&[
+                aether_core::SymbolEdge {
+                    source_id: "consumer-a".to_owned(),
+                    target_qualified_name: "alpha".to_owned(),
+                    edge_kind: EdgeKind::Calls,
+                    file_path: "crates/example/src/consumer_a.rs".to_owned(),
+                },
+                aether_core::SymbolEdge {
+                    source_id: "consumer-a".to_owned(),
+                    target_qualified_name: "beta".to_owned(),
+                    edge_kind: EdgeKind::Calls,
+                    file_path: "crates/example/src/consumer_a.rs".to_owned(),
+                },
+                aether_core::SymbolEdge {
+                    source_id: "consumer-b".to_owned(),
+                    target_qualified_name: "gamma".to_owned(),
+                    edge_kind: EdgeKind::Calls,
+                    file_path: "crates/example/src/consumer_b.rs".to_owned(),
+                },
+                aether_core::SymbolEdge {
+                    source_id: "consumer-b".to_owned(),
+                    target_qualified_name: "delta".to_owned(),
+                    edge_kind: EdgeKind::Calls,
+                    file_path: "crates/example/src/consumer_b.rs".to_owned(),
+                },
+            ])
+            .expect("seed trait edges");
+
+        let trait_sir = SirAnnotation {
+            intent: "Mock summary for Store".to_owned(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            side_effects: Vec::new(),
+            dependencies: Vec::new(),
+            error_modes: Vec::new(),
+            confidence: 0.9,
+            method_dependencies: Some(HashMap::from([
+                (
+                    "alpha".to_owned(),
+                    vec!["SirMetaRecord".to_owned(), "SirBlob".to_owned()],
+                ),
+                (
+                    "beta".to_owned(),
+                    vec!["SirMetaRecord".to_owned(), "SirBlob".to_owned()],
+                ),
+                ("gamma".to_owned(), vec!["SymbolRecord".to_owned()]),
+                ("delta".to_owned(), vec!["SymbolRecord".to_owned()]),
+            ])),
+        };
+        store
+            .write_sir_blob(
+                "trait-store",
+                serde_json::to_string(&trait_sir)
+                    .expect("serialize trait sir")
+                    .as_str(),
+            )
+            .expect("seed trait sir");
     }
 
     fn seed_surreal_graph_snapshot(
@@ -1696,11 +2330,60 @@ model = "qwen3-embeddings-4B"
         args.suggest_splits = false;
         let execution = execute_health_score_command(workspace.path(), &hot_health_config(), args)
             .expect("health-score execution");
-        let rendered = render_health_report_json(&execution.report, &[entry]);
+        let rendered = render_health_report_json(&execution.report, &[entry], &[]);
 
         assert!(rendered.contains("\"split_suggestions\""));
+        assert!(rendered.contains("\"trait_split_suggestions\""));
         assert!(rendered.contains("\"diagnostics\""));
         assert!(rendered.contains("\"confidence_label\""));
         assert!(rendered.contains("\"stability_score\""));
+    }
+
+    #[test]
+    fn suggest_splits_table_includes_trait_split_section() {
+        let workspace = create_workspace();
+        seed_trait_split_workspace(workspace.path());
+
+        let mut args = default_args();
+        args.output = HealthScoreOutputFormat::Table;
+        args.suggest_splits = true;
+        let execution = execute_health_score_command(workspace.path(), &hot_health_config(), args)
+            .expect("health-score execution");
+
+        assert!(execution.rendered.contains("Trait split suggestions:"));
+        assert!(
+            execution
+                .rendered
+                .contains("Store (crates/example/src/lib.rs) - 4 methods -> 2 clusters")
+        );
+        assert!(execution.rendered.contains("alpha, beta"));
+        assert!(execution.rendered.contains("delta, gamma"));
+    }
+
+    #[test]
+    fn suggest_splits_json_includes_trait_split_entries() {
+        let workspace = create_workspace();
+        seed_trait_split_workspace(workspace.path());
+
+        let mut args = default_args();
+        args.output = HealthScoreOutputFormat::Json;
+        args.suggest_splits = true;
+        let execution = execute_health_score_command(workspace.path(), &hot_health_config(), args)
+            .expect("health-score execution");
+
+        let rendered: serde_json::Value =
+            serde_json::from_str(&execution.rendered).expect("json output");
+        let trait_entries = rendered
+            .get("trait_split_suggestions")
+            .and_then(serde_json::Value::as_array)
+            .expect("trait split suggestions array");
+        assert!(!trait_entries.is_empty());
+        assert_eq!(
+            trait_entries[0]
+                .get("suggestion")
+                .and_then(|value| value.get("trait_name"))
+                .and_then(serde_json::Value::as_str),
+            Some("Store")
+        );
     }
 }
