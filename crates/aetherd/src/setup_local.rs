@@ -260,6 +260,7 @@ mod tests {
             dependencies: Vec::new(),
             error_modes: Vec::new(),
             confidence: 0.8,
+            method_dependencies: None,
         };
         validate_smoke_test_sir(&valid).expect("valid sir");
 
@@ -271,6 +272,7 @@ mod tests {
             dependencies: Vec::new(),
             error_modes: Vec::new(),
             confidence: 0.8,
+            method_dependencies: None,
         };
         let err = validate_smoke_test_sir(&invalid).expect_err("expected invalid sir");
         assert!(

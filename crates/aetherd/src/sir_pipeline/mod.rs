@@ -377,7 +377,7 @@ impl SirPipeline {
                     SirGenerationOutcome::Success(generated) => {
                         match self.commit_successful_generation(
                             store,
-                            generated,
+                            *generated,
                             generation_pass,
                             commit_hash.as_deref(),
                             print_sir,
@@ -394,7 +394,7 @@ impl SirPipeline {
                         stats.failure_count += 1;
                         self.handle_failed_generation(
                             store,
-                            failed,
+                            *failed,
                             generation_pass,
                             print_sir,
                             out,
@@ -510,7 +510,7 @@ impl SirPipeline {
                     let file_path = generated.symbol.file_path.clone();
                     match self.commit_successful_generation(
                         store,
-                        generated,
+                        *generated,
                         generation_pass,
                         commit_hash.as_deref(),
                         print_sir,
@@ -528,7 +528,7 @@ impl SirPipeline {
                 }
                 SirGenerationOutcome::Failure(failed) => {
                     stats.failure_count += 1;
-                    self.handle_failed_generation(store, failed, generation_pass, print_sir, out)?;
+                    self.handle_failed_generation(store, *failed, generation_pass, print_sir, out)?;
                 }
             }
         }

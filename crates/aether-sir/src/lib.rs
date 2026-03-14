@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,6 +21,9 @@ pub struct SirAnnotation {
     pub dependencies: Vec<String>,
     pub error_modes: Vec<String>,
     pub confidence: f32,
+    /// Per-method dependency map for traits/structs. None for functions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method_dependencies: Option<HashMap<String, Vec<String>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -73,6 +76,21 @@ pub fn canonicalize_sir_json(sir: &SirAnnotation) -> String {
     canonical.insert("error_modes", Value::from(error_modes));
     canonical.insert("inputs", Value::from(inputs));
     canonical.insert("intent", Value::from(sir.intent.clone()));
+    if let Some(method_dependencies) = &sir.method_dependencies {
+        let canonical_method_dependencies = method_dependencies
+            .iter()
+            .map(|(method_name, deps)| {
+                let mut sorted_deps = deps.clone();
+                sorted_deps.sort();
+                (method_name.clone(), sorted_deps)
+            })
+            .collect::<BTreeMap<_, _>>();
+        canonical.insert(
+            "method_dependencies",
+            serde_json::to_value(canonical_method_dependencies)
+                .expect("canonical method dependency serialization cannot fail"),
+        );
+    }
     canonical.insert("outputs", Value::from(outputs));
     canonical.insert("side_effects", Value::from(side_effects));
 
@@ -152,7 +170,18 @@ mod tests {
             dependencies: vec!["serde".to_owned(), "tokio".to_owned()],
             error_modes: vec!["io_error".to_owned(), "timeout".to_owned()],
             confidence: 0.75,
+            method_dependencies: None,
         }
+    }
+
+    fn sample_method_dependencies() -> HashMap<String, Vec<String>> {
+        HashMap::from([
+            (
+                "load".to_owned(),
+                vec!["Record".to_owned(), "StoreError".to_owned()],
+            ),
+            ("delete".to_owned(), vec!["StoreError".to_owned()]),
+        ])
     }
 
     #[test]
@@ -184,6 +213,7 @@ mod tests {
             dependencies: vec!["tokio".to_owned(), "serde".to_owned()],
             error_modes: vec!["timeout".to_owned(), "io_error".to_owned()],
             confidence: 0.75,
+            method_dependencies: None,
         };
 
         let canonical_a = canonicalize_sir_json(&sir_a);
@@ -208,6 +238,61 @@ mod tests {
         let hash_b = sir_hash(&sir_b);
 
         assert_eq!(hash_a, hash_b);
+    }
+
+    #[test]
+    fn deserialize_without_method_dependencies_defaults_to_none() {
+        let json = r#"{"intent":"Summarize behavior","inputs":["a"],"outputs":["result"],"side_effects":[],"dependencies":["serde"],"error_modes":[],"confidence":0.75}"#;
+
+        let sir: SirAnnotation = serde_json::from_str(json).expect("sir should deserialize");
+        assert_eq!(sir.method_dependencies, None);
+    }
+
+    #[test]
+    fn sir_round_trips_with_method_dependencies() {
+        let mut sir = sample_sir();
+        sir.method_dependencies = Some(sample_method_dependencies());
+
+        let encoded = serde_json::to_string(&sir).expect("sir should serialize");
+        let decoded: SirAnnotation =
+            serde_json::from_str(&encoded).expect("sir should deserialize");
+
+        assert_eq!(decoded, sir);
+    }
+
+    #[test]
+    fn canonicalization_is_stable_for_method_dependency_map_reordering() {
+        let mut sir_a = sample_sir();
+        sir_a.method_dependencies = Some(HashMap::from([
+            (
+                "save".to_owned(),
+                vec!["StoreError".to_owned(), "Record".to_owned()],
+            ),
+            ("delete".to_owned(), vec!["StoreError".to_owned()]),
+        ]));
+
+        let mut sir_b = sample_sir();
+        sir_b.method_dependencies = Some(HashMap::from([
+            ("delete".to_owned(), vec!["StoreError".to_owned()]),
+            (
+                "save".to_owned(),
+                vec!["Record".to_owned(), "StoreError".to_owned()],
+            ),
+        ]));
+
+        assert_eq!(canonicalize_sir_json(&sir_a), canonicalize_sir_json(&sir_b));
+        assert_eq!(
+            canonicalize_sir_json(&sir_a),
+            "{\"confidence\":0.75,\"dependencies\":[\"serde\",\"tokio\"],\"error_modes\":[\"io_error\",\"timeout\"],\"inputs\":[\"a\",\"b\"],\"intent\":\"Summarize behavior\",\"method_dependencies\":{\"delete\":[\"StoreError\"],\"save\":[\"Record\",\"StoreError\"]},\"outputs\":[\"result\"],\"side_effects\":[\"db\",\"network\"]}"
+        );
+    }
+
+    #[test]
+    fn serializing_without_method_dependencies_omits_the_field() {
+        let sir = sample_sir();
+        let encoded = serde_json::to_string(&sir).expect("sir should serialize");
+
+        assert!(!encoded.contains("method_dependencies"));
     }
 
     #[test]
