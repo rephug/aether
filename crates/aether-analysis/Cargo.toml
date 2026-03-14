@@ -9,8 +9,11 @@ authors.workspace = true
 aether-config = { path = "../aether-config" }
 aether-core = { path = "../aether-core" }
 aether-graph-algo = { path = "../aether-graph-algo" }
+aether-health = { path = "../aether-health" }
 aether-infer = { path = "../aether-infer" }
 aether-memory = { path = "../aether-memory" }
+aether-parse = { path = "../aether-parse" }
+aether-sir = { path = "../aether-sir" }
 aether-store = { path = "../aether-store" }
 gix.workspace = true
 petgraph = "0.6"

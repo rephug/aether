@@ -10,15 +10,15 @@ use aether_core::{Symbol, SymbolChangeEvent};
 use aether_infer::ProviderOverrides;
 use aether_infer::sir_prompt::SirEnrichmentContext;
 use aether_infer::{download_candle_embedding_model, download_candle_reranker_model};
-use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
-use aether_store::{SirStateStore, SqliteStore, SymbolCatalogStore};
+use aether_sir::SirAnnotation;
+use aether_store::{SirStateStore, SqliteStore};
 use aetherd::calibrate::run_calibration_once;
 use aetherd::causal::run_trace_cause_command;
 use aetherd::cli::{
     AskArgs, BlastRadiusArgs, Cli, Commands, CommunitiesArgs, CouplingReportArgs, DriftAckArgs,
     DriftReportArgs, FsckArgs, HealthArgs, HealthScoreArgs, InitAgentArgs, LogFormat,
-    MineCouplingArgs, NotesArgs, RecallArgs, RegenerateArgs, RememberArgs, SetupLocalArgs,
-    TestIntentsArgs, TraceCauseArgs, parse_cli,
+    MineCouplingArgs, NotesArgs, RecallArgs, RefactorPrepArgs, RegenerateArgs, RememberArgs,
+    SetupLocalArgs, TestIntentsArgs, TraceCauseArgs, VerifyIntentArgs, parse_cli,
 };
 use aetherd::coupling::{
     run_blast_radius_command, run_coupling_report_command, run_mine_coupling_command,
@@ -28,7 +28,7 @@ use aetherd::fsck::run_fsck;
 use aetherd::health::run_health_command;
 use aetherd::health_score::run_health_score_command;
 use aetherd::indexer::{
-    IndexerConfig, compute_symbol_priority_scores, run_indexing_loop,
+    IndexerConfig, build_enrichment_context, compute_symbol_priority_scores, run_indexing_loop,
     run_initial_index_once_for_cli,
 };
 use aetherd::init_agent::{InitAgentOptions, run_init_agent};
@@ -36,10 +36,13 @@ use aetherd::memory::{
     run_ask_command, run_notes_command, run_recall_command, run_remember_command,
 };
 use aetherd::observer::ObserverState;
+use aetherd::refactor_prep::run_refactor_prep_command;
 use aetherd::search::run_search_once;
 use aetherd::setup_local::{SetupLocalOptions, run_setup_local};
+use aetherd::sir_pipeline::{SIR_GENERATION_PASS_REGENERATED, SirDeepPromptSpec, SirPipeline};
 use aetherd::test_intents::run_test_intents_command;
 use aetherd::verification::{VerificationRequest, run_verification};
+use aetherd::verify_intent::run_verify_intent_command;
 use anyhow::{Context, Result, anyhow};
 
 fn main() -> Result<()> {
@@ -319,6 +322,8 @@ fn run_subcommand(workspace: &Path, config: &AetherConfig, command: Commands) ->
         Commands::TraceCause(args) => run_trace_cause_subcommand(workspace, args),
         Commands::Health(args) => run_health_subcommand(workspace, args),
         Commands::HealthScore(args) => run_health_score_subcommand(workspace, config, args),
+        Commands::RefactorPrep(args) => run_refactor_prep_subcommand(workspace, config, args),
+        Commands::VerifyIntent(args) => run_verify_intent_subcommand(workspace, config, args),
         Commands::Fsck(args) => run_fsck_subcommand(workspace, args),
     }
 }
@@ -601,99 +606,16 @@ fn build_regeneration_enrichment_context(
     deep_priority_threshold: f64,
     deep_confidence_threshold: f64,
 ) -> Result<SirEnrichmentContext> {
-    let file_rollup_id = synthetic_file_sir_id(
-        candidate.symbol.language.as_str(),
-        candidate.symbol.file_path.as_str(),
-    );
-    let file_intent = store
-        .read_sir_blob(file_rollup_id.as_str())?
-        .and_then(|blob| serde_json::from_str::<FileSir>(&blob).ok())
-        .map(|sir| sir.intent.trim().to_owned())
-        .unwrap_or_default();
-
-    let mut neighbors = Vec::<(f64, String, String)>::new();
-    for peer in store.list_symbols_for_file(candidate.symbol.file_path.as_str())? {
-        if peer.id == candidate.symbol.id {
-            continue;
-        }
-        let Some(blob) = store.read_sir_blob(peer.id.as_str())? else {
-            continue;
-        };
-        let Ok(peer_sir) = serde_json::from_str::<SirAnnotation>(&blob) else {
-            continue;
-        };
-        neighbors.push((
-            priority_scores
-                .get(peer.id.as_str())
-                .copied()
-                .unwrap_or(0.0),
-            peer.qualified_name,
-            peer_sir.intent,
-        ));
-    }
-    neighbors.sort_by(|left, right| {
-        right
-            .0
-            .total_cmp(&left.0)
-            .then_with(|| left.1.cmp(&right.1))
-    });
-    if max_neighbors > 0 && neighbors.len() > max_neighbors {
-        neighbors.truncate(max_neighbors);
-    }
-
-    Ok(SirEnrichmentContext {
-        file_intent: Some(file_intent),
-        neighbor_intents: neighbors
-            .into_iter()
-            .map(|(_, name, intent)| (name, intent))
-            .collect(),
-        baseline_sir: Some(candidate.baseline_sir.clone()),
-        priority_reason: format_regeneration_priority_reason(
-            store,
-            candidate.symbol.id.as_str(),
-            candidate.priority,
-            candidate.confidence as f64,
-            deep_priority_threshold,
-            deep_confidence_threshold,
-        ),
-    })
-}
-
-fn format_regeneration_priority_reason(
-    store: &SqliteStore,
-    symbol_id: &str,
-    priority_score: f64,
-    confidence: f64,
-    deep_priority_threshold: f64,
-    deep_confidence_threshold: f64,
-) -> String {
-    let mut reasons = Vec::<String>::new();
-    if priority_score >= deep_priority_threshold {
-        reasons.push(format!(
-            "priority {:.2} at or above threshold {:.2}",
-            priority_score, deep_priority_threshold
-        ));
-    }
-    if confidence <= deep_confidence_threshold {
-        reasons.push(format!(
-            "confidence {:.2} at or below threshold {:.2}",
-            confidence, deep_confidence_threshold
-        ));
-    }
-    if let Ok(Some(metadata)) = store.get_symbol_metadata(symbol_id) {
-        if metadata.is_public {
-            reasons.push("public API symbol".to_owned());
-        }
-        let kind = metadata.kind.to_ascii_lowercase();
-        if kind == "function" || kind == "method" {
-            reasons.push("function/method".to_owned());
-        }
-    }
-    if reasons.is_empty() {
-        "selected for regeneration".to_owned()
-    } else {
-        reasons.join(" + ")
-    }
+    build_enrichment_context(
+        store,
+        &candidate.symbol,
+        Some(candidate.baseline_sir.clone()),
+        priority_scores,
+        max_neighbors,
+        deep_priority_threshold,
+        deep_confidence_threshold,
+        candidate.priority,
+    )
 }
 
 fn truncate_display_name(value: &str, width: usize) -> String {
@@ -802,6 +724,22 @@ fn run_health_score_subcommand(
     run_health_score_command(workspace, config, args).context("health-score command failed")
 }
 
+fn run_refactor_prep_subcommand(
+    workspace: &Path,
+    config: &AetherConfig,
+    args: RefactorPrepArgs,
+) -> Result<()> {
+    run_refactor_prep_command(workspace, config, args).context("refactor-prep command failed")
+}
+
+fn run_verify_intent_subcommand(
+    workspace: &Path,
+    config: &AetherConfig,
+    args: VerifyIntentArgs,
+) -> Result<()> {
+    run_verify_intent_command(workspace, config, args).context("verify-intent command failed")
+}
+
 fn run_fsck_subcommand(workspace: &Path, args: FsckArgs) -> Result<()> {
     run_fsck(workspace, args.repair, args.verbose)
         .map(|_| ())
@@ -844,4 +782,3 @@ fn build_env_filter(configured_log_level: &str) -> tracing_subscriber::EnvFilter
         .or_else(|_| tracing_subscriber::EnvFilter::try_new(configured_log_level))
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_LEVEL))
 }
-use aetherd::sir_pipeline::{SIR_GENERATION_PASS_REGENERATED, SirDeepPromptSpec, SirPipeline};

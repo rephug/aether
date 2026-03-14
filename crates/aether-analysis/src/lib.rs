@@ -3,6 +3,7 @@ mod coupling;
 mod drift;
 mod graph_algorithms;
 mod health;
+mod refactor;
 mod test_intents;
 
 pub use causal::{
@@ -25,4 +26,5 @@ pub use graph_algorithms::{
     cross_community_edges, louvain_communities, page_rank, strongly_connected_components,
 };
 pub use health::*;
+pub use refactor::*;
 pub use test_intents::{InferredTestTarget, TestGuard, TestIntentAnalyzer};

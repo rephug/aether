@@ -8,6 +8,7 @@ pub mod models;
 pub mod output;
 pub mod planner;
 pub mod planner_communities;
+pub mod refactor;
 mod scanner;
 pub mod scoring;
 pub mod semantic_signals;
@@ -35,6 +36,9 @@ pub use planner::{
 };
 pub use planner_communities::{
     FileCommunityConfig, FileSymbol, PlannerDiagnostics, detect_file_communities,
+};
+pub use refactor::{
+    RefactorCandidate, RefactorSelectionInput, RefactorSymbolSelection, select_refactor_targets,
 };
 pub use semantic_signals::{SemanticFileInput, SemanticInput};
 

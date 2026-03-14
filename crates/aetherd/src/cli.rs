@@ -386,6 +386,36 @@ impl std::str::FromStr for HealthScoreOutputFormat {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RefactorPrepOutputFormat {
+    #[default]
+    Human,
+    Json,
+}
+
+impl RefactorPrepOutputFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Json => "json",
+        }
+    }
+}
+
+impl std::str::FromStr for RefactorPrepOutputFormat {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "human" => Ok(Self::Human),
+            "json" => Ok(Self::Json),
+            other => Err(format!(
+                "invalid refactor-prep output format '{other}', expected one of: human, json"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct HealthScoreArgs {
     #[arg(
@@ -441,6 +471,56 @@ pub struct FsckArgs {
     pub verbose: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct RefactorPrepArgs {
+    #[arg(
+        long,
+        conflicts_with = "crate_name",
+        required_unless_present = "crate_name",
+        help = "Workspace-relative file path to prepare for refactoring"
+    )]
+    pub file: Option<String>,
+
+    #[arg(
+        long = "crate",
+        conflicts_with = "file",
+        required_unless_present = "file",
+        help = "Crate name to prepare for refactoring"
+    )]
+    pub crate_name: Option<String>,
+
+    #[arg(
+        long,
+        default_value_t = 20,
+        help = "Maximum number of refactor candidates"
+    )]
+    pub top_n: usize,
+
+    #[arg(long, help = "Force the deep pass to use the local Qwen provider")]
+    pub local: bool,
+
+    #[arg(
+        long,
+        default_value = "human",
+        value_parser = parse_refactor_prep_output_format,
+        help = "Output format: human or json"
+    )]
+    pub output: RefactorPrepOutputFormat,
+}
+
+#[derive(Debug, Clone, PartialEq, Args)]
+pub struct VerifyIntentArgs {
+    #[arg(long, help = "Snapshot identifier created by refactor-prep")]
+    pub snapshot: String,
+
+    #[arg(
+        long,
+        default_value_t = 0.85,
+        help = "Minimum similarity required to pass verification"
+    )]
+    pub threshold: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, Subcommand)]
 pub enum Commands {
     /// Generate agent configuration files for AI coding agents
@@ -479,6 +559,10 @@ pub enum Commands {
     Health(HealthArgs),
     /// Compute a structural health score for each workspace crate
     HealthScore(HealthScoreArgs),
+    /// Deep-scan the riskiest symbols in a file or crate and persist an intent snapshot
+    RefactorPrep(RefactorPrepArgs),
+    /// Compare current SIR against a saved refactor-prep snapshot
+    VerifyIntent(VerifyIntentArgs),
     /// Verify and optionally repair cross-store consistency
     Fsck(FsckArgs),
 }
@@ -734,6 +818,10 @@ fn parse_communities_format(value: &str) -> Result<CommunitiesFormat, String> {
 }
 
 fn parse_health_score_output_format(value: &str) -> Result<HealthScoreOutputFormat, String> {
+    value.parse()
+}
+
+fn parse_refactor_prep_output_format(value: &str) -> Result<RefactorPrepOutputFormat, String> {
     value.parse()
 }
 
@@ -1375,6 +1463,58 @@ mod tests {
                     args.crate_filter,
                     vec!["aether-core".to_owned(), "aether-store".to_owned()]
                 );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refactor_prep_subcommand_parses_file_local_and_output() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "refactor-prep",
+            "--file",
+            "crates/aetherd/src/main.rs",
+            "--top-n",
+            "12",
+            "--local",
+            "--output",
+            "json",
+        ])
+        .expect("refactor-prep should parse");
+
+        match cli.command {
+            Some(Commands::RefactorPrep(args)) => {
+                assert_eq!(args.file.as_deref(), Some("crates/aetherd/src/main.rs"));
+                assert_eq!(args.crate_name, None);
+                assert_eq!(args.top_n, 12);
+                assert!(args.local);
+                assert_eq!(args.output.as_str(), "json");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_intent_subcommand_parses_snapshot_and_threshold() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "verify-intent",
+            "--snapshot",
+            "refactor-prep-1234",
+            "--threshold",
+            "0.9",
+        ])
+        .expect("verify-intent should parse");
+
+        match cli.command {
+            Some(Commands::VerifyIntent(args)) => {
+                assert_eq!(args.snapshot, "refactor-prep-1234");
+                assert!((args.threshold - 0.9).abs() < f64::EPSILON);
             }
             other => panic!("unexpected command: {other:?}"),
         }
