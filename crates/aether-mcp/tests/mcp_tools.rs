@@ -932,12 +932,21 @@ fn mcp_usage_matrix_reports_consumers_clusters_and_uncalled_methods() -> Result<
 
     run_index_and_seed_sir(workspace)?;
 
+    let store = SqliteStore::open(workspace)?;
+    let example_store_id = store
+        .list_symbols_for_file("src/store.rs")?
+        .into_iter()
+        .find(|symbol| symbol.qualified_name == "ExampleStore")
+        .expect("ExampleStore symbol should exist")
+        .id;
+
     let server = AetherMcpServer::new(workspace, false)?;
     let rt = Runtime::new()?;
     let response = rt
         .block_on(
             server.aether_usage_matrix(Parameters(AetherUsageMatrixRequest {
                 symbol: "ExampleStore".to_owned(),
+                symbol_id: None,
                 file: Some("src/store.rs".to_owned()),
                 kind: Some("struct".to_owned()),
             })),
@@ -1008,6 +1017,71 @@ fn mcp_usage_matrix_reports_consumers_clusters_and_uncalled_methods() -> Result<
     );
     assert!(cluster.reason.contains("src/consumer_a.rs"));
     assert!(cluster.reason.contains("src/consumer_b.rs"));
+
+    let by_id = rt
+        .block_on(
+            server.aether_usage_matrix(Parameters(AetherUsageMatrixRequest {
+                symbol: String::new(),
+                symbol_id: Some(example_store_id),
+                file: None,
+                kind: None,
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert_eq!(by_id.target, "ExampleStore");
+    assert_eq!(by_id.target_file, "src/store.rs");
+    assert_eq!(by_id.method_count, 4);
+
+    Ok(())
+}
+
+#[test]
+fn mcp_usage_matrix_resolves_exact_qualified_name_before_fuzzy_search_limit() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    write_test_config(workspace);
+
+    fs::create_dir_all(workspace.join("src"))?;
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "mod consumer;\npub mod store;\n\npub use consumer::run;\n",
+    )?;
+
+    let mut store_source = String::new();
+    for index in 0..120 {
+        store_source.push_str(&format!("pub struct AStore{index:03};\n"));
+    }
+    store_source
+        .push_str("\npub struct Store;\n\nimpl Store {\n    pub fn alpha() -> i32 { 1 }\n}\n");
+    fs::write(workspace.join("src/store.rs"), store_source)?;
+    fs::write(
+        workspace.join("src/consumer.rs"),
+        "use crate::store::Store;\n\npub fn run() -> i32 {\n    Store::alpha()\n}\n",
+    )?;
+
+    run_index_and_seed_sir(workspace)?;
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+    let response = rt
+        .block_on(
+            server.aether_usage_matrix(Parameters(AetherUsageMatrixRequest {
+                symbol: "Store".to_owned(),
+                symbol_id: None,
+                file: Some("src/store.rs".to_owned()),
+                kind: Some("struct".to_owned()),
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+
+    assert_eq!(response.target, "Store");
+    assert_eq!(response.target_file, "src/store.rs");
+    assert_eq!(response.method_count, 1);
+    assert_eq!(response.consumer_count, 1);
+    assert_eq!(response.matrix[0].consumer_file, "src/consumer.rs");
+    assert_eq!(response.matrix[0].methods_used, vec!["alpha".to_owned()]);
 
     Ok(())
 }

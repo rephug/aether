@@ -260,6 +260,39 @@ impl SqliteStore {
 
         Ok(record)
     }
+    pub fn find_symbol_search_results_by_qualified_name(
+        &self,
+        qualified_name: &str,
+    ) -> Result<Vec<SymbolSearchResult>, StoreError> {
+        let qualified_name = qualified_name.trim();
+        if qualified_name.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, qualified_name, file_path, language, kind, access_count, last_accessed_at
+            FROM symbols
+            WHERE qualified_name = ?1
+            ORDER BY file_path ASC, kind ASC, id ASC
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![qualified_name], |row| {
+            Ok(SymbolSearchResult {
+                symbol_id: row.get(0)?,
+                qualified_name: row.get(1)?,
+                file_path: row.get(2)?,
+                language: row.get(3)?,
+                kind: row.get(4)?,
+                access_count: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0),
+                last_accessed_at: row.get(6)?,
+            })
+        })?;
+
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
     pub fn list_all_symbol_ids(&self) -> Result<Vec<String>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

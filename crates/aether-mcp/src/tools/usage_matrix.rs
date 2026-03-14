@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use aether_store::{SymbolCatalogStore, SymbolRelationStore, SymbolSearchResult};
+use aether_store::{
+    SqliteStore, SymbolCatalogStore, SymbolRecord, SymbolRelationStore, SymbolSearchResult,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -13,7 +15,10 @@ use crate::AetherMcpError;
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherUsageMatrixRequest {
     /// Symbol name (e.g., "Store", "SqliteStore")
+    #[serde(default)]
     pub symbol: String,
+    /// Optional symbol ID for direct resolution
+    pub symbol_id: Option<String>,
     /// Optional file path to disambiguate
     pub file: Option<String>,
     /// Optional kind filter (e.g., "trait", "struct")
@@ -55,15 +60,50 @@ pub struct MethodCluster {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UsageMatrixTargetSelection {
+    symbol_id: String,
+    qualified_name: String,
+    file_path: String,
+    kind: String,
+}
+
+impl From<SymbolSearchResult> for UsageMatrixTargetSelection {
+    fn from(value: SymbolSearchResult) -> Self {
+        Self {
+            symbol_id: value.symbol_id,
+            qualified_name: value.qualified_name,
+            file_path: value.file_path,
+            kind: value.kind,
+        }
+    }
+}
+
+impl From<SymbolRecord> for UsageMatrixTargetSelection {
+    fn from(value: SymbolRecord) -> Self {
+        Self {
+            symbol_id: value.id,
+            qualified_name: value.qualified_name,
+            file_path: value.file_path,
+            kind: value.kind,
+        }
+    }
+}
+
 impl AetherMcpServer {
     pub fn aether_usage_matrix_logic(
         &self,
         request: AetherUsageMatrixRequest,
     ) -> Result<AetherUsageMatrixResponse, AetherMcpError> {
         let symbol_query = request.symbol.trim();
-        if symbol_query.is_empty() {
+        let symbol_id = request
+            .symbol_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if symbol_query.is_empty() && symbol_id.is_none() {
             return Err(AetherMcpError::Message(
-                "symbol must not be empty".to_owned(),
+                "symbol or symbol_id must not be empty".to_owned(),
             ));
         }
 
@@ -76,61 +116,20 @@ impl AetherMcpServer {
             .map(|value| value.to_ascii_lowercase());
         let store = self.state.store.as_ref();
 
-        let mut candidates = store
-            .search_symbols(symbol_query, 100)?
-            .into_iter()
-            .filter(|candidate| {
-                candidate.qualified_name == symbol_query
-                    || symbol_leaf_name(candidate.qualified_name.as_str()) == symbol_query
-            })
-            .filter(|candidate| {
-                file_filter
-                    .as_deref()
-                    .map(|file| candidate.file_path == file)
-                    .unwrap_or(true)
-            })
-            .filter(|candidate| {
-                kind_filter
-                    .as_deref()
-                    .map(|kind| candidate.kind == *kind)
-                    .unwrap_or(true)
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| {
-            left.qualified_name
-                .cmp(&right.qualified_name)
-                .then_with(|| left.file_path.cmp(&right.file_path))
-                .then_with(|| left.kind.cmp(&right.kind))
-                .then_with(|| left.symbol_id.cmp(&right.symbol_id))
-        });
-
-        let target = match candidates.as_slice() {
-            [] => {
-                return Err(AetherMcpError::Message(format!(
-                    "symbol '{}' not found{}{}",
-                    symbol_query,
-                    file_filter
-                        .as_deref()
-                        .map(|file| format!(" in {file}"))
-                        .unwrap_or_default(),
-                    kind_filter
-                        .as_deref()
-                        .map(|kind| format!(" with kind '{kind}'"))
-                        .unwrap_or_default()
-                )));
-            }
-            [candidate] => candidate,
-            many => {
-                let candidates = many
-                    .iter()
-                    .map(format_candidate)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(AetherMcpError::Message(format!(
-                    "symbol '{}' is ambiguous: {}",
-                    symbol_query, candidates
-                )));
-            }
+        let target = if let Some(symbol_id) = symbol_id {
+            self.resolve_usage_matrix_target_by_id(
+                store,
+                symbol_id,
+                file_filter.as_deref(),
+                kind_filter.as_deref(),
+            )?
+        } else {
+            self.resolve_usage_matrix_target_by_name(
+                store,
+                symbol_query,
+                file_filter.as_deref(),
+                kind_filter.as_deref(),
+            )?
         };
 
         let Some(target_record) = store.get_symbol_record(target.symbol_id.as_str())? else {
@@ -295,9 +294,168 @@ impl AetherMcpServer {
         };
         normalize_workspace_relative_path(self.workspace(), raw_file, "file").map(Some)
     }
+
+    fn resolve_usage_matrix_target_by_id(
+        &self,
+        store: &SqliteStore,
+        symbol_id: &str,
+        file_filter: Option<&str>,
+        kind_filter: Option<&str>,
+    ) -> Result<UsageMatrixTargetSelection, AetherMcpError> {
+        let Some(candidate) = store.get_symbol_record(symbol_id)? else {
+            return Err(AetherMcpError::Message(format!(
+                "symbol_id '{}' not found",
+                symbol_id
+            )));
+        };
+        if !matches_usage_matrix_filters(
+            candidate.file_path.as_str(),
+            candidate.kind.as_str(),
+            file_filter,
+            kind_filter,
+        ) {
+            return Err(AetherMcpError::Message(format!(
+                "symbol_id '{}' does not match the requested file/kind filters",
+                symbol_id
+            )));
+        }
+
+        Ok(candidate.into())
+    }
+
+    fn resolve_usage_matrix_target_by_name(
+        &self,
+        store: &SqliteStore,
+        symbol_query: &str,
+        file_filter: Option<&str>,
+        kind_filter: Option<&str>,
+    ) -> Result<UsageMatrixTargetSelection, AetherMcpError> {
+        let mut exact_candidates = store
+            .find_symbol_search_results_by_qualified_name(symbol_query)?
+            .into_iter()
+            .filter(|candidate| {
+                matches_usage_matrix_filters(
+                    candidate.file_path.as_str(),
+                    candidate.kind.as_str(),
+                    file_filter,
+                    kind_filter,
+                )
+            })
+            .map(UsageMatrixTargetSelection::from)
+            .collect::<Vec<_>>();
+        sort_usage_matrix_candidates(&mut exact_candidates);
+        if let Some(target) =
+            select_usage_matrix_candidate(symbol_query, exact_candidates.as_slice())?
+        {
+            return Ok(target);
+        }
+
+        let fuzzy_matches = store.search_symbols(symbol_query, 100)?;
+
+        let mut exact_leaf_candidates = fuzzy_matches
+            .iter()
+            .filter(|candidate| symbol_leaf_name(candidate.qualified_name.as_str()) == symbol_query)
+            .filter(|candidate| {
+                matches_usage_matrix_filters(
+                    candidate.file_path.as_str(),
+                    candidate.kind.as_str(),
+                    file_filter,
+                    kind_filter,
+                )
+            })
+            .cloned()
+            .map(UsageMatrixTargetSelection::from)
+            .collect::<Vec<_>>();
+        sort_usage_matrix_candidates(&mut exact_leaf_candidates);
+        if let Some(target) =
+            select_usage_matrix_candidate(symbol_query, exact_leaf_candidates.as_slice())?
+        {
+            return Ok(target);
+        }
+
+        let mut fuzzy_candidates = fuzzy_matches
+            .into_iter()
+            .filter(|candidate| {
+                matches_usage_matrix_filters(
+                    candidate.file_path.as_str(),
+                    candidate.kind.as_str(),
+                    file_filter,
+                    kind_filter,
+                )
+            })
+            .map(UsageMatrixTargetSelection::from)
+            .collect::<Vec<_>>();
+        sort_usage_matrix_candidates(&mut fuzzy_candidates);
+
+        select_usage_matrix_candidate(symbol_query, fuzzy_candidates.as_slice())?.ok_or_else(|| {
+            AetherMcpError::Message(not_found_message(symbol_query, file_filter, kind_filter))
+        })
+    }
 }
 
-fn format_candidate(candidate: &SymbolSearchResult) -> String {
+fn matches_usage_matrix_filters(
+    candidate_file: &str,
+    candidate_kind: &str,
+    file_filter: Option<&str>,
+    kind_filter: Option<&str>,
+) -> bool {
+    file_filter
+        .map(|file| candidate_file == file)
+        .unwrap_or(true)
+        && kind_filter
+            .map(|kind| candidate_kind == kind)
+            .unwrap_or(true)
+}
+
+fn sort_usage_matrix_candidates(candidates: &mut [UsageMatrixTargetSelection]) {
+    candidates.sort_by(|left, right| {
+        left.qualified_name
+            .cmp(&right.qualified_name)
+            .then_with(|| left.file_path.cmp(&right.file_path))
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.symbol_id.cmp(&right.symbol_id))
+    });
+}
+
+fn select_usage_matrix_candidate(
+    symbol_query: &str,
+    candidates: &[UsageMatrixTargetSelection],
+) -> Result<Option<UsageMatrixTargetSelection>, AetherMcpError> {
+    match candidates {
+        [] => Ok(None),
+        [candidate] => Ok(Some(candidate.clone())),
+        many => {
+            let candidates = many
+                .iter()
+                .map(format_candidate)
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(AetherMcpError::Message(format!(
+                "symbol '{}' is ambiguous: {}",
+                symbol_query, candidates
+            )))
+        }
+    }
+}
+
+fn not_found_message(
+    symbol_query: &str,
+    file_filter: Option<&str>,
+    kind_filter: Option<&str>,
+) -> String {
+    format!(
+        "symbol '{}' not found{}{}",
+        symbol_query,
+        file_filter
+            .map(|file| format!(" in {file}"))
+            .unwrap_or_default(),
+        kind_filter
+            .map(|kind| format!(" with kind '{kind}'"))
+            .unwrap_or_default()
+    )
+}
+
+fn format_candidate(candidate: &UsageMatrixTargetSelection) -> String {
     format!(
         "{} [{} @ {}]",
         candidate.qualified_name, candidate.kind, candidate.file_path
