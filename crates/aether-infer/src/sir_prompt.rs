@@ -44,7 +44,7 @@ Bad intent example: 'Define a database structure'"
                 .to_owned(),
         );
         sections.push(
-            "If this type has methods (trait methods, impl methods): include a \
+            "If this type has methods (trait methods, impl methods): you MUST include a \
 \"method_dependencies\" field that maps each method name to its specific \
 dependencies as an array of strings. The flat \"dependencies\" array must \
 still contain the union of all method dependencies. Example:\n\
@@ -97,7 +97,7 @@ fn strict_response_contract(context: &SirContext) -> &'static str {
     if is_type_definition(context.kind.as_str()) {
         "Respond with STRICT JSON only (no markdown, no prose) and these fields: \
 intent (string), inputs (array of string), outputs (array of string), side_effects (array of string), dependencies (array of string), error_modes (array of string), confidence (number in [0.0,1.0]).\n\
-For type definitions, you may additionally include method_dependencies (object mapping method names to arrays of string) when the type has methods.\n\
+For type definitions, you MUST include method_dependencies (object mapping method names to arrays of string) when the type has methods.\n\
 Do not add any other keys.\n\n\
 "
     } else {
@@ -112,7 +112,7 @@ fn enriched_response_contract(context: &SirContext) -> &'static str {
     if is_type_definition(context.kind.as_str()) {
         "\n\nRespond with STRICT JSON only. Use fields intent, inputs, outputs,\n\
 side_effects, dependencies, error_modes, confidence. For type definitions,\n\
-you may additionally include method_dependencies when the type has methods.\n\
+you MUST include method_dependencies when the type has methods.\n\
 Do not add any other keys."
     } else {
         "\n\nRespond with STRICT JSON only. Exactly these fields: intent, inputs, outputs,\n\
@@ -254,7 +254,7 @@ mod tests {
         let prompt = build_sir_prompt_for_kind("pub struct State {}", &context);
         assert!(prompt.contains("For type definitions: describe WHY this type exists"));
         assert!(prompt.contains("\"method_dependencies\" field"));
-        assert!(prompt.contains("you may additionally include method_dependencies"));
+        assert!(prompt.contains("you MUST include method_dependencies"));
     }
 
     #[test]
@@ -271,7 +271,7 @@ mod tests {
 
         let prompt = build_sir_prompt_for_kind("pub fn run() {}", &context);
         assert!(prompt.contains("exactly these fields"));
-        assert!(!prompt.contains("you may additionally include method_dependencies"));
+        assert!(!prompt.contains("you MUST include method_dependencies"));
         assert!(!prompt.contains("If this type has methods (trait methods, impl methods)"));
     }
 
@@ -368,7 +368,7 @@ mod tests {
         };
 
         let prompt = build_enriched_sir_prompt("pub trait Store {}", &context, &enrichment);
-        assert!(prompt.contains("you may additionally include method_dependencies"));
+        assert!(prompt.contains("you MUST include method_dependencies"));
         assert!(prompt.contains("\"method_dependencies\" field"));
     }
 
