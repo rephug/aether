@@ -61,11 +61,22 @@ pub struct MethodCluster {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct UsageMatrixTargetSelection {
-    symbol_id: String,
-    qualified_name: String,
-    file_path: String,
-    kind: String,
+pub(crate) struct UsageMatrixTargetSelection {
+    pub(crate) symbol_id: String,
+    pub(crate) qualified_name: String,
+    pub(crate) file_path: String,
+    pub(crate) kind: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct UsageMatrixData {
+    pub(crate) target: String,
+    pub(crate) target_file: String,
+    pub(crate) child_methods: Vec<SymbolRecord>,
+    pub(crate) matrix: Vec<ConsumerRow>,
+    pub(crate) method_consumers: Vec<MethodConsumers>,
+    pub(crate) uncalled_methods: Vec<String>,
+    pub(crate) suggested_clusters: Vec<MethodCluster>,
 }
 
 impl From<SymbolSearchResult> for UsageMatrixTargetSelection {
@@ -114,33 +125,66 @@ impl AetherMcpServer {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| value.to_ascii_lowercase());
+        let target = self.resolve_usage_matrix_target(
+            symbol_query,
+            symbol_id,
+            file_filter.as_deref(),
+            kind_filter.as_deref(),
+        )?;
+
         let store = self.state.store.as_ref();
-
-        let target = if let Some(symbol_id) = symbol_id {
-            self.resolve_usage_matrix_target_by_id(
-                store,
-                symbol_id,
-                file_filter.as_deref(),
-                kind_filter.as_deref(),
-            )?
-        } else {
-            self.resolve_usage_matrix_target_by_name(
-                store,
-                symbol_query,
-                file_filter.as_deref(),
-                kind_filter.as_deref(),
-            )?
-        };
-
         let Some(target_record) = store.get_symbol_record(target.symbol_id.as_str())? else {
             return Err(AetherMcpError::Message(format!(
                 "symbol '{}' could not be resolved after selection",
                 target.symbol_id
             )));
         };
+        let data = self.build_usage_matrix_data(store, &target_record)?;
 
-        let child_methods = child_method_symbols(store, &target_record)?;
-        let method_count = child_methods.len() as u32;
+        Ok(AetherUsageMatrixResponse {
+            schema_version: MEMORY_SCHEMA_VERSION.to_owned(),
+            target: data.target,
+            target_file: data.target_file,
+            method_count: data.child_methods.len() as u32,
+            consumer_count: data.matrix.len() as u32,
+            matrix: data.matrix,
+            method_consumers: data.method_consumers,
+            uncalled_methods: data.uncalled_methods,
+            suggested_clusters: data.suggested_clusters,
+        })
+    }
+
+    pub(crate) fn normalize_usage_matrix_file(
+        &self,
+        raw_file: Option<&str>,
+    ) -> Result<Option<String>, AetherMcpError> {
+        let Some(raw_file) = raw_file.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        normalize_workspace_relative_path(self.workspace(), raw_file, "file").map(Some)
+    }
+
+    pub(crate) fn resolve_usage_matrix_target(
+        &self,
+        symbol_query: &str,
+        symbol_id: Option<&str>,
+        file_filter: Option<&str>,
+        kind_filter: Option<&str>,
+    ) -> Result<UsageMatrixTargetSelection, AetherMcpError> {
+        let store = self.state.store.as_ref();
+        if let Some(symbol_id) = symbol_id {
+            self.resolve_usage_matrix_target_by_id(store, symbol_id, file_filter, kind_filter)
+        } else {
+            self.resolve_usage_matrix_target_by_name(store, symbol_query, file_filter, kind_filter)
+        }
+    }
+
+    pub(crate) fn build_usage_matrix_data(
+        &self,
+        store: &SqliteStore,
+        target_record: &SymbolRecord,
+    ) -> Result<UsageMatrixData, AetherMcpError> {
+        let child_methods = child_method_symbols(store, target_record)?;
         let mut method_edges = HashMap::<String, Vec<(String, String)>>::new();
         let mut caller_symbol_ids = HashSet::<String>::new();
 
@@ -285,27 +329,15 @@ impl AetherMcpServer {
                 .then_with(|| left.cluster_name.cmp(&right.cluster_name))
         });
 
-        Ok(AetherUsageMatrixResponse {
-            schema_version: MEMORY_SCHEMA_VERSION.to_owned(),
+        Ok(UsageMatrixData {
             target: symbol_leaf_name(target_record.qualified_name.as_str()).to_owned(),
-            target_file: target.file_path.clone(),
-            method_count,
-            consumer_count: matrix.len() as u32,
+            target_file: target_record.file_path.clone(),
+            child_methods,
             matrix,
             method_consumers,
             uncalled_methods,
             suggested_clusters,
         })
-    }
-
-    fn normalize_usage_matrix_file(
-        &self,
-        raw_file: Option<&str>,
-    ) -> Result<Option<String>, AetherMcpError> {
-        let Some(raw_file) = raw_file.map(str::trim).filter(|value| !value.is_empty()) else {
-            return Ok(None);
-        };
-        normalize_workspace_relative_path(self.workspace(), raw_file, "file").map(Some)
     }
 
     fn resolve_usage_matrix_target_by_id(

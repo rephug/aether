@@ -29,7 +29,10 @@ pub use output::{
     format_compare_json, format_compare_table, format_crate_explanation, format_hotspots_text,
     format_json, format_table,
 };
-pub use planner::{SplitConfidence, SplitSuggestion, SuggestedModule, suggest_split};
+pub use planner::{
+    ConsumerMethodUsage, CrossCuttingMethod, SplitConfidence, SplitSuggestion, SuggestedModule,
+    SuggestedSubTrait, TraitMethod, TraitSplitSuggestion, suggest_split, suggest_trait_split,
+};
 pub use planner_communities::{
     FileCommunityConfig, FileSymbol, PlannerDiagnostics, detect_file_communities,
 };

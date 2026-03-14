@@ -22,6 +22,7 @@ mod router;
 mod search;
 mod sir;
 mod status;
+mod trait_split;
 mod usage_matrix;
 #[cfg(feature = "verification")]
 mod verification;
@@ -34,6 +35,7 @@ pub use memory::*;
 pub use search::*;
 pub use sir::*;
 pub use status::*;
+pub use trait_split::*;
 pub use usage_matrix::*;
 #[cfg(feature = "verification")]
 pub use verification::*;
