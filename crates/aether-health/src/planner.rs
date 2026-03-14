@@ -12,6 +12,8 @@ const STOPWORDS: &[&str] = &[
     "default", "new", "from", "into", "load", "save", "get", "set", "is", "has", "with", "for",
     "the", "and", "fn", "test", "mock", "impl", "try", "run", "do",
 ];
+const TRAIT_CLUSTER_DEP_UBIQUITY_THRESHOLD: f32 = 0.80;
+const TRAIT_CLUSTER_MERGE_THRESHOLD: f32 = 0.30;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SplitSuggestion {
@@ -249,25 +251,42 @@ pub fn suggest_trait_split(
         .collect::<Vec<_>>();
     uncalled_methods.sort();
 
-    let mut clusters_by_consumers = BTreeMap::<Vec<usize>, Vec<usize>>::new();
-    for (method_index, consumers) in method_consumers.iter().enumerate() {
-        if consumers.is_empty() {
-            continue;
-        }
-        let mut key = consumers.iter().copied().collect::<Vec<_>>();
-        key.sort_unstable();
-        clusters_by_consumers
-            .entry(key)
-            .or_default()
-            .push(method_index);
-    }
+    let called_methods = method_consumers
+        .iter()
+        .enumerate()
+        .filter_map(|(method_index, consumers)| (!consumers.is_empty()).then_some(method_index))
+        .collect::<Vec<_>>();
+    let filtered_dep_sets = build_filtered_dep_sets(
+        methods,
+        method_dependencies,
+        TRAIT_CLUSTER_DEP_UBIQUITY_THRESHOLD,
+    );
+    let dep_backed_called_methods = called_methods
+        .iter()
+        .filter(|method_index| !filtered_dep_sets[**method_index].is_empty())
+        .count();
+    let use_dependency_clustering =
+        !called_methods.is_empty() && dep_backed_called_methods * 2 >= called_methods.len();
 
-    let mut clusters = clusters_by_consumers.into_values().collect::<Vec<_>>();
+    let mut clusters = if use_dependency_clustering {
+        agglomerative_trait_clusters(
+            &method_consumers,
+            &filtered_dep_sets,
+            &called_methods,
+            TRAIT_CLUSTER_MERGE_THRESHOLD,
+        )
+    } else {
+        consumer_only_trait_clusters(&method_consumers, &method_names)
+    };
     for cluster in &mut clusters {
         cluster.sort_by(|left, right| method_names[*left].cmp(&method_names[*right]));
+        cluster.dedup();
     }
-
-    merge_similar_trait_clusters(&mut clusters, &method_consumers, &method_names);
+    clusters.sort_by(|left, right| {
+        trait_cluster_merge_key(left, &method_names)
+            .cmp(&trait_cluster_merge_key(right, &method_names))
+            .then_with(|| right.len().cmp(&left.len()))
+    });
 
     if clusters.is_empty() || (clusters.len() < 2 && uncalled_methods.is_empty()) {
         return None;
@@ -373,7 +392,21 @@ pub fn suggest_trait_split(
             overlapping_clusters.sort();
             cross_cutting_methods.push(CrossCuttingMethod {
                 method: method_names[method_index].clone(),
-                reason: format!("Consumers overlap {} clusters", overlapping_clusters.len()),
+                reason: if use_dependency_clustering {
+                    let home_cluster = cluster_method_sets
+                        .iter()
+                        .enumerate()
+                        .find(|(_, cluster_methods)| cluster_methods.contains(&method_index))
+                        .map(|(index, _)| cluster_names[index].as_str())
+                        .unwrap_or("unknown");
+                    format!(
+                        "Structurally belongs in {} due to shared dependency types, but usage heavily overlaps with {}.",
+                        home_cluster,
+                        overlapping_clusters.join(", ")
+                    )
+                } else {
+                    format!("Consumers overlap {} clusters", overlapping_clusters.len())
+                },
                 overlapping_clusters,
             });
         }
@@ -384,7 +417,9 @@ pub fn suggest_trait_split(
         .iter()
         .filter(|suggestion| suggestion.consumer_isolation < 0.3)
         .count();
-    let confidence = if !suggested_traits.is_empty()
+    let confidence = if !use_dependency_clustering {
+        SplitConfidence::Low
+    } else if !suggested_traits.is_empty()
         && suggested_traits
             .iter()
             .all(|suggestion| suggestion.consumer_isolation >= 0.6)
@@ -565,6 +600,186 @@ fn split_confidence(confidence: f32) -> SplitConfidence {
     }
 }
 
+fn consumer_only_trait_clusters(
+    method_consumers: &[HashSet<usize>],
+    method_names: &[String],
+) -> Vec<Vec<usize>> {
+    let mut clusters_by_consumers = BTreeMap::<Vec<usize>, Vec<usize>>::new();
+    for (method_index, consumers) in method_consumers.iter().enumerate() {
+        if consumers.is_empty() {
+            continue;
+        }
+        let mut key = consumers.iter().copied().collect::<Vec<_>>();
+        key.sort_unstable();
+        clusters_by_consumers
+            .entry(key)
+            .or_default()
+            .push(method_index);
+    }
+
+    let mut clusters = clusters_by_consumers.into_values().collect::<Vec<_>>();
+    for cluster in &mut clusters {
+        cluster.sort_by(|left, right| method_names[*left].cmp(&method_names[*right]));
+    }
+
+    merge_similar_trait_clusters(&mut clusters, method_consumers, method_names);
+    clusters
+}
+
+/// Build filtered dependency type sets per method, removing ubiquitous types.
+/// Returns one HashSet<String> per method (indexed by method position).
+/// Methods with no dependency data get an empty set.
+fn build_filtered_dep_sets(
+    methods: &[TraitMethod],
+    method_dependencies: Option<&HashMap<String, Vec<String>>>,
+    ubiquity_threshold: f32,
+) -> Vec<HashSet<String>> {
+    let Some(method_dependencies) = method_dependencies else {
+        return vec![HashSet::new(); methods.len()];
+    };
+
+    let mut dep_sets = methods
+        .iter()
+        .map(|method| {
+            method_dependency_values(method, method_dependencies)
+                .iter()
+                .filter_map(|dependency| {
+                    let display = display_dependency_name(dependency);
+                    (!display.is_empty()).then_some(display)
+                })
+                .collect::<HashSet<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    let methods_with_deps = dep_sets.iter().filter(|deps| !deps.is_empty()).count();
+    if methods_with_deps == 0 {
+        return dep_sets;
+    }
+
+    let mut counts = HashMap::<String, usize>::new();
+    for dep_set in &dep_sets {
+        for dependency in dep_set {
+            *counts.entry(dependency.clone()).or_default() += 1;
+        }
+    }
+
+    let stoplist = counts
+        .into_iter()
+        .filter_map(|(dependency, count)| {
+            ((count as f32 / methods_with_deps as f32) > ubiquity_threshold).then_some(dependency)
+        })
+        .collect::<HashSet<_>>();
+
+    if stoplist.is_empty() {
+        return dep_sets;
+    }
+
+    for dep_set in &mut dep_sets {
+        dep_set.retain(|dependency| !stoplist.contains(dependency));
+    }
+
+    dep_sets
+}
+
+/// Compute fused similarity between two methods.
+/// Score = 0.75 * dep_jaccard + 0.25 * consumer_jaccard
+/// Utility fallback: if BOTH dep sets are empty, use consumer_jaccard only.
+fn fused_similarity(
+    dep_set_a: &HashSet<String>,
+    dep_set_b: &HashSet<String>,
+    consumer_set_a: &HashSet<usize>,
+    consumer_set_b: &HashSet<usize>,
+) -> f32 {
+    let consumer_jaccard = jaccard_similarity(consumer_set_a, consumer_set_b);
+    if dep_set_a.is_empty() && dep_set_b.is_empty() {
+        return consumer_jaccard;
+    }
+
+    let dep_jaccard = jaccard_similarity(dep_set_a, dep_set_b);
+    0.75 * dep_jaccard + 0.25 * consumer_jaccard
+}
+
+/// Agglomerative hierarchical clustering with average linkage.
+/// Returns cluster assignments as Vec<Vec<usize>> where each inner vec
+/// contains method indices drawn from called_methods.
+fn agglomerative_trait_clusters(
+    method_consumers: &[HashSet<usize>],
+    method_deps: &[HashSet<String>],
+    called_methods: &[usize],
+    merge_threshold: f32,
+) -> Vec<Vec<usize>> {
+    let mut clusters = called_methods
+        .iter()
+        .copied()
+        .map(|method_index| vec![method_index])
+        .collect::<Vec<_>>();
+
+    loop {
+        let mut best_merge: Option<(usize, usize)> = None;
+        let mut best_score = -1.0_f32;
+
+        for left_index in 0..clusters.len() {
+            for right_index in (left_index + 1)..clusters.len() {
+                let mut total_score = 0.0_f32;
+                let mut pair_count = 0_usize;
+                for method_a in &clusters[left_index] {
+                    for method_b in &clusters[right_index] {
+                        total_score += fused_similarity(
+                            &method_deps[*method_a],
+                            &method_deps[*method_b],
+                            &method_consumers[*method_a],
+                            &method_consumers[*method_b],
+                        );
+                        pair_count += 1;
+                    }
+                }
+
+                if pair_count == 0 {
+                    continue;
+                }
+                let score = total_score / pair_count as f32;
+                let is_better = if score > best_score {
+                    true
+                } else if score < best_score {
+                    false
+                } else if let Some((best_left, best_right)) = best_merge {
+                    let left_key = trait_cluster_index_key(clusters[left_index].as_slice());
+                    let best_left_key = trait_cluster_index_key(clusters[best_left].as_slice());
+                    let right_key = trait_cluster_index_key(clusters[right_index].as_slice());
+                    let best_right_key = trait_cluster_index_key(clusters[best_right].as_slice());
+                    left_key < best_left_key
+                        || (left_key == best_left_key && right_key < best_right_key)
+                } else {
+                    true
+                };
+                if is_better {
+                    best_score = score;
+                    best_merge = Some((left_index, right_index));
+                }
+            }
+        }
+
+        let Some((left_index, right_index)) = best_merge else {
+            break;
+        };
+        if best_score < merge_threshold {
+            break;
+        }
+
+        let moved = clusters.remove(right_index);
+        clusters[left_index].extend(moved);
+        clusters[left_index].sort_unstable();
+        clusters[left_index].dedup();
+    }
+
+    clusters.sort_by(|left, right| {
+        trait_cluster_index_key(left)
+            .cmp(&trait_cluster_index_key(right))
+            .then_with(|| right.len().cmp(&left.len()))
+    });
+    clusters
+}
+
 fn merge_similar_trait_clusters(
     clusters: &mut Vec<Vec<usize>>,
     method_consumers: &[HashSet<usize>],
@@ -656,6 +871,10 @@ fn trait_cluster_merge_key(cluster: &[usize], method_names: &[String]) -> String
         .to_owned()
 }
 
+fn trait_cluster_index_key(cluster: &[usize]) -> usize {
+    cluster.iter().copied().min().unwrap_or(usize::MAX)
+}
+
 fn cluster_consumer_union(
     cluster: &[usize],
     method_consumers: &[HashSet<usize>],
@@ -695,7 +914,7 @@ fn cluster_isolation(
     exclusive_consumers as f32 / cluster_consumers.len() as f32
 }
 
-fn jaccard_similarity(left: &HashSet<usize>, right: &HashSet<usize>) -> f32 {
+fn jaccard_similarity<T: Eq + std::hash::Hash>(left: &HashSet<T>, right: &HashSet<T>) -> f32 {
     if left.is_empty() && right.is_empty() {
         return 1.0;
     }
@@ -940,13 +1159,14 @@ fn display_trait_method_name(method: &TraitMethod) -> String {
 mod tests {
     use super::{
         ConsumerMethodUsage, FileCommunityConfig, FileSymbol, SplitConfidence, TraitMethod,
-        disambiguated_module_names, fallback_module_name, module_name_for_tokens, normalize_token,
-        ranked_tokens, split_confidence, suggest_split, suggest_trait_split, suggested_file_path,
+        agglomerative_trait_clusters, build_filtered_dep_sets, disambiguated_module_names,
+        fallback_module_name, module_name_for_tokens, normalize_token, ranked_tokens,
+        split_confidence, suggest_split, suggest_trait_split, suggested_file_path,
     };
     use crate::planner_communities::detect_file_communities;
     use aether_core::SymbolKind;
     use aether_graph_algo::GraphAlgorithmEdge;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     fn config() -> FileCommunityConfig {
         FileCommunityConfig {
@@ -992,6 +1212,10 @@ mod tests {
                 .map(|method| (*method).to_owned())
                 .collect(),
         }
+    }
+
+    fn consumer_set(consumer_indices: &[usize]) -> HashSet<usize> {
+        consumer_indices.iter().copied().collect()
     }
 
     #[test]
@@ -1360,5 +1584,153 @@ mod tests {
                     || cluster.dominant_dependencies
                         == vec!["SirMetaRecord".to_owned(), "SirBlob".to_owned()])
         );
+    }
+
+    #[test]
+    fn trait_split_two_signal_clustering_uses_dependencies() {
+        let methods = vec![
+            trait_method("load_sir"),
+            trait_method("save_sir"),
+            trait_method("list_symbols"),
+            trait_method("delete_symbols"),
+            trait_method("heartbeat"),
+        ];
+        let method_dependencies = HashMap::from([
+            (
+                "load_sir".to_owned(),
+                vec![
+                    "StoreError".to_owned(),
+                    "SirBlob".to_owned(),
+                    "SirMetaRecord".to_owned(),
+                ],
+            ),
+            (
+                "save_sir".to_owned(),
+                vec![
+                    "StoreError".to_owned(),
+                    "SirBlob".to_owned(),
+                    "SirMetaRecord".to_owned(),
+                ],
+            ),
+            (
+                "list_symbols".to_owned(),
+                vec!["StoreError".to_owned(), "SymbolRecord".to_owned()],
+            ),
+            (
+                "delete_symbols".to_owned(),
+                vec!["StoreError".to_owned(), "SymbolRecord".to_owned()],
+            ),
+            (
+                "heartbeat".to_owned(),
+                vec!["StoreError".to_owned(), "MetricsState".to_owned()],
+            ),
+        ]);
+        let filtered_dep_sets = build_filtered_dep_sets(&methods, Some(&method_dependencies), 0.80);
+        assert!(!filtered_dep_sets[0].contains("StoreError"));
+        assert_eq!(
+            filtered_dep_sets[0],
+            HashSet::from(["SirBlob".to_owned(), "SirMetaRecord".to_owned(),])
+        );
+
+        let consumers = vec![
+            consumer_usage("src/load_consumer.rs", &["load_sir"]),
+            consumer_usage("src/save_consumer.rs", &["save_sir"]),
+            consumer_usage("src/list_consumer.rs", &["list_symbols"]),
+            consumer_usage("src/delete_consumer.rs", &["delete_symbols"]),
+            consumer_usage("src/heartbeat_consumer.rs", &["heartbeat"]),
+        ];
+        let suggestion = suggest_trait_split(
+            "Store",
+            "src/store.rs",
+            &methods,
+            &consumers,
+            Some(&method_dependencies),
+        )
+        .expect("trait split suggestion");
+
+        let mut clusters = suggestion
+            .suggested_traits
+            .iter()
+            .map(|cluster| cluster.methods.clone())
+            .collect::<Vec<_>>();
+        clusters.sort();
+        assert_eq!(
+            clusters,
+            vec![
+                vec!["delete_symbols".to_owned(), "list_symbols".to_owned()],
+                vec!["heartbeat".to_owned()],
+                vec!["load_sir".to_owned(), "save_sir".to_owned()],
+            ]
+        );
+        assert!(matches!(
+            suggestion.confidence,
+            SplitConfidence::High | SplitConfidence::Medium
+        ));
+    }
+
+    #[test]
+    fn agglomerative_trait_clusters_fall_back_to_consumer_similarity_for_utilities() {
+        let methods = vec![
+            trait_method("alpha"),
+            trait_method("beta"),
+            trait_method("gamma"),
+        ];
+        let method_dependencies = HashMap::from([
+            ("alpha".to_owned(), vec!["StoreError".to_owned()]),
+            ("beta".to_owned(), vec!["StoreError".to_owned()]),
+            ("gamma".to_owned(), vec!["StoreError".to_owned()]),
+        ]);
+        let filtered_dep_sets = build_filtered_dep_sets(&methods, Some(&method_dependencies), 0.80);
+        assert!(filtered_dep_sets.iter().all(HashSet::is_empty));
+
+        let method_consumers = vec![
+            consumer_set(&[0, 1]),
+            consumer_set(&[0, 1]),
+            consumer_set(&[2]),
+        ];
+        let clusters =
+            agglomerative_trait_clusters(&method_consumers, &filtered_dep_sets, &[0, 1, 2], 0.30);
+        assert_eq!(clusters, vec![vec![0, 1], vec![2]]);
+    }
+
+    #[test]
+    fn trait_split_gracefully_degrades_when_dependency_coverage_is_sparse() {
+        let methods = vec![
+            trait_method("alpha"),
+            trait_method("beta"),
+            trait_method("gamma"),
+            trait_method("delta"),
+        ];
+        let consumers = vec![
+            consumer_usage("src/consumer_a.rs", &["alpha", "beta", "gamma"]),
+            consumer_usage("src/consumer_b.rs", &["beta", "gamma", "delta"]),
+        ];
+        let method_dependencies =
+            HashMap::from([("alpha".to_owned(), vec!["AlphaRecord".to_owned()])]);
+
+        let suggestion = suggest_trait_split(
+            "Store",
+            "src/store.rs",
+            &methods,
+            &consumers,
+            Some(&method_dependencies),
+        )
+        .expect("trait split suggestion");
+
+        let mut clusters = suggestion
+            .suggested_traits
+            .iter()
+            .map(|cluster| cluster.methods.clone())
+            .collect::<Vec<_>>();
+        clusters.sort();
+        assert_eq!(
+            clusters,
+            vec![
+                vec!["alpha".to_owned()],
+                vec!["beta".to_owned(), "gamma".to_owned()],
+                vec!["delta".to_owned()],
+            ]
+        );
+        assert_eq!(suggestion.confidence, SplitConfidence::Low);
     }
 }
