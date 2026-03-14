@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,9 +16,9 @@ use aether_mcp::{
     AetherExplainRequest, AetherGetSirRequest, AetherHealthExplainRequest,
     AetherHealthHotspotsRequest, AetherHealthRequest, AetherMcpServer, AetherRecallRequest,
     AetherRememberRequest, AetherSearchRequest, AetherSymbolLookupRequest,
-    AetherSymbolTimelineRequest, AetherTestIntentsRequest, AetherWhyChangedReason,
-    AetherWhyChangedRequest, AetherWhySelectorMode, MCP_SCHEMA_VERSION, MEMORY_SCHEMA_VERSION,
-    SirLevelRequest,
+    AetherSymbolTimelineRequest, AetherTestIntentsRequest, AetherUsageMatrixRequest,
+    AetherWhyChangedReason, AetherWhyChangedRequest, AetherWhySelectorMode, MCP_SCHEMA_VERSION,
+    MEMORY_SCHEMA_VERSION, SharedState, SirLevelRequest,
 };
 #[cfg(feature = "verification")]
 use aether_mcp::{AetherVerifyMode, AetherVerifyRequest};
@@ -73,6 +74,17 @@ fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn unique_env_name(prefix: &str) -> String {
+    format!(
+        "{prefix}_{}_{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    )
 }
 
 fn seed_health_workspace(workspace: &Path, graph_backend: GraphBackend) -> Result<()> {
@@ -840,9 +852,12 @@ vector_backend = "sqlite"
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
     assert!(beta_edges.found);
+    assert!(!beta_edges.aggregated);
+    assert_eq!(beta_edges.child_method_count, 0);
     assert_eq!(beta_edges.caller_count, 1);
     assert_eq!(beta_edges.callers.len(), 1);
     assert_eq!(beta_edges.callers[0].qualified_name, "alpha");
+    assert_eq!(beta_edges.callers[0].methods_called, None);
 
     let alpha_edges = rt
         .block_on(
@@ -853,12 +868,20 @@ vector_backend = "sqlite"
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
     assert!(alpha_edges.found);
+    assert!(!alpha_edges.aggregated);
+    assert_eq!(alpha_edges.child_method_count, 0);
     assert_eq!(alpha_edges.dependency_count, 1);
     assert!(
         alpha_edges
             .dependencies
             .iter()
             .any(|edge| edge.qualified_name == "beta")
+    );
+    assert!(
+        alpha_edges
+            .dependencies
+            .iter()
+            .all(|edge| edge.referencing_methods.is_none())
     );
 
     let call_chain = rt
@@ -875,6 +898,250 @@ vector_backend = "sqlite"
     assert_eq!(call_chain.levels[0][0].qualified_name, "beta");
     assert_eq!(call_chain.levels[1][0].qualified_name, "gamma");
     assert_eq!(call_chain.levels[2][0].qualified_name, "delta");
+
+    Ok(())
+}
+
+#[test]
+fn mcp_usage_matrix_reports_consumers_clusters_and_uncalled_methods() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    write_test_config(workspace);
+
+    fs::create_dir_all(workspace.join("src"))?;
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "mod consumer_a;\nmod consumer_b;\nmod consumer_c;\npub mod store;\n\npub use consumer_a::run_a;\npub use consumer_b::run_b;\npub use consumer_c::run_c;\n",
+    )?;
+    fs::write(
+        workspace.join("src/store.rs"),
+        "pub struct ExampleStore;\n\nimpl ExampleStore {\n    pub fn alpha() -> i32 { 1 }\n    pub fn beta() -> i32 { 2 }\n    pub fn gamma() -> i32 { 3 }\n    pub fn delta() -> i32 { 4 }\n}\n",
+    )?;
+    fs::write(
+        workspace.join("src/consumer_a.rs"),
+        "use crate::store::ExampleStore;\n\npub fn run_a() -> i32 {\n    ExampleStore::alpha() + ExampleStore::beta()\n}\n",
+    )?;
+    fs::write(
+        workspace.join("src/consumer_b.rs"),
+        "use crate::store::ExampleStore;\n\npub fn run_b() -> i32 {\n    ExampleStore::alpha() + ExampleStore::beta()\n}\n",
+    )?;
+    fs::write(
+        workspace.join("src/consumer_c.rs"),
+        "use crate::store::ExampleStore;\n\npub fn run_c() -> i32 {\n    ExampleStore::gamma()\n}\n",
+    )?;
+
+    run_index_and_seed_sir(workspace)?;
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+    let response = rt
+        .block_on(
+            server.aether_usage_matrix(Parameters(AetherUsageMatrixRequest {
+                symbol: "ExampleStore".to_owned(),
+                file: Some("src/store.rs".to_owned()),
+                kind: Some("struct".to_owned()),
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+
+    assert_eq!(response.schema_version, MEMORY_SCHEMA_VERSION);
+    assert_eq!(response.target_file, "src/store.rs");
+    assert_eq!(response.method_count, 4);
+    assert_eq!(response.consumer_count, 3);
+    assert_eq!(response.uncalled_methods, vec!["delta".to_owned()]);
+
+    let matrix_by_file = response
+        .matrix
+        .iter()
+        .map(|row| (row.consumer_file.clone(), row.methods_used.clone()))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        matrix_by_file.get("src/consumer_a.rs"),
+        Some(&vec!["alpha".to_owned(), "beta".to_owned()])
+    );
+    assert_eq!(
+        matrix_by_file.get("src/consumer_b.rs"),
+        Some(&vec!["alpha".to_owned(), "beta".to_owned()])
+    );
+    assert_eq!(
+        matrix_by_file.get("src/consumer_c.rs"),
+        Some(&vec!["gamma".to_owned()])
+    );
+
+    let method_consumers = response
+        .method_consumers
+        .iter()
+        .map(|row| (row.method.clone(), row.consumer_files.clone()))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        method_consumers.get("alpha"),
+        Some(&vec![
+            "src/consumer_a.rs".to_owned(),
+            "src/consumer_b.rs".to_owned()
+        ])
+    );
+    assert_eq!(
+        method_consumers.get("beta"),
+        Some(&vec![
+            "src/consumer_a.rs".to_owned(),
+            "src/consumer_b.rs".to_owned()
+        ])
+    );
+    assert_eq!(
+        method_consumers.get("gamma"),
+        Some(&vec!["src/consumer_c.rs".to_owned()])
+    );
+    assert_eq!(method_consumers.get("delta"), Some(&Vec::new()));
+
+    let cluster = response
+        .suggested_clusters
+        .iter()
+        .find(|cluster| cluster.methods == vec!["alpha".to_owned(), "beta".to_owned()])
+        .expect("alpha/beta cluster");
+    assert_eq!(
+        cluster.shared_consumers,
+        vec![
+            "src/consumer_a.rs".to_owned(),
+            "src/consumer_b.rs".to_owned()
+        ]
+    );
+    assert!(cluster.reason.contains("src/consumer_a.rs"));
+    assert!(cluster.reason.contains("src/consumer_b.rs"));
+
+    Ok(())
+}
+
+#[test]
+fn mcp_dependencies_aggregate_type_level_call_relationships() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    write_test_config(workspace);
+
+    fs::create_dir_all(workspace.join("src"))?;
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "pub struct Calc;\n\nimpl Calc {\n    pub fn alpha() -> i32 { helper_one() }\n    pub fn beta() -> i32 { helper_one() + helper_two() }\n    pub fn gamma() -> i32 { helper_two() }\n}\n\npub fn helper_one() -> i32 { 1 }\npub fn helper_two() -> i32 { 2 }\n\npub fn run_x() -> i32 {\n    Calc::alpha() + Calc::beta()\n}\n\npub fn run_y() -> i32 {\n    Calc::beta()\n}\n",
+    )?;
+
+    run_index_and_seed_sir(workspace)?;
+
+    let store = SqliteStore::open(workspace)?;
+    let calc_id = store
+        .list_symbols_for_file("src/lib.rs")?
+        .into_iter()
+        .find(|symbol| symbol.qualified_name == "Calc")
+        .expect("Calc symbol should exist")
+        .id;
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+    let response = rt
+        .block_on(
+            server
+                .aether_dependencies(Parameters(AetherDependenciesRequest { symbol_id: calc_id })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+
+    assert!(response.found);
+    assert!(response.aggregated);
+    assert_eq!(response.child_method_count, 3);
+    assert_eq!(response.caller_count, 2);
+    assert_eq!(response.dependency_count, 2);
+
+    let callers = response
+        .callers
+        .iter()
+        .map(|row| (row.qualified_name.clone(), row.methods_called))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(callers.get("run_x"), Some(&Some(2)));
+    assert_eq!(callers.get("run_y"), Some(&Some(1)));
+
+    let dependencies = response
+        .dependencies
+        .iter()
+        .map(|row| (row.qualified_name.clone(), row.referencing_methods))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(dependencies.get("helper_one"), Some(&Some(2)));
+    assert_eq!(dependencies.get("helper_two"), Some(&Some(2)));
+
+    Ok(())
+}
+
+#[test]
+fn mcp_search_hybrid_falls_back_when_embedding_api_key_is_missing() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    write_test_config(workspace);
+
+    fs::create_dir_all(workspace.join("src"))?;
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "pub fn alpha_search_target() -> i32 { 1 }\n",
+    )?;
+    run_initial_index_once(&IndexerConfig {
+        workspace: workspace.to_path_buf(),
+        debounce_ms: 300,
+        print_events: false,
+        print_sir: false,
+        sir_concurrency: 2,
+        lifecycle_logs: false,
+        force: false,
+        full: false,
+        deep: false,
+        dry_run: false,
+        inference_provider: None,
+        inference_model: None,
+        inference_endpoint: None,
+        inference_api_key_env: None,
+        embeddings_only: false,
+    })?;
+
+    let env_name = unique_env_name("AETHER_TEST_MCP_MISSING_EMBED_KEY");
+    unsafe {
+        std::env::remove_var(&env_name);
+    }
+
+    let mut config = AetherConfig::default();
+    config.storage.graph_backend = GraphBackend::Sqlite;
+    config.embeddings.enabled = true;
+    config.embeddings.provider = EmbeddingProviderKind::OpenAiCompat;
+    config.embeddings.vector_backend = EmbeddingVectorBackend::Sqlite;
+    config.embeddings.model = Some("text-embedding-3-large".to_owned());
+    config.embeddings.endpoint = Some("https://example.invalid/v1".to_owned());
+    config.embeddings.api_key_env = Some(env_name.clone());
+    save_workspace_config(workspace, &config)?;
+
+    let state = SharedState::open_readwrite(workspace)?;
+    assert!(!state.semantic_search_available);
+
+    let expected_reason = format!(
+        "Embedding API key not configured. Register MCP server with --env {env_name}=<value> to enable semantic search."
+    );
+    let server = AetherMcpServer::from_state(std::sync::Arc::new(state), false);
+    let rt = Runtime::new()?;
+    let response = rt
+        .block_on(server.aether_search(Parameters(AetherSearchRequest {
+            query: "alpha_search_target".to_owned(),
+            limit: Some(10),
+            mode: Some(SearchMode::Hybrid),
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+
+    assert_eq!(response.mode_requested, SearchMode::Hybrid);
+    assert_eq!(response.mode_used, SearchMode::Lexical);
+    assert_eq!(
+        response.fallback_reason.as_deref(),
+        Some(expected_reason.as_str())
+    );
+    assert!(
+        response
+            .matches
+            .iter()
+            .any(|row| row.qualified_name.contains("alpha_search_target"))
+    );
 
     Ok(())
 }

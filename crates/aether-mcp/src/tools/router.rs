@@ -13,7 +13,8 @@ use super::{
     AetherSearchRequest, AetherSearchResponse, AetherSessionNoteResponse, AetherStatusResponse,
     AetherSymbolLookupRequest, AetherSymbolLookupResponse, AetherSymbolTimelineRequest,
     AetherSymbolTimelineResponse, AetherTestIntentsRequest, AetherTestIntentsResponse,
-    AetherTextResponse, AetherTraceCauseRequest, AetherTraceCauseResponse, AetherWhyChangedRequest,
+    AetherTextResponse, AetherTraceCauseRequest, AetherTraceCauseResponse,
+    AetherUsageMatrixRequest, AetherUsageMatrixResponse, AetherWhyChangedRequest,
     AetherWhyChangedResponse, SERVER_DESCRIPTION, SERVER_NAME, SERVER_VERSION,
 };
 #[cfg(feature = "verification")]
@@ -65,6 +66,23 @@ impl AetherMcpServer {
         self.verbose_log("MCP tool called: aether_dependencies");
         self.aether_dependencies_logic(request)
             .await
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_usage_matrix",
+        description = "Get a consumer-by-method usage matrix for a trait or struct, showing which files call which methods and suggesting method clusters for trait decomposition"
+    )]
+    pub async fn aether_usage_matrix(
+        &self,
+        Parameters(request): Parameters<AetherUsageMatrixRequest>,
+    ) -> Result<Json<AetherUsageMatrixResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_usage_matrix");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_usage_matrix_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)
             .map_err(to_mcp_error)
     }

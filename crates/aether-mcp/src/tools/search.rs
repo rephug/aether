@@ -19,7 +19,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{AetherMcpServer, effective_limit};
+use super::{AetherMcpServer, child_method_symbols, effective_limit, is_type_symbol_kind};
+use crate::state::semantic_search_unavailability;
 use crate::{AetherMcpError, SearchMode};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -58,10 +59,34 @@ pub struct AetherDependenciesRequest {
 pub struct AetherDependenciesResponse {
     pub symbol_id: String,
     pub found: bool,
+    pub aggregated: bool,
+    pub child_method_count: u32,
     pub caller_count: u32,
     pub dependency_count: u32,
-    pub callers: Vec<AetherSymbolLookupMatch>,
-    pub dependencies: Vec<AetherSymbolLookupMatch>,
+    pub callers: Vec<AetherDependencyCaller>,
+    pub dependencies: Vec<AetherDependencyTarget>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherDependencyCaller {
+    pub symbol_id: String,
+    pub qualified_name: String,
+    pub file_path: String,
+    pub language: String,
+    pub kind: String,
+    pub semantic_score: Option<f32>,
+    pub methods_called: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherDependencyTarget {
+    pub symbol_id: String,
+    pub qualified_name: String,
+    pub file_path: String,
+    pub language: String,
+    pub kind: String,
+    pub semantic_score: Option<f32>,
+    pub referencing_methods: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -177,6 +202,34 @@ impl From<SymbolRecord> for AetherSymbolLookupMatch {
     }
 }
 
+impl From<SymbolRecord> for AetherDependencyCaller {
+    fn from(value: SymbolRecord) -> Self {
+        Self {
+            symbol_id: value.id,
+            qualified_name: value.qualified_name,
+            file_path: value.file_path,
+            language: value.language,
+            kind: value.kind,
+            semantic_score: None,
+            methods_called: None,
+        }
+    }
+}
+
+impl From<SymbolRecord> for AetherDependencyTarget {
+    fn from(value: SymbolRecord) -> Self {
+        Self {
+            symbol_id: value.id,
+            qualified_name: value.qualified_name,
+            file_path: value.file_path,
+            language: value.language,
+            kind: value.kind,
+            semantic_score: None,
+            referencing_methods: None,
+        }
+    }
+}
+
 impl AetherMcpServer {
     pub fn aether_symbol_lookup_logic(
         &self,
@@ -204,56 +257,110 @@ impl AetherMcpServer {
     ) -> Result<AetherDependenciesResponse, AetherMcpError> {
         let symbol_id = request.symbol_id.trim();
         if symbol_id.is_empty() {
-            return Ok(AetherDependenciesResponse {
-                symbol_id: String::new(),
-                found: false,
-                caller_count: 0,
-                dependency_count: 0,
-                callers: Vec::new(),
-                dependencies: Vec::new(),
-            });
+            return Ok(empty_dependencies_response(String::new()));
         }
 
         if !self.sqlite_path().exists() {
-            return Ok(AetherDependenciesResponse {
-                symbol_id: symbol_id.to_owned(),
-                found: false,
-                caller_count: 0,
-                dependency_count: 0,
-                callers: Vec::new(),
-                dependencies: Vec::new(),
-            });
+            return Ok(empty_dependencies_response(symbol_id.to_owned()));
         }
 
         let store = self.state.store.as_ref();
         let Some(symbol) = store.get_symbol_record(symbol_id)? else {
-            return Ok(AetherDependenciesResponse {
-                symbol_id: symbol_id.to_owned(),
-                found: false,
-                caller_count: 0,
-                dependency_count: 0,
-                callers: Vec::new(),
-                dependencies: Vec::new(),
-            });
+            return Ok(empty_dependencies_response(symbol_id.to_owned()));
         };
 
         let graph_store = self.state.graph.as_ref();
-        let callers = graph_store
-            .get_callers(&symbol.qualified_name)
-            .await?
-            .into_iter()
-            .map(AetherSymbolLookupMatch::from)
+        if !is_type_symbol_kind(symbol.kind.as_str()) {
+            let callers = graph_store
+                .get_callers(&symbol.qualified_name)
+                .await?
+                .into_iter()
+                .map(AetherDependencyCaller::from)
+                .collect::<Vec<_>>();
+            let dependencies = graph_store
+                .get_dependencies(&symbol.id)
+                .await?
+                .into_iter()
+                .map(AetherDependencyTarget::from)
+                .collect::<Vec<_>>();
+
+            return Ok(AetherDependenciesResponse {
+                symbol_id: symbol_id.to_owned(),
+                found: true,
+                aggregated: false,
+                child_method_count: 0,
+                caller_count: callers.len() as u32,
+                dependency_count: dependencies.len() as u32,
+                callers,
+                dependencies,
+            });
+        }
+
+        let child_methods = child_method_symbols(store, &symbol)?;
+        let child_method_count = child_methods.len() as u32;
+
+        let mut callers_by_id = HashMap::<String, (SymbolRecord, HashSet<String>)>::new();
+        let mut dependencies_by_id = HashMap::<String, (SymbolRecord, HashSet<String>)>::new();
+
+        for child_method in &child_methods {
+            let child_key = child_method.id.clone();
+
+            for caller in graph_store
+                .get_callers(child_method.qualified_name.as_str())
+                .await?
+            {
+                let entry = callers_by_id
+                    .entry(caller.id.clone())
+                    .or_insert_with(|| (caller, HashSet::new()));
+                entry.1.insert(child_key.clone());
+            }
+
+            for dependency in graph_store
+                .get_dependencies(child_method.id.as_str())
+                .await?
+            {
+                let entry = dependencies_by_id
+                    .entry(dependency.id.clone())
+                    .or_insert_with(|| (dependency, HashSet::new()));
+                entry.1.insert(child_key.clone());
+            }
+        }
+
+        let mut callers = callers_by_id
+            .into_values()
+            .map(|(record, child_methods)| AetherDependencyCaller {
+                methods_called: Some(child_methods.len() as u32),
+                ..AetherDependencyCaller::from(record)
+            })
             .collect::<Vec<_>>();
-        let dependencies = graph_store
-            .get_dependencies(&symbol.id)
-            .await?
-            .into_iter()
-            .map(AetherSymbolLookupMatch::from)
+        callers.sort_by(|left, right| {
+            right
+                .methods_called
+                .cmp(&left.methods_called)
+                .then_with(|| left.qualified_name.cmp(&right.qualified_name))
+                .then_with(|| left.symbol_id.cmp(&right.symbol_id))
+        });
+
+        let mut dependencies = dependencies_by_id
+            .into_values()
+            .map(|(record, child_methods)| AetherDependencyTarget {
+                referencing_methods: Some(child_methods.len() as u32),
+                ..AetherDependencyTarget::from(record)
+            })
             .collect::<Vec<_>>();
+        dependencies.sort_by(|left, right| {
+            right
+                .referencing_methods
+                .cmp(&left.referencing_methods)
+                .then_with(|| left.qualified_name.cmp(&right.qualified_name))
+                .then_with(|| left.symbol_id.cmp(&right.symbol_id))
+        });
 
         Ok(AetherDependenciesResponse {
             symbol_id: symbol_id.to_owned(),
             found: true,
+            aggregated: true,
+            child_method_count,
             caller_count: callers.len() as u32,
             dependency_count: dependencies.len() as u32,
             callers,
@@ -373,6 +480,11 @@ impl AetherMcpServer {
         .map_err(|err| AetherMcpError::Message(format!("search join: {err}")))??;
         let reranker_kind = search_config_ref.search.reranker;
         let rerank_window = search_config_ref.search.rerank_window;
+        let semantic_unavailability = if self.state.semantic_search_available {
+            None
+        } else {
+            semantic_search_unavailability(search_config_ref)
+        };
 
         let envelope = match mode_requested {
             SearchMode::Lexical => SearchEnvelope {
@@ -382,6 +494,19 @@ impl AetherMcpServer {
                 matches: lexical,
             },
             SearchMode::Semantic => {
+                if let Some(unavailability) = semantic_unavailability.as_ref() {
+                    return Ok(AetherSearchResponse::from_search_envelope(
+                        request.query,
+                        limit,
+                        SearchEnvelope {
+                            mode_requested: SearchMode::Semantic,
+                            mode_used: SearchMode::Lexical,
+                            fallback_reason: Some(unavailability.fallback_reason()),
+                            matches: lexical,
+                        },
+                    ));
+                }
+
                 let (semantic, fallback_reason) = self
                     .semantic_search_matches(&request.query, retrieval_limit)
                     .await?;
@@ -402,6 +527,19 @@ impl AetherMcpServer {
                 }
             }
             SearchMode::Hybrid => {
+                if let Some(unavailability) = semantic_unavailability.as_ref() {
+                    return Ok(AetherSearchResponse::from_search_envelope(
+                        request.query,
+                        limit,
+                        SearchEnvelope {
+                            mode_requested: SearchMode::Hybrid,
+                            mode_used: SearchMode::Lexical,
+                            fallback_reason: Some(unavailability.fallback_reason()),
+                            matches: lexical,
+                        },
+                    ));
+                }
+
                 let (semantic, fallback_reason) = self
                     .semantic_search_matches(&request.query, retrieval_limit)
                     .await?;
@@ -477,6 +615,14 @@ impl AetherMcpServer {
             ));
         }
 
+        let store = self.state.store.as_ref();
+        if store.list_all_symbol_ids()?.is_empty() {
+            return Ok((
+                Vec::new(),
+                Some(SEARCH_FALLBACK_SEMANTIC_INDEX_NOT_READY.to_owned()),
+            ));
+        }
+
         let loaded = load_embedding_provider_from_config(
             self.workspace(),
             EmbeddingProviderOverrides::default(),
@@ -527,7 +673,6 @@ impl AetherMcpServer {
             ));
         }
 
-        let store = self.state.store.as_ref();
         let mut matches = Vec::new();
         for candidate in candidates {
             let Some(symbol) = store.get_symbol_search_result(&candidate.symbol_id)? else {
@@ -709,6 +854,19 @@ impl AetherMcpServer {
         };
 
         Ok(format!("{intent}\n{fallback}"))
+    }
+}
+
+fn empty_dependencies_response(symbol_id: String) -> AetherDependenciesResponse {
+    AetherDependenciesResponse {
+        symbol_id,
+        found: false,
+        aggregated: false,
+        child_method_count: 0,
+        caller_count: 0,
+        dependency_count: 0,
+        callers: Vec::new(),
+        dependencies: Vec::new(),
     }
 }
 

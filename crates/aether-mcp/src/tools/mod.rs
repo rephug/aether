@@ -22,6 +22,7 @@ mod router;
 mod search;
 mod sir;
 mod status;
+mod usage_matrix;
 #[cfg(feature = "verification")]
 mod verification;
 
@@ -33,10 +34,14 @@ pub use memory::*;
 pub use search::*;
 pub use sir::*;
 pub use status::*;
+pub use usage_matrix::*;
 #[cfg(feature = "verification")]
 pub use verification::*;
 
-pub(crate) use common::{effective_limit, symbol_leaf_name};
+pub(crate) use common::{
+    child_method_symbols, effective_limit, is_type_symbol_kind, normalize_workspace_relative_path,
+    symbol_leaf_name,
+};
 
 pub const SERVER_NAME: &str = "aether";
 pub const SERVER_VERSION: &str = "0.1.0";
