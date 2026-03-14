@@ -90,7 +90,7 @@ impl AetherMcpServer {
 
     #[tool(
         name = "aether_suggest_trait_split",
-        description = "Suggest how to decompose a large trait into smaller sub-traits based on consumer usage patterns"
+        description = "Suggest how to decompose a large trait or struct into smaller capability groups based on consumer usage patterns"
     )]
     pub async fn aether_suggest_trait_split(
         &self,

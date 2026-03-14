@@ -17,8 +17,9 @@ use aether_mcp::{
     AetherHealthHotspotsRequest, AetherHealthRequest, AetherMcpServer, AetherRecallRequest,
     AetherRememberRequest, AetherSearchRequest, AetherSuggestTraitSplitRequest,
     AetherSymbolLookupRequest, AetherSymbolTimelineRequest, AetherTestIntentsRequest,
-    AetherUsageMatrixRequest, AetherWhyChangedReason, AetherWhyChangedRequest,
-    AetherWhySelectorMode, MCP_SCHEMA_VERSION, MEMORY_SCHEMA_VERSION, SharedState, SirLevelRequest,
+    AetherTraitSplitResolutionMode, AetherUsageMatrixRequest, AetherWhyChangedReason,
+    AetherWhyChangedRequest, AetherWhySelectorMode, MCP_SCHEMA_VERSION, MEMORY_SCHEMA_VERSION,
+    SharedState, SirLevelRequest,
 };
 #[cfg(feature = "verification")]
 use aether_mcp::{AetherVerifyMode, AetherVerifyRequest};
@@ -1235,9 +1236,293 @@ fn mcp_suggest_trait_split_returns_clusters() -> Result<()> {
 
     assert_eq!(response.schema_version, MEMORY_SCHEMA_VERSION);
     assert_eq!(response.message, None);
+    assert_eq!(
+        response.resolved_via.mode,
+        AetherTraitSplitResolutionMode::Direct
+    );
+    assert_eq!(response.resolved_via.qualified_name, "ExampleStore");
+    assert_eq!(response.resolved_via.kind, "trait");
     let suggestion = response.suggestion.expect("trait split suggestion");
     assert_eq!(suggestion.trait_name, "ExampleStore");
     assert_eq!(suggestion.trait_file, "src/store.rs");
+    assert_eq!(suggestion.method_count, 4);
+    assert_eq!(suggestion.suggested_traits.len(), 2);
+    assert!(
+        suggestion
+            .suggested_traits
+            .iter()
+            .any(|cluster| cluster.methods == vec!["alpha".to_owned(), "beta".to_owned()])
+    );
+    assert!(
+        suggestion
+            .suggested_traits
+            .iter()
+            .any(|cluster| cluster.methods == vec!["delta".to_owned(), "gamma".to_owned()])
+    );
+
+    Ok(())
+}
+
+#[test]
+fn mcp_suggest_trait_split_accepts_struct_targets() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    write_test_config(workspace);
+
+    let store = SqliteStore::open(workspace)?;
+    for symbol in [
+        custom_symbol_record(
+            "struct-example-store",
+            "ExampleStore",
+            "src/store.rs",
+            "struct",
+        ),
+        custom_symbol_record(
+            "struct-method-alpha",
+            "ExampleStore::alpha",
+            "src/store.rs",
+            "method",
+        ),
+        custom_symbol_record(
+            "struct-method-beta",
+            "ExampleStore::beta",
+            "src/store.rs",
+            "method",
+        ),
+        custom_symbol_record(
+            "struct-method-gamma",
+            "ExampleStore::gamma",
+            "src/store.rs",
+            "method",
+        ),
+        custom_symbol_record(
+            "struct-method-delta",
+            "ExampleStore::delta",
+            "src/store.rs",
+            "method",
+        ),
+        custom_symbol_record("consumer-a", "run_a", "src/consumer_a.rs", "function"),
+        custom_symbol_record("consumer-b", "run_b", "src/consumer_b.rs", "function"),
+    ] {
+        store.upsert_symbol(symbol)?;
+    }
+
+    store.upsert_edges(&[
+        SymbolEdge {
+            source_id: "consumer-a".to_owned(),
+            target_qualified_name: "alpha".to_owned(),
+            edge_kind: EdgeKind::Calls,
+            file_path: "src/consumer_a.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "consumer-a".to_owned(),
+            target_qualified_name: "beta".to_owned(),
+            edge_kind: EdgeKind::Calls,
+            file_path: "src/consumer_a.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "consumer-b".to_owned(),
+            target_qualified_name: "gamma".to_owned(),
+            edge_kind: EdgeKind::Calls,
+            file_path: "src/consumer_b.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "consumer-b".to_owned(),
+            target_qualified_name: "delta".to_owned(),
+            edge_kind: EdgeKind::Calls,
+            file_path: "src/consumer_b.rs".to_owned(),
+        },
+    ])?;
+
+    let struct_sir = SirAnnotation {
+        intent: "Mock summary for ExampleStore".to_owned(),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        side_effects: Vec::new(),
+        dependencies: Vec::new(),
+        error_modes: Vec::new(),
+        confidence: 0.9,
+        method_dependencies: Some(HashMap::from([
+            (
+                "alpha".to_owned(),
+                vec!["SirMetaRecord".to_owned(), "SirBlob".to_owned()],
+            ),
+            (
+                "beta".to_owned(),
+                vec!["SirMetaRecord".to_owned(), "SirBlob".to_owned()],
+            ),
+            ("gamma".to_owned(), vec!["SymbolRecord".to_owned()]),
+            ("delta".to_owned(), vec!["SymbolRecord".to_owned()]),
+        ])),
+    };
+    store.write_sir_blob(
+        "struct-example-store",
+        serde_json::to_string(&struct_sir)?.as_str(),
+    )?;
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+    let response = rt
+        .block_on(
+            server.aether_suggest_trait_split(Parameters(AetherSuggestTraitSplitRequest {
+                trait_name: "ExampleStore".to_owned(),
+                file: Some("src/store.rs".to_owned()),
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+
+    assert_eq!(response.schema_version, MEMORY_SCHEMA_VERSION);
+    assert_eq!(response.message, None);
+    assert_eq!(
+        response.resolved_via.mode,
+        AetherTraitSplitResolutionMode::Direct
+    );
+    assert_eq!(response.resolved_via.qualified_name, "ExampleStore");
+    assert_eq!(response.resolved_via.kind, "struct");
+    let suggestion = response.suggestion.expect("trait split suggestion");
+    assert_eq!(suggestion.trait_name, "ExampleStore");
+    assert_eq!(suggestion.trait_file, "src/store.rs");
+    assert_eq!(suggestion.method_count, 4);
+    assert_eq!(suggestion.suggested_traits.len(), 2);
+    assert!(
+        suggestion
+            .suggested_traits
+            .iter()
+            .any(|cluster| cluster.methods == vec!["alpha".to_owned(), "beta".to_owned()])
+    );
+    assert!(
+        suggestion
+            .suggested_traits
+            .iter()
+            .any(|cluster| cluster.methods == vec!["delta".to_owned(), "gamma".to_owned()])
+    );
+
+    Ok(())
+}
+
+#[test]
+fn mcp_suggest_trait_split_falls_back_to_same_file_implementor_methods() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    write_test_config(workspace);
+
+    let store = SqliteStore::open(workspace)?;
+    for symbol in [
+        custom_symbol_record("trait-store", "Store", "src/lib.rs", "trait"),
+        custom_symbol_record("struct-sqlite-store", "SqliteStore", "src/lib.rs", "struct"),
+        custom_symbol_record(
+            "sqlite-method-alpha",
+            "SqliteStore::alpha",
+            "src/lib.rs",
+            "method",
+        ),
+        custom_symbol_record(
+            "sqlite-method-beta",
+            "SqliteStore::beta",
+            "src/lib.rs",
+            "method",
+        ),
+        custom_symbol_record(
+            "sqlite-method-gamma",
+            "SqliteStore::gamma",
+            "src/lib.rs",
+            "method",
+        ),
+        custom_symbol_record(
+            "sqlite-method-delta",
+            "SqliteStore::delta",
+            "src/lib.rs",
+            "method",
+        ),
+        custom_symbol_record("consumer-a", "run_a", "src/consumer_a.rs", "function"),
+        custom_symbol_record("consumer-b", "run_b", "src/consumer_b.rs", "function"),
+    ] {
+        store.upsert_symbol(symbol)?;
+    }
+
+    store.upsert_edges(&[
+        SymbolEdge {
+            source_id: "struct-sqlite-store".to_owned(),
+            target_qualified_name: "Store".to_owned(),
+            edge_kind: EdgeKind::Implements,
+            file_path: "src/lib.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "consumer-a".to_owned(),
+            target_qualified_name: "alpha".to_owned(),
+            edge_kind: EdgeKind::Calls,
+            file_path: "src/consumer_a.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "consumer-a".to_owned(),
+            target_qualified_name: "beta".to_owned(),
+            edge_kind: EdgeKind::Calls,
+            file_path: "src/consumer_a.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "consumer-b".to_owned(),
+            target_qualified_name: "gamma".to_owned(),
+            edge_kind: EdgeKind::Calls,
+            file_path: "src/consumer_b.rs".to_owned(),
+        },
+        SymbolEdge {
+            source_id: "consumer-b".to_owned(),
+            target_qualified_name: "delta".to_owned(),
+            edge_kind: EdgeKind::Calls,
+            file_path: "src/consumer_b.rs".to_owned(),
+        },
+    ])?;
+
+    let sqlite_sir = SirAnnotation {
+        intent: "Mock summary for SqliteStore".to_owned(),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        side_effects: Vec::new(),
+        dependencies: Vec::new(),
+        error_modes: Vec::new(),
+        confidence: 0.9,
+        method_dependencies: Some(HashMap::from([
+            (
+                "alpha".to_owned(),
+                vec!["SirMetaRecord".to_owned(), "SirBlob".to_owned()],
+            ),
+            (
+                "beta".to_owned(),
+                vec!["SirMetaRecord".to_owned(), "SirBlob".to_owned()],
+            ),
+            ("gamma".to_owned(), vec!["SymbolRecord".to_owned()]),
+            ("delta".to_owned(), vec!["SymbolRecord".to_owned()]),
+        ])),
+    };
+    store.write_sir_blob(
+        "struct-sqlite-store",
+        serde_json::to_string(&sqlite_sir)?.as_str(),
+    )?;
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+    let response = rt
+        .block_on(
+            server.aether_suggest_trait_split(Parameters(AetherSuggestTraitSplitRequest {
+                trait_name: "Store".to_owned(),
+                file: Some("src/lib.rs".to_owned()),
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+
+    assert_eq!(response.schema_version, MEMORY_SCHEMA_VERSION);
+    assert_eq!(response.message, None);
+    assert_eq!(
+        response.resolved_via.mode,
+        AetherTraitSplitResolutionMode::Implementor
+    );
+    assert_eq!(response.resolved_via.qualified_name, "SqliteStore");
+    assert_eq!(response.resolved_via.kind, "struct");
+    let suggestion = response.suggestion.expect("trait split suggestion");
+    assert_eq!(suggestion.trait_name, "Store");
+    assert_eq!(suggestion.trait_file, "src/lib.rs");
     assert_eq!(suggestion.method_count, 4);
     assert_eq!(suggestion.suggested_traits.len(), 2);
     assert!(
