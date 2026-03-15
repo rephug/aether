@@ -287,6 +287,8 @@ mod tests {
             planner: PlannerConfig::default(),
             health_score: HealthScoreConfig::default(),
             dashboard: DashboardConfig::default(),
+            batch: None,
+            watcher: None,
         };
 
         let codes = warning_codes(&validate_config(&config));

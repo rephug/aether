@@ -17,12 +17,12 @@ use super::{
 };
 
 #[derive(Debug)]
-pub(super) struct SirJob {
-    pub(super) symbol: Symbol,
-    pub(super) symbol_text: String,
-    pub(super) context: SirContext,
-    pub(super) custom_prompt: Option<String>,
-    pub(super) deep_mode: bool,
+pub(crate) struct SirJob {
+    pub(crate) symbol: Symbol,
+    pub(crate) symbol_text: String,
+    pub(crate) context: SirContext,
+    pub(crate) custom_prompt: Option<String>,
+    pub(crate) deep_mode: bool,
 }
 
 #[derive(Debug)]
@@ -45,10 +45,11 @@ pub(super) enum SirGenerationOutcome {
     Failure(Box<FailedSirGeneration>),
 }
 
-pub(super) fn build_job(
+pub(crate) fn build_job(
     workspace_root: &Path,
     symbol: Symbol,
     priority_score: Option<f64>,
+    max_chars: Option<usize>,
 ) -> Result<SirJob> {
     let full_path = workspace_root.join(&symbol.file_path);
     let source = fs::read_to_string(&full_path)
@@ -63,10 +64,14 @@ pub(super) fn build_job(
                 symbol.file_path,
             )
         })?;
-    if symbol_text.len() > MAX_SYMBOL_TEXT_CHARS {
+    let effective_limit = match max_chars {
+        Some(0) | None => MAX_SYMBOL_TEXT_CHARS,
+        Some(value) => value,
+    };
+    if effective_limit > 0 && symbol_text.len() > effective_limit {
         let truncated = symbol_text
             .char_indices()
-            .take_while(|(index, _)| *index < MAX_SYMBOL_TEXT_CHARS)
+            .take_while(|(index, _)| *index < effective_limit)
             .last()
             .map(|(index, ch)| index + ch.len_utf8())
             .unwrap_or(0);

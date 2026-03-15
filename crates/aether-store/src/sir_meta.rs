@@ -8,6 +8,7 @@ pub struct SirMetaRecord {
     pub provider: String,
     pub model: String,
     pub generation_pass: String,
+    pub prompt_hash: Option<String>,
     pub updated_at: i64,
     pub sir_status: String,
     pub last_error: Option<String>,
@@ -20,6 +21,7 @@ pub(crate) struct SirRowState {
     pub(crate) provider: String,
     pub(crate) model: String,
     pub(crate) generation_pass: String,
+    pub(crate) prompt_hash: Option<String>,
     pub(crate) updated_at: i64,
     pub(crate) sir_status: String,
     pub(crate) last_error: Option<String>,
@@ -38,6 +40,7 @@ pub(crate) fn load_sir_row_state(
             provider,
             model,
             generation_pass,
+            prompt_hash,
             updated_at,
             sir_status,
             last_error,
@@ -58,16 +61,17 @@ pub(crate) fn load_sir_row_state(
                     .map(|value| value.trim().to_owned())
                     .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| "scan".to_owned()),
-                updated_at: row.get::<_, i64>(5)?.max(0),
+                prompt_hash: row.get(5)?,
+                updated_at: row.get::<_, i64>(6)?.max(0),
                 sir_status: row
-                    .get::<_, Option<String>>(6)?
+                    .get::<_, Option<String>>(7)?
                     .map(|value| value.trim().to_owned())
                     .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| "fresh".to_owned()),
-                last_error: row.get(7)?,
-                last_attempt_at: row.get::<_, i64>(8)?.max(0),
+                last_error: row.get(8)?,
+                last_attempt_at: row.get::<_, i64>(9)?.max(0),
                 sir_json: row
-                    .get::<_, Option<String>>(9)?
+                    .get::<_, Option<String>>(10)?
                     .filter(|value| !value.trim().is_empty()),
             })
         },
@@ -84,16 +88,17 @@ pub(crate) fn upsert_sir_row_state(
     tx.execute(
         r#"
         INSERT INTO sir (
-            id, sir_hash, sir_version, provider, model, generation_pass, updated_at,
+            id, sir_hash, sir_version, provider, model, generation_pass, prompt_hash, updated_at,
             sir_status, last_error, last_attempt_at, sir_json
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         ON CONFLICT(id) DO UPDATE SET
             sir_hash = excluded.sir_hash,
             sir_version = excluded.sir_version,
             provider = excluded.provider,
             model = excluded.model,
             generation_pass = excluded.generation_pass,
+            prompt_hash = excluded.prompt_hash,
             updated_at = excluded.updated_at,
             sir_status = excluded.sir_status,
             last_error = excluded.last_error,
@@ -107,6 +112,7 @@ pub(crate) fn upsert_sir_row_state(
             &row.provider,
             &row.model,
             &row.generation_pass,
+            &row.prompt_hash,
             row.updated_at,
             &row.sir_status,
             &row.last_error,
@@ -118,6 +124,54 @@ pub(crate) fn upsert_sir_row_state(
 }
 
 impl SqliteStore {
+    pub fn list_sir_blobs_for_ids(
+        &self,
+        symbol_ids: &[String],
+    ) -> Result<HashMap<String, String>, StoreError> {
+        let normalized = symbol_ids
+            .iter()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if normalized.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut blobs = HashMap::new();
+        let conn = self.conn.lock().unwrap();
+        for chunk in normalized.chunks(SQLITE_PARAM_CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                r#"
+                SELECT id, sir_json
+                FROM sir
+                WHERE id IN ({placeholders})
+                  AND COALESCE(TRIM(sir_json), '') <> ''
+                ORDER BY id ASC
+                "#
+            );
+            let params_vec = chunk
+                .iter()
+                .cloned()
+                .map(SqlValue::Text)
+                .collect::<Vec<_>>();
+            let mut stmt = conn.prepare(sql.as_str())?;
+            let rows = stmt.query_map(params_from_iter(params_vec), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (symbol_id, sir_json) = row?;
+                blobs.insert(symbol_id, sir_json);
+            }
+        }
+
+        Ok(blobs)
+    }
+
     pub(crate) fn sir_blob_path(&self, symbol_id: &str) -> PathBuf {
         self.sir_dir.join(format!("{symbol_id}.json"))
     }
@@ -306,16 +360,17 @@ impl SqliteStore {
         self.conn.lock().unwrap().execute(
             r#"
             INSERT INTO sir (
-                id, sir_hash, sir_version, provider, model, generation_pass, updated_at,
-                sir_status, last_error, last_attempt_at
+                id, sir_hash, sir_version, provider, model, generation_pass, prompt_hash,
+                updated_at, sir_status, last_error, last_attempt_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             ON CONFLICT(id) DO UPDATE SET
                 sir_hash = excluded.sir_hash,
                 sir_version = excluded.sir_version,
                 provider = excluded.provider,
                 model = excluded.model,
                 generation_pass = excluded.generation_pass,
+                prompt_hash = excluded.prompt_hash,
                 updated_at = excluded.updated_at,
                 sir_status = excluded.sir_status,
                 last_error = excluded.last_error,
@@ -328,6 +383,7 @@ impl SqliteStore {
                 record.provider,
                 record.model,
                 record.generation_pass,
+                record.prompt_hash,
                 record.updated_at,
                 record.sir_status,
                 record.last_error,
@@ -351,6 +407,7 @@ impl SqliteStore {
                 provider,
                 model,
                 generation_pass,
+                prompt_hash,
                 updated_at,
                 sir_status,
                 last_error,
@@ -373,10 +430,11 @@ impl SqliteStore {
                         .map(|value| value.trim().to_owned())
                         .filter(|value| !value.is_empty())
                         .unwrap_or_else(|| "scan".to_owned()),
-                    updated_at: row.get(6)?,
-                    sir_status: row.get(7)?,
-                    last_error: row.get(8)?,
-                    last_attempt_at: row.get(9)?,
+                    prompt_hash: row.get(6)?,
+                    updated_at: row.get(7)?,
+                    sir_status: row.get(8)?,
+                    last_error: row.get(9)?,
+                    last_attempt_at: row.get(10)?,
                 })
             })
             .optional()?;

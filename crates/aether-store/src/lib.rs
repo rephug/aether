@@ -19,6 +19,7 @@ use serde_json::from_str as json_from_str;
 use thiserror::Error;
 mod analysis;
 mod embeddings;
+mod fingerprint_history;
 mod graph;
 mod lexical;
 mod lifecycle;
@@ -53,6 +54,7 @@ pub use analysis::{
     CommunitySnapshotRecord, CouplingMiningStateRecord, DriftAnalysisStateRecord, DriftResultRecord,
 };
 pub use embeddings::{SemanticSearchResult, SymbolEmbeddingMetaRecord, SymbolEmbeddingRecord};
+pub use fingerprint_history::SirFingerprintHistoryRecord;
 pub use graph::{
     CouplingEdgeRecord, GraphDependencyEdgeRecord, GraphSyncStats, ResolvedEdge, TestedByRecord,
     UpstreamDependencyEdgeRecord, UpstreamDependencyNodeRecord, UpstreamDependencyTraversal,

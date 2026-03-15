@@ -12,11 +12,12 @@ use aether_infer::sir_prompt::SirEnrichmentContext;
 use aether_infer::{download_candle_embedding_model, download_candle_reranker_model};
 use aether_sir::SirAnnotation;
 use aether_store::{SirStateStore, SqliteStore};
+use aetherd::batch::run_batch_command;
 use aetherd::calibrate::run_calibration_once;
 use aetherd::causal::run_trace_cause_command;
 use aetherd::cli::{
-    AskArgs, BlastRadiusArgs, Cli, Commands, CommunitiesArgs, CouplingReportArgs, DriftAckArgs,
-    DriftReportArgs, FsckArgs, HealthArgs, HealthScoreArgs, InitAgentArgs, LogFormat,
+    AskArgs, BatchArgs, BlastRadiusArgs, Cli, Commands, CommunitiesArgs, CouplingReportArgs,
+    DriftAckArgs, DriftReportArgs, FsckArgs, HealthArgs, HealthScoreArgs, InitAgentArgs, LogFormat,
     MineCouplingArgs, NotesArgs, RecallArgs, RefactorPrepArgs, RegenerateArgs, RememberArgs,
     SetupLocalArgs, TestIntentsArgs, TraceCauseArgs, VerifyIntentArgs, parse_cli,
 };
@@ -309,6 +310,7 @@ fn run(cli: Cli) -> Result<()> {
 
 fn run_subcommand(workspace: &Path, config: &AetherConfig, command: Commands) -> Result<()> {
     match command {
+        Commands::Batch(args) => run_batch_subcommand(workspace, config, args),
         Commands::InitAgent(args) => run_init_agent_command(workspace, args),
         Commands::Regenerate(args) => run_regenerate_command(workspace, args),
         Commands::SetupLocal(args) => run_setup_local_command(workspace, args),
@@ -331,6 +333,10 @@ fn run_subcommand(workspace: &Path, config: &AetherConfig, command: Commands) ->
         Commands::VerifyIntent(args) => run_verify_intent_subcommand(workspace, config, args),
         Commands::Fsck(args) => run_fsck_subcommand(workspace, args),
     }
+}
+
+fn run_batch_subcommand(workspace: &Path, config: &AetherConfig, args: BatchArgs) -> Result<()> {
+    run_batch_command(workspace, config, args)
 }
 
 fn load_config_for_command(workspace: &Path, command: Option<&Commands>) -> Result<AetherConfig> {

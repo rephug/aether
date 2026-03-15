@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -6,31 +6,35 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aether_analysis::TestIntentAnalyzer;
-use aether_config::{InferenceProviderKind, ensure_workspace_config};
+use aether_config::{InferenceProviderKind, WatcherConfig, ensure_workspace_config};
 use aether_core::{GitContext, Symbol, SymbolChangeEvent, content_hash, normalize_path};
 use aether_graph_algo::{GraphAlgorithmEdge, page_rank_sync};
 use aether_infer::ProviderOverrides;
 use aether_infer::sir_prompt::SirEnrichmentContext;
-use aether_parse::{SymbolExtractor, TestIntent};
+use aether_parse::{SymbolExtractor, TestIntent, language_for_path};
 use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
 #[cfg(test)]
 use aether_store::SirHistoryStore;
 use aether_store::{
-    SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord, SymbolRelationStore,
-    TestIntentRecord, TestIntentStore, open_graph_store,
+    SirMetaRecord, SirStateStore, SqliteStore, SymbolCatalogStore, SymbolEmbeddingRecord,
+    SymbolRecord, SymbolRelationStore, TestIntentRecord, TestIntentStore, open_graph_store,
 };
 use anyhow::{Context, Result};
+use gix::bstr::ByteSlice;
 use gix::traverse::commit::simple::CommitTimeOrder;
 use ignore::WalkBuilder;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
+use crate::batch::hash::compute_prompt_hash;
+use crate::batch::write_fingerprint_row;
 use crate::observer::{DebounceQueue, ObserverState, is_ignored_path};
 use crate::priority_queue::{
     SirPriorityQueue, compute_priority_score, kind_priority_score, size_inverse_score,
 };
 use crate::sir_pipeline::{
-    QualityBatchItem, SIR_GENERATION_PASS_DEEP, SIR_GENERATION_PASS_REGENERATED,
-    SIR_GENERATION_PASS_SCAN, SIR_GENERATION_PASS_TRIAGE, SirPipeline,
+    MAX_SYMBOL_TEXT_CHARS, QualityBatchItem, SIR_GENERATION_PASS_DEEP, SIR_GENERATION_PASS_PREMIUM,
+    SIR_GENERATION_PASS_REGENERATED, SIR_GENERATION_PASS_SCAN, SIR_GENERATION_PASS_TRIAGE,
+    SirPipeline, build_job,
 };
 
 const REQUEST_POLL_BATCH: usize = 128;
@@ -57,6 +61,132 @@ pub struct IndexerConfig {
     pub inference_model: Option<String>,
     pub inference_endpoint: Option<String>,
     pub inference_api_key_env: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WatcherRuntimeConfig {
+    watcher: WatcherConfig,
+    premium_provider: Option<InferenceProviderKind>,
+    premium_model: Option<String>,
+    generation_pass: &'static str,
+}
+
+impl WatcherRuntimeConfig {
+    fn from_workspace(config: &IndexerConfig) -> Result<Self> {
+        let workspace_config = ensure_workspace_config(&config.workspace)
+            .context("failed to load workspace config for watcher")?;
+        let watcher = workspace_config.watcher.unwrap_or_default();
+        let premium_provider = if watcher.realtime_provider.trim().is_empty() {
+            None
+        } else {
+            Some(
+                watcher
+                    .realtime_provider
+                    .parse()
+                    .map_err(anyhow::Error::msg)
+                    .context("invalid [watcher].realtime_provider")?,
+            )
+        };
+        let premium_model = {
+            let value = watcher.realtime_model.trim();
+            (!value.is_empty()).then(|| value.to_owned())
+        };
+        let generation_pass = if premium_model.is_some() {
+            SIR_GENERATION_PASS_PREMIUM
+        } else {
+            SIR_GENERATION_PASS_SCAN
+        };
+        Ok(Self {
+            watcher,
+            premium_provider,
+            premium_model,
+            generation_pass,
+        })
+    }
+
+    fn provider_overrides(&self, config: &IndexerConfig) -> ProviderOverrides {
+        if let Some(model) = self.premium_model.as_ref() {
+            ProviderOverrides {
+                provider: self.premium_provider.or(config.inference_provider),
+                model: Some(model.clone()),
+                endpoint: config.inference_endpoint.clone(),
+                api_key_env: config.inference_api_key_env.clone(),
+            }
+        } else {
+            ProviderOverrides {
+                provider: config.inference_provider,
+                model: config.inference_model.clone(),
+                endpoint: config.inference_endpoint.clone(),
+                api_key_env: config.inference_api_key_env.clone(),
+            }
+        }
+    }
+
+    fn git_debounce_window(&self) -> Duration {
+        Duration::from_secs_f64(self.watcher.git_debounce_secs.max(0.1))
+    }
+
+    fn prompt_config_fingerprint(&self, pipeline: &SirPipeline) -> String {
+        format!(
+            "{}:{}:{}",
+            pipeline.model_name(),
+            "low",
+            MAX_SYMBOL_TEXT_CHARS
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct GitDebounceState {
+    last_git_event_at: Option<Instant>,
+    dirty_paths: HashSet<PathBuf>,
+}
+
+impl GitDebounceState {
+    fn mark_git_event(&mut self, now: Instant) {
+        self.last_git_event_at = Some(now);
+    }
+
+    fn has_pending(&self) -> bool {
+        self.last_git_event_at.is_some()
+    }
+
+    fn extend_dirty<I>(&mut self, paths: I)
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        self.dirty_paths.extend(paths);
+    }
+
+    fn should_fire(&self, now: Instant, debounce_window: Duration) -> bool {
+        self.last_git_event_at
+            .is_some_and(|last_seen| now.saturating_duration_since(last_seen) >= debounce_window)
+    }
+
+    fn take_dirty_paths(&mut self) -> HashSet<PathBuf> {
+        self.last_git_event_at = None;
+        std::mem::take(&mut self.dirty_paths)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HeadState {
+    sha: Option<String>,
+    marker: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitTriggerKind {
+    BranchSwitch,
+    GitPull,
+    Merge,
+}
+
+#[derive(Debug, Default)]
+struct ClassifiedWatchEvent {
+    git_event: bool,
+    source_paths: Vec<PathBuf>,
+    watch_dirs: Vec<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -1071,6 +1201,20 @@ fn run_initial_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> 
     Ok(())
 }
 
+pub(crate) fn run_structural_index_once(
+    workspace: &Path,
+) -> Result<(SqliteStore, HashMap<String, Symbol>, usize)> {
+    let mut observer = ObserverState::new(workspace.to_path_buf())?;
+    observer.seed_from_disk()?;
+    let store = SqliteStore::open(workspace).context("failed to initialize local store")?;
+    let mut structural = StructuralIndexer::new(workspace.to_path_buf())?;
+    let (initial_events, symbols_by_id, symbol_count) = collect_initial_snapshot(&observer);
+    for event in &initial_events {
+        structural.process_event(&store, event)?;
+    }
+    Ok((store, symbols_by_id, symbol_count))
+}
+
 pub fn run_initial_index_once(config: &IndexerConfig) -> Result<()> {
     run_initial_index_once_inner(config, false)
 }
@@ -1081,6 +1225,7 @@ pub fn run_initial_index_once_for_cli(config: &IndexerConfig) -> Result<()> {
 
 pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
     let (mut observer, store) = initialize_observer_and_store(&config)?;
+    let watcher_runtime = WatcherRuntimeConfig::from_workspace(&config)?;
     let mut structural = StructuralIndexer::new(config.workspace.clone())?;
 
     let mut initial_symbol_index = HashMap::<String, Symbol>::new();
@@ -1116,7 +1261,13 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
 
     let mut worker_started = 0usize;
     for worker_id in 0..config.sir_concurrency.max(1) {
-        match spawn_semantic_worker(worker_id, &config, store.clone(), queue_state.clone()) {
+        match spawn_semantic_worker(
+            worker_id,
+            &config,
+            &watcher_runtime,
+            store.clone(),
+            queue_state.clone(),
+        ) {
             Ok(()) => {
                 worker_started += 1;
             }
@@ -1144,6 +1295,7 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
         Config::default(),
     )
     .context("failed to initialize file watcher")?;
+    let git_watch_dir = resolve_git_watch_dir(&config.workspace);
 
     for entry in WalkBuilder::new(&config.workspace)
         .hidden(true)
@@ -1157,24 +1309,36 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
             .watch(entry.path(), RecursiveMode::NonRecursive)
             .with_context(|| format!("failed to watch directory {}", entry.path().display()))?;
     }
+    if let Some(git_watch_dir) = git_watch_dir.as_ref()
+        && git_watch_dir.exists()
+    {
+        watcher
+            .watch(git_watch_dir, RecursiveMode::Recursive)
+            .with_context(|| {
+                format!(
+                    "failed to watch git metadata directory {}",
+                    git_watch_dir.display()
+                )
+            })?;
+    }
 
     let debounce_window = Duration::from_millis(config.debounce_ms);
+    let git_debounce_window = watcher_runtime.git_debounce_window();
     let poll_interval = Duration::from_millis(50);
     let mut debounce_queue = DebounceQueue::default();
+    let mut git_debounce_state = GitDebounceState::default();
 
     loop {
         match rx.recv_timeout(poll_interval) {
             Ok(result) => {
-                if let Ok(ref event) = result {
-                    for path in &event.paths {
-                        if path.is_dir() && !crate::observer::is_ignored_path(path) {
-                            let _ = watcher.watch(path, notify::RecursiveMode::NonRecursive);
-                        }
-                    }
-                }
-                if let Err(err) =
-                    enqueue_event_paths(&config.workspace, result, &mut debounce_queue)
-                {
+                if let Err(err) = handle_watch_result(
+                    &config.workspace,
+                    git_watch_dir.as_deref(),
+                    &mut watcher,
+                    result,
+                    &mut debounce_queue,
+                    &mut git_debounce_state,
+                ) {
                     tracing::warn!(error = ?err, "watch event error");
                 }
             }
@@ -1185,58 +1349,460 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
         }
 
         while let Ok(result) = rx.try_recv() {
-            if let Ok(ref event) = result {
-                for path in &event.paths {
-                    if path.is_dir() && !crate::observer::is_ignored_path(path) {
-                        let _ = watcher.watch(path, notify::RecursiveMode::NonRecursive);
-                    }
-                }
-            }
-            if let Err(err) = enqueue_event_paths(&config.workspace, result, &mut debounce_queue) {
+            if let Err(err) = handle_watch_result(
+                &config.workspace,
+                git_watch_dir.as_deref(),
+                &mut watcher,
+                result,
+                &mut debounce_queue,
+                &mut git_debounce_state,
+            ) {
                 tracing::warn!(error = ?err, "watch event error");
             }
         }
 
-        for path in debounce_queue.drain_due(Instant::now(), debounce_window) {
-            match observer.process_path(&path) {
-                Ok(Some(event)) => {
-                    if config.print_events {
-                        let line = serde_json::to_string(&event)
-                            .context("failed to serialize symbol-change event")?;
-                        println!("{line}");
-                    }
+        let now = Instant::now();
+        if git_debounce_state.should_fire(now, git_debounce_window) {
+            git_debounce_state.extend_dirty(debounce_queue.drain_due(now, Duration::ZERO));
+            let dirty_paths = git_debounce_state.take_dirty_paths();
+            if let Err(err) = process_git_trigger(
+                &config,
+                &watcher_runtime,
+                git_watch_dir.as_deref(),
+                &mut observer,
+                &mut structural,
+                store.as_ref(),
+                &queue_state,
+                dirty_paths,
+            ) {
+                tracing::warn!(error = %err, "git-triggered reindex failed");
+            }
+            continue;
+        }
 
-                    structural.process_event(store.as_ref(), &event)?;
-                    for removed in &event.removed {
-                        queue_state.remove_symbol(&removed.id);
-                    }
-                    let mut changed = Vec::new();
-                    collect_changed_symbols(&event, &mut changed);
-                    for symbol in &changed {
-                        queue_state.upsert_symbol(symbol.clone());
-                    }
-                    if let Err(err) = enqueue_changed_symbols(
-                        config.workspace.as_path(),
-                        store.as_ref(),
-                        &queue_state,
-                        &changed,
-                    ) {
-                        tracing::warn!(
-                            file_path = %event.file_path,
-                            error = %err,
-                            "failed to enqueue changed symbols"
-                        );
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => tracing::error!(
-                    path = %path.display(),
-                    error = %err,
-                    "process error"
-                ),
+        if git_debounce_state.has_pending() {
+            continue;
+        }
+
+        for path in debounce_queue.drain_due(now, debounce_window) {
+            if let Err(err) = process_reindex_path(
+                &config,
+                &mut observer,
+                &mut structural,
+                store.as_ref(),
+                &queue_state,
+                &path,
+            ) {
+                tracing::error!(path = %path.display(), error = %err, "process error");
             }
         }
     }
+}
+
+fn handle_watch_result(
+    workspace: &Path,
+    git_watch_dir: Option<&Path>,
+    watcher: &mut RecommendedWatcher,
+    result: notify::Result<Event>,
+    debounce_queue: &mut DebounceQueue,
+    git_debounce_state: &mut GitDebounceState,
+) -> Result<()> {
+    let event = result.context("notify error")?;
+    let classified = classify_watch_event(workspace, git_watch_dir, event);
+    for path in &classified.watch_dirs {
+        let _ = watcher.watch(path, RecursiveMode::NonRecursive);
+    }
+    enqueue_classified_watch_event(classified, debounce_queue, git_debounce_state);
+    Ok(())
+}
+
+fn classify_watch_event(
+    workspace: &Path,
+    git_watch_dir: Option<&Path>,
+    event: Event,
+) -> ClassifiedWatchEvent {
+    let mut classified = ClassifiedWatchEvent::default();
+    for path in event.paths {
+        if git_watch_dir.is_some_and(|git_dir| path.starts_with(git_dir)) {
+            classified.git_event = true;
+            continue;
+        }
+
+        if path.is_dir() {
+            if !is_ignored_path(&path) {
+                classified.watch_dirs.push(path);
+            }
+            continue;
+        }
+
+        if is_ignored_path(&path) {
+            continue;
+        }
+        if let Ok(relative) = path.strip_prefix(workspace)
+            && is_ignored_path(relative)
+        {
+            continue;
+        }
+
+        classified.source_paths.push(path);
+    }
+
+    classified
+}
+
+fn enqueue_classified_watch_event(
+    classified: ClassifiedWatchEvent,
+    debounce_queue: &mut DebounceQueue,
+    git_debounce_state: &mut GitDebounceState,
+) {
+    let now = Instant::now();
+    if classified.git_event {
+        git_debounce_state.mark_git_event(now);
+    }
+
+    if git_debounce_state.has_pending() {
+        git_debounce_state.extend_dirty(classified.source_paths);
+    } else {
+        for path in classified.source_paths {
+            debounce_queue.mark(path, now);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_git_trigger(
+    config: &IndexerConfig,
+    watcher_runtime: &WatcherRuntimeConfig,
+    git_watch_dir: Option<&Path>,
+    observer: &mut ObserverState,
+    structural: &mut StructuralIndexer,
+    store: &SqliteStore,
+    queue_state: &SharedQueueState,
+    dirty_paths: HashSet<PathBuf>,
+) -> Result<()> {
+    let previous_head = read_persisted_head_state(config.workspace.as_path())?;
+    let current_head = read_current_head_state(config.workspace.as_path(), git_watch_dir)?;
+    let mut paths = dirty_paths.into_iter().collect::<BTreeSet<_>>();
+
+    if previous_head.sha != current_head.sha {
+        let trigger_kind =
+            classify_git_trigger_kind(config.workspace.as_path(), &previous_head, &current_head);
+        if trigger_kind.is_some_and(|kind| git_trigger_enabled(&watcher_runtime.watcher, kind)) {
+            let git_paths = if !watcher_runtime.watcher.git_trigger_changed_files_only
+                || previous_head.sha.is_none()
+            {
+                collect_full_reindex_paths(config.workspace.as_path(), observer)
+            } else if let (Some(old_sha), Some(new_sha)) =
+                (previous_head.sha.as_deref(), current_head.sha.as_deref())
+            {
+                match changed_paths_between_heads(config.workspace.as_path(), old_sha, new_sha) {
+                    Ok(paths) => paths,
+                    Err(err) => {
+                        tracing::warn!(
+                            old_sha,
+                            new_sha,
+                            error = %err,
+                            "failed to diff git heads; falling back to full reindex"
+                        );
+                        collect_full_reindex_paths(config.workspace.as_path(), observer)
+                    }
+                }
+            } else {
+                collect_full_reindex_paths(config.workspace.as_path(), observer)
+            };
+            paths.extend(git_paths);
+        }
+    }
+
+    if !paths.is_empty() {
+        tracing::info!(path_count = paths.len(), "processing watcher reindex batch");
+        process_reindex_paths(
+            config,
+            observer,
+            structural,
+            store,
+            queue_state,
+            paths.into_iter().collect::<Vec<_>>(),
+        )?;
+    }
+
+    write_persisted_head_state(config.workspace.as_path(), &current_head)?;
+    Ok(())
+}
+
+fn process_reindex_paths(
+    config: &IndexerConfig,
+    observer: &mut ObserverState,
+    structural: &mut StructuralIndexer,
+    store: &SqliteStore,
+    queue_state: &SharedQueueState,
+    paths: Vec<PathBuf>,
+) -> Result<()> {
+    for path in paths {
+        process_reindex_path(config, observer, structural, store, queue_state, &path)?;
+    }
+    Ok(())
+}
+
+fn process_reindex_path(
+    config: &IndexerConfig,
+    observer: &mut ObserverState,
+    structural: &mut StructuralIndexer,
+    store: &SqliteStore,
+    queue_state: &SharedQueueState,
+    path: &Path,
+) -> Result<()> {
+    match observer.process_path(path) {
+        Ok(Some(event)) => {
+            if config.print_events {
+                let line = serde_json::to_string(&event)
+                    .context("failed to serialize symbol-change event")?;
+                println!("{line}");
+            }
+
+            structural.process_event(store, &event)?;
+            for removed in &event.removed {
+                queue_state.remove_symbol(&removed.id);
+            }
+            let mut changed = Vec::new();
+            collect_changed_symbols(&event, &mut changed);
+            for symbol in &changed {
+                queue_state.upsert_symbol(symbol.clone());
+            }
+            if let Err(err) =
+                enqueue_changed_symbols(config.workspace.as_path(), store, queue_state, &changed)
+            {
+                tracing::warn!(
+                    file_path = %event.file_path,
+                    error = %err,
+                    "failed to enqueue changed symbols"
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to process {}", path.display()));
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_git_watch_dir(workspace: &Path) -> Option<PathBuf> {
+    let dot_git = workspace.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+
+    let raw = fs::read_to_string(&dot_git).ok()?;
+    let git_dir = raw.strip_prefix("gitdir:")?.trim();
+    let path = PathBuf::from(git_dir);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        workspace.join(path)
+    })
+}
+
+fn read_persisted_head_state(workspace: &Path) -> Result<HeadState> {
+    let aether_dir = workspace.join(".aether");
+    Ok(HeadState {
+        sha: read_optional_trimmed_file(aether_dir.join("last_indexed_head"))?,
+        marker: read_optional_trimmed_file(aether_dir.join("last_indexed_head_ref"))?,
+    })
+}
+
+fn write_persisted_head_state(workspace: &Path, head_state: &HeadState) -> Result<()> {
+    let aether_dir = workspace.join(".aether");
+    fs::create_dir_all(&aether_dir).with_context(|| {
+        format!(
+            "failed to create watcher state directory {}",
+            aether_dir.display()
+        )
+    })?;
+    write_optional_trimmed_file(
+        aether_dir.join("last_indexed_head"),
+        head_state.sha.as_deref(),
+    )?;
+    write_optional_trimmed_file(
+        aether_dir.join("last_indexed_head_ref"),
+        head_state.marker.as_deref(),
+    )?;
+    Ok(())
+}
+
+fn read_current_head_state(workspace: &Path, git_watch_dir: Option<&Path>) -> Result<HeadState> {
+    let marker = git_watch_dir
+        .map(|git_dir| git_dir.join("HEAD"))
+        .map(read_optional_trimmed_file)
+        .transpose()?
+        .flatten();
+    let sha = GitContext::open(workspace)
+        .and_then(|context| context.head_commit_hash())
+        .or_else(|| {
+            marker
+                .as_deref()
+                .filter(|value| !value.starts_with("ref:"))
+                .map(str::to_owned)
+        });
+    Ok(HeadState { sha, marker })
+}
+
+fn read_optional_trimmed_file(path: PathBuf) -> Result<Option<String>> {
+    match fs::read_to_string(&path) {
+        Ok(raw) => Ok({
+            let trimmed = raw.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to read watcher state file {}", path.display())),
+    }
+}
+
+fn write_optional_trimmed_file(path: PathBuf, value: Option<&str>) -> Result<()> {
+    if let Some(value) = value {
+        fs::write(&path, format!("{}\n", value.trim()))
+            .with_context(|| format!("failed to write watcher state file {}", path.display()))?;
+    } else if let Err(err) = fs::remove_file(&path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(err)
+            .with_context(|| format!("failed to remove watcher state file {}", path.display()));
+    }
+    Ok(())
+}
+
+fn classify_git_trigger_kind(
+    workspace: &Path,
+    previous_head: &HeadState,
+    current_head: &HeadState,
+) -> Option<GitTriggerKind> {
+    let previous_sha = previous_head.sha.as_deref()?;
+    let current_sha = current_head.sha.as_deref()?;
+    if previous_sha == current_sha {
+        return None;
+    }
+    if previous_head.marker.as_deref() != current_head.marker.as_deref() {
+        return Some(GitTriggerKind::BranchSwitch);
+    }
+    match current_commit_parent_count(workspace, current_sha) {
+        Ok(parent_count) if parent_count > 1 => Some(GitTriggerKind::Merge),
+        Ok(_) => Some(GitTriggerKind::GitPull),
+        Err(err) => {
+            tracing::warn!(
+                current_sha,
+                error = %err,
+                "failed to classify git head advance; treating as git pull"
+            );
+            Some(GitTriggerKind::GitPull)
+        }
+    }
+}
+
+fn current_commit_parent_count(workspace: &Path, commit_hash: &str) -> Result<usize> {
+    let repo = gix::discover(workspace).context("failed to open git repo")?;
+    let commit_id = repo
+        .rev_parse_single(commit_hash)
+        .with_context(|| format!("failed to resolve commit {commit_hash}"))?;
+    let commit = repo
+        .find_commit(commit_id.detach())
+        .with_context(|| format!("failed to load commit {commit_hash}"))?;
+    Ok(commit.parent_ids().count())
+}
+
+fn git_trigger_enabled(watcher: &WatcherConfig, trigger: GitTriggerKind) -> bool {
+    match trigger {
+        GitTriggerKind::BranchSwitch => watcher.trigger_on_branch_switch,
+        GitTriggerKind::GitPull => watcher.trigger_on_git_pull,
+        GitTriggerKind::Merge => watcher.trigger_on_merge,
+    }
+}
+
+fn changed_paths_between_heads(
+    workspace: &Path,
+    old_sha: &str,
+    new_sha: &str,
+) -> Result<Vec<PathBuf>> {
+    let repo = gix::discover(workspace).context("failed to open git repo for diff")?;
+    let old_id = repo
+        .rev_parse_single(old_sha)
+        .with_context(|| format!("failed to resolve previous head {old_sha}"))?;
+    let new_id = repo
+        .rev_parse_single(new_sha)
+        .with_context(|| format!("failed to resolve current head {new_sha}"))?;
+    let old_commit = repo
+        .find_commit(old_id.detach())
+        .with_context(|| format!("failed to load previous head commit {old_sha}"))?;
+    let new_commit = repo
+        .find_commit(new_id.detach())
+        .with_context(|| format!("failed to load current head commit {new_sha}"))?;
+    let old_tree = old_commit
+        .tree()
+        .with_context(|| format!("failed to load previous head tree {old_sha}"))?;
+    let new_tree = new_commit
+        .tree()
+        .with_context(|| format!("failed to load current head tree {new_sha}"))?;
+
+    let mut diff_options = gix::diff::Options::default();
+    diff_options.track_rewrites(None);
+    let changes = repo
+        .diff_tree_to_tree(Some(&old_tree), Some(&new_tree), Some(diff_options))
+        .with_context(|| format!("failed to diff git heads {old_sha}..{new_sha}"))?;
+
+    let mut paths = BTreeSet::new();
+    for change in changes {
+        let raw_path = change.location().to_str_lossy();
+        let normalized = normalize_path(normalize_git_rename_path(raw_path.as_ref()).as_str());
+        if normalized.is_empty() || is_ignored_path(Path::new(&normalized)) {
+            continue;
+        }
+        paths.insert(workspace.join(normalized));
+    }
+
+    Ok(paths.into_iter().collect())
+}
+
+fn normalize_git_rename_path(path: &str) -> String {
+    let value = path.trim();
+    if let (Some(brace_start), Some(brace_end)) = (value.find('{'), value.find('}'))
+        && brace_start < brace_end
+    {
+        let prefix = &value[..brace_start];
+        let inner = &value[brace_start + 1..brace_end];
+        let suffix = &value[brace_end + 1..];
+        if let Some((_, new_part)) = inner.split_once("=>") {
+            return format!("{}{}{}", prefix, new_part.trim(), suffix);
+        }
+    }
+    if let Some((_, right)) = value.rsplit_once("=>") {
+        return right.trim().to_owned();
+    }
+    value.to_owned()
+}
+
+fn collect_full_reindex_paths(workspace: &Path, observer: &ObserverState) -> Vec<PathBuf> {
+    let mut paths = observer
+        .tracked_paths()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for entry in WalkBuilder::new(workspace).standard_filters(true).build() {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if !entry
+            .file_type()
+            .map(|kind| kind.is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if is_ignored_path(entry.path()) || language_for_path(entry.path()).is_none() {
+            continue;
+        }
+        paths.insert(entry.path().to_path_buf());
+    }
+    paths.into_iter().collect()
 }
 
 fn initialize_observer_and_store(
@@ -1306,20 +1872,19 @@ fn initialize_full_indexer(
 fn spawn_semantic_worker(
     worker_id: usize,
     config: &IndexerConfig,
+    watcher_runtime: &WatcherRuntimeConfig,
     store: Arc<SqliteStore>,
     queue_state: SharedQueueState,
 ) -> Result<()> {
     let pipeline = SirPipeline::new(
         config.workspace.clone(),
         1,
-        ProviderOverrides {
-            provider: config.inference_provider,
-            model: config.inference_model.clone(),
-            endpoint: config.inference_endpoint.clone(),
-            api_key_env: config.inference_api_key_env.clone(),
-        },
+        watcher_runtime.provider_overrides(config),
     )
     .with_context(|| format!("failed to initialize SIR pipeline for worker {worker_id}"))?;
+    let generation_pass = watcher_runtime.generation_pass;
+    let prompt_config_fingerprint = watcher_runtime.prompt_config_fingerprint(&pipeline);
+    let workspace_root = config.workspace.clone();
 
     std::thread::Builder::new()
         .name(format!("aether-sir-{worker_id}"))
@@ -1346,31 +1911,59 @@ fn spawn_semantic_worker(
                     continue;
                 }
 
+                let previous_meta = store.get_sir_meta(symbol_id.as_str()).ok().flatten();
+                let previous_embedding = pipeline
+                    .load_symbol_embedding(symbol_id.as_str())
+                    .ok()
+                    .flatten();
                 let event = SymbolChangeEvent {
                     file_path: symbol.file_path.clone(),
                     language: symbol.language,
-                    added: vec![symbol],
+                    added: vec![symbol.clone()],
                     removed: Vec::new(),
                     updated: Vec::new(),
                 };
                 let mut sink = std::io::sink();
-                let result = pipeline.process_event_with_priority(
+                let result = pipeline.process_event_with_priority_and_pass(
                     store.as_ref(),
                     &event,
                     false,
                     false,
                     &mut sink,
                     Some(score),
+                    generation_pass,
                 );
-                if let Err(err) = result {
-                    tracing::warn!(
-                        symbol_id = %symbol_id,
-                        error = %err,
-                        "semantic indexing failed for queued symbol"
-                    );
-                    let _ = queue_state.queue.lock().map(|mut queue| {
-                        queue.push(symbol_id.clone(), score.clamp(0.0, 1.0));
-                    });
+                match result {
+                    Ok(stats) => {
+                        if stats.success_count > 0
+                            && let Err(err) = finalize_watcher_generation(
+                                &pipeline,
+                                workspace_root.as_path(),
+                                store.as_ref(),
+                                &symbol,
+                                previous_meta.as_ref(),
+                                previous_embedding.as_ref(),
+                                generation_pass,
+                                &prompt_config_fingerprint,
+                            )
+                        {
+                            tracing::warn!(
+                                symbol_id = %symbol_id,
+                                error = %err,
+                                "failed to record watcher prompt hash and fingerprint history"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            symbol_id = %symbol_id,
+                            error = %err,
+                            "semantic indexing failed for queued symbol"
+                        );
+                        let _ = queue_state.queue.lock().map(|mut queue| {
+                            queue.push(symbol_id.clone(), score.clamp(0.0, 1.0));
+                        });
+                    }
                 }
 
                 queue_state.complete_task(symbol_id.as_str());
@@ -1379,6 +1972,74 @@ fn spawn_semantic_worker(
         .context("failed to spawn semantic worker thread")?;
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_watcher_generation(
+    pipeline: &SirPipeline,
+    workspace_root: &Path,
+    store: &SqliteStore,
+    symbol: &Symbol,
+    previous_meta: Option<&SirMetaRecord>,
+    previous_embedding: Option<&SymbolEmbeddingRecord>,
+    generation_pass: &str,
+    prompt_config_fingerprint: &str,
+) -> Result<()> {
+    let job = build_job(workspace_root, symbol.clone(), None, None)
+        .with_context(|| format!("failed to rebuild prompt hash input for {}", symbol.id))?;
+    let prompt_hash = compute_prompt_hash(job.symbol_text.as_str(), &[], prompt_config_fingerprint);
+
+    let current_meta = store
+        .get_sir_meta(symbol.id.as_str())
+        .with_context(|| format!("failed to reload SIR metadata for {}", symbol.id))?
+        .ok_or_else(|| anyhow::anyhow!("missing SIR metadata for {}", symbol.id))?;
+    store
+        .upsert_sir_meta(SirMetaRecord {
+            prompt_hash: Some(prompt_hash.clone()),
+            ..current_meta
+        })
+        .with_context(|| format!("failed to persist watcher prompt hash for {}", symbol.id))?;
+    let current_embedding = pipeline
+        .load_symbol_embedding(symbol.id.as_str())
+        .with_context(|| format!("failed to reload embedding for {}", symbol.id))?;
+    write_fingerprint_row(
+        store,
+        symbol.id.as_str(),
+        prompt_hash.as_str(),
+        previous_meta.and_then(|meta| meta.prompt_hash.as_deref()),
+        "watcher",
+        pipeline.model_name(),
+        generation_pass,
+        watcher_semantic_delta(previous_embedding, current_embedding.as_ref()),
+    )
+    .with_context(|| format!("failed to write watcher fingerprint row for {}", symbol.id))
+}
+
+fn watcher_semantic_delta(
+    previous: Option<&SymbolEmbeddingRecord>,
+    current: Option<&SymbolEmbeddingRecord>,
+) -> Option<f64> {
+    let previous = previous?;
+    let current = current?;
+    if previous.embedding.len() != current.embedding.len() || previous.embedding.is_empty() {
+        return None;
+    }
+
+    let mut dot = 0.0_f64;
+    let mut left_norm = 0.0_f64;
+    let mut right_norm = 0.0_f64;
+    for (left, right) in previous.embedding.iter().zip(current.embedding.iter()) {
+        let left = f64::from(*left);
+        let right = f64::from(*right);
+        dot += left * right;
+        left_norm += left * left;
+        right_norm += right * right;
+    }
+    if left_norm <= f64::EPSILON || right_norm <= f64::EPSILON {
+        return None;
+    }
+
+    Some(1.0 - (dot / (left_norm.sqrt() * right_norm.sqrt())))
 }
 
 fn enqueue_symbols_missing_sir(
@@ -1780,35 +2441,6 @@ fn unix_timestamp_millis() -> i64 {
         .unwrap_or(0)
 }
 
-fn enqueue_event_paths(
-    workspace: &PathBuf,
-    event: notify::Result<Event>,
-    queue: &mut DebounceQueue,
-) -> Result<()> {
-    let event = event.context("notify error")?;
-    let now = Instant::now();
-
-    for path in event.paths {
-        if is_ignored_path(&path) {
-            continue;
-        }
-
-        if let Ok(relative) = path.strip_prefix(workspace)
-            && is_ignored_path(relative)
-        {
-            continue;
-        }
-
-        if path.is_dir() {
-            continue;
-        }
-
-        queue.mark(path, now);
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1890,6 +2522,7 @@ vector_backend = "sqlite"
                 provider: "mock".to_owned(),
                 model: "mock-model".to_owned(),
                 generation_pass: "scan".to_owned(),
+                prompt_hash: None,
                 updated_at: version.updated_at,
                 sir_status: "fresh".to_owned(),
                 last_error: None,
@@ -2049,5 +2682,75 @@ vector_backend = "sqlite"
             .count_symbols_with_sir()
             .expect("count coverage after second reconcile");
         assert_eq!((total_symbols, symbols_with_sir), (1, 1));
+    }
+
+    #[test]
+    fn resolve_git_watch_dir_follows_worktree_gitdir_file() {
+        let temp = tempdir().expect("tempdir");
+        let git_admin = temp.path().join("git-admin/worktrees/demo");
+        fs::create_dir_all(&git_admin).expect("create git admin dir");
+        fs::write(
+            temp.path().join(".git"),
+            format!("gitdir: {}\n", git_admin.display()),
+        )
+        .expect("write gitdir pointer");
+
+        let resolved = resolve_git_watch_dir(temp.path()).expect("resolve git watch dir");
+        assert_eq!(resolved, git_admin);
+    }
+
+    #[test]
+    fn classify_watch_event_recognizes_git_paths_outside_workspace() {
+        let temp = tempdir().expect("tempdir");
+        let git_admin = temp.path().join("git-admin/worktrees/demo");
+        let source_file = temp.path().join("src/lib.rs");
+        fs::create_dir_all(source_file.parent().expect("source parent")).expect("create src dir");
+        let event = Event {
+            kind: notify::EventKind::Modify(notify::event::ModifyKind::Any),
+            paths: vec![git_admin.join("HEAD"), source_file.clone()],
+            attrs: Default::default(),
+        };
+
+        let classified = classify_watch_event(temp.path(), Some(&git_admin), event);
+        assert!(classified.git_event);
+        assert_eq!(classified.source_paths, vec![source_file]);
+    }
+
+    #[test]
+    fn git_events_suppress_normal_file_debounce_until_settled() {
+        let mut debounce_queue = DebounceQueue::default();
+        let mut git_state = GitDebounceState::default();
+        let source_a = PathBuf::from("src/lib.rs");
+        let source_b = PathBuf::from("src/main.rs");
+
+        enqueue_classified_watch_event(
+            ClassifiedWatchEvent {
+                git_event: true,
+                source_paths: vec![source_a.clone()],
+                watch_dirs: Vec::new(),
+            },
+            &mut debounce_queue,
+            &mut git_state,
+        );
+        enqueue_classified_watch_event(
+            ClassifiedWatchEvent {
+                git_event: false,
+                source_paths: vec![source_b.clone()],
+                watch_dirs: Vec::new(),
+            },
+            &mut debounce_queue,
+            &mut git_state,
+        );
+
+        assert!(git_state.has_pending());
+        assert!(
+            debounce_queue
+                .drain_due(Instant::now(), Duration::ZERO)
+                .is_empty()
+        );
+
+        let mut dirty = git_state.take_dirty_paths().into_iter().collect::<Vec<_>>();
+        dirty.sort();
+        assert_eq!(dirty, vec![source_a, source_b]);
     }
 }
