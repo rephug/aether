@@ -50,6 +50,17 @@ pub(crate) fn build_pass_jsonl(
     pass_config: &PassConfig,
     symbols_by_id: &HashMap<String, Symbol>,
 ) -> Result<BuildSummary> {
+    build_pass_jsonl_for_ids(workspace, store, runtime, pass_config, symbols_by_id, None)
+}
+
+pub(crate) fn build_pass_jsonl_for_ids(
+    workspace: &Path,
+    store: &SqliteStore,
+    runtime: &BatchRuntimeConfig,
+    pass_config: &PassConfig,
+    symbols_by_id: &HashMap<String, Symbol>,
+    candidate_ids: Option<&[String]>,
+) -> Result<BuildSummary> {
     if pass_config.model.trim().is_empty() {
         return Err(anyhow!(
             "batch {} requires a model (set [batch].{}_model or pass --model)",
@@ -71,9 +82,12 @@ pub(crate) fn build_pass_jsonl(
         skipped: 0,
         unresolved_symbols: 0,
     };
-    let symbol_ids = store
-        .list_all_symbol_ids()
-        .context("failed to list symbols for batch build")?;
+    let symbol_ids = match candidate_ids {
+        Some(ids) => ids.to_vec(),
+        None => store
+            .list_all_symbol_ids()
+            .context("failed to list symbols for batch build")?,
+    };
     let graph = if matches!(pass_config.pass, BatchPass::Scan) {
         HashMap::new()
     } else {

@@ -504,6 +504,7 @@ impl AetherMcpServer {
             model: "deterministic".to_owned(),
             generation_pass: "single".to_owned(),
             prompt_hash: None,
+            staleness_score: None,
             updated_at: version_write.updated_at,
             sir_status: "fresh".to_owned(),
             last_error: None,

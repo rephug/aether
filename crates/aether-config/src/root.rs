@@ -8,6 +8,7 @@ use crate::{
     analysis::{CouplingConfig, DriftConfig},
     batch::BatchConfig,
     constants::{AETHER_DIR_NAME, CONFIG_FILE_NAME, DEFAULT_DASHBOARD_PORT, DEFAULT_LOG_LEVEL},
+    continuous::ContinuousConfig,
     embeddings::EmbeddingsConfig,
     health::{HealthConfig, HealthScoreConfig},
     inference::InferenceConfig,
@@ -50,6 +51,8 @@ pub struct AetherConfig {
     pub health_score: HealthScoreConfig,
     #[serde(default)]
     pub dashboard: DashboardConfig,
+    #[serde(default)]
+    pub continuous: Option<ContinuousConfig>,
     #[serde(default)]
     pub batch: Option<BatchConfig>,
     #[serde(default, rename = "watcher")]
@@ -209,11 +212,12 @@ mod tests {
         parse_workspace_config_str, save_workspace_config,
     };
     use crate::{
-        AetherConfig, BatchConfig, DEFAULT_COHERE_API_KEY_ENV, DEFAULT_DASHBOARD_PORT,
-        DEFAULT_DRIFT_ANALYSIS_WINDOW, DEFAULT_DRIFT_HUB_PERCENTILE, DEFAULT_DRIFT_THRESHOLD,
-        DEFAULT_GEMINI_API_KEY_ENV, DEFAULT_HEALTH_DRIFT_WEIGHT, DEFAULT_HEALTH_NO_SIR_WEIGHT,
-        DEFAULT_HEALTH_PAGERANK_WEIGHT, DEFAULT_HEALTH_RECENCY_WEIGHT,
-        DEFAULT_HEALTH_SCORE_AUTHOR_COUNT_HIGH, DEFAULT_HEALTH_SCORE_BLAME_AGE_SPREAD_HIGH_SECS,
+        AetherConfig, BatchConfig, ContinuousConfig, DEFAULT_COHERE_API_KEY_ENV,
+        DEFAULT_DASHBOARD_PORT, DEFAULT_DRIFT_ANALYSIS_WINDOW, DEFAULT_DRIFT_HUB_PERCENTILE,
+        DEFAULT_DRIFT_THRESHOLD, DEFAULT_GEMINI_API_KEY_ENV, DEFAULT_HEALTH_DRIFT_WEIGHT,
+        DEFAULT_HEALTH_NO_SIR_WEIGHT, DEFAULT_HEALTH_PAGERANK_WEIGHT,
+        DEFAULT_HEALTH_RECENCY_WEIGHT, DEFAULT_HEALTH_SCORE_AUTHOR_COUNT_HIGH,
+        DEFAULT_HEALTH_SCORE_BLAME_AGE_SPREAD_HIGH_SECS,
         DEFAULT_HEALTH_SCORE_BOUNDARY_LEAKAGE_HIGH, DEFAULT_HEALTH_SCORE_CHURN_30D_HIGH,
         DEFAULT_HEALTH_SCORE_CHURN_90D_HIGH, DEFAULT_HEALTH_SCORE_DEAD_FEATURE_FAIL,
         DEFAULT_HEALTH_SCORE_DEAD_FEATURE_WARN, DEFAULT_HEALTH_SCORE_DRIFT_DENSITY_HIGH,
@@ -464,6 +468,7 @@ mod tests {
         assert!(config.health_score.semantic_weight.is_none());
         assert_eq!(config.dashboard.port, DEFAULT_DASHBOARD_PORT);
         assert!(config.dashboard.enabled);
+        assert_eq!(config.continuous, None);
         assert!(config_path(workspace).exists());
 
         let content = fs::read_to_string(config_path(workspace)).expect("read config file");
@@ -754,6 +759,50 @@ enabled = false
         );
         assert_eq!(config.dashboard.port, 9800);
         assert!(!config.dashboard.enabled);
+    }
+
+    #[test]
+    fn parse_workspace_config_accepts_empty_continuous_section() {
+        let config = parse_workspace_config_str("").expect("parse empty config");
+        assert_eq!(config.continuous, None);
+    }
+
+    #[test]
+    fn parse_workspace_config_parses_full_continuous_section() {
+        let config = parse_workspace_config_str(
+            r#"
+[continuous]
+enabled = true
+schedule = "hourly"
+staleness_half_life_days = 21.5
+staleness_sigmoid_k = 0.45
+neighbor_decay = 0.6
+neighbor_cutoff = 0.2
+coupling_predict_threshold = 0.9
+priority_pagerank_alpha = 0.15
+max_requeue_per_run = 250
+auto_submit = true
+requeue_pass = "deep"
+"#,
+        )
+        .expect("parse continuous config");
+
+        assert_eq!(
+            config.continuous,
+            Some(ContinuousConfig {
+                enabled: true,
+                schedule: "hourly".to_owned(),
+                staleness_half_life_days: 21.5,
+                staleness_sigmoid_k: 0.45,
+                neighbor_decay: 0.6,
+                neighbor_cutoff: 0.2,
+                coupling_predict_threshold: 0.9,
+                priority_pagerank_alpha: 0.15,
+                max_requeue_per_run: 250,
+                auto_submit: true,
+                requeue_pass: "deep".to_owned(),
+            })
+        );
     }
 
     #[test]

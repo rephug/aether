@@ -135,7 +135,7 @@ fn run_full_batch_command(
     Ok(())
 }
 
-fn submit_batch_chunk(
+pub(crate) fn submit_batch_chunk(
     workspace: &Path,
     script: &Path,
     runtime: &BatchRuntimeConfig,

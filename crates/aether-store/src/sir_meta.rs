@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SirMetaRecord {
     pub id: String,
     pub sir_hash: String,
@@ -9,12 +9,13 @@ pub struct SirMetaRecord {
     pub model: String,
     pub generation_pass: String,
     pub prompt_hash: Option<String>,
+    pub staleness_score: Option<f64>,
     pub updated_at: i64,
     pub sir_status: String,
     pub last_error: Option<String>,
     pub last_attempt_at: i64,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SirRowState {
     pub(crate) sir_hash: String,
     pub(crate) sir_version: i64,
@@ -22,6 +23,7 @@ pub(crate) struct SirRowState {
     pub(crate) model: String,
     pub(crate) generation_pass: String,
     pub(crate) prompt_hash: Option<String>,
+    pub(crate) staleness_score: Option<f64>,
     pub(crate) updated_at: i64,
     pub(crate) sir_status: String,
     pub(crate) last_error: Option<String>,
@@ -41,6 +43,7 @@ pub(crate) fn load_sir_row_state(
             model,
             generation_pass,
             prompt_hash,
+            staleness_score,
             updated_at,
             sir_status,
             last_error,
@@ -62,16 +65,17 @@ pub(crate) fn load_sir_row_state(
                     .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| "scan".to_owned()),
                 prompt_hash: row.get(5)?,
-                updated_at: row.get::<_, i64>(6)?.max(0),
+                staleness_score: row.get(6)?,
+                updated_at: row.get::<_, i64>(7)?.max(0),
                 sir_status: row
-                    .get::<_, Option<String>>(7)?
+                    .get::<_, Option<String>>(8)?
                     .map(|value| value.trim().to_owned())
                     .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| "fresh".to_owned()),
-                last_error: row.get(8)?,
-                last_attempt_at: row.get::<_, i64>(9)?.max(0),
+                last_error: row.get(9)?,
+                last_attempt_at: row.get::<_, i64>(10)?.max(0),
                 sir_json: row
-                    .get::<_, Option<String>>(10)?
+                    .get::<_, Option<String>>(11)?
                     .filter(|value| !value.trim().is_empty()),
             })
         },
@@ -88,10 +92,10 @@ pub(crate) fn upsert_sir_row_state(
     tx.execute(
         r#"
         INSERT INTO sir (
-            id, sir_hash, sir_version, provider, model, generation_pass, prompt_hash, updated_at,
-            sir_status, last_error, last_attempt_at, sir_json
+            id, sir_hash, sir_version, provider, model, generation_pass, prompt_hash,
+            staleness_score, updated_at, sir_status, last_error, last_attempt_at, sir_json
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
         ON CONFLICT(id) DO UPDATE SET
             sir_hash = excluded.sir_hash,
             sir_version = excluded.sir_version,
@@ -99,6 +103,7 @@ pub(crate) fn upsert_sir_row_state(
             model = excluded.model,
             generation_pass = excluded.generation_pass,
             prompt_hash = excluded.prompt_hash,
+            staleness_score = excluded.staleness_score,
             updated_at = excluded.updated_at,
             sir_status = excluded.sir_status,
             last_error = excluded.last_error,
@@ -113,6 +118,7 @@ pub(crate) fn upsert_sir_row_state(
             &row.model,
             &row.generation_pass,
             &row.prompt_hash,
+            row.staleness_score,
             row.updated_at,
             &row.sir_status,
             &row.last_error,
@@ -361,9 +367,9 @@ impl SqliteStore {
             r#"
             INSERT INTO sir (
                 id, sir_hash, sir_version, provider, model, generation_pass, prompt_hash,
-                updated_at, sir_status, last_error, last_attempt_at
+                staleness_score, updated_at, sir_status, last_error, last_attempt_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             ON CONFLICT(id) DO UPDATE SET
                 sir_hash = excluded.sir_hash,
                 sir_version = excluded.sir_version,
@@ -371,6 +377,7 @@ impl SqliteStore {
                 model = excluded.model,
                 generation_pass = excluded.generation_pass,
                 prompt_hash = excluded.prompt_hash,
+                staleness_score = excluded.staleness_score,
                 updated_at = excluded.updated_at,
                 sir_status = excluded.sir_status,
                 last_error = excluded.last_error,
@@ -384,6 +391,7 @@ impl SqliteStore {
                 record.model,
                 record.generation_pass,
                 record.prompt_hash,
+                record.staleness_score,
                 record.updated_at,
                 record.sir_status,
                 record.last_error,
@@ -408,6 +416,7 @@ impl SqliteStore {
                 model,
                 generation_pass,
                 prompt_hash,
+                staleness_score,
                 updated_at,
                 sir_status,
                 last_error,
@@ -431,10 +440,11 @@ impl SqliteStore {
                         .filter(|value| !value.is_empty())
                         .unwrap_or_else(|| "scan".to_owned()),
                     prompt_hash: row.get(6)?,
-                    updated_at: row.get(7)?,
-                    sir_status: row.get(8)?,
-                    last_error: row.get(9)?,
-                    last_attempt_at: row.get(10)?,
+                    staleness_score: row.get(7)?,
+                    updated_at: row.get(8)?,
+                    sir_status: row.get(9)?,
+                    last_error: row.get(10)?,
+                    last_attempt_at: row.get(11)?,
                 })
             })
             .optional()?;

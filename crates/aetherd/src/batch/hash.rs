@@ -1,31 +1,35 @@
 use blake3::Hasher;
 
+pub fn compute_source_hash_segment(source: &str) -> String {
+    let mut h = Hasher::new();
+    h.update(source.as_bytes());
+    let hex = h.finalize().to_hex().to_string();
+    hex[..16].to_owned()
+}
+
+pub fn compute_neighbor_hash_segment(neighbor_intents: &[&str]) -> String {
+    let mut sorted = neighbor_intents.to_vec();
+    sorted.sort();
+    let mut h = Hasher::new();
+    for intent in sorted {
+        h.update(intent.as_bytes());
+        h.update(b"\n");
+    }
+    let hex = h.finalize().to_hex().to_string();
+    hex[..16].to_owned()
+}
+
+pub fn compute_config_hash_segment(config: &str) -> String {
+    let mut h = Hasher::new();
+    h.update(config.as_bytes());
+    let hex = h.finalize().to_hex().to_string();
+    hex[..16].to_owned()
+}
+
 pub fn compute_prompt_hash(source: &str, neighbor_intents: &[&str], config: &str) -> String {
-    let source_hash = {
-        let mut h = Hasher::new();
-        h.update(source.as_bytes());
-        let hex = h.finalize().to_hex().to_string();
-        hex[..16].to_owned()
-    };
-
-    let neighbor_hash = {
-        let mut h = Hasher::new();
-        let mut sorted = neighbor_intents.to_vec();
-        sorted.sort();
-        for intent in &sorted {
-            h.update(intent.as_bytes());
-            h.update(b"\n");
-        }
-        let hex = h.finalize().to_hex().to_string();
-        hex[..16].to_owned()
-    };
-
-    let config_hash = {
-        let mut h = Hasher::new();
-        h.update(config.as_bytes());
-        let hex = h.finalize().to_hex().to_string();
-        hex[..16].to_owned()
-    };
+    let source_hash = compute_source_hash_segment(source);
+    let neighbor_hash = compute_neighbor_hash_segment(neighbor_intents);
+    let config_hash = compute_config_hash_segment(config);
 
     format!("{source_hash}|{neighbor_hash}|{config_hash}")
 }
@@ -47,7 +51,10 @@ pub fn diff_prompt_hashes(old: &str, new: &str) -> (bool, bool, bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_prompt_hash, diff_prompt_hashes};
+    use super::{
+        compute_config_hash_segment, compute_neighbor_hash_segment, compute_prompt_hash,
+        compute_source_hash_segment, diff_prompt_hashes,
+    };
 
     #[test]
     fn compute_prompt_hash_is_stable_for_identical_inputs() {
@@ -92,6 +99,18 @@ mod tests {
         assert_eq!(
             diff_prompt_hashes(&base, &changed_config),
             (false, false, true)
+        );
+    }
+
+    #[test]
+    fn prompt_hash_segments_match_composed_hash() {
+        let source_hash = compute_source_hash_segment("fn run() {}");
+        let neighbor_hash = compute_neighbor_hash_segment(&["intent b", "intent a"]);
+        let config_hash = compute_config_hash_segment("model:low:10000");
+
+        assert_eq!(
+            compute_prompt_hash("fn run() {}", &["intent a", "intent b"], "model:low:10000"),
+            format!("{source_hash}|{neighbor_hash}|{config_hash}")
         );
     }
 }

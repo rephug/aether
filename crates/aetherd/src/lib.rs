@@ -2,6 +2,7 @@ pub mod batch;
 pub mod calibrate;
 pub mod causal;
 pub mod cli;
+pub mod continuous;
 pub mod coupling;
 pub mod drift;
 pub mod fsck;

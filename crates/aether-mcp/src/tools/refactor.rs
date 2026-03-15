@@ -432,6 +432,7 @@ impl AetherMcpServer {
             model: model_name.to_owned(),
             generation_pass: "deep".to_owned(),
             prompt_hash: None,
+            staleness_score: None,
             updated_at: version.updated_at,
             sir_status: "fresh".to_owned(),
             last_error: None,
@@ -471,6 +472,7 @@ impl AetherMcpServer {
                 .map(|meta| meta.generation_pass.clone())
                 .unwrap_or_else(|| "scan".to_owned()),
             prompt_hash: current.as_ref().and_then(|meta| meta.prompt_hash.clone()),
+            staleness_score: current.as_ref().and_then(|meta| meta.staleness_score),
             updated_at,
             sir_status: "stale".to_owned(),
             last_error: Some(error_message.to_owned()),
@@ -794,6 +796,7 @@ vector_backend = "sqlite"
                 model: "mock".to_owned(),
                 generation_pass: "deep".to_owned(),
                 prompt_hash: None,
+                staleness_score: None,
                 updated_at: current_unix_timestamp(),
                 sir_status: "fresh".to_owned(),
                 last_error: None,

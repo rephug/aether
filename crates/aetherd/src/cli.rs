@@ -641,10 +641,32 @@ pub struct BatchRunArgs {
     pub poll_interval_secs: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct ContinuousArgs {
+    #[command(subcommand)]
+    pub command: ContinuousCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum ContinuousCommand {
+    /// Run one continuous-intelligence scoring and re-queue cycle
+    RunOnce(ContinuousRunOnceArgs),
+    /// Show the latest continuous-intelligence summary
+    Status(ContinuousStatusArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args, Default)]
+pub struct ContinuousRunOnceArgs {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args, Default)]
+pub struct ContinuousStatusArgs {}
+
 #[derive(Debug, Clone, PartialEq, Subcommand)]
 pub enum Commands {
     /// Batch indexing operations
     Batch(BatchArgs),
+    /// Continuous intelligence operations
+    Continuous(ContinuousArgs),
     /// Generate agent configuration files for AI coding agents
     InitAgent(InitAgentArgs),
     /// Regenerate low-quality SIR records with optional deep enrichment
@@ -984,7 +1006,7 @@ mod tests {
     use aether_config::OLLAMA_DEFAULT_ENDPOINT;
     use clap::Parser;
 
-    use super::{Cli, Commands, parse_since_duration};
+    use super::{Cli, Commands, ContinuousCommand, parse_since_duration};
     use crate::init_agent::AgentPlatform;
 
     #[test]
@@ -1186,6 +1208,32 @@ mod tests {
         let cli =
             Cli::try_parse_from(["aetherd", "--workspace", ".", "status"]).expect("status parse");
         assert!(matches!(cli.command, Some(Commands::Status)));
+    }
+
+    #[test]
+    fn continuous_run_once_subcommand_parses() {
+        let cli = Cli::try_parse_from(["aetherd", "--workspace", ".", "continuous", "run-once"])
+            .expect("continuous run-once parse");
+
+        match cli.command {
+            Some(Commands::Continuous(args)) => {
+                assert!(matches!(args.command, ContinuousCommand::RunOnce(_)));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn continuous_status_subcommand_parses() {
+        let cli = Cli::try_parse_from(["aetherd", "--workspace", ".", "continuous", "status"])
+            .expect("continuous status parse");
+
+        match cli.command {
+            Some(Commands::Continuous(args)) => {
+                assert!(matches!(args.command, ContinuousCommand::Status(_)));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]

@@ -45,7 +45,7 @@ fn migration_v6_renames_legacy_generation_pass_values_to_scan() {
     assert_eq!(single_meta.generation_pass, "scan");
     assert_eq!(
         store.get_schema_version().expect("schema version").version,
-        9
+        10
     );
 }
 
@@ -73,7 +73,7 @@ fn migration_v7_expands_symbol_edge_kinds() {
     let version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("query migrated version");
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
 
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM symbol_edges", [], |row| row.get(0))
@@ -216,13 +216,13 @@ fn run_migrations_sets_user_version_and_is_idempotent() {
     let first_version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("query first user_version");
-    assert_eq!(first_version, 9);
+    assert_eq!(first_version, 10);
 
     run_migrations(&conn).expect("run migrations twice");
     let second_version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("query second user_version");
-    assert_eq!(second_version, 9);
+    assert_eq!(second_version, 10);
 }
 
 #[test]
@@ -232,7 +232,7 @@ fn schema_version_table_is_populated() {
 
     let schema = store.get_schema_version().expect("get schema version");
     assert_eq!(schema.component, "core");
-    assert_eq!(schema.version, 9);
+    assert_eq!(schema.version, 10);
     assert!(schema.migrated_at > 0);
 }
 
@@ -276,6 +276,21 @@ fn migration_v9_adds_prompt_hash_and_fingerprint_history() {
             .iter()
             .any(|column| column == "delta_sem")
     );
+}
+
+#[test]
+fn migration_v10_adds_staleness_score_to_sir() {
+    let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+    run_migrations(&conn).expect("run migrations");
+
+    let sir_columns = conn
+        .prepare("PRAGMA table_info(sir)")
+        .expect("prepare sir table_info")
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("query sir columns")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect sir columns");
+    assert!(sir_columns.iter().any(|column| column == "staleness_score"));
 }
 
 #[test]
@@ -464,7 +479,7 @@ fn migration_from_v2_to_v3_adds_write_intents_table() {
     let version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("query user_version");
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
 
     let exists = conn
         .query_row(
