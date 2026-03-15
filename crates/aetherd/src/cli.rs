@@ -661,12 +661,90 @@ pub struct ContinuousRunOnceArgs {}
 #[derive(Debug, Clone, PartialEq, Eq, Args, Default)]
 pub struct ContinuousStatusArgs {}
 
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct SirContextArgs {
+    #[arg(
+        help = "Symbol selector: qualified name, symbol ID, or fuzzy search",
+        required_unless_present = "symbols",
+        conflicts_with = "symbols"
+    )]
+    pub selector: Option<String>,
+
+    #[arg(
+        long,
+        default_value = "markdown",
+        value_parser = ["markdown", "json", "text"],
+        help = "Output format"
+    )]
+    pub format: String,
+
+    #[arg(long, default_value_t = 16000, help = "Max token budget")]
+    pub max_tokens: usize,
+
+    #[arg(
+        long,
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u32).range(1..=3),
+        help = "Dependency depth (1-3)"
+    )]
+    pub depth: u32,
+
+    #[arg(long, help = "Sections to include (comma-separated)")]
+    pub include: Option<String>,
+
+    #[arg(long, help = "Write to file instead of stdout")]
+    pub output: Option<String>,
+
+    #[arg(
+        long,
+        conflicts_with = "selector",
+        help = "Read symbol selectors from file (one per line)"
+    )]
+    pub symbols: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct SirInjectArgs {
+    #[arg(help = "Symbol selector")]
+    pub selector: String,
+
+    #[arg(long, help = "Intent text")]
+    pub intent: String,
+
+    #[arg(long, help = "Behavior summary")]
+    pub behavior: Option<String>,
+
+    #[arg(long, help = "Edge cases")]
+    pub edge_cases: Option<String>,
+
+    #[arg(long, help = "Overwrite even if existing SIR has higher quality")]
+    pub force: bool,
+
+    #[arg(long, help = "Show what would change without persisting")]
+    pub dry_run: bool,
+
+    #[arg(long, help = "Skip re-embedding")]
+    pub no_embed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct SirDiffArgs {
+    #[arg(help = "Symbol selector")]
+    pub selector: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Subcommand)]
 pub enum Commands {
     /// Batch indexing operations
     Batch(BatchArgs),
     /// Continuous intelligence operations
     Continuous(ContinuousArgs),
+    /// Assemble semantic context for a symbol
+    SirContext(SirContextArgs),
+    /// Inject or update a symbol's SIR intent
+    SirInject(SirInjectArgs),
+    /// Show SIR vs source code delta
+    SirDiff(SirDiffArgs),
     /// Generate agent configuration files for AI coding agents
     InitAgent(InitAgentArgs),
     /// Regenerate low-quality SIR records with optional deep enrichment
@@ -1231,6 +1309,123 @@ mod tests {
         match cli.command {
             Some(Commands::Continuous(args)) => {
                 assert!(matches!(args.command, ContinuousCommand::Status(_)));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sir_context_subcommand_parses_selector_mode() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "sir-context",
+            "demo::alpha",
+            "--format",
+            "json",
+            "--max-tokens",
+            "1200",
+            "--depth",
+            "2",
+            "--include",
+            "deps,tests",
+        ])
+        .expect("sir-context should parse");
+
+        match cli.command {
+            Some(Commands::SirContext(args)) => {
+                assert_eq!(args.selector.as_deref(), Some("demo::alpha"));
+                assert_eq!(args.symbols, None);
+                assert_eq!(args.format, "json");
+                assert_eq!(args.max_tokens, 1200);
+                assert_eq!(args.depth, 2);
+                assert_eq!(args.include.as_deref(), Some("deps,tests"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sir_context_subcommand_parses_symbols_file_mode() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "sir-context",
+            "--symbols",
+            "selectors.txt",
+            "--output",
+            "context.md",
+        ])
+        .expect("sir-context file mode should parse");
+
+        match cli.command {
+            Some(Commands::SirContext(args)) => {
+                assert_eq!(args.selector, None);
+                assert_eq!(args.symbols.as_deref(), Some("selectors.txt"));
+                assert_eq!(args.output.as_deref(), Some("context.md"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sir_context_subcommand_rejects_selector_and_symbols_together() {
+        let result = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "sir-context",
+            "demo::alpha",
+            "--symbols",
+            "selectors.txt",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sir_inject_subcommand_parses_all_flags() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "sir-inject",
+            "demo::alpha",
+            "--intent",
+            "updated intent",
+            "--behavior",
+            "writes cache",
+            "--edge-cases",
+            "io",
+            "--force",
+            "--dry-run",
+            "--no-embed",
+        ])
+        .expect("sir-inject should parse");
+
+        match cli.command {
+            Some(Commands::SirInject(args)) => {
+                assert_eq!(args.selector, "demo::alpha");
+                assert_eq!(args.intent, "updated intent");
+                assert_eq!(args.behavior.as_deref(), Some("writes cache"));
+                assert_eq!(args.edge_cases.as_deref(), Some("io"));
+                assert!(args.force);
+                assert!(args.dry_run);
+                assert!(args.no_embed);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sir_diff_subcommand_parses_selector() {
+        let cli = Cli::try_parse_from(["aetherd", "--workspace", ".", "sir-diff", "demo::alpha"])
+            .expect("sir-diff should parse");
+
+        match cli.command {
+            Some(Commands::SirDiff(args)) => {
+                assert_eq!(args.selector, "demo::alpha");
             }
             other => panic!("unexpected command: {other:?}"),
         }
