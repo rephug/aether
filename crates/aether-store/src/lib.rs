@@ -29,6 +29,7 @@ mod sir_history;
 mod sir_meta;
 mod snapshots;
 mod symbols;
+mod task_context_history;
 mod test_intents;
 mod thresholds;
 mod write_intents;
@@ -71,6 +72,7 @@ pub use sir_history::{
 pub use sir_meta::SirMetaRecord;
 pub use snapshots::{IntentSnapshot, IntentSnapshotSummary, SnapshotEntry};
 pub use symbols::{SymbolMetadata, SymbolRecord, SymbolSearchResult};
+pub use task_context_history::TaskContextHistoryRecord;
 pub use test_intents::TestIntentRecord;
 pub use thresholds::{CalibrationEmbeddingRecord, ThresholdCalibrationRecord};
 pub use write_intents::{IntentOperation, WriteIntent, WriteIntentStatus};
