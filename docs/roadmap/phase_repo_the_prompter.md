@@ -13,7 +13,7 @@
 
 1. **Immediate daily value.** Robert's workflow involves consulting Claude, Gemini Deep Think, and ChatGPT — none of which are MCP-connected. Today that means manually assembling context. Phase Repo automates this.
 
-2. **Low implementation cost.** Every feature builds on existing infrastructure (context assembly engine, SIR store, graph queries, token budgeting). No new databases, no new protocols, no new crates. Mostly new CLI commands and formatters on top of existing query paths.
+2. **Low implementation cost.** The `sir-context` command already exists in `aetherd` with budgeted symbol-centric context assembly. Phase Repo generalizes that engine to support file targets, overview mode, and multiple output formats. No new crates, no new databases, no new protocols.
 
 3. **Amplifies existing investment.** Phase 8 built a world-class understanding engine. Phase 10 makes it autonomous. Phase Repo makes it *accessible* — the missing bridge between intelligence and consumption.
 
@@ -21,15 +21,37 @@
 
 ---
 
+## Existing Foundation: `sir-context`
+
+The current `sir-context` command in `aetherd` provides symbol-centric budgeted context assembly. Phase Repo does **not** create a parallel pipeline. Instead, R.1 refactors `sir_context.rs` into a shared assembly core that both the new `context` command and the compatibility `sir-context` alias use.
+
+**What already exists:**
+- Greedy token allocator with tier-based priority
+- Symbol selector resolution (by ID, qualified name, or fuzzy name match)
+- SIR loading and formatting
+- Caller/dependency graph traversal via SQLite graph APIs
+- Test intent queries
+- Project memory search via `aether_recall`
+
+**What Phase Repo adds:**
+- File-level targeting (not just symbol-level)
+- Overview mode (project-level summary)
+- Additional intelligence layers (coupling, health, drift)
+- Multiple output formats (markdown, JSON, XML, compact)
+- Preset system for reusable configurations
+- Interactive dashboard builder
+
+---
+
 ## Stage Plan
 
 | Stage | Name | Scope | Codex Runs | Dependencies |
 |-------|------|-------|------------|--------------|
-| R.1 | Context Export CLI | `aether context` command — clipboard-ready, token-budgeted context assembly | 1–2 | Phase 8 complete (SIR, graph, health) |
+| R.1 | Context Export CLI | `aether context` command — generalize `sir-context` into shared export engine | 1–2 | Phase 8 complete (SIR, graph, health) |
 | R.2 | SIR-Guided File Slicing | Symbol-range extraction for token-efficient file inclusion | 1 | R.1 |
 | R.3 | Prompt Preset Library | Named, reusable prompt templates with variable substitution | 1–2 | R.1 |
-| R.4 | Multi-Format Output | Markdown, XML, JSON, and agent-native output formats | 1 | R.1 |
-| R.5 | Interactive Context Builder | TUI/dashboard-based context assembly with live token counting | 1–2 | R.1, R.2 |
+| R.4 | Multi-Format Output | XML and compact formatters on top of the shared ExportDocument | 1 | R.1 |
+| R.5 | Interactive Context Builder | Dashboard page with live token counting and clipboard export (no TUI) | 1–2 | R.1, R.2 |
 
 ### Dependency Chain
 
@@ -40,7 +62,7 @@ R.1 (Context Export) ──► R.2 (File Slicing)
         │                      │
         ├──► R.4 (Formats)     │
         │                      │
-        └──► R.5 (Interactive) ◄┘
+        └──► R.5 (Dashboard) ◄─┘
 ```
 
 R.2, R.3, and R.4 are independent after R.1. R.5 benefits from R.2 but can start without it.
@@ -53,12 +75,12 @@ R.2, R.3, and R.4 are independent after R.1. R.5 benefits from R.2 but can start
 
 | # | Decision | Resolution | Rationale |
 |---|----------|------------|-----------|
-| 97 | Context export lives in existing `aetherd` binary | CLI subcommand, not a new crate. Uses existing `SharedState`. | No new binary, no new dependencies. Context assembly already exists in `aether-generate` (Phase 8.1 spec). The export command is a read-only formatter on top of it. |
-| 98 | Default token budget for export: 32K tokens | Same as Phase 8 context assembly (Decision #48). Configurable via `--budget` flag. | 32K fits in every major model's context window. Users can raise for 128K+ models. |
-| 99 | Default output: markdown to stdout | `aether context` prints to stdout. Pipe to `pbcopy`/`xclip`/`xsel` for clipboard. No built-in clipboard dependency. | Cross-platform without linking to platform clipboard libraries. Shell piping is universal. Adding `| pbcopy` or `| xclip -selection clipboard` is one extra shell token. |
+| 97 | Command surface | New top-level `context` subcommand; `sir-context` retained as compatibility alias routing to the same shared engine. | `context` is cleaner for daily human use. `sir-context` stays so nothing that references it breaks. Zero migration cost. |
+| 98 | Default token budget for export: 32K tokens | Same as Phase 8 context assembly. Configurable via `--budget` flag. | 32K fits in every major model's context window. Users can raise for 128K+ models. |
+| 99 | Default output: markdown to stdout | `aether context` prints to stdout. Pipe to `pbcopy`/`xclip`/`xsel` for clipboard. `--output` flag for file write parity with current `sir-context`. No built-in clipboard dependency. | Cross-platform without linking to platform clipboard libraries. Shell piping is universal. |
 | 100 | Presets stored in `.aether/presets/` as TOML files | One file per preset. Human-editable. Version-controllable. | TOML is already the config format. No new parser needed. Users can share presets by committing the directory. |
-| 101 | File slicing granularity: symbol-level | Slice at symbol boundaries (function, struct, impl block, etc.) using existing tree-sitter span data. Not line-level or AST-node-level. | Symbol-level matches SIR granularity. AETHER already knows every symbol's byte range from parsing. Finer granularity adds complexity without proportional value. |
-| 102 | Context priority tiers (9 tiers) | Same priority ranking as Phase 10.3 `sir context` (if implemented first) or Phase 8.1 budget system. Tiers: (1) target file slices, (2) target SIRs, (3) immediate caller/callee SIRs, (4) test intents, (5) coupling data, (6) project memory, (7) health warnings, (8) drift alerts, (9) broader graph neighborhood. | Consistent with existing context assembly design. Health warnings and drift alerts are new additions that leverage Phase 8's unique intelligence. |
+| 101 | File slicing granularity: symbol-level | Slice at symbol boundaries (function, struct, impl block, etc.) using existing tree-sitter span data from `symbols` table. Not line-level or AST-node-level. | Symbol-level matches SIR granularity. AETHER already knows every symbol's byte range from parsing. |
+| 102 | R.1 ships markdown + JSON; XML and compact deferred to R.4 | Markdown is the primary paste-into-chat format. JSON is free via serde. XML/compact are rendering work that belongs in R.4. | Keeps R.1 focused on the assembly engine and the two highest-value formats. |
 
 ---
 
@@ -67,153 +89,38 @@ R.2, R.3, and R.4 are independent after R.1. R.5 benefits from R.2 but can start
 **Codename:** Courier
 **Depends on:** Phase 8 complete (SIR store, graph, health scores)
 **New crates:** None
-**Modified crates:** `aetherd` (new subcommand), possibly `aether-generate` (reuse context assembly)
+**Modified crates:** `aetherd` (new subcommand + refactored `sir_context.rs`)
 
 ### Purpose
 
-Add an `aether context` CLI command that assembles AETHER's intelligence into a single, token-budgeted document suitable for pasting into any AI chat interface. This is the "clipboard-ready prompt export" — the single most immediately useful feature from RepoPrompt's playbook, except AETHER's version includes semantic intelligence that RepoPrompt can't produce.
+Add a top-level `aether context` CLI command that assembles AETHER's intelligence into a single, token-budgeted document suitable for pasting into any AI chat interface. The implementation generalizes the existing `sir-context` engine into a shared assembly core used by both commands.
 
-### What to Build
+### Architecture: Shared Export Engine
 
-#### CLI Interface
+Refactor current `sir_context.rs` into two layers:
 
-```bash
-# Basic: context for a specific file
-aether context src/payments/processor.rs
+1. **Assembly core** — resolve targets, load indexed data, apply budget tiers, emit `ExportDocument`
+2. **Renderers** — markdown and JSON (R.1), XML and compact added in R.4
 
-# Context for a specific symbol
-aether context --symbol validate_payment_amount --file src/payments/processor.rs
+Both `context` and `sir-context` route through the assembly core. `sir-context` maps its existing symbol-selector + file arguments into a `ContextTarget::Symbol` and calls the same engine.
 
-# Context for multiple targets
-aether context src/payments/processor.rs src/payments/validator.rs
-
-# With budget control
-aether context src/payments/processor.rs --budget 64000
-
-# With depth control (how many hops in the dependency graph)
-aether context src/payments/processor.rs --depth 2
-
-# Include specific intelligence layers
-aether context src/payments/processor.rs --include sir,graph,coupling,health,drift
-
-# Exclude layers
-aether context src/payments/processor.rs --exclude drift,memory
-
-# Output format (default: markdown)
-aether context src/payments/processor.rs --format markdown
-aether context src/payments/processor.rs --format xml
-aether context src/payments/processor.rs --format json
-
-# Pipe to clipboard (platform-dependent, user's responsibility)
-aether context src/payments/processor.rs | xclip -selection clipboard
-aether context src/payments/processor.rs | pbcopy  # macOS
-
-# Task-oriented: provide a task description for smarter context selection
-aether context --task "add rate limiting to the API endpoint" src/api/routes.rs
-
-# Overview mode: project-level summary without targeting specific files
-aether context --overview
-aether context --overview --budget 16000
-```
-
-#### Output Structure (Markdown Format)
-
-```markdown
-# AETHER Context: src/payments/processor.rs
-Generated: 2026-03-15T14:30:00Z | Budget: 32,000 tokens | Used: 28,412 tokens
-
-## Project Overview
-- **Workspace:** /home/rephu/projects/aether
-- **Total Symbols:** 3,748 | **SIR Coverage:** 100%
-- **Health Score:** 42/100 (Watch)
-
-## Target File: src/payments/processor.rs
-### Symbols (7)
-
-#### `validate_payment_amount` (Function)
-**Intent:** Validates that a payment amount is positive, non-zero, and within
-the account's available balance. Returns a typed error for each failure mode.
-**Edge Cases:** Zero amount → InvalidAmount, negative → InvalidAmount,
-exceeds balance → InsufficientFunds, overflow → AmountOverflow
-**Error Handling:** Returns Result<ValidatedAmount, PaymentError>
-**Dependencies:** AccountBalance, PaymentError, ValidatedAmount
-**Health:** 78/100 | **Drift:** None
-
-#### `process_payment` (Function)
-**Intent:** Orchestrates the full payment flow: validate → authorize → capture → record.
-...
-
-### File Source (Relevant Sections)
-```rust
-// Lines 45-78: validate_payment_amount
-pub fn validate_payment_amount(
-    amount: Decimal,
-    balance: &AccountBalance,
-) -> Result<ValidatedAmount, PaymentError> {
-    ...
-}
-```
-
-## Dependency Neighborhood (1-hop)
-
-### Callers of target symbols
-| Symbol | File | Relationship |
-|--------|------|-------------|
-| `handle_payment_request` | src/api/routes.rs | CALLS → validate_payment_amount |
-| `batch_processor` | src/jobs/payments.rs | CALLS → process_payment |
-
-### Callees from target symbols
-| Symbol | File | Relationship |
-|--------|------|-------------|
-| `AccountBalance::available` | src/models/account.rs | validate_payment_amount → CALLS |
-| `authorize_payment` | src/payments/gateway.rs | process_payment → CALLS |
-
-### Neighbor SIRs (summarized)
-**`handle_payment_request`** — Parses HTTP request body into PaymentRequest,
-validates via validate_payment_amount, returns 200 with receipt or 4xx with error detail.
-...
-
-## Coupling Data
-| File | Coupling Score | Signal |
-|------|---------------|--------|
-| src/payments/validator.rs | 0.87 | Co-change in 12/15 commits |
-| src/api/routes.rs | 0.63 | Shared caller pattern |
-
-## Health Warnings
-- **Boundary Leaker:** process_payment calls into 2 communities (payments + notifications)
-- **Test Coverage Gap:** validate_payment_amount has 7 SIR edge cases but only 3 test guards
-
-## Active Drift
-(None detected for target symbols)
-
-## Relevant Project Memory
-- "Chose rust_decimal over f64 for money — precision requirement from Payment Gateway v2 spec" (2026-02-14)
-```
-
-#### Context Assembly Engine
+### Shared Export Model
 
 ```rust
-/// Assembled context for export, built from AETHER's intelligence layers.
-pub struct ExportContext {
-    /// Target files/symbols the user requested
-    pub targets: Vec<ExportTarget>,
-
-    /// Optional task description for smarter context selection
-    pub task: Option<String>,
-
-    /// Token budget
-    pub budget: TokenBudget,
-
-    /// Which intelligence layers to include
-    pub layers: LayerSelection,
-
-    /// Graph traversal depth
-    pub depth: u8,
+/// What to export context for.
+pub enum ContextTarget {
+    /// File-level: include all symbols in this file + neighborhood
+    File { path: PathBuf },
+    /// Symbol-level: focused on a specific symbol (current sir-context behavior)
+    Symbol { selector: String, file_hint: Option<PathBuf> },
+    /// Project overview: aggregate summary without specific targets
+    Overview,
 }
 
+/// Which intelligence layers to include.
 pub struct LayerSelection {
     pub sir: bool,           // SIR annotations for target + neighbor symbols
-    pub source: bool,        // Actual source code (file slices in R.2, whole files in R.1)
+    pub source: bool,        // Actual source code (whole files in R.1, sliced in R.2)
     pub graph: bool,         // Dependency neighborhood (callers, callees)
     pub coupling: bool,      // Co-change coupling data
     pub health: bool,        // Health warnings and scores
@@ -222,29 +129,101 @@ pub struct LayerSelection {
     pub tests: bool,         // Test intents for target symbols
 }
 
-impl Default for LayerSelection {
-    fn default() -> Self {
-        Self {
-            sir: true,
-            source: true,
-            graph: true,
-            coupling: true,
-            health: true,
-            drift: true,
-            memory: true,
-            tests: true,
-        }
-    }
+/// Output format selection.
+pub enum ContextFormat {
+    Markdown,   // R.1: human-paste format
+    Json,       // R.1: programmatic consumption
+    Xml,        // R.4: structured Claude API format
+    Compact,    // R.4: maximum density
+}
+
+/// The assembled export document, format-agnostic.
+pub struct ExportDocument {
+    /// Project-level overview (symbol count, SIR coverage, health)
+    pub project_overview: ProjectOverview,
+    /// Per-target sections with symbols, SIRs, source
+    pub target_sections: Vec<TargetSection>,
+    /// Neighbor SIR summaries from graph traversal
+    pub neighbor_summaries: Vec<NeighborSummary>,
+    /// Per-layer budget usage tracking
+    pub budget_usage: BudgetUsage,
+    /// Notices (e.g., "coupling data unavailable — SurrealKV locked")
+    pub notices: Vec<String>,
 }
 ```
 
-#### Token Budget Allocation
+### CLI Interface
 
-Reuses the priority-ranked budget system from Phase 8.1 / Phase 10.3:
+```bash
+# File-level context (most common use case)
+aether context crates/aether-store/src/lib.rs
+
+# Symbol-level context
+aether context --symbol GraphStore --file crates/aether-store/src/graph.rs
+
+# Multiple file targets
+aether context crates/aether-mcp/src/lib.rs crates/aether-infer/src/lib.rs
+
+# Project overview
+aether context --overview
+
+# Budget and depth control
+aether context crates/aether-store/src/lib.rs --budget 64000 --depth 3
+
+# Layer control
+aether context crates/aether-mcp/src/lib.rs --include sir,graph,coupling,health
+aether context crates/aether-mcp/src/lib.rs --exclude drift,memory
+
+# Format selection (R.1: markdown or json)
+aether context crates/aether-store/src/lib.rs --format markdown
+aether context crates/aether-store/src/lib.rs --format json
+
+# Task-oriented bias for smarter context selection
+aether context --task "refactor the SIR pipeline into smaller modules" crates/aetherd/src/sir_pipeline.rs
+
+# Write to file (parity with current sir-context)
+aether context crates/aether-store/src/lib.rs --output context.md
+
+# Pipe to clipboard
+aether context crates/aether-store/src/lib.rs | xclip -selection clipboard
+aether context crates/aether-store/src/lib.rs | pbcopy  # macOS
+
+# Compatibility: sir-context still works, routes to same engine
+aether sir-context --selector SharedState --file crates/aetherd/src/main.rs
+```
+
+### Target Resolution Rules
+
+| Target Type | Resolution | Fallback |
+|---|---|---|
+| Indexed file | `list_symbols_for_file()` → assemble per-file sections with SIR, source, neighbors | — |
+| Unindexed or no-SIR file | Read file from disk, emit source-only section | Add "index data unavailable" notice |
+| Empty workspace | Detect via `count_symbols_with_sir()` | Source-only output + "run aetherd --index-once first" notice |
+| Symbol target | Reuse current selector resolution logic from `sir-context` | — |
+| Overview | `count_symbols_with_sir()` + aggregate health/drift summaries | Health/drift sections omit cleanly if no data exists |
+
+### Data Sources
+
+| Layer | Source | Unavailable Behavior |
+|---|---|---|
+| Symbols + SIR | SQLite `symbols` + `sir_annotations` tables | Notice: "index data unavailable" |
+| Graph (callers/deps) | SQLite graph APIs (`callers_of`, `dependencies_of`) | Omit graph section |
+| Coupling | SurrealDB readonly access (best effort) | Omit coupling + notice: "coupling data unavailable (SurrealKV locked)" |
+| Health | `HealthAnalyzer` filtered to target symbols/files | Fall back to symbol risk/staleness metadata + notice |
+| Drift | SQLite `drift_results` table | Omit drift section |
+| Memory | SQLite project notes via semantic search | Omit memory section |
+| Tests | SQLite `test_intents` table | Omit tests section |
+| Source code | Disk read of target files | Error if file doesn't exist |
+
+**Key principle:** SurrealKV lock contention is a known issue. The context command must never fail because SurrealDB is locked by a running `aetherd` process. Coupling data is best-effort; all other layers use SQLite which supports concurrent readers.
+
+### Budget Policy
+
+Reuse the existing greedy token allocator. Updated tier order for Phase Repo priorities:
 
 | Priority | Layer | Default % of Budget | Rationale |
 |----------|-------|-------------------|-----------|
-| 1 | Target file source (sliced in R.2) | 30% | The AI needs to see the actual code |
+| 1 | Target file source | 30% | The AI needs to see the actual code |
 | 2 | Target symbol SIRs | 15% | Semantic understanding of what the code does |
 | 3 | Immediate neighbor SIRs | 15% | Context for how target fits into the system |
 | 4 | Test intents | 10% | What's tested, what's not |
@@ -254,20 +233,120 @@ Reuses the priority-ranked budget system from Phase 8.1 / Phase 10.3:
 | 8 | Drift alerts | 5% | Where code and intent have diverged |
 | 9 | Broader graph | 5% | Extended dependency neighborhood |
 
-When budget is exhausted, lower-priority layers are truncated or omitted. The output includes a "Budget Usage" section showing what was included vs. truncated.
+When budget is exhausted, lower-priority layers are truncated or omitted. The output includes a budget usage footer showing what was included vs. truncated.
+
+### Markdown Output Example (Real AETHER Symbols)
+
+```markdown
+# AETHER Context: crates/aether-store/src/graph.rs
+Generated: 2026-03-15T14:30:00Z | Budget: 32,000 tokens | Used: 24,180 tokens
+
+## Project Overview
+- **Workspace:** /home/rephu/projects/aether
+- **Total Symbols:** 3,748 | **SIR Coverage:** 100%
+- **Health Score:** 42/100 (Watch)
+
+## Target File: crates/aether-store/src/graph.rs
+### Symbols (12)
+
+#### `GraphStore` (Trait)
+**Intent:** Defines the abstract interface for persisting and querying
+dependency edges between symbols. Supports CALLS, DEPENDS_ON, TYPE_REF,
+and IMPLEMENTS edge types with bidirectional traversal.
+**Edge Cases:** Empty graph returns empty vecs, duplicate edges are idempotent
+**Dependencies:** SymbolId, EdgeKind, GraphEdge
+**Health:** 82/100 | **Drift:** None
+
+#### `SurrealGraphStore` (Struct)
+**Intent:** SurrealDB-backed implementation of GraphStore using Record
+References for bidirectional edge traversal and SurrealKV for embedded storage.
+...
+
+### File Source
+```rust
+// crates/aether-store/src/graph.rs (lines 1-340)
+use crate::edge::{EdgeKind, GraphEdge};
+...
+```
+
+## Dependency Neighborhood (2-hop)
+
+### Callers of target symbols
+| Symbol | File | Relationship |
+|--------|------|-------------|
+| `build_dependency_graph` | crates/aetherd/src/indexer.rs | CALLS → GraphStore::upsert_edges |
+| `health_analysis` | crates/aether-analysis/src/health.rs | CALLS → GraphStore::callers_of |
+
+### Callees from target symbols
+| Symbol | File | Relationship |
+|--------|------|-------------|
+| `SymbolId::from_parts` | crates/aether-core/src/symbol.rs | SurrealGraphStore → CALLS |
+
+### Neighbor SIRs (summarized)
+**`build_dependency_graph`** — Traverses tree-sitter AST to extract CALLS and
+DEPENDS_ON edges, batches them, and upserts via GraphStore trait...
+
+## Coupling Data
+| File | Coupling Score | Signal |
+|------|---------------|--------|
+| crates/aether-store/src/edge.rs | 0.91 | Co-change in 14/16 commits |
+| crates/aether-analysis/src/health.rs | 0.58 | Shared dependency pattern |
+
+## Health Warnings
+- **God File risk:** graph.rs at 340 lines is within bounds but growing
+- **Test Coverage Gap:** GraphStore trait has 4 edge types but only 2 have dedicated test coverage
+
+## Active Drift
+(None detected for target symbols)
+
+## Relevant Project Memory
+- "SurrealDB 3.0 replaces CozoDB — Decision #38, Phase 7.2 migration" (2026-02-21)
+- "Record References for bidirectional edges — Decision #42" (2026-02-21)
+
+## Budget Usage
+| Layer | Tokens | Status |
+|-------|--------|--------|
+| Source | 7,200 | ✓ Included |
+| Target SIRs | 3,600 | ✓ Included |
+| Neighbor SIRs | 4,100 | ✓ Included |
+| Test Intents | 2,400 | ✓ Included |
+| Coupling | 1,800 | ✓ Included |
+| Memory | 1,680 | ✓ Included |
+| Health | 1,200 | ✓ Included |
+| Drift | 200 | ✓ Included |
+| Broader Graph | 2,000 | ✓ Included |
+| **Total** | **24,180 / 32,000** | |
+```
+
+### Compatibility: sir-context Mapping
+
+`sir-context` stays as a compatibility alias. It maps its existing arguments into the shared engine:
+
+```
+aether sir-context --selector SharedState --file crates/aetherd/src/main.rs
+  → ContextTarget::Symbol { selector: "SharedState", file_hint: Some("crates/aetherd/src/main.rs") }
+  → LayerSelection::default()
+  → ContextFormat::Markdown
+```
+
+Existing tests and docs that reference `sir-context` continue to work. New tests and docs use `context` as the canonical command.
 
 ### Pass Criteria
 
 1. `aether context <file>` produces markdown output with SIR summaries, dependency neighborhood, coupling data, health warnings.
-2. `--budget` flag correctly limits output size (measured in estimated tokens).
-3. `--include` and `--exclude` flags control which intelligence layers appear.
-4. `--depth` controls graph traversal depth.
-5. `--format markdown` (default) produces clean, pasteable markdown.
-6. `--overview` mode produces project-level summary without file targets.
-7. `--task` mode biases context selection toward task-relevant symbols (via semantic search).
-8. Output includes budget usage summary (included/truncated/omitted layers).
-9. Empty workspace (no SIRs) gracefully degrades to file-only output.
-10. `cargo fmt --all --check`, `cargo clippy`, `cargo test` pass.
+2. `aether context --symbol <n> --file <path>` produces symbol-focused output equivalent to current `sir-context`.
+3. `sir-context` still works as compatibility alias routing through shared engine.
+4. `--budget` flag correctly limits output size.
+5. `--include` and `--exclude` flags control which intelligence layers appear.
+6. `--depth` controls graph traversal depth.
+7. `--format markdown` (default) and `--format json` both produce valid output.
+8. `--overview` mode produces project-level summary without file targets.
+9. `--task` mode biases context selection toward task-relevant symbols via semantic search.
+10. Unindexed file degrades to source-only output with notice (not an error).
+11. SurrealKV lock contention produces a notice, not a failure — coupling layer omitted gracefully.
+12. Empty workspace degrades gracefully with "run aetherd --index-once first" notice.
+13. Output includes budget usage footer (included/truncated/omitted layers).
+14. `cargo fmt --all --check`, `cargo clippy -p aetherd`, `cargo test -p aetherd` pass.
 
 ### Exact Codex Prompt
 
@@ -285,61 +364,98 @@ You are working in the repo root of https://github.com/rephug/aether.
 Read docs/roadmap/phase_repo_the_prompter.md for the full specification.
 Focus on Stage R.1 — Context Export CLI.
 
-1) Ensure working tree is clean. If not, stop and report dirty files.
-2) git worktree add -b feature/phase-repo-stage-r1-context-export /home/rephu/phase-repo-r1
-3) cd /home/rephu/phase-repo-r1
+IMPORTANT CONTEXT: The existing `sir-context` command in aetherd already has
+a budgeted, symbol-centric context assembly engine in sir_context.rs. Do NOT
+create a parallel pipeline. Refactor sir_context.rs into two layers:
+1. Assembly core: resolve targets, load indexed data, apply budget tiers, emit ExportDocument
+2. Renderers: markdown and JSON formatters
 
-4) In crates/aetherd — add `context` subcommand:
-   - Parse CLI args: file targets, --symbol, --budget (default 32000), --depth (default 2),
-     --include, --exclude, --format (markdown|xml|json), --task, --overview
-   - Build ExportContext from args
-   - Call context assembly engine
-   - Format and print to stdout
+Both the new `context` command and the compatibility `sir-context` alias
+route through the same assembly core.
 
-5) Context assembly engine (in aetherd or aether-generate):
-   - Given targets + budget + layers + depth:
-     a. Resolve target files/symbols via existing store queries
-     b. Load SIRs for target symbols
-     c. Traverse dependency graph to --depth, load neighbor SIRs
-     d. Load coupling data for target files
-     e. Load health scores and warnings for target symbols
-     f. Load drift data for target symbols
-     g. Load relevant project memory (semantic search with task or file names)
-     h. Load test intents for target symbols
-   - Apply token budget: estimate tokens per layer, truncate from priority 9 upward
-   - Return assembled context struct
+PREFLIGHT:
+1) Ensure working tree is clean (git status --porcelain must be empty).
+2) git pull --ff-only
+3) git worktree add -b feature/phase-repo-stage-r1-context-export /home/rephu/phase-repo-r1
+4) cd /home/rephu/phase-repo-r1
 
-6) Markdown formatter:
-   - Header with metadata (workspace, timestamp, budget used)
-   - Project overview section
-   - Per-target-file sections with symbol SIRs
-   - Source code sections (whole file for now — R.2 adds slicing)
-   - Dependency neighborhood tables
-   - Neighbor SIR summaries
-   - Coupling data table
-   - Health warnings list
-   - Drift alerts list
-   - Project memory notes
-   - Budget usage summary footer
+IMPLEMENTATION:
 
-7) Token estimation:
-   - Use simple heuristic: 1 token ≈ 4 characters (conservative)
-   - Or reuse tiktoken-rs if already in deps, otherwise the heuristic is fine
+5) Refactor crates/aetherd sir_context.rs:
+   - Extract shared types: ContextTarget (File/Symbol/Overview), LayerSelection,
+     ExportDocument, BudgetUsage, ContextFormat
+   - Extract assembly core: resolve targets → load data → apply budget → emit ExportDocument
+   - Keep sir-context working by mapping its args into ContextTarget::Symbol
 
-8) Add tests:
-   - Mock store with known symbols, SIRs, edges → verify output contains expected sections
-   - Budget truncation: set budget to 1000 tokens → verify lower-priority layers omitted
-   - --include sir,graph → verify only those layers present
-   - --exclude drift → verify drift section absent
-   - --overview mode → verify project summary without file sections
-   - Empty workspace → graceful degradation
+6) Add `context` subcommand to aetherd CLI:
+   - Positional file targets → ContextTarget::File per path
+   - --symbol with optional --file → ContextTarget::Symbol
+   - --overview → ContextTarget::Overview
+   - --budget (default 32000), --depth (default 2)
+   - --include, --exclude (layer names: sir,source,graph,coupling,health,drift,memory,tests)
+   - --format markdown|json
+   - --task (string, passed to memory search and neighbor ordering)
+   - --output (file path, parity with sir-context)
+   - Default: markdown to stdout
 
-9) Run:
-   - cargo fmt --all --check
-   - cargo clippy -p aetherd -- -D warnings
-   - cargo test -p aetherd
+7) Assembly core target resolution:
+   - Indexed file: list_symbols_for_file() → per-file sections
+   - Unindexed file: read from disk, source-only section + "index data unavailable" notice
+   - Symbol: reuse existing selector resolution from sir-context
+   - Overview: count_symbols_with_sir() + aggregate health/drift if available
 
-10) Commit: "Add aether context CLI for clipboard-ready intelligence export"
+8) Data source access:
+   - SQLite for symbols, SIR, test intents, project notes, drift results, graph
+   - SurrealDB for coupling: best-effort readonly. If locked, omit coupling + add notice
+   - HealthAnalyzer for health warnings: filter to targets. Fallback to symbol metadata if unavailable
+   - All layers degrade gracefully — never fail the whole command because one layer is unavailable
+
+9) Budget tiers (greedy allocator, same pattern as existing sir-context):
+   Priority 1: target source (30%)
+   Priority 2: target SIRs (15%)
+   Priority 3: immediate neighbor SIRs (15%)
+   Priority 4: test intents (10%)
+   Priority 5: coupling (8%)
+   Priority 6: project memory (7%)
+   Priority 7: health warnings (5%)
+   Priority 8: drift alerts (5%)
+   Priority 9: broader graph (5%)
+
+10) Renderers:
+    - MarkdownRenderer: headers, tables, code fences, budget footer
+    - JsonRenderer: serde_json serialization of ExportDocument
+
+11) Wire sir-context as compatibility alias:
+    - Map existing selector/file args → ContextTarget::Symbol
+    - Route through shared assembly core
+    - Preserve current behavior exactly
+
+12) Tests:
+    - context with indexed file target: includes source, SIRs, neighbors, tests, memory
+    - context with symbol target: matches current sir-context behavior
+    - context --overview: project summary without file sections
+    - Unindexed file: source-only output + notice
+    - Empty workspace: graceful degradation
+    - Coupling unavailable (SurrealKV locked): notice, not error
+    - Health/drift sections omit cleanly when no data exists
+    - Low budget: lower-priority layers truncated first, omissions recorded
+    - --format json: valid JSON matching ExportDocument schema
+    - sir-context compatibility: still parses and routes correctly
+
+13) Run:
+    - cargo fmt --all --check
+    - cargo clippy -p aetherd -- -D warnings
+    - cargo test -p aetherd
+    - Per-crate only — never --workspace
+
+14) Commit: "Add aether context CLI with shared export engine (Phase Repo R.1)"
+
+PR title: "Phase Repo R.1: Context Export CLI with shared assembly engine"
+PR body: "Adds top-level `aether context` command for clipboard-ready intelligence
+export. Refactors sir_context.rs into shared assembly core + renderers. Supports
+file targets, symbol targets, overview mode, budget tiers, layer selection, and
+markdown/JSON output. sir-context retained as compatibility alias. Graceful
+degradation when SurrealKV locked or index unavailable."
 ```
 
 ---
@@ -349,46 +465,29 @@ Focus on Stage R.1 — Context Export CLI.
 **Codename:** Scalpel
 **Depends on:** R.1 (Context Export)
 **New crates:** None
-**Modified crates:** `aetherd` (context assembly), `aether-parse` (symbol byte ranges)
+**Modified crates:** `aetherd` (context assembly), references `symbols` table parse spans
 
 ### Purpose
 
-Instead of including entire files in context output, extract only the symbol definitions that are relevant to the query. Uses AETHER's existing tree-sitter parse data (which already knows every symbol's byte range) to slice files at symbol boundaries. This can reduce source-code token usage by 50–80% for large files, freeing budget for more intelligence layers.
+Replace whole-file source blocks in context output with symbol-guided slices derived from existing parse spans in the `symbols` table. This can reduce source-code token usage by 50–80% for large files, freeing budget for more intelligence layers.
 
 ### What to Build
 
 #### File Slicer
 
 ```rust
-/// Extract relevant symbol ranges from a file.
 pub struct FileSlice {
-    /// Source file path
     pub file: PathBuf,
-
-    /// Extracted ranges with context
     pub sections: Vec<SliceSection>,
-
-    /// Total tokens saved vs including the whole file
     pub tokens_saved: usize,
 }
 
 pub struct SliceSection {
-    /// Symbol ID this section belongs to
     pub symbol_id: String,
-
-    /// Symbol name for labeling
     pub symbol_name: String,
-
-    /// Start line (1-indexed)
     pub start_line: usize,
-
-    /// End line (1-indexed)
     pub end_line: usize,
-
-    /// The actual source code
     pub source: String,
-
-    /// Lines of surrounding context (configurable, default 3)
     pub context_lines_before: usize,
     pub context_lines_after: usize,
 }
@@ -396,27 +495,28 @@ pub struct SliceSection {
 
 #### Selection Logic
 
-Given a set of target symbols and their graph neighborhood:
+Given target symbols and their graph neighborhood:
 
-1. **Primary targets:** Always include the full symbol definition (function body, struct + impl block, etc.)
-2. **Direct callers/callees (1-hop):** Include signature + first doc comment line. Skip body unless budget allows.
-3. **2-hop neighbors:** Include signature only (one line).
-4. **Merging adjacent ranges:** If two selected symbols are within 5 lines of each other in the same file, merge into a single range to preserve context flow.
-5. **Elision markers:** Between non-adjacent ranges, insert `// ... (N lines omitted) ...` markers.
+1. **Primary targets (depth 0):** Full symbol definition (function body, struct + impl block)
+2. **Direct callers/callees (depth 1):** Signature + first doc comment line. Skip body unless budget allows.
+3. **Depth 2+ neighbors:** Signature only (one line).
+4. **Adjacent merge:** If two selected symbols are within 5 lines in the same file, merge into a single range.
+5. **Elision markers:** Between non-adjacent ranges, insert `// ... (N lines omitted) ...`
+6. **Small file fallback:** Files under 50 lines include whole file (not worth slicing).
 
 #### Integration with R.1
 
-The context assembly engine's "Target file source" layer (Priority 1) switches from "whole file" to "sliced file" when R.2 is available. The budget allocation remains the same, but the same 30% budget now covers more relevant code.
+The assembly core's "target source" layer (Priority 1) switches from whole-file to sliced output. Same budget allocation, but 30% of budget now covers more relevant code.
 
 ### Pass Criteria
 
-1. Slicing correctly extracts symbol byte ranges from tree-sitter parse data.
+1. Single-symbol extraction returns correct byte range from parse spans.
 2. Adjacent symbols within 5 lines merge into single range.
 3. Elision markers show correct omitted line counts.
-4. Context lines (before/after) configurable, default 3.
-5. Token savings reported in output.
-6. Whole-file fallback when file has fewer than 50 lines (not worth slicing).
-7. `cargo fmt`, `cargo clippy`, `cargo test` pass.
+4. Context lines (before/after) configurable via `--context-lines` flag, default 3.
+5. Files under 50 lines return whole file.
+6. Token savings reported in budget footer.
+7. `cargo fmt`, `cargo clippy -p aetherd`, `cargo test -p aetherd` pass.
 
 ### Exact Codex Prompt
 
@@ -431,44 +531,47 @@ CRITICAL BUILD SETTINGS — use these for ALL cargo commands in this session:
 
 You are working in the repo root of https://github.com/rephug/aether.
 
-Read docs/roadmap/phase_repo_the_prompter.md for the full specification.
-Focus on Stage R.2 — SIR-Guided File Slicing.
+Read docs/roadmap/phase_repo_the_prompter.md — focus on Stage R.2.
 
-1) Ensure working tree is clean. If not, stop and report dirty files.
-2) git worktree add -b feature/phase-repo-stage-r2-file-slicing /home/rephu/phase-repo-r2
-3) cd /home/rephu/phase-repo-r2
+PREFLIGHT:
+1) git status --porcelain (must be clean)
+2) git pull --ff-only
+3) git worktree add -b feature/phase-repo-stage-r2-file-slicing /home/rephu/phase-repo-r2
+4) cd /home/rephu/phase-repo-r2
 
-4) In the context assembly engine (where R.1 builds ExportContext):
-   - Add FileSlice struct and SliceSection struct
-   - Implement slice_file_for_symbols(file_path, symbol_ids, depth_map, context_lines) -> FileSlice
-   - Query existing symbol metadata (start_line, end_line from `symbols` table or tree-sitter spans)
-   - For primary targets (depth 0): include full symbol body
-   - For depth 1: include signature + doc comment
-   - For depth 2+: include signature only (one line)
+IMPLEMENTATION:
+
+5) Add FileSlice and SliceSection structs to the context assembly engine.
+
+6) Implement slice_file_for_symbols():
+   - Query symbol metadata (start_line, end_line) from symbols table
+   - Depth 0 targets: full body
+   - Depth 1: signature + doc comment
+   - Depth 2+: signature only
    - Merge adjacent ranges within 5 lines
    - Insert elision markers between non-adjacent ranges
-   - Skip slicing for files under 50 lines (include whole file)
+   - Files under 50 lines: return whole file
 
-5) Update R.1's markdown formatter to use sliced output:
-   - Replace whole-file inclusion with sliced sections
-   - Show "N lines omitted" markers
-   - Show token savings in budget summary
+7) Update R.1's assembly core: replace whole-file source inclusion with sliced output.
 
-6) Add --context-lines flag (default 3) for controlling surrounding context
+8) Add --context-lines flag (default 3).
 
-7) Add tests:
+9) Tests:
    - File with 3 functions, request 1 → only that function extracted
    - Two adjacent functions → merged into single range
    - File under 50 lines → whole file returned
-   - Token savings calculated correctly
    - Elision markers show correct line counts
+   - Token savings calculated correctly
 
-8) Run:
-   - cargo fmt --all --check
-   - cargo clippy -p aetherd -- -D warnings
-   - cargo test -p aetherd
+10) cargo fmt --all --check && cargo clippy -p aetherd -- -D warnings && cargo test -p aetherd
 
-9) Commit: "Add SIR-guided file slicing for token-efficient context export"
+11) Commit: "Add SIR-guided file slicing for token-efficient context export"
+
+PR title: "Phase Repo R.2: SIR-guided file slicing"
+PR body: "Replaces whole-file source inclusion with symbol-guided slices using
+existing parse spans. Merges adjacent ranges, inserts elision markers, falls
+back to whole file for small files. Reduces source token usage 50-80% for
+large files like aether-store/src/lib.rs."
 ```
 
 ---
@@ -482,43 +585,9 @@ Focus on Stage R.2 — SIR-Guided File Slicing.
 
 ### Purpose
 
-Save named, reusable context configurations as presets. Instead of remembering `aether context --include sir,graph,coupling --depth 3 --budget 64000`, save it as `aether context --preset deep-review`. Presets can also include task templates with variable placeholders.
+Save named, reusable context configurations as presets. Instead of remembering `aether context --include sir,graph,coupling --depth 3 --budget 64000`, save it as `aether context --preset deep`.
 
-### What to Build
-
-#### Preset Schema (TOML)
-
-```toml
-# .aether/presets/deep-review.toml
-[preset]
-name = "deep-review"
-description = "Deep code review context with full graph traversal"
-
-[context]
-budget = 64000
-depth = 3
-include = ["sir", "source", "graph", "coupling", "health", "drift", "tests"]
-format = "markdown"
-context_lines = 5
-
-[task_template]
-# Optional: pre-fill --task with a template. {target} is replaced with the file/symbol arg.
-template = "Review {target} for correctness, edge case handling, and error propagation. Flag any coupling concerns."
-```
-
-```toml
-# .aether/presets/quick-explain.toml
-[preset]
-name = "quick-explain"
-description = "Lightweight context for quick questions about a symbol"
-
-[context]
-budget = 8000
-depth = 1
-include = ["sir", "source"]
-format = "markdown"
-context_lines = 0
-```
+### Preset Schema (TOML)
 
 ```toml
 # .aether/presets/refactor-plan.toml
@@ -534,31 +603,20 @@ format = "markdown"
 context_lines = 5
 
 [task_template]
-template = "Plan a refactor of {target}. Consider coupling, health warnings, and test coverage gaps. Propose a migration order based on dependency structure."
+template = "Plan a refactor of {target}. Consider coupling, health warnings, and test coverage gaps."
 ```
 
-#### CLI Commands
+### CLI Commands
 
 ```bash
-# Use a preset
-aether context --preset deep-review src/payments/processor.rs
-
-# List available presets
-aether preset list
-
-# Show preset details
-aether preset show deep-review
-
-# Create a preset interactively (writes TOML file)
-aether preset create my-preset
-
-# Delete a preset
-aether preset delete my-preset
+aether context --preset deep crates/aether-mcp/src/lib.rs    # Use a preset
+aether preset list                                             # List all presets
+aether preset show deep                                        # Show preset details
+aether preset create my-preset                                 # Create interactively
+aether preset delete my-preset                                 # Remove user preset
 ```
 
-#### Built-in Presets
-
-Ship 4 built-in presets that are always available (stored in binary, not in `.aether/presets/`):
+### Built-in Presets (embedded in binary)
 
 | Name | Budget | Depth | Layers | Use Case |
 |------|--------|-------|--------|----------|
@@ -567,17 +625,17 @@ Ship 4 built-in presets that are always available (stored in binary, not in `.ae
 | `deep` | 64K | 3 | all layers | Deep analysis or refactor planning |
 | `overview` | 16K | 0 | sir, health, drift | Project-level health check |
 
-User presets in `.aether/presets/` override built-ins with the same name.
+User presets in `.aether/presets/` override built-ins with the same name. CLI flags always override preset values.
 
 ### Pass Criteria
 
-1. `aether context --preset <name>` applies all preset settings.
-2. CLI flags override preset values (e.g., `--preset deep --budget 128000` uses deep preset but overrides budget).
+1. `aether context --preset <n>` applies all preset settings.
+2. CLI flags override preset values.
 3. `aether preset list` shows built-in + user presets with descriptions.
-4. Task template variable substitution works ({target} replaced with actual file/symbol).
-5. User presets in `.aether/presets/` override built-ins.
+4. Task template variable substitution works (`{target}` replaced with actual file/symbol).
+5. User presets override built-ins with same name.
 6. Invalid preset TOML produces clear error message.
-7. `cargo fmt`, `cargo clippy`, `cargo test` pass.
+7. `cargo fmt`, `cargo clippy -p aetherd`, `cargo test -p aetherd` pass.
 
 ### Exact Codex Prompt
 
@@ -592,46 +650,44 @@ CRITICAL BUILD SETTINGS — use these for ALL cargo commands in this session:
 
 You are working in the repo root of https://github.com/rephug/aether.
 
-Read docs/roadmap/phase_repo_the_prompter.md for the full specification.
-Focus on Stage R.3 — Prompt Preset Library.
+Read docs/roadmap/phase_repo_the_prompter.md — focus on Stage R.3.
 
-1) Ensure working tree is clean. If not, stop and report dirty files.
-2) git worktree add -b feature/phase-repo-stage-r3-presets /home/rephu/phase-repo-r3
-3) cd /home/rephu/phase-repo-r3
+PREFLIGHT:
+1) git status --porcelain (must be clean)
+2) git pull --ff-only
+3) git worktree add -b feature/phase-repo-stage-r3-presets /home/rephu/phase-repo-r3
+4) cd /home/rephu/phase-repo-r3
 
-4) Define Preset struct matching the TOML schema:
-   - PresetConfig { name, description, context: ContextSettings, task_template: Option }
-   - ContextSettings { budget, depth, include, format, context_lines }
+IMPLEMENTATION:
 
-5) Implement preset loading:
-   - Built-in presets: quick, review, deep, overview (embedded in binary)
-   - User presets: scan .aether/presets/*.toml
+5) Define PresetConfig struct matching TOML schema.
+
+6) Implement preset loading:
+   - Built-in: quick, review, deep, overview (embedded in binary)
+   - User: scan .aether/presets/*.toml
    - User overrides built-in if same name
 
-6) Add `aether preset` subcommand group:
-   - `list` — table of name, description, budget, depth
-   - `show <name>` — full preset details
-   - `create <name>` — interactive prompt, writes TOML to .aether/presets/
-   - `delete <name>` — removes user preset file (cannot delete built-in)
+7) Add `aether preset` subcommand group: list, show, create, delete.
 
-7) Integrate with R.1's `aether context`:
-   - `--preset <name>` loads preset, applies settings
-   - Explicit CLI flags override preset values
-   - Task template: replace {target} with the file/symbol arguments
+8) Integrate with `aether context`: --preset loads config, explicit CLI flags override.
 
-8) Add tests:
-   - Preset loading from TOML
-   - CLI flag overrides preset values
-   - User preset overrides built-in
-   - Task template variable substitution
-   - Invalid TOML error handling
+9) Task template: replace {target} with file/symbol arguments.
 
-9) Run:
-   - cargo fmt --all --check
-   - cargo clippy -p aetherd -- -D warnings
-   - cargo test -p aetherd
+10) Tests:
+    - Preset loading from TOML
+    - CLI flags override preset values
+    - User preset overrides built-in
+    - Template substitution
+    - Invalid TOML error handling
 
-10) Commit: "Add prompt preset library for reusable context configurations"
+11) cargo fmt --all --check && cargo clippy -p aetherd -- -D warnings && cargo test -p aetherd
+
+12) Commit: "Add prompt preset library for reusable context configurations"
+
+PR title: "Phase Repo R.3: Prompt preset library"
+PR body: "Adds .aether/presets/ TOML-based presets with 4 built-in defaults
+(quick/review/deep/overview). CLI flags override preset values. Task templates
+support {target} variable substitution."
 ```
 
 ---
@@ -645,81 +701,67 @@ Focus on Stage R.3 — Prompt Preset Library.
 
 ### Purpose
 
-Different AI tools consume context differently. Markdown works for ChatGPT/Claude web. XML with structured tags works better for Claude API prompts. JSON works for programmatic consumption. Add format-specific output renderers.
+Formalize a `Formatter` trait and add XML and compact renderers on top of the same `ExportDocument` that R.1 already produces.
 
-### What to Build
+### Formats
 
-#### Formats
+| Format | Flag | Use Case |
+|--------|------|----------|
+| `markdown` | `--format markdown` (default) | ChatGPT, Claude web, Gemini |
+| `json` | `--format json` | Programmatic consumption, piping |
+| `xml` | `--format xml` | Claude API prompts, structured context |
+| `compact` | `--format compact` | Maximum density, small budgets |
 
-| Format | Flag | Use Case | Structure |
-|--------|------|----------|-----------|
-| `markdown` | `--format markdown` (default) | ChatGPT, Claude web, Gemini | Headers, tables, code fences |
-| `xml` | `--format xml` | Claude API prompts, structured context | `<aether_context>`, `<symbol>`, `<sir>` tags |
-| `json` | `--format json` | Programmatic consumption, piping to tools | Structured JSON matching ExportContext |
-| `compact` | `--format compact` | Maximum density, small budgets | SIR-only, no source code, no tables |
-
-#### XML Format Example
+### XML Format Example
 
 ```xml
 <aether_context workspace="/home/rephu/projects/aether" generated="2026-03-15T14:30:00Z">
-  <overview symbols="3748" sir_coverage="100%" health="42/100" />
-
-  <target file="src/payments/processor.rs">
-    <symbol name="validate_payment_amount" kind="function" health="78">
+  <overview symbols="3748" sir_coverage="100%" health="42" />
+  <target file="crates/aether-store/src/graph.rs">
+    <symbol name="GraphStore" kind="trait" health="82">
       <sir>
-        <intent>Validates payment amounts against account balance</intent>
-        <edge_cases>Zero amount, negative amount, exceeds balance, overflow</edge_cases>
-        <error_handling>Returns Result&lt;ValidatedAmount, PaymentError&gt;</error_handling>
-        <dependencies>AccountBalance, PaymentError, ValidatedAmount</dependencies>
+        <intent>Defines the abstract interface for persisting and querying dependency edges</intent>
+        <edge_cases>Empty graph returns empty vecs, duplicate edges idempotent</edge_cases>
+        <dependencies>SymbolId, EdgeKind, GraphEdge</dependencies>
       </sir>
-      <source start_line="45" end_line="78">
-        <!-- source code here -->
-      </source>
     </symbol>
   </target>
-
   <graph depth="2">
-    <edge source="handle_payment_request" target="validate_payment_amount" type="CALLS" />
-    <edge source="process_payment" target="authorize_payment" type="CALLS" />
+    <edge source="build_dependency_graph" target="GraphStore::upsert_edges" type="CALLS" />
   </graph>
-
   <coupling>
-    <pair file_a="processor.rs" file_b="validator.rs" score="0.87" />
+    <pair file_a="graph.rs" file_b="edge.rs" score="0.91" />
   </coupling>
-
   <warnings>
-    <health symbol="process_payment" issue="boundary_leaker" detail="calls into 2 communities" />
-    <test_gap symbol="validate_payment_amount" sir_edge_cases="7" test_guards="3" />
+    <test_gap symbol="GraphStore" sir_edge_cases="4" test_guards="2" />
   </warnings>
 </aether_context>
 ```
 
-#### Compact Format Example
+### Compact Format Example
 
 ```
-=== AETHER Context: src/payments/processor.rs ===
-Budget: 8K | Symbols: 7 | Health: 78/100
+=== AETHER Context: crates/aether-store/src/graph.rs ===
+Budget: 8K | Symbols: 12 | Health: 82/100
 
-[validate_payment_amount] Function
-  Intent: Validates payment amounts against account balance
-  Edges: Zero/negative → InvalidAmount, exceeds balance → InsufficientFunds
-  Deps: AccountBalance, PaymentError, ValidatedAmount
-  Callers: handle_payment_request (src/api/routes.rs)
-  Callees: AccountBalance::available (src/models/account.rs)
+[GraphStore] Trait
+  Intent: Abstract interface for dependency edge persistence and querying
+  Edges: Empty graph → empty vecs, duplicate edges → idempotent
+  Deps: SymbolId, EdgeKind, GraphEdge
+  Callers: build_dependency_graph (crates/aetherd/src/indexer.rs)
 
-[process_payment] Function
-  Intent: Orchestrates payment flow: validate → authorize → capture → record
+[SurrealGraphStore] Struct
+  Intent: SurrealDB-backed GraphStore with Record References
   ...
 ```
 
 ### Pass Criteria
 
-1. Each format produces valid, well-structured output.
-2. XML is valid XML (parseable by standard XML parsers).
-3. JSON matches a documented schema.
-4. Compact format fits 2x more symbols in the same token budget as markdown.
-5. All formats include budget usage metadata.
-6. `cargo fmt`, `cargo clippy`, `cargo test` pass.
+1. XML output is valid XML (parseable by standard parsers).
+2. JSON schema unchanged from R.1.
+3. Compact output is denser than markdown for same content.
+4. All formats include budget usage metadata.
+5. `cargo fmt`, `cargo clippy -p aetherd`, `cargo test -p aetherd` pass.
 
 ### Exact Codex Prompt
 
@@ -734,104 +776,64 @@ CRITICAL BUILD SETTINGS — use these for ALL cargo commands in this session:
 
 You are working in the repo root of https://github.com/rephug/aether.
 
-Read docs/roadmap/phase_repo_the_prompter.md for the full specification.
-Focus on Stage R.4 — Multi-Format Output.
+Read docs/roadmap/phase_repo_the_prompter.md — focus on Stage R.4.
 
-1) Ensure working tree is clean. If not, stop and report dirty files.
-2) git worktree add -b feature/phase-repo-stage-r4-formats /home/rephu/phase-repo-r4
-3) cd /home/rephu/phase-repo-r4
+PREFLIGHT:
+1) git status --porcelain (must be clean)
+2) git pull --ff-only
+3) git worktree add -b feature/phase-repo-stage-r4-formats /home/rephu/phase-repo-r4
+4) cd /home/rephu/phase-repo-r4
 
-4) Define OutputFormatter trait:
-   - fn format(context: &ExportContext) -> String
-   - Implementations: MarkdownFormatter, XmlFormatter, JsonFormatter, CompactFormatter
+IMPLEMENTATION:
 
-5) Implement each formatter:
-   - Markdown: existing from R.1 (extract into trait impl)
-   - XML: structured <aether_context> document with nested elements
-   - JSON: serde_json serialization of ExportContext
-   - Compact: dense single-line-per-symbol format
+5) Define Formatter trait: fn format(doc: &ExportDocument) -> String
 
-6) Wire --format flag to formatter selection in aether context command
+6) Extract existing markdown and JSON renderers from R.1 into trait impls.
 
-7) Add tests:
-   - Each format produces non-empty output
-   - XML parses as valid XML
-   - JSON parses as valid JSON with expected schema
-   - Compact uses fewer tokens than markdown for same content
+7) Add XmlFormatter: structured <aether_context> document with nested elements.
 
-8) Run:
-   - cargo fmt --all --check
-   - cargo clippy -p aetherd -- -D warnings
-   - cargo test -p aetherd
+8) Add CompactFormatter: dense single-line-per-symbol format.
 
-9) Commit: "Add multi-format output for context export (XML, JSON, compact)"
+9) Wire --format xml|compact to new formatters.
+
+10) Tests:
+    - XML parses as valid XML
+    - JSON unchanged from R.1
+    - Compact uses fewer tokens than markdown for same content
+    - All formats include budget metadata
+
+11) cargo fmt --all --check && cargo clippy -p aetherd -- -D warnings && cargo test -p aetherd
+
+12) Commit: "Add XML and compact formatters for context export"
+
+PR title: "Phase Repo R.4: XML and compact output formats"
+PR body: "Formalizes Formatter trait. Adds XML (structured <aether_context> tags
+for Claude API prompts) and compact (maximum density for small budgets) output
+formats alongside existing markdown and JSON."
 ```
 
 ---
 
-## Stage R.5 — Interactive Context Builder
+## Stage R.5 — Interactive Context Builder (Dashboard)
 
 **Codename:** Workbench
 **Depends on:** R.1 (Context Export), R.2 (File Slicing) recommended
 **New crates:** None
-**Modified crates:** `aether-dashboard` (new page), `aetherd` (API endpoint)
+**Modified crates:** `aether-dashboard` (new page + API endpoint)
+**Scope:** Dashboard-only. No TUI in Phase Repo.
 
 ### Purpose
 
-Add a dashboard page (and optionally a TUI) where developers can interactively build context: browse the file tree, select symbols, see live token budget consumption, toggle intelligence layers, and copy the result. This is AETHER's answer to RepoPrompt's visual context builder — but powered by real semantic intelligence.
+Add a dashboard page where developers can interactively build context: browse the file tree, select symbols, see live token budget consumption, toggle intelligence layers, and copy the result. This reuses the existing HTMX + D3 dashboard infrastructure from Phase 7.6/7.9 and the existing `SharedState` + symbol catalog.
 
 ### What to Build
-
-#### Dashboard Page: `/dashboard/context-builder`
-
-**Layout:**
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│ Context Builder                    Budget: [====----] 18K / 32K │
-├──────────────────┬──────────────────────────────────────────────┤
-│ File Tree        │ Selected Context Preview                     │
-│ ☐ src/           │                                              │
-│   ☑ payments/    │ ## src/payments/processor.rs                  │
-│     ☑ proc...rs  │ ### validate_payment_amount (Function)        │
-│     ☐ valid..rs  │ **Intent:** Validates payment amounts...      │
-│   ☐ api/         │ ...                                          │
-│   ☐ models/      │                                              │
-│                  │ ## Dependency Neighborhood                    │
-│ ──────────────── │ ...                                          │
-│ Intelligence     │                                              │
-│ ☑ SIR            │                                              │
-│ ☑ Source Code    │                                              │
-│ ☑ Graph          │                                              │
-│ ☐ Coupling       │                                              │
-│ ☑ Health         │                                              │
-│ ☐ Drift          │                                              │
-│ ☐ Memory         │                                              │
-│ ──────────────── │                                              │
-│ Task: [________] │                                              │
-│ Depth: [2   ▼]  │                                              │
-│ Format: [md  ▼] │                                              │
-│ [Copy] [Export]  │                                              │
-├──────────────────┴──────────────────────────────────────────────┤
-│ Budget: SIR 4.2K | Source 9.8K | Graph 2.1K | Health 1.9K      │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**Interactions:**
-- Check/uncheck files in tree → live token count updates
-- Toggle intelligence layers → preview updates
-- Click symbol in preview → expand/collapse SIR details
-- "Copy" button → copies formatted output to clipboard (via Clipboard API)
-- "Export" button → downloads as file
-- Task field → biases context selection via semantic search
-- Preset dropdown → loads saved presets from R.3
 
 #### API Endpoint
 
 ```
 POST /api/v1/context/build
 {
-  "targets": ["src/payments/processor.rs"],
+  "targets": ["crates/aether-store/src/graph.rs"],
   "budget": 32000,
   "depth": 2,
   "layers": { "sir": true, "source": true, "graph": true, ... },
@@ -844,23 +846,59 @@ POST /api/v1/context/build
   "content": "# AETHER Context: ...",
   "budget_usage": {
     "total": 32000,
-    "used": 28412,
-    "by_layer": { "sir": 4200, "source": 9800, ... }
-  },
-  "token_estimate": 28412
+    "used": 24180,
+    "by_layer": { "sir": 3600, "source": 7200, ... }
+  }
 }
 ```
+
+#### Dashboard Page: `/dashboard/context-builder`
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Context Builder                    Budget: [====----] 24K / 32K │
+├──────────────────┬──────────────────────────────────────────────┤
+│ File Tree        │ Preview                                      │
+│ ☐ crates/        │                                              │
+│   ☑ aether-store │ # AETHER Context: .../graph.rs               │
+│     ☑ graph.rs   │ ## GraphStore (Trait)                         │
+│     ☐ edge.rs    │ **Intent:** Defines the abstract interface... │
+│   ☐ aether-mcp   │ ...                                          │
+│                  │                                              │
+│ ──────────────── │                                              │
+│ Layers           │                                              │
+│ ☑ SIR            │                                              │
+│ ☑ Source Code    │                                              │
+│ ☑ Graph          │                                              │
+│ ☐ Coupling       │                                              │
+│ ☑ Health         │                                              │
+│ ──────────────── │                                              │
+│ Task: [________] │                                              │
+│ Depth: [2   ▼]  │                                              │
+│ Preset: [review] │                                              │
+│ [Copy] [Export]  │                                              │
+├──────────────────┴──────────────────────────────────────────────┤
+│ SIR 3.6K | Source 7.2K | Graph 4.1K | Health 1.2K | = 24.2K    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Interactions:**
+- Check/uncheck files → HTMX partial swap updates preview + budget bar
+- Toggle layers → preview updates
+- Copy button → `navigator.clipboard.writeText()`
+- Export button → download as file
+- Preset dropdown → loads R.3 presets
+- Task field → biases context selection
 
 ### Pass Criteria
 
 1. Dashboard page renders file tree with checkboxes.
-2. Selecting files updates token budget display in real-time (via HTMX partial swap).
-3. Intelligence layer toggles update preview.
+2. Selecting files updates token budget display via HTMX.
+3. Layer toggles update preview.
 4. Copy button copies formatted context to clipboard.
 5. Preset dropdown loads R.3 presets.
 6. Budget breakdown shows per-layer token usage.
-7. Mobile-friendly layout (stacked instead of side-by-side).
-8. `cargo fmt`, `cargo clippy`, `cargo test` pass.
+7. `cargo fmt`, `cargo clippy -p aetherd --features dashboard`, `cargo test -p aetherd` pass.
 
 ### Exact Codex Prompt
 
@@ -875,42 +913,44 @@ CRITICAL BUILD SETTINGS — use these for ALL cargo commands in this session:
 
 You are working in the repo root of https://github.com/rephug/aether.
 
-Read docs/roadmap/phase_repo_the_prompter.md for the full specification.
-Focus on Stage R.5 — Interactive Context Builder.
+Read docs/roadmap/phase_repo_the_prompter.md — focus on Stage R.5.
 
-1) Ensure working tree is clean. If not, stop and report dirty files.
-2) git worktree add -b feature/phase-repo-stage-r5-context-builder /home/rephu/phase-repo-r5
-3) cd /home/rephu/phase-repo-r5
+PREFLIGHT:
+1) git status --porcelain (must be clean)
+2) git pull --ff-only
+3) git worktree add -b feature/phase-repo-stage-r5-builder /home/rephu/phase-repo-r5
+4) cd /home/rephu/phase-repo-r5
 
-4) Add POST /api/v1/context/build endpoint to aether-dashboard:
+IMPLEMENTATION:
+
+5) Add POST /api/v1/context/build to aether-dashboard:
    - Accept ExportContextRequest JSON body
-   - Call context assembly engine from R.1
-   - Return formatted content + budget usage breakdown
+   - Call R.1's assembly core
+   - Return formatted content + budget usage
 
-5) Add dashboard page /dashboard/context-builder:
-   - File tree with checkboxes (load via HTMX from existing file list API)
-   - Intelligence layer toggles (checkboxes)
-   - Task input field, depth selector, format selector
-   - Preview panel (HTMX partial swap on selection change)
-   - Live token budget bar
-   - Budget breakdown footer (per-layer token usage)
+6) Add /dashboard/context-builder page:
+   - File tree with checkboxes (HTMX from existing file list)
+   - Layer toggles, task input, depth selector, format selector
+   - Preview panel (HTMX partial swap on change)
+   - Live budget bar + per-layer breakdown footer
    - Copy button (navigator.clipboard.writeText)
    - Export/download button
-   - Preset dropdown (loads from /api/v1/presets endpoint)
+   - Preset dropdown (from R.3)
 
-6) Add sidebar link for Context Builder page
+7) Add sidebar link for Context Builder page.
 
-7) Add tests:
+8) Tests:
    - API endpoint returns expected JSON schema
-   - Budget usage breakdown sums correctly
-   - Format flag produces correct output format
+   - Budget usage sums correctly
 
-8) Run:
-   - cargo fmt --all --check
-   - cargo clippy -p aetherd --features dashboard -- -D warnings
-   - cargo test -p aetherd
+9) cargo fmt --all --check && cargo clippy -p aetherd --features dashboard -- -D warnings && cargo test -p aetherd
 
-9) Commit: "Add interactive context builder dashboard page"
+10) Commit: "Add interactive context builder dashboard page"
+
+PR title: "Phase Repo R.5: Interactive context builder"
+PR body: "Adds /dashboard/context-builder page with file tree selection, live
+token budget, layer toggles, preset loading, and clipboard/export. Uses HTMX
+partial swaps and existing SharedState. Dashboard-only, no TUI."
 ```
 
 ---
@@ -923,7 +963,7 @@ Focus on Stage R.5 — Interactive Context Builder.
 | R.2 SIR-Guided File Slicing | 1 | 1–2 days | High |
 | R.3 Prompt Preset Library | 1–2 | 2–3 days | Medium |
 | R.4 Multi-Format Output | 1 | 1–2 days | Medium |
-| R.5 Interactive Context Builder | 1–2 | 3–5 days | Lower (nice-to-have) |
+| R.5 Interactive Context Builder | 1–2 | 3–5 days | Lower |
 | **Total** | **5–8** | **~2–3 weeks** | |
 
 ---
@@ -935,16 +975,12 @@ Phase 8 remaining (health inversion + boundary leaker + 8.14b)
     ↓
 Phase 10 (Conductor — batch, continuous, agent hooks)
     ↓
-Phase Repo R.1 (Context Export) ← can start here once 10.3 ships
-    ↓                               or even during 10.x if time permits
-Phase Repo R.2–R.4 (parallel)
+Phase Repo R.1–R.5 ← slots after 10.3 or during 10.x
     ↓
-Phase 9 (Beacon — Tauri app, integrates context builder into desktop)
-    ↓
-Phase Repo R.5 (Interactive Context Builder — may fold into Phase 9)
+Phase 9 (Beacon — Tauri app)
 ```
 
-**Note on Phase 10.3 overlap:** Phase 10.3 (Agent Hooks) defines `sir context` which does token-budgeted context assembly for Claude Code integration. Phase Repo R.1 builds on the same engine but formats for human consumption (clipboard/paste) rather than programmatic consumption (MCP tool response). If Phase 10.3 ships first, R.1 reuses its context assembly. If Phase Repo ships first, 10.3 reuses R.1's assembly engine with a different output format. Either ordering works — the context assembly engine is the shared foundation.
+**Phase 10.3 overlap note:** Phase 10.3 defines `sir context` for agent-facing context assembly. Phase Repo R.1 generalizes that same engine for human-facing export. If 10.3 ships first, R.1 refactors its engine. If Phase Repo ships first, 10.3 reuses R.1's assembly core. Either ordering works.
 
 ---
 
@@ -952,16 +988,18 @@ Phase Repo R.5 (Interactive Context Builder — may fold into Phase 9)
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
-| Context assembly queries too slow for interactive use | Medium | Medium | R.5's dashboard uses debounced requests. CLI (R.1) can be synchronous without concern. Cache assembled context in memory for repeated queries with same parameters. |
-| Token estimation inaccuracy | Low | Low | The 4-chars-per-token heuristic is conservative. Users can adjust budget if output is too large/small. Exact counting is not worth the tiktoken dependency. |
-| Preset proliferation / management overhead | Low | Low | Ship only 4 built-in presets. User presets are opt-in. TOML files are human-readable and deletable. |
-| Format maintenance burden (4 formats) | Low | Medium | All formats render from the same ExportContext struct. Adding a field to ExportContext automatically appears in JSON. Other formats need manual update but the rendering code is simple. |
+| SurrealKV lock contention blocks context command | High | High | All SurrealDB access is best-effort. Coupling layer omitted with notice. All other layers use SQLite (concurrent readers). |
+| Token estimation inaccuracy | Low | Low | 4-chars-per-token heuristic is conservative. Users adjust budget if needed. |
+| sir-context compatibility regression | Medium | Medium | Existing sir-context tests must pass unchanged after refactor. |
+| Health/drift data incomplete for some symbols | Medium | Low | Layers degrade gracefully. Missing data → section omitted with notice. |
 
 ---
 
 ## What Phase Repo Does NOT Do
 
-- **Does not replace MCP tools.** MCP remains the primary interface for connected agents. Phase Repo serves the disconnect case (paste into chat).
-- **Does not add new intelligence.** Every layer in the context output already exists — SIR, graph, coupling, health, drift, memory, tests. Phase Repo is a read-only formatter.
-- **Does not do agent orchestration.** RepoPrompt's Context Builder uses an agent to discover files. AETHER's context assembly is deterministic (graph traversal + priority ranking). If you specify a target, AETHER knows exactly what's relevant without an agent.
-- **Does not write files.** This is pure read. No file mutation, no apply mode. That's Phase 8 Synthesizer territory.
+- **Does not replace MCP tools.** MCP remains the primary interface for connected agents.
+- **Does not add new intelligence.** Every layer already exists. Phase Repo is a read-only formatter.
+- **Does not do agent orchestration.** Context assembly is deterministic (graph traversal + priority ranking), not agent-driven discovery.
+- **Does not write files.** Pure read. No apply mode.
+- **Does not include a TUI.** R.5 is dashboard-only. TUI could be a future addition.
+- **Does not add a new crate.** Everything lives in `aetherd` and `aether-dashboard`.
