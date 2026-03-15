@@ -220,6 +220,30 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
         });
     }
 
+    if let Some(continuous) = &config.continuous {
+        let schedule = continuous.schedule.trim().to_ascii_lowercase();
+        if !matches!(schedule.as_str(), "hourly" | "nightly") {
+            warnings.push(ConfigWarning {
+                code: "continuous_schedule_invalid",
+                message: format!(
+                    "[continuous].schedule='{}' is unsupported; expected 'hourly' or 'nightly'",
+                    continuous.schedule
+                ),
+            });
+        }
+
+        let requeue_pass = continuous.requeue_pass.trim().to_ascii_lowercase();
+        if !matches!(requeue_pass.as_str(), "scan" | "triage" | "deep") {
+            warnings.push(ConfigWarning {
+                code: "continuous_requeue_pass_invalid",
+                message: format!(
+                    "[continuous].requeue_pass='{}' is unsupported; expected one of: scan, triage, deep",
+                    continuous.requeue_pass
+                ),
+            });
+        }
+    }
+
     warnings
 }
 
@@ -228,6 +252,7 @@ mod tests {
     use crate::{
         AetherConfig, DEFAULT_GEMINI_API_KEY_ENV,
         analysis::{CouplingConfig, DriftConfig},
+        continuous::ContinuousConfig,
         embeddings::{
             CandleEmbeddingsConfig, EmbeddingProviderKind, EmbeddingVectorBackend, EmbeddingsConfig,
         },
@@ -287,6 +312,7 @@ mod tests {
             planner: PlannerConfig::default(),
             health_score: HealthScoreConfig::default(),
             dashboard: DashboardConfig::default(),
+            continuous: None,
             batch: None,
             watcher: None,
         };
@@ -381,5 +407,21 @@ task_type = "RETRIEVAL_DOCUMENT"
         let codes = warning_codes(&validate_config(&config));
         assert!(codes.contains(&"embeddings_endpoint_unused_for_gemini_native"));
         assert!(codes.contains(&"embeddings_task_type_unused_for_gemini_native"));
+    }
+
+    #[test]
+    fn validate_config_warns_on_invalid_continuous_values() {
+        let config = AetherConfig {
+            continuous: Some(ContinuousConfig {
+                schedule: "weekly".to_owned(),
+                requeue_pass: "unknown".to_owned(),
+                ..ContinuousConfig::default()
+            }),
+            ..AetherConfig::default()
+        };
+
+        let codes = warning_codes(&validate_config(&config));
+        assert!(codes.contains(&"continuous_schedule_invalid"));
+        assert!(codes.contains(&"continuous_requeue_pass_invalid"));
     }
 }

@@ -1,6 +1,7 @@
 mod analysis;
 mod batch;
 mod constants;
+mod continuous;
 mod embeddings;
 mod health;
 mod inference;
@@ -17,6 +18,7 @@ mod watcher;
 pub use analysis::*;
 pub use batch::*;
 pub use constants::*;
+pub use continuous::*;
 pub use embeddings::*;
 pub use health::*;
 pub use inference::*;

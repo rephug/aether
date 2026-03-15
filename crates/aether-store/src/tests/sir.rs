@@ -40,6 +40,7 @@ fn read_sir_blob_backfills_sqlite_from_mirror_without_overwriting_meta() {
         model: "legacy-model".to_owned(),
         generation_pass: "scan".to_owned(),
         prompt_hash: Some("legacy-source|legacy-neighbor|legacy-config".to_owned()),
+        staleness_score: None,
         updated_at: 1_700_111_222,
         sir_status: "fresh".to_owned(),
         last_error: None,

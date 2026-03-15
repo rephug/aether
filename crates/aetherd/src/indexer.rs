@@ -27,6 +27,7 @@ use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::batch::hash::compute_prompt_hash;
 use crate::batch::write_fingerprint_row;
+use crate::continuous::cosine_distance_from_embeddings;
 use crate::observer::{DebounceQueue, ObserverState, is_ignored_path};
 use crate::priority_queue::{
     SirPriorityQueue, compute_priority_score, kind_priority_score, size_inverse_score,
@@ -2010,36 +2011,9 @@ fn finalize_watcher_generation(
         "watcher",
         pipeline.model_name(),
         generation_pass,
-        watcher_semantic_delta(previous_embedding, current_embedding.as_ref()),
+        cosine_distance_from_embeddings(previous_embedding, current_embedding.as_ref()),
     )
     .with_context(|| format!("failed to write watcher fingerprint row for {}", symbol.id))
-}
-
-fn watcher_semantic_delta(
-    previous: Option<&SymbolEmbeddingRecord>,
-    current: Option<&SymbolEmbeddingRecord>,
-) -> Option<f64> {
-    let previous = previous?;
-    let current = current?;
-    if previous.embedding.len() != current.embedding.len() || previous.embedding.is_empty() {
-        return None;
-    }
-
-    let mut dot = 0.0_f64;
-    let mut left_norm = 0.0_f64;
-    let mut right_norm = 0.0_f64;
-    for (left, right) in previous.embedding.iter().zip(current.embedding.iter()) {
-        let left = f64::from(*left);
-        let right = f64::from(*right);
-        dot += left * right;
-        left_norm += left * left;
-        right_norm += right * right;
-    }
-    if left_norm <= f64::EPSILON || right_norm <= f64::EPSILON {
-        return None;
-    }
-
-    Some(1.0 - (dot / (left_norm.sqrt() * right_norm.sqrt())))
 }
 
 fn enqueue_symbols_missing_sir(
@@ -2523,6 +2497,7 @@ vector_backend = "sqlite"
                 model: "mock-model".to_owned(),
                 generation_pass: "scan".to_owned(),
                 prompt_hash: None,
+                staleness_score: None,
                 updated_at: version.updated_at,
                 sir_status: "fresh".to_owned(),
                 last_error: None,

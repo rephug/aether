@@ -12,8 +12,10 @@ use anyhow::{Result, anyhow};
 
 use crate::cli::{BatchBuildArgs, BatchPass, BatchRunArgs};
 
-pub(crate) use ingest::write_fingerprint_row;
+pub(crate) use build::build_pass_jsonl_for_ids;
+pub(crate) use ingest::{ingest_results, write_fingerprint_row};
 pub use run::run_batch_command;
+pub(crate) use run::submit_batch_chunk;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PassConfig {

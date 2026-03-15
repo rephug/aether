@@ -5,14 +5,13 @@ use aether_config::InferenceProviderKind;
 use aether_core::{Language, Position, SourceRange, Symbol, SymbolKind};
 use aether_infer::ProviderOverrides;
 use aether_sir::SirAnnotation;
-use aether_store::{
-    SirFingerprintHistoryRecord, SirMetaRecord, SirStateStore, SqliteStore, SymbolEmbeddingRecord,
-};
+use aether_store::{SirFingerprintHistoryRecord, SirMetaRecord, SirStateStore, SqliteStore};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 use crate::batch::PassConfig;
 use crate::batch::hash::diff_prompt_hashes;
+use crate::continuous::cosine_distance_from_embeddings;
 use crate::sir_pipeline::{SirPipeline, UpsertSirIntentPayload};
 
 #[derive(Debug, Clone, Default)]
@@ -185,7 +184,7 @@ fn ingest_result_line(
         format!("batch_{}", pass_config.pass.as_str()).as_str(),
         pass_config.model.as_str(),
         pass_config.pass.as_str(),
-        semantic_delta(previous_embedding.as_ref(), current_embedding.as_ref()),
+        cosine_distance_from_embeddings(previous_embedding.as_ref(), current_embedding.as_ref()),
     )
     .with_context(|| format!("failed to write fingerprint row for {symbol_id}"))?;
 
@@ -304,33 +303,6 @@ fn parse_symbol_kind(raw: &str) -> Result<SymbolKind> {
         "type_alias" => Ok(SymbolKind::TypeAlias),
         other => Err(anyhow!("unsupported symbol kind '{other}'")),
     }
-}
-
-fn semantic_delta(
-    previous: Option<&SymbolEmbeddingRecord>,
-    current: Option<&SymbolEmbeddingRecord>,
-) -> Option<f64> {
-    let previous = previous?;
-    let current = current?;
-    if previous.embedding.len() != current.embedding.len() || previous.embedding.is_empty() {
-        return None;
-    }
-
-    let mut dot = 0.0_f64;
-    let mut left_norm = 0.0_f64;
-    let mut right_norm = 0.0_f64;
-    for (left, right) in previous.embedding.iter().zip(current.embedding.iter()) {
-        let left = f64::from(*left);
-        let right = f64::from(*right);
-        dot += left * right;
-        left_norm += left * left;
-        right_norm += right * right;
-    }
-    if left_norm <= f64::EPSILON || right_norm <= f64::EPSILON {
-        return None;
-    }
-
-    Some(1.0 - (dot / (left_norm.sqrt() * right_norm.sqrt())))
 }
 
 fn unix_timestamp_secs() -> i64 {

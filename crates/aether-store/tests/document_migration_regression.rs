@@ -7,7 +7,7 @@ fn existing_symbol_and_sir_operations_still_work_after_migration_v6() {
     let store = SqliteStore::open(temp.path()).expect("open store");
 
     let schema = store.get_schema_version().expect("schema version");
-    assert_eq!(schema.version, 9);
+    assert_eq!(schema.version, 10);
 
     store
         .upsert_symbol(SymbolRecord {
@@ -29,6 +29,7 @@ fn existing_symbol_and_sir_operations_still_work_after_migration_v6() {
         model: "mock".to_owned(),
         generation_pass: "scan".to_owned(),
         prompt_hash: None,
+        staleness_score: None,
         updated_at: 1_700_000_100,
         sir_status: "fresh".to_owned(),
         last_error: None,

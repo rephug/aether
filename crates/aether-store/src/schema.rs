@@ -441,6 +441,11 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         conn.execute("PRAGMA user_version = 9", [])?;
     }
 
+    if version < 10 {
+        ensure_sir_column(conn, "staleness_score", "REAL")?;
+        conn.execute("PRAGMA user_version = 10", [])?;
+    }
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_version (

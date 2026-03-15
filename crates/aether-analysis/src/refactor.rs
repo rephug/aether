@@ -1287,6 +1287,7 @@ vector_backend = "sqlite"
                 model: "mock".to_owned(),
                 generation_pass: "deep".to_owned(),
                 prompt_hash: None,
+                staleness_score: None,
                 updated_at: 1_700_000_001,
                 sir_status: "fresh".to_owned(),
                 last_error: None,
