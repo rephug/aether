@@ -662,6 +662,65 @@ pub struct ContinuousRunOnceArgs {}
 pub struct ContinuousStatusArgs {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct ContextArgs {
+    #[arg(
+        help = "Workspace-relative file targets",
+        value_name = "FILE",
+        required_unless_present_any = ["symbol", "overview"],
+        conflicts_with_all = ["symbol", "overview"]
+    )]
+    pub targets: Vec<String>,
+
+    #[arg(
+        long,
+        help = "Focused symbol selector: qualified name, symbol ID, or fuzzy search",
+        conflicts_with_all = ["targets", "overview"]
+    )]
+    pub symbol: Option<String>,
+
+    #[arg(long, help = "Optional file hint for --symbol resolution")]
+    pub file: Option<String>,
+
+    #[arg(
+        long,
+        help = "Emit a project overview without file or symbol targets",
+        conflicts_with_all = ["targets", "symbol", "file"]
+    )]
+    pub overview: bool,
+
+    #[arg(
+        long,
+        default_value = "markdown",
+        value_parser = ["markdown", "json"],
+        help = "Output format"
+    )]
+    pub format: String,
+
+    #[arg(long, default_value_t = 32000, help = "Max token budget")]
+    pub budget: usize,
+
+    #[arg(
+        long,
+        default_value_t = 2,
+        value_parser = clap::value_parser!(u32).range(1..=3),
+        help = "Dependency depth (1-3)"
+    )]
+    pub depth: u32,
+
+    #[arg(long, help = "Layers to include (comma-separated)")]
+    pub include: Option<String>,
+
+    #[arg(long, help = "Layers to exclude (comma-separated)")]
+    pub exclude: Option<String>,
+
+    #[arg(long, help = "Bias context ordering toward this task description")]
+    pub task: Option<String>,
+
+    #[arg(long, help = "Write to file instead of stdout")]
+    pub output: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct SirContextArgs {
     #[arg(
         help = "Symbol selector: qualified name, symbol ID, or fuzzy search",
@@ -739,6 +798,8 @@ pub enum Commands {
     Batch(BatchArgs),
     /// Continuous intelligence operations
     Continuous(ContinuousArgs),
+    /// Export clipboard-ready semantic context for files, symbols, or the whole workspace
+    Context(ContextArgs),
     /// Assemble semantic context for a symbol
     SirContext(SirContextArgs),
     /// Inject or update a symbol's SIR intent
@@ -1309,6 +1370,85 @@ mod tests {
         match cli.command {
             Some(Commands::Continuous(args)) => {
                 assert!(matches!(args.command, ContinuousCommand::Status(_)));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_subcommand_parses_file_targets() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "context",
+            "src/lib.rs",
+            "src/main.rs",
+            "--budget",
+            "64000",
+            "--depth",
+            "3",
+            "--include",
+            "sir,source,graph",
+            "--exclude",
+            "drift",
+            "--task",
+            "refactor error handling",
+        ])
+        .expect("context file mode should parse");
+
+        match cli.command {
+            Some(Commands::Context(args)) => {
+                assert_eq!(args.targets, vec!["src/lib.rs", "src/main.rs"]);
+                assert_eq!(args.symbol, None);
+                assert!(!args.overview);
+                assert_eq!(args.budget, 64_000);
+                assert_eq!(args.depth, 3);
+                assert_eq!(args.include.as_deref(), Some("sir,source,graph"));
+                assert_eq!(args.exclude.as_deref(), Some("drift"));
+                assert_eq!(args.task.as_deref(), Some("refactor error handling"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_subcommand_parses_symbol_mode() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "context",
+            "--symbol",
+            "demo::alpha",
+            "--file",
+            "src/lib.rs",
+            "--format",
+            "json",
+        ])
+        .expect("context symbol mode should parse");
+
+        match cli.command {
+            Some(Commands::Context(args)) => {
+                assert!(args.targets.is_empty());
+                assert_eq!(args.symbol.as_deref(), Some("demo::alpha"));
+                assert_eq!(args.file.as_deref(), Some("src/lib.rs"));
+                assert_eq!(args.format, "json");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_subcommand_parses_overview_mode() {
+        let cli = Cli::try_parse_from(["aetherd", "--workspace", ".", "context", "--overview"])
+            .expect("context overview parse");
+
+        match cli.command {
+            Some(Commands::Context(args)) => {
+                assert!(args.targets.is_empty());
+                assert!(args.overview);
+                assert_eq!(args.symbol, None);
             }
             other => panic!("unexpected command: {other:?}"),
         }

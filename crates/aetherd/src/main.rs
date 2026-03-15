@@ -16,11 +16,11 @@ use aetherd::batch::run_batch_command;
 use aetherd::calibrate::run_calibration_once;
 use aetherd::causal::run_trace_cause_command;
 use aetherd::cli::{
-    AskArgs, BatchArgs, BlastRadiusArgs, Cli, Commands, CommunitiesArgs, ContinuousArgs,
-    CouplingReportArgs, DriftAckArgs, DriftReportArgs, FsckArgs, HealthArgs, HealthScoreArgs,
-    InitAgentArgs, LogFormat, MineCouplingArgs, NotesArgs, RecallArgs, RefactorPrepArgs,
-    RegenerateArgs, RememberArgs, SetupLocalArgs, SirContextArgs, SirDiffArgs, SirInjectArgs,
-    TestIntentsArgs, TraceCauseArgs, VerifyIntentArgs, parse_cli,
+    AskArgs, BatchArgs, BlastRadiusArgs, Cli, Commands, CommunitiesArgs, ContextArgs,
+    ContinuousArgs, CouplingReportArgs, DriftAckArgs, DriftReportArgs, FsckArgs, HealthArgs,
+    HealthScoreArgs, InitAgentArgs, LogFormat, MineCouplingArgs, NotesArgs, RecallArgs,
+    RefactorPrepArgs, RegenerateArgs, RememberArgs, SetupLocalArgs, SirContextArgs, SirDiffArgs,
+    SirInjectArgs, TestIntentsArgs, TraceCauseArgs, VerifyIntentArgs, parse_cli,
 };
 use aetherd::continuous::run_continuous_command;
 use aetherd::coupling::{
@@ -42,7 +42,7 @@ use aetherd::observer::ObserverState;
 use aetherd::refactor_prep::run_refactor_prep_command;
 use aetherd::search::run_search_once;
 use aetherd::setup_local::{SetupLocalOptions, run_setup_local};
-use aetherd::sir_context::run_sir_context_command;
+use aetherd::sir_context::{run_context_command, run_sir_context_command};
 use aetherd::sir_diff::run_sir_diff_command;
 use aetherd::sir_inject::run_sir_inject_command;
 use aetherd::sir_pipeline::{SIR_GENERATION_PASS_REGENERATED, SirDeepPromptSpec, SirPipeline};
@@ -317,6 +317,7 @@ fn run_subcommand(workspace: &Path, config: &AetherConfig, command: Commands) ->
     match command {
         Commands::Batch(args) => run_batch_subcommand(workspace, config, args),
         Commands::Continuous(args) => run_continuous_subcommand(workspace, config, args),
+        Commands::Context(args) => run_context_subcommand(workspace, args),
         Commands::SirContext(args) => run_sir_context_subcommand(workspace, args),
         Commands::SirInject(args) => run_sir_inject_subcommand(workspace, args),
         Commands::SirDiff(args) => run_sir_diff_subcommand(workspace, args),
@@ -346,6 +347,10 @@ fn run_subcommand(workspace: &Path, config: &AetherConfig, command: Commands) ->
 
 fn run_batch_subcommand(workspace: &Path, config: &AetherConfig, args: BatchArgs) -> Result<()> {
     run_batch_command(workspace, config, args)
+}
+
+fn run_context_subcommand(workspace: &Path, args: ContextArgs) -> Result<()> {
+    run_context_command(workspace, args).context("context command failed")
 }
 
 fn run_sir_context_subcommand(workspace: &Path, args: SirContextArgs) -> Result<()> {
