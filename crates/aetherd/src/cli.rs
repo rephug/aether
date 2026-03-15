@@ -521,8 +521,130 @@ pub struct VerifyIntentArgs {
     pub threshold: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BatchPass {
+    Scan,
+    Triage,
+    Deep,
+}
+
+impl BatchPass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Scan => "scan",
+            Self::Triage => "triage",
+            Self::Deep => "deep",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct BatchArgs {
+    #[command(subcommand)]
+    pub command: BatchCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum BatchCommand {
+    /// Run structural extraction only and populate the symbols/graph store
+    Extract,
+    /// Build Gemini Batch API JSONL for a single pass
+    Build(BatchBuildArgs),
+    /// Ingest Gemini Batch API result JSONL for a single pass
+    Ingest(BatchIngestArgs),
+    /// Run extract -> build -> submit/poll/download -> ingest across one or more passes
+    Run(BatchRunArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct BatchBuildArgs {
+    #[arg(long, value_enum, help = "Batch pass to build")]
+    pub pass: BatchPass,
+
+    #[arg(long, help = "Model override for this pass")]
+    pub model: Option<String>,
+
+    #[arg(long, help = "Thinking override for this pass")]
+    pub thinking: Option<String>,
+
+    #[arg(long, help = "Neighbor depth override for this pass")]
+    pub neighbor_depth: Option<u32>,
+
+    #[arg(long, help = "Max source chars override for this pass")]
+    pub max_chars: Option<usize>,
+
+    #[arg(long, help = "Batch JSONL output directory override")]
+    pub batch_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct BatchIngestArgs {
+    #[arg(long, value_enum, help = "Batch pass to ingest")]
+    pub pass: BatchPass,
+
+    #[arg(long, help = "Model override for this pass")]
+    pub model: Option<String>,
+
+    #[arg(help = "Path to the Gemini result JSONL file")]
+    pub results_jsonl: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct BatchRunArgs {
+    #[arg(
+        long,
+        default_value = "scan",
+        help = "Comma-separated passes to run in order"
+    )]
+    pub passes: String,
+
+    #[arg(long, help = "Scan-pass model override")]
+    pub scan_model: Option<String>,
+
+    #[arg(long, help = "Triage-pass model override")]
+    pub triage_model: Option<String>,
+
+    #[arg(long, help = "Deep-pass model override")]
+    pub deep_model: Option<String>,
+
+    #[arg(long, help = "Scan-pass thinking override")]
+    pub scan_thinking: Option<String>,
+
+    #[arg(long, help = "Triage-pass thinking override")]
+    pub triage_thinking: Option<String>,
+
+    #[arg(long, help = "Deep-pass thinking override")]
+    pub deep_thinking: Option<String>,
+
+    #[arg(long, help = "Triage-pass neighbor depth override")]
+    pub triage_neighbor_depth: Option<u32>,
+
+    #[arg(long, help = "Deep-pass neighbor depth override")]
+    pub deep_neighbor_depth: Option<u32>,
+
+    #[arg(long, help = "Scan-pass max source chars override")]
+    pub scan_max_chars: Option<usize>,
+
+    #[arg(long, help = "Triage-pass max source chars override")]
+    pub triage_max_chars: Option<usize>,
+
+    #[arg(long, help = "Deep-pass max source chars override")]
+    pub deep_max_chars: Option<usize>,
+
+    #[arg(long, help = "Batch JSONL output directory override")]
+    pub batch_dir: Option<String>,
+
+    #[arg(long, help = "JSONL chunk size override")]
+    pub jsonl_chunk_size: Option<usize>,
+
+    #[arg(long, help = "Batch poll interval override in seconds")]
+    pub poll_interval_secs: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Subcommand)]
 pub enum Commands {
+    /// Batch indexing operations
+    Batch(BatchArgs),
     /// Generate agent configuration files for AI coding agents
     InitAgent(InitAgentArgs),
     /// Regenerate low-quality SIR records with optional deep enrichment

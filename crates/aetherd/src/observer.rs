@@ -203,6 +203,16 @@ impl ObserverState {
         events.sort_by(|a, b| a.file_path.cmp(&b.file_path));
         events
     }
+
+    pub fn tracked_paths(&self) -> Vec<PathBuf> {
+        let mut paths = self
+            .snapshots
+            .keys()
+            .map(|relative| self.workspace.join(relative))
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
 }
 
 #[derive(Debug, Default)]

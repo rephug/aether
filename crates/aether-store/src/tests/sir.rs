@@ -39,6 +39,7 @@ fn read_sir_blob_backfills_sqlite_from_mirror_without_overwriting_meta() {
         provider: "legacy-provider".to_owned(),
         model: "legacy-model".to_owned(),
         generation_pass: "scan".to_owned(),
+        prompt_hash: Some("legacy-source|legacy-neighbor|legacy-config".to_owned()),
         updated_at: 1_700_111_222,
         sir_status: "fresh".to_owned(),
         last_error: None,
@@ -75,9 +76,9 @@ fn get_sir_meta_defaults_generation_pass_to_scan_when_null() {
     conn.execute(
         r#"
             INSERT INTO sir (
-                id, sir_hash, sir_version, provider, model, generation_pass, updated_at,
-                sir_status, last_error, last_attempt_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9)
+                id, sir_hash, sir_version, provider, model, generation_pass, prompt_hash,
+                updated_at, sir_status, last_error, last_attempt_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10)
             "#,
         params![
             "legacy-null-pass",
@@ -85,6 +86,7 @@ fn get_sir_meta_defaults_generation_pass_to_scan_when_null() {
             1_i64,
             "legacy-provider",
             "legacy-model",
+            Option::<String>::None,
             1_700_000_500_i64,
             "fresh",
             Option::<String>::None,
@@ -99,6 +101,53 @@ fn get_sir_meta_defaults_generation_pass_to_scan_when_null() {
         .expect("read migrated metadata")
         .expect("metadata should exist");
     assert_eq!(meta.generation_pass, "scan");
+    assert_eq!(meta.prompt_hash, None);
+}
+
+#[test]
+fn sir_meta_round_trips_prompt_hash_and_fingerprint_rows() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    let store = SqliteStore::open(workspace).expect("open store");
+
+    let meta = SirMetaRecord {
+        prompt_hash: Some("src123|nbr456|cfg789".to_owned()),
+        ..sir_meta_record()
+    };
+    store
+        .upsert_sir_meta(meta.clone())
+        .expect("upsert sir meta");
+
+    let loaded = store
+        .get_sir_meta(meta.id.as_str())
+        .expect("load sir meta")
+        .expect("sir meta exists");
+    assert_eq!(loaded.prompt_hash, meta.prompt_hash);
+
+    store
+        .insert_sir_fingerprint_history(&SirFingerprintHistoryRecord {
+            symbol_id: meta.id.clone(),
+            timestamp: 1_700_000_123,
+            prompt_hash: "src123|nbr456|cfg789".to_owned(),
+            prompt_hash_previous: Some("src111|nbr222|cfg333".to_owned()),
+            trigger: "batch_scan".to_owned(),
+            source_changed: true,
+            neighbor_changed: false,
+            config_changed: true,
+            generation_model: Some("gemini-3.1-flash-lite-preview".to_owned()),
+            generation_pass: Some("scan".to_owned()),
+            delta_sem: Some(0.12),
+        })
+        .expect("insert fingerprint row");
+
+    let rows = store
+        .list_sir_fingerprint_history(meta.id.as_str())
+        .expect("list fingerprint rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].prompt_hash, "src123|nbr456|cfg789");
+    assert!(rows[0].source_changed);
+    assert!(!rows[0].neighbor_changed);
+    assert!(rows[0].config_changed);
 }
 
 #[test]

@@ -8,17 +8,17 @@ use serde_json::{Value, json};
 use super::SIR_GENERATION_PASS_SCAN;
 
 #[derive(Debug, Clone)]
-pub(super) struct UpsertSirIntentPayload {
-    pub(super) symbol: Symbol,
-    pub(super) sir: SirAnnotation,
-    pub(super) provider_name: String,
-    pub(super) model_name: String,
-    pub(super) generation_pass: String,
-    pub(super) commit_hash: Option<String>,
+pub(crate) struct UpsertSirIntentPayload {
+    pub(crate) symbol: Symbol,
+    pub(crate) sir: SirAnnotation,
+    pub(crate) provider_name: String,
+    pub(crate) model_name: String,
+    pub(crate) generation_pass: String,
+    pub(crate) commit_hash: Option<String>,
 }
 
 impl UpsertSirIntentPayload {
-    pub(super) fn to_json_string(&self) -> Result<String> {
+    pub(crate) fn to_json_string(&self) -> Result<String> {
         serde_json::to_string(&json!({
             "symbol": self.symbol,
             "sir": self.sir,
@@ -30,7 +30,7 @@ impl UpsertSirIntentPayload {
         .context("failed to serialize upsert intent payload")
     }
 
-    pub(super) fn from_json_str(raw: &str) -> Result<Self> {
+    pub(crate) fn from_json_str(raw: &str) -> Result<Self> {
         let value: Value = serde_json::from_str(raw).context("failed to parse payload JSON")?;
         let object = value
             .as_object()

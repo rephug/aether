@@ -1293,6 +1293,7 @@ fn seed_workspace(workspace: &std::path::Path) {
             provider: "mock".to_owned(),
             model: "mock-model".to_owned(),
             generation_pass: "single".to_owned(),
+            prompt_hash: None,
             updated_at: 1_700_000_100,
             sir_status: "ready".to_owned(),
             last_error: None,

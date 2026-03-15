@@ -410,6 +410,37 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         conn.execute("PRAGMA user_version = 8", [])?;
     }
 
+    if version < 9 {
+        ensure_sir_column(conn, "prompt_hash", "TEXT")?;
+
+        conn.execute_batch(
+            r#"
+        CREATE TABLE IF NOT EXISTS sir_fingerprint_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol_id TEXT NOT NULL,
+            timestamp INTEGER NOT NULL,
+            prompt_hash TEXT NOT NULL,
+            prompt_hash_previous TEXT,
+            trigger TEXT NOT NULL,
+            source_changed INTEGER NOT NULL DEFAULT 0,
+            neighbor_changed INTEGER NOT NULL DEFAULT 0,
+            config_changed INTEGER NOT NULL DEFAULT 0,
+            generation_model TEXT,
+            generation_pass TEXT,
+            delta_sem REAL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_fingerprint_symbol_time
+            ON sir_fingerprint_history(symbol_id, timestamp DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_fingerprint_delta
+            ON sir_fingerprint_history(delta_sem DESC)
+            WHERE delta_sem IS NOT NULL;
+        "#,
+        )?;
+        conn.execute("PRAGMA user_version = 9", [])?;
+    }
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_version (

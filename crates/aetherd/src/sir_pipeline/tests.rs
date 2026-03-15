@@ -188,6 +188,7 @@ vector_backend = "sqlite"
                 provider: "test".to_owned(),
                 model: "test".to_owned(),
                 generation_pass: SIR_GENERATION_PASS_SCAN.to_owned(),
+                prompt_hash: None,
                 updated_at: 1_700_000_100,
                 sir_status: SIR_STATUS_FRESH.to_owned(),
                 last_error: None,

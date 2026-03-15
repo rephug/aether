@@ -1,4 +1,5 @@
 mod analysis;
+mod batch;
 mod constants;
 mod embeddings;
 mod health;
@@ -11,8 +12,10 @@ mod sir_quality;
 mod storage;
 mod validate;
 mod verification;
+mod watcher;
 
 pub use analysis::*;
+pub use batch::*;
 pub use constants::*;
 pub use embeddings::*;
 pub use health::*;
@@ -24,3 +27,4 @@ pub use sir_quality::*;
 pub use storage::*;
 pub use validate::*;
 pub use verification::*;
+pub use watcher::*;

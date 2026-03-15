@@ -304,6 +304,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "blake3",
  "clap",
  "gix",
  "ignore",

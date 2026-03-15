@@ -28,6 +28,7 @@ aether-sir = { path = "../aether-sir" }
 aether-store = { path = "../aether-store" }
 anyhow.workspace = true
 axum.workspace = true
+blake3.workspace = true
 clap.workspace = true
 ignore = "0.4"
 notify.workspace = true

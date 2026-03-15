@@ -1,0 +1,363 @@
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+
+use aether_core::Symbol;
+use aether_infer::sir_prompt::{
+    SirEnrichmentContext, build_enriched_sir_prompt, build_enriched_sir_prompt_with_cot,
+    build_sir_prompt_for_kind,
+};
+use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
+use aether_store::{GraphDependencyEdgeRecord, SirStateStore, SqliteStore};
+use anyhow::{Context, Result, anyhow};
+use serde_json::json;
+
+use crate::batch::hash::compute_prompt_hash;
+use crate::batch::{BatchRuntimeConfig, PassConfig};
+use crate::cli::BatchPass;
+use crate::observer::ObserverState;
+use crate::sir_pipeline::build_job;
+
+#[derive(Debug, Clone)]
+pub(crate) struct BuildSummary {
+    pub files: Vec<PathBuf>,
+    pub written: usize,
+    pub skipped: usize,
+    pub unresolved_symbols: usize,
+}
+
+pub(crate) fn snapshot_workspace_symbols(workspace: &Path) -> Result<HashMap<String, Symbol>> {
+    let mut observer = ObserverState::new(workspace.to_path_buf())
+        .context("failed to initialize batch symbol observer")?;
+    observer
+        .seed_from_disk()
+        .context("failed to snapshot workspace symbols for batch build")?;
+
+    let mut symbols_by_id = HashMap::new();
+    for event in observer.initial_symbol_events() {
+        for symbol in event.added.into_iter().chain(event.updated.into_iter()) {
+            symbols_by_id.insert(symbol.id.clone(), symbol);
+        }
+    }
+    Ok(symbols_by_id)
+}
+
+pub(crate) fn build_pass_jsonl(
+    workspace: &Path,
+    store: &SqliteStore,
+    runtime: &BatchRuntimeConfig,
+    pass_config: &PassConfig,
+    symbols_by_id: &HashMap<String, Symbol>,
+) -> Result<BuildSummary> {
+    if pass_config.model.trim().is_empty() {
+        return Err(anyhow!(
+            "batch {} requires a model (set [batch].{}_model or pass --model)",
+            pass_config.pass.as_str(),
+            pass_config.pass.as_str()
+        ));
+    }
+
+    fs::create_dir_all(&runtime.batch_dir).with_context(|| {
+        format!(
+            "failed to create batch output directory {}",
+            runtime.batch_dir.display()
+        )
+    })?;
+
+    let mut summary = BuildSummary {
+        files: Vec::new(),
+        written: 0,
+        skipped: 0,
+        unresolved_symbols: 0,
+    };
+    let symbol_ids = store
+        .list_all_symbol_ids()
+        .context("failed to list symbols for batch build")?;
+    let graph = if matches!(pass_config.pass, BatchPass::Scan) {
+        HashMap::new()
+    } else {
+        build_neighbor_graph(
+            &store
+                .list_graph_dependency_edges()
+                .context("failed to list graph dependency edges for batch build")?,
+        )
+    };
+
+    let mut candidate_ids = Vec::new();
+    for symbol_id in symbol_ids {
+        if symbols_by_id.contains_key(symbol_id.as_str()) {
+            candidate_ids.push(symbol_id);
+        } else {
+            summary.unresolved_symbols += 1;
+            tracing::warn!(
+                symbol_id = %symbol_id,
+                "batch build skipped symbol missing from current workspace snapshot"
+            );
+        }
+    }
+    candidate_ids.sort();
+
+    let baseline_sirs = if matches!(pass_config.pass, BatchPass::Scan) {
+        HashMap::new()
+    } else {
+        parse_sir_map(
+            &store
+                .list_sir_blobs_for_ids(&candidate_ids)
+                .context("failed to prefetch baseline SIR blobs for batch build")?,
+        )
+    };
+
+    let mut file_rollup_ids = HashSet::new();
+    let mut neighbor_ids = HashSet::new();
+    if !matches!(pass_config.pass, BatchPass::Scan) {
+        for symbol_id in &candidate_ids {
+            let Some(symbol) = symbols_by_id.get(symbol_id.as_str()) else {
+                continue;
+            };
+            file_rollup_ids.insert(synthetic_file_sir_id(
+                symbol.language.as_str(),
+                symbol.file_path.as_str(),
+            ));
+            for neighbor_id in collect_neighbor_ids(&graph, symbol_id, pass_config.neighbor_depth) {
+                neighbor_ids.insert(neighbor_id);
+            }
+        }
+    }
+
+    let file_intents = parse_file_intents(
+        &store
+            .list_sir_blobs_for_ids(&file_rollup_ids.into_iter().collect::<Vec<_>>())
+            .context("failed to prefetch file rollup SIR blobs for batch build")?,
+    );
+    let neighbor_sirs = parse_sir_map(
+        &store
+            .list_sir_blobs_for_ids(&neighbor_ids.into_iter().collect::<Vec<_>>())
+            .context("failed to prefetch neighbor SIR blobs for batch build")?,
+    );
+
+    let mut chunk_index = 0usize;
+    let mut current_lines = 0usize;
+    let mut writer = None::<BufWriter<File>>;
+    for symbol_id in candidate_ids {
+        let Some(symbol) = symbols_by_id.get(symbol_id.as_str()) else {
+            continue;
+        };
+        let job = match build_job(workspace, symbol.clone(), None, Some(pass_config.max_chars)) {
+            Ok(job) => job,
+            Err(err) => {
+                tracing::warn!(symbol_id = %symbol.id, error = %err, "failed to build batch SIR job");
+                continue;
+            }
+        };
+
+        let (neighbor_entries, prompt) = match pass_config.pass {
+            BatchPass::Scan => (
+                Vec::new(),
+                build_sir_prompt_for_kind(&job.symbol_text, &job.context),
+            ),
+            BatchPass::Triage | BatchPass::Deep => {
+                let Some(baseline_sir) = baseline_sirs.get(symbol_id.as_str()).cloned() else {
+                    tracing::warn!(
+                        symbol_id = %symbol_id,
+                        pass = pass_config.pass.as_str(),
+                        "batch build skipped symbol without baseline SIR"
+                    );
+                    continue;
+                };
+                let enrichment = build_enrichment_context(
+                    symbol,
+                    pass_config,
+                    &graph,
+                    &file_intents,
+                    &neighbor_sirs,
+                    symbols_by_id,
+                    baseline_sir,
+                );
+                let prompt = if matches!(pass_config.pass, BatchPass::Deep) {
+                    build_enriched_sir_prompt_with_cot(&job.symbol_text, &job.context, &enrichment)
+                } else {
+                    build_enriched_sir_prompt(&job.symbol_text, &job.context, &enrichment)
+                };
+                (enrichment.neighbor_intents, prompt)
+            }
+        };
+
+        let neighbor_texts = neighbor_entries
+            .iter()
+            .map(|(_, intent)| intent.as_str())
+            .collect::<Vec<_>>();
+        let prompt_hash = compute_prompt_hash(
+            job.symbol_text.as_str(),
+            &neighbor_texts,
+            pass_config.config_fingerprint().as_str(),
+        );
+        let existing_hash = store
+            .get_sir_meta(symbol_id.as_str())
+            .with_context(|| format!("failed to read SIR metadata for {symbol_id}"))?
+            .and_then(|record| record.prompt_hash);
+        if existing_hash.as_deref() == Some(prompt_hash.as_str()) {
+            summary.skipped += 1;
+            continue;
+        }
+
+        if writer.is_none() || current_lines >= runtime.jsonl_chunk_size {
+            chunk_index += 1;
+            current_lines = 0;
+            let file_path = runtime.batch_dir.join(format!(
+                "{}-{:04}.jsonl",
+                pass_config.pass.as_str(),
+                chunk_index
+            ));
+            let file = File::create(&file_path).with_context(|| {
+                format!("failed to create batch JSONL file {}", file_path.display())
+            })?;
+            writer = Some(BufWriter::new(file));
+            summary.files.push(file_path);
+        }
+
+        let line = json!({
+            "key": format!("{}|{}", symbol_id, prompt_hash),
+            "request": {
+                "contents": [{
+                    "parts": [{
+                        "text": prompt
+                    }]
+                }],
+                "generationConfig": {
+                    "responseMimeType": "application/json",
+                    "temperature": 0.0,
+                    "thinkingConfig": {
+                        "thinkingLevel": pass_config.thinking_level()?
+                    }
+                }
+            }
+        });
+        let writer_ref = writer.as_mut().expect("writer initialized");
+        serde_json::to_writer(&mut *writer_ref, &line)
+            .context("failed to serialize batch JSONL line")?;
+        writer_ref
+            .write_all(b"\n")
+            .context("failed to terminate batch JSONL line")?;
+        current_lines += 1;
+        summary.written += 1;
+    }
+
+    if let Some(writer) = writer.as_mut() {
+        writer
+            .flush()
+            .context("failed to flush batch JSONL output")?;
+    }
+
+    Ok(summary)
+}
+
+fn build_neighbor_graph(edges: &[GraphDependencyEdgeRecord]) -> HashMap<String, BTreeSet<String>> {
+    let mut graph = HashMap::<String, BTreeSet<String>>::new();
+    for edge in edges {
+        graph
+            .entry(edge.source_symbol_id.clone())
+            .or_default()
+            .insert(edge.target_symbol_id.clone());
+        graph
+            .entry(edge.target_symbol_id.clone())
+            .or_default()
+            .insert(edge.source_symbol_id.clone());
+    }
+    graph
+}
+
+fn collect_neighbor_ids(
+    graph: &HashMap<String, BTreeSet<String>>,
+    symbol_id: &str,
+    max_depth: u32,
+) -> Vec<String> {
+    if max_depth == 0 {
+        return Vec::new();
+    }
+
+    let mut seen = HashSet::<String>::from([symbol_id.to_owned()]);
+    let mut queue = VecDeque::<(String, u32)>::from([(symbol_id.to_owned(), 0)]);
+    let mut ordered = Vec::new();
+    while let Some((current, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+        let Some(neighbors) = graph.get(current.as_str()) else {
+            continue;
+        };
+        for neighbor in neighbors {
+            if seen.insert(neighbor.clone()) {
+                ordered.push(neighbor.clone());
+                queue.push_back((neighbor.clone(), depth + 1));
+            }
+        }
+    }
+
+    ordered
+}
+
+fn parse_sir_map(blobs: &HashMap<String, String>) -> HashMap<String, SirAnnotation> {
+    let mut parsed = HashMap::new();
+    for (symbol_id, blob) in blobs {
+        match serde_json::from_str::<SirAnnotation>(blob) {
+            Ok(sir) => {
+                parsed.insert(symbol_id.clone(), sir);
+            }
+            Err(err) => {
+                tracing::warn!(symbol_id = %symbol_id, error = %err, "skipping invalid SIR blob during batch build");
+            }
+        }
+    }
+    parsed
+}
+
+fn parse_file_intents(blobs: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut parsed = HashMap::new();
+    for (symbol_id, blob) in blobs {
+        match serde_json::from_str::<FileSir>(blob) {
+            Ok(file_sir) => {
+                parsed.insert(symbol_id.clone(), file_sir.intent);
+            }
+            Err(err) => {
+                tracing::warn!(symbol_id = %symbol_id, error = %err, "skipping invalid file rollup SIR during batch build");
+            }
+        }
+    }
+    parsed
+}
+
+fn build_enrichment_context(
+    symbol: &Symbol,
+    pass_config: &PassConfig,
+    graph: &HashMap<String, BTreeSet<String>>,
+    file_intents: &HashMap<String, String>,
+    neighbor_sirs: &HashMap<String, SirAnnotation>,
+    symbols_by_id: &HashMap<String, Symbol>,
+    baseline_sir: SirAnnotation,
+) -> SirEnrichmentContext {
+    let file_rollup_id = synthetic_file_sir_id(symbol.language.as_str(), symbol.file_path.as_str());
+    let mut neighbor_intents =
+        collect_neighbor_ids(graph, symbol.id.as_str(), pass_config.neighbor_depth)
+            .into_iter()
+            .filter_map(|neighbor_id| {
+                let neighbor_symbol = symbols_by_id.get(neighbor_id.as_str())?;
+                let neighbor_sir = neighbor_sirs.get(neighbor_id.as_str())?;
+                Some((
+                    neighbor_symbol.qualified_name.clone(),
+                    neighbor_sir.intent.clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
+    neighbor_intents.sort_by(|left, right| left.0.cmp(&right.0));
+
+    SirEnrichmentContext {
+        file_intent: file_intents.get(file_rollup_id.as_str()).cloned(),
+        neighbor_intents,
+        baseline_sir: Some(baseline_sir),
+        priority_reason: format!(
+            "Selected for batch {} regeneration",
+            pass_config.pass.as_str()
+        ),
+    }
+}

@@ -1,3 +1,4 @@
+pub mod batch;
 pub mod calibrate;
 pub mod causal;
 pub mod cli;

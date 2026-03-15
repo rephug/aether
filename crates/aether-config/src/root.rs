@@ -6,6 +6,7 @@ use thiserror::Error;
 
 use crate::{
     analysis::{CouplingConfig, DriftConfig},
+    batch::BatchConfig,
     constants::{AETHER_DIR_NAME, CONFIG_FILE_NAME, DEFAULT_DASHBOARD_PORT, DEFAULT_LOG_LEVEL},
     embeddings::EmbeddingsConfig,
     health::{HealthConfig, HealthScoreConfig},
@@ -16,6 +17,7 @@ use crate::{
     sir_quality::SirQualityConfig,
     storage::StorageConfig,
     verification::VerifyConfig,
+    watcher::WatcherConfig,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -48,6 +50,10 @@ pub struct AetherConfig {
     pub health_score: HealthScoreConfig,
     #[serde(default)]
     pub dashboard: DashboardConfig,
+    #[serde(default)]
+    pub batch: Option<BatchConfig>,
+    #[serde(default, rename = "watcher")]
+    pub watcher: Option<WatcherConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,7 +209,7 @@ mod tests {
         parse_workspace_config_str, save_workspace_config,
     };
     use crate::{
-        AetherConfig, DEFAULT_COHERE_API_KEY_ENV, DEFAULT_DASHBOARD_PORT,
+        AetherConfig, BatchConfig, DEFAULT_COHERE_API_KEY_ENV, DEFAULT_DASHBOARD_PORT,
         DEFAULT_DRIFT_ANALYSIS_WINDOW, DEFAULT_DRIFT_HUB_PERCENTILE, DEFAULT_DRIFT_THRESHOLD,
         DEFAULT_GEMINI_API_KEY_ENV, DEFAULT_HEALTH_DRIFT_WEIGHT, DEFAULT_HEALTH_NO_SIR_WEIGHT,
         DEFAULT_HEALTH_PAGERANK_WEIGHT, DEFAULT_HEALTH_RECENCY_WEIGHT,
@@ -224,7 +230,7 @@ mod tests {
         DEFAULT_VERIFY_CONTAINER_WORKDIR, DEFAULT_VERIFY_MICROVM_MEMORY_MIB,
         DEFAULT_VERIFY_MICROVM_RUNTIME, DEFAULT_VERIFY_MICROVM_VCPU_COUNT,
         DEFAULT_VERIFY_MICROVM_WORKDIR, EmbeddingProviderKind, EmbeddingVectorBackend,
-        GraphBackend, InferenceProviderKind, SearchRerankerKind, VerifyMode,
+        GraphBackend, InferenceProviderKind, SearchRerankerKind, VerifyMode, WatcherConfig,
         health::default_health_score_stale_ref_patterns,
     };
 
@@ -888,6 +894,8 @@ fallback_to_host_on_unavailable = true
             config.health_score.file_loc_fail,
             DEFAULT_HEALTH_SCORE_FILE_LOC_FAIL
         );
+        assert!(config.batch.is_none());
+        assert!(config.watcher.is_none());
     }
 
     #[test]
@@ -1079,5 +1087,84 @@ dimensions = 3072
             Some("GEMINI_API_KEY")
         );
         assert_eq!(config.embeddings.dimensions, Some(3072));
+    }
+
+    #[test]
+    fn parse_workspace_config_str_accepts_empty_toml_with_batch_and_watcher_absent() {
+        let config = parse_workspace_config_str("").expect("parse empty config");
+        assert_eq!(config, AetherConfig::default());
+        assert!(config.batch.is_none());
+        assert!(config.watcher.is_none());
+    }
+
+    #[test]
+    fn parse_workspace_config_str_reads_batch_and_watcher_sections() {
+        let config = parse_workspace_config_str(
+            r#"
+[batch]
+scan_model = "gemini-3.1-flash-lite-preview"
+triage_model = "gemini-3.1-pro-preview"
+deep_model = "gemini-3.1-pro-preview"
+scan_thinking = "low"
+triage_thinking = "medium"
+deep_thinking = "high"
+triage_neighbor_depth = 2
+deep_neighbor_depth = 3
+scan_max_chars = 9000
+triage_max_chars = 12000
+deep_max_chars = 16000
+passes = ["scan", "triage", "deep"]
+auto_chain = false
+batch_dir = ".aether/custom-batch"
+poll_interval_secs = 120
+jsonl_chunk_size = 1234
+
+[watcher]
+realtime_model = "gemini-3.1-pro-preview"
+realtime_provider = "gemini"
+trigger_on_branch_switch = false
+trigger_on_git_pull = true
+trigger_on_merge = false
+git_trigger_changed_files_only = false
+git_debounce_secs = 4.5
+trigger_on_build_success = true
+"#,
+        )
+        .expect("parse config with batch and watcher");
+
+        assert_eq!(
+            config.batch,
+            Some(BatchConfig {
+                scan_model: "gemini-3.1-flash-lite-preview".to_owned(),
+                triage_model: "gemini-3.1-pro-preview".to_owned(),
+                deep_model: "gemini-3.1-pro-preview".to_owned(),
+                scan_thinking: "low".to_owned(),
+                triage_thinking: "medium".to_owned(),
+                deep_thinking: "high".to_owned(),
+                triage_neighbor_depth: 2,
+                deep_neighbor_depth: 3,
+                scan_max_chars: 9000,
+                triage_max_chars: 12000,
+                deep_max_chars: 16000,
+                passes: vec!["scan".to_owned(), "triage".to_owned(), "deep".to_owned()],
+                auto_chain: false,
+                batch_dir: ".aether/custom-batch".to_owned(),
+                poll_interval_secs: 120,
+                jsonl_chunk_size: 1234,
+            })
+        );
+        assert_eq!(
+            config.watcher,
+            Some(WatcherConfig {
+                realtime_model: "gemini-3.1-pro-preview".to_owned(),
+                realtime_provider: "gemini".to_owned(),
+                trigger_on_branch_switch: false,
+                trigger_on_git_pull: true,
+                trigger_on_merge: false,
+                git_trigger_changed_files_only: false,
+                git_debounce_secs: 4.5,
+                trigger_on_build_success: true,
+            })
+        );
     }
 }

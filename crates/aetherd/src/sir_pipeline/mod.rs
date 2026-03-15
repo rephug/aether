@@ -35,10 +35,10 @@ use aether_store::{
 use anyhow::{Context, Result, anyhow};
 use tokio::runtime::Runtime;
 
-use self::infer::{GeneratedSir, SirGenerationOutcome, SirJob, build_job, generate_sir_jobs};
-use self::persist::{
-    UpsertSirIntentPayload, flatten_error_line, to_symbol_record, to_test_intent_record,
-};
+pub(crate) use self::infer::build_job;
+use self::infer::{GeneratedSir, SirGenerationOutcome, SirJob, generate_sir_jobs};
+pub(crate) use self::persist::UpsertSirIntentPayload;
+use self::persist::{flatten_error_line, to_symbol_record, to_test_intent_record};
 use self::rollup::{FileLeafSir, aggregate_file_sir};
 use crate::quality::SirQualityMonitor;
 
@@ -47,13 +47,13 @@ mod persist;
 mod rollup;
 
 pub const DEFAULT_SIR_CONCURRENCY: usize = 2;
-const SIR_STATUS_FRESH: &str = "fresh";
+pub(crate) const SIR_STATUS_FRESH: &str = "fresh";
 const SIR_STATUS_STALE: &str = "stale";
 const INFERENCE_MAX_RETRIES: usize = 2;
 const INFERENCE_ATTEMPT_TIMEOUT_SECS: u64 = 90;
 const INFERENCE_BACKOFF_BASE_MS: u64 = 200;
 const INFERENCE_BACKOFF_MAX_MS: u64 = 2_000;
-const MAX_SYMBOL_TEXT_CHARS: usize = 10_000;
+pub(crate) const MAX_SYMBOL_TEXT_CHARS: usize = 10_000;
 pub const SIR_GENERATION_PASS_SCAN: &str = "scan";
 pub const SIR_GENERATION_PASS_TRIAGE: &str = "triage";
 pub const SIR_GENERATION_PASS_DEEP: &str = "deep";
@@ -479,7 +479,12 @@ impl SirPipeline {
             let language = item.symbol.language;
             touched_files.entry(file_path.clone()).or_insert(language);
 
-            match build_job(&self.workspace_root, item.symbol, Some(item.priority_score)) {
+            match build_job(
+                &self.workspace_root,
+                item.symbol,
+                Some(item.priority_score),
+                None,
+            ) {
                 Ok(mut job) => {
                     let prompt = if item.use_cot {
                         sir_prompt::build_enriched_sir_prompt_with_cot(
@@ -659,7 +664,7 @@ impl SirPipeline {
                 continue;
             }
 
-            match build_job(&self.workspace_root, symbol, priority_score) {
+            match build_job(&self.workspace_root, symbol, priority_score, None) {
                 Ok(mut job) => {
                     if let Some(prompt_overrides) = prompt_overrides
                         && let Some(override_spec) = prompt_overrides.get(job.symbol.id.as_str())
@@ -974,6 +979,7 @@ impl SirPipeline {
             provider: generated.provider_name.clone(),
             model: generated.model_name.clone(),
             generation_pass: generation_pass.to_owned(),
+            prompt_hash: None,
             updated_at: version_write.updated_at,
             sir_status: SIR_STATUS_FRESH.to_owned(),
             last_error: None,
@@ -1071,6 +1077,7 @@ impl SirPipeline {
                 provider: self.provider_name.clone(),
                 model: self.model_name.clone(),
                 generation_pass: generation_pass.to_owned(),
+                prompt_hash: None,
                 updated_at: 0,
                 sir_status: SIR_STATUS_STALE.to_owned(),
                 last_error: Some(failed.error_message.clone()),
@@ -1095,6 +1102,7 @@ impl SirPipeline {
                 } else {
                     record.generation_pass
                 },
+                prompt_hash: record.prompt_hash,
                 updated_at: record.updated_at,
                 sir_status: SIR_STATUS_STALE.to_owned(),
                 last_error: Some(failed.error_message.clone()),
@@ -1248,7 +1256,7 @@ impl SirPipeline {
             let Some(spec) = deep_specs.get(symbol.id.as_str()) else {
                 continue;
             };
-            let job = build_job(&self.workspace_root, symbol.clone(), priority_score)
+            let job = build_job(&self.workspace_root, symbol.clone(), priority_score, None)
                 .with_context(|| {
                     format!("failed to build deep SIR job for {}", symbol.qualified_name)
                 })?;
@@ -1292,6 +1300,37 @@ impl SirPipeline {
 
     pub fn model_name(&self) -> &str {
         self.model_name.as_str()
+    }
+
+    pub(crate) fn load_symbol_embedding(
+        &self,
+        symbol_id: &str,
+    ) -> Result<Option<SymbolEmbeddingRecord>> {
+        let symbol_id = symbol_id.trim();
+        if symbol_id.is_empty() {
+            return Ok(None);
+        }
+
+        let Some(meta) = self
+            .runtime
+            .block_on(self.vector_store.get_embedding_meta(symbol_id))
+            .with_context(|| format!("failed to read embedding metadata for {symbol_id}"))?
+        else {
+            return Ok(None);
+        };
+
+        let records = self
+            .runtime
+            .block_on(self.vector_store.list_embeddings_for_symbols(
+                meta.provider.as_str(),
+                meta.model.as_str(),
+                &[symbol_id.to_owned()],
+            ))
+            .with_context(|| format!("failed to read embedding vector for {symbol_id}"))?;
+
+        Ok(records
+            .into_iter()
+            .find(|record| record.symbol_id == symbol_id))
     }
 
     pub fn with_inference_timeout_secs(mut self, timeout_secs: u64) -> Self {
@@ -1610,7 +1649,7 @@ impl SirPipeline {
         Ok(())
     }
 
-    fn persist_sir_payload_into_sqlite(
+    pub(crate) fn persist_sir_payload_into_sqlite(
         &self,
         store: &SqliteStore,
         payload: &UpsertSirIntentPayload,
@@ -1639,6 +1678,7 @@ impl SirPipeline {
             provider: payload.provider_name.clone(),
             model: payload.model_name.clone(),
             generation_pass: payload.generation_pass.clone(),
+            prompt_hash: None,
             updated_at: version_write.updated_at,
             sir_status: SIR_STATUS_FRESH.to_owned(),
             last_error: None,
@@ -1765,7 +1805,7 @@ impl SirPipeline {
         Ok(())
     }
 
-    fn refresh_embedding_if_needed(
+    pub(crate) fn refresh_embedding_if_needed(
         &self,
         symbol_id: &str,
         sir_hash_value: &str,
@@ -1942,6 +1982,7 @@ impl SirPipeline {
                 provider: self.provider_name.clone(),
                 model: self.model_name.clone(),
                 generation_pass: generation_pass.to_owned(),
+                prompt_hash: None,
                 updated_at: version_write.updated_at,
                 sir_status: SIR_STATUS_FRESH.to_owned(),
                 last_error: None,
