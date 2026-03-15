@@ -1831,6 +1831,13 @@ fn normalize_workspace_relative_path(workspace: &Path, value: &str) -> Result<St
     }
 
     let path = PathBuf::from(trimmed);
+    // Reject parent traversal components before any resolution
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err(anyhow!("path must not contain '..' components"));
+    }
     let normalized = if path.is_absolute() {
         if !path.starts_with(workspace) {
             return Err(anyhow!(
