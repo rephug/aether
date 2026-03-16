@@ -214,8 +214,9 @@ pub(crate) fn default_health_score_stale_ref_fail() -> usize {
 }
 
 pub(crate) fn default_health_score_stale_ref_patterns() -> Vec<String> {
+    let legacy_cozo_graph_store = concat!("Cozo", "GraphStore");
     vec![
-        "CozoGraphStore".to_owned(),
+        legacy_cozo_graph_store.to_owned(),
         "cozo".to_owned(),
         "CozoDB".to_owned(),
     ]

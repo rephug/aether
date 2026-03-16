@@ -8,8 +8,9 @@ use std::sync::OnceLock;
 use aether_core::normalize_path;
 use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
 use aether_store::{
-    CouplingEdgeRecord, CozoGraphStore, GraphDependencyEdgeRecord, SemanticIndexStore, SqliteStore,
-    SymbolCatalogStore, SymbolSearchResult, TaskContextHistoryRecord,
+    CouplingEdgeRecord, GraphDependencyEdgeRecord, SemanticIndexStore, SqliteStore,
+    SurrealGraphStore, SymbolCatalogStore, SymbolSearchResult, TaskContextHistoryRecord,
+    block_on_store_future, open_surreal_graph_store_readonly,
 };
 use anyhow::{Context, Result, anyhow};
 use gix::bstr::ByteSlice;
@@ -350,9 +351,10 @@ fn branch_diff_to_symbols_with_context(
     let changed_paths = changed_paths_between_refs(workspace, "main", branch_name)?;
     let mut file_paths = changed_paths.into_iter().collect::<BTreeSet<_>>();
     let mut notices = Vec::new();
+    let graph_store = open_surreal_graph_store_readonly(workspace).ok();
 
     match coupled_file_paths(
-        workspace,
+        graph_store.as_ref(),
         file_paths.iter().cloned().collect::<Vec<_>>().as_slice(),
     ) {
         Ok(paths) => {
@@ -724,25 +726,27 @@ fn normalize_git_rename_path(path: &str) -> String {
 }
 
 fn coupled_file_paths(
-    workspace: &Path,
+    graph_store: Option<&SurrealGraphStore>,
     file_paths: &[String],
 ) -> std::result::Result<Vec<String>, String> {
     if file_paths.is_empty() {
         return Ok(Vec::new());
     }
 
-    let graph_store = match CozoGraphStore::open_readonly(workspace) {
-        Ok(graph_store) => graph_store,
-        Err(_) => {
-            return Err("coupling data unavailable — daemon may hold SurrealDB lock".to_owned());
-        }
+    let Some(graph_store) = graph_store else {
+        return Err("coupling data unavailable — daemon may hold SurrealDB lock".to_owned());
     };
 
     let mut coupled = BTreeSet::new();
     for file_path in file_paths {
-        let edges = match graph_store.list_co_change_edges_for_file(file_path.as_str(), 0.0) {
-            Ok(edges) => edges,
+        let edges = match block_on_store_future(
+            graph_store.list_co_change_edges_for_file(file_path.as_str(), 0.0),
+        ) {
+            Ok(Ok(edges)) => edges,
             Err(_) => {
+                return Err("coupling data unavailable — daemon may hold SurrealDB lock".to_owned());
+            }
+            Ok(Err(_)) => {
                 return Err("coupling data unavailable — daemon may hold SurrealDB lock".to_owned());
             }
         };

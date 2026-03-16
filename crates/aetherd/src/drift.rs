@@ -4,19 +4,25 @@ use std::path::Path;
 use aether_analysis::{
     AcknowledgeDriftRequest, CommunitiesRequest, DriftAnalyzer, DriftReportRequest,
 };
+use aether_store::open_surreal_graph_store_readonly;
 use anyhow::{Context, Result};
 
 use crate::cli::{CommunitiesArgs, CommunitiesFormat, DriftAckArgs, DriftReportArgs};
 
 pub fn run_drift_report_command(workspace: &Path, args: DriftReportArgs) -> Result<()> {
     let analyzer = DriftAnalyzer::new(workspace).context("failed to initialize drift analyzer")?;
+    let graph = open_surreal_graph_store_readonly(workspace)
+        .context("failed to open configured surreal graph store")?;
     let report = analyzer
-        .report(DriftReportRequest {
-            window: Some(args.window),
-            include: None,
-            min_drift_magnitude: Some(args.min_drift.clamp(0.0, 1.0)),
-            include_acknowledged: Some(args.include_acknowledged),
-        })
+        .report_with_graph(
+            &graph,
+            DriftReportRequest {
+                window: Some(args.window),
+                include: None,
+                min_drift_magnitude: Some(args.min_drift.clamp(0.0, 1.0)),
+                include_acknowledged: Some(args.include_acknowledged),
+            },
+        )
         .context("drift report failed")?;
     let value = serde_json::to_value(report).context("failed to serialize drift report")?;
     write_json_to_stdout(&value)
@@ -37,10 +43,15 @@ pub fn run_drift_ack_command(workspace: &Path, args: DriftAckArgs) -> Result<()>
 
 pub fn run_communities_command(workspace: &Path, args: CommunitiesArgs) -> Result<()> {
     let analyzer = DriftAnalyzer::new(workspace).context("failed to initialize drift analyzer")?;
+    let graph = open_surreal_graph_store_readonly(workspace)
+        .context("failed to open configured surreal graph store")?;
     let result = analyzer
-        .communities(CommunitiesRequest {
-            format: Some(args.format.as_str().to_owned()),
-        })
+        .communities_with_graph(
+            &graph,
+            CommunitiesRequest {
+                format: Some(args.format.as_str().to_owned()),
+            },
+        )
         .context("communities query failed")?;
 
     match args.format {

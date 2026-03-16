@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 
 use aether_core::{file_source_id, normalize_path};
 use aether_store::{
-    CozoGraphStore, SqliteStore, SymbolRelationStore, TestIntentStore, TestedByRecord,
+    SqliteStore, SurrealGraphStore, SymbolRelationStore, TestIntentStore, TestedByRecord,
+    block_on_store_future, open_surreal_graph_store_readonly, open_surreal_graph_store_sync,
 };
 use serde::{Deserialize, Serialize};
 
@@ -66,16 +67,24 @@ impl TestIntentAnalyzer {
         &self,
         test_file: &str,
     ) -> Result<Vec<InferredTestTarget>, AnalysisError> {
+        let graph = open_surreal_graph_store_sync(&self.workspace)?;
+        self.refresh_for_test_file_with_graph(&graph, test_file)
+    }
+
+    pub fn refresh_for_test_file_with_graph(
+        &self,
+        graph: &SurrealGraphStore,
+        test_file: &str,
+    ) -> Result<Vec<InferredTestTarget>, AnalysisError> {
         let test_file = normalize_repo_path(test_file);
         if test_file.is_empty() {
             return Ok(Vec::new());
         }
 
         let store = SqliteStore::open(&self.workspace)?;
-        let cozo = CozoGraphStore::open(&self.workspace)?;
         let intents = store.list_test_intents_for_file(test_file.as_str())?;
         if intents.is_empty() {
-            cozo.replace_tested_by_for_test_file(test_file.as_str(), &[])?;
+            block_on_store_future(graph.replace_tested_by_for_test_file(test_file.as_str(), &[]))??;
             return Ok(Vec::new());
         }
 
@@ -107,7 +116,9 @@ impl TestIntentAnalyzer {
             }
         }
 
-        for edge in cozo.list_co_change_edges_for_file(test_file.as_str(), 0.0)? {
+        for edge in
+            block_on_store_future(graph.list_co_change_edges_for_file(test_file.as_str(), 0.0))??
+        {
             let target = if edge.file_a == test_file {
                 edge.file_b
             } else {
@@ -167,7 +178,9 @@ impl TestIntentAnalyzer {
                 inference_method: entry.inference_method.clone(),
             })
             .collect::<Vec<_>>();
-        cozo.replace_tested_by_for_test_file(test_file.as_str(), &relation_rows)?;
+        block_on_store_future(
+            graph.replace_tested_by_for_test_file(test_file.as_str(), &relation_rows),
+        )??;
 
         Ok(inferred)
     }
@@ -176,14 +189,23 @@ impl TestIntentAnalyzer {
         &self,
         target_file: &str,
     ) -> Result<Vec<TestGuard>, AnalysisError> {
+        let graph = open_surreal_graph_store_readonly(&self.workspace)?;
+        self.list_guards_for_target_file_with_graph(&graph, target_file)
+    }
+
+    pub fn list_guards_for_target_file_with_graph(
+        &self,
+        graph: &SurrealGraphStore,
+        target_file: &str,
+    ) -> Result<Vec<TestGuard>, AnalysisError> {
         let target_file = normalize_repo_path(target_file);
         if target_file.is_empty() {
             return Ok(Vec::new());
         }
 
         let store = SqliteStore::open(&self.workspace)?;
-        let cozo = CozoGraphStore::open(&self.workspace)?;
-        let rows = cozo.list_tested_by_for_target_file(target_file.as_str())?;
+        let rows =
+            block_on_store_future(graph.list_tested_by_for_target_file(target_file.as_str()))??;
 
         let mut guards = Vec::new();
         for row in rows {
@@ -515,10 +537,11 @@ fn is_probably_test_file(path: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use aether_core::{EdgeKind, SymbolEdge, content_hash};
-    use aether_store::{CouplingEdgeRecord, TestIntentRecord};
+    use aether_store::{CouplingEdgeRecord, CozoGraphStore, TestIntentRecord}; // test
     use tempfile::tempdir;
 
     fn test_intent(file_path: &str, test_name: &str, intent: &str) -> TestIntentRecord {
@@ -660,7 +683,7 @@ mod tests {
             )
             .expect("write intents");
 
-        let cozo = CozoGraphStore::open(temp.path()).expect("open cozo");
+        let cozo = CozoGraphStore::open(temp.path()).expect("open cozo"); // test
         cozo.replace_tested_by_for_test_file(
             "tests/payment_test.rs",
             &[TestedByRecord {
@@ -708,7 +731,7 @@ mod tests {
             )
             .expect("write intents");
 
-        let cozo = CozoGraphStore::open(temp.path()).expect("open cozo");
+        let cozo = CozoGraphStore::open(temp.path()).expect("open cozo"); // test
         cozo.upsert_co_change_edges(&[CouplingEdgeRecord {
             file_a: "src/payment.rs".to_owned(),
             file_b: "tests/payment_cases.rs".to_owned(),

@@ -16,8 +16,9 @@ use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
 #[cfg(test)]
 use aether_store::SirHistoryStore;
 use aether_store::{
-    SirMetaRecord, SirStateStore, SqliteStore, SymbolCatalogStore, SymbolEmbeddingRecord,
-    SymbolRecord, SymbolRelationStore, TestIntentRecord, TestIntentStore, open_graph_store,
+    SirMetaRecord, SirStateStore, SqliteStore, SurrealGraphStore, SymbolCatalogStore,
+    SymbolEmbeddingRecord, SymbolRecord, SymbolRelationStore, TestIntentRecord, TestIntentStore,
+    open_graph_store, open_surreal_graph_store_sync,
 };
 use anyhow::{Context, Result};
 use gix::bstr::ByteSlice;
@@ -2253,6 +2254,7 @@ struct StructuralIndexer {
     test_intent_analyzer: TestIntentAnalyzer,
     graph_runtime: tokio::runtime::Runtime,
     graph_store: Box<dyn aether_store::GraphStore>,
+    surreal_graph_store: Option<SurrealGraphStore>,
 }
 
 impl StructuralIndexer {
@@ -2268,6 +2270,7 @@ impl StructuralIndexer {
         let graph_store = graph_runtime
             .block_on(open_graph_store(&workspace_root))
             .context("failed to open configured graph store")?;
+        let surreal_graph_store = open_surreal_graph_store_sync(&workspace_root).ok();
 
         Ok(Self {
             workspace_root,
@@ -2275,6 +2278,7 @@ impl StructuralIndexer {
             test_intent_analyzer,
             graph_runtime,
             graph_store,
+            surreal_graph_store,
         })
     }
 
@@ -2336,15 +2340,17 @@ impl StructuralIndexer {
             }
         }
 
-        let _ = self
-            .test_intent_analyzer
-            .refresh_for_test_file(event.file_path.as_str())
-            .with_context(|| {
-                format!(
-                    "failed to refresh tested_by links for test file {}",
-                    event.file_path
-                )
-            })?;
+        if let Some(graph) = self.surreal_graph_store.as_ref() {
+            let _ = self
+                .test_intent_analyzer
+                .refresh_for_test_file_with_graph(graph, event.file_path.as_str())
+                .with_context(|| {
+                    format!(
+                        "failed to refresh tested_by links for test file {}",
+                        event.file_path
+                    )
+                })?;
+        }
 
         let stats = self
             .graph_runtime

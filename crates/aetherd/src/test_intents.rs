@@ -3,7 +3,7 @@ use std::path::Path;
 
 use aether_analysis::TestIntentAnalyzer;
 use aether_core::normalize_path;
-use aether_store::{SqliteStore, TestIntentStore};
+use aether_store::{SqliteStore, TestIntentStore, open_surreal_graph_store_sync};
 use anyhow::{Context, Result};
 use serde_json::json;
 
@@ -20,8 +20,10 @@ pub fn run_test_intents_command(workspace: &Path, args: TestIntentsArgs) -> Resu
     }
 
     let analyzer = TestIntentAnalyzer::new(workspace).context("failed to initialize analyzer")?;
+    let graph = open_surreal_graph_store_sync(workspace)
+        .context("failed to open configured surreal graph store")?;
     let _ = analyzer
-        .refresh_for_test_file(file_path.as_str())
+        .refresh_for_test_file_with_graph(&graph, file_path.as_str())
         .context("failed to refresh tested_by links")?;
 
     let store = SqliteStore::open(workspace).context("failed to open store")?;

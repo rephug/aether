@@ -7,9 +7,10 @@ use aether_core::{GitContext, Language, normalize_path};
 use aether_health::{ScoreReport, workspace_health_config_or_default};
 use aether_sir::{FileSir, SirAnnotation, canonicalize_file_sir_json, synthetic_file_sir_id};
 use aether_store::{
-    CouplingEdgeRecord, CozoGraphStore, DriftStore, ProjectNoteStore, SirStateStore, SqliteStore,
-    SymbolCatalogStore, SymbolRecord, SymbolRelationStore, TaskContextHistoryRecord,
-    TestIntentStore,
+    CouplingEdgeRecord, DriftStore, ProjectNoteStore, SirStateStore, SqliteStore,
+    SurrealGraphStore, SymbolCatalogStore, SymbolRecord, SymbolRelationStore,
+    TaskContextHistoryRecord, TestIntentStore, block_on_store_future,
+    open_surreal_graph_store_readonly,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
@@ -820,6 +821,8 @@ fn prepare_file_target(
         }
     };
 
+    let graph_store = open_surreal_graph_store_readonly(workspace).ok();
+
     if symbol_records.is_empty() {
         output
             .notices
@@ -856,7 +859,7 @@ fn prepare_file_target(
             tests = prepare_tests_for_file(store, path, task)?;
         }
         if layers.coupling {
-            let (entries, notice) = prepare_coupling_for_file(workspace, path)?;
+            let (entries, notice) = prepare_coupling_for_file(graph_store.as_ref(), path)?;
             if let Some(notice) = notice {
                 output.notices.push(notice);
             }
@@ -2450,8 +2453,10 @@ fn prepare_symbol_context(
     } else {
         Vec::new()
     };
+    let graph_store = open_surreal_graph_store_readonly(workspace).ok();
     let coupling = if include.coupling {
-        let (entries, notice) = prepare_coupling_for_file(workspace, record.file_path.as_str())?;
+        let (entries, notice) =
+            prepare_coupling_for_file(graph_store.as_ref(), record.file_path.as_str())?;
         if let Some(notice) = notice {
             base_output.notices.push(notice);
         }
@@ -2646,27 +2651,31 @@ fn prepare_callers_with_intent(
 }
 
 fn prepare_coupling_for_file(
-    workspace: &Path,
+    graph_store: Option<&SurrealGraphStore>,
     file_path: &str,
 ) -> Result<(Vec<PreparedItem<CouplingContext>>, Option<String>)> {
-    let graph_store = match CozoGraphStore::open_readonly(workspace) {
-        Ok(graph) => graph,
-        Err(_) => {
-            return Ok((
-                Vec::new(),
-                Some("coupling data unavailable — daemon may hold SurrealDB lock".to_owned()),
-            ));
-        }
+    let Some(graph_store) = graph_store else {
+        return Ok((
+            Vec::new(),
+            Some("coupling data unavailable — daemon may hold SurrealDB lock".to_owned()),
+        ));
     };
-    let edges = match graph_store.list_co_change_edges_for_file(file_path, 0.0) {
-        Ok(edges) => edges,
-        Err(_) => {
-            return Ok((
-                Vec::new(),
-                Some("coupling data unavailable — daemon may hold SurrealDB lock".to_owned()),
-            ));
-        }
-    };
+    let edges =
+        match block_on_store_future(graph_store.list_co_change_edges_for_file(file_path, 0.0)) {
+            Ok(Ok(edges)) => edges,
+            Err(_) => {
+                return Ok((
+                    Vec::new(),
+                    Some("coupling data unavailable — daemon may hold SurrealDB lock".to_owned()),
+                ));
+            }
+            Ok(Err(_)) => {
+                return Ok((
+                    Vec::new(),
+                    Some("coupling data unavailable — daemon may hold SurrealDB lock".to_owned()),
+                ));
+            }
+        };
     Ok((
         edges
             .into_iter()

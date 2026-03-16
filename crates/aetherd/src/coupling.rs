@@ -2,6 +2,7 @@ use std::io::Write;
 use std::path::Path;
 
 use aether_analysis::{BlastRadiusRequest, CouplingAnalyzer, MineCouplingRequest};
+use aether_store::{open_surreal_graph_store_readonly, open_surreal_graph_store_sync};
 use anyhow::{Context, Result};
 use serde_json::json;
 
@@ -9,10 +10,15 @@ use crate::cli::{BlastRadiusArgs, CouplingReportArgs, MineCouplingArgs};
 
 pub fn run_mine_coupling_command(workspace: &Path, args: MineCouplingArgs) -> Result<()> {
     let analyzer = CouplingAnalyzer::new(workspace).context("failed to initialize analyzer")?;
+    let graph = open_surreal_graph_store_sync(workspace)
+        .context("failed to open configured surreal graph store")?;
     let result = analyzer
-        .mine(MineCouplingRequest {
-            commits: args.commits,
-        })
+        .mine_with_graph(
+            &graph,
+            MineCouplingRequest {
+                commits: args.commits,
+            },
+        )
         .context("coupling mining failed")?;
 
     let response = serde_json::to_value(result).context("failed to serialize mining output")?;
@@ -21,12 +27,17 @@ pub fn run_mine_coupling_command(workspace: &Path, args: MineCouplingArgs) -> Re
 
 pub fn run_blast_radius_command(workspace: &Path, args: BlastRadiusArgs) -> Result<()> {
     let analyzer = CouplingAnalyzer::new(workspace).context("failed to initialize analyzer")?;
+    let graph = open_surreal_graph_store_sync(workspace)
+        .context("failed to open configured surreal graph store")?;
     let result = analyzer
-        .blast_radius(BlastRadiusRequest {
-            file_path: args.file,
-            min_risk: args.min_risk,
-            auto_mine: true,
-        })
+        .blast_radius_with_graph(
+            &graph,
+            BlastRadiusRequest {
+                file_path: args.file,
+                min_risk: args.min_risk,
+                auto_mine: true,
+            },
+        )
         .context("blast radius query failed")?;
 
     let response =
@@ -36,8 +47,10 @@ pub fn run_blast_radius_command(workspace: &Path, args: BlastRadiusArgs) -> Resu
 
 pub fn run_coupling_report_command(workspace: &Path, args: CouplingReportArgs) -> Result<()> {
     let analyzer = CouplingAnalyzer::new(workspace).context("failed to initialize analyzer")?;
+    let graph = open_surreal_graph_store_readonly(workspace)
+        .context("failed to open configured surreal graph store")?;
     let edges = analyzer
-        .coupling_report(args.top.clamp(1, 200))
+        .coupling_report_with_graph(&graph, args.top.clamp(1, 200))
         .context("coupling report query failed")?;
 
     let response = json!({

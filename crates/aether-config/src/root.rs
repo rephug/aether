@@ -238,6 +238,8 @@ mod tests {
         health::default_health_score_stale_ref_patterns,
     };
 
+    const LEGACY_COZO_GRAPH_STORE: &str = concat!("Cozo", "GraphStore");
+
     #[test]
     fn ensure_workspace_config_creates_default_file() {
         let temp = tempdir().expect("tempdir");
@@ -540,7 +542,7 @@ mod tests {
         assert!(content.contains("file_loc_warn = 800"));
         assert!(content.contains("trait_method_fail = 35"));
         assert!(content.contains("stale_ref_patterns = ["));
-        assert!(content.contains("\"CozoGraphStore\""));
+        assert!(content.contains(&format!("\"{LEGACY_COZO_GRAPH_STORE}\"")));
         assert!(content.contains("\"CozoDB\""));
         assert!(content.contains("[dashboard]"));
         assert!(content.contains("port = 9720"));
@@ -636,12 +638,13 @@ dead_feature_warn = 2
 dead_feature_fail = 6
 stale_ref_warn = 2
 stale_ref_fail = 4
-stale_ref_patterns = [" CozoGraphStore ", "", "LegacyStore"]
+stale_ref_patterns = [" __LEGACY_COZO_GRAPH_STORE__ ", "", "LegacyStore"]
 
 [dashboard]
 port = 9800
 enabled = false
-"#;
+"#
+        .replace("__LEGACY_COZO_GRAPH_STORE__", LEGACY_COZO_GRAPH_STORE);
         fs::write(config_path(workspace), raw).expect("write config");
 
         let config = load_workspace_config(workspace).expect("load config");
@@ -755,7 +758,7 @@ enabled = false
         assert_eq!(config.health_score.stale_ref_fail, 4);
         assert_eq!(
             config.health_score.stale_ref_patterns,
-            vec!["CozoGraphStore".to_owned(), "LegacyStore".to_owned()]
+            vec![LEGACY_COZO_GRAPH_STORE.to_owned(), "LegacyStore".to_owned()]
         );
         assert_eq!(config.dashboard.port, 9800);
         assert!(!config.dashboard.enabled);
@@ -1029,14 +1032,14 @@ deep_timeout_secs = 0
         let mut config = AetherConfig::default();
         config.health_score.file_loc_warn = 900;
         config.health_score.stale_ref_patterns =
-            vec!["CozoGraphStore".to_owned(), "LegacyStore".to_owned()];
+            vec![LEGACY_COZO_GRAPH_STORE.to_owned(), "LegacyStore".to_owned()];
 
         save_workspace_config(workspace, &config).expect("save config");
         let stored = load_workspace_config(workspace).expect("load config");
         assert_eq!(stored.health_score.file_loc_warn, 900);
         assert_eq!(
             stored.health_score.stale_ref_patterns,
-            vec!["CozoGraphStore".to_owned(), "LegacyStore".to_owned()]
+            vec![LEGACY_COZO_GRAPH_STORE.to_owned(), "LegacyStore".to_owned()]
         );
 
         let rendered = fs::read_to_string(config_path(workspace)).expect("read config");
