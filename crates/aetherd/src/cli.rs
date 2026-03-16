@@ -662,6 +662,42 @@ pub struct ContinuousRunOnceArgs {}
 pub struct ContinuousStatusArgs {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct PresetArgs {
+    #[command(subcommand)]
+    pub command: PresetCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum PresetCommand {
+    /// List available presets
+    List,
+    /// Show details of a preset
+    Show(PresetShowArgs),
+    /// Create a new user preset scaffold
+    Create(PresetCreateArgs),
+    /// Delete a user preset
+    Delete(PresetDeleteArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct PresetShowArgs {
+    #[arg(help = "Preset name")]
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct PresetCreateArgs {
+    #[arg(help = "Preset name")]
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct PresetDeleteArgs {
+    #[arg(help = "Preset name")]
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct ContextArgs {
     #[arg(
         help = "Workspace-relative file targets",
@@ -695,24 +731,25 @@ pub struct ContextArgs {
     )]
     pub branch: Option<String>,
 
-    #[arg(
-        long,
-        default_value = "markdown",
-        value_parser = ["markdown", "json"],
-        help = "Output format"
-    )]
-    pub format: String,
-
-    #[arg(long, default_value_t = 32000, help = "Max token budget")]
-    pub budget: usize,
+    #[arg(long, help = "Apply a named preset (CLI flags override preset values)")]
+    pub preset: Option<String>,
 
     #[arg(
         long,
-        default_value_t = 2,
-        value_parser = clap::value_parser!(u32).range(1..=3),
-        help = "Dependency depth (1-3)"
+        value_parser = ["markdown", "json", "xml", "compact"],
+        help = "Output format (defaults to markdown)"
     )]
-    pub depth: u32,
+    pub format: Option<String>,
+
+    #[arg(long, help = "Max token budget (defaults to 32000)")]
+    pub budget: Option<usize>,
+
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u32).range(0..=3),
+        help = "Dependency depth (0-3, defaults to 2)"
+    )]
+    pub depth: Option<u32>,
 
     #[arg(long, help = "Layers to include (comma-separated)")]
     pub include: Option<String>,
@@ -722,6 +759,12 @@ pub struct ContextArgs {
 
     #[arg(long, help = "Bias context ordering toward this task description")]
     pub task: Option<String>,
+
+    #[arg(
+        long,
+        help = "Context lines before/after each symbol slice (defaults to 3)"
+    )]
+    pub context_lines: Option<usize>,
 
     #[arg(long, help = "Write to file instead of stdout")]
     pub output: Option<String>,
@@ -825,6 +868,8 @@ pub enum Commands {
     Batch(BatchArgs),
     /// Continuous intelligence operations
     Continuous(ContinuousArgs),
+    /// Manage context presets
+    Preset(PresetArgs),
     /// Export clipboard-ready semantic context for files, symbols, or the whole workspace
     Context(ContextArgs),
     /// Show recent task context history
@@ -1176,7 +1221,9 @@ mod tests {
     use aether_config::OLLAMA_DEFAULT_ENDPOINT;
     use clap::Parser;
 
-    use super::{Cli, Commands, ContinuousCommand, parse_since_duration};
+    use super::{
+        Cli, Commands, ContinuousCommand, PresetCommand, PresetShowArgs, parse_since_duration,
+    };
     use crate::init_agent::AgentPlatform;
 
     #[test]
@@ -1433,11 +1480,13 @@ mod tests {
                 assert_eq!(args.targets, vec!["src/lib.rs", "src/main.rs"]);
                 assert_eq!(args.symbol, None);
                 assert!(!args.overview);
-                assert_eq!(args.budget, 64_000);
-                assert_eq!(args.depth, 3);
+                assert_eq!(args.preset, None);
+                assert_eq!(args.budget, Some(64_000));
+                assert_eq!(args.depth, Some(3));
                 assert_eq!(args.include.as_deref(), Some("sir,source,graph"));
                 assert_eq!(args.exclude.as_deref(), Some("drift"));
                 assert_eq!(args.task.as_deref(), Some("refactor error handling"));
+                assert_eq!(args.context_lines, None);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -1464,7 +1513,7 @@ mod tests {
                 assert!(args.targets.is_empty());
                 assert_eq!(args.symbol.as_deref(), Some("demo::alpha"));
                 assert_eq!(args.file.as_deref(), Some("src/lib.rs"));
-                assert_eq!(args.format, "json");
+                assert_eq!(args.format.as_deref(), Some("json"));
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -1506,6 +1555,54 @@ mod tests {
                 assert_eq!(args.task.as_deref(), Some("repair auth flow"));
                 assert!(!args.overview);
                 assert_eq!(args.symbol, None);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_subcommand_parses_preset_and_context_lines() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "context",
+            "src/lib.rs",
+            "--preset",
+            "deep",
+            "--context-lines",
+            "5",
+            "--depth",
+            "0",
+            "--format",
+            "compact",
+        ])
+        .expect("context preset mode should parse");
+
+        match cli.command {
+            Some(Commands::Context(args)) => {
+                assert_eq!(args.preset.as_deref(), Some("deep"));
+                assert_eq!(args.context_lines, Some(5));
+                assert_eq!(args.depth, Some(0));
+                assert_eq!(args.format.as_deref(), Some("compact"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preset_subcommand_parses_show() {
+        let cli = Cli::try_parse_from(["aetherd", "--workspace", ".", "preset", "show", "deep"])
+            .expect("preset show should parse");
+
+        match cli.command {
+            Some(Commands::Preset(args)) => {
+                assert_eq!(
+                    args.command,
+                    PresetCommand::Show(PresetShowArgs {
+                        name: "deep".to_owned()
+                    })
+                );
             }
             other => panic!("unexpected command: {other:?}"),
         }

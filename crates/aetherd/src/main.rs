@@ -18,11 +18,12 @@ use aetherd::causal::run_trace_cause_command;
 use aetherd::cli::{
     AskArgs, BatchArgs, BlastRadiusArgs, Cli, Commands, CommunitiesArgs, ContextArgs,
     ContinuousArgs, CouplingReportArgs, DriftAckArgs, DriftReportArgs, FsckArgs, HealthArgs,
-    HealthScoreArgs, InitAgentArgs, LogFormat, MineCouplingArgs, NotesArgs, RecallArgs,
+    HealthScoreArgs, InitAgentArgs, LogFormat, MineCouplingArgs, NotesArgs, PresetArgs, RecallArgs,
     RefactorPrepArgs, RegenerateArgs, RememberArgs, SetupLocalArgs, SirContextArgs, SirDiffArgs,
     SirInjectArgs, TaskHistoryArgs, TaskRelevanceArgs, TestIntentsArgs, TraceCauseArgs,
     VerifyIntentArgs, parse_cli,
 };
+use aetherd::context_presets::run_preset_command;
 use aetherd::continuous::run_continuous_command;
 use aetherd::coupling::{
     run_blast_radius_command, run_coupling_report_command, run_mine_coupling_command,
@@ -319,6 +320,7 @@ fn run_subcommand(workspace: &Path, config: &AetherConfig, command: Commands) ->
     match command {
         Commands::Batch(args) => run_batch_subcommand(workspace, config, args),
         Commands::Continuous(args) => run_continuous_subcommand(workspace, config, args),
+        Commands::Preset(args) => run_preset_subcommand(workspace, args),
         Commands::Context(args) => run_context_subcommand(workspace, args),
         Commands::TaskHistory(args) => run_task_history_subcommand(workspace, args),
         Commands::TaskRelevance(args) => run_task_relevance_subcommand(workspace, args),
@@ -355,6 +357,10 @@ fn run_batch_subcommand(workspace: &Path, config: &AetherConfig, args: BatchArgs
 
 fn run_context_subcommand(workspace: &Path, args: ContextArgs) -> Result<()> {
     run_context_command(workspace, args).context("context command failed")
+}
+
+fn run_preset_subcommand(workspace: &Path, args: PresetArgs) -> Result<()> {
+    run_preset_command(workspace, args).context("preset command failed")
 }
 
 fn run_task_history_subcommand(workspace: &Path, args: TaskHistoryArgs) -> Result<()> {
