@@ -446,6 +446,28 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         conn.execute("PRAGMA user_version = 10", [])?;
     }
 
+    if version < 11 {
+        conn.execute_batch(
+            r#"
+        CREATE TABLE IF NOT EXISTS task_context_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_description TEXT NOT NULL,
+            branch_name TEXT,
+            resolved_symbol_ids TEXT NOT NULL,
+            resolved_file_paths TEXT NOT NULL,
+            total_symbols INTEGER NOT NULL,
+            budget_used INTEGER NOT NULL,
+            budget_max INTEGER NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_task_context_history_created
+            ON task_context_history(created_at DESC);
+        "#,
+        )?;
+        conn.execute("PRAGMA user_version = 11", [])?;
+    }
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_version (

@@ -8,7 +8,8 @@ use aether_health::{ScoreReport, workspace_health_config_or_default};
 use aether_sir::{FileSir, SirAnnotation, canonicalize_file_sir_json, synthetic_file_sir_id};
 use aether_store::{
     CouplingEdgeRecord, CozoGraphStore, DriftStore, ProjectNoteStore, SirStateStore, SqliteStore,
-    SymbolCatalogStore, SymbolRecord, SymbolRelationStore, TestIntentStore,
+    SymbolCatalogStore, SymbolRecord, SymbolRelationStore, TaskContextHistoryRecord,
+    TestIntentStore,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
@@ -18,6 +19,7 @@ use crate::sir_agent_support::{
     current_unix_timestamp_secs, first_line, first_sentence, format_relative_age,
     load_fresh_symbol_source, output_path, read_selector_file, resolve_symbol,
 };
+use crate::task_context::resolve_task_symbols_with_context;
 
 const CHARS_PER_TOKEN: f64 = 3.5;
 const MEMORY_LIMIT: usize = 10;
@@ -282,7 +284,7 @@ struct PreparedItem<T> {
 }
 
 #[derive(Debug, Clone)]
-struct PreparedTargetSection {
+pub(crate) struct PreparedTargetSection {
     output: TargetSection,
     source: Option<PreparedItem<SourceBlock>>,
     file_sir: Option<PreparedItem<FileSirContext>>,
@@ -297,7 +299,7 @@ struct PreparedTargetSection {
 }
 
 #[derive(Debug, Default)]
-struct BudgetAllocator {
+pub(crate) struct BudgetAllocator {
     max_tokens: usize,
     used_tokens: usize,
 }
@@ -365,10 +367,86 @@ impl LayerBudgetStats {
 pub fn run_context_command(workspace: &Path, args: ContextArgs) -> Result<()> {
     let format = parse_context_format(args.format.as_str())?;
     let layers = parse_layer_selection(args.include.as_deref(), args.exclude.as_deref())?;
-    let targets = context_targets(workspace, &args)?;
+    let task_bias = args
+        .task
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            args.branch
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        });
     let store = SqliteStore::open(workspace).context("failed to open local store")?;
 
     let mut notices = Vec::new();
+    let mut task_history_payload = None;
+    let targets = if let Some(branch_name) = args
+        .branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let task_description = args
+            .task
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(branch_name);
+        let resolution = resolve_task_symbols_with_context(
+            workspace,
+            &store,
+            task_description,
+            Some(branch_name),
+            20,
+            0.6,
+        )?;
+        notices.extend(resolution.notices.iter().cloned());
+
+        let ranked_symbol_ids = resolution
+            .ranked_symbols
+            .iter()
+            .take(20)
+            .map(|(symbol_id, _)| symbol_id.clone())
+            .collect::<Vec<_>>();
+        let ranked_rows = store
+            .get_symbol_search_results_batch(ranked_symbol_ids.as_slice())
+            .context("failed to resolve task-ranked symbols")?;
+        let mut selected_symbol_ids = Vec::new();
+        let mut selected_file_paths = Vec::new();
+        let mut seen_files = HashSet::new();
+        let mut targets = Vec::new();
+        for symbol_id in ranked_symbol_ids {
+            let Some(row) = ranked_rows.get(symbol_id.as_str()) else {
+                notices.push(format!(
+                    "task-ranked symbol metadata missing for {symbol_id}; skipping target"
+                ));
+                continue;
+            };
+            selected_symbol_ids.push(symbol_id.clone());
+            if seen_files.insert(row.file_path.clone()) {
+                selected_file_paths.push(row.file_path.clone());
+            }
+            targets.push(ContextTarget::Symbol {
+                selector: row.qualified_name.clone(),
+                file_hint: Some(row.file_path.clone()),
+            });
+        }
+        if targets.is_empty() {
+            notices.push("task context resolved no symbol targets".to_owned());
+        }
+        task_history_payload = Some((
+            task_description.to_owned(),
+            branch_name.to_owned(),
+            selected_symbol_ids,
+            selected_file_paths,
+        ));
+        targets
+    } else {
+        context_targets(workspace, &args)?
+    };
+
     let health_report = match compute_workspace_health_report(workspace) {
         Ok(report) => report,
         Err(err) => {
@@ -386,7 +464,7 @@ pub fn run_context_command(workspace: &Path, args: ContextArgs) -> Result<()> {
             target,
             layers,
             args.depth,
-            args.task.as_deref(),
+            task_bias,
             health_report.as_ref(),
         )?);
     }
@@ -398,14 +476,30 @@ pub fn run_context_command(workspace: &Path, args: ContextArgs) -> Result<()> {
         let path = output_path(path);
         fs::write(&path, rendered)
             .with_context(|| format!("failed to write output file {}", path.display()))?;
-        return Ok(());
+    } else {
+        let mut out = std::io::stdout();
+        out.write_all(rendered.as_bytes())
+            .context("failed to write context output")?;
+        if !rendered.ends_with('\n') {
+            writeln!(&mut out).context("failed to write trailing newline")?;
+        }
     }
 
-    let mut out = std::io::stdout();
-    out.write_all(rendered.as_bytes())
-        .context("failed to write context output")?;
-    if !rendered.ends_with('\n') {
-        writeln!(&mut out).context("failed to write trailing newline")?;
+    if let Some((task_description, branch_name, symbol_ids, file_paths)) = task_history_payload {
+        store
+            .insert_task_context_history(&TaskContextHistoryRecord {
+                task_description,
+                branch_name: Some(branch_name),
+                resolved_symbol_ids: serde_json::to_string(&symbol_ids)
+                    .context("failed to serialize task history symbol ids")?,
+                resolved_file_paths: serde_json::to_string(&file_paths)
+                    .context("failed to serialize task history file paths")?,
+                total_symbols: symbol_ids.len() as i64,
+                budget_used: document.budget_usage.used_tokens as i64,
+                budget_max: document.budget_usage.max_tokens as i64,
+                created_at: current_unix_timestamp_secs(),
+            })
+            .context("failed to persist task context history")?;
     }
     Ok(())
 }
@@ -505,7 +599,7 @@ fn context_targets(workspace: &Path, args: &ContextArgs) -> Result<Vec<ContextTa
     Ok(targets)
 }
 
-fn parse_context_format(raw: &str) -> Result<ContextFormat> {
+pub(crate) fn parse_context_format(raw: &str) -> Result<ContextFormat> {
     match raw.trim() {
         "markdown" => Ok(ContextFormat::Markdown),
         "json" => Ok(ContextFormat::Json),
@@ -515,7 +609,10 @@ fn parse_context_format(raw: &str) -> Result<ContextFormat> {
     }
 }
 
-fn parse_layer_selection(include: Option<&str>, exclude: Option<&str>) -> Result<LayerSelection> {
+pub(crate) fn parse_layer_selection(
+    include: Option<&str>,
+    exclude: Option<&str>,
+) -> Result<LayerSelection> {
     let mut layers = match include {
         Some(raw) if !raw.trim().is_empty() => LayerSelection {
             sir: false,
@@ -569,7 +666,7 @@ fn set_context_layer(layers: &mut LayerSelection, token: &str, value: bool) -> R
     Ok(())
 }
 
-fn build_project_overview(
+pub(crate) fn build_project_overview(
     workspace: &Path,
     store: &SqliteStore,
     health_report: Option<&ScoreReport>,
@@ -632,7 +729,7 @@ fn build_project_overview(
     })
 }
 
-fn prepare_target_section(
+pub(crate) fn prepare_target_section(
     workspace: &Path,
     store: &SqliteStore,
     target: &ContextTarget,
@@ -1333,7 +1430,7 @@ fn prepare_drift_for_target(
         .collect())
 }
 
-fn allocate_export_document(
+pub(crate) fn allocate_export_document(
     overview: ProjectOverview,
     prepared: Vec<PreparedTargetSection>,
     max_tokens: usize,
@@ -1573,7 +1670,7 @@ fn allocate_prepared_vec<T: Clone>(
     None
 }
 
-fn render_export_document(document: &ExportDocument, format: ContextFormat) -> String {
+pub(crate) fn render_export_document(document: &ExportDocument, format: ContextFormat) -> String {
     match format {
         ContextFormat::Markdown => render_export_markdown(document),
         ContextFormat::Json => {
@@ -3180,6 +3277,7 @@ fn parse_include_sections(raw: Option<&str>) -> Result<IncludeSections> {
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::process::Command;
 
     use aether_core::Language;
     use aether_sir::{FileSir, synthetic_file_sir_id};
@@ -3376,6 +3474,31 @@ vector_backend = "sqlite"
         (temp, store, symbols)
     }
 
+    fn run_git(workspace: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(workspace)
+            .output()
+            .expect("run git");
+        if !output.status.success() {
+            panic!(
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+    }
+
+    fn init_git_repo(workspace: &Path) {
+        run_git(workspace, &["init"]);
+        run_git(workspace, &["branch", "-M", "main"]);
+        run_git(workspace, &["config", "user.name", "Aether Test"]);
+        run_git(
+            workspace,
+            &["config", "user.email", "aether-test@example.com"],
+        );
+    }
+
     #[test]
     fn include_parser_rejects_unknown_sections() {
         let err = parse_include_sections(Some("deps,wat")).expect_err("expected parse error");
@@ -3394,6 +3517,7 @@ vector_backend = "sqlite"
                 symbol: None,
                 file: None,
                 overview: false,
+                branch: None,
                 format: "markdown".to_owned(),
                 budget: 8_000,
                 depth: 2,
@@ -3426,6 +3550,7 @@ vector_backend = "sqlite"
                 symbol: None,
                 file: None,
                 overview: false,
+                branch: None,
                 format: "markdown".to_owned(),
                 budget: 4_000,
                 depth: 2,
@@ -3455,6 +3580,7 @@ vector_backend = "sqlite"
                 symbol: None,
                 file: None,
                 overview: true,
+                branch: None,
                 format: "markdown".to_owned(),
                 budget: 2_000,
                 depth: 2,
@@ -3483,6 +3609,7 @@ vector_backend = "sqlite"
                 symbol: None,
                 file: None,
                 overview: false,
+                branch: None,
                 format: "json".to_owned(),
                 budget: 8_000,
                 depth: 2,
@@ -3498,6 +3625,55 @@ vector_backend = "sqlite"
         let parsed = serde_json::from_str::<serde_json::Value>(&rendered).expect("parse json");
         assert_eq!(parsed["target_sections"].as_array().map(Vec::len), Some(1));
         assert_eq!(parsed["target_sections"][0]["target_kind"], "file");
+    }
+
+    #[test]
+    fn context_branch_mode_assembles_ranked_symbols_and_persists_history() {
+        let (temp, _store, _symbols) = seed_workspace();
+        init_git_repo(temp.path());
+        run_git(temp.path(), &["add", "."]);
+        run_git(temp.path(), &["commit", "-m", "main"]);
+        run_git(temp.path(), &["checkout", "-b", "feature/fix-auth"]);
+        fs::write(
+            temp.path().join("src/lib.rs"),
+            "pub fn alpha() -> i32 { 2 }\n\npub fn beta() -> i32 { alpha() }\n\npub fn gamma() -> i32 { beta() }\n",
+        )
+        .expect("update source");
+        run_git(temp.path(), &["add", "."]);
+        run_git(temp.path(), &["commit", "-m", "feature"]);
+
+        let output = temp.path().join("branch-context.md");
+        run_context_command(
+            temp.path(),
+            ContextArgs {
+                targets: Vec::new(),
+                symbol: None,
+                file: None,
+                overview: false,
+                branch: Some("feature/fix-auth".to_owned()),
+                format: "markdown".to_owned(),
+                budget: 8_000,
+                depth: 2,
+                include: None,
+                exclude: None,
+                task: Some("repair alpha flow".to_owned()),
+                output: Some(output.display().to_string()),
+            },
+        )
+        .expect("run branch context");
+
+        let rendered = fs::read_to_string(output).expect("read output");
+        assert!(rendered.contains("## Target Symbol:"));
+        assert!(rendered.contains("sparse-only"));
+
+        let reopened = SqliteStore::open(temp.path()).expect("reopen store");
+        let history = reopened
+            .list_recent_task_history(10)
+            .expect("list task history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].task_description, "repair alpha flow");
+        assert_eq!(history[0].branch_name.as_deref(), Some("feature/fix-auth"));
+        assert_eq!(history[0].total_symbols, 3);
     }
 
     #[test]

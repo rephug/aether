@@ -20,7 +20,8 @@ use aetherd::cli::{
     ContinuousArgs, CouplingReportArgs, DriftAckArgs, DriftReportArgs, FsckArgs, HealthArgs,
     HealthScoreArgs, InitAgentArgs, LogFormat, MineCouplingArgs, NotesArgs, RecallArgs,
     RefactorPrepArgs, RegenerateArgs, RememberArgs, SetupLocalArgs, SirContextArgs, SirDiffArgs,
-    SirInjectArgs, TestIntentsArgs, TraceCauseArgs, VerifyIntentArgs, parse_cli,
+    SirInjectArgs, TaskHistoryArgs, TaskRelevanceArgs, TestIntentsArgs, TraceCauseArgs,
+    VerifyIntentArgs, parse_cli,
 };
 use aetherd::continuous::run_continuous_command;
 use aetherd::coupling::{
@@ -46,6 +47,7 @@ use aetherd::sir_context::{run_context_command, run_sir_context_command};
 use aetherd::sir_diff::run_sir_diff_command;
 use aetherd::sir_inject::run_sir_inject_command;
 use aetherd::sir_pipeline::{SIR_GENERATION_PASS_REGENERATED, SirDeepPromptSpec, SirPipeline};
+use aetherd::task_context::{run_task_history_command, run_task_relevance_command};
 use aetherd::test_intents::run_test_intents_command;
 use aetherd::verification::{VerificationRequest, run_verification};
 use aetherd::verify_intent::run_verify_intent_command;
@@ -318,6 +320,8 @@ fn run_subcommand(workspace: &Path, config: &AetherConfig, command: Commands) ->
         Commands::Batch(args) => run_batch_subcommand(workspace, config, args),
         Commands::Continuous(args) => run_continuous_subcommand(workspace, config, args),
         Commands::Context(args) => run_context_subcommand(workspace, args),
+        Commands::TaskHistory(args) => run_task_history_subcommand(workspace, args),
+        Commands::TaskRelevance(args) => run_task_relevance_subcommand(workspace, args),
         Commands::SirContext(args) => run_sir_context_subcommand(workspace, args),
         Commands::SirInject(args) => run_sir_inject_subcommand(workspace, args),
         Commands::SirDiff(args) => run_sir_diff_subcommand(workspace, args),
@@ -351,6 +355,14 @@ fn run_batch_subcommand(workspace: &Path, config: &AetherConfig, args: BatchArgs
 
 fn run_context_subcommand(workspace: &Path, args: ContextArgs) -> Result<()> {
     run_context_command(workspace, args).context("context command failed")
+}
+
+fn run_task_history_subcommand(workspace: &Path, args: TaskHistoryArgs) -> Result<()> {
+    run_task_history_command(workspace, args).context("task-history command failed")
+}
+
+fn run_task_relevance_subcommand(workspace: &Path, args: TaskRelevanceArgs) -> Result<()> {
+    run_task_relevance_command(workspace, args).context("task-relevance command failed")
 }
 
 fn run_sir_context_subcommand(workspace: &Path, args: SirContextArgs) -> Result<()> {

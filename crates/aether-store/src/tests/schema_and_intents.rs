@@ -45,7 +45,7 @@ fn migration_v6_renames_legacy_generation_pass_values_to_scan() {
     assert_eq!(single_meta.generation_pass, "scan");
     assert_eq!(
         store.get_schema_version().expect("schema version").version,
-        10
+        11
     );
 }
 
@@ -73,7 +73,7 @@ fn migration_v7_expands_symbol_edge_kinds() {
     let version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("query migrated version");
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
 
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM symbol_edges", [], |row| row.get(0))
@@ -216,13 +216,13 @@ fn run_migrations_sets_user_version_and_is_idempotent() {
     let first_version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("query first user_version");
-    assert_eq!(first_version, 10);
+    assert_eq!(first_version, 11);
 
     run_migrations(&conn).expect("run migrations twice");
     let second_version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("query second user_version");
-    assert_eq!(second_version, 10);
+    assert_eq!(second_version, 11);
 }
 
 #[test]
@@ -232,7 +232,7 @@ fn schema_version_table_is_populated() {
 
     let schema = store.get_schema_version().expect("get schema version");
     assert_eq!(schema.component, "core");
-    assert_eq!(schema.version, 10);
+    assert_eq!(schema.version, 11);
     assert!(schema.migrated_at > 0);
 }
 
@@ -479,7 +479,18 @@ fn migration_from_v2_to_v3_adds_write_intents_table() {
     let version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("query user_version");
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
+
+    let task_history_exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_context_history' LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .expect("query sqlite_master")
+        .is_some();
+    assert!(task_history_exists);
 
     let exists = conn
         .query_row(
@@ -502,6 +513,46 @@ fn migration_from_v2_to_v3_adds_write_intents_table() {
         .expect("query sqlite_master")
         .is_some();
     assert!(requests_exists);
+}
+
+#[test]
+fn task_context_history_round_trips_in_newest_first_order() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+
+    store
+        .insert_task_context_history(&TaskContextHistoryRecord {
+            task_description: "older task".to_owned(),
+            branch_name: Some("feature/older".to_owned()),
+            resolved_symbol_ids: "[\"sym-a\"]".to_owned(),
+            resolved_file_paths: "[\"src/lib.rs\"]".to_owned(),
+            total_symbols: 1,
+            budget_used: 1200,
+            budget_max: 32_000,
+            created_at: 1_700_000_000,
+        })
+        .expect("insert older task history");
+    store
+        .insert_task_context_history(&TaskContextHistoryRecord {
+            task_description: "newer task".to_owned(),
+            branch_name: None,
+            resolved_symbol_ids: "[\"sym-b\",\"sym-c\"]".to_owned(),
+            resolved_file_paths: "[\"src/main.rs\"]".to_owned(),
+            total_symbols: 2,
+            budget_used: 2400,
+            budget_max: 32_000,
+            created_at: 1_700_000_100,
+        })
+        .expect("insert newer task history");
+
+    let history = store
+        .list_recent_task_history(10)
+        .expect("list recent history");
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].task_description, "newer task");
+    assert_eq!(history[0].branch_name, None);
+    assert_eq!(history[1].task_description, "older task");
+    assert_eq!(history[1].branch_name.as_deref(), Some("feature/older"));
 }
 
 #[test]

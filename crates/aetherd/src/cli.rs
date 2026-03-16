@@ -666,7 +666,7 @@ pub struct ContextArgs {
     #[arg(
         help = "Workspace-relative file targets",
         value_name = "FILE",
-        required_unless_present_any = ["symbol", "overview"],
+        required_unless_present_any = ["symbol", "overview", "branch"],
         conflicts_with_all = ["symbol", "overview"]
     )]
     pub targets: Vec<String>,
@@ -687,6 +687,13 @@ pub struct ContextArgs {
         conflicts_with_all = ["targets", "symbol", "file"]
     )]
     pub overview: bool,
+
+    #[arg(
+        long,
+        help = "Derive task scope from branch diff against main",
+        conflicts_with_all = ["targets", "symbol", "overview"]
+    )]
+    pub branch: Option<String>,
 
     #[arg(
         long,
@@ -718,6 +725,26 @@ pub struct ContextArgs {
 
     #[arg(long, help = "Write to file instead of stdout")]
     pub output: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct TaskHistoryArgs {
+    #[arg(long, default_value_t = 10)]
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct TaskRelevanceArgs {
+    /// Task description
+    pub task: String,
+
+    /// Branch for diff-based scoping
+    #[arg(long)]
+    pub branch: Option<String>,
+
+    /// Number of top symbols to show
+    #[arg(long, default_value_t = 20)]
+    pub top: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
@@ -800,6 +827,10 @@ pub enum Commands {
     Continuous(ContinuousArgs),
     /// Export clipboard-ready semantic context for files, symbols, or the whole workspace
     Context(ContextArgs),
+    /// Show recent task context history
+    TaskHistory(TaskHistoryArgs),
+    /// Show task-to-symbol relevance scores without assembling context
+    TaskRelevance(TaskRelevanceArgs),
     /// Assemble semantic context for a symbol
     SirContext(SirContextArgs),
     /// Inject or update a symbol's SIR intent
@@ -1449,6 +1480,77 @@ mod tests {
                 assert!(args.targets.is_empty());
                 assert!(args.overview);
                 assert_eq!(args.symbol, None);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_subcommand_parses_branch_mode() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "context",
+            "--branch",
+            "feature/fix-auth",
+            "--task",
+            "repair auth flow",
+        ])
+        .expect("context branch mode should parse");
+
+        match cli.command {
+            Some(Commands::Context(args)) => {
+                assert!(args.targets.is_empty());
+                assert_eq!(args.branch.as_deref(), Some("feature/fix-auth"));
+                assert_eq!(args.task.as_deref(), Some("repair auth flow"));
+                assert!(!args.overview);
+                assert_eq!(args.symbol, None);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_history_subcommand_parses_limit() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "task-history",
+            "--limit",
+            "25",
+        ])
+        .expect("task-history should parse");
+
+        match cli.command {
+            Some(Commands::TaskHistory(args)) => {
+                assert_eq!(args.limit, 25);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_relevance_subcommand_parses_task_branch_and_top() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "task-relevance",
+            "stabilize auth context selection",
+            "--branch",
+            "feature/fix-auth",
+            "--top",
+            "12",
+        ])
+        .expect("task-relevance should parse");
+
+        match cli.command {
+            Some(Commands::TaskRelevance(args)) => {
+                assert_eq!(args.task, "stabilize auth context selection");
+                assert_eq!(args.branch.as_deref(), Some("feature/fix-auth"));
+                assert_eq!(args.top, 12);
             }
             other => panic!("unexpected command: {other:?}"),
         }
