@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use aether_config::GraphBackend;
-use aether_store::SurrealGraphStore;
 
 use crate::state::SharedState;
 use crate::support::{self, DashboardState};
@@ -104,7 +103,8 @@ pub(crate) async fn load_coupling_data(
         });
     }
 
-    let graph = SurrealGraphStore::open_readonly(shared.workspace.as_path())
+    let graph = shared
+        .surreal_graph_store()
         .await
         .map_err(|e| e.to_string())?;
 

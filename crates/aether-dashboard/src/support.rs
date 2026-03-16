@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aether_core::normalize_path;
-use aether_store::{DriftStore, SirStateStore, SurrealGraphStore};
+use aether_store::{DriftStore, SirStateStore};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, response::Html};
@@ -249,7 +249,7 @@ pub(crate) async fn load_overview_data(shared: &SharedState) -> Result<OverviewD
         .unwrap_or(0);
 
     let coupling_count = if shared.config.storage.graph_backend.as_str() == "surreal" {
-        load_surreal_coupling_count(shared.workspace.as_path())
+        load_surreal_coupling_count(shared)
             .await
             .unwrap_or_else(|err| {
                 tracing::warn!(error = %err, "dashboard: failed to count surreal co_change rows");
@@ -282,8 +282,9 @@ pub(crate) async fn load_overview_data(shared: &SharedState) -> Result<OverviewD
     })
 }
 
-async fn load_surreal_coupling_count(workspace: &Path) -> Result<i64, String> {
-    let graph = SurrealGraphStore::open_readonly(workspace)
+async fn load_surreal_coupling_count(shared: &SharedState) -> Result<i64, String> {
+    let graph = shared
+        .surreal_graph_store()
         .await
         .map_err(|e| e.to_string())?;
     let mut response = graph

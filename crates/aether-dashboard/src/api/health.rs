@@ -126,7 +126,10 @@ pub(crate) async fn load_health_data(shared: &SharedState, query: &HealthQuery) 
         };
 
         match shared.surreal_graph_store().await {
-            Ok(graph) => match analyzer.analyze_with_graph(&request, graph.as_ref()).await {
+            Ok(graph) => match analyzer
+                .analyze_with_handles(&request, shared.store.as_ref(), Some(graph.as_ref()))
+                .await
+            {
                 Ok(report) => {
                     analysis_available = report.analysis.total_symbols > 0;
                     for note in &report.notes {

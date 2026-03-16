@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use aether_analysis::HealthAnalyzer;
 use aether_config::{AetherConfig, GraphBackend};
@@ -54,6 +55,51 @@ struct TraitSplitSuggestionEntry {
     suggestion: Option<TraitSplitSuggestion>,
 }
 
+struct HealthCommandStores {
+    runtime: &'static tokio::runtime::Runtime,
+    store: SqliteStore,
+    graph: Option<SurrealGraphStore>,
+}
+
+impl HealthCommandStores {
+    fn open_if_available(workspace: &Path, config: &AetherConfig) -> Result<Option<Self>> {
+        let sqlite_path = workspace.join(".aether").join("meta.sqlite");
+        if !sqlite_path.exists() {
+            return Ok(None);
+        }
+
+        let runtime = health_command_runtime();
+        let store = SqliteStore::open(workspace).context("failed to open local store")?;
+        let graph = if config.storage.graph_backend == GraphBackend::Surreal {
+            match runtime.block_on(SurrealGraphStore::open(workspace)) {
+                Ok(graph) => Some(graph),
+                Err(err) => {
+                    eprintln!("Warning: could not open graph store: {err}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok(Some(Self {
+            runtime,
+            store,
+            graph,
+        }))
+    }
+}
+
+fn health_command_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("health-score tokio runtime should initialize")
+    })
+}
+
 pub fn run_health_score_command(
     workspace: &Path,
     config: &AetherConfig,
@@ -84,8 +130,13 @@ pub fn execute_health_score_command(
         bail!("--compare cannot be combined with --crate");
     }
 
+    let stores = if args.semantic || args.suggest_splits {
+        HealthCommandStores::open_if_available(workspace, config)?
+    } else {
+        None
+    };
     let compare_baseline = load_compare_baseline(workspace, args.compare.as_deref())?;
-    let mut report = compute_current_report(workspace, config, &args)?;
+    let mut report = compute_current_report(workspace, config, &args, stores.as_ref())?;
 
     let history_allowed = !args.no_history && args.crate_filter.is_empty();
     if history_allowed {
@@ -98,13 +149,19 @@ pub fn execute_health_score_command(
             config,
             &report,
             args.semantic,
+            stores.as_ref().map(|stores| &stores.store),
+            stores.as_ref().and_then(|stores| stores.graph.as_ref()),
+            stores.as_ref().map(|stores| stores.runtime),
         ))
     } else {
         None
     };
     let trait_split_suggestions = if args.suggest_splits && compare_baseline.is_none() {
         Some(collect_trait_split_suggestion_entries(
-            workspace, config, &report,
+            workspace,
+            config,
+            &report,
+            stores.as_ref().map(|stores| &stores.store),
         ))
     } else {
         None
@@ -172,10 +229,16 @@ fn compute_current_report(
     workspace: &Path,
     config: &AetherConfig,
     args: &HealthScoreArgs,
+    stores: Option<&HealthCommandStores>,
 ) -> Result<ScoreReport> {
     let report = if args.semantic {
         let git = GitContext::open(workspace);
-        let semantic = load_semantic_input(workspace)?;
+        let semantic = load_semantic_input(
+            workspace,
+            stores.map(|stores| &stores.store),
+            stores.and_then(|stores| stores.graph.as_ref()),
+            stores.map(|stores| stores.runtime),
+        )?;
         compute_workspace_score_with_signals(
             workspace,
             &config.health_score,
@@ -352,6 +415,9 @@ fn collect_split_suggestion_entries(
     config: &AetherConfig,
     report: &ScoreReport,
     semantic_enabled: bool,
+    store: Option<&SqliteStore>,
+    graph: Option<&SurrealGraphStore>,
+    runtime: Option<&tokio::runtime::Runtime>,
 ) -> Vec<SplitSuggestionEntry> {
     let qualifying = report
         .crates
@@ -394,23 +460,35 @@ fn collect_split_suggestion_entries(
             .collect();
     }
 
-    let store = match SqliteStore::open_readonly(workspace) {
-        Ok(store) => store,
-        Err(_) => {
-            return qualifying
-                .into_iter()
-                .map(|crate_score| {
-                    split_entry(
-                        crate_score.name.clone(),
-                        crate_score.score,
-                        "unavailable",
-                        Some("workspace index is not readable".to_owned()),
-                        None,
-                        None,
-                    )
-                })
-                .collect();
-        }
+    let Some(store) = store else {
+        return qualifying
+            .into_iter()
+            .map(|crate_score| {
+                split_entry(
+                    crate_score.name.clone(),
+                    crate_score.score,
+                    "unavailable",
+                    Some("workspace index is not readable".to_owned()),
+                    None,
+                    None,
+                )
+            })
+            .collect();
+    };
+    let Some(runtime) = runtime else {
+        return qualifying
+            .into_iter()
+            .map(|crate_score| {
+                split_entry(
+                    crate_score.name.clone(),
+                    crate_score.score,
+                    "unavailable",
+                    Some("workspace index is not readable".to_owned()),
+                    None,
+                    None,
+                )
+            })
+            .collect();
     };
 
     let loaded =
@@ -449,12 +527,9 @@ fn collect_split_suggestion_entries(
             }
         };
 
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(err) => {
+    let graph = match graph {
+        Some(graph) => graph,
+        None => {
             return qualifying
                 .into_iter()
                 .map(|crate_score| {
@@ -462,28 +537,7 @@ fn collect_split_suggestion_entries(
                         crate_score.name.clone(),
                         crate_score.score,
                         "unavailable",
-                        Some(format!(
-                            "failed to build runtime for split suggestions: {err}"
-                        )),
-                        None,
-                        None,
-                    )
-                })
-                .collect();
-        }
-    };
-
-    let graph = match runtime.block_on(SurrealGraphStore::open_readonly(workspace)) {
-        Ok(graph) => graph,
-        Err(err) => {
-            return qualifying
-                .into_iter()
-                .map(|crate_score| {
-                    split_entry(
-                        crate_score.name.clone(),
-                        crate_score.score,
-                        "unavailable",
-                        Some(format!("failed to open surreal graph: {err}")),
+                        Some("surreal graph store is unavailable".to_owned()),
                         None,
                         None,
                     )
@@ -549,13 +603,13 @@ fn collect_split_suggestion_entries(
                 crate_score.name.as_str(),
                 crate_score.score,
                 crate_score.metrics.max_file_path.as_deref(),
-                &store,
+                store,
                 all_edges.as_slice(),
                 vector_store.as_ref(),
                 loaded.provider_name.as_str(),
                 loaded.model_name.as_str(),
                 &planner_config,
-                &runtime,
+                runtime,
             )
         })
         .collect()
@@ -565,6 +619,7 @@ fn collect_trait_split_suggestion_entries(
     workspace: &Path,
     config: &AetherConfig,
     report: &ScoreReport,
+    store: Option<&SqliteStore>,
 ) -> Vec<TraitSplitSuggestionEntry> {
     let qualifying = report
         .crates
@@ -577,21 +632,18 @@ fn collect_trait_split_suggestion_entries(
         return Vec::new();
     }
 
-    let store = match SqliteStore::open_readonly(workspace) {
-        Ok(store) => store,
-        Err(_) => {
-            return qualifying
-                .into_iter()
-                .map(|crate_score| {
-                    trait_split_entry(
-                        crate_score.name.clone(),
-                        "unavailable",
-                        Some("workspace index is not readable".to_owned()),
-                        None,
-                    )
-                })
-                .collect();
-        }
+    let Some(store) = store else {
+        return qualifying
+            .into_iter()
+            .map(|crate_score| {
+                trait_split_entry(
+                    crate_score.name.clone(),
+                    "unavailable",
+                    Some("workspace index is not readable".to_owned()),
+                    None,
+                )
+            })
+            .collect();
     };
 
     let mut entries = Vec::new();
@@ -600,7 +652,7 @@ fn collect_trait_split_suggestion_entries(
             workspace,
             config,
             crate_score,
-            &store,
+            store,
         ));
     }
     entries
@@ -1329,31 +1381,37 @@ fn symbol_is_test(store: &SqliteStore, record: &SymbolRecord) -> bool {
     normalized_path.starts_with("tests/") || normalized_path.contains("/tests/")
 }
 
-fn load_semantic_input(workspace: &Path) -> Result<Option<SemanticInput>> {
+fn load_semantic_input(
+    workspace: &Path,
+    store: Option<&SqliteStore>,
+    graph: Option<&SurrealGraphStore>,
+    runtime: Option<&tokio::runtime::Runtime>,
+) -> Result<Option<SemanticInput>> {
     let sqlite_path = workspace.join(".aether").join("meta.sqlite");
     if !sqlite_path.exists() {
         return Ok(None);
     }
 
+    let Some(store) = store else {
+        return Ok(None);
+    };
+    let Some(graph) = graph else {
+        return Ok(None);
+    };
+    let Some(runtime) = runtime else {
+        return Ok(None);
+    };
+
     let analyzer =
         HealthAnalyzer::new(workspace).context("failed to initialize health analyzer")?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("failed to build runtime for semantic health scoring")?;
     let centrality = runtime
-        .block_on(analyzer.centrality_by_file())
+        .block_on(analyzer.centrality_by_file_with_handles(store, graph))
         .context("failed to collect centrality by file")?;
     if centrality.files.is_empty() && !centrality.notes.is_empty() {
         return Ok(None);
     }
 
-    let store = match SqliteStore::open_readonly(workspace) {
-        Ok(store) => store,
-        Err(_) => return Ok(None),
-    };
-
-    let drift_by_symbol = latest_semantic_drift_by_symbol(&store)?;
+    let drift_by_symbol = latest_semantic_drift_by_symbol(store)?;
     let community_by_symbol = store
         .list_latest_community_snapshot()
         .unwrap_or_default()
@@ -1424,6 +1482,10 @@ fn load_semantic_input(workspace: &Path) -> Result<Option<SemanticInput>> {
         );
     }
 
+    if files.is_empty() {
+        return Ok(None);
+    }
+
     Ok(Some(SemanticInput {
         workspace_max_pagerank: centrality.workspace_max_pagerank,
         files,
@@ -1458,7 +1520,7 @@ mod tests {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use aether_config::AetherConfig;
+    use aether_config::{AetherConfig, GraphBackend};
     use aether_core::EdgeKind;
     use aether_graph_algo::GraphAlgorithmEdge;
     use aether_sir::SirAnnotation;
@@ -2087,6 +2149,98 @@ model = "qwen3-embeddings-4B"
             .expect("health-score execution");
 
         assert!(execution.rendered.contains("status: skipped"));
+    }
+
+    #[test]
+    fn semantic_suggest_splits_reuses_open_graph_handle() {
+        let workspace = create_workspace();
+        write_semantic_config(workspace.path());
+        write_file(
+            &workspace.path().join("crates/example/src/lib.rs"),
+            "pub trait Store {\n    fn alpha(&self);\n    fn beta(&self);\n    fn gamma(&self);\n}\n\npub fn sir_alpha() -> i32 { 1 }\npub fn sir_beta() -> i32 { sir_alpha() }\npub fn sir_gamma() -> i32 { sir_beta() }\npub fn sir_delta() -> i32 { sir_gamma() }\npub fn note_alpha() -> i32 { 3 }\npub fn note_beta() -> i32 { note_alpha() }\npub fn note_gamma() -> i32 { note_beta() }\npub fn note_delta() -> i32 { note_gamma() }\n",
+        );
+
+        let store = SqliteStore::open(workspace.path()).expect("open sqlite");
+        let symbols = vec![
+            symbol("sym-sir-a", "crate::sir_alpha", "crates/example/src/lib.rs"),
+            symbol("sym-sir-b", "crate::sir_beta", "crates/example/src/lib.rs"),
+            symbol("sym-sir-c", "crate::sir_gamma", "crates/example/src/lib.rs"),
+            symbol("sym-sir-d", "crate::sir_delta", "crates/example/src/lib.rs"),
+            symbol(
+                "sym-note-a",
+                "crate::note_alpha",
+                "crates/example/src/lib.rs",
+            ),
+            symbol(
+                "sym-note-b",
+                "crate::note_beta",
+                "crates/example/src/lib.rs",
+            ),
+            symbol(
+                "sym-note-c",
+                "crate::note_gamma",
+                "crates/example/src/lib.rs",
+            ),
+            symbol(
+                "sym-note-d",
+                "crate::note_delta",
+                "crates/example/src/lib.rs",
+            ),
+        ];
+        for symbol in &symbols {
+            store.upsert_symbol(symbol.clone()).expect("upsert symbol");
+        }
+        store
+            .upsert_symbol_embedding(embedding_record("sym-sir-a", vec![1.0, 0.0]))
+            .expect("seed sir-a embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-sir-b", vec![0.95, 0.05]))
+            .expect("seed sir-b embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-sir-c", vec![0.92, 0.08]))
+            .expect("seed sir-c embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-sir-d", vec![0.9, 0.1]))
+            .expect("seed sir-d embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-note-a", vec![0.0, 1.0]))
+            .expect("seed note-a embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-note-b", vec![0.05, 0.95]))
+            .expect("seed note-b embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-note-c", vec![0.08, 0.92]))
+            .expect("seed note-c embedding");
+        store
+            .upsert_symbol_embedding(embedding_record("sym-note-d", vec![0.1, 0.9]))
+            .expect("seed note-d embedding");
+
+        seed_surreal_graph_snapshot(
+            workspace.path(),
+            &symbols,
+            &[
+                ("sym-sir-a", "sym-sir-b"),
+                ("sym-sir-b", "sym-sir-c"),
+                ("sym-sir-c", "sym-sir-d"),
+                ("sym-note-a", "sym-note-b"),
+                ("sym-note-b", "sym-note-c"),
+                ("sym-note-c", "sym-note-d"),
+            ],
+        );
+
+        let mut config = hot_health_config();
+        config.storage.graph_backend = GraphBackend::Surreal;
+
+        let mut args = default_args();
+        args.output = HealthScoreOutputFormat::Table;
+        args.semantic = true;
+        args.suggest_splits = true;
+        let execution = execute_health_score_command(workspace.path(), &config, args)
+            .expect("health-score execution");
+
+        assert!(execution.rendered.contains("Split suggestions:"));
+        assert!(execution.rendered.contains("status: suggested"));
+        assert!(!execution.rendered.contains("status: unavailable"));
     }
 
     #[test]
