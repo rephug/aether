@@ -4,6 +4,7 @@ use std::path::Path;
 use aether_analysis::{
     AcknowledgeDriftRequest, CommunitiesRequest, DriftAnalyzer, DriftReportRequest,
 };
+use aether_config::{GraphBackend, load_workspace_config};
 use aether_store::open_surreal_graph_store_readonly;
 use anyhow::{Context, Result};
 
@@ -11,19 +12,22 @@ use crate::cli::{CommunitiesArgs, CommunitiesFormat, DriftAckArgs, DriftReportAr
 
 pub fn run_drift_report_command(workspace: &Path, args: DriftReportArgs) -> Result<()> {
     let analyzer = DriftAnalyzer::new(workspace).context("failed to initialize drift analyzer")?;
-    let graph = open_surreal_graph_store_readonly(workspace)
-        .context("failed to open configured surreal graph store")?;
-    let report = analyzer
-        .report_with_graph(
-            &graph,
-            DriftReportRequest {
-                window: Some(args.window),
-                include: None,
-                min_drift_magnitude: Some(args.min_drift.clamp(0.0, 1.0)),
-                include_acknowledged: Some(args.include_acknowledged),
-            },
-        )
-        .context("drift report failed")?;
+    let request = DriftReportRequest {
+        window: Some(args.window),
+        include: None,
+        min_drift_magnitude: Some(args.min_drift.clamp(0.0, 1.0)),
+        include_acknowledged: Some(args.include_acknowledged),
+    };
+    let config = load_workspace_config(workspace).context("failed to load workspace config")?;
+    let report = match config.storage.graph_backend {
+        GraphBackend::Surreal => {
+            let graph = open_surreal_graph_store_readonly(workspace)
+                .context("failed to open configured surreal graph store")?;
+            analyzer.report_with_graph(&graph, request)
+        }
+        _ => analyzer.report(request),
+    }
+    .context("drift report failed")?;
     let value = serde_json::to_value(report).context("failed to serialize drift report")?;
     write_json_to_stdout(&value)
 }
