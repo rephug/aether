@@ -1,14 +1,16 @@
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use aether_analysis::{
-    PreparedRefactorCandidate, RefactorPreparationRequest, RefactorScope, collect_intent_snapshot,
-    prepare_refactor_prep,
+    HealthAnalyzer, HealthInclude, HealthRequest, PreparedRefactorCandidate,
+    RefactorPreparationRequest, RefactorScope, collect_intent_snapshot,
+    prepare_refactor_prep_with_health_report,
 };
-use aether_config::{AetherConfig, InferenceProviderKind};
+use aether_config::{AetherConfig, GraphBackend, InferenceProviderKind};
 use aether_infer::ProviderOverrides;
-use aether_store::{SirStateStore, SnapshotStore, SqliteStore};
+use aether_store::{SirStateStore, SnapshotStore, SqliteStore, SurrealGraphStore};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
@@ -58,6 +60,18 @@ struct DeepScanOutcome {
     failed_symbol_ids: Vec<String>,
 }
 
+const DEFAULT_REFACTOR_HEALTH_LIMIT: u32 = 200;
+
+fn refactor_prep_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("refactor-prep tokio runtime should initialize")
+    })
+}
+
 pub fn run_refactor_prep_command(
     workspace: &Path,
     config: &AetherConfig,
@@ -91,14 +105,45 @@ where
     F: Fn(&SqliteStore, &[PreparedRefactorCandidate], bool) -> Result<DeepScanOutcome>,
 {
     let store = SqliteStore::open(workspace).context("failed to open local store")?;
+    let runtime = refactor_prep_runtime();
+    let graph = if config.storage.graph_backend == GraphBackend::Surreal {
+        match runtime.block_on(SurrealGraphStore::open(workspace)) {
+            Ok(graph) => Some(graph),
+            Err(err) => {
+                eprintln!("Warning: could not open graph store: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let scope = refactor_scope_from_args(&args)?;
-    let prep = prepare_refactor_prep(
+    let analyzer =
+        HealthAnalyzer::new(workspace).context("failed to initialize health analyzer")?;
+    let health_report = runtime
+        .block_on(analyzer.analyze_with_handles(
+            &HealthRequest {
+                include: vec![
+                    HealthInclude::CriticalSymbols,
+                    HealthInclude::Bottlenecks,
+                    HealthInclude::Cycles,
+                    HealthInclude::RiskHotspots,
+                ],
+                limit: DEFAULT_REFACTOR_HEALTH_LIMIT,
+                min_risk: 0.0,
+            },
+            &store,
+            graph.as_ref(),
+        ))
+        .context("failed to compute health report for refactor prep")?;
+    let prep = prepare_refactor_prep_with_health_report(
         workspace,
         &store,
         RefactorPreparationRequest {
             scope: scope.clone(),
             top_n: args.top_n,
         },
+        &health_report,
     )
     .context("failed to prepare refactor candidates")?;
 
@@ -361,9 +406,10 @@ mod tests {
 
     use aether_analysis::PreparedRefactorCandidate;
     use aether_config::load_workspace_config;
-    use aether_core::Language;
+    use aether_core::{EdgeKind, Language};
     use aether_store::{
-        SirMetaRecord, SirStateStore, SnapshotStore, SqliteStore, SymbolCatalogStore, SymbolRecord,
+        GraphStore, ResolvedEdge, SirMetaRecord, SirStateStore, SnapshotStore, SqliteStore,
+        SurrealGraphStore, SymbolCatalogStore, SymbolRecord,
     };
     use tempfile::tempdir;
 
@@ -380,6 +426,30 @@ provider = "qwen3_local"
 [storage]
 mirror_sir_files = true
 graph_backend = "sqlite"
+
+[sir_quality]
+deep_concurrency = 1
+deep_timeout_secs = 30
+
+[embeddings]
+enabled = false
+provider = "qwen3_local"
+vector_backend = "sqlite"
+"#,
+        )
+        .expect("write config");
+    }
+
+    fn write_surreal_test_config(workspace: &Path) {
+        fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
+        fs::write(
+            workspace.join(".aether/config.toml"),
+            r#"[inference]
+provider = "qwen3_local"
+
+[storage]
+mirror_sir_files = true
+graph_backend = "surreal"
 
 [sir_quality]
 deep_concurrency = 1
@@ -458,6 +528,35 @@ vector_backend = "sqlite"
             .expect("upsert meta");
     }
 
+    fn seed_surreal_graph(workspace: &Path, symbols: &[aether_core::Symbol]) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let graph = SurrealGraphStore::open(workspace)
+                .await
+                .expect("open surreal graph");
+            for symbol in symbols {
+                graph
+                    .upsert_symbol_node(&symbol_record(symbol))
+                    .await
+                    .expect("upsert symbol node");
+            }
+            for edge in symbols.windows(2) {
+                graph
+                    .upsert_edge(&ResolvedEdge {
+                        source_id: edge[0].id.clone(),
+                        target_id: edge[1].id.clone(),
+                        edge_kind: EdgeKind::Calls,
+                        file_path: edge[0].file_path.clone(),
+                    })
+                    .await
+                    .expect("upsert edge");
+            }
+        });
+    }
+
     #[test]
     fn refactor_prep_with_mock_executor_produces_snapshot_and_brief() {
         let temp = tempdir().expect("tempdir");
@@ -528,5 +627,68 @@ vector_backend = "sqlite"
                 .expect("lookup snapshot")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn refactor_prep_with_surreal_graph_reuses_open_handles() {
+        let temp = tempdir().expect("tempdir");
+        write_surreal_test_config(temp.path());
+        let relative = write_demo_source(temp.path());
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        let symbols = parse_symbols(temp.path(), &relative);
+        for symbol in &symbols {
+            store
+                .upsert_symbol(symbol_record(symbol))
+                .expect("upsert symbol");
+            seed_scan_sir(&store, symbol);
+        }
+        seed_surreal_graph(temp.path(), &symbols);
+        let config = load_workspace_config(temp.path()).expect("load config");
+
+        let execution = execute_refactor_prep_with_executor(
+            temp.path(),
+            &config,
+            RefactorPrepArgs {
+                file: Some(relative.clone()),
+                crate_name: None,
+                top_n: 2,
+                local: false,
+                output: RefactorPrepOutputFormat::Human,
+            },
+            |store, candidates: &[PreparedRefactorCandidate], _local| {
+                let mut succeeded = HashSet::new();
+                for candidate in candidates {
+                    let sir_json = format!(
+                        "{{\"confidence\":0.95,\"dependencies\":[],\"error_modes\":[],\"inputs\":[],\"intent\":\"{} deep\",\"outputs\":[],\"side_effects\":[]}}",
+                        candidate.symbol.qualified_name
+                    );
+                    store.write_sir_blob(candidate.symbol.id.as_str(), &sir_json)?;
+                    store.upsert_sir_meta(SirMetaRecord {
+                        id: candidate.symbol.id.clone(),
+                        sir_hash: format!("deep-{}", candidate.symbol.id),
+                        sir_version: 2,
+                        provider: "mock".to_owned(),
+                        model: "mock".to_owned(),
+                        generation_pass: "deep".to_owned(),
+                        prompt_hash: None,
+                        staleness_score: None,
+                        updated_at: 1_700_000_010,
+                        sir_status: "fresh".to_owned(),
+                        last_error: None,
+                        last_attempt_at: 1_700_000_010,
+                    })?;
+                    succeeded.insert(candidate.symbol.id.clone());
+                }
+                Ok(DeepScanOutcome {
+                    requested: candidates.len(),
+                    succeeded_ids: succeeded,
+                    failed_symbol_ids: Vec::new(),
+                })
+            },
+        )
+        .expect("execute surreal refactor prep");
+
+        assert!(execution.summary.snapshot_id.starts_with("refactor-prep-"));
+        assert!(execution.summary.deep_completed <= execution.summary.deep_requested);
     }
 }

@@ -209,7 +209,50 @@ impl HealthAnalyzer {
     }
 
     pub async fn analyze(&self, request: &HealthRequest) -> Result<HealthReport, AnalysisError> {
-        self.analyze_internal(request, None).await
+        let analyzed_at = now_millis();
+        if !self.config.enabled {
+            return Ok(empty_report(
+                analyzed_at,
+                vec![
+                    "Health analysis disabled by configuration ([health].enabled = false)"
+                        .to_owned(),
+                ],
+            ));
+        }
+
+        if self.graph_backend != GraphBackend::Surreal {
+            return Ok(empty_report(
+                analyzed_at,
+                vec![format!(
+                    "Health analysis currently requires Surreal graph backend; configured backend is {}",
+                    self.graph_backend.as_str()
+                )],
+            ));
+        }
+
+        let sqlite_path = self.workspace.join(".aether").join("meta.sqlite");
+        if !sqlite_path.exists() {
+            return Ok(empty_report(
+                analyzed_at,
+                vec!["SQLite metadata store unavailable; returning empty health report".to_owned()],
+            ));
+        }
+
+        let store = SqliteStore::open_readonly(&self.workspace)?;
+        let graph = match SurrealGraphStore::open(&self.workspace).await {
+            Ok(graph) => graph,
+            Err(err) => {
+                return Ok(empty_report(
+                    analyzed_at,
+                    vec![format!(
+                        "Surreal graph store unavailable; returning empty health report: {err}"
+                    )],
+                ));
+            }
+        };
+
+        self.analyze_with_handles(request, &store, Some(&graph))
+            .await
     }
 
     pub async fn centrality_by_file(&self) -> Result<FileCentralityReport, AnalysisError> {
@@ -251,7 +294,7 @@ impl HealthAnalyzer {
         }
 
         let store = SqliteStore::open_readonly(&self.workspace)?;
-        let graph = match SurrealGraphStore::open_readonly(&self.workspace).await {
+        let graph = match SurrealGraphStore::open(&self.workspace).await {
             Ok(graph) => graph,
             Err(err) => {
                 notes.push(format!(
@@ -265,7 +308,52 @@ impl HealthAnalyzer {
             }
         };
 
-        let dependency_edges = match query_dependency_edges(&graph).await {
+        self.centrality_by_file_with_handles(&store, &graph).await
+    }
+
+    pub async fn centrality_by_file_with_handles(
+        &self,
+        store: &SqliteStore,
+        graph: &SurrealGraphStore,
+    ) -> Result<FileCentralityReport, AnalysisError> {
+        let mut notes = Vec::new();
+
+        if !self.config.enabled {
+            notes.push(
+                "Health analysis disabled by configuration ([health].enabled = false)".to_owned(),
+            );
+            return Ok(FileCentralityReport {
+                workspace_max_pagerank: 0.0,
+                files: Vec::new(),
+                notes,
+            });
+        }
+
+        if self.graph_backend != GraphBackend::Surreal {
+            notes.push(format!(
+                "Health analysis currently requires Surreal graph backend; configured backend is {}",
+                self.graph_backend.as_str()
+            ));
+            return Ok(FileCentralityReport {
+                workspace_max_pagerank: 0.0,
+                files: Vec::new(),
+                notes,
+            });
+        }
+
+        let sqlite_path = self.workspace.join(".aether").join("meta.sqlite");
+        if !sqlite_path.exists() {
+            notes.push(
+                "SQLite metadata store unavailable; returning empty centrality report".to_owned(),
+            );
+            return Ok(FileCentralityReport {
+                workspace_max_pagerank: 0.0,
+                files: Vec::new(),
+                notes,
+            });
+        }
+
+        let dependency_edges = match query_dependency_edges(graph).await {
             Ok(edges) => edges,
             Err(err) => {
                 notes.push(format!(
@@ -278,7 +366,7 @@ impl HealthAnalyzer {
                 });
             }
         };
-        let symbol_rows = match query_symbol_rows(&graph).await {
+        let symbol_rows = match query_symbol_rows(graph).await {
             Ok(rows) => rows,
             Err(err) => {
                 notes.push(format!(
@@ -359,13 +447,44 @@ impl HealthAnalyzer {
         request: &HealthRequest,
         graph: &SurrealGraphStore,
     ) -> Result<HealthReport, AnalysisError> {
-        self.analyze_internal(request, Some(graph)).await
+        let analyzed_at = now_millis();
+        if !self.config.enabled {
+            return Ok(empty_report(
+                analyzed_at,
+                vec![
+                    "Health analysis disabled by configuration ([health].enabled = false)"
+                        .to_owned(),
+                ],
+            ));
+        }
+
+        let sqlite_path = self.workspace.join(".aether").join("meta.sqlite");
+        if !sqlite_path.exists() {
+            return Ok(empty_report(
+                analyzed_at,
+                vec!["SQLite metadata store unavailable; returning empty health report".to_owned()],
+            ));
+        }
+
+        let store = SqliteStore::open(&self.workspace)?;
+        self.analyze_with_handles(request, &store, Some(graph))
+            .await
+    }
+
+    pub async fn analyze_with_handles(
+        &self,
+        request: &HealthRequest,
+        store: &SqliteStore,
+        graph: Option<&SurrealGraphStore>,
+    ) -> Result<HealthReport, AnalysisError> {
+        self.analyze_internal(request, store, graph).await
     }
 
     async fn analyze_internal(
         &self,
         request: &HealthRequest,
-        graph_override: Option<&SurrealGraphStore>,
+        store: &SqliteStore,
+        graph: Option<&SurrealGraphStore>,
     ) -> Result<HealthReport, AnalysisError> {
         let analyzed_at = now_millis();
         let mut notes = Vec::new();
@@ -380,7 +499,7 @@ impl HealthAnalyzer {
             return Ok(empty_report(analyzed_at, notes));
         }
 
-        if graph_override.is_none() && self.graph_backend != GraphBackend::Surreal {
+        if graph.is_none() && self.graph_backend != GraphBackend::Surreal {
             notes.push(format!(
                 "Health analysis currently requires Surreal graph backend; configured backend is {}",
                 self.graph_backend.as_str()
@@ -396,24 +515,8 @@ impl HealthAnalyzer {
             return Ok(empty_report(analyzed_at, notes));
         }
 
-        let store = SqliteStore::open_readonly(&self.workspace)?;
-        let opened_graph = if graph_override.is_some() {
-            None
-        } else {
-            match SurrealGraphStore::open_readonly(&self.workspace).await {
-                Ok(graph) => Some(graph),
-                Err(err) => {
-                    notes.push(format!(
-                        "Surreal graph store unavailable; returning empty health report: {err}"
-                    ));
-                    return Ok(empty_report(analyzed_at, notes));
-                }
-            }
-        };
-        let graph = if let Some(existing) = graph_override {
+        let graph = if let Some(existing) = graph {
             existing
-        } else if let Some(opened) = opened_graph.as_ref() {
-            opened
         } else {
             notes.push("Surreal graph store unavailable; returning empty health report".to_owned());
             return Ok(empty_report(analyzed_at, notes));
@@ -480,7 +583,7 @@ impl HealthAnalyzer {
 
         let symbol_ids_vec = symbol_ids.into_iter().collect::<Vec<_>>();
         let sqlite_rows = store.get_symbol_search_results_batch(symbol_ids_vec.as_slice())?;
-        let drift_by_symbol = latest_semantic_drift_by_symbol(&store)?;
+        let drift_by_symbol = latest_semantic_drift_by_symbol(store)?;
 
         let mut symbol_graph_by_id = HashMap::<String, SymbolGraphRow>::new();
         for row in symbol_rows {
@@ -504,7 +607,7 @@ impl HealthAnalyzer {
                 .or_else(|| fallback.as_ref().map(|row| row.file_path.clone()))
                 .unwrap_or_default();
             let last_accessed_at = sqlite.and_then(|row| row.last_accessed_at);
-            let has_sir = has_sir(&store, symbol_id)?;
+            let has_sir = has_sir(store, symbol_id)?;
 
             symbol_snapshot_by_id.insert(
                 symbol_id.clone(),

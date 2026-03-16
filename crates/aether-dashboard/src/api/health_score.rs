@@ -173,8 +173,15 @@ async fn compute_health_score_report(shared: &SharedState) -> Result<ScoreReport
 async fn load_semantic_input(shared: &SharedState) -> Result<Option<SemanticInput>, String> {
     let analyzer = HealthAnalyzer::new(shared.workspace.as_path())
         .map_err(|err| format!("failed to initialize health analyzer: {err}"))?;
+    let graph = match shared.surreal_graph_store().await {
+        Ok(graph) => graph,
+        Err(err) => {
+            warn!("health-score semantic graph unavailable: {err}");
+            return Ok(None);
+        }
+    };
     let centrality = analyzer
-        .centrality_by_file()
+        .centrality_by_file_with_handles(shared.store.as_ref(), graph.as_ref())
         .await
         .map_err(|err| format!("failed to collect centrality by file: {err}"))?;
     if centrality.files.is_empty() && !centrality.notes.is_empty() {

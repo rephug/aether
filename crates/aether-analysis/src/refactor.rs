@@ -146,10 +146,19 @@ pub fn prepare_refactor_prep(
     store: &SqliteStore,
     request: RefactorPreparationRequest,
 ) -> Result<RefactorPreparation, AnalysisError> {
+    let health_report = compute_health_report(workspace)?;
+    prepare_refactor_prep_with_health_report(workspace, store, request, &health_report)
+}
+
+pub fn prepare_refactor_prep_with_health_report(
+    workspace: &Path,
+    store: &SqliteStore,
+    request: RefactorPreparationRequest,
+    health_report: &HealthReport,
+) -> Result<RefactorPreparation, AnalysisError> {
     let resolved = resolve_scope_symbols(workspace, &request.scope)?;
     let top_n = request.top_n.max(1);
-    let health_report = compute_health_report(workspace)?;
-    let metrics = collect_scope_metrics(store, &resolved.symbols, &health_report)?;
+    let metrics = collect_scope_metrics(store, &resolved.symbols, health_report)?;
     let priority_scores = metrics
         .iter()
         .map(|metric| (metric.symbol.id.clone(), metric.risk_score))
@@ -227,7 +236,7 @@ pub fn prepare_refactor_prep(
         candidates,
         forced_cycle_members: selection.forced_cycle_members,
         skipped_fresh: selection.skipped_fresh,
-        health_report,
+        health_report: health_report.clone(),
         notes,
     })
 }
