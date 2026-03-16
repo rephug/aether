@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -15,6 +15,9 @@ use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 
 use crate::cli::{ContextArgs, SirContextArgs};
+use crate::context_presets::resolve_context_options;
+use crate::context_renderers;
+use crate::context_slicer::{SliceNeighbor, render_file_slice, slice_file_for_context};
 use crate::sir_agent_support::{
     current_unix_timestamp_secs, first_line, first_sentence, format_relative_age,
     load_fresh_symbol_source, output_path, read_selector_file, resolve_symbol,
@@ -53,6 +56,8 @@ pub enum ContextTarget {
 pub enum ContextFormat {
     Markdown,
     Json,
+    Xml,
+    Compact,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -365,9 +370,10 @@ impl LayerBudgetStats {
 }
 
 pub fn run_context_command(workspace: &Path, args: ContextArgs) -> Result<()> {
-    let format = parse_context_format(args.format.as_str())?;
-    let layers = parse_layer_selection(args.include.as_deref(), args.exclude.as_deref())?;
-    let task_bias = args
+    let resolved = resolve_context_options(workspace, &args)?;
+    let format = parse_context_format(resolved.format.as_str())?;
+    let layers = parse_layer_selection(resolved.include.as_deref(), resolved.exclude.as_deref())?;
+    let task_bias = resolved
         .task
         .as_deref()
         .map(str::trim)
@@ -388,7 +394,7 @@ pub fn run_context_command(workspace: &Path, args: ContextArgs) -> Result<()> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        let task_description = args
+        let task_description = resolved
             .task
             .as_deref()
             .map(str::trim)
@@ -463,13 +469,14 @@ pub fn run_context_command(workspace: &Path, args: ContextArgs) -> Result<()> {
             &store,
             target,
             layers,
-            args.depth,
+            resolved.depth,
             task_bias,
             health_report.as_ref(),
+            resolved.context_lines,
         )?);
     }
 
-    let document = allocate_export_document(overview, prepared, args.budget, notices);
+    let document = allocate_export_document(overview, prepared, resolved.budget, notices);
     let rendered = render_export_document(&document, format);
 
     if let Some(path) = args.output.as_deref() {
@@ -603,8 +610,10 @@ pub(crate) fn parse_context_format(raw: &str) -> Result<ContextFormat> {
     match raw.trim() {
         "markdown" => Ok(ContextFormat::Markdown),
         "json" => Ok(ContextFormat::Json),
+        "xml" => Ok(ContextFormat::Xml),
+        "compact" => Ok(ContextFormat::Compact),
         other => Err(anyhow!(
-            "unsupported context output format '{other}', expected one of: markdown, json"
+            "unsupported context output format '{other}', expected one of: markdown, json, xml, compact"
         )),
     }
 }
@@ -729,6 +738,7 @@ pub(crate) fn build_project_overview(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_target_section(
     workspace: &Path,
     store: &SqliteStore,
@@ -737,6 +747,7 @@ pub(crate) fn prepare_target_section(
     depth: u32,
     task: Option<&str>,
     health_report: Option<&ScoreReport>,
+    context_lines: usize,
 ) -> Result<PreparedTargetSection> {
     match target {
         ContextTarget::File { path } => prepare_file_target(
@@ -747,6 +758,7 @@ pub(crate) fn prepare_target_section(
             depth,
             task,
             health_report,
+            context_lines,
         ),
         ContextTarget::Symbol {
             selector,
@@ -760,10 +772,12 @@ pub(crate) fn prepare_target_section(
             depth,
             task,
             health_report,
+            context_lines,
         ),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_file_target(
     workspace: &Path,
     store: &SqliteStore,
@@ -772,6 +786,7 @@ fn prepare_file_target(
     depth: u32,
     task: Option<&str>,
     health_report: Option<&ScoreReport>,
+    context_lines: usize,
 ) -> Result<PreparedTargetSection> {
     let full_path = workspace.join(path);
     if !full_path.exists() {
@@ -876,13 +891,20 @@ fn prepare_file_target(
     }
 
     let source = if layers.source {
-        Some(PreparedItem {
-            cost_text: file_source.clone(),
-            value: SourceBlock {
-                language: language.unwrap_or_else(|| "text".to_owned()),
-                content: file_source,
-            },
-        })
+        Some(prepare_context_source_block(
+            workspace,
+            path,
+            language.as_deref().unwrap_or("text"),
+            file_source.as_str(),
+            &symbol_records
+                .iter()
+                .map(|record| record.id.clone())
+                .collect::<Vec<_>>(),
+            &[],
+            depth,
+            context_lines,
+            &mut output.notices,
+        )?)
     } else {
         None
     };
@@ -912,6 +934,7 @@ fn prepare_symbol_target(
     depth: u32,
     task: Option<&str>,
     health_report: Option<&ScoreReport>,
+    context_lines: usize,
 ) -> Result<PreparedTargetSection> {
     let record = resolve_symbol_with_file_hint(store, selector, file_hint)?;
     let include = IncludeSections {
@@ -1014,13 +1037,25 @@ fn prepare_symbol_target(
     };
 
     let source = if layers.source {
-        Some(PreparedItem {
-            cost_text: prepared.base_output.source_code.clone(),
-            value: SourceBlock {
-                language: prepared.base_output.language.clone(),
-                content: prepared.base_output.source_code.clone(),
-            },
-        })
+        let slice_neighbors = collect_same_file_slice_neighbors(store, &record, depth)?;
+        let full_source =
+            fs::read_to_string(workspace.join(&record.file_path)).with_context(|| {
+                format!(
+                    "failed to read source file {}",
+                    workspace.join(&record.file_path).display()
+                )
+            })?;
+        Some(prepare_context_source_block(
+            workspace,
+            record.file_path.as_str(),
+            prepared.base_output.language.as_str(),
+            full_source.as_str(),
+            std::slice::from_ref(&record.id),
+            slice_neighbors.as_slice(),
+            depth,
+            context_lines,
+            &mut output.notices,
+        )?)
     } else {
         None
     };
@@ -1067,6 +1102,147 @@ fn prepare_symbol_target(
         }),
         drift,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_context_source_block(
+    workspace: &Path,
+    file_path: &str,
+    language: &str,
+    full_source: &str,
+    target_symbol_ids: &[String],
+    neighbor_symbol_ids: &[SliceNeighbor],
+    depth: u32,
+    context_lines: usize,
+    notices: &mut Vec<String>,
+) -> Result<PreparedItem<SourceBlock>> {
+    if target_symbol_ids.is_empty() {
+        return Ok(PreparedItem {
+            cost_text: full_source.to_owned(),
+            value: SourceBlock {
+                language: language.to_owned(),
+                content: full_source.to_owned(),
+            },
+        });
+    }
+
+    match slice_file_for_context(
+        workspace,
+        file_path,
+        target_symbol_ids,
+        neighbor_symbol_ids,
+        depth,
+        context_lines,
+    ) {
+        Ok(slice) => {
+            let content = render_file_slice(&slice);
+            if slice.total_lines >= 50 {
+                let included_lines = slice.total_lines.saturating_sub(slice.omitted_lines);
+                let saved_tokens =
+                    estimate_tokens(full_source).saturating_sub(estimate_tokens(content.as_str()));
+                notices.push(format!(
+                    "Source sliced: {included_lines} of {} lines included (~{saved_tokens} tokens saved)",
+                    slice.total_lines
+                ));
+            }
+            Ok(PreparedItem {
+                cost_text: content.clone(),
+                value: SourceBlock {
+                    language: slice.language,
+                    content,
+                },
+            })
+        }
+        Err(err) => {
+            notices.push(format!(
+                "source slicing failed for {file_path} — {err}; including whole file"
+            ));
+            Ok(PreparedItem {
+                cost_text: full_source.to_owned(),
+                value: SourceBlock {
+                    language: language.to_owned(),
+                    content: full_source.to_owned(),
+                },
+            })
+        }
+    }
+}
+
+fn collect_same_file_slice_neighbors(
+    store: &SqliteStore,
+    record: &SymbolRecord,
+    depth: u32,
+) -> Result<Vec<SliceNeighbor>> {
+    if depth == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut neighbor_depths: HashMap<String, u32> = HashMap::new();
+    for edge in store
+        .get_callers(record.qualified_name.as_str())
+        .with_context(|| format!("failed to list callers for {}", record.qualified_name))?
+    {
+        let Some(caller) = store
+            .get_symbol_record(edge.source_id.as_str())
+            .with_context(|| format!("failed to load caller {}", edge.source_id))?
+        else {
+            continue;
+        };
+        if caller.file_path == record.file_path && caller.id != record.id {
+            neighbor_depths
+                .entry(caller.id)
+                .and_modify(|existing| *existing = (*existing).min(1))
+                .or_insert(1);
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut frontier = vec![record.id.clone()];
+    for current_depth in 1..=depth {
+        let mut next_frontier = Vec::new();
+        for source_id in frontier {
+            let edges = store
+                .get_dependencies(source_id.as_str())
+                .with_context(|| format!("failed to list dependencies for {}", source_id))?;
+            for edge in edges {
+                let Some(target) = store
+                    .get_symbol_by_qualified_name(edge.target_qualified_name.as_str())
+                    .with_context(|| {
+                        format!(
+                            "failed to resolve dependency '{}'",
+                            edge.target_qualified_name
+                        )
+                    })?
+                else {
+                    continue;
+                };
+                if seen.insert(target.id.clone()) {
+                    next_frontier.push(target.id.clone());
+                }
+                if target.file_path == record.file_path && target.id != record.id {
+                    neighbor_depths
+                        .entry(target.id)
+                        .and_modify(|existing| *existing = (*existing).min(current_depth))
+                        .or_insert(current_depth);
+                }
+            }
+        }
+        if next_frontier.is_empty() {
+            break;
+        }
+        frontier = next_frontier;
+    }
+
+    let mut neighbors = neighbor_depths
+        .into_iter()
+        .map(|(symbol_id, depth)| SliceNeighbor { symbol_id, depth })
+        .collect::<Vec<_>>();
+    neighbors.sort_by(|left, right| {
+        left.depth
+            .cmp(&right.depth)
+            .then_with(|| left.symbol_id.cmp(&right.symbol_id))
+    });
+    Ok(neighbors)
 }
 
 fn read_file_rollup(
@@ -1676,6 +1852,8 @@ pub(crate) fn render_export_document(document: &ExportDocument, format: ContextF
         ContextFormat::Json => {
             serde_json::to_string_pretty(document).unwrap_or_else(|_| "{}".to_owned())
         }
+        ContextFormat::Xml => context_renderers::render_xml(document),
+        ContextFormat::Compact => context_renderers::render_compact(document),
     }
 }
 
@@ -3518,12 +3696,14 @@ vector_backend = "sqlite"
                 file: None,
                 overview: false,
                 branch: None,
-                format: "markdown".to_owned(),
-                budget: 8_000,
-                depth: 2,
+                preset: None,
+                format: Some("markdown".to_owned()),
+                budget: Some(8_000),
+                depth: Some(2),
                 include: None,
                 exclude: None,
                 task: None,
+                context_lines: None,
                 output: Some(output.display().to_string()),
             },
         )
@@ -3551,12 +3731,14 @@ vector_backend = "sqlite"
                 file: None,
                 overview: false,
                 branch: None,
-                format: "markdown".to_owned(),
-                budget: 4_000,
-                depth: 2,
+                preset: None,
+                format: Some("markdown".to_owned()),
+                budget: Some(4_000),
+                depth: Some(2),
                 include: None,
                 exclude: Some("graph,coupling,health,drift,memory,tests,sir".to_owned()),
                 task: None,
+                context_lines: None,
                 output: Some(output.display().to_string()),
             },
         )
@@ -3581,12 +3763,14 @@ vector_backend = "sqlite"
                 file: None,
                 overview: true,
                 branch: None,
-                format: "markdown".to_owned(),
-                budget: 2_000,
-                depth: 2,
+                preset: None,
+                format: Some("markdown".to_owned()),
+                budget: Some(2_000),
+                depth: Some(2),
                 include: None,
                 exclude: None,
                 task: None,
+                context_lines: None,
                 output: Some(output.display().to_string()),
             },
         )
@@ -3610,12 +3794,14 @@ vector_backend = "sqlite"
                 file: None,
                 overview: false,
                 branch: None,
-                format: "json".to_owned(),
-                budget: 8_000,
-                depth: 2,
+                preset: None,
+                format: Some("json".to_owned()),
+                budget: Some(8_000),
+                depth: Some(2),
                 include: None,
                 exclude: None,
                 task: None,
+                context_lines: None,
                 output: Some(output.display().to_string()),
             },
         )
@@ -3651,12 +3837,14 @@ vector_backend = "sqlite"
                 file: None,
                 overview: false,
                 branch: Some("feature/fix-auth".to_owned()),
-                format: "markdown".to_owned(),
-                budget: 8_000,
-                depth: 2,
+                preset: None,
+                format: Some("markdown".to_owned()),
+                budget: Some(8_000),
+                depth: Some(2),
                 include: None,
                 exclude: None,
                 task: Some("repair alpha flow".to_owned()),
+                context_lines: None,
                 output: Some(output.display().to_string()),
             },
         )
