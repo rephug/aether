@@ -238,7 +238,7 @@ impl HealthAnalyzer {
             ));
         }
 
-        let store = SqliteStore::open(&self.workspace)?;
+        let store = SqliteStore::open_readonly(&self.workspace)?;
         let graph = match SurrealGraphStore::open(&self.workspace).await {
             Ok(graph) => graph,
             Err(err) => {
@@ -293,7 +293,7 @@ impl HealthAnalyzer {
             });
         }
 
-        let store = SqliteStore::open(&self.workspace)?;
+        let store = SqliteStore::open_readonly(&self.workspace)?;
         let graph = match SurrealGraphStore::open(&self.workspace).await {
             Ok(graph) => graph,
             Err(err) => {
