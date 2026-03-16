@@ -3,7 +3,7 @@ use std::path::Path;
 
 use aether_analysis::{CausalAnalyzer, TraceCauseRequest};
 use aether_core::normalize_path;
-use aether_store::{SqliteStore, SymbolCatalogStore};
+use aether_store::{SqliteStore, SymbolCatalogStore, open_surreal_graph_store_readonly};
 use anyhow::{Context, Result, anyhow};
 
 use crate::cli::TraceCauseArgs;
@@ -15,13 +15,18 @@ pub fn run_trace_cause_command(workspace: &Path, args: TraceCauseArgs) -> Result
 
     let analyzer =
         CausalAnalyzer::new(workspace).context("failed to initialize causal analyzer")?;
+    let graph = open_surreal_graph_store_readonly(workspace)
+        .context("failed to open configured surreal graph store")?;
     let result = analyzer
-        .trace_cause(TraceCauseRequest {
-            target_symbol_id,
-            lookback: Some(args.lookback),
-            max_depth: Some(args.depth),
-            limit: Some(args.limit),
-        })
+        .trace_cause_with_graph(
+            &graph,
+            TraceCauseRequest {
+                target_symbol_id,
+                lookback: Some(args.lookback),
+                max_depth: Some(args.depth),
+                limit: Some(args.limit),
+            },
+        )
         .context("trace cause analysis failed")?;
 
     let value = serde_json::to_value(result).context("failed to serialize trace-cause output")?;

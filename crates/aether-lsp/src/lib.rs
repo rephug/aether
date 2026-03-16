@@ -10,8 +10,10 @@ use aether_health::{ScoreReport, compute_workspace_score, workspace_health_confi
 use aether_parse::{RustUsePrefix, language_for_path, rust_use_path_at_cursor};
 use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
 use aether_store::{
-    CouplingEdgeRecord, CozoGraphStore, ProjectNoteStore, SirHistoryStore, SirStateStore,
-    SqliteStore, StoreError, SymbolCatalogStore, SymbolRelationStore, TestIntentStore,
+    CouplingEdgeRecord, ProjectNoteStore, SirHistoryStore, SirStateStore, SqliteStore, StoreError,
+    SurrealGraphStore, SymbolCatalogStore, SymbolRelationStore, TestIntentStore,
+    block_on_store_future, open_surreal_graph_store_readonly,
+    open_surreal_graph_store_readonly_async,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -43,6 +45,7 @@ pub struct AetherLspBackend {
     client: Client,
     workspace_root: PathBuf,
     store: Arc<SqliteStore>,
+    surreal_graph: Option<Arc<SurrealGraphStore>>,
     health_score_cache: Arc<RwLock<Option<(Instant, ScoreReport)>>>,
 }
 
@@ -63,11 +66,17 @@ fn get_extractor()
 }
 
 impl AetherLspBackend {
-    pub fn new(client: Client, workspace_root: PathBuf, store: Arc<SqliteStore>) -> Self {
+    pub fn new(
+        client: Client,
+        workspace_root: PathBuf,
+        store: Arc<SqliteStore>,
+        surreal_graph: Option<Arc<SurrealGraphStore>>,
+    ) -> Self {
         Self {
             client,
             workspace_root,
             store,
+            surreal_graph,
             health_score_cache: Arc::new(RwLock::new(None)),
         }
     }
@@ -115,12 +124,14 @@ impl LanguageServer for AetherLspBackend {
 
         let workspace_root = self.workspace_root.clone();
         let store = Arc::clone(&self.store);
+        let surreal_graph = self.surreal_graph.clone();
         let health_score_cache = Arc::clone(&self.health_score_cache);
         let position = text_doc_pos.position;
         let resolution = match tokio::task::spawn_blocking(move || {
-            resolve_hover_markdown_for_source_with_health(
+            resolve_hover_markdown_for_source_with_health_and_graph(
                 &workspace_root,
                 store.as_ref(),
+                surreal_graph.as_deref(),
                 &file_path,
                 &source,
                 position,
@@ -165,12 +176,21 @@ impl LanguageServer for AetherLspBackend {
 
 pub async fn run_stdio(workspace_root: PathBuf) -> Result<(), LspServerError> {
     let store = Arc::new(SqliteStore::open(&workspace_root)?);
+    let surreal_graph = open_surreal_graph_store_readonly_async(&workspace_root)
+        .await
+        .ok()
+        .map(Arc::new);
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
     let (service, socket) = LspService::new(|client| {
-        AetherLspBackend::new(client, workspace_root.clone(), store.clone())
+        AetherLspBackend::new(
+            client,
+            workspace_root.clone(),
+            store.clone(),
+            surreal_graph.clone(),
+        )
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;
@@ -187,6 +207,7 @@ pub fn resolve_hover_markdown_for_path(
     resolve_hover_markdown_for_source(workspace_root, store, file_path, &source, position)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn resolve_hover_markdown_for_source_with_health(
     workspace_root: &Path,
     store: &SqliteStore,
@@ -195,8 +216,34 @@ fn resolve_hover_markdown_for_source_with_health(
     position: Position,
     health_score_cache: &RwLock<Option<(Instant, ScoreReport)>>,
 ) -> Result<Option<String>, HoverResolveError> {
-    let Some(mut markdown) =
-        resolve_hover_markdown_for_source(workspace_root, store, file_path, source, position)?
+    resolve_hover_markdown_for_source_with_health_and_graph(
+        workspace_root,
+        store,
+        None,
+        file_path,
+        source,
+        position,
+        health_score_cache,
+    )
+}
+
+fn resolve_hover_markdown_for_source_with_health_and_graph(
+    workspace_root: &Path,
+    store: &SqliteStore,
+    graph: Option<&SurrealGraphStore>,
+    file_path: &Path,
+    source: &str,
+    position: Position,
+    health_score_cache: &RwLock<Option<(Instant, ScoreReport)>>,
+) -> Result<Option<String>, HoverResolveError> {
+    let Some(mut markdown) = resolve_hover_markdown_for_source_with_graph(
+        workspace_root,
+        store,
+        graph,
+        file_path,
+        source,
+        position,
+    )?
     else {
         return Ok(None);
     };
@@ -214,6 +261,24 @@ fn resolve_hover_markdown_for_source_with_health(
 pub fn resolve_hover_markdown_for_source(
     workspace_root: &Path,
     store: &SqliteStore,
+    file_path: &Path,
+    source: &str,
+    position: Position,
+) -> Result<Option<String>, HoverResolveError> {
+    resolve_hover_markdown_for_source_with_graph(
+        workspace_root,
+        store,
+        None,
+        file_path,
+        source,
+        position,
+    )
+}
+
+fn resolve_hover_markdown_for_source_with_graph(
+    workspace_root: &Path,
+    store: &SqliteStore,
+    graph: Option<&SurrealGraphStore>,
     file_path: &Path,
     source: &str,
     position: Position,
@@ -307,6 +372,7 @@ pub fn resolve_hover_markdown_for_source(
     let context_lines = collect_project_context_lines(
         workspace_root,
         store,
+        graph,
         symbol.file_path.as_str(),
         symbol_id.as_str(),
         current_unix_timestamp_millis(),
@@ -681,6 +747,7 @@ fn compact_why_hint(store: &SqliteStore, symbol_id: &str) -> Result<Option<Strin
 fn collect_project_context_lines(
     workspace_root: &Path,
     store: &SqliteStore,
+    graph: Option<&SurrealGraphStore>,
     file_path: &str,
     symbol_id: &str,
     now_ms: i64,
@@ -690,7 +757,7 @@ fn collect_project_context_lines(
     if let Some(line) = top_project_note_line(store, file_path, symbol_id, now_ms)? {
         lines.push(line);
     }
-    if let Some(line) = top_coupling_line(workspace_root, file_path)? {
+    if let Some(line) = top_coupling_line_with_graph(workspace_root, graph, file_path)? {
         lines.push(line);
     }
     let test_lines = top_test_intent_lines(store, file_path, symbol_id)?;
@@ -720,18 +787,36 @@ fn top_project_note_line(
     Ok(Some(format!("📝 \"{snippet}\" ({age})")))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn top_coupling_line(
     workspace_root: &Path,
     file_path: &str,
 ) -> Result<Option<String>, HoverResolveError> {
-    let cozo = match CozoGraphStore::open(workspace_root) {
-        Ok(store) => store,
-        Err(_) => return Ok(None),
+    top_coupling_line_with_graph(workspace_root, None, file_path)
+}
+
+fn top_coupling_line_with_graph(
+    workspace_root: &Path,
+    graph: Option<&SurrealGraphStore>,
+    file_path: &str,
+) -> Result<Option<String>, HoverResolveError> {
+    let owned_graph;
+    let graph = match graph {
+        Some(graph) => graph,
+        None => match open_surreal_graph_store_readonly(workspace_root) {
+            Ok(store) => {
+                owned_graph = store;
+                &owned_graph
+            }
+            Err(_) => return Ok(None),
+        },
     };
 
-    let mut edges = match cozo.list_co_change_edges_for_file(file_path, 0.0) {
-        Ok(edges) => edges,
+    let mut edges = match block_on_store_future(graph.list_co_change_edges_for_file(file_path, 0.0))
+    {
+        Ok(Ok(edges)) => edges,
         Err(_) => return Ok(None),
+        Ok(Err(_)) => return Ok(None),
     };
     if edges.is_empty() {
         return Ok(None);
@@ -1030,14 +1115,23 @@ fn no_sir_hover() -> Hover {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use std::fs;
     use std::path::Path;
 
     use aether_parse::SymbolExtractor;
     use aether_store::{
-        CouplingEdgeRecord, CozoGraphStore, ProjectNoteRecord, ProjectNoteStore, SirHistoryStore,
-        SirMetaRecord, SirStateStore, SymbolCatalogStore, SymbolRecord, TestIntentRecord,
+        CouplingEdgeRecord,
+        CozoGraphStore, // test
+        ProjectNoteRecord,
+        ProjectNoteStore,
+        SirHistoryStore, // test
+        SirMetaRecord,
+        SirStateStore,
+        SymbolCatalogStore,
+        SymbolRecord,
+        TestIntentRecord,
         TestIntentStore,
     };
     use tempfile::tempdir;
@@ -1529,7 +1623,7 @@ mod tests {
             )
             .expect("insert test intents");
 
-        let cozo = CozoGraphStore::open(workspace).expect("open cozo");
+        let cozo = CozoGraphStore::open(workspace).expect("open cozo"); // test
         cozo.upsert_co_change_edges(&[CouplingEdgeRecord {
             file_a: "src/lib.rs".to_owned(),
             file_b: "src/gateway.rs".to_owned(),

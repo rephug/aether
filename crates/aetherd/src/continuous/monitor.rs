@@ -8,7 +8,10 @@ use aether_config::{AetherConfig, GraphBackend, aether_dir};
 use aether_core::{GitContext, Symbol};
 use aether_graph_algo::{GraphAlgorithmEdge, page_rank_sync};
 use aether_health::git_signals::compute_file_git_stats;
-use aether_store::{CozoGraphStore, SirStateStore, SqliteStore};
+use aether_store::{
+    SirStateStore, SqliteStore, SurrealGraphStore, block_on_store_future,
+    open_surreal_graph_store_readonly,
+};
 use anyhow::{Context, Result};
 use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
@@ -346,8 +349,17 @@ fn score_symbols(
         continuous.neighbor_decay,
         continuous.neighbor_cutoff,
     );
+    let surreal_graph = if matches!(
+        config.storage.graph_backend,
+        GraphBackend::Surreal | GraphBackend::Cozo
+    ) {
+        open_surreal_graph_store_readonly(workspace).ok()
+    } else {
+        None
+    };
     let coupling_scores = coupling_predict(
         workspace,
+        surreal_graph.as_ref(),
         config,
         last_successful_at,
         symbols_by_id,
@@ -518,6 +530,7 @@ fn propagate_neighbor_staleness(
 
 fn coupling_predict(
     workspace: &Path,
+    graph_store: Option<&SurrealGraphStore>,
     config: &AetherConfig,
     last_successful_at: Option<i64>,
     symbols_by_id: &HashMap<String, Symbol>,
@@ -537,12 +550,9 @@ fn coupling_predict(
         return HashMap::new();
     }
 
-    let graph_store = match CozoGraphStore::open_readonly(workspace) {
-        Ok(graph) => graph,
-        Err(err) => {
-            tracing::warn!(error = %err, "continuous monitor skipped coupling prediction");
-            return HashMap::new();
-        }
+    let Some(graph_store) = graph_store else {
+        tracing::warn!("continuous monitor skipped coupling prediction");
+        return HashMap::new();
     };
 
     let candidate_set = candidate_ids
@@ -570,11 +580,15 @@ fn coupling_predict(
 
     let mut bumps = HashMap::<String, f64>::new();
     for file_path in recently_edited {
-        let Ok(edges) =
-            graph_store.list_co_change_edges_for_file(file_path.as_str(), threshold as f32)
-        else {
-            continue;
+        let edges = match block_on_store_future(
+            graph_store.list_co_change_edges_for_file(file_path.as_str(), threshold as f32),
+        ) {
+            Ok(Ok(edges)) => edges,
+            _ => continue,
         };
+        if edges.is_empty() {
+            continue;
+        }
         for edge in edges {
             if f64::from(edge.fused_score) < threshold {
                 continue;

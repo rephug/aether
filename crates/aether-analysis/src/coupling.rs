@@ -5,8 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aether_config::{CouplingConfig, GraphBackend, load_workspace_config};
 use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
 use aether_store::{
-    CouplingEdgeRecord, CouplingMiningStateRecord, CouplingStateStore, CozoGraphStore, SqliteStore,
-    StoreError, SymbolCatalogStore, SymbolRelationStore, open_vector_store,
+    CouplingEdgeRecord, CouplingMiningStateRecord, CouplingStateStore, SqliteStore, StoreError,
+    SurrealGraphStore, SymbolCatalogStore, SymbolRelationStore, block_on_store_future,
+    open_surreal_graph_store_readonly, open_surreal_graph_store_sync, open_vector_store,
 };
 use gix::bstr::ByteSlice;
 use serde::{Deserialize, Serialize};
@@ -206,6 +207,15 @@ impl CouplingAnalyzer {
         &self,
         request: MineCouplingRequest,
     ) -> Result<CouplingMiningOutcome, AnalysisError> {
+        let graph = open_surreal_graph_store_sync(&self.workspace)?;
+        self.mine_with_graph(&graph, request)
+    }
+
+    pub fn mine_with_graph(
+        &self,
+        graph: &SurrealGraphStore,
+        request: MineCouplingRequest,
+    ) -> Result<CouplingMiningOutcome, AnalysisError> {
         let mined_at = now_millis();
         if !self.config.enabled {
             return Ok(CouplingMiningOutcome {
@@ -324,7 +334,6 @@ impl CouplingAnalyzer {
             }
         }
 
-        let cozo = CozoGraphStore::open(&self.workspace)?;
         let mut candidate_pairs = Vec::new();
         for ((file_a, file_b), aggregate) in pairs {
             let total_commits_a = per_file_commit_count
@@ -340,7 +349,9 @@ impl CouplingAnalyzer {
             let mut merged_total_commits_a = total_commits_a;
             let mut merged_total_commits_b = total_commits_b;
 
-            if let Some(existing) = cozo.get_co_change_edge(file_a.as_str(), file_b.as_str())? {
+            if let Some(existing) =
+                block_on_store_future(graph.get_co_change_edge(file_a.as_str(), file_b.as_str()))??
+            {
                 co_change_count += existing.co_change_count;
                 merged_total_commits_a += existing.total_commits_a;
                 merged_total_commits_b += existing.total_commits_b;
@@ -383,7 +394,7 @@ impl CouplingAnalyzer {
             last_co_change_at,
         ) in candidate_pairs
         {
-            let static_signal = if self.has_static_dependency(&store, &cozo, &file_a, &file_b)? {
+            let static_signal = if self.has_static_dependency(&store, graph, &file_a, &file_b)? {
                 1.0
             } else {
                 0.0
@@ -417,7 +428,7 @@ impl CouplingAnalyzer {
             });
         }
 
-        cozo.upsert_co_change_edges(records.as_slice())?;
+        block_on_store_future(graph.upsert_co_change_edges(records.as_slice()))??;
         store.upsert_coupling_mining_state(CouplingMiningStateRecord {
             last_commit_hash: Some(head_commit_hash.clone()),
             last_mined_at: Some(mined_at),
@@ -441,19 +452,28 @@ impl CouplingAnalyzer {
         &self,
         request: BlastRadiusRequest,
     ) -> Result<BlastRadiusResult, AnalysisError> {
+        let graph = open_surreal_graph_store_sync(&self.workspace)?;
+        self.blast_radius_with_graph(&graph, request)
+    }
+
+    pub fn blast_radius_with_graph(
+        &self,
+        graph: &SurrealGraphStore,
+        request: BlastRadiusRequest,
+    ) -> Result<BlastRadiusResult, AnalysisError> {
         let file_path = normalize_repo_path(request.file_path.as_str());
         let mut store = SqliteStore::open(&self.workspace)?;
         let mut mining_state = store.get_coupling_mining_state()?;
 
         if request.auto_mine && self.needs_auto_mine(mining_state.as_ref())? {
-            let _ = self.mine(MineCouplingRequest::default())?;
+            let _ = self.mine_with_graph(graph, MineCouplingRequest::default())?;
             store = SqliteStore::open(&self.workspace)?;
             mining_state = store.get_coupling_mining_state()?;
         }
 
-        let cozo = CozoGraphStore::open(&self.workspace)?;
-        let edges =
-            cozo.list_co_change_edges_for_file(file_path.as_str(), request.min_risk.min_score())?;
+        let edges = block_on_store_future(
+            graph.list_co_change_edges_for_file(file_path.as_str(), request.min_risk.min_score()),
+        )??;
 
         let mut coupled_files = Vec::with_capacity(edges.len());
         for edge in edges {
@@ -496,8 +516,16 @@ impl CouplingAnalyzer {
     }
 
     pub fn coupling_report(&self, top: u32) -> Result<Vec<CouplingEdge>, AnalysisError> {
-        let cozo = CozoGraphStore::open(&self.workspace)?;
-        let records = cozo.list_top_co_change_edges(top)?;
+        let graph = open_surreal_graph_store_readonly(&self.workspace)?;
+        self.coupling_report_with_graph(&graph, top)
+    }
+
+    pub fn coupling_report_with_graph(
+        &self,
+        graph: &SurrealGraphStore,
+        top: u32,
+    ) -> Result<Vec<CouplingEdge>, AnalysisError> {
+        let records = block_on_store_future(graph.list_top_co_change_edges(top))??;
         Ok(records
             .into_iter()
             .map(|record| CouplingEdge {
@@ -579,12 +607,12 @@ impl CouplingAnalyzer {
     fn has_static_dependency(
         &self,
         store: &SqliteStore,
-        cozo: &CozoGraphStore,
+        graph: &SurrealGraphStore,
         file_a: &str,
         file_b: &str,
     ) -> Result<bool, AnalysisError> {
         if self.graph_backend == GraphBackend::Cozo
-            && cozo.has_dependency_between_files(file_a, file_b)?
+            && block_on_store_future(graph.has_dependency_between_files(file_a, file_b))??
         {
             return Ok(true);
         }

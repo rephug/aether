@@ -249,10 +249,13 @@ impl SharedState {
         Ok(())
     }
 
-    pub async fn surreal_graph_for_health(&self) -> Result<Arc<SurrealGraphStore>, AetherMcpError> {
-        if self.config.storage.graph_backend != GraphBackend::Surreal {
+    pub async fn surreal_graph(&self) -> Result<Arc<SurrealGraphStore>, AetherMcpError> {
+        if !matches!(
+            self.config.storage.graph_backend,
+            GraphBackend::Surreal | GraphBackend::Cozo
+        ) {
             return Err(AetherMcpError::Message(
-                "health analysis requires surreal graph backend".to_owned(),
+                "operation requires surreal-compatible graph backend".to_owned(),
             ));
         }
 
@@ -261,9 +264,17 @@ impl SharedState {
             return Ok(existing.clone());
         }
 
-        let graph = Arc::new(SurrealGraphStore::open_readonly(&self.workspace).await?);
+        let graph = Arc::new(if self.read_only {
+            SurrealGraphStore::open_readonly(&self.workspace).await?
+        } else {
+            SurrealGraphStore::open(&self.workspace).await?
+        });
         *guard = Some(graph.clone());
         Ok(graph)
+    }
+
+    pub async fn surreal_graph_for_health(&self) -> Result<Arc<SurrealGraphStore>, AetherMcpError> {
+        self.surreal_graph().await
     }
 }
 

@@ -1,9 +1,11 @@
+use std::sync::Arc;
+
 use aether_analysis::{
     AcknowledgeDriftRequest as AnalysisAcknowledgeDriftRequest, CausalAnalyzer, DriftAnalyzer,
     DriftInclude as AnalysisDriftInclude, DriftReportRequest as AnalysisDriftReportRequest,
     TraceCauseRequest as AnalysisTraceCauseRequest,
 };
-use aether_store::{SqliteStore, SymbolCatalogStore, SymbolRecord};
+use aether_store::{SqliteStore, SurrealGraphStore, SymbolCatalogStore, SymbolRecord};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -229,15 +231,37 @@ impl AetherMcpServer {
         &self,
         request: AetherDriftReportRequest,
     ) -> Result<AetherDriftReportResponse, AetherMcpError> {
+        self.aether_drift_report_logic_with_graph(None, request)
+    }
+
+    pub fn aether_drift_report_logic_with_graph(
+        &self,
+        graph: Option<Arc<SurrealGraphStore>>,
+        request: AetherDriftReportRequest,
+    ) -> Result<AetherDriftReportResponse, AetherMcpError> {
         let analyzer = DriftAnalyzer::new(self.workspace())?;
-        let report = analyzer.report(AnalysisDriftReportRequest {
-            window: request.window,
-            include: request
-                .include
-                .map(|items| items.into_iter().map(Into::into).collect()),
-            min_drift_magnitude: request.min_drift_magnitude,
-            include_acknowledged: request.include_acknowledged,
-        })?;
+        let report = if let Some(graph) = graph.as_deref() {
+            analyzer.report_with_graph(
+                graph,
+                AnalysisDriftReportRequest {
+                    window: request.window,
+                    include: request
+                        .include
+                        .map(|items| items.into_iter().map(Into::into).collect()),
+                    min_drift_magnitude: request.min_drift_magnitude,
+                    include_acknowledged: request.include_acknowledged,
+                },
+            )?
+        } else {
+            analyzer.report(AnalysisDriftReportRequest {
+                window: request.window,
+                include: request
+                    .include
+                    .map(|items| items.into_iter().map(Into::into).collect()),
+                min_drift_magnitude: request.min_drift_magnitude,
+                include_acknowledged: request.include_acknowledged,
+            })?
+        };
 
         Ok(AetherDriftReportResponse {
             schema_version: report.schema_version,
@@ -338,15 +362,35 @@ impl AetherMcpServer {
         &self,
         request: AetherTraceCauseRequest,
     ) -> Result<AetherTraceCauseResponse, AetherMcpError> {
+        self.aether_trace_cause_logic_with_graph(None, request)
+    }
+
+    pub fn aether_trace_cause_logic_with_graph(
+        &self,
+        graph: Option<Arc<SurrealGraphStore>>,
+        request: AetherTraceCauseRequest,
+    ) -> Result<AetherTraceCauseResponse, AetherMcpError> {
         let store = self.state.store.as_ref();
         let target_symbol = self.resolve_trace_cause_symbol(store, &request)?;
         let analyzer = CausalAnalyzer::new(self.workspace())?;
-        let result = analyzer.trace_cause(AnalysisTraceCauseRequest {
-            target_symbol_id: target_symbol.id,
-            lookback: request.lookback,
-            max_depth: request.max_depth,
-            limit: request.limit,
-        })?;
+        let result = if let Some(graph) = graph.as_deref() {
+            analyzer.trace_cause_with_graph(
+                graph,
+                AnalysisTraceCauseRequest {
+                    target_symbol_id: target_symbol.id,
+                    lookback: request.lookback,
+                    max_depth: request.max_depth,
+                    limit: request.limit,
+                },
+            )?
+        } else {
+            analyzer.trace_cause(AnalysisTraceCauseRequest {
+                target_symbol_id: target_symbol.id,
+                lookback: request.lookback,
+                max_depth: request.max_depth,
+                limit: request.limit,
+            })?
+        };
 
         Ok(AetherTraceCauseResponse {
             schema_version: result.schema_version,
@@ -458,6 +502,7 @@ impl AetherMcpServer {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use std::fs;
     use std::path::Path;
@@ -592,7 +637,7 @@ api_key_env = "GEMINI_API_KEY"
 
         let server = AetherMcpServer::new(workspace, false).expect("new mcp server");
         let store = SqliteStore::open(workspace).expect("open store");
-        let graph = aether_store::CozoGraphStore::open(workspace).expect("open graph");
+        let graph = aether_store::CozoGraphStore::open(workspace).expect("open graph"); // test
 
         let sym_a = SymbolRecord {
             id: "sym-a".to_owned(),

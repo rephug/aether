@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aether_core::{
@@ -13,6 +14,7 @@ use aether_memory::{
     ProjectMemoryService, RecallRequest, RememberRequest, SemanticQuery,
     truncate_content_for_embedding,
 };
+use aether_store::open_surreal_graph_store_readonly;
 use anyhow::{Context, Result};
 use serde_json::json;
 
@@ -230,14 +232,20 @@ pub fn run_ask_command(workspace: &Path, args: AskArgs) -> Result<()> {
         .collect::<Vec<_>>();
 
     let runtime = build_runtime().context("failed to build runtime for ask query")?;
+    let graph = open_surreal_graph_store_readonly(workspace)
+        .ok()
+        .map(Arc::new);
     let result = runtime
-        .block_on(service.ask(AskQueryRequest {
-            query: args.query.clone(),
-            limit: args.limit,
-            include,
-            now_ms: None,
-            semantic: semantic_query,
-        }))
+        .block_on(service.ask_with_graph(
+            AskQueryRequest {
+                query: args.query.clone(),
+                limit: args.limit,
+                include,
+                now_ms: None,
+                semantic: semantic_query,
+            },
+            graph,
+        ))
         .context("failed to run unified ask query")?;
 
     let response = json!({

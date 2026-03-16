@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
+use std::future::Future;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use aether_config::{GraphBackend, load_workspace_config};
@@ -43,7 +44,9 @@ mod graph_surreal;
 mod tests;
 mod vector;
 
-pub use graph_cozo_compat::CozoGraphStore;
+#[allow(deprecated)]
+#[deprecated(note = "use GraphStore dispatch or SurrealGraphStore directly")]
+pub use graph_cozo_compat::CozoGraphStore; // #[deprecated]
 pub use graph_sqlite::SqliteGraphStore;
 pub use graph_surreal::SurrealGraphStore;
 pub use vector::{
@@ -378,9 +381,7 @@ pub async fn open_graph_store(
     let config = load_workspace_config(workspace_root)?;
     match config.storage.graph_backend {
         GraphBackend::Surreal => Ok(Box::new(SurrealGraphStore::open(workspace_root).await?)),
-        GraphBackend::Cozo => Err(StoreError::Graph(
-            "CozoDB backend removed; run `aether graph-migrate` to convert to SurrealDB".to_owned(),
-        )),
+        GraphBackend::Cozo => Ok(Box::new(SurrealGraphStore::open(workspace_root).await?)),
         GraphBackend::Sqlite => Ok(Box::new(SqliteGraphStore::open(workspace_root)?)),
     }
 }
@@ -391,14 +392,88 @@ pub fn open_graph_store_readonly(
     let workspace_root = workspace_root.as_ref();
     let config = load_workspace_config(workspace_root)?;
     match config.storage.graph_backend {
-        GraphBackend::Surreal => {
-            // Uses CozoGraphStore (sync compat shim) because this function is sync.
-            // The shim wraps SurrealGraphStore internally.
-            Ok(Box::new(CozoGraphStore::open_readonly(workspace_root)?))
-        }
-        GraphBackend::Cozo => Ok(Box::new(CozoGraphStore::open_readonly(workspace_root)?)),
+        GraphBackend::Surreal => Ok(Box::new(open_surreal_graph_store_readonly(workspace_root)?)),
+        GraphBackend::Cozo => Ok(Box::new(open_surreal_graph_store_readonly(workspace_root)?)),
         GraphBackend::Sqlite => Ok(Box::new(SqliteGraphStore::open_readonly(workspace_root)?)),
     }
+}
+
+fn store_runtime() -> Result<&'static tokio::runtime::Runtime, StoreError> {
+    static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+    let runtime = RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|err| format!("failed to initialize store tokio runtime: {err}"))
+    });
+    runtime
+        .as_ref()
+        .map_err(|err| StoreError::Graph(err.clone()))
+}
+
+pub fn block_on_store_future<F, T>(future: F) -> Result<T, StoreError>
+where
+    F: Future<Output = T> + Send,
+    T: Send,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(move || -> Result<T, StoreError> {
+                let runtime = store_runtime()?;
+                Ok(runtime.block_on(future))
+            });
+            handle
+                .join()
+                .map_err(|_| StoreError::Graph("store runtime helper thread panicked".to_owned()))?
+        })
+    } else {
+        let runtime = store_runtime()?;
+        Ok(runtime.block_on(future))
+    }
+}
+
+fn surreal_backend_supported(workspace_root: &Path) -> Result<(), StoreError> {
+    let config = load_workspace_config(workspace_root)?;
+    match config.storage.graph_backend {
+        GraphBackend::Surreal | GraphBackend::Cozo => Ok(()),
+        GraphBackend::Sqlite => Err(StoreError::Graph(
+            "configured graph backend 'sqlite' does not support Surreal graph operations"
+                .to_owned(),
+        )),
+    }
+}
+
+pub async fn open_surreal_graph_store(
+    workspace_root: impl AsRef<Path>,
+) -> Result<SurrealGraphStore, StoreError> {
+    let workspace_root = workspace_root.as_ref();
+    surreal_backend_supported(workspace_root)?;
+    SurrealGraphStore::open(workspace_root).await
+}
+
+pub async fn open_surreal_graph_store_readonly_async(
+    workspace_root: impl AsRef<Path>,
+) -> Result<SurrealGraphStore, StoreError> {
+    let workspace_root = workspace_root.as_ref();
+    surreal_backend_supported(workspace_root)?;
+    SurrealGraphStore::open_readonly(workspace_root).await
+}
+
+pub fn open_surreal_graph_store_sync(
+    workspace_root: impl AsRef<Path>,
+) -> Result<SurrealGraphStore, StoreError> {
+    let workspace_root = workspace_root.as_ref().to_path_buf();
+    block_on_store_future(async move { open_surreal_graph_store(workspace_root).await })?
+}
+
+pub fn open_surreal_graph_store_readonly(
+    workspace_root: impl AsRef<Path>,
+) -> Result<SurrealGraphStore, StoreError> {
+    let workspace_root = workspace_root.as_ref().to_path_buf();
+    block_on_store_future(
+        async move { open_surreal_graph_store_readonly_async(workspace_root).await },
+    )?
 }
 
 pub struct SqliteStore {

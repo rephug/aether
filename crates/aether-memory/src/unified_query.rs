@@ -9,8 +9,8 @@ use crate::ranking::{apply_recency_access_boost, rrf_score};
 use crate::search::SemanticQuery;
 use crate::{MemoryError, current_unix_timestamp_millis};
 use aether_store::{
-    CouplingEdgeRecord, CozoGraphStore, ProjectNoteStore, SirStateStore, SqliteStore,
-    SymbolCatalogStore, TestIntentStore,
+    CouplingEdgeRecord, ProjectNoteStore, SirStateStore, SqliteStore, SurrealGraphStore,
+    SymbolCatalogStore, TestIntentStore, block_on_store_future, open_surreal_graph_store_readonly,
 };
 
 const SYMBOL_COUPLING_SEED_LIMIT: usize = 10;
@@ -89,6 +89,14 @@ struct CouplingAggregate {
 
 impl ProjectMemoryService {
     pub async fn ask(&self, request: AskQueryRequest) -> Result<AskQueryResult, MemoryError> {
+        self.ask_with_graph(request, None).await
+    }
+
+    pub async fn ask_with_graph(
+        &self,
+        request: AskQueryRequest,
+        graph: Option<Arc<SurrealGraphStore>>,
+    ) -> Result<AskQueryResult, MemoryError> {
         let query = request.query.trim();
         if query.is_empty() {
             return Ok(AskQueryResult {
@@ -273,10 +281,15 @@ impl ProjectMemoryService {
         let workspace = self.workspace().to_path_buf();
         let store_clone = store.clone();
         let query_owned = query.to_owned();
+        let graph = graph.clone();
 
         let result = tokio::task::spawn_blocking(move || -> Result<AskQueryResult, MemoryError> {
             let coupling_candidates = if include.contains(&AskInclude::Coupling) {
-                rank_coupling_candidates(&workspace, symbol_candidates.as_slice())?
+                rank_coupling_candidates_with_graph(
+                    graph.as_deref(),
+                    &workspace,
+                    symbol_candidates.as_slice(),
+                )?
             } else {
                 Vec::new()
             };
@@ -475,13 +488,23 @@ fn rank_test_candidates(test_rows: Vec<aether_store::TestIntentRecord>) -> Vec<R
         .collect()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn rank_coupling_candidates(
     workspace: &Path,
     symbol_candidates: &[RankedCandidate],
 ) -> Result<Vec<RankedCandidate>, MemoryError> {
-    let cozo = match CozoGraphStore::open(workspace) {
-        Ok(cozo) => cozo,
-        Err(_) => return Ok(Vec::new()),
+    let graph = open_surreal_graph_store_readonly(workspace).ok();
+
+    rank_coupling_candidates_with_graph(graph.as_ref(), workspace, symbol_candidates)
+}
+
+fn rank_coupling_candidates_with_graph(
+    graph: Option<&SurrealGraphStore>,
+    _workspace: &Path,
+    symbol_candidates: &[RankedCandidate],
+) -> Result<Vec<RankedCandidate>, MemoryError> {
+    let Some(graph) = graph else {
+        return Ok(Vec::new());
     };
 
     let mut by_file = HashMap::<String, CouplingAggregate>::new();
@@ -489,7 +512,7 @@ fn rank_coupling_candidates(
         let Some(anchor_file) = symbol.item.file.as_deref() else {
             continue;
         };
-        let edges = cozo.list_co_change_edges_for_file(anchor_file, 0.0)?;
+        let edges = block_on_store_future(graph.list_co_change_edges_for_file(anchor_file, 0.0))??;
         for edge in edges {
             let coupled_file = coupled_file_for_edge(anchor_file, &edge);
             if coupled_file.is_empty() {
@@ -723,12 +746,13 @@ fn increment_access_from_results(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use aether_store::{CouplingEdgeRecord, CozoGraphStore};
+    use aether_store::{CouplingEdgeRecord, CozoGraphStore}; // test
 
     use super::{AskResultItem, AskResultKind, RankedCandidate, merge_candidates};
 
@@ -930,7 +954,7 @@ mod tests {
     #[test]
     fn coupling_candidates_are_derived_from_top_symbol_files() {
         let workspace = test_workspace("coupling");
-        let cozo = CozoGraphStore::open(&workspace).expect("open cozo");
+        let cozo = CozoGraphStore::open(&workspace).expect("open cozo"); // test
         cozo.upsert_co_change_edges(&[CouplingEdgeRecord {
             file_a: "src/a.rs".to_owned(),
             file_b: "src/b.rs".to_owned(),

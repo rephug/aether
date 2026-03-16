@@ -402,14 +402,22 @@ impl AetherMcpServer {
             Arc::clone(&self.state.store),
             self.state.vector_store.clone(),
         );
+        let graph = if include.contains(&MemoryAskInclude::Coupling) {
+            self.state.surreal_graph().await.ok()
+        } else {
+            None
+        };
         let result = memory
-            .ask(MemoryAskQueryRequest {
-                query: request.query.clone(),
-                limit,
-                include,
-                now_ms: None,
-                semantic: semantic_query,
-            })
+            .ask_with_graph(
+                MemoryAskQueryRequest {
+                    query: request.query.clone(),
+                    limit,
+                    include,
+                    now_ms: None,
+                    semantic: semantic_query,
+                },
+                graph,
+            )
             .await?;
 
         let results = result
@@ -446,13 +454,21 @@ impl AetherMcpServer {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use std::fs;
     use std::path::Path;
 
     use aether_store::{
-        CouplingEdgeRecord, CozoGraphStore, ProjectNoteRecord, ProjectNoteStore, SirStateStore,
-        SymbolCatalogStore, SymbolRecord, TestIntentRecord, TestIntentStore,
+        CouplingEdgeRecord,
+        CozoGraphStore, // test
+        ProjectNoteRecord,
+        ProjectNoteStore,
+        SirStateStore, // test
+        SymbolCatalogStore,
+        SymbolRecord,
+        TestIntentRecord,
+        TestIntentStore,
     };
     use tempfile::tempdir;
 
@@ -552,7 +568,7 @@ vector_backend = "sqlite"
             )
             .expect("upsert test intent");
 
-        let cozo = CozoGraphStore::open(workspace).expect("open cozo");
+        let cozo = CozoGraphStore::open(workspace).expect("open cozo"); // test
         cozo.upsert_co_change_edges(&[CouplingEdgeRecord {
             file_a: "src/payments/processor.rs".to_owned(),
             file_b: "src/payments/gateway.rs".to_owned(),

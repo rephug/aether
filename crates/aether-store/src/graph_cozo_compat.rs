@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
@@ -12,15 +14,23 @@ use super::{
 
 pub type CrossCommunityEdge = (String, String, String, i64, i64);
 
+// Legacy compatibility shim for synchronous Cozo-era call sites.
+// Production code should use GraphStore dispatch or SurrealGraphStore directly.
+#[cfg_attr(
+    not(test),
+    deprecated(note = "use GraphStore dispatch or SurrealGraphStore directly")
+)]
 pub struct CozoGraphStore {
     inner: SurrealGraphStore,
 }
 
+#[allow(deprecated)]
 impl CozoGraphStore {
     fn runtime() -> &'static tokio::runtime::Runtime {
         static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
         RUNTIME.get_or_init(|| {
-            tokio::runtime::Builder::new_current_thread()
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
                 .expect("global CozoGraphStore compatibility tokio runtime should initialize")
@@ -178,6 +188,7 @@ impl CozoGraphStore {
 }
 
 #[async_trait]
+#[allow(deprecated)]
 impl GraphStore for CozoGraphStore {
     async fn upsert_symbol_node(&self, symbol: &SymbolRecord) -> Result<(), StoreError> {
         self.inner.upsert_symbol_node(symbol).await

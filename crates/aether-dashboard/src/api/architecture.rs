@@ -6,6 +6,7 @@ use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
 use aether_analysis::{CommunitiesRequest, DriftAnalyzer};
+use aether_config::GraphBackend;
 
 use crate::api::common;
 use crate::support::{self, DashboardState};
@@ -70,21 +71,18 @@ pub(crate) fn load_architecture_data(
     granularity: Option<&str>,
 ) -> Result<ArchitectureData, String> {
     let granularity = granularity.unwrap_or("symbol").trim().to_ascii_lowercase();
+    if shared.config.storage.graph_backend != GraphBackend::Surreal {
+        return Ok(not_computed_architecture_data(granularity));
+    }
 
     let analyzer = DriftAnalyzer::new(shared.workspace.as_path()).map_err(|e| e.to_string())?;
-    let result = analyzer
-        .communities(CommunitiesRequest { format: None })
-        .map_err(|e| e.to_string())?;
+    let result = match analyzer.communities(CommunitiesRequest { format: None }) {
+        Ok(result) => result,
+        Err(_) => return Ok(not_computed_architecture_data(granularity)),
+    };
 
     if result.communities.is_empty() {
-        return Ok(ArchitectureData {
-            granularity,
-            not_computed: true,
-            community_count: 0,
-            misplaced_count: 0,
-            communities: Vec::new(),
-            symbols: Vec::new(),
-        });
+        return Ok(not_computed_architecture_data(granularity));
     }
 
     let symbol_rows = common::load_symbols(shared)?;
@@ -193,6 +191,17 @@ pub(crate) fn load_architecture_data(
         communities,
         symbols,
     })
+}
+
+fn not_computed_architecture_data(granularity: String) -> ArchitectureData {
+    ArchitectureData {
+        granularity,
+        not_computed: true,
+        community_count: 0,
+        misplaced_count: 0,
+        communities: Vec::new(),
+        symbols: Vec::new(),
+    }
 }
 
 fn directory_of(file_path: &str) -> String {

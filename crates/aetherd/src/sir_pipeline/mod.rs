@@ -30,7 +30,7 @@ use aether_store::{
     IntentOperation, SirHistoryStore, SirMetaRecord, SirStateStore, SqliteStore,
     SymbolCatalogStore, SymbolEmbeddingRecord, SymbolRelationStore, TestIntentStore,
     VectorEmbeddingMetaRecord, VectorStore, WriteIntent, WriteIntentStatus, open_graph_store,
-    open_vector_store,
+    open_surreal_graph_store_sync, open_vector_store,
 };
 use anyhow::{Context, Result, anyhow};
 use tokio::runtime::Runtime;
@@ -1772,16 +1772,18 @@ impl SirPipeline {
                 })?;
         }
 
-        let test_intent_analyzer = TestIntentAnalyzer::new(&self.workspace_root)
-            .context("failed to initialize test intent analyzer")?;
-        let _ = test_intent_analyzer
-            .refresh_for_test_file(event.file_path.as_str())
-            .with_context(|| {
-                format!(
-                    "failed to refresh tested_by links for test file {}",
-                    event.file_path
-                )
-            })?;
+        if let Ok(graph) = open_surreal_graph_store_sync(&self.workspace_root) {
+            let test_intent_analyzer = TestIntentAnalyzer::new(&self.workspace_root)
+                .context("failed to initialize test intent analyzer")?;
+            let _ = test_intent_analyzer
+                .refresh_for_test_file_with_graph(&graph, event.file_path.as_str())
+                .with_context(|| {
+                    format!(
+                        "failed to refresh tested_by links for test file {}",
+                        event.file_path
+                    )
+                })?;
+        }
 
         Ok(())
     }

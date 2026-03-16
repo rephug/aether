@@ -6,7 +6,10 @@ use aether_config::load_workspace_config;
 use aether_infer::{
     EmbeddingProviderOverrides, LoadedEmbeddingProvider, load_embedding_provider_from_config,
 };
-use aether_store::{CozoGraphStore, SirHistoryRecord, SirHistoryStore, SqliteStore};
+use aether_store::{
+    SirHistoryRecord, SirHistoryStore, SqliteStore, SurrealGraphStore, block_on_store_future,
+    open_surreal_graph_store_readonly,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -171,6 +174,15 @@ impl CausalAnalyzer {
         &self,
         request: TraceCauseRequest,
     ) -> Result<TraceCauseResult, AnalysisError> {
+        let graph = open_surreal_graph_store_readonly(&self.workspace)?;
+        self.trace_cause_with_graph(&graph, request)
+    }
+
+    pub fn trace_cause_with_graph(
+        &self,
+        graph: &SurrealGraphStore,
+        request: TraceCauseRequest,
+    ) -> Result<TraceCauseResult, AnalysisError> {
         let target_symbol_id = request.target_symbol_id.trim();
         if target_symbol_id.is_empty() {
             return Err(AnalysisError::Message(
@@ -189,14 +201,15 @@ impl CausalAnalyzer {
         let limit = request.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
         let store = SqliteStore::open_readonly(&self.workspace)?;
-        let cozo = CozoGraphStore::open(&self.workspace)?;
         let Some(target_symbol) = store.get_symbol_record(target_symbol_id)? else {
             return Err(AnalysisError::Message(format!(
                 "target symbol '{target_symbol_id}' not found"
             )));
         };
 
-        let traversal = cozo.list_upstream_dependency_traversal(target_symbol_id, max_depth)?;
+        let traversal = block_on_store_future(
+            graph.list_upstream_dependency_traversal(target_symbol_id, max_depth),
+        )??;
         let mut notes = Vec::new();
         if requested_max_depth > MAX_MAX_DEPTH {
             notes.push(format!("max depth truncated at {max_depth}"));
@@ -327,7 +340,7 @@ impl CausalAnalyzer {
                 continue;
             };
             let (coupling_strength, coupling_type) = resolve_coupling_strength(
-                &cozo,
+                graph,
                 target_symbol.file_path.as_str(),
                 candidate_symbol.file_path.as_str(),
                 depth,
@@ -625,15 +638,16 @@ fn build_path_ids(
 }
 
 fn resolve_coupling_strength(
-    cozo: &CozoGraphStore,
+    graph: &SurrealGraphStore,
     target_file: &str,
     upstream_file: &str,
     depth: u32,
 ) -> Result<(f32, String), AnalysisError> {
     if !target_file.is_empty() && !upstream_file.is_empty() {
-        let mut edge = cozo.get_co_change_edge(target_file, upstream_file)?;
+        let mut edge =
+            block_on_store_future(graph.get_co_change_edge(target_file, upstream_file))??;
         if edge.is_none() {
-            edge = cozo.get_co_change_edge(upstream_file, target_file)?;
+            edge = block_on_store_future(graph.get_co_change_edge(upstream_file, target_file))??;
         }
         if let Some(edge) = edge {
             return Ok((edge.fused_score.clamp(0.0, 1.0), edge.coupling_type));
@@ -752,6 +766,7 @@ fn now_millis() -> i64 {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use std::fs;
     use std::path::Path;
@@ -759,7 +774,11 @@ mod tests {
 
     use aether_core::EdgeKind;
     use aether_store::{
-        CozoGraphStore, ResolvedEdge, SirHistoryRecord, SirHistoryStore, SymbolCatalogStore,
+        CozoGraphStore, // test
+        ResolvedEdge,
+        SirHistoryRecord,
+        SirHistoryStore,
+        SymbolCatalogStore, // test
         SymbolRecord,
     };
     use tempfile::tempdir;
@@ -797,7 +816,7 @@ mod tests {
         let commit_c = commit_marker(temp.path(), "c");
 
         let store = aether_store::SqliteStore::open(temp.path()).expect("open store");
-        let graph = CozoGraphStore::open(temp.path()).expect("open graph");
+        let graph = CozoGraphStore::open(temp.path()).expect("open graph"); // test
 
         let sym_a = symbol("sym-a", "a", "src/a.rs");
         let sym_b = symbol("sym-b", "b", "src/b.rs");
@@ -887,7 +906,7 @@ mod tests {
         init_repo(temp.path(), false);
         let _ = commit_marker(temp.path(), "seed");
         let store = aether_store::SqliteStore::open(temp.path()).expect("open store");
-        let graph = CozoGraphStore::open(temp.path()).expect("open graph");
+        let graph = CozoGraphStore::open(temp.path()).expect("open graph"); // test
 
         let sym_a = symbol("sym-a", "a", "src/a.rs");
         let sym_b = symbol("sym-b", "b", "src/b.rs");
@@ -987,7 +1006,7 @@ mod tests {
         init_repo(temp.path(), false);
         let _ = commit_marker(temp.path(), "seed");
         let store = aether_store::SqliteStore::open(temp.path()).expect("open store");
-        let graph = CozoGraphStore::open(temp.path()).expect("open graph");
+        let graph = CozoGraphStore::open(temp.path()).expect("open graph"); // test
 
         let sym_a = symbol("sym-a", "a", "src/a.rs");
         let sym_b = symbol("sym-b", "b", "src/b.rs");
@@ -1041,7 +1060,7 @@ mod tests {
         init_repo(temp.path(), false);
         let _ = commit_marker(temp.path(), "seed");
         let store = aether_store::SqliteStore::open(temp.path()).expect("open store");
-        let graph = CozoGraphStore::open(temp.path()).expect("open graph");
+        let graph = CozoGraphStore::open(temp.path()).expect("open graph"); // test
 
         let sym_a = symbol("sym-a", "a", "src/a.rs");
         let sym_b = symbol("sym-b", "b", "src/b.rs");
@@ -1093,7 +1112,7 @@ mod tests {
         let _commit_new = commit_marker(temp.path(), "new");
 
         let store = aether_store::SqliteStore::open(temp.path()).expect("open store");
-        let graph = CozoGraphStore::open(temp.path()).expect("open graph");
+        let graph = CozoGraphStore::open(temp.path()).expect("open graph"); // test
         let sym_a = symbol("sym-a", "a", "src/a.rs");
         let sym_b = symbol("sym-b", "b", "src/b.rs");
         upsert_symbol_and_node(&store, &graph, &sym_a);
@@ -1143,7 +1162,7 @@ mod tests {
         let _ = commit_marker(temp.path(), "seed");
 
         let store = aether_store::SqliteStore::open(temp.path()).expect("open store");
-        let graph = CozoGraphStore::open(temp.path()).expect("open graph");
+        let graph = CozoGraphStore::open(temp.path()).expect("open graph"); // test
         let sym_a = symbol("sym-a", "a", "src/a.rs");
         let sym_b = symbol("sym-b", "b", "src/b.rs");
         let sym_c = symbol("sym-c", "c", "src/c.rs");
@@ -1230,14 +1249,20 @@ api_key_env = "GEMINI_API_KEY"
 
     fn upsert_symbol_and_node(
         store: &aether_store::SqliteStore,
-        graph: &CozoGraphStore,
+        graph: &CozoGraphStore, // test
         symbol: &SymbolRecord,
     ) {
         store.upsert_symbol(symbol.clone()).expect("upsert symbol");
         graph.upsert_symbol_node(symbol).expect("upsert node");
     }
 
-    fn upsert_edge(graph: &CozoGraphStore, source_id: &str, target_id: &str, edge_kind: EdgeKind) {
+    fn upsert_edge(
+        graph: &CozoGraphStore, // test
+        source_id: &str,
+        target_id: &str,
+        edge_kind: EdgeKind,
+    ) {
+        // test
         graph
             .upsert_edge(&ResolvedEdge {
                 source_id: source_id.to_owned(),

@@ -10,9 +10,10 @@ use aether_infer::{
 };
 use aether_memory::{EntityRef, NoteSourceType, ProjectMemoryService, RememberRequest};
 use aether_store::{
-    CommunitySnapshotRecord, CozoGraphStore, DriftAnalysisStateRecord, DriftResultRecord,
-    DriftStore, SirHistoryBaselineSelector, SirHistoryStore, SirStateStore, SqliteStore,
-    SymbolCatalogStore, SymbolRelationStore, TestIntentStore, open_vector_store,
+    CommunitySnapshotRecord, DriftAnalysisStateRecord, DriftResultRecord, DriftStore,
+    SirHistoryBaselineSelector, SirHistoryStore, SirStateStore, SqliteStore, SurrealGraphStore,
+    SymbolCatalogStore, SymbolRelationStore, TestIntentStore, block_on_store_future,
+    open_surreal_graph_store_readonly, open_vector_store,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -212,6 +213,32 @@ impl DriftAnalyzer {
     }
 
     pub fn report(&self, request: DriftReportRequest) -> Result<DriftReportResult, AnalysisError> {
+        match open_surreal_graph_store_readonly(&self.workspace) {
+            Ok(graph) => self.report_internal(Some(&graph), request),
+            Err(aether_store::StoreError::Graph(message))
+                if message.contains(
+                    "configured graph backend 'sqlite' does not support Surreal graph operations",
+                ) =>
+            {
+                self.report_internal(None, request)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    pub fn report_with_graph(
+        &self,
+        graph: &SurrealGraphStore,
+        request: DriftReportRequest,
+    ) -> Result<DriftReportResult, AnalysisError> {
+        self.report_internal(Some(graph), request)
+    }
+
+    fn report_internal(
+        &self,
+        graph: Option<&SurrealGraphStore>,
+        request: DriftReportRequest,
+    ) -> Result<DriftReportResult, AnalysisError> {
         let analyzed_at = now_millis();
         let include_acknowledged = request.include_acknowledged.unwrap_or(false);
         let min_magnitude = request.min_drift_magnitude.unwrap_or(0.0).clamp(0.0, 1.0);
@@ -241,7 +268,6 @@ impl DriftAnalyzer {
         }
 
         let store = SqliteStore::open(&self.workspace)?;
-        let cozo = CozoGraphStore::open(&self.workspace)?;
         let previous_state = store.get_drift_analysis_state()?;
         let changed_symbols =
             self.collect_changed_symbols(&store, resolved_window.commits.as_slice())?;
@@ -258,8 +284,14 @@ impl DriftAnalyzer {
         )?;
         report_records.extend(semantic_records);
 
-        let boundary =
-            self.compute_boundary_records(&store, &cozo, &resolved_window, analyzed_at)?;
+        let boundary = if let Some(graph) = graph {
+            self.compute_boundary_records(&store, graph, &resolved_window, analyzed_at)?
+        } else {
+            BoundaryComputation {
+                records: Vec::new(),
+                current_snapshot: Vec::new(),
+            }
+        };
         report_records.extend(boundary.records);
         if !boundary.current_snapshot.is_empty() && !resolved_window.to_commit.is_empty() {
             store.replace_community_snapshot(
@@ -269,13 +301,20 @@ impl DriftAnalyzer {
             )?;
         }
 
-        let structural = self.compute_structural_records(
-            &store,
-            &cozo,
-            previous_state.as_ref(),
-            &resolved_window,
-            analyzed_at,
-        )?;
+        let structural = if let Some(graph) = graph {
+            self.compute_structural_records(
+                &store,
+                graph,
+                previous_state.as_ref(),
+                &resolved_window,
+                analyzed_at,
+            )?
+        } else {
+            StructuralComputation {
+                records: Vec::new(),
+                snapshot_records: Vec::new(),
+            }
+        };
         report_records.extend(structural.records);
         snapshot_records.extend(structural.snapshot_records);
 
@@ -451,12 +490,19 @@ impl DriftAnalyzer {
 
     pub fn communities(
         &self,
+        request: CommunitiesRequest,
+    ) -> Result<CommunitiesResult, AnalysisError> {
+        let graph = open_surreal_graph_store_readonly(&self.workspace)?;
+        self.communities_with_graph(&graph, request)
+    }
+
+    pub fn communities_with_graph(
+        &self,
+        graph: &SurrealGraphStore,
         _request: CommunitiesRequest,
     ) -> Result<CommunitiesResult, AnalysisError> {
         let store = SqliteStore::open_readonly(&self.workspace)?;
-        let cozo = CozoGraphStore::open(&self.workspace)?;
-        let mut entries = cozo
-            .list_louvain_communities()?
+        let mut entries = block_on_store_future(graph.list_louvain_communities())??
             .into_iter()
             .map(|(symbol_id, community_id)| {
                 let symbol = store.get_symbol_record(symbol_id.as_str())?;
@@ -806,11 +852,11 @@ impl DriftAnalyzer {
     fn compute_boundary_records(
         &self,
         store: &SqliteStore,
-        cozo: &CozoGraphStore,
+        graph: &SurrealGraphStore,
         window: &ResolvedWindow,
         detected_at: i64,
     ) -> Result<BoundaryComputation, AnalysisError> {
-        let assignments = cozo.list_louvain_communities()?;
+        let assignments = block_on_store_future(graph.list_louvain_communities())??;
         let current_snapshot = assignments
             .iter()
             .map(|(symbol_id, community_id)| CommunitySnapshotRecord {
@@ -821,7 +867,8 @@ impl DriftAnalyzer {
             })
             .collect::<Vec<_>>();
         let community_by_symbol = assignments.into_iter().collect::<HashMap<_, _>>();
-        let cross_edges = cozo.list_cross_community_edges(&community_by_symbol)?;
+        let cross_edges =
+            block_on_store_future(graph.list_cross_community_edges(&community_by_symbol))??;
         if cross_edges.is_empty() {
             return Ok(BoundaryComputation {
                 records: Vec::new(),
@@ -905,7 +952,7 @@ impl DriftAnalyzer {
     fn compute_structural_records(
         &self,
         store: &SqliteStore,
-        cozo: &CozoGraphStore,
+        graph: &SurrealGraphStore,
         previous_state: Option<&DriftAnalysisStateRecord>,
         window: &ResolvedWindow,
         detected_at: i64,
@@ -948,7 +995,7 @@ impl DriftAnalyzer {
         let mut records = Vec::new();
         let mut snapshot_records = Vec::new();
 
-        let pagerank = cozo.list_pagerank()?;
+        let pagerank = block_on_store_future(graph.list_pagerank())??;
         if !pagerank.is_empty() {
             let threshold = percentile(
                 pagerank
@@ -1028,7 +1075,7 @@ impl DriftAnalyzer {
             }
         }
 
-        let scc = cozo.list_strongly_connected_components()?;
+        let scc = block_on_store_future(graph.list_strongly_connected_components())??;
         for component in scc.into_iter().filter(|component| component.len() > 1) {
             let mut symbols = component.clone();
             symbols.sort();
@@ -1082,7 +1129,7 @@ impl DriftAnalyzer {
             });
         }
 
-        let components = cozo.list_connected_components()?;
+        let components = block_on_store_future(graph.list_connected_components())??;
         if components.len() > 1 {
             let mut iter = components.into_iter();
             let _main_component = iter.next();
@@ -1752,14 +1799,22 @@ fn now_millis() -> i64 {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use std::fs;
     use std::path::Path;
     use std::process::Command;
 
     use aether_store::{
-        CozoGraphStore, DriftResultRecord, DriftStore, SirHistoryStore, SirMetaRecord,
-        SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord,
+        CozoGraphStore, // test
+        DriftResultRecord,
+        DriftStore,
+        SirHistoryStore,
+        SirMetaRecord, // test
+        SirStateStore,
+        SqliteStore,
+        SymbolCatalogStore,
+        SymbolRecord,
     };
     use tempfile::tempdir;
 
@@ -1897,7 +1952,7 @@ mod tests {
 
         let analyzer = DriftAnalyzer::new(temp.path()).expect("create analyzer");
         let store = SqliteStore::open(temp.path()).expect("open store");
-        let cozo = CozoGraphStore::open(temp.path()).expect("open cozo");
+        let cozo = CozoGraphStore::open(temp.path()).expect("open cozo"); // test
 
         let source = SymbolRecord {
             id: "sym-a".to_owned(),

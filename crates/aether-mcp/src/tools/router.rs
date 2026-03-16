@@ -206,12 +206,15 @@ impl AetherMcpServer {
         Parameters(request): Parameters<AetherBlastRadiusRequest>,
     ) -> Result<Json<AetherBlastRadiusResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_blast_radius");
+        let graph = self.state.surreal_graph().await.ok();
         let server = self.clone();
-        tokio::task::spawn_blocking(move || server.aether_blast_radius_logic(request))
-            .await
-            .map_err(|err| McpError::internal_error(err.to_string(), None))?
-            .map(Json)
-            .map_err(to_mcp_error)
+        tokio::task::spawn_blocking(move || {
+            server.aether_blast_radius_logic_with_graph(graph, request)
+        })
+        .await
+        .map_err(|err| McpError::internal_error(err.to_string(), None))?
+        .map(Json)
+        .map_err(to_mcp_error)
     }
 
     #[tool(
@@ -240,12 +243,15 @@ impl AetherMcpServer {
         Parameters(request): Parameters<AetherDriftReportRequest>,
     ) -> Result<Json<AetherDriftReportResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_drift_report");
+        let graph = self.state.surreal_graph().await.ok();
         let server = self.clone();
-        tokio::task::spawn_blocking(move || server.aether_drift_report_logic(request))
-            .await
-            .map_err(|err| McpError::internal_error(err.to_string(), None))?
-            .map(Json)
-            .map_err(to_mcp_error)
+        tokio::task::spawn_blocking(move || {
+            server.aether_drift_report_logic_with_graph(graph, request)
+        })
+        .await
+        .map_err(|err| McpError::internal_error(err.to_string(), None))?
+        .map(Json)
+        .map_err(to_mcp_error)
     }
 
     #[tool(
@@ -336,12 +342,15 @@ impl AetherMcpServer {
         Parameters(request): Parameters<AetherTraceCauseRequest>,
     ) -> Result<Json<AetherTraceCauseResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_trace_cause");
+        let graph = self.state.surreal_graph().await.ok();
         let server = self.clone();
-        tokio::task::spawn_blocking(move || server.aether_trace_cause_logic(request))
-            .await
-            .map_err(|err| McpError::internal_error(err.to_string(), None))?
-            .map(Json)
-            .map_err(to_mcp_error)
+        tokio::task::spawn_blocking(move || {
+            server.aether_trace_cause_logic_with_graph(graph, request)
+        })
+        .await
+        .map_err(|err| McpError::internal_error(err.to_string(), None))?
+        .map(Json)
+        .map_err(to_mcp_error)
     }
 
     #[tool(

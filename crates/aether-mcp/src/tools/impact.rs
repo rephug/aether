@@ -1,11 +1,17 @@
+use std::sync::Arc;
+
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use aether_analysis::{
-    BlastRadiusRequest, CouplingAnalyzer, RiskLevel as CouplingRiskLevel, TestIntentAnalyzer,
+    AnalysisError, BlastRadiusRequest, BlastRadiusResult, CouplingAnalyzer,
+    RiskLevel as CouplingRiskLevel, TestIntentAnalyzer,
 };
 use aether_core::normalize_path;
-use aether_store::{ProjectNoteStore, SqliteStore, SymbolCatalogStore, TestIntentStore};
+use aether_store::{
+    CouplingStateStore, ProjectNoteStore, SqliteStore, StoreError, SurrealGraphStore,
+    SymbolCatalogStore, TestIntentStore,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -123,6 +129,14 @@ impl AetherMcpServer {
         &self,
         request: AetherBlastRadiusRequest,
     ) -> Result<AetherBlastRadiusResponse, AetherMcpError> {
+        self.aether_blast_radius_logic_with_graph(None, request)
+    }
+
+    pub fn aether_blast_radius_logic_with_graph(
+        &self,
+        graph: Option<Arc<SurrealGraphStore>>,
+        request: AetherBlastRadiusRequest,
+    ) -> Result<AetherBlastRadiusResponse, AetherMcpError> {
         let target_file = normalize_path(request.file.trim());
         if target_file.is_empty() {
             return Ok(AetherBlastRadiusResponse {
@@ -135,14 +149,42 @@ impl AetherMcpServer {
         }
 
         let analyzer = CouplingAnalyzer::new(self.workspace())?;
-        let blast = analyzer.blast_radius(BlastRadiusRequest {
-            file_path: target_file.clone(),
-            min_risk: request
-                .min_risk
-                .unwrap_or(AetherCouplingRiskLevel::Medium)
-                .into(),
-            auto_mine: !self.state.read_only,
-        })?;
+        let min_risk = request
+            .min_risk
+            .unwrap_or(AetherCouplingRiskLevel::Medium)
+            .into();
+        let blast_result = if let Some(graph) = graph.as_deref() {
+            analyzer.blast_radius_with_graph(
+                graph,
+                BlastRadiusRequest {
+                    file_path: target_file.clone(),
+                    min_risk,
+                    auto_mine: !self.state.read_only,
+                },
+            )
+        } else {
+            analyzer.blast_radius(BlastRadiusRequest {
+                file_path: target_file.clone(),
+                min_risk,
+                auto_mine: !self.state.read_only,
+            })
+        };
+        let blast = match blast_result {
+            Ok(blast) => blast,
+            Err(AnalysisError::Store(StoreError::Graph(message)))
+                if message.contains(
+                    "configured graph backend 'sqlite' does not support Surreal graph operations",
+                ) =>
+            {
+                BlastRadiusResult {
+                    target_file: target_file.clone(),
+                    mining_state: SqliteStore::open(self.workspace())?
+                        .get_coupling_mining_state()?,
+                    coupled_files: Vec::new(),
+                }
+            }
+            Err(err) => return Err(err.into()),
+        };
 
         let mining_state = blast
             .mining_state
@@ -187,9 +229,13 @@ impl AetherMcpServer {
             });
         }
 
-        let test_guards = match TestIntentAnalyzer::new(self.workspace())
-            .and_then(|analyzer| analyzer.list_guards_for_target_file(blast.target_file.as_str()))
-        {
+        let test_guards = match TestIntentAnalyzer::new(self.workspace()).and_then(|analyzer| {
+            if let Some(graph) = graph.as_deref() {
+                analyzer.list_guards_for_target_file_with_graph(graph, blast.target_file.as_str())
+            } else {
+                analyzer.list_guards_for_target_file(blast.target_file.as_str())
+            }
+        }) {
             Ok(guards) => {
                 let mapped = guards
                     .into_iter()
