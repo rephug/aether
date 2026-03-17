@@ -16,6 +16,7 @@ pub(crate) struct StalenessHeatmapQuery {
     pub since: Option<String>,
     #[allow(dead_code)]
     pub granularity: Option<String>,
+    pub stale_only: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -52,6 +53,7 @@ fn load_staleness_heatmap(
 ) -> Result<StalenessHeatmapData, String> {
     let since_days = super::common::parse_window_days(params.since.as_deref().or(Some("30d")));
     let cutoff = super::common::cutoff_millis_for_days(since_days);
+    let stale_only = params.stale_only.unwrap_or(false);
 
     let Some(conn) =
         support::open_meta_sqlite_ro(shared.workspace.as_path()).map_err(|e| e.to_string())?
@@ -70,12 +72,25 @@ fn load_staleness_heatmap(
             Err(_) => false,
         };
 
-    if has_fingerprint_data {
-        load_from_fingerprint_history(&conn, cutoff)
+    let mut data = if has_fingerprint_data {
+        load_from_fingerprint_history(&conn, cutoff)?
     } else {
         // Fallback: use drift_results grouped by time and module
-        load_from_drift_results(&conn, cutoff)
+        load_from_drift_results(&conn, cutoff)?
+    };
+
+    // When stale_only is set, zero out cells below the 0.3 threshold
+    if stale_only {
+        for row in &mut data.cells {
+            for cell in row.iter_mut() {
+                if *cell < 0.3 {
+                    *cell = 0.0;
+                }
+            }
+        }
     }
+
+    Ok(data)
 }
 
 fn load_from_fingerprint_history(
