@@ -103,7 +103,7 @@ The `AetherMcpServer` already uses `self.state` after the 7.1 refactor. Creating
 ```toml
 [query]
 index_path = ".aether"              # Path to the live .aether/ directory
-bind_address = "127.0.0.1:9720"     # HTTP + MCP endpoint
+bind_address = "127.0.0.1:9731"     # HTTP + MCP endpoint
 auth_token = ""                      # If set, require Bearer token
 max_concurrent_queries = 32
 read_timeout_ms = 5000

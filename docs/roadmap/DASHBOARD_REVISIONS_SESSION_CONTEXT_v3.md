@@ -43,7 +43,7 @@ The first full E2E validation was run March 1, 2026 against `tokio-rs/mini-redis
 - Feature-gated: `--features dashboard` on cargo build
 - Spawns its own Tokio runtime on a `std::thread::spawn` (separate from LSP's single-threaded runtime)
 - Shares `SharedState` (read-only) with MCP tools — `Arc<SharedState>` passed to router
-- Binds to `127.0.0.1:9720`
+- Binds to `127.0.0.1:9730`
 - `--no-dashboard` CLI flag disables even when feature compiled
 
 ### HTML Templating & Tech Stack

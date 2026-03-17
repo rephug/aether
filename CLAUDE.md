@@ -69,7 +69,7 @@ crates/
 - **Blocking in async:** no `std::thread::sleep` or blocking I/O in async functions
 - **Clone proliferation:** prefer borrowing; flag unnecessary `.clone()` calls
 - **Semantic drift:** if a function's name no longer describes what it does after a change, flag it
-- **SurrealKV lock contention:** `pkill -f aetherd` before running CLI commands if daemon is running
+- **SurrealKV lock contention:** CLI commands auto-detect running daemon via `/api/v1/daemon-status` and degrade gracefully or exit with guidance. Manual `pkill -f aetherd` still works as fallback.
 
 ### Do NOT suggest
 
@@ -161,7 +161,7 @@ Dragged down by `aetherd` god files. The following are refactor candidates but a
 
 ### Known issues
 
-- SurrealKV lock contention: requires `pkill -f aetherd` before CLI commands
+- SurrealKV lock contention: CLI commands now detect running daemon and degrade gracefully or exit with instructions. Manual `pkill -f aetherd` still works as fallback.
 - Boundary Leaker false positives on 11/16 crates (orphaned symbols)
 - Health score `--suggest-splits` crash (sending into closed channel)
 - Post-refactor health score git blame distortion on newly split files

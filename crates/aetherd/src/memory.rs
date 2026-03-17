@@ -232,9 +232,28 @@ pub fn run_ask_command(workspace: &Path, args: AskArgs) -> Result<()> {
         .collect::<Vec<_>>();
 
     let runtime = build_runtime().context("failed to build runtime for ask query")?;
-    let graph = open_surreal_graph_store_readonly(workspace)
-        .ok()
-        .map(Arc::new);
+    let graph = {
+        let skip = aether_config::load_workspace_config(workspace)
+            .ok()
+            .and_then(|cfg| {
+                if matches!(
+                    cfg.storage.graph_backend,
+                    aether_config::GraphBackend::Surreal | aether_config::GraphBackend::Cozo
+                ) {
+                    crate::daemon_detect::detect_running_daemon(&cfg, workspace)
+                } else {
+                    None
+                }
+            });
+        if let Some(ref daemon) = skip {
+            crate::daemon_detect::warn_daemon_detected(daemon, "ask");
+            None
+        } else {
+            open_surreal_graph_store_readonly(workspace)
+                .ok()
+                .map(Arc::new)
+        }
+    };
     let result = runtime
         .block_on(service.ask_with_graph(
             AskQueryRequest {

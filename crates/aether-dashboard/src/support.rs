@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aether_core::normalize_path;
 use aether_store::{DriftStore, SirStateStore};
@@ -25,11 +25,15 @@ const TIMEOUT_ERROR_PREFIX: &str = "__aether_dashboard_timeout__:";
 #[derive(Clone)]
 pub(crate) struct DashboardState {
     pub shared: Arc<SharedState>,
+    pub started_at: Instant,
 }
 
 impl DashboardState {
     pub fn new(shared: Arc<SharedState>) -> Self {
-        Self { shared }
+        Self {
+            shared,
+            started_at: Instant::now(),
+        }
     }
 }
 

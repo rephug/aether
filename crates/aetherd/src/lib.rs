@@ -7,6 +7,7 @@ pub mod context_renderers;
 pub mod context_slicer;
 pub mod continuous;
 pub mod coupling;
+pub mod daemon_detect;
 pub mod drift;
 pub mod fsck;
 pub mod health;

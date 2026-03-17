@@ -680,7 +680,7 @@ mod tests {
         assert!(content.contains(&format!("\"{LEGACY_COZO_GRAPH_STORE}\"")));
         assert!(content.contains("\"CozoDB\""));
         assert!(content.contains("[dashboard]"));
-        assert!(content.contains("port = 9720"));
+        assert!(content.contains("port = 9730"));
         assert!(content.contains("enabled = true"));
         assert!(content.contains("\"cargo fmt --all --check\""));
         assert!(content.contains("\"cargo clippy --workspace -- -D warnings\""));

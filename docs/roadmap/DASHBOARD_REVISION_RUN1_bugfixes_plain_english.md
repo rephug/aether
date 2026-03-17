@@ -266,10 +266,10 @@ aetherd --workspace . --index-once --inference-provider mock 2>&1 | grep -i "ski
 # Test Bug 2: dashboard pages don't deadlock
 aetherd --workspace . --lsp --index --inference-provider mock &
 sleep 3
-curl -s -m 5 http://127.0.0.1:9720/api/v1/overview | head -c 200
-curl -s -m 15 http://127.0.0.1:9720/dashboard/frag/architecture | head -c 200
-curl -s -m 15 http://127.0.0.1:9720/dashboard/frag/causal | head -c 200
-curl -s -m 5 http://127.0.0.1:9720/api/v1/overview | head -c 200
+curl -s -m 5 http://127.0.0.1:9730/api/v1/overview | head -c 200
+curl -s -m 15 http://127.0.0.1:9730/dashboard/frag/architecture | head -c 200
+curl -s -m 15 http://127.0.0.1:9730/dashboard/frag/causal | head -c 200
+curl -s -m 5 http://127.0.0.1:9730/api/v1/overview | head -c 200
 kill %1
 
 PLAIN ENGLISH:

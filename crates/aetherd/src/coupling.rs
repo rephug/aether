@@ -2,13 +2,27 @@ use std::io::Write;
 use std::path::Path;
 
 use aether_analysis::{BlastRadiusRequest, CouplingAnalyzer, MineCouplingRequest};
+use aether_config::{GraphBackend, load_workspace_config};
 use aether_store::{open_surreal_graph_store_readonly, open_surreal_graph_store_sync};
 use anyhow::{Context, Result};
 use serde_json::json;
 
 use crate::cli::{BlastRadiusArgs, CouplingReportArgs, MineCouplingArgs};
 
+fn check_daemon_for_graph(workspace: &Path, command_name: &str) -> Result<()> {
+    let config = load_workspace_config(workspace).context("failed to load workspace config")?;
+    if matches!(
+        config.storage.graph_backend,
+        GraphBackend::Surreal | GraphBackend::Cozo
+    ) && let Some(daemon) = crate::daemon_detect::detect_running_daemon(&config, workspace)
+    {
+        crate::daemon_detect::exit_daemon_detected(&daemon, command_name);
+    }
+    Ok(())
+}
+
 pub fn run_mine_coupling_command(workspace: &Path, args: MineCouplingArgs) -> Result<()> {
+    check_daemon_for_graph(workspace, "mine-coupling")?;
     let analyzer = CouplingAnalyzer::new(workspace).context("failed to initialize analyzer")?;
     let graph = open_surreal_graph_store_sync(workspace)
         .context("failed to open configured surreal graph store")?;
@@ -26,6 +40,7 @@ pub fn run_mine_coupling_command(workspace: &Path, args: MineCouplingArgs) -> Re
 }
 
 pub fn run_blast_radius_command(workspace: &Path, args: BlastRadiusArgs) -> Result<()> {
+    check_daemon_for_graph(workspace, "blast-radius")?;
     let analyzer = CouplingAnalyzer::new(workspace).context("failed to initialize analyzer")?;
     let graph = open_surreal_graph_store_sync(workspace)
         .context("failed to open configured surreal graph store")?;
@@ -46,6 +61,7 @@ pub fn run_blast_radius_command(workspace: &Path, args: BlastRadiusArgs) -> Resu
 }
 
 pub fn run_coupling_report_command(workspace: &Path, args: CouplingReportArgs) -> Result<()> {
+    check_daemon_for_graph(workspace, "coupling-report")?;
     let analyzer = CouplingAnalyzer::new(workspace).context("failed to initialize analyzer")?;
     let graph = open_surreal_graph_store_readonly(workspace)
         .context("failed to open configured surreal graph store")?;

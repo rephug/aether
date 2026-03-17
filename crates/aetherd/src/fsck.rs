@@ -126,53 +126,64 @@ pub fn run_fsck(workspace: &Path, repair: bool, verbose: bool) -> Result<FsckRep
     let mut dangling_edges = Vec::new();
     let mut surreal_graph_opt = None::<SurrealGraphStore>;
     match config.storage.graph_backend {
-        GraphBackend::Surreal => match runtime.block_on(SurrealGraphStore::open(&workspace)) {
-            Ok(graph) => {
-                let mut existing_for_sqlite = HashSet::new();
-                for chunk in sqlite_symbol_ids.chunks(500) {
-                    let chunk_ids = chunk.to_vec();
-                    let found = runtime
-                        .block_on(graph.list_existing_symbol_ids(chunk_ids.as_slice()))
-                        .context("failed to query Surreal symbol node presence")?;
-                    existing_for_sqlite.extend(found);
+        GraphBackend::Surreal | GraphBackend::Cozo => {
+            if let Some(daemon) = crate::daemon_detect::detect_running_daemon(&config, &workspace) {
+                crate::daemon_detect::warn_daemon_detected(&daemon, "fsck");
+                report.graph_check_error = Some(format!(
+                    "AETHER daemon is running (PID {}); graph checks skipped",
+                    daemon.pid
+                ));
+            } else {
+                match runtime.block_on(SurrealGraphStore::open(&workspace)) {
+                    Ok(graph) => {
+                        let mut existing_for_sqlite = HashSet::new();
+                        for chunk in sqlite_symbol_ids.chunks(500) {
+                            let chunk_ids = chunk.to_vec();
+                            let found = runtime
+                                .block_on(graph.list_existing_symbol_ids(chunk_ids.as_slice()))
+                                .context("failed to query Surreal symbol node presence")?;
+                            existing_for_sqlite.extend(found);
+                        }
+
+                        missing_graph_node_ids = sqlite_symbol_ids
+                            .iter()
+                            .filter(|symbol_id| !existing_for_sqlite.contains(symbol_id.as_str()))
+                            .cloned()
+                            .collect::<Vec<_>>();
+
+                        let graph_symbol_ids = runtime
+                            .block_on(graph.list_all_symbol_ids())
+                            .context("failed to list Surreal graph symbol IDs")?;
+                        report.graph_nodes_in_surreal = graph_symbol_ids.len();
+
+                        phantom_graph_node_ids = graph_symbol_ids
+                            .iter()
+                            .filter(|symbol_id| !sqlite_symbol_ids_set.contains(symbol_id.as_str()))
+                            .cloned()
+                            .collect::<Vec<_>>();
+
+                        let edges = runtime
+                            .block_on(graph.list_dependency_edges())
+                            .context("failed to list Surreal dependency edges")?;
+                        dangling_edges = edges
+                            .into_iter()
+                            .filter(|edge| {
+                                !sqlite_symbol_ids_set.contains(edge.source_symbol_id.as_str())
+                                    || !sqlite_symbol_ids_set
+                                        .contains(edge.target_symbol_id.as_str())
+                            })
+                            .collect::<Vec<_>>();
+
+                        surreal_graph_opt = Some(graph);
+                    }
+                    Err(err) => {
+                        report.graph_check_error =
+                            Some(format!("failed to open Surreal graph store: {err}"));
+                    }
                 }
-
-                missing_graph_node_ids = sqlite_symbol_ids
-                    .iter()
-                    .filter(|symbol_id| !existing_for_sqlite.contains(symbol_id.as_str()))
-                    .cloned()
-                    .collect::<Vec<_>>();
-
-                let graph_symbol_ids = runtime
-                    .block_on(graph.list_all_symbol_ids())
-                    .context("failed to list Surreal graph symbol IDs")?;
-                report.graph_nodes_in_surreal = graph_symbol_ids.len();
-
-                phantom_graph_node_ids = graph_symbol_ids
-                    .iter()
-                    .filter(|symbol_id| !sqlite_symbol_ids_set.contains(symbol_id.as_str()))
-                    .cloned()
-                    .collect::<Vec<_>>();
-
-                let edges = runtime
-                    .block_on(graph.list_dependency_edges())
-                    .context("failed to list Surreal dependency edges")?;
-                dangling_edges = edges
-                    .into_iter()
-                    .filter(|edge| {
-                        !sqlite_symbol_ids_set.contains(edge.source_symbol_id.as_str())
-                            || !sqlite_symbol_ids_set.contains(edge.target_symbol_id.as_str())
-                    })
-                    .collect::<Vec<_>>();
-
-                surreal_graph_opt = Some(graph);
             }
-            Err(err) => {
-                report.graph_check_error =
-                    Some(format!("failed to open Surreal graph store: {err}"));
-            }
-        },
-        GraphBackend::Sqlite | GraphBackend::Cozo => {
+        }
+        GraphBackend::Sqlite => {
             report.graph_check_error = Some(format!(
                 "graph backend '{}' does not expose Surreal fsck checks; skipped",
                 config.storage.graph_backend.as_str()

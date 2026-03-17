@@ -372,7 +372,7 @@ When `--features dashboard` is enabled:
 {
     let dashboard = aether_dashboard::dashboard_router(state.clone());
     app = app.nest("/dashboard", dashboard);
-    tracing::info!("Dashboard available at http://127.0.0.1:9720/dashboard/");
+    tracing::info!("Dashboard available at http://127.0.0.1:9730/dashboard/");
 }
 ```
 
@@ -445,7 +445,7 @@ All loaded from CDN. No local node_modules, no bundler. For air-gapped environme
 
 1. `cargo build --features dashboard` compiles aetherd with embedded static files.
 2. `cargo build` (no features) does NOT include dashboard (404 on `/dashboard/`).
-3. Dashboard loads at `http://127.0.0.1:9720/dashboard/` when feature enabled.
+3. Dashboard loads at `http://127.0.0.1:9730/dashboard/` when feature enabled.
 4. HTMX navigation between pages works without full page reloads.
 5. All 5 JSON API endpoints return valid data from SharedState.
 6. HTMX fragment endpoints return valid HTML snippets.

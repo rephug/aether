@@ -23,7 +23,7 @@ AETHER is a Rust multi-crate workspace (~65K LOC, 16 crates) that creates persis
 - **Baseline workspace score:** 44/100 (Watch)
 - **Worst crate:** `aether-store` at 100/100 (Critical) — God File + Legacy Residue
 - **MCP stdio validated:** `aether-mcp` binary connects via Claude Code, 20 tools working
-- **aether-query HTTP validated:** `/health`, `/info`, `/mcp` all responding on port 9721, read-only mode confirmed
+- **aether-query HTTP validated:** `/health`, `/info`, `/mcp` all responding on port 9731, read-only mode confirmed
 
 ---
 
@@ -55,7 +55,7 @@ AETHER is a Rust multi-crate workspace (~65K LOC, 16 crates) that creates persis
 ## Known Issues (Not Blocking 8.10)
 
 - `aether-mcp` and `aether-query` fight over SurrealKV LOCK — only one can open a workspace at a time
-- `aether-query` binds to port 9721 by default (dashboard config uses 9720)
+- `aether-query` binds to port 9731 by default (dashboard config uses 9730)
 - Incomplete SurrealDB migration: `aether-analysis/src/causal.rs`, `aether-analysis/src/drift.rs`, `aether-memory/src/unified_query.rs` still use `CozoGraphStore::open()` directly
 
 ---

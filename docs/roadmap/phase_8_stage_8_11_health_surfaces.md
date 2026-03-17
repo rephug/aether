@@ -395,7 +395,7 @@ The MCP tools recompute on every call — agent interactions are infrequent enou
 
 ## Pass Criteria
 
-1. Dashboard at `http://127.0.0.1:9720/dashboard/` shows health score panel with hotspot table
+1. Dashboard at `http://127.0.0.1:9730/dashboard/` shows health score panel with hotspot table
 2. Archetype distribution renders as colored pills or bar segments
 3. Trend sparkline shows data from score history (or "no history" placeholder if first run)
 4. `aether_health_hotspots` MCP tool returns correct data when called via MCP client
@@ -510,7 +510,7 @@ VALIDATION
 
 14) Start dashboard and verify health-score panel renders:
     cargo run -p aetherd --features dashboard -- --workspace . &
-    curl http://127.0.0.1:9720/api/v1/health-score | python3 -m json.tool
+    curl http://127.0.0.1:9730/api/v1/health-score | python3 -m json.tool
 
 15) Test CLI features:
     cargo run -p aetherd --bin aetherd -- health-score --workspace . --suggest-splits

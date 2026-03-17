@@ -61,7 +61,7 @@ fn default_index_path() -> PathBuf {
 }
 
 fn default_bind() -> String {
-    "127.0.0.1:9721".to_owned()
+    "127.0.0.1:9731".to_owned()
 }
 
 fn default_max_concurrent() -> usize {
@@ -166,7 +166,7 @@ warn_after_minutes = 10
         let empty_cfg = load_query_config_from_path(&empty).expect("empty defaults");
 
         assert_eq!(missing_cfg.query.index_path, std::path::PathBuf::from("."));
-        assert_eq!(missing_cfg.query.bind_address, "127.0.0.1:9721");
+        assert_eq!(missing_cfg.query.bind_address, "127.0.0.1:9731");
         assert!(missing_cfg.query.auth_token.is_empty());
         assert_eq!(empty_cfg.query.max_concurrent_queries, 32);
         assert_eq!(empty_cfg.staleness.warn_after_minutes, 30);

@@ -10,6 +10,15 @@ use serde_json::json;
 use crate::cli::TestIntentsArgs;
 
 pub fn run_test_intents_command(workspace: &Path, args: TestIntentsArgs) -> Result<()> {
+    let config = aether_config::load_workspace_config(workspace)
+        .context("failed to load workspace config")?;
+    if matches!(
+        config.storage.graph_backend,
+        aether_config::GraphBackend::Surreal | aether_config::GraphBackend::Cozo
+    ) && let Some(daemon) = crate::daemon_detect::detect_running_daemon(&config, workspace)
+    {
+        crate::daemon_detect::exit_daemon_detected(&daemon, "test-intents");
+    }
     let file_path = normalize_path(args.file.trim());
     if file_path.is_empty() {
         return write_json_to_stdout(&json!({
