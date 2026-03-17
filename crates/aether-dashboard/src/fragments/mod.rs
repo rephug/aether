@@ -14,17 +14,20 @@ mod blast_radius;
 mod causal;
 mod changes;
 mod context;
+mod context_export;
 mod continuous;
 mod coupling;
 mod decompose;
 mod drift_table;
 mod file;
+mod fingerprint;
 mod flow;
 mod glossary;
 mod graph;
 mod health;
 mod health_score;
 mod overview;
+mod presets;
 mod prompts;
 mod search_results;
 mod spec;
@@ -111,5 +114,14 @@ pub(crate) fn fragment_router() -> Router<Arc<DashboardState>> {
         .route(
             "/dashboard/frag/task-context",
             get(task_context::task_context_fragment),
+        )
+        .route(
+            "/dashboard/frag/context-export",
+            get(context_export::context_export_fragment),
+        )
+        .route("/dashboard/frag/presets", get(presets::presets_fragment))
+        .route(
+            "/dashboard/frag/fingerprint",
+            get(fingerprint::fingerprint_fragment),
         )
 }

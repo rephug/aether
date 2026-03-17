@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 
 use crate::support::DashboardState;
 
@@ -16,18 +16,21 @@ mod causal_chain;
 pub(crate) mod changes;
 pub(crate) mod common;
 pub(crate) mod context;
+pub(crate) mod context_export;
 pub(crate) mod continuous;
 pub(crate) mod coupling;
 pub(crate) mod decompose;
 pub(crate) mod difficulty;
 pub(crate) mod drift;
 pub(crate) mod file;
+pub(crate) mod fingerprint;
 pub(crate) mod flow;
 pub(crate) mod glossary;
 mod graph;
 pub(crate) mod health;
 pub(crate) mod health_score;
 mod overview;
+pub(crate) mod presets;
 pub(crate) mod prompts;
 mod search;
 pub(crate) mod spec;
@@ -102,5 +105,23 @@ pub(crate) fn api_router() -> Router<Arc<DashboardState>> {
         .route(
             "/api/v1/task-history",
             get(task_context::task_context_handler),
+        )
+        .route(
+            "/api/v1/context-targets",
+            get(context_export::context_export_handler),
+        )
+        .route("/api/v1/presets", get(presets::presets_handler))
+        .route("/api/v1/presets", post(presets::create_preset_handler))
+        .route(
+            "/api/v1/presets/{name}",
+            delete(presets::delete_preset_handler),
+        )
+        .route(
+            "/api/v1/fingerprint-summary",
+            get(fingerprint::fingerprint_summary_handler),
+        )
+        .route(
+            "/api/v1/fingerprint-history",
+            get(fingerprint::fingerprint_history_handler),
         )
 }
