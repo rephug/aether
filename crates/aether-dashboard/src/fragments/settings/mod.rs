@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use aether_config::load_workspace_config;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::response::Html;
 use maud::html;
 
@@ -95,9 +96,14 @@ pub(crate) async fn settings_fragment(State(_state): State<Arc<DashboardState>>)
 }
 
 /// Individual section fragment — dispatches to the correct section renderer.
+///
+/// Accepts query parameters via HTMX `hx-include="closest form"` so that
+/// conditional fields (e.g. provider-specific inputs) can re-render based
+/// on the user's unsaved dropdown selection rather than the on-disk config.
 pub(crate) async fn settings_section_fragment(
     State(state): State<Arc<DashboardState>>,
     Path(section): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Html<String> {
     let workspace = state.shared.workspace.clone();
     let config = match load_workspace_config(&workspace) {
@@ -112,9 +118,9 @@ pub(crate) async fn settings_section_fragment(
     };
 
     let markup = match section.as_str() {
-        "inference" => inference::render(&config),
-        "embeddings" => embeddings::render(&config),
-        "search" => search::render(&config),
+        "inference" => inference::render(&config, &params),
+        "embeddings" => embeddings::render(&config, &params),
+        "search" => search::render(&config, &params),
         "indexing" => indexing::render(&config, &workspace),
         "dashboard" => dashboard_cfg::render(&config),
         "generation" => generation::render(&config),

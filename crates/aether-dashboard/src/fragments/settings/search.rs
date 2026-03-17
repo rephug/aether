@@ -1,11 +1,17 @@
+use std::collections::HashMap;
+
 use aether_config::AetherConfig;
 use maud::{Markup, html};
 
 use super::helpers;
 
-pub(crate) fn render(config: &AetherConfig) -> Markup {
+pub(crate) fn render(config: &AetherConfig, params: &HashMap<String, String>) -> Markup {
     let c = &config.search;
-    let reranker_str = c.reranker.as_str();
+    let saved_reranker = c.reranker.as_str();
+    let reranker_str = params
+        .get("reranker")
+        .map(|s| s.as_str())
+        .unwrap_or(saved_reranker);
 
     html! {
         form hx-post="/api/v1/settings/search"

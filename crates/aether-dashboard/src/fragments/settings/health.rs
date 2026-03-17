@@ -186,6 +186,52 @@ pub(crate) fn render(config: &AetherConfig) -> Markup {
             None,
         ))
 
+        // Dead Features
+        (helpers::section_divider("Dead Features"))
+
+        (helpers::number_input(
+            "health_score.dead_feature_warn",
+            "Dead Feature Warning",
+            hs.dead_feature_warn,
+            "Dead feature gate count warning threshold",
+            Some("1"),
+            None,
+            None,
+        ))
+
+        (helpers::number_input(
+            "health_score.dead_feature_fail",
+            "Dead Feature Failure",
+            hs.dead_feature_fail,
+            "Dead feature gate count failure threshold",
+            Some("1"),
+            None,
+            None,
+        ))
+
+        // Stale References
+        (helpers::section_divider("Stale References"))
+
+        (helpers::number_input(
+            "health_score.stale_ref_warn",
+            "Stale Ref Warning",
+            hs.stale_ref_warn,
+            "Stale reference count warning threshold",
+            Some("1"),
+            None,
+            None,
+        ))
+
+        (helpers::number_input(
+            "health_score.stale_ref_fail",
+            "Stale Ref Failure",
+            hs.stale_ref_fail,
+            "Stale reference count failure threshold",
+            Some("1"),
+            None,
+            None,
+        ))
+
         // TODO Density
         (helpers::section_divider("TODO Density"))
 

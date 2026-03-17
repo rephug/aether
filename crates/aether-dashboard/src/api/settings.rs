@@ -196,14 +196,16 @@ pub(crate) async fn reset_section_handler(
         }
     }
 
-    // Re-load the config and render the section form with the fresh defaults
+    // Re-load the config and render the section form with the fresh defaults.
+    // Pass empty params — after reset there are no unsaved overrides.
     let config = load_workspace_config(&state.shared.workspace).unwrap_or_default();
     let workspace = state.shared.workspace.clone();
+    let no_params = HashMap::new();
 
     let markup = match section.as_str() {
-        "inference" => crate::fragments::settings::inference::render(&config),
-        "embeddings" => crate::fragments::settings::embeddings::render(&config),
-        "search" => crate::fragments::settings::search::render(&config),
+        "inference" => crate::fragments::settings::inference::render(&config, &no_params),
+        "embeddings" => crate::fragments::settings::embeddings::render(&config, &no_params),
+        "search" => crate::fragments::settings::search::render(&config, &no_params),
         "indexing" => crate::fragments::settings::indexing::render(&config, &workspace),
         "dashboard" => crate::fragments::settings::dashboard_cfg::render(&config),
         "generation" => crate::fragments::settings::generation::render(&config),
@@ -845,7 +847,8 @@ fn build_health(
     // Health score config (structural thresholds)
     let mut hs = Map::new();
 
-    // Warn/fail pairs — validate that fail > warn
+    // Warn/fail pairs — validate that fail > warn.
+    // Only validate + write pairs whose fields are actually present in the form.
     let warn_fail_usize_pairs = &[
         ("file_loc_warn", "file_loc_fail"),
         ("trait_method_warn", "trait_method_fail"),
@@ -857,6 +860,12 @@ fn build_health(
     for (warn_key, fail_key) in warn_fail_usize_pairs {
         let hs_warn_key = format!("health_score.{warn_key}");
         let hs_fail_key = format!("health_score.{fail_key}");
+
+        // Skip pairs where neither field is present in the submitted form.
+        if !form.contains_key(&hs_warn_key) && !form.contains_key(&hs_fail_key) {
+            continue;
+        }
+
         let warn_val = parse_usize_min(form, &hs_warn_key, 1);
         let fail_val = parse_usize_min(form, &hs_fail_key, 1);
 

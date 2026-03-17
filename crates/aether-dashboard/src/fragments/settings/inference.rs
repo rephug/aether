@@ -1,11 +1,19 @@
+use std::collections::HashMap;
+
 use aether_config::AetherConfig;
 use maud::{Markup, html};
 
 use super::helpers;
 
-pub(crate) fn render(config: &AetherConfig) -> Markup {
+pub(crate) fn render(config: &AetherConfig, params: &HashMap<String, String>) -> Markup {
     let c = &config.inference;
-    let provider_str = c.provider.as_str();
+    let saved_provider = c.provider.as_str();
+    // Use query-param override if present (from HTMX hx-include on dropdown change),
+    // otherwise fall back to the saved config value.
+    let provider_str = params
+        .get("provider")
+        .map(|s| s.as_str())
+        .unwrap_or(saved_provider);
 
     html! {
         form hx-post="/api/v1/settings/inference"
