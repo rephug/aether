@@ -33,6 +33,7 @@ mod overview;
 pub(crate) mod presets;
 pub(crate) mod prompts;
 mod search;
+pub(crate) mod settings;
 pub(crate) mod spec;
 pub(crate) mod symbol;
 pub(crate) mod task_context;
@@ -123,5 +124,13 @@ pub(crate) fn api_router() -> Router<Arc<DashboardState>> {
         .route(
             "/api/v1/fingerprint-history",
             get(fingerprint::fingerprint_history_handler),
+        )
+        .route(
+            "/api/v1/settings/{section}",
+            get(settings::get_section_handler).post(settings::save_section_handler),
+        )
+        .route(
+            "/api/v1/settings/{section}/reset",
+            post(settings::reset_section_handler),
         )
 }

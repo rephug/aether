@@ -30,6 +30,7 @@ mod overview;
 mod presets;
 mod prompts;
 mod search_results;
+pub(crate) mod settings;
 mod spec;
 mod symbol;
 mod task_context;
@@ -123,5 +124,10 @@ pub(crate) fn fragment_router() -> Router<Arc<DashboardState>> {
         .route(
             "/dashboard/frag/fingerprint",
             get(fingerprint::fingerprint_fragment),
+        )
+        .route("/dashboard/frag/settings", get(settings::settings_fragment))
+        .route(
+            "/dashboard/frag/settings/{section}",
+            get(settings::settings_section_fragment),
         )
 }

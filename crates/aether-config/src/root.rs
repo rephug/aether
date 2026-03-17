@@ -98,6 +98,10 @@ pub enum ConfigError {
     TomlParse(#[from] toml::de::Error),
     #[error("failed to serialize config TOML: {0}")]
     TomlSerialize(#[from] toml::ser::Error),
+    #[error("toml edit error: {0}")]
+    TomlEdit(#[from] toml_edit::TomlError),
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 pub fn aether_dir(workspace_root: impl AsRef<Path>) -> PathBuf {
@@ -148,6 +152,137 @@ pub fn save_workspace_config(
     let content = toml::to_string_pretty(&normalized)?;
     fs::write(config_path(workspace_root), content)?;
     Ok(())
+}
+
+/// Save a single config section while preserving TOML comments and formatting.
+///
+/// Uses `toml_edit` to parse the existing file, merge the given JSON values into
+/// the specified section, and write back. Falls back to `save_workspace_config()`
+/// if the config file does not yet exist.
+pub fn save_workspace_config_preserving_comments(
+    workspace_root: impl AsRef<Path>,
+    section: &str,
+    values: &serde_json::Value,
+) -> Result<(), ConfigError> {
+    let workspace_root = workspace_root.as_ref();
+    let path = config_path(workspace_root);
+
+    if !path.exists() {
+        // No existing file — create one via the standard path, then merge.
+        fs::create_dir_all(aether_dir(workspace_root))?;
+        let config = AetherConfig::default();
+        save_workspace_config(workspace_root, &config)?;
+    }
+
+    let raw = fs::read_to_string(&path)?;
+    let mut doc: toml_edit::DocumentMut = raw.parse()?;
+
+    // Get or create the target section table.
+    if doc.get(section).is_none() {
+        doc[section] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let table = doc[section].as_table_mut().ok_or_else(|| {
+        std::io::Error::other(format!("config section '{section}' is not a table"))
+    })?;
+
+    if let serde_json::Value::Object(map) = values {
+        merge_json_into_toml_table(table, map);
+    }
+
+    fs::write(&path, doc.to_string())?;
+    Ok(())
+}
+
+/// Reset a config section to its defaults while preserving other sections.
+pub fn reset_section_to_defaults(
+    workspace_root: impl AsRef<Path>,
+    section: &str,
+) -> Result<(), ConfigError> {
+    let defaults = AetherConfig::default();
+    let defaults_value = serde_json::to_value(&defaults)?;
+    let section_defaults = defaults_value
+        .get(section)
+        .cloned()
+        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+
+    let workspace_root = workspace_root.as_ref();
+    let path = config_path(workspace_root);
+
+    if !path.exists() {
+        return save_workspace_config(workspace_root, &defaults);
+    }
+
+    let raw = fs::read_to_string(&path)?;
+    let mut doc: toml_edit::DocumentMut = raw.parse()?;
+
+    // Replace section entirely with defaults.
+    doc.remove(section);
+    doc[section] = toml_edit::Item::Table(toml_edit::Table::new());
+
+    let table = doc[section].as_table_mut().unwrap();
+    if let serde_json::Value::Object(map) = &section_defaults {
+        merge_json_into_toml_table(table, map);
+    }
+
+    fs::write(&path, doc.to_string())?;
+    Ok(())
+}
+
+fn merge_json_into_toml_table(
+    table: &mut toml_edit::Table,
+    map: &serde_json::Map<String, serde_json::Value>,
+) {
+    for (key, value) in map {
+        match value {
+            serde_json::Value::Object(inner) => {
+                // Nested table (e.g., search.thresholds).
+                if table.get(key).is_none() {
+                    table[key] = toml_edit::Item::Table(toml_edit::Table::new());
+                }
+                if let Some(sub) = table[key].as_table_mut() {
+                    merge_json_into_toml_table(sub, inner);
+                }
+            }
+            serde_json::Value::String(s) => {
+                table[key] = toml_edit::value(s.as_str());
+            }
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    table[key] = toml_edit::value(i);
+                } else if let Some(f) = n.as_f64() {
+                    table[key] = toml_edit::value(f);
+                }
+            }
+            serde_json::Value::Bool(b) => {
+                table[key] = toml_edit::value(*b);
+            }
+            serde_json::Value::Array(arr) => {
+                let mut toml_arr = toml_edit::Array::new();
+                for item in arr {
+                    match item {
+                        serde_json::Value::String(s) => {
+                            toml_arr.push(s.as_str());
+                        }
+                        serde_json::Value::Number(n) => {
+                            if let Some(i) = n.as_i64() {
+                                toml_arr.push(i);
+                            } else if let Some(f) = n.as_f64() {
+                                toml_arr.push(f);
+                            }
+                        }
+                        serde_json::Value::Bool(b) => {
+                            toml_arr.push(*b);
+                        }
+                        _ => {}
+                    }
+                }
+                table[key] = toml_edit::value(toml_arr);
+            }
+            serde_json::Value::Null => {
+                table.remove(key);
+            }
+        }
+    }
 }
 
 pub(crate) fn parse_workspace_config_str(raw: &str) -> Result<AetherConfig, ConfigError> {

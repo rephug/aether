@@ -133,6 +133,7 @@ fn main() {
             commands::get_workspace_path,
             commands::pause_indexing,
             commands::resume_indexing,
+            commands::restart_app,
         ])
         .setup(move |app| {
             // Build system tray.
