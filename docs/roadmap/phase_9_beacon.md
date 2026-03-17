@@ -112,7 +112,7 @@ No forced updates. No telemetry. Update check can be disabled in settings.
 
 | Stage | Name | Description | Claude Code Sessions | Dependencies |
 |-------|------|-------------|----------------------|--------------|
-| 9.1 | Tauri Shell + System Tray | Complete dashboard with 10.x/R.x operational pages, then embed in Tauri native window with system tray | 3–4 | Phase 8 + 10.1-10.3 + R.1 complete, Stage 7.6 (dashboard) |
+| 9.1 | Tauri Shell + System Tray | Part A: Dashboard pages for 10.x/R.x. Part B: Tauri native window + tray. Part C: Visual polish for product-ready look | 4–5 | Phase 8 + 10.1-10.3 + R.1 complete, Stage 7.6 (dashboard) |
 | 9.2 | Configuration UI | Settings screens replacing TOML editing for all 15+ config sections | 2–3 | 9.1 |
 | 9.3 | Onboarding Wizard | First-run experience: workspace picker, dependency detection, provider setup | 1–2 | 9.2 |
 | 9.4 | Enhanced Visualizations | New D3 pages: drift timeline, coupling chord, memory timeline, health scorecard, staleness heatmap | 2–3 | 9.1 (can parallel with 9.2/9.3) |
@@ -135,7 +135,7 @@ No forced updates. No telemetry. Update check can be disabled in settings.
 - 9.3 depends on 9.2 (wizard uses the same settings components)
 - 9.4 is completely independent of 9.2/9.3 (visualization pages, not config)
 
-**Estimated total: 9–14 Claude Code sessions.**
+**Estimated total: 10–15 Claude Code sessions.**
 
 ---
 

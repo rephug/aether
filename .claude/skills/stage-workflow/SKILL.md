@@ -104,6 +104,7 @@ Phase 9 (The Beacon) wraps AETHER in a Tauri 2.x desktop application. Key archit
 - **Stage 9.1 is two parts:**
   - **Part A:** Dashboard completion — add 6 operational pages for batch pipeline (10.1), continuous monitor (10.2), task context (10.6), context export (R.1), presets (R.3), and fingerprint history (10.1). All work in `crates/aether-dashboard/`.
   - **Part B:** Tauri shell — new `crates/aether-desktop/` wrapping the completed dashboard in a native window with system tray.
+  - **Part C:** Visual polish — consistent component styling, unified D3 color palette, dark mode audit, CDN deps bundled locally, responsive sidebar collapse, empty states, page transitions. CSS/HTML/JS only — no Rust API changes.
 - **New crate:** `crates/aether-desktop/` — Tauri app that embeds `aetherd` directly (no subprocess)
 - **Frontend:** HTMX + D3.js + Tailwind CSS (same as existing 27+ page dashboard, Decision #91) — NO React/Vue/Svelte
 - **Single binary:** Tauri app compiles all aetherd code in-process (Decision #92)

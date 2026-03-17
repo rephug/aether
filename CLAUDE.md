@@ -287,7 +287,7 @@ Read the spec before starting each stage:
 
 | Stage | Spec file | What it builds |
 |-------|-----------|----------------|
-| 9.1 | `phase_9_stage_9_1_tauri_shell.md` | Part A: Dashboard pages for batch, continuous, task context, export, presets, fingerprints. Part B: Tauri 2.x shell, embed aetherd, webview, system tray |
+| 9.1 | `phase_9_stage_9_1_tauri_shell.md` | Part A: Dashboard pages for batch, continuous, task context, export, presets, fingerprints. Part B: Tauri 2.x shell, embed aetherd, webview, system tray. Part C: Visual polish — consistent cards, unified D3 colors, dark mode audit, bundle CDN deps locally, responsive sidebar |
 | 9.2 | `phase_9_stage_9_2_configuration_ui.md` | Settings UI replacing TOML editing for all 15+ config sections, hot-reload |
 | 9.3 | `phase_9_stage_9_3_onboarding_wizard.md` | First-run wizard: workspace picker, dep detection, provider setup |
 | 9.4 | `phase_9_stage_9_4_enhanced_visualizations.md` | D3 viz: drift timeline, coupling chord, memory timeline, health scorecard, staleness heatmap, blast radius upgrade |

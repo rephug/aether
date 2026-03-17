@@ -165,6 +165,44 @@ Dashboard
 - Workspace Cargo.toml: add `aether-desktop` to members, `desktop` feature flag
 - `tauri.conf.json` with window size, title, CSP policy, and plugin configuration
 
+#### Part C: Dashboard visual polish
+
+The dashboard is functional but was built incrementally across Phases 7–10 without a unified visual design pass. Before shipping as a desktop product, apply a cohesive polish layer:
+
+**Layout & Navigation:**
+- Sidebar: refine spacing, add section grouping headers (Intelligence, Operations, Analysis), active state highlight with accent color bar
+- Responsive: sidebar collapse to icon-only mode on narrow windows (important for Tauri where users resize freely)
+- Page transitions: subtle fade or slide on HTMX fragment swap (CSS transitions, not JS animation)
+
+**Cards & Data Display:**
+- Consistent card component: rounded corners, subtle shadow, hover state, consistent padding across all pages
+- Metric cards: standardize the large-number + sparkline + status-color pattern used in health scoring across all pages
+- Tables: striped rows, sticky headers, hover highlight, consistent column alignment
+- Empty states: replace bare "No data" text with illustrated empty states (simple SVG icons + helpful message)
+
+**Color & Typography:**
+- Review the earthy palette (surface-0 through surface-4) — ensure sufficient contrast in both light and dark modes
+- Accent colors: establish a clear hierarchy (cyan = primary action, orange = warning, green = success, red = error)
+- Code/monospace text: consistent styling for symbol names, file paths, TOML keys
+- Status badges: standardize the green/yellow/red badge pattern used across health, drift, staleness
+
+**Charts & Visualizations:**
+- Consistent D3 color palette across all 9+ chart modules (currently each chart picks its own colors)
+- Shared tooltip style (currently varies between charts)
+- Loading states: skeleton placeholders while D3 charts render, not blank divs
+- Chart containers: consistent border, background, and padding
+
+**Dark Mode:**
+- Audit all 27+ pages for dark mode contrast issues
+- Ensure D3 charts respect dark mode (axis labels, grid lines, tooltip backgrounds)
+- Sidebar and header backgrounds should feel distinct but not jarring in dark mode
+
+**Desktop-specific:**
+- Remove CDN dependencies for Tailwind, D3, HTMX, Tippy — bundle locally for offline use in the Tauri app (CDN won't work without internet)
+- Window title bar integration: page title reflected in the Tauri window title
+
+**SCOPE GUARD for Part C:** This is a CSS/HTML/JS polish pass. Do NOT restructure Rust API routes, change data models, or modify the axum server logic. All changes are in `src/static/`, `src/fragments/`, and `src/templates/`.
+
 ### Out of scope
 
 - Settings/configuration UI (Stage 9.2)
@@ -311,4 +349,14 @@ aether-graph-algo = { path = "../aether-graph-algo" }
 17. `cargo fmt --all --check`, `cargo clippy -p aether-desktop -- -D warnings` pass.
 18. `cargo test -p aether-desktop` passes (unit tests for commands and tray state machine).
 
-### Estimated Claude Code sessions: 3–4
+**Part C — Visual polish:**
+
+19. All CDN dependencies (Tailwind, D3, HTMX, Tippy) are bundled locally — dashboard works offline in Tauri.
+20. Sidebar has section grouping headers and collapses to icon-only mode when window is narrow.
+21. Cards, tables, and metric displays use a consistent component style across all pages.
+22. D3 charts use a unified color palette and shared tooltip style.
+23. Dark mode renders correctly across all pages — no contrast issues, charts respect dark backgrounds.
+24. Empty states show SVG icon + message instead of bare text.
+25. Page transitions have a subtle CSS fade on HTMX swap.
+
+### Estimated Claude Code sessions: 4–5
