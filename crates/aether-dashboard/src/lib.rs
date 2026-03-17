@@ -31,6 +31,33 @@ pub fn dashboard_router(state: Arc<SharedState>) -> Router {
         .with_state(app_state)
 }
 
+/// Stateless wizard-only router — serves the setup wizard UI without
+/// requiring a `SharedState` (no SQLite store, no graph, no config).
+pub fn wizard_router() -> Router {
+    Router::new()
+        .route("/dashboard", get(wizard_shell))
+        .route("/dashboard/", get(wizard_shell))
+        .route("/dashboard/static/{*path}", get(wizard_static))
+        .merge(fragments::wizard::wizard_fragment_router())
+        .route("/dashboard/{*path}", get(wizard_shell_catchall))
+}
+
+async fn wizard_shell() -> Response {
+    embedded_file_response("wizard.html")
+}
+
+async fn wizard_shell_catchall(Path(_path): Path<String>) -> Response {
+    embedded_file_response("wizard.html")
+}
+
+async fn wizard_static(Path(path): Path<String>) -> Response {
+    let normalized = path.trim_start_matches('/');
+    if normalized.is_empty() {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    embedded_file_response(normalized)
+}
+
 async fn dashboard_shell(State(_state): State<Arc<support::DashboardState>>) -> Response {
     embedded_file_response("index.html")
 }

@@ -51,6 +51,7 @@
     "shortDescription": "Semantic Intelligence for Code and Documents"
   },
   "plugins": {
+    "dialog": {},
     "notification": {},
     "shell": {},
     "updater": {

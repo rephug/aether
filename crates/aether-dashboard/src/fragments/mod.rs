@@ -41,6 +41,7 @@ mod symbol;
 mod task_context;
 mod time_machine;
 mod tour;
+pub(crate) mod wizard;
 mod xray;
 
 pub(crate) fn fragment_router() -> Router<Arc<DashboardState>> {
@@ -155,5 +156,19 @@ pub(crate) fn fragment_router() -> Router<Arc<DashboardState>> {
         .route(
             "/dashboard/frag/staleness-heatmap",
             get(staleness_heatmap::staleness_heatmap_fragment),
+        )
+        // Phase 9.3: Wizard (for "Run Setup Again" from sidebar)
+        .route(
+            "/dashboard/frag/wizard/step/{n}",
+            get(wizard::wizard_step_with_state),
+        )
+        .route(
+            "/dashboard/frag/wizard/detect",
+            get(wizard::wizard_detect_with_state),
+        )
+        // Phase 9.3: First-run progress (post-wizard restart)
+        .route(
+            "/dashboard/frag/first-run-progress",
+            get(wizard::progress::first_run_progress_fragment),
         )
 }
