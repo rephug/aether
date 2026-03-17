@@ -16,6 +16,7 @@ members = [
     "crates/aether-lsp",
     "crates/aether-mcp",
     "crates/aether-query",
+    "crates/aether-desktop",
 ]
 resolver = "2"
 

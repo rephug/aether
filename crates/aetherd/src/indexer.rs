@@ -63,6 +63,9 @@ pub struct IndexerConfig {
     pub inference_model: Option<String>,
     pub inference_endpoint: Option<String>,
     pub inference_api_key_env: Option<String>,
+    /// When set, the indexer skips processing debounced events while the flag is true.
+    /// Events are still accumulated so they fire once the indexer is resumed.
+    pub pause_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1361,6 +1364,15 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
             ) {
                 tracing::warn!(error = ?err, "watch event error");
             }
+        }
+
+        // Skip processing while paused — events stay queued and fire on resume.
+        if config
+            .pause_flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            continue;
         }
 
         let now = Instant::now();

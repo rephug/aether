@@ -371,6 +371,14 @@ where
 pub(crate) fn html_empty_state(title: &str, cmd: Option<&str>) -> Markup {
     html! {
         div class="empty-state" {
+            // Empty state SVG icon — a folder with magnifying glass
+            svg class="empty-state-icon" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" {
+                rect x="4" y="12" width="32" height="24" rx="2" stroke="currentColor" stroke-width="1.5" fill="none" {}
+                path d="M4 16h32" stroke="currentColor" stroke-width="1.5" {}
+                path d="M4 12l4-4h10l4 4" stroke="currentColor" stroke-width="1.5" fill="none" {}
+                circle cx="34" cy="30" r="8" stroke="currentColor" stroke-width="1.5" fill="none" {}
+                line x1="40" y1="36" x2="46" y2="42" stroke="currentColor" stroke-width="2" stroke-linecap="round" {}
+            }
             div class="empty-state-title" { (title) }
             @if let Some(cmd) = cmd {
                 code class="empty-state-cmd" { (cmd) }
@@ -382,6 +390,11 @@ pub(crate) fn html_empty_state(title: &str, cmd: Option<&str>) -> Markup {
 pub(crate) fn html_error_state(title: &str, detail: &str) -> Markup {
     html! {
         div class="empty-state" {
+            svg class="empty-state-icon" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" {
+                circle cx="24" cy="24" r="20" stroke="currentColor" stroke-width="1.5" fill="none" {}
+                path d="M24 14v12" stroke="currentColor" stroke-width="2" stroke-linecap="round" {}
+                circle cx="24" cy="32" r="1.5" fill="currentColor" {}
+            }
             div class="empty-state-title" { (title) }
             div class="empty-state-msg" { (detail) }
         }
