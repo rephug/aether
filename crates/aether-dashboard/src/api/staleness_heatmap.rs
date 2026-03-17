@@ -72,23 +72,14 @@ fn load_staleness_heatmap(
             Err(_) => false,
         };
 
-    let mut data = if has_fingerprint_data {
-        load_from_fingerprint_history(&conn, cutoff)?
+    let stale_threshold = if stale_only { Some(0.3) } else { None };
+
+    let data = if has_fingerprint_data {
+        load_from_fingerprint_history(&conn, cutoff, stale_threshold)?
     } else {
         // Fallback: use drift_results grouped by time and module
-        load_from_drift_results(&conn, cutoff)?
+        load_from_drift_results(&conn, cutoff, stale_threshold)?
     };
-
-    // When stale_only is set, zero out cells below the 0.3 threshold
-    if stale_only {
-        for row in &mut data.cells {
-            for cell in row.iter_mut() {
-                if *cell < 0.3 {
-                    *cell = 0.0;
-                }
-            }
-        }
-    }
 
     Ok(data)
 }
@@ -96,6 +87,7 @@ fn load_staleness_heatmap(
 fn load_from_fingerprint_history(
     conn: &rusqlite::Connection,
     cutoff: Option<i64>,
+    stale_threshold: Option<f64>,
 ) -> Result<StalenessHeatmapData, String> {
     // Query fingerprint changes: group by date and by module (parent dir)
     // We join to symbols to get file_path for module grouping
@@ -160,12 +152,13 @@ fn load_from_fingerprint_history(
         }
     }
 
-    build_heatmap_from_date_data(module_date_data)
+    build_heatmap_from_date_data(module_date_data, stale_threshold)
 }
 
 fn load_from_drift_results(
     conn: &rusqlite::Connection,
     cutoff: Option<i64>,
+    stale_threshold: Option<f64>,
 ) -> Result<StalenessHeatmapData, String> {
     let mut stmt = match conn.prepare(
         r#"
@@ -244,11 +237,12 @@ fn load_from_drift_results(
         })
         .collect();
 
-    build_heatmap_from_date_data(converted)
+    build_heatmap_from_date_data(converted, stale_threshold)
 }
 
 fn build_heatmap_from_date_data(
     module_date_data: HashMap<String, BTreeMap<String, (usize, usize)>>,
+    stale_threshold: Option<f64>,
 ) -> Result<StalenessHeatmapData, String> {
     if module_date_data.is_empty() {
         return Ok(StalenessHeatmapData {
@@ -268,8 +262,38 @@ fn build_heatmap_from_date_data(
     all_dates.sort();
     all_dates.truncate(MAX_DAYS);
 
+    // When stale_only is active, filter out modules where no cell reaches the
+    // threshold BEFORE sorting/truncating. This ensures truly stale modules
+    // aren't pushed out by active-but-not-stale modules filling the top slots.
+    let filtered_data: HashMap<String, BTreeMap<String, (usize, usize)>> =
+        if let Some(threshold) = stale_threshold {
+            module_date_data
+                .into_iter()
+                .filter(|(_module, date_map)| {
+                    // Keep module only if at least one cell reaches the threshold
+                    date_map.values().any(|(changes, total)| {
+                        if *total == 0 {
+                            false
+                        } else {
+                            (*changes as f64 / *total as f64) >= threshold
+                        }
+                    })
+                })
+                .collect()
+        } else {
+            module_date_data
+        };
+
+    if filtered_data.is_empty() {
+        return Ok(StalenessHeatmapData {
+            modules: Vec::new(),
+            dates: all_dates,
+            cells: Vec::new(),
+        });
+    }
+
     // Sort modules by total activity (most active first), truncate
-    let mut module_activity: Vec<(String, usize)> = module_date_data
+    let mut module_activity: Vec<(String, usize)> = filtered_data
         .iter()
         .map(|(module, date_map)| {
             let total: usize = date_map.values().map(|(changes, _)| *changes).sum();
@@ -288,7 +312,7 @@ fn build_heatmap_from_date_data(
             all_dates
                 .iter()
                 .map(|date| {
-                    module_date_data
+                    filtered_data
                         .get(module)
                         .and_then(|date_map| date_map.get(date))
                         .map(|(changes, total)| {

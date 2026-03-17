@@ -1,5 +1,5 @@
 {
-  "$schema": "https://raw.githubusercontent.com/nicegui-org/nicegui/refs/tags/v2.17.0/nicegui/resources/.schemas/tauri-v2.json",
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/tauri-v2.5.0/crates/tauri-cli/config.schema.json",
   "productName": "AETHER",
   "version": "0.1.0",
   "identifier": "com.aether.desktop",
@@ -18,7 +18,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' http://127.0.0.1:*; script-src 'self' 'unsafe-inline' 'unsafe-eval' http://127.0.0.1:*; style-src 'self' 'unsafe-inline' http://127.0.0.1:*; connect-src 'self' http://127.0.0.1:*; img-src 'self' data: http://127.0.0.1:*; font-src 'self' http://127.0.0.1:*"
+      "csp": "default-src 'self' http://127.0.0.1:*; script-src 'self' 'unsafe-inline' 'unsafe-eval' http://127.0.0.1:*; style-src 'self' 'unsafe-inline' http://127.0.0.1:*; connect-src 'self' http://127.0.0.1:* https://github.com https://api.github.com; img-src 'self' data: http://127.0.0.1:*; font-src 'self' http://127.0.0.1:*"
     },
     "trayIcon": {
       "iconPath": "icons/icon.png",
@@ -28,13 +28,35 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["msi", "dmg", "appimage", "deb"],
     "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
       "icons/icon.png"
-    ]
+    ],
+    "windows": {
+      "wix": {
+        "language": "en-US"
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    },
+    "linux": {
+      "deb": {},
+      "appimage": {}
+    },
+    "category": "DeveloperTool",
+    "shortDescription": "Semantic Intelligence for Code and Documents"
   },
   "plugins": {
     "notification": {},
-    "shell": {}
+    "shell": {},
+    "updater": {
+      "endpoints": [
+        "https://github.com/rephug/aether/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

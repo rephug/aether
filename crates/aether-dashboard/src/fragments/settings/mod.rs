@@ -21,6 +21,7 @@ pub(crate) mod helpers;
 pub(crate) mod indexing;
 pub(crate) mod inference;
 pub(crate) mod search;
+pub(crate) mod updates;
 pub(crate) mod watcher;
 
 const TABS: &[(&str, &str)] = &[
@@ -37,6 +38,7 @@ const TABS: &[(&str, &str)] = &[
     ("batch", "Batch"),
     ("watcher", "Watcher"),
     ("continuous", "Continuous"),
+    ("updates", "Updates"),
 ];
 
 /// Main settings page — renders the tab bar and loads the first section via HTMX.
@@ -131,6 +133,7 @@ pub(crate) async fn settings_section_fragment(
         "batch" => batch::render(&config),
         "watcher" => watcher::render(&config),
         "continuous" => continuous::render(&config),
+        "updates" => updates::render(),
         _ => html! {
             div class="text-text-muted text-sm py-8 text-center" {
                 "Unknown settings section: " (section)
