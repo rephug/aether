@@ -46,3 +46,10 @@ pub fn resume_indexing(pause: State<'_, PauseFlag>) -> Result<String, String> {
     pause.0.store(false, Ordering::Relaxed);
     Ok("Indexing resumed".to_owned())
 }
+
+#[allow(unreachable_code)]
+#[tauri::command]
+pub fn restart_app(app_handle: tauri::AppHandle) -> Result<String, String> {
+    app_handle.restart();
+    Ok("Restarting".to_owned())
+}
