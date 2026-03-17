@@ -10,7 +10,7 @@ pub(crate) async fn health_scorecard_fragment(
     State(_state): State<Arc<DashboardState>>,
 ) -> Html<String> {
     support::html_markup_response(html! {
-        div class="space-y-4" hx-get="/dashboard/frag/health-scorecard" hx-trigger="every 30s" hx-target="this" hx-swap="outerHTML" {
+        div class="space-y-4" hx-get="/dashboard/frag/health-scorecard" hx-trigger="every 30s" hx-target="this" hx-swap="outerHTML" hx-on-htmx-after-swap="if(window.initHealthScorecard) window.initHealthScorecard()" {
             (support::explanation_header(
                 "Health Scorecard",
                 "At-a-glance project health metrics with trend indicators.",

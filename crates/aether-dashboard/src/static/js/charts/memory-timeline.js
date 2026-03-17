@@ -1,6 +1,11 @@
 (function () {
   const tip = () => window.AetherTooltip || { show() {}, hide() {} };
 
+  function escapeHtml(str) {
+    if (!str) return '';
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
   function empty(el, msg) {
     el.innerHTML = `<div class="chart-empty"><div class="empty-state"><div class="empty-state-title">${msg}</div></div></div>`;
   }
@@ -83,9 +88,9 @@
       .on('mouseover', (event, d) => {
         d3.select(event.currentTarget).attr('r', 9);
         tip().show(event,
-          `<strong>${d.title || d.event_type}</strong><br/>` +
+          `<strong>${escapeHtml(d.title) || escapeHtml(d.event_type)}</strong><br/>` +
           new Date(d.timestamp).toLocaleDateString() + '<br/>' +
-          (d.detail ? `<em>${d.detail.substring(0, 150)}</em><br/>` : '') +
+          (d.detail ? `<em>${escapeHtml(d.detail.substring(0, 150))}</em><br/>` : '') +
           (d.affected_count ? `Affected: ${d.affected_count} symbols` : '')
         );
       })
@@ -97,13 +102,14 @@
         const detail = document.getElementById('memory-timeline-detail');
         if (detail) {
           detail.classList.remove('hidden');
+          // All user-controlled strings are escaped via escapeHtml() to prevent XSS
           detail.innerHTML =
             '<div class="flex items-center justify-between mb-2">' +
-            `<strong style="color:${TYPE_COLORS[d.event_type] || '#94a3b8'}">${d.title || d.event_type}</strong>` +
+            `<strong style="color:${TYPE_COLORS[d.event_type] || '#94a3b8'}">${escapeHtml(d.title) || escapeHtml(d.event_type)}</strong>` +
             '<button onclick="this.closest(\'#memory-timeline-detail\').classList.add(\'hidden\')" class="text-text-secondary hover:text-text-primary text-lg">&times;</button>' +
             '</div>' +
             `<div class="text-xs text-text-secondary mb-2">${new Date(d.timestamp).toLocaleString()}</div>` +
-            (d.detail ? `<p class="text-sm mb-2">${d.detail}</p>` : '') +
+            (d.detail ? `<p class="text-sm mb-2">${escapeHtml(d.detail)}</p>` : '') +
             (d.affected_count ? `<div class="text-xs text-text-secondary">Affected symbols: ${d.affected_count}</div>` : '');
         }
       });
