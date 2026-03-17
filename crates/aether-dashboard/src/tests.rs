@@ -643,7 +643,7 @@ async fn static_shell_serves_index_with_htmx() {
     assert!(body.contains("hx-get=\"/dashboard/frag/anatomy\""));
     assert!(body.contains("id=\"ask-container\""));
     assert!(body.contains("hx-post=\"/dashboard/frag/ask\""));
-    assert!(body.contains("🕐 Recent Changes"));
+    assert!(body.contains("Recent Changes"));
     assert!(body.contains("hx-get=\"/dashboard/frag/changes\""));
 }
 

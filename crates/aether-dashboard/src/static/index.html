@@ -11,7 +11,7 @@
     }
   </script>
 
-  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="/dashboard/static/vendor/tailwindcss.js"></script>
   <script>
     tailwind.config = {
       darkMode: 'class',
@@ -44,13 +44,11 @@
     }
   </script>
 
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/htmx/2.0.4/htmx.min.js"></script>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/tippy.js/6.3.7/tippy.css" />
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/tippy.js/6.3.7/tippy-bundle.umd.min.js"></script>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script src="/dashboard/static/vendor/d3.v7.min.js"></script>
+  <script src="/dashboard/static/vendor/htmx.min.js"></script>
+  <link rel="stylesheet" href="/dashboard/static/vendor/tippy.css" />
+  <script src="/dashboard/static/vendor/tippy-bundle.umd.min.js"></script>
+  <link rel="stylesheet" href="/dashboard/static/vendor/fonts.css" />
 
   <link rel="stylesheet" href="/dashboard/static/style.css" />
   <link rel="stylesheet" href="/dashboard/static/css/aether-dashboard.css" />
@@ -60,6 +58,7 @@
   <script src="/dashboard/static/js/aether-responsive.js" defer></script>
   <script src="/dashboard/static/js/aether-animate.js" defer></script>
 
+  <script src="/dashboard/static/js/aether-palette.js" defer></script>
   <script src="/dashboard/static/charts.js" defer></script>
   <script src="/dashboard/static/js/charts/xray-cards.js" defer></script>
   <script src="/dashboard/static/js/charts/xray-hotspots.js" defer></script>
@@ -80,32 +79,41 @@
       </div>
 
       <nav class="flex-1 overflow-y-auto p-2 space-y-0.5">
-        <a href="#" class="nav-link active" hx-get="/dashboard/frag/anatomy" hx-target="#main-content" hx-push-url="/dashboard/anatomy" onclick="setActiveNav(this)"><span class="sidebar-label">📖 Anatomy</span></a>
-        <a href="#" class="nav-link" hx-get="/dashboard/frag/tour" hx-target="#main-content" hx-push-url="/dashboard/tour" onclick="setActiveNav(this)"><span class="sidebar-label">🗺️ Tour</span></a>
-        <a href="#" class="nav-link" hx-get="/dashboard/frag/flow" hx-target="#main-content" hx-push-url="/dashboard/flow" onclick="setActiveNav(this)"><span class="sidebar-label">🔄 Trace Flow</span></a>
-        <a href="#" class="nav-link" hx-get="/dashboard/frag/glossary" hx-target="#main-content" hx-push-url="/dashboard/glossary" onclick="setActiveNav(this)"><span class="sidebar-label">📚 Glossary</span></a>
-        <a href="#" class="nav-link" hx-get="/dashboard/frag/prompts" hx-target="#main-content" hx-push-url="/dashboard/prompts" onclick="setActiveNav(this)"><span class="sidebar-label">💬 Prompts</span></a>
-        <a href="#" class="nav-link" hx-get="/dashboard/frag/changes" hx-target="#main-content" hx-push-url="/dashboard/changes" onclick="setActiveNav(this)"><span class="sidebar-label">🕐 Recent Changes</span></a>
+        <div class="sidebar-section-header"><span class="sidebar-label">Explore</span></div>
+        <a href="#" class="nav-link active" hx-get="/dashboard/frag/anatomy" hx-target="#main-content" hx-push-url="/dashboard/anatomy" onclick="setActiveNav(this)"><span class="sidebar-label">Anatomy</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/tour" hx-target="#main-content" hx-push-url="/dashboard/tour" onclick="setActiveNav(this)"><span class="sidebar-label">Tour</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/flow" hx-target="#main-content" hx-push-url="/dashboard/flow" onclick="setActiveNav(this)"><span class="sidebar-label">Trace Flow</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/glossary" hx-target="#main-content" hx-push-url="/dashboard/glossary" onclick="setActiveNav(this)"><span class="sidebar-label">Glossary</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/prompts" hx-target="#main-content" hx-push-url="/dashboard/prompts" onclick="setActiveNav(this)"><span class="sidebar-label">Prompts</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/changes" hx-target="#main-content" hx-push-url="/dashboard/changes" onclick="setActiveNav(this)"><span class="sidebar-label">Recent Changes</span></a>
 
-        <div class="my-2 border-t border-surface-3/40 dark:border-slate-700"></div>
-
+        <div class="sidebar-section-header"><span class="sidebar-label">Intelligence</span></div>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/overview" hx-target="#main-content" hx-push-url="/dashboard/overview" onclick="setActiveNav(this)"><span class="sidebar-label">Overview</span></a>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/graph" hx-target="#main-content" hx-push-url="/dashboard/graph" onclick="setActiveNav(this)"><span class="sidebar-label">Graph</span></a>
-        <a href="#" class="nav-link" hx-get="/dashboard/frag/health" hx-target="#main-content" hx-push-url="/dashboard/health" onclick="setActiveNav(this)"><span class="sidebar-label">Health</span></a>
-        <a href="#" class="nav-link" hx-get="/dashboard/frag/coupling" hx-target="#main-content" hx-push-url="/dashboard/coupling" onclick="setActiveNav(this)"><span class="sidebar-label">Coupling Map</span></a>
-        <a href="#" class="nav-link" hx-get="/dashboard/frag/drift-table" hx-target="#main-content" hx-push-url="/dashboard/drift" onclick="setActiveNav(this)"><span class="sidebar-label">Drift Report</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/blast-radius" hx-target="#main-content" hx-push-url="/dashboard/blast-radius" onclick="setActiveNav(this)"><span class="sidebar-label">Blast Radius</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/architecture" hx-target="#main-content" hx-push-url="/dashboard/architecture" onclick="setActiveNav(this)"><span class="sidebar-label">Architecture</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/causal" hx-target="#main-content" hx-push-url="/dashboard/causal" onclick="setActiveNav(this)"><span class="sidebar-label">Causal Explorer</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/time-machine" hx-target="#main-content" hx-push-url="/dashboard/time-machine" onclick="setActiveNav(this)"><span class="sidebar-label">Time Machine</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/xray" hx-target="#main-content" hx-push-url="/dashboard/xray" onclick="setActiveNav(this)"><span class="sidebar-label">X-Ray</span></a>
 
-        <div class="my-2 border-t border-surface-3/40 dark:border-slate-700"></div>
-
+        <div class="sidebar-section-header"><span class="sidebar-label">Context</span></div>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/context-export" hx-target="#main-content" hx-push-url="/dashboard/context-export" onclick="setActiveNav(this)"><span class="sidebar-label">Context Export</span></a>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/task-context" hx-target="#main-content" hx-push-url="/dashboard/task-context" onclick="setActiveNav(this)"><span class="sidebar-label">Task Context</span></a>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/presets" hx-target="#main-content" hx-push-url="/dashboard/presets" onclick="setActiveNav(this)"><span class="sidebar-label">Presets</span></a>
 
-        <div class="my-2 border-t border-surface-3/40 dark:border-slate-700"></div>
-
+        <div class="sidebar-section-header"><span class="sidebar-label">Operations</span></div>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/batch" hx-target="#main-content" hx-push-url="/dashboard/batch" onclick="setActiveNav(this)"><span class="sidebar-label">Batch Pipeline</span></a>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/continuous" hx-target="#main-content" hx-push-url="/dashboard/continuous" onclick="setActiveNav(this)"><span class="sidebar-label">Continuous Monitor</span></a>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/fingerprint" hx-target="#main-content" hx-push-url="/dashboard/fingerprint" onclick="setActiveNav(this)"><span class="sidebar-label">Fingerprint History</span></a>
+
+        <div class="sidebar-section-header"><span class="sidebar-label">Analysis</span></div>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/health" hx-target="#main-content" hx-push-url="/dashboard/health" onclick="setActiveNav(this)"><span class="sidebar-label">Health</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/health-score" hx-target="#main-content" hx-push-url="/dashboard/health-score" onclick="setActiveNav(this)"><span class="sidebar-label">Health Score</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/coupling" hx-target="#main-content" hx-push-url="/dashboard/coupling" onclick="setActiveNav(this)"><span class="sidebar-label">Coupling Map</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/drift-table" hx-target="#main-content" hx-push-url="/dashboard/drift" onclick="setActiveNav(this)"><span class="sidebar-label">Drift Report</span></a>
+
+        <div class="sidebar-section-header"><span class="sidebar-label">Search</span></div>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/search" hx-target="#main-content" hx-push-url="/dashboard/search" onclick="setActiveNav(this)"><span class="sidebar-label">Search</span></a>
       </nav>
 
       <div class="px-3 py-3 border-t border-surface-3/40 dark:border-slate-700 space-y-2">

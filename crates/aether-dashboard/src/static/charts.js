@@ -1,11 +1,13 @@
 (function () {
+  // Use AetherPalette if available, otherwise fall back to static values.
+  var P = window.AetherPalette || {};
   const BASE_COLORS = {
-    text: '#64748b',
-    border: '#cbd5e1',
-    node: '#0ea5a8',
-    warn: '#f59e0b',
-    danger: '#ef4444',
-    ok: '#10b981',
+    text:   (typeof P.text === 'function' ? P.text() : P.text) || '#64748b',
+    border: (typeof P.border === 'function' ? P.border() : P.border) || '#cbd5e1',
+    node:   P.cyan || '#0ea5a8',
+    warn:   P.warn || '#f59e0b',
+    danger: P.danger || '#ef4444',
+    ok:     P.ok || '#10b981',
   };
   const GRAPH_COLOR_MODE_KEY = 'aether-graph-color-mode';
   const GRAPH_COLOR_LAYER = 'layer';
