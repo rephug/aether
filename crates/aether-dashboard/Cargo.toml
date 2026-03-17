@@ -25,6 +25,7 @@ chrono = { version = "0.4", features = ["serde"] }
 rusqlite = { workspace = true }
 toml = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+walkdir = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

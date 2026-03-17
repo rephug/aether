@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AETHER Setup</title>
+
+  <script>
+    if (localStorage.theme === 'dark' || (!localStorage.theme && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+      document.documentElement.classList.add('dark');
+    }
+  </script>
+
+  <script src="/dashboard/static/vendor/tailwindcss.js"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            surface: {
+              '0': '#f7f7f4',
+              '1': '#ffffff',
+              '2': '#eef0ea',
+              '3': '#d7dbd0',
+              '4': '#c7ccb9',
+            },
+            text: {
+              primary: '#1b1e16',
+              secondary: '#485041',
+              muted: '#6f7769',
+            },
+            accent: {
+              cyan: '#0ea5a8',
+              orange: '#ea7d28',
+              green: '#1b9a59',
+              red: '#c94a34',
+              purple: '#5e6db3',
+              yellow: '#b7871d'
+            }
+          }
+        }
+      }
+    }
+  </script>
+
+  <script src="/dashboard/static/vendor/htmx.min.js"></script>
+  <link rel="stylesheet" href="/dashboard/static/vendor/fonts.css" />
+  <link rel="stylesheet" href="/dashboard/static/style.css" />
+  <link rel="stylesheet" href="/dashboard/static/css/aether-dashboard.css" />
+  <script src="/dashboard/static/js/aether-theme.js" defer></script>
+</head>
+
+<body class="h-full bg-gradient-to-br from-surface-0 via-surface-1 to-surface-2 text-text-primary dark:bg-slate-950 dark:text-slate-100">
+  <div class="flex items-center justify-center min-h-full p-4">
+    <div class="w-full max-w-2xl">
+      <div id="wizard-content"
+           hx-get="/dashboard/frag/wizard/step/1"
+           hx-trigger="load"
+           hx-target="this">
+        <div class="flex items-center justify-center h-64">
+          <div class="text-text-muted dark:text-slate-400 text-sm">Loading...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
