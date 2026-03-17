@@ -35,12 +35,15 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler mold clang
+          sudo apt-get install -y protobuf-compiler mold clang \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libglib2.0-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
       - name: Lint
         env:
           PROTOC: /usr/bin/protoc
+          PKG_CONFIG_PATH: /usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig
         run: cargo clippy --workspace --features aetherd/dashboard -- -D warnings
 
   test:
@@ -83,6 +86,31 @@ jobs:
           PROTOC: /usr/bin/protoc
           CARGO_BUILD_JOBS: "2"
         run: cargo test -p ${{ matrix.crate }}
+
+  test-desktop:
+    name: test-aether-desktop
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler mold clang \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libglib2.0-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: aether-desktop
+      - name: Test
+        env:
+          PROTOC: /usr/bin/protoc
+          CARGO_BUILD_JOBS: "2"
+          PKG_CONFIG_PATH: /usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+        run: cargo test -p aether-desktop
 
   test-aetherd-dashboard:
     name: test-aetherd-dashboard

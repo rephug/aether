@@ -266,6 +266,7 @@ git branch -d feature/phase9-stage9-1-tauri-shell
 
 **Worktree paths:** `/home/rephu/aether-phase9-*` (siblings of `projects/`, NOT inside it)
 **The `-b` flag is required** — omitting it causes commits directly on main.
+**NEVER commit directly to main.** Always create a feature branch, push, and create a PR via `gh pr create` with a descriptive title and body.
 
 ## Decision register
 
