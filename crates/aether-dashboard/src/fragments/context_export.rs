@@ -114,7 +114,9 @@ pub(crate) async fn context_export_fragment(
                             @for preset in &data.available_presets {
                                 button
                                     class="px-2 py-1 text-xs rounded border border-surface-3/50 hover:bg-surface-2/60 dark:hover:bg-slate-700/60"
-                                    onclick=(format!("applyPreset('{}', {})", preset.name, preset.budget))
+                                    data-preset-name=(preset.name.as_str())
+                                    data-preset-budget=(preset.budget.to_string())
+                                    onclick="applyPreset(this.dataset.presetName, Number(this.dataset.presetBudget))"
                                     title=(preset.description.as_str()) {
                                     (preset.name.as_str())
                                 }

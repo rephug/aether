@@ -14,7 +14,13 @@ use aether_store::SqliteStore;
 use tauri::Manager;
 
 /// Shared pause flag — the indexer thread checks this before processing events.
-pub struct PauseFlag(pub AtomicBool);
+pub struct PauseFlag(pub Arc<AtomicBool>);
+
+impl PauseFlag {
+    pub fn from(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+}
 
 /// Application state shared with Tauri commands.
 pub struct AppState {
@@ -85,9 +91,13 @@ fn main() {
         store,
     };
 
+    // Create shared pause flag for indexer control.
+    let pause_flag = Arc::new(AtomicBool::new(false));
+
     // Start indexer on a background thread.
     let indexer_workspace = workspace.clone();
     let sir_concurrency = config.inference.concurrency.max(1);
+    let indexer_pause = pause_flag.clone();
     std::thread::spawn(move || {
         let indexer_config = aetherd::indexer::IndexerConfig {
             workspace: indexer_workspace,
@@ -105,6 +115,7 @@ fn main() {
             inference_model: None,
             inference_endpoint: None,
             inference_api_key_env: None,
+            pause_flag: Some(indexer_pause),
         };
         if let Err(err) = aetherd::indexer::run_indexing_loop(indexer_config) {
             tracing::error!(error = %err, "indexer loop exited with error");
@@ -116,7 +127,7 @@ fn main() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_shell::init())
         .manage(app_state)
-        .manage(PauseFlag(AtomicBool::new(false)))
+        .manage(PauseFlag::from(pause_flag))
         .invoke_handler(tauri::generate_handler![
             commands::get_status,
             commands::get_workspace_path,

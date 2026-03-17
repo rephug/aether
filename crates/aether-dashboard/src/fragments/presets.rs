@@ -90,10 +90,11 @@ pub(crate) async fn presets_fragment(State(state): State<Arc<DashboardState>>) -
                                 @if !preset.is_builtin {
                                     button
                                         class="text-xs text-red-500 hover:underline"
-                                        hx-delete=(format!("/api/v1/presets/{}", support::percent_encode(&preset.name)))
-                                        hx-target="#main-content"
                                         hx-confirm=(format!("Delete preset '{}'?", preset.name))
-                                        hx-swap="innerHTML" {
+                                        onclick=(format!(
+                                            "fetch('/api/v1/presets/{}', {{method:'DELETE'}}).then(function(){{htmx.ajax('GET','/dashboard/frag/presets','#main-content')}})",
+                                            support::percent_encode(&preset.name)
+                                        )) {
                                         "Delete"
                                     }
                                 }

@@ -284,6 +284,7 @@ fn run(cli: Cli) -> Result<()> {
         inference_model: cli.inference_model,
         inference_endpoint: cli.inference_endpoint,
         inference_api_key_env: cli.inference_api_key_env,
+        pause_flag: None,
     };
 
     if cli.lsp {

@@ -170,6 +170,7 @@ fn run_index_and_seed_sir(workspace: &Path) -> Result<()> {
         inference_endpoint: None,
         embeddings_only: false,
         inference_api_key_env: None,
+        pause_flag: None,
     })?;
 
     let store = SqliteStore::open(workspace)?;
@@ -928,6 +929,7 @@ vector_backend = "sqlite"
         inference_endpoint: None,
         inference_api_key_env: None,
         embeddings_only: false,
+        pause_flag: None,
     })?;
 
     let store = SqliteStore::open(workspace)?;
@@ -1774,6 +1776,7 @@ fn mcp_search_hybrid_falls_back_when_embedding_api_key_is_missing() -> Result<()
         inference_endpoint: None,
         inference_api_key_env: None,
         embeddings_only: false,
+        pause_flag: None,
     })?;
 
     let env_name = unique_env_name("AETHER_TEST_MCP_MISSING_EMBED_KEY");

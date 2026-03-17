@@ -59,6 +59,7 @@ vector_backend = "sqlite"
         inference_model: None,
         inference_endpoint: None,
         inference_api_key_env: None,
+        pause_flag: None,
     };
 
     run_initial_index_once(&config)?;
