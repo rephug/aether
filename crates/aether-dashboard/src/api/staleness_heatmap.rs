@@ -74,12 +74,26 @@ fn load_staleness_heatmap(
 
     let stale_threshold = if stale_only { Some(0.3) } else { None };
 
-    let data = if has_fingerprint_data {
+    let mut data = if has_fingerprint_data {
         load_from_fingerprint_history(&conn, cutoff, stale_threshold)?
     } else {
         // Fallback: use drift_results grouped by time and module
         load_from_drift_results(&conn, cutoff, stale_threshold)?
     };
+
+    // Cell-level zeroing: when stale_only is active, zero out individual cells
+    // below the threshold. Module-level filtering (in build_heatmap_from_date_data)
+    // already ensured each kept module has at least one stale cell; this pass
+    // hides sub-threshold noise within those modules.
+    if stale_only {
+        for row in &mut data.cells {
+            for cell in row.iter_mut() {
+                if *cell < 0.3 {
+                    *cell = 0.0;
+                }
+            }
+        }
+    }
 
     Ok(data)
 }

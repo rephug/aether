@@ -123,6 +123,31 @@ pub(crate) fn render() -> Markup {
                                     notes.textContent = info.body.substring(0, 200);
                                     result.appendChild(notes);
                                 }
+                                // Install Update button
+                                var installBr = document.createElement('br');
+                                result.appendChild(installBr);
+                                var installBtn = document.createElement('button');
+                                installBtn.type = 'button';
+                                installBtn.className = 'mt-2 px-4 py-2 rounded-md bg-accent-cyan/20 text-accent-cyan text-sm font-medium hover:bg-accent-cyan/30 transition-colors border border-accent-cyan/30';
+                                installBtn.textContent = 'Install Update';
+                                installBtn.onclick = function() {
+                                    installBtn.disabled = true;
+                                    installBtn.textContent = 'Installing\u2026';
+                                    installBtn.className = 'mt-2 px-4 py-2 rounded-md bg-surface-3/20 text-text-muted text-sm font-medium border border-surface-3/30 cursor-not-allowed';
+                                    window.__TAURI__.core.invoke('install_update').then(function() {
+                                        installBtn.textContent = 'Update installed \u2014 restart to apply';
+                                        installBtn.className = 'mt-2 px-4 py-2 rounded-md bg-accent-green/20 text-accent-green text-sm font-medium border border-accent-green/30';
+                                    }).catch(function(err) {
+                                        installBtn.disabled = false;
+                                        installBtn.textContent = 'Install Update';
+                                        installBtn.className = 'mt-2 px-4 py-2 rounded-md bg-accent-cyan/20 text-accent-cyan text-sm font-medium hover:bg-accent-cyan/30 transition-colors border border-accent-cyan/30';
+                                        var errMsg = document.createElement('span');
+                                        errMsg.className = 'ml-2 text-xs text-accent-red';
+                                        errMsg.textContent = 'Install failed: ' + err;
+                                        installBtn.parentNode.appendChild(errMsg);
+                                    });
+                                };
+                                result.appendChild(installBtn);
                             } else {
                                 result.textContent = '';
                                 var ok = document.createElement('span');
