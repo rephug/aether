@@ -17,8 +17,10 @@ mod context;
 mod context_export;
 mod continuous;
 mod coupling;
+mod coupling_chord;
 mod decompose;
 mod drift_table;
+mod drift_timeline;
 mod file;
 mod fingerprint;
 mod flow;
@@ -26,12 +28,15 @@ mod glossary;
 mod graph;
 mod health;
 mod health_score;
+mod health_scorecard;
+mod memory_timeline;
 mod overview;
 mod presets;
 mod prompts;
 mod search_results;
 pub(crate) mod settings;
 mod spec;
+mod staleness_heatmap;
 mod symbol;
 mod task_context;
 mod time_machine;
@@ -129,5 +134,26 @@ pub(crate) fn fragment_router() -> Router<Arc<DashboardState>> {
         .route(
             "/dashboard/frag/settings/{section}",
             get(settings::settings_section_fragment),
+        )
+        // Phase 9.4: Enhanced Visualizations
+        .route(
+            "/dashboard/frag/drift-timeline",
+            get(drift_timeline::drift_timeline_fragment),
+        )
+        .route(
+            "/dashboard/frag/coupling-chord",
+            get(coupling_chord::coupling_chord_fragment),
+        )
+        .route(
+            "/dashboard/frag/memory-timeline",
+            get(memory_timeline::memory_timeline_fragment),
+        )
+        .route(
+            "/dashboard/frag/health-scorecard",
+            get(health_scorecard::health_scorecard_fragment),
+        )
+        .route(
+            "/dashboard/frag/staleness-heatmap",
+            get(staleness_heatmap::staleness_heatmap_fragment),
         )
 }

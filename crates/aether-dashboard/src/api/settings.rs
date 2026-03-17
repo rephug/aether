@@ -266,7 +266,7 @@ fn json_str(form: &HashMap<String, String>, key: &str) -> Value {
 }
 
 fn insert_opt_str(obj: &mut Map<String, Value>, form: &HashMap<String, String>, key: &str) {
-    if let Some(v) = form.get(key).filter(|s| !s.is_empty()) {
+    if let Some(v) = form.get(key) {
         obj.insert(key.into(), Value::String(v.clone()));
     }
 }
@@ -567,7 +567,9 @@ fn build_indexing(
         }
     }
 
-    sections.insert("watcher".into(), Value::Object(obj));
+    if !obj.is_empty() {
+        sections.insert("watcher".into(), Value::Object(obj));
+    }
 }
 
 // --- Dashboard ---
@@ -1115,7 +1117,7 @@ fn insert_opt_str_prefixed(
     form_key: &str,
     obj_key: &str,
 ) {
-    if let Some(v) = form.get(form_key).filter(|s| !s.is_empty()) {
+    if let Some(v) = form.get(form_key) {
         obj.insert(obj_key.into(), Value::String(v.clone()));
     }
 }

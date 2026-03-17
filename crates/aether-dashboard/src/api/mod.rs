@@ -19,9 +19,11 @@ pub(crate) mod context;
 pub(crate) mod context_export;
 pub(crate) mod continuous;
 pub(crate) mod coupling;
+mod coupling_matrix;
 pub(crate) mod decompose;
 pub(crate) mod difficulty;
 pub(crate) mod drift;
+mod drift_timeline;
 pub(crate) mod file;
 pub(crate) mod fingerprint;
 pub(crate) mod flow;
@@ -29,12 +31,15 @@ pub(crate) mod glossary;
 mod graph;
 pub(crate) mod health;
 pub(crate) mod health_score;
+mod health_scorecard;
+mod memory_timeline;
 mod overview;
 pub(crate) mod presets;
 pub(crate) mod prompts;
 mod search;
 pub(crate) mod settings;
 pub(crate) mod spec;
+mod staleness_heatmap;
 pub(crate) mod symbol;
 pub(crate) mod task_context;
 mod time_machine;
@@ -132,5 +137,26 @@ pub(crate) fn api_router() -> Router<Arc<DashboardState>> {
         .route(
             "/api/v1/settings/{section}/reset",
             post(settings::reset_section_handler),
+        )
+        // Phase 9.4: Enhanced Visualization APIs
+        .route(
+            "/api/v1/drift-timeline",
+            get(drift_timeline::drift_timeline_handler),
+        )
+        .route(
+            "/api/v1/coupling-matrix",
+            get(coupling_matrix::coupling_matrix_handler),
+        )
+        .route(
+            "/api/v1/memory-timeline",
+            get(memory_timeline::memory_timeline_handler),
+        )
+        .route(
+            "/api/v1/health-scorecard",
+            get(health_scorecard::health_scorecard_handler),
+        )
+        .route(
+            "/api/v1/staleness-heatmap",
+            get(staleness_heatmap::staleness_heatmap_handler),
         )
 }
