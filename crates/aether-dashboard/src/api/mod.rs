@@ -9,12 +9,14 @@ pub(crate) mod anatomy;
 mod architecture;
 pub(crate) mod ask;
 pub(crate) mod autopsy;
+pub(crate) mod batch;
 mod blast_radius;
 pub(crate) mod catalog;
 mod causal_chain;
 pub(crate) mod changes;
 pub(crate) mod common;
 pub(crate) mod context;
+pub(crate) mod continuous;
 pub(crate) mod coupling;
 pub(crate) mod decompose;
 pub(crate) mod difficulty;
@@ -30,6 +32,7 @@ pub(crate) mod prompts;
 mod search;
 pub(crate) mod spec;
 pub(crate) mod symbol;
+pub(crate) mod task_context;
 mod time_machine;
 pub(crate) mod tour;
 mod xray;
@@ -90,5 +93,14 @@ pub(crate) fn api_router() -> Router<Arc<DashboardState>> {
         .route(
             "/api/v1/causal-chain",
             get(causal_chain::causal_chain_handler),
+        )
+        .route("/api/v1/batch-status", get(batch::batch_handler))
+        .route(
+            "/api/v1/continuous-status",
+            get(continuous::continuous_handler),
+        )
+        .route(
+            "/api/v1/task-history",
+            get(task_context::task_context_handler),
         )
 }

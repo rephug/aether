@@ -9,10 +9,12 @@ mod anatomy;
 mod architecture;
 mod ask;
 mod autopsy;
+mod batch;
 mod blast_radius;
 mod causal;
 mod changes;
 mod context;
+mod continuous;
 mod coupling;
 mod decompose;
 mod drift_table;
@@ -27,6 +29,7 @@ mod prompts;
 mod search_results;
 mod spec;
 mod symbol;
+mod task_context;
 mod time_machine;
 mod tour;
 mod xray;
@@ -99,5 +102,14 @@ pub(crate) fn fragment_router() -> Router<Arc<DashboardState>> {
         .route(
             "/dashboard/frag/health-score",
             get(health_score::health_score_fragment),
+        )
+        .route("/dashboard/frag/batch", get(batch::batch_fragment))
+        .route(
+            "/dashboard/frag/continuous",
+            get(continuous::continuous_fragment),
+        )
+        .route(
+            "/dashboard/frag/task-context",
+            get(task_context::task_context_fragment),
         )
 }

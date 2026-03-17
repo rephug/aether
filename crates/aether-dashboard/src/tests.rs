@@ -5,7 +5,7 @@ use aether_config::{AetherConfig, GraphBackend, save_workspace_config};
 use aether_core::{EdgeKind, SymbolEdge};
 use aether_store::{
     DriftAnalysisStateRecord, DriftStore, SirMetaRecord, SirStateStore, SqliteStore,
-    SymbolCatalogStore, SymbolRecord, SymbolRelationStore,
+    SymbolCatalogStore, SymbolRecord, SymbolRelationStore, TaskContextHistoryRecord,
 };
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
@@ -1316,4 +1316,337 @@ fn seed_workspace(workspace: &std::path::Path) {
             drift_detected: 1,
         })
         .unwrap();
+
+    // Seed task context history for task-context page tests
+    store
+        .insert_task_context_history(&TaskContextHistoryRecord {
+            task_description: "Fix the login bug in auth module".to_owned(),
+            branch_name: Some("fix/auth-login".to_owned()),
+            resolved_symbol_ids: "sym-demo-run,sym-demo-helper".to_owned(),
+            resolved_file_paths: "src/lib.rs,src/main.rs".to_owned(),
+            total_symbols: 2,
+            budget_used: 8000,
+            budget_max: 32000,
+            created_at: 1_700_000_300,
+        })
+        .unwrap();
+
+    // Seed continuous status JSON for batch/continuous page tests
+    let continuous_dir = aether_config::aether_dir(workspace).join("continuous");
+    fs::create_dir_all(&continuous_dir).unwrap();
+    fs::write(
+        continuous_dir.join("status.json"),
+        r#"{
+            "last_started_at": 1700000100,
+            "last_completed_at": 1700000200,
+            "last_successful_completed_at": 1700000200,
+            "total_symbols": 3,
+            "symbols_with_sir": 1,
+            "scored_symbols": 3,
+            "score_bands": { "critical": 0, "high": 1, "medium": 1, "low": 1 },
+            "most_stale_symbol": { "symbol_id": "sym-demo-run", "qualified_name": "demo::run", "staleness_score": 0.85 },
+            "selected_symbols": 1,
+            "written_requests": 2,
+            "skipped_requests": 1,
+            "unresolved_symbols": 0,
+            "chunk_count": 1,
+            "auto_submit": false,
+            "submitted_chunks": 0,
+            "ingested_results": 0,
+            "fingerprint_rows": 0,
+            "requeue_pass": "scan",
+            "last_error": null
+        }"#,
+    )
+    .unwrap();
+}
+
+// ── Tests for new Phase 9.1 Part A pages ──────────────────────────────
+
+#[tokio::test]
+async fn batch_api_returns_expected_fields() {
+    let (_tmp, app, _ids) = seeded_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/batch-status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["data"]["has_data"].as_bool().unwrap());
+    assert!(json["data"]["written_requests"].is_number());
+    assert!(json["data"]["skipped_requests"].is_number());
+    assert!(json["data"]["batch_files"].is_array());
+}
+
+#[tokio::test]
+async fn batch_api_empty_workspace_returns_no_data() {
+    let (_tmp, app) = empty_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/batch-status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(!json["data"]["has_data"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn batch_fragment_renders_status_card() {
+    let (_tmp, app, _ids) = seeded_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/batch")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("Batch"));
+    assert!(body.contains("Requests Written"));
+}
+
+#[tokio::test]
+async fn batch_fragment_empty_shows_empty_state() {
+    let (_tmp, app) = empty_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/batch")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("No batch runs yet"));
+}
+
+#[tokio::test]
+async fn continuous_api_returns_expected_fields() {
+    let (_tmp, app, _ids) = seeded_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/continuous-status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["data"]["has_data"].as_bool().unwrap());
+    assert_eq!(json["data"]["total_symbols"].as_u64().unwrap(), 3);
+    assert!(json["data"]["score_bands"].is_object());
+    assert!(json["data"]["most_stale"].is_object());
+}
+
+#[tokio::test]
+async fn continuous_api_empty_workspace_returns_no_data() {
+    let (_tmp, app) = empty_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/continuous-status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(!json["data"]["has_data"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn continuous_fragment_renders_staleness_distribution() {
+    let (_tmp, app, _ids) = seeded_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/continuous")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("Staleness Distribution"));
+    assert!(body.contains("demo::run"));
+}
+
+#[tokio::test]
+async fn continuous_fragment_empty_shows_empty_state() {
+    let (_tmp, app) = empty_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/continuous")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("No continuous monitor data"));
+}
+
+#[tokio::test]
+async fn task_context_api_returns_expected_fields() {
+    let (_tmp, app, _ids) = seeded_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/task-history?limit=10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["data"]["has_history"].as_bool().unwrap());
+    assert_eq!(json["data"]["total_entries"].as_u64().unwrap(), 1);
+    let entry = &json["data"]["entries"][0];
+    assert_eq!(
+        entry["task_description"].as_str().unwrap(),
+        "Fix the login bug in auth module"
+    );
+    assert_eq!(entry["symbol_count"].as_i64().unwrap(), 2);
+    assert_eq!(entry["file_count"].as_u64().unwrap(), 2);
+    assert!(entry["budget_pct"].as_f64().unwrap() > 0.0);
+}
+
+#[tokio::test]
+async fn task_context_api_empty_returns_no_history() {
+    let (_tmp, app) = empty_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/task-history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(!json["data"]["has_history"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn task_context_fragment_renders_history_table() {
+    let (_tmp, app, _ids) = seeded_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/task-context")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("Fix the login bug"));
+    assert!(body.contains("fix/auth-login"));
+}
+
+#[tokio::test]
+async fn task_context_fragment_empty_shows_empty_state() {
+    let (_tmp, app) = empty_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/task-context")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("No task context resolutions yet"));
 }
