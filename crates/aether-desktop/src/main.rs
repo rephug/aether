@@ -4,6 +4,7 @@
 mod commands;
 mod notifications;
 mod tray;
+mod updater;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -134,8 +135,16 @@ fn main() {
             commands::pause_indexing,
             commands::resume_indexing,
             commands::restart_app,
+            commands::check_for_update,
+            commands::install_update,
+            commands::get_update_preferences,
+            commands::set_update_preferences,
         ])
         .setup(move |app| {
+            // Register updater plugin.
+            app.handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())?;
+
             // Build system tray.
             tray::build_tray(app.handle())?;
 
