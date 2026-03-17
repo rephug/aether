@@ -1,0 +1,40 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicegui-org/nicegui/refs/tags/v2.17.0/nicegui/resources/.schemas/tauri-v2.json",
+  "productName": "AETHER",
+  "version": "0.1.0",
+  "identifier": "com.aether.desktop",
+  "build": {
+    "frontendDist": "src/static"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "AETHER",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600,
+        "url": "about:blank"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' http://127.0.0.1:*; script-src 'self' 'unsafe-inline' 'unsafe-eval' http://127.0.0.1:*; style-src 'self' 'unsafe-inline' http://127.0.0.1:*; connect-src 'self' http://127.0.0.1:*; img-src 'self' data: http://127.0.0.1:*; font-src 'self' http://127.0.0.1:*"
+    },
+    "trayIcon": {
+      "iconPath": "icons/icon.png",
+      "iconAsTemplate": false,
+      "tooltip": "AETHER"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.png"
+    ]
+  },
+  "plugins": {
+    "notification": {},
+    "shell": {}
+  }
+}
