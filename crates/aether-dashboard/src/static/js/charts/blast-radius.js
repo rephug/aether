@@ -1,13 +1,40 @@
 (function () {
+  const tip = () => window.AetherTooltip || { show() {}, hide() {} };
+
   function parseParams() {
-    const hidden = document.getElementById('blast-symbol-id');
-    const depth = document.getElementById('blast-depth');
-    const min = document.getElementById('blast-min-coupling');
+    const symEl = document.getElementById('blast-symbol-id');
+    const depthEl = document.getElementById('blast-depth');
+    const couplingEl = document.getElementById('blast-min-coupling');
     return {
-      symbol_id: hidden ? hidden.value.trim() : '',
-      depth: depth ? Number(depth.value || 3) : 3,
-      min_coupling: min ? Number(min.value || 0.2) : 0.2,
+      symbol_id: symEl ? symEl.value.trim() : '',
+      depth: depthEl ? parseInt(depthEl.value, 10) || 3 : 3,
+      min_coupling: couplingEl ? parseFloat(couplingEl.value) || 0.2 : 0.2,
     };
+  }
+
+  function buildHierarchy(data) {
+    const center = data.center;
+    const nodeMap = {};
+    const root = { id: center.symbol_id, data: center, children: [] };
+    nodeMap[center.symbol_id] = root;
+
+    const rings = data.rings || [];
+    rings.forEach((ring) => {
+      (ring.nodes || []).forEach((node) => {
+        nodeMap[node.symbol_id] = { id: node.symbol_id, data: node, children: [] };
+      });
+    });
+
+    rings.forEach((ring) => {
+      (ring.nodes || []).forEach((node) => {
+        const parentId = node.parent_symbol_id || center.symbol_id;
+        const parent = nodeMap[parentId] || root;
+        const child = nodeMap[node.symbol_id];
+        if (child && parent) parent.children.push(child);
+      });
+    });
+
+    return d3.hierarchy(root);
   }
 
   function draw(data) {
@@ -16,119 +43,147 @@
     container.innerHTML = '';
 
     if (!data || !data.center) {
-      container.innerHTML = '<div class="chart-empty"><div class="empty-state-title">Select a symbol to view blast radius</div></div>';
+      container.innerHTML = '<div class="chart-empty"><div class="empty-state"><div class="empty-state-title">Select a symbol to explore its blast radius</div></div></div>';
       return;
     }
 
-    const width = container.clientWidth || 900;
+    const width = container.clientWidth || 800;
     const height = Math.max(560, container.clientHeight || 560);
-    const svg = d3.select(container).append('svg').attr('width', width).attr('height', height);
-    const g = svg.append('g');
-    const center = { x: width / 2, y: height / 2 };
+    const radius = Math.min(width, height) / 2 - 80;
 
-    const rings = data.rings || [];
-    const maxHop = d3.max(rings, (r) => r.hop) || 1;
-    const ringGap = Math.min(width, height) / (maxHop * 2 + 2);
+    const svg = d3.select(container).append('svg')
+      .attr('width', width)
+      .attr('height', height);
 
-    for (let hop = 1; hop <= maxHop; hop++) {
-      g.append('circle')
-        .attr('cx', center.x)
-        .attr('cy', center.y)
-        .attr('r', hop * ringGap)
-        .attr('fill', 'none')
-        .attr('stroke', '#94a3b8')
-        .attr('stroke-opacity', 0.3)
-        .attr('stroke-dasharray', '4,4');
-    }
+    const g = svg.append('g')
+      .attr('transform', `translate(${width / 2},${height / 2})`);
 
-    const nodes = [data.center];
-    (data.rings || []).forEach((ring) => {
-      const total = Math.max(1, ring.nodes.length);
-      ring.nodes.forEach((n, i) => {
-        const angle = (Math.PI * 2 * i) / total;
-        const r = ring.hop * ringGap;
-        n.x = center.x + Math.cos(angle) * r;
-        n.y = center.y + Math.sin(angle) * r;
-        n.hop = ring.hop;
-        nodes.push(n);
-      });
-    });
+    svg.call(d3.zoom().scaleExtent([0.4, 4]).on('zoom', (event) => {
+      g.attr('transform', `translate(${width / 2},${height / 2})` + event.transform);
+    }));
 
-    data.center.x = center.x;
-    data.center.y = center.y;
-    data.center.hop = 0;
+    const hierarchy = buildHierarchy(data);
+    const treeLayout = d3.tree()
+      .size([2 * Math.PI, radius])
+      .separation((a, b) => (a.parent === b.parent ? 1 : 2) / a.depth);
 
-    const byId = new Map(nodes.map((n) => [n.symbol_id, n]));
-    const links = [];
-    nodes.forEach((n) => {
-      if (!n.parent_symbol_id) return;
-      if (byId.has(n.parent_symbol_id)) {
-        links.push({ source: byId.get(n.parent_symbol_id), target: n, coupling: n.coupling_to_parent });
-      }
-    });
+    treeLayout(hierarchy);
 
-    g.selectAll('line.link')
-      .data(links)
-      .join('line')
-      .attr('x1', (d) => d.source.x)
-      .attr('y1', (d) => d.source.y)
-      .attr('x2', (d) => d.target.x)
-      .attr('y2', (d) => d.target.y)
+    // Staleness color scale: green (0) -> red (1)
+    const stalenessColor = d3.scaleSequential(d3.interpolateRdYlGn).domain([1, 0]);
+
+    // PageRank size scale
+    const allPr = [];
+    hierarchy.each((d) => { allPr.push(d.data.data ? d.data.data.pagerank || 0 : 0); });
+    const prScale = d3.scaleSqrt().domain([0, d3.max(allPr) || 1]).range([4, 16]);
+
+    // Draw links
+    const linkRadial = d3.linkRadial()
+      .angle((d) => d.x)
+      .radius((d) => d.y);
+
+    g.selectAll('path.link')
+      .data(hierarchy.links())
+      .join('path')
+      .attr('class', 'link')
+      .attr('fill', 'none')
+      .attr('d', linkRadial)
       .attr('stroke', (d) => {
-        const t = (d.coupling?.type || '').toLowerCase();
-        if (t.includes('semantic')) return '#22c55e';
-        if (t.includes('temporal')) return '#f59e0b';
-        return '#3b82f6';
+        const coupling = d.target.data.data ? d.target.data.data.coupling_to_parent : null;
+        if (!coupling) return '#94a3b8';
+        const type = (coupling.coupling_type || '').toLowerCase();
+        if (type.includes('semantic')) return '#22c55e';
+        if (type.includes('temporal')) return '#f59e0b';
+        if (type.includes('struct')) return '#3b82f6';
+        return '#94a3b8';
       })
-      .attr('stroke-opacity', 0.6)
-      .attr('stroke-width', (d) => 1 + 3 * Number(d.coupling?.strength || 0))
+      .attr('stroke-width', (d) => {
+        const coupling = d.target.data.data ? d.target.data.data.coupling_to_parent : null;
+        const strength = coupling && coupling.strength ? coupling.strength : 0.3;
+        return 1 + 2 * strength;
+      })
+      .attr('stroke-opacity', 0.6);
+
+    // Draw nodes
+    const nodes = g.selectAll('g.node')
+      .data(hierarchy.descendants())
+      .join('g')
+      .attr('class', 'node')
+      .attr('transform', (d) => `translate(${d3.pointRadial(d.x, d.y)})`);
+
+    const circles = nodes.append('circle')
+      .attr('r', (d) => prScale(d.data.data ? d.data.data.pagerank || 0 : 0))
+      .attr('fill', (d) => {
+        const drift = d.data.data ? d.data.data.drift_score || 0 : 0;
+        return stalenessColor(drift);
+      })
+      .attr('stroke', (d) => {
+        const hasTests = d.data.data ? d.data.data.has_tests : false;
+        return hasTests ? '#334155' : '#f59e0b';
+      })
+      .attr('stroke-width', (d) => d.depth === 0 ? 3 : 1.5)
       .attr('stroke-dasharray', (d) => {
-        const t = (d.coupling?.type || '').toLowerCase();
-        if (t.includes('semantic')) return '6,3';
-        if (t.includes('temporal')) return '2,3';
-        return '0';
-      });
-
-    const prScale = d3.scaleSqrt().domain([0, d3.max(nodes, (n) => n.pagerank || 0) || 1]).range([5, 15]);
-    const tip = window.AetherTooltip;
-
-    const nodeSel = g.selectAll('circle.node')
-      .data(nodes)
-      .join('circle')
-      .attr('cx', (d) => d.x)
-      .attr('cy', (d) => d.y)
-      .attr('r', (d) => prScale(d.pagerank || 0))
-      .attr('fill', (d) => window.AetherTheme.riskColor(d.risk_score || 0))
-      .attr('stroke', (d) => d.has_tests ? '#0f172a' : '#f59e0b')
-      .attr('stroke-width', 1.5)
-      .attr('stroke-dasharray', (d) => d.has_tests ? '0' : '4,3')
+        const hasTests = d.data.data ? d.data.data.has_tests : false;
+        return hasTests ? '' : '3,2';
+      })
       .style('cursor', 'pointer')
       .on('mouseover', (event, d) => {
-        tip.show(event, `<strong>${d.qualified_name}</strong><br/>risk ${Number(d.risk_score || 0).toFixed(2)} / importance ${Number(d.pagerank || 0).toFixed(3)}<br/>${d.file_path}`);
+        const nd = d.data.data || {};
+        const name = nd.qualified_name || nd.symbol_id || '?';
+        const intent = nd.sir_intent || '';
+        const drift = (nd.drift_score || 0).toFixed(2);
+        const pr = (nd.pagerank || 0).toFixed(3);
+        const file = nd.file_path || '';
+        tip().show(event,
+          `<strong>${name}</strong>` +
+          (intent ? `<br/><em>${intent.substring(0, 120)}</em>` : '') +
+          `<br/>drift ${drift} / importance ${pr}` +
+          `<br/><span style="opacity:0.7">${file}</span>`
+        );
       })
-      .on('mouseout', () => tip.hide())
+      .on('mouseout', () => tip().hide())
       .on('click', (event, d) => {
+        const nd = d.data.data || {};
         if (event.shiftKey) {
-          const encoded = encodeURIComponent(d.symbol_id);
+          const encoded = encodeURIComponent(nd.symbol_id || '');
           htmx.ajax('GET', `/dashboard/frag/symbol/${encoded}`, {
             target: '#main-content',
             pushURL: `/dashboard/symbol/${encoded}`,
           });
-          return;
+        } else {
+          const symInput = document.getElementById('blast-symbol-id');
+          const textInput = document.getElementById('blast-symbol-input');
+          if (symInput && nd.symbol_id) {
+            symInput.value = nd.symbol_id;
+            if (textInput) textInput.value = nd.qualified_name || nd.symbol_id;
+            load();
+          }
         }
-        const hidden = document.getElementById('blast-symbol-id');
-        const input = document.getElementById('blast-symbol-input');
-        if (hidden) hidden.value = d.symbol_id;
-        if (input) input.value = d.qualified_name;
-        load();
       });
 
-    if (window.AetherAnimate) window.AetherAnimate.enterTransition(nodeSel);
+    if (window.AetherAnimate) window.AetherAnimate.enterTransition(circles);
 
-    svg.call(d3.zoom().scaleExtent([0.4, 4]).on('zoom', (event) => g.attr('transform', event.transform)));
+    // Labels for nodes with enough importance
+    nodes.filter((d) => (d.data.data ? d.data.data.pagerank || 0 : 0) > 0.01 || d.depth === 0)
+      .append('text')
+      .attr('dy', '0.31em')
+      .attr('x', (d) => d.x < Math.PI === !d.children ? 6 : -6)
+      .attr('text-anchor', (d) => d.x < Math.PI === !d.children ? 'start' : 'end')
+      .attr('transform', (d) => {
+        if (d.depth === 0) return '';
+        return `rotate(${d.x * 180 / Math.PI - 90})${d.x >= Math.PI ? ' rotate(180)' : ''}`;
+      })
+      .attr('fill', () => window.AetherPalette ? window.AetherPalette.text() : '#64748b')
+      .attr('font-size', 10)
+      .text((d) => {
+        const name = d.data.data ? (d.data.data.qualified_name || '') : '';
+        return name.length > 25 ? name.slice(-25) : name;
+      });
   }
 
   function load() {
+    const container = document.getElementById('blast-radius-chart');
+    if (!container) return;
     const p = parseParams();
     if (!p.symbol_id) {
       draw(null);
@@ -156,10 +211,10 @@
       load();
     });
 
-    const depth = document.getElementById('blast-depth');
-    const min = document.getElementById('blast-min-coupling');
-    if (depth) depth.addEventListener('change', load);
-    if (min) min.addEventListener('change', load);
+    const depthSlider = document.getElementById('blast-depth');
+    const couplingSlider = document.getElementById('blast-min-coupling');
+    if (depthSlider) depthSlider.addEventListener('change', load);
+    if (couplingSlider) couplingSlider.addEventListener('change', load);
 
     load();
   };

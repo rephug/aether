@@ -69,6 +69,11 @@
   <script src="/dashboard/static/js/charts/time-machine.js" defer></script>
   <script src="/dashboard/static/js/charts/causal-explorer.js" defer></script>
   <script src="/dashboard/static/js/charts/smart-search.js" defer></script>
+  <script src="/dashboard/static/js/charts/drift-timeline.js" defer></script>
+  <script src="/dashboard/static/js/charts/coupling-chord.js" defer></script>
+  <script src="/dashboard/static/js/charts/memory-timeline.js" defer></script>
+  <script src="/dashboard/static/js/charts/health-sparkline.js" defer></script>
+  <script src="/dashboard/static/js/charts/staleness-heatmap.js" defer></script>
 </head>
 
 <body class="h-full complexity-beginner bg-gradient-to-br from-surface-0 via-surface-1 to-surface-2 text-text-primary dark:bg-slate-950 dark:text-slate-100">
@@ -95,6 +100,8 @@
         <a href="#" class="nav-link" hx-get="/dashboard/frag/causal" hx-target="#main-content" hx-push-url="/dashboard/causal" onclick="setActiveNav(this)"><span class="sidebar-label">Causal Explorer</span></a>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/time-machine" hx-target="#main-content" hx-push-url="/dashboard/time-machine" onclick="setActiveNav(this)"><span class="sidebar-label">Time Machine</span></a>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/xray" hx-target="#main-content" hx-push-url="/dashboard/xray" onclick="setActiveNav(this)"><span class="sidebar-label">X-Ray</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/drift-timeline" hx-target="#main-content" hx-push-url="/dashboard/drift-timeline" onclick="setActiveNav(this)"><span class="sidebar-label">Drift Timeline</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/memory-timeline" hx-target="#main-content" hx-push-url="/dashboard/memory-timeline" onclick="setActiveNav(this)"><span class="sidebar-label">Memory Timeline</span></a>
 
         <div class="sidebar-section-header"><span class="sidebar-label">Context</span></div>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/context-export" hx-target="#main-content" hx-push-url="/dashboard/context-export" onclick="setActiveNav(this)"><span class="sidebar-label">Context Export</span></a>
@@ -105,11 +112,14 @@
         <a href="#" class="nav-link" hx-get="/dashboard/frag/batch" hx-target="#main-content" hx-push-url="/dashboard/batch" onclick="setActiveNav(this)"><span class="sidebar-label">Batch Pipeline</span></a>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/continuous" hx-target="#main-content" hx-push-url="/dashboard/continuous" onclick="setActiveNav(this)"><span class="sidebar-label">Continuous Monitor</span></a>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/fingerprint" hx-target="#main-content" hx-push-url="/dashboard/fingerprint" onclick="setActiveNav(this)"><span class="sidebar-label">Fingerprint History</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/staleness-heatmap" hx-target="#main-content" hx-push-url="/dashboard/staleness-heatmap" onclick="setActiveNav(this)"><span class="sidebar-label">Staleness Heatmap</span></a>
 
         <div class="sidebar-section-header"><span class="sidebar-label">Analysis</span></div>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/health" hx-target="#main-content" hx-push-url="/dashboard/health" onclick="setActiveNav(this)"><span class="sidebar-label">Health</span></a>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/health-score" hx-target="#main-content" hx-push-url="/dashboard/health-score" onclick="setActiveNav(this)"><span class="sidebar-label">Health Score</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/health-scorecard" hx-target="#main-content" hx-push-url="/dashboard/health-scorecard" onclick="setActiveNav(this)"><span class="sidebar-label">Health Scorecard</span></a>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/coupling" hx-target="#main-content" hx-push-url="/dashboard/coupling" onclick="setActiveNav(this)"><span class="sidebar-label">Coupling Map</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/coupling-chord" hx-target="#main-content" hx-push-url="/dashboard/coupling-chord" onclick="setActiveNav(this)"><span class="sidebar-label">Coupling Chord</span></a>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/drift-table" hx-target="#main-content" hx-push-url="/dashboard/drift" onclick="setActiveNav(this)"><span class="sidebar-label">Drift Report</span></a>
 
         <div class="sidebar-section-header"><span class="sidebar-label">Search</span></div>
@@ -337,6 +347,11 @@
       if (window.initTimeMachine && document.getElementById('time-machine-graph')) window.initTimeMachine();
       if (window.initCausalExplorer && document.getElementById('causal-graph')) window.initCausalExplorer();
       if (window.initSmartSearch && document.getElementById('smart-search-results')) window.initSmartSearch();
+      if (window.initDriftTimeline && document.getElementById('drift-timeline-chart')) window.initDriftTimeline();
+      if (window.initCouplingChord && document.getElementById('coupling-chord-chart')) window.initCouplingChord();
+      if (window.initMemoryTimeline && document.getElementById('memory-timeline-chart')) window.initMemoryTimeline();
+      if (window.initHealthScorecard && document.getElementById('health-scorecard-grid')) window.initHealthScorecard();
+      if (window.initStalenessHeatmap && document.getElementById('staleness-heatmap-chart')) window.initStalenessHeatmap();
     }
 
     document.body.addEventListener('click', function(e) {
