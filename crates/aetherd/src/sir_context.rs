@@ -821,7 +821,26 @@ fn prepare_file_target(
         }
     };
 
-    let graph_store = open_surreal_graph_store_readonly(workspace).ok();
+    let graph_store = {
+        let skip = aether_config::load_workspace_config(workspace)
+            .ok()
+            .and_then(|cfg| {
+                if matches!(
+                    cfg.storage.graph_backend,
+                    aether_config::GraphBackend::Surreal | aether_config::GraphBackend::Cozo
+                ) {
+                    crate::daemon_detect::detect_running_daemon(&cfg, workspace)
+                } else {
+                    None
+                }
+            });
+        if let Some(ref daemon) = skip {
+            crate::daemon_detect::warn_daemon_detected(daemon, "context");
+            None
+        } else {
+            open_surreal_graph_store_readonly(workspace).ok()
+        }
+    };
 
     if symbol_records.is_empty() {
         output
@@ -2453,7 +2472,26 @@ fn prepare_symbol_context(
     } else {
         Vec::new()
     };
-    let graph_store = open_surreal_graph_store_readonly(workspace).ok();
+    let graph_store = {
+        let skip = aether_config::load_workspace_config(workspace)
+            .ok()
+            .and_then(|cfg| {
+                if matches!(
+                    cfg.storage.graph_backend,
+                    aether_config::GraphBackend::Surreal | aether_config::GraphBackend::Cozo
+                ) {
+                    crate::daemon_detect::detect_running_daemon(&cfg, workspace)
+                } else {
+                    None
+                }
+            });
+        if let Some(ref daemon) = skip {
+            crate::daemon_detect::warn_daemon_detected(daemon, "context");
+            None
+        } else {
+            open_surreal_graph_store_readonly(workspace).ok()
+        }
+    };
     let coupling = if include.coupling {
         let (entries, notice) =
             prepare_coupling_for_file(graph_store.as_ref(), record.file_path.as_str())?;

@@ -331,6 +331,7 @@ dependencies = [
  "axum",
  "blake3",
  "clap",
+ "fs2",
  "gix",
  "ignore",
  "notify",
@@ -344,6 +345,7 @@ dependencies = [
  "tower-lsp",
  "tracing",
  "tracing-subscriber",
+ "ureq 3.2.0",
  "walkdir",
 ]
 
@@ -5617,7 +5619,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
- "ureq",
+ "ureq 2.12.1",
 ]
 
 [[package]]
@@ -12976,6 +12978,31 @@ dependencies = [
  "serde_json",
  "url",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "ureq"
+version = "3.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdc97a28575b85cfedf2a7e7d3cc64b3e11bd8ac766666318003abbacc7a21fc"
+dependencies = [
+ "base64 0.22.1",
+ "log",
+ "percent-encoding",
+ "ureq-proto",
+ "utf-8",
+]
+
+[[package]]
+name = "ureq-proto"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d81f9efa9df032be5934a46a068815a10a042b494b6a58cb0a1a97bb5467ed6f"
+dependencies = [
+ "base64 0.22.1",
+ "http",
+ "httparse",
+ "log",
 ]
 
 [[package]]

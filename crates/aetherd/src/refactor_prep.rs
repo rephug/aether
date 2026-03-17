@@ -106,12 +106,20 @@ where
 {
     let store = SqliteStore::open(workspace).context("failed to open local store")?;
     let runtime = refactor_prep_runtime();
-    let graph = if config.storage.graph_backend == GraphBackend::Surreal {
-        match runtime.block_on(SurrealGraphStore::open(workspace)) {
-            Ok(graph) => Some(graph),
-            Err(err) => {
-                eprintln!("Warning: could not open graph store: {err}");
-                None
+    let graph = if matches!(
+        config.storage.graph_backend,
+        GraphBackend::Surreal | GraphBackend::Cozo
+    ) {
+        if let Some(daemon) = crate::daemon_detect::detect_running_daemon(config, workspace) {
+            crate::daemon_detect::warn_daemon_detected(&daemon, "refactor-prep");
+            None
+        } else {
+            match runtime.block_on(SurrealGraphStore::open(workspace)) {
+                Ok(graph) => Some(graph),
+                Err(err) => {
+                    eprintln!("Warning: could not open graph store: {err}");
+                    None
+                }
             }
         }
     } else {

@@ -31,7 +31,7 @@ Gemini performed a full codebase scan (via repomix export) and identified 13+ fi
 
 **Files:** `crates/aether-dashboard/src/lib.rs`, `crates/aether-query/src/server.rs`
 
-**Problem:** `.layer(CorsLayer::permissive())` on localhost servers allows any website to make cross-origin requests to `127.0.0.1:9720`. A malicious site can silently `fetch('http://127.0.0.1:9720/mcp')`, query your codebase, and exfiltrate SIR summaries, project notes, and dependency graphs. This is especially dangerous for AETHER's regulated-industry target market.
+**Problem:** `.layer(CorsLayer::permissive())` on localhost servers allows any website to make cross-origin requests to `127.0.0.1:9730`. A malicious site can silently `fetch('http://127.0.0.1:9730/mcp')`, query your codebase, and exfiltrate SIR summaries, project notes, and dependency graphs. This is especially dangerous for AETHER's regulated-industry target market.
 
 **Fix:** Remove `.layer(CorsLayer::permissive())` entirely from both files. The standard Same-Origin Policy will then block cross-origin requests. If the dashboard serves from a different port and needs CORS, replace with a restrictive policy:
 
@@ -458,17 +458,17 @@ The exact `gix` API depends on the version in the workspace. Read `gix`'s actual
 
 ```rust
 // BEFORE:
-const DEFAULT_PORT: u16 = 9720;
+const DEFAULT_PORT: u16 = 9730;
 // or in config:
-bind_address = "127.0.0.1:9720"
+bind_address = "127.0.0.1:9730"
 
 // AFTER:
-const DEFAULT_PORT: u16 = 9721;
+const DEFAULT_PORT: u16 = 9731;
 // or:
-bind_address = "127.0.0.1:9721"
+bind_address = "127.0.0.1:9731"
 ```
 
-Grep for `9720` across the entire `aether-query` crate to catch all occurrences.
+Grep for `9730` across the entire `aether-query` crate to catch all occurrences.
 
 ### 12b: Delete duplicate static_assets
 
@@ -551,7 +551,7 @@ Read docs/hardening/pass4_fixes.md for the detailed before/after code.
    Fix 9:  PERFORMANCE — Truncate symbol text before inference (sir_pipeline.rs)
    Fix 10: PERFORMANCE — Inotify non-recursive watch with is_ignored_path filter (indexer.rs)
    Fix 11: TECH DEBT — Remove git shell-out, use gix (coupling.rs)
-   Fix 12: CLEANUP — Port 9720→9721 in aether-query, delete static_assets/
+   Fix 12: CLEANUP — Port 9730→9731 in aether-query, delete static_assets/
 
    For each fix:
    - Read the file at the specified path first
@@ -711,4 +711,4 @@ git status --porcelain
 | 9. Text truncation | Claude | Claude (confirmed in source) | No size limit before inference |
 | 10. Inotify | Claude + Gemini correction | Both | Recursive + Gemini added is_ignored_path |
 | 11. Git shell-out | Gemini pushback | Gemini (had source) | Command::new("git") in coupling.rs |
-| 12. Port + assets | Claude | Claude | Both on 9720, duplicate dir exists |
+| 12. Port + assets | Claude | Claude | Both on 9730, duplicate dir exists |

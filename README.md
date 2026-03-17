@@ -318,7 +318,7 @@ A web-based visualization layer. HTMX + D3.js + Tailwind. No React. No Node.js. 
 
 ```bash
 aetherd --workspace .
-# → http://localhost:9720/dashboard
+# → http://localhost:9730/dashboard
 ```
 
 27+ pages including:
@@ -508,7 +508,7 @@ semantic_rescue_threshold = 0.90
 
 [dashboard]
 enabled = true
-port = 9720
+port = 9730
 ```
 
 ### Pick Your Intelligence Backend

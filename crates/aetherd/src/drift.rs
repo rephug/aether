@@ -19,6 +19,13 @@ pub fn run_drift_report_command(workspace: &Path, args: DriftReportArgs) -> Resu
         include_acknowledged: Some(args.include_acknowledged),
     };
     let config = load_workspace_config(workspace).context("failed to load workspace config")?;
+    if matches!(
+        config.storage.graph_backend,
+        GraphBackend::Surreal | GraphBackend::Cozo
+    ) && let Some(daemon) = crate::daemon_detect::detect_running_daemon(&config, workspace)
+    {
+        crate::daemon_detect::exit_daemon_detected(&daemon, "drift-report");
+    }
     let report = match config.storage.graph_backend {
         GraphBackend::Surreal => {
             let graph = open_surreal_graph_store_readonly(workspace)
@@ -46,6 +53,14 @@ pub fn run_drift_ack_command(workspace: &Path, args: DriftAckArgs) -> Result<()>
 }
 
 pub fn run_communities_command(workspace: &Path, args: CommunitiesArgs) -> Result<()> {
+    let config = load_workspace_config(workspace).context("failed to load workspace config")?;
+    if matches!(
+        config.storage.graph_backend,
+        GraphBackend::Surreal | GraphBackend::Cozo
+    ) && let Some(daemon) = crate::daemon_detect::detect_running_daemon(&config, workspace)
+    {
+        crate::daemon_detect::exit_daemon_detected(&daemon, "communities");
+    }
     let analyzer = DriftAnalyzer::new(workspace).context("failed to initialize drift analyzer")?;
     let graph = open_surreal_graph_store_readonly(workspace)
         .context("failed to open configured surreal graph store")?;

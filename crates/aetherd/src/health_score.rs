@@ -70,12 +70,20 @@ impl HealthCommandStores {
 
         let runtime = health_command_runtime();
         let store = SqliteStore::open(workspace).context("failed to open local store")?;
-        let graph = if config.storage.graph_backend == GraphBackend::Surreal {
-            match runtime.block_on(SurrealGraphStore::open(workspace)) {
-                Ok(graph) => Some(graph),
-                Err(err) => {
-                    eprintln!("Warning: could not open graph store: {err}");
-                    None
+        let graph = if matches!(
+            config.storage.graph_backend,
+            GraphBackend::Surreal | GraphBackend::Cozo
+        ) {
+            if let Some(daemon) = crate::daemon_detect::detect_running_daemon(config, workspace) {
+                crate::daemon_detect::warn_daemon_detected(&daemon, "health-score");
+                None
+            } else {
+                match runtime.block_on(SurrealGraphStore::open(workspace)) {
+                    Ok(graph) => Some(graph),
+                    Err(err) => {
+                        eprintln!("Warning: could not open graph store: {err}");
+                        None
+                    }
                 }
             }
         } else {

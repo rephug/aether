@@ -20,6 +20,7 @@ pub(crate) mod context_export;
 pub(crate) mod continuous;
 pub(crate) mod coupling;
 mod coupling_matrix;
+pub(crate) mod daemon_status;
 pub(crate) mod decompose;
 pub(crate) mod difficulty;
 pub(crate) mod drift;
@@ -137,6 +138,11 @@ pub(crate) fn api_router() -> Router<Arc<DashboardState>> {
         .route(
             "/api/v1/settings/{section}/reset",
             post(settings::reset_section_handler),
+        )
+        // Daemon status (lightweight, no ApiEnvelope)
+        .route(
+            "/api/v1/daemon-status",
+            get(daemon_status::daemon_status_handler),
         )
         // Phase 9.4: Enhanced Visualization APIs
         .route(

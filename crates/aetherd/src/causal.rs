@@ -9,6 +9,15 @@ use anyhow::{Context, Result, anyhow};
 use crate::cli::TraceCauseArgs;
 
 pub fn run_trace_cause_command(workspace: &Path, args: TraceCauseArgs) -> Result<()> {
+    let config = aether_config::load_workspace_config(workspace)
+        .context("failed to load workspace config")?;
+    if matches!(
+        config.storage.graph_backend,
+        aether_config::GraphBackend::Surreal | aether_config::GraphBackend::Cozo
+    ) && let Some(daemon) = crate::daemon_detect::detect_running_daemon(&config, workspace)
+    {
+        crate::daemon_detect::exit_daemon_detected(&daemon, "trace-cause");
+    }
     let store = SqliteStore::open(workspace).context("failed to open store")?;
     let target_symbol_id =
         resolve_target_symbol_id(&store, &args).context("failed to resolve target symbol")?;

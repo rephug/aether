@@ -351,7 +351,26 @@ fn branch_diff_to_symbols_with_context(
     let changed_paths = changed_paths_between_refs(workspace, "main", branch_name)?;
     let mut file_paths = changed_paths.into_iter().collect::<BTreeSet<_>>();
     let mut notices = Vec::new();
-    let graph_store = open_surreal_graph_store_readonly(workspace).ok();
+    let graph_store = {
+        let skip = aether_config::load_workspace_config(workspace)
+            .ok()
+            .and_then(|cfg| {
+                if matches!(
+                    cfg.storage.graph_backend,
+                    aether_config::GraphBackend::Surreal | aether_config::GraphBackend::Cozo
+                ) {
+                    crate::daemon_detect::detect_running_daemon(&cfg, workspace)
+                } else {
+                    None
+                }
+            });
+        if let Some(ref daemon) = skip {
+            crate::daemon_detect::warn_daemon_detected(daemon, "task-context");
+            None
+        } else {
+            open_surreal_graph_store_readonly(workspace).ok()
+        }
+    };
 
     match coupled_file_paths(
         graph_store.as_ref(),
