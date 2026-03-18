@@ -14,6 +14,7 @@ mod blast_radius;
 mod causal;
 mod changes;
 mod context;
+mod context_builder;
 mod context_export;
 mod continuous;
 mod coupling;
@@ -125,6 +126,10 @@ pub(crate) fn fragment_router() -> Router<Arc<DashboardState>> {
         .route(
             "/dashboard/frag/context-export",
             get(context_export::context_export_fragment),
+        )
+        .route(
+            "/dashboard/frag/context-builder",
+            get(context_builder::context_builder_fragment),
         )
         .route("/dashboard/frag/presets", get(presets::presets_fragment))
         .route(
