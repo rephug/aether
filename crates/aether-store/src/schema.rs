@@ -519,6 +519,48 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         conn.execute("PRAGMA user_version = 12", [])?;
     }
 
+    if version < 13 {
+        conn.execute_batch(
+            r#"
+        CREATE TABLE IF NOT EXISTS intent_contracts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol_id TEXT NOT NULL,
+            clause_type TEXT NOT NULL,
+            clause_text TEXT NOT NULL,
+            clause_embedding_json TEXT,
+            created_at INTEGER NOT NULL,
+            created_by TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1,
+            violation_streak INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_contracts_symbol
+            ON intent_contracts(symbol_id) WHERE active = 1;
+
+        CREATE TABLE IF NOT EXISTS intent_violations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contract_id INTEGER NOT NULL,
+            symbol_id TEXT NOT NULL,
+            sir_version INTEGER NOT NULL,
+            violation_type TEXT NOT NULL,
+            confidence REAL,
+            reason TEXT,
+            detected_at INTEGER NOT NULL,
+            dismissed INTEGER NOT NULL DEFAULT 0,
+            dismissed_at INTEGER,
+            dismissed_reason TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_violations_contract
+            ON intent_violations(contract_id, detected_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_violations_symbol
+            ON intent_violations(symbol_id, detected_at DESC);
+        "#,
+        )?;
+        conn.execute("PRAGMA user_version = 13", [])?;
+    }
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_version (

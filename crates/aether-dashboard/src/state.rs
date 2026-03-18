@@ -39,7 +39,7 @@ impl SharedState {
         ensure_workspace_store_ready(&workspace)?;
         let config = Arc::new(load_workspace_config(&workspace)?);
         let store = Arc::new(SqliteStore::open_readonly(&workspace)?);
-        store.check_compatibility("core", 12)?;
+        store.check_compatibility("core", 13)?;
         let (graph, surreal_graph) = open_shared_graph_async(&workspace, &config, true).await?;
         let surreal_graph = Arc::new(Mutex::new(surreal_graph));
         let vector_store = open_vector_store_async_optional(&workspace, &config).await?;

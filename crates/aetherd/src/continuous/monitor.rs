@@ -189,7 +189,8 @@ fn run_monitor_once_inner(
             let results_jsonl =
                 submit_batch_chunk(workspace, &script, &runtime, &pass_config, input_jsonl)?;
             submitted_chunks += 1;
-            let ingest_summary = ingest_results(workspace, &store, &pass_config, &results_jsonl)?;
+            let ingest_summary =
+                ingest_results(workspace, &store, &pass_config, &results_jsonl, config)?;
             ingested_results += ingest_summary.processed;
             fingerprint_rows += ingest_summary.fingerprint_rows;
         }

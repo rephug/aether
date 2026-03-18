@@ -315,6 +315,7 @@ mod tests {
             continuous: None,
             batch: None,
             seismograph: None,
+            contracts: None,
             watcher: None,
         };
 

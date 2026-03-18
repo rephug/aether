@@ -7,8 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aether_analysis::TestIntentAnalyzer;
 use aether_config::{
-    InferenceProviderKind, SIR_QUALITY_FLOOR_CONFIDENCE, SIR_QUALITY_FLOOR_WINDOW,
-    ensure_workspace_config,
+    ContractsConfig, InferenceProviderKind, SIR_QUALITY_FLOOR_CONFIDENCE, SIR_QUALITY_FLOOR_WINDOW,
+    ensure_workspace_config, load_workspace_config,
 };
 use aether_core::{EdgeKind, GitContext, Language, Symbol, SymbolChangeEvent, content_hash};
 use aether_infer::{
@@ -104,6 +104,7 @@ pub struct SirPipeline {
     tiered_parse_fallback_model: Option<String>,
     skip_surreal_sync: bool,
     skip_local_edges: bool,
+    contracts_config: Option<ContractsConfig>,
 }
 
 struct PreparedCandidateJobs {
@@ -112,6 +113,10 @@ struct PreparedCandidateJobs {
 }
 
 impl SirPipeline {
+    pub(crate) fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
     pub fn new(
         workspace_root: PathBuf,
         sir_concurrency: usize,
@@ -229,6 +234,9 @@ impl SirPipeline {
         let vector_store = runtime
             .block_on(open_vector_store(&workspace_root))
             .context("failed to initialize vector store")?;
+        let contracts_config = load_workspace_config(&workspace_root)
+            .ok()
+            .and_then(|c| c.contracts);
 
         Ok(Self {
             workspace_root,
@@ -250,6 +258,7 @@ impl SirPipeline {
             tiered_parse_fallback_model,
             skip_surreal_sync: false,
             skip_local_edges: false,
+            contracts_config,
         })
     }
 
@@ -1614,6 +1623,29 @@ impl SirPipeline {
                     format!("failed to update status vector_done for intent {intent_id}")
                 })?;
             status = WriteIntentStatus::VectorDone;
+        }
+
+        // Contract verification after embedding refresh (non-fatal)
+        if status == WriteIntentStatus::VectorDone
+            && let Some(ref contracts_config) = self.contracts_config
+            && contracts_config.enabled
+            && let Ok(Some(emb_record)) = self.load_symbol_embedding(payload.symbol.id.as_str())
+        {
+            let config = load_workspace_config(&self.workspace_root).unwrap_or_default();
+            if let Err(err) = crate::contracts::verify_symbol_contracts(
+                store,
+                payload.symbol.id.as_str(),
+                canonical_json.as_str(),
+                Some(emb_record.embedding.as_slice()),
+                &config,
+                &self.workspace_root,
+            ) {
+                tracing::warn!(
+                    symbol_id = %payload.symbol.id,
+                    error = %err,
+                    "Contract verification failed during SIR pipeline"
+                );
+            }
         }
 
         if status == WriteIntentStatus::VectorDone {

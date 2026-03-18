@@ -17,14 +17,15 @@ use aetherd::calibrate::run_calibration_once;
 use aetherd::causal::run_trace_cause_command;
 use aetherd::cli::{
     AskArgs, BatchArgs, BlastRadiusArgs, Cli, Commands, CommunitiesArgs, ContextArgs,
-    ContinuousArgs, CouplingReportArgs, DriftAckArgs, DriftReportArgs, FsckArgs, HealthArgs,
-    HealthScoreArgs, InitAgentArgs, LogFormat, MineCouplingArgs, NotesArgs, PresetArgs, RecallArgs,
-    RefactorPrepArgs, RegenerateArgs, RememberArgs, SeismographArgs, SetupLocalArgs,
+    ContinuousArgs, ContractArgs, CouplingReportArgs, DriftAckArgs, DriftReportArgs, FsckArgs,
+    HealthArgs, HealthScoreArgs, InitAgentArgs, LogFormat, MineCouplingArgs, NotesArgs, PresetArgs,
+    RecallArgs, RefactorPrepArgs, RegenerateArgs, RememberArgs, SeismographArgs, SetupLocalArgs,
     SirContextArgs, SirDiffArgs, SirInjectArgs, TaskHistoryArgs, TaskRelevanceArgs,
     TestIntentsArgs, TraceCauseArgs, VerifyIntentArgs, parse_cli,
 };
 use aetherd::context_presets::run_preset_command;
 use aetherd::continuous::run_continuous_command;
+use aetherd::contracts::run_contract_command;
 use aetherd::coupling::{
     run_blast_radius_command, run_coupling_report_command, run_mine_coupling_command,
 };
@@ -351,6 +352,7 @@ fn run_subcommand(workspace: &Path, config: &AetherConfig, command: Commands) ->
         Commands::VerifyIntent(args) => run_verify_intent_subcommand(workspace, config, args),
         Commands::Fsck(args) => run_fsck_subcommand(workspace, args),
         Commands::Seismograph(args) => run_seismograph_subcommand(workspace, config, args),
+        Commands::Contract(args) => run_contract_subcommand(workspace, config, args),
     }
 }
 
@@ -821,6 +823,14 @@ fn run_seismograph_subcommand(
     args: SeismographArgs,
 ) -> Result<()> {
     run_seismograph_command(workspace, config, args).context("seismograph command failed")
+}
+
+fn run_contract_subcommand(
+    workspace: &Path,
+    config: &AetherConfig,
+    args: ContractArgs,
+) -> Result<()> {
+    run_contract_command(workspace, config, args).context("contract command failed")
 }
 
 fn init_tracing_subscriber(log_format: LogFormat, configured_log_level: &str) -> Result<()> {

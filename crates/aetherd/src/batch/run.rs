@@ -64,6 +64,7 @@ fn run_ingest_command(
         &store,
         &pass_config,
         args.results_jsonl.as_path(),
+        config,
     )?;
     println!(
         "Ingested {} result(s), skipped {}, wrote {} fingerprint row(s)",
@@ -120,6 +121,7 @@ fn run_full_batch_command(
                 &extract_summary.store,
                 &pass_config,
                 results_jsonl.as_path(),
+                config,
             )?;
             println!(
                 "Ingested {} chunk {}: processed {}, skipped {}, fingerprint rows {}",
