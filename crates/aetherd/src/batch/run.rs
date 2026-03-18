@@ -37,7 +37,15 @@ fn run_build_command(workspace: &Path, config: &AetherConfig, args: &BatchBuildA
         runtime.batch_dir = normalize_batch_dir(workspace, batch_dir);
     }
     let pass_config = resolve_build_pass_config(&runtime, args);
-    let summary = build_pass_jsonl(workspace, &store, &runtime, &pass_config, &symbols_by_id)?;
+    let contracts_enabled = config.contracts.as_ref().is_some_and(|c| c.enabled);
+    let summary = build_pass_jsonl(
+        workspace,
+        &store,
+        &runtime,
+        &pass_config,
+        &symbols_by_id,
+        contracts_enabled,
+    )?;
     println!(
         "Built {} chunk(s), wrote {} request(s), skipped {}, unresolved {}",
         summary.files.len(),
@@ -88,6 +96,7 @@ fn run_full_batch_command(
         ));
     }
 
+    let contracts_enabled = config.contracts.as_ref().is_some_and(|c| c.enabled);
     let extract_summary = run_extract(workspace)?;
     println!("Extracted {} symbols", extract_summary.symbol_count);
     for pass in passes {
@@ -98,6 +107,7 @@ fn run_full_batch_command(
             &runtime,
             &pass_config,
             &extract_summary.symbols_by_id,
+            contracts_enabled,
         )?;
         println!(
             "Built {} chunk(s) for {}: wrote {}, skipped {}, unresolved {}",

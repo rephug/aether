@@ -122,6 +122,9 @@ pub struct SirEnrichmentContext {
     pub baseline_sir: Option<SirAnnotation>,
     /// Human-readable explanation of why this symbol was selected for enriched analysis
     pub priority_reason: String,
+    /// Contract clauses from caller symbols that depend on this symbol.
+    /// Each entry: (caller qualified name, clause type, clause text)
+    pub caller_contract_clauses: Vec<(String, String, String)>,
 }
 
 fn format_baseline_sir(baseline_sir: &Option<SirAnnotation>) -> String {
@@ -175,6 +178,20 @@ including conditional mutations, correct confidence reflecting your certainty.",
         kind_specific_guidance(context),
         symbol_text,
     );
+
+    if !enrichment.caller_contract_clauses.is_empty() {
+        prompt.push_str(
+            "\n\nCaller contracts (behavioral expectations from callers of this symbol):\n",
+        );
+        for (caller_name, clause_type, clause_text) in &enrichment.caller_contract_clauses {
+            prompt.push_str(&format!(
+                "- {caller_name} [{clause_type}]: \"{clause_text}\"\n"
+            ));
+        }
+        prompt.push_str(
+            "Ensure your SIR summary clarifies whether these contracted behaviors are preserved.\n",
+        );
+    }
 
     if include_cot {
         prompt.push_str(
@@ -308,6 +325,7 @@ mod tests {
                 method_dependencies: None,
             }),
             priority_reason: "high PageRank + public method".to_owned(),
+            caller_contract_clauses: Vec::new(),
         };
 
         let prompt = build_enriched_sir_prompt("pub fn run() {}", &context, &enrichment);
@@ -333,6 +351,7 @@ mod tests {
             neighbor_intents: Vec::new(),
             baseline_sir: None,
             priority_reason: "low confidence triage output".to_owned(),
+            caller_contract_clauses: Vec::new(),
         };
 
         let prompt = build_enriched_sir_prompt("pub trait Store {}", &context, &enrichment);
@@ -356,10 +375,71 @@ mod tests {
             neighbor_intents: Vec::new(),
             baseline_sir: None,
             priority_reason: "low confidence triage output".to_owned(),
+            caller_contract_clauses: Vec::new(),
         };
 
         let prompt = build_enriched_sir_prompt_with_cot("pub fn run() {}", &context, &enrichment);
         assert!(prompt.contains("<thinking>"));
         assert!(prompt.contains("After closing your </thinking> tag, output the final JSON."));
+    }
+
+    #[test]
+    fn build_enriched_prompt_includes_caller_contract_clauses() {
+        let context = SirContext {
+            language: "rust".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            qualified_name: "demo::run".to_owned(),
+            priority_score: Some(0.9),
+            kind: "function".to_owned(),
+            is_public: true,
+            line_count: 60,
+        };
+        let enrichment = SirEnrichmentContext {
+            file_intent: None,
+            neighbor_intents: Vec::new(),
+            baseline_sir: None,
+            priority_reason: "test".to_owned(),
+            caller_contract_clauses: vec![
+                (
+                    "payments::checkout".to_owned(),
+                    "must".to_owned(),
+                    "reject negative amounts".to_owned(),
+                ),
+                (
+                    "payments::refund".to_owned(),
+                    "must_not".to_owned(),
+                    "allow duplicate refunds".to_owned(),
+                ),
+            ],
+        };
+
+        let prompt = build_enriched_sir_prompt("pub fn run() {}", &context, &enrichment);
+        assert!(prompt.contains("Caller contracts"));
+        assert!(prompt.contains("payments::checkout [must]: \"reject negative amounts\""));
+        assert!(prompt.contains("payments::refund [must_not]: \"allow duplicate refunds\""));
+        assert!(prompt.contains("contracted behaviors are preserved"));
+    }
+
+    #[test]
+    fn build_enriched_prompt_omits_contracts_when_empty() {
+        let context = SirContext {
+            language: "rust".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            qualified_name: "demo::run".to_owned(),
+            priority_score: None,
+            kind: "function".to_owned(),
+            is_public: true,
+            line_count: 10,
+        };
+        let enrichment = SirEnrichmentContext {
+            file_intent: None,
+            neighbor_intents: Vec::new(),
+            baseline_sir: None,
+            priority_reason: "test".to_owned(),
+            caller_contract_clauses: Vec::new(),
+        };
+
+        let prompt = build_enriched_sir_prompt("pub fn run() {}", &context, &enrichment);
+        assert!(!prompt.contains("Caller contracts"));
     }
 }

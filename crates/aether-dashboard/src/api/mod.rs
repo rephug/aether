@@ -19,6 +19,7 @@ pub(crate) mod context;
 mod context_build;
 pub(crate) mod context_export;
 pub(crate) mod continuous;
+pub(crate) mod contracts;
 pub(crate) mod coupling;
 mod coupling_matrix;
 pub(crate) mod daemon_status;
@@ -179,6 +180,12 @@ pub(crate) fn api_router() -> Router<Arc<DashboardState>> {
         .route(
             "/api/v1/seismograph-gauge",
             get(seismograph::seismograph_gauge_handler),
+        )
+        // Phase 10.5: Intent Contracts
+        .route("/api/v1/contracts", get(contracts::contracts_handler))
+        .route(
+            "/api/v1/contracts/dismiss",
+            post(contracts::dismiss_handler),
         )
         // Phase Repo R.5: Context Builder
         .route(

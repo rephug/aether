@@ -1182,6 +1182,34 @@ async fn unknown_static_path_returns_404() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn contracts_api_returns_ok() {
+    let (_tmp, app, _ids) = seeded_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/contracts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json.get("data").is_some());
+    assert!(json.get("meta").is_some());
+    assert!(json["data"].get("contracts").is_some());
+    assert!(json["data"]["contracts"].is_array());
+    assert!(json["data"].get("summary").is_some());
+    assert!(json["data"]["summary"].get("total_contracts").is_some());
+    assert!(json["data"]["summary"].get("satisfaction_rate").is_some());
+    assert!(json["data"].get("recent_violations").is_some());
+    assert!(json["data"]["recent_violations"].is_array());
+}
+
 struct TestIds {
     primary: String,
 }

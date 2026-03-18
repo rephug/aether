@@ -49,8 +49,17 @@ pub(crate) fn build_pass_jsonl(
     runtime: &BatchRuntimeConfig,
     pass_config: &PassConfig,
     symbols_by_id: &HashMap<String, Symbol>,
+    contracts_enabled: bool,
 ) -> Result<BuildSummary> {
-    build_pass_jsonl_for_ids(workspace, store, runtime, pass_config, symbols_by_id, None)
+    build_pass_jsonl_for_ids(
+        workspace,
+        store,
+        runtime,
+        pass_config,
+        symbols_by_id,
+        None,
+        contracts_enabled,
+    )
 }
 
 pub(crate) fn build_pass_jsonl_for_ids(
@@ -60,6 +69,7 @@ pub(crate) fn build_pass_jsonl_for_ids(
     pass_config: &PassConfig,
     symbols_by_id: &HashMap<String, Symbol>,
     candidate_ids: Option<&[String]>,
+    contracts_enabled: bool,
 ) -> Result<BuildSummary> {
     if pass_config.model.trim().is_empty() {
         return Err(anyhow!(
@@ -88,14 +98,19 @@ pub(crate) fn build_pass_jsonl_for_ids(
             .list_all_symbol_ids()
             .context("failed to list symbols for batch build")?,
     };
-    let graph = if matches!(pass_config.pass, BatchPass::Scan) {
-        HashMap::new()
+    let raw_edges = if matches!(pass_config.pass, BatchPass::Scan) {
+        Vec::new()
     } else {
-        build_neighbor_graph(
-            &store
-                .list_graph_dependency_edges()
-                .context("failed to list graph dependency edges for batch build")?,
-        )
+        store
+            .list_graph_dependency_edges()
+            .context("failed to list graph dependency edges for batch build")?
+    };
+    let graph = build_neighbor_graph(&raw_edges);
+    let caller_contracts_map = if contracts_enabled && !matches!(pass_config.pass, BatchPass::Scan)
+    {
+        build_caller_contracts_map(store, &raw_edges, symbols_by_id)
+    } else {
+        HashMap::new()
     };
 
     let mut candidate_ids = Vec::new();
@@ -187,6 +202,7 @@ pub(crate) fn build_pass_jsonl_for_ids(
                     &neighbor_sirs,
                     symbols_by_id,
                     baseline_sir,
+                    &caller_contracts_map,
                 );
                 let prompt = if matches!(pass_config.pass, BatchPass::Deep) {
                     build_enriched_sir_prompt_with_cot(&job.symbol_text, &job.context, &enrichment)
@@ -341,6 +357,7 @@ fn parse_file_intents(blobs: &HashMap<String, String>) -> HashMap<String, String
     parsed
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_enrichment_context(
     symbol: &Symbol,
     pass_config: &PassConfig,
@@ -349,6 +366,7 @@ fn build_enrichment_context(
     neighbor_sirs: &HashMap<String, SirAnnotation>,
     symbols_by_id: &HashMap<String, Symbol>,
     baseline_sir: SirAnnotation,
+    caller_contracts: &HashMap<String, Vec<(String, String, String)>>,
 ) -> SirEnrichmentContext {
     let file_rollup_id = synthetic_file_sir_id(symbol.language.as_str(), symbol.file_path.as_str());
     let mut neighbor_intents =
@@ -365,6 +383,11 @@ fn build_enrichment_context(
             .collect::<Vec<_>>();
     neighbor_intents.sort_by(|left, right| left.0.cmp(&right.0));
 
+    let caller_contract_clauses = caller_contracts
+        .get(symbol.id.as_str())
+        .cloned()
+        .unwrap_or_default();
+
     SirEnrichmentContext {
         file_intent: file_intents.get(file_rollup_id.as_str()).cloned(),
         neighbor_intents,
@@ -373,5 +396,54 @@ fn build_enrichment_context(
             "Selected for batch {} regeneration",
             pass_config.pass.as_str()
         ),
+        caller_contract_clauses,
     }
+}
+
+/// Build a map from target symbol ID to contract clauses imposed by its callers.
+///
+/// For each "calls" edge A→B, if A has active contracts, those clauses are
+/// collected under B's symbol ID so B's enrichment prompt can reference them.
+fn build_caller_contracts_map(
+    store: &SqliteStore,
+    edges: &[GraphDependencyEdgeRecord],
+    symbols_by_id: &HashMap<String, Symbol>,
+) -> HashMap<String, Vec<(String, String, String)>> {
+    // Build inverted index: target_symbol_id → deduplicated set of caller symbol IDs
+    let mut target_to_callers: HashMap<String, HashSet<String>> = HashMap::new();
+    for edge in edges {
+        if edge.edge_kind == "calls" {
+            target_to_callers
+                .entry(edge.target_symbol_id.clone())
+                .or_default()
+                .insert(edge.source_symbol_id.clone());
+        }
+    }
+
+    let mut result: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
+    for (target_id, caller_ids) in &target_to_callers {
+        for caller_id in caller_ids {
+            let contracts = match store.list_active_contracts_for_symbol(caller_id) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            if contracts.is_empty() {
+                continue;
+            }
+            let caller_name = symbols_by_id
+                .get(caller_id.as_str())
+                .map(|s| s.qualified_name.as_str())
+                .unwrap_or(caller_id.as_str());
+            let entry = result.entry(target_id.clone()).or_default();
+            for contract in contracts {
+                entry.push((
+                    caller_name.to_owned(),
+                    contract.clause_type,
+                    contract.clause_text,
+                ));
+            }
+        }
+    }
+
+    result
 }
