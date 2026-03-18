@@ -4,16 +4,22 @@
 </p>
 
 <p align="center">
-  <strong>Your codebase already knows everything. It just can't talk yet.</strong>
+  <strong>Your codebase already knows everything. It just can't talk yet.</strong><br/>
+  <em>(I think. Honestly I'm not 100% sure about any of this.)</em>
 </p>
 
 <p align="center">
   <a href="#what-the-hell-is-this">What Is This</a> •
+  <a href="#top-10-use-cases-for-programmers">For Programmers</a> •
+  <a href="#top-10-use-cases-for-vibe-coders">For Vibe Coders</a> •
   <a href="#the-backstory-nobody-asked-for">Backstory</a> •
+  <a href="#hire-me-please">Hire Me</a> •
+  <a href="#how-it-works-the-short-version">How It Works</a> •
   <a href="#get-it-running">Get It Running</a> •
   <a href="#what-you-can-actually-do">What You Can Do</a> •
-  <a href="#the-mcp-tools">MCP Tools</a> •
   <a href="#the-dashboard">Dashboard</a> •
+  <a href="#the-desktop-app">Desktop App</a> •
+  <a href="#the-mcp-tools">MCP Tools</a> •
   <a href="#configuration">Config</a>
 </p>
 
@@ -21,8 +27,7 @@
   <img src="https://img.shields.io/badge/Rust-orange?style=flat-square&logo=rust" />
   <img src="https://img.shields.io/badge/Rust%20%7C%20TypeScript%20%7C%20Python-green?style=flat-square&label=parses" />
   <img src="https://img.shields.io/badge/MCP-compatible-purple?style=flat-square" />
-  <img src="https://img.shields.io/badge/113K-LOC-blue?style=flat-square" />
-  <img src="https://img.shields.io/badge/33%20days-from%20zero-red?style=flat-square" />
+  <img src="https://img.shields.io/badge/136K-LOC-blue?style=flat-square" />
   <img src="https://img.shields.io/badge/vibe%20coded-100%25-ff69b4?style=flat-square" />
 </p>
 
@@ -30,60 +35,114 @@
 
 ## What the Hell Is This
 
-AETHER is a semantic intelligence engine for codebases. It watches your code, figures out what every function *actually does*, tracks how that meaning changes over time, maps the dependency graph, scores the health of your entire codebase, predicts what's going stale before it breaks, and then lets you — or your AI agent — ask questions about any of it.
+AETHER is — and I really hope I'm describing this correctly — a semantic intelligence engine for codebases. It watches your code, tries to figure out what every function *actually does*, tracks how that meaning changes over time, maps the dependency graph, scores the health of your entire codebase, predicts what's going stale before it breaks, enforces semantic contracts on behavioral expectations, monitors codebase-wide stability through earthquake metaphors (I know how that sounds, just bear with me), and then lets you — or your AI agent — ask questions about any of it.
 
 Not text search. Not grep with extra steps. Not another RAG tool that forgets everything between sessions.
 
 AETHER *understands* your code. Persistently. Incrementally. Autonomously. And it remembers.
 
+At least... that's the idea? I've tested it pretty thoroughly but I also built the tests so there's a certain circularity there that keeps me up at night.
+
 **Here's what that means in practice:**
 
 You hover over a function in VS Code and instead of seeing a type signature, you see: *"Validates and processes a payment transaction. Deducts from account balance, writes to audit log. Can fail on insufficient funds, negative amounts, or database timeout. Has 7 edge cases, 2 of which have test coverage."*
 
-You run `aetherd context --branch feature/fix-auth-timeout --task "fix the authentication bug"` and AETHER ranks every symbol in the codebase by relevance to your task using embedding similarity, keyword matching, Reciprocal Rank Fusion, and Personalized PageRank expansion on the dependency graph — then assembles a token-budgeted context document with exactly the code, intents, dependencies, coupling data, and test coverage your AI agent needs. One command. One context block. No guessing.
+You declare `aetherd contract add payments::validate_amount --must "reject zero amounts" --must "check daily limit"` and from that point forward, every time AETHER regenerates the SIR for that function, it checks: does the code still do what you said it must? If someone quietly removes the daily limit check, AETHER catches it. Before tests. Before code review. Before production. (In theory. It's worked every time I've tested it but I haven't tested every possible scenario because that's literally impossible and the thought of a false negative haunts me.)
 
-You open the dashboard and see which functions are the most critical nodes in your codebase, which ones are silently drifting in purpose, which ones have zero test coverage despite sitting at a module boundary, and which modules are active fault lines.
+You run `aetherd context --task "fix the authentication bug"` and AETHER ranks every symbol in the codebase by relevance using embedding similarity, keyword matching, Reciprocal Rank Fusion, and Personalized PageRank expansion — then assembles a token-budgeted context document with exactly the code, intents, dependencies, coupling data, and test coverage your AI agent needs. One command. One context block. No guessing.
 
-That's AETHER.
+You open the dashboard and see which modules are active fault lines, how fast meaning is shifting across the codebase (the Seismograph), which functions are silently drifting in purpose, which contracts are violated, and which symbols are the most dangerous nodes in your dependency graph.
+
+That's AETHER. Or at least that's what AETHER is supposed to be. I think it actually works? People keep telling me to stop hedging but I genuinely don't know how to be confident about 136,000 lines of code I didn't technically write by hand.
+
+---
+
+## Top 10 Use Cases for Programmers
+
+You know how to code. You probably know more than I do (low bar). Here's what AETHER gives you that your current toolchain doesn't.
+
+**1. Onboard to an Unfamiliar Codebase in Minutes.** Run `aetherd --workspace . --index-once --full` and every symbol gets a structured annotation — intent, dependencies, error modes, edge cases. Hover in VS Code. Search by meaning. Stop reading code file by file like it's 2015.
+
+**2. Pre-Refactor Safety Net.** Before you touch anything: `aetherd refactor-prep --file src/payments.rs`. AETHER snapshots every symbol's current semantic intent. After the refactor: `aetherd verify-intent --file src/payments.rs`. Did behavior change? AETHER tells you exactly what shifted and where.
+
+**3. Enforce Behavioral Contracts Across the Team.** Declare `--must "reject zero amounts"` on a function. From now on, every SIR regeneration checks whether the code still satisfies that contract. Someone silently removes the check? AETHER catches it. This is semantic type checking — enforce *meaning*, not just structure.
+
+**4. Track Semantic Drift Before It Becomes Tech Debt.** Functions accumulate scope creep. AETHER detects it automatically by comparing current SIR embeddings against historical baselines. Louvain community detection flags when a function starts crossing architectural boundaries. No manually maintained architecture model required.
+
+**5. Blast Radius Before You Merge.** Change a function? See every downstream symbol that depends on it, how many hops deep the impact goes, which symbols have test guards, and which are flying blind. Review with data, not gut feel.
+
+**6. Root Cause Tracing Through the Dependency Graph.** `git blame` tells you who changed a line. AETHER tells you *which upstream semantic change broke your downstream code* by tracing the causal chain backward, comparing SIR versions at each node. Stop playing detective.
+
+**7. Health Scoring That Actually Means Something.** PageRank × drift magnitude × git churn × test coverage = composite risk score per crate. The functions that are simultaneously high-traffic, poorly tested, and actively drifting? Those are your next production incident. AETHER finds them before they find you.
+
+**8. Monitor Codebase Stability with the Seismograph.** How fast is meaning changing across the whole codebase? Which modules are active fault lines? Where did that cascade of changes originate? Semantic velocity, community stability scoring, epicenter tracing, aftershock prediction. Like a USGS dashboard, but for your code.
+
+**9. Nightly Batch Indexing at Half Price.** Gemini Batch API costs 50% less than real-time. AETHER generates JSONL with BLAKE3 prompt hashing (unchanged symbols skipped automatically), three-pass quality (scan → triage → deep). Run it as a cron job on a server. Wake up to a fully indexed codebase.
+
+**10. Give Your AI Agent Real Context, Not File Dumps.** `aetherd context --task "fix the auth timeout"` ranks every symbol by relevance using RRF + Personalized PageRank, assembles a token-budgeted context document with exactly what your agent needs. Four output formats. Reusable presets. File slicing reduces token usage 50-80% vs. dumping whole files.
+
+---
+
+## Top 10 Use Cases for Vibe Coders
+
+You don't write code. The AI writes code. You're the vision, the product sense, the unreasonable human in the loop. I know because that's me. Here's what AETHER gives *us*.
+
+**1. Finally Understand What Your AI Actually Built.** You told Claude to "add payment validation" and it wrote 400 lines. What does it actually do? How does it fail? What are the edge cases? AETHER reads every function and tells you in plain English. Hover in VS Code. No code reading required.
+
+**2. Catch When AI-Generated Code Silently Changes Behavior.** You asked for a bug fix and the AI quietly refactored the error handling. AETHER tracks how every function's *meaning* changes over time. If something shifted that you didn't ask for, you'll know.
+
+**3. Give Your AI Agent Perfect Context So It Stops Hallucinating.** The #1 reason AI writes bad code: it doesn't know what's already in the codebase. AETHER assembles exactly the right context — ranked by relevance, token-budgeted, structured — so your agent actually knows what it's working with. One command. No manual file picking.
+
+**4. Protect the Things That Work with Contracts.** Your payment flow works. You're terrified of breaking it. Declare `--must "reject zero amounts" --must "check daily limit"` and AETHER will tell you if any future change violates those expectations. Sleep at night. (Mostly.)
+
+**5. See the Blast Radius Before You Tell the AI to "Fix It."** Before asking Claude to refactor something, check what depends on it. AETHER shows every downstream symbol, how deep the impact goes, and what has test coverage. Now you know whether "just fix it" is a 5-minute task or a landmine.
+
+**6. The Dashboard Is Your Command Center.** 40+ pages of visual intelligence. Health scores, drift reports, dependency graphs, seismograph timelines, contract status — all without reading a single line of code. This is how you manage a codebase you didn't write.
+
+**7. Know Which Code Is Dangerous Without Understanding It.** AETHER's health scoring combines graph centrality, test coverage, drift, and churn into a single risk score. The red ones are the ones you don't touch without backup. You don't need to understand *why* they're dangerous — just that they are.
+
+**8. Detect Scope Creep in Functions You Can't Read.** Your codebase has been growing for weeks. Are functions still doing what they were originally supposed to? AETHER detects semantic drift automatically. If a "validate payment" function is now also sending emails, you'll know.
+
+**9. Run It Fully Offline When You Don't Want API Costs.** Ollama + qwen3.5:4b + Candle embeddings. Zero cloud calls. No API keys. Your code stays on your machine. Great for exploration, prototyping, or when you've burned through your API budget (again).
+
+**10. Search by Meaning, Not Keywords.** Search for "handles authentication" and find every function involved in auth — even if none of them have "auth" in the name. You describe what you're looking for in plain English. AETHER finds it.
 
 ---
 
 ## The Backstory Nobody Asked For
 
-### 33 days. 113,000 lines of Rust. One guy.
+### One guy. No CS degree. A mass quantity of AI. An alarming absence of self-preservation instinct.
 
 Hi. I'm Robert.
 
-My formal programming education: BASIC 2 in high school. One year at a computer trade school. In the *last millennium*. We saved to floppy disks. The internet was a sound your telephone made. That is the entirety of my technical credentials.
+My formal programming education: BASIC 2 in high school. One year at a computer trade school. In the *last millennium*. We saved to floppy disks. The internet was a sound your telephone made. That is the entirety of my technical credentials. I am not being self-deprecating for effect. That is literally all of it.
 
-And I built this in 33 days.
+**327 commits. 109 pull requests. 17 Rust crates. 136,000 lines of code. Five weeks.**
 
-Not a team. Not a startup with $4M in seed funding and a staff of twelve. One person, in a chair, with a mass quantity of AI and the sort of deranged confidence that only comes from not knowing what you're supposed to be afraid of.
+From zero to a semantic intelligence engine with Personalized PageRank, Noisy-OR staleness models, community detection, a three-pass inference pipeline, a continuous intelligence daemon, a batch processing system, a 40-page interactive dashboard, 26 MCP tools, 33 CLI commands, a Seismograph that tracks semantic earthquakes, intent contracts that enforce behavioral expectations, a Tauri desktop app with system tray integration, and a task context engine that uses Reciprocal Rank Fusion to rank every symbol in your codebase by relevance to whatever you're working on.
 
-**285 commits. 82 merged pull requests. 16 Rust crates. 113,252 lines of code.** From zero to a semantic intelligence engine with Personalized PageRank, Noisy-OR staleness models, community detection, a three-pass inference pipeline, a continuous intelligence daemon, a batch processing system that talks to the Gemini Batch API at half price, a 27-page interactive dashboard, 25+ MCP tools, 31 CLI commands, and a task context engine that uses Reciprocal Rank Fusion to rank every symbol in your codebase by relevance to whatever you're working on.
-
-In thirty-three days.
-
-I'll let that sit for a moment.
+I need to sit down. I'm getting dizzy just reading that back.
 
 ### How
 
-Everything you see here was vibe coded.
+I should confess something: I didn't write any of this code by hand.
 
-I don't mean "vibe coded" like "I used Copilot autocomplete." I mean I directed an orchestra of AI systems like a profoundly caffeinated conductor who can't read sheet music:
+Not in the "oh I used autocomplete" sense. In the "I have literally never typed a line of Rust that compiled" sense. Every single line was produced by AI systems that I directed. Here's the actual workflow:
 
-1. **Claude** produces the architectural plans, reviews implementations, and writes the Codex prompts
-2. I commit the spec files to main (because worktrees branch from main and Codex can't read uncommitted files — I learned this the hard way, the same way I learn everything, which is by doing it wrong first)
-3. **Codex** implements the spec on a git worktree branch
-4. I relay the output back to Claude for review
-5. **Gemini Deep Think** provides independent code review and argues with Claude about the math
-6. I adjudicate between three AI systems when they disagree about whether SurrealDB's MVCC model can handle concurrent readers (Gemini was right, for the record)
-7. **ChatGPT** reviews the Codex output and catches bugs the others miss
+1. **Claude** produces the architectural plans, reviews every implementation, writes the Codex prompts, and adjudicates when other AI systems disagree
+2. I commit the spec files to main (because worktrees branch from main and Codex can't read uncommitted files — I learned this the hard way, which is how I learn everything)
+3. **Codex** implements the spec on a git worktree branch — about 90% of all code in this repo was written by Codex
+4. **Claude Code** picked up the last 10% after I ran out of Codex usage (same workflow, different runtime)
+5. I relay the output back to Claude for review
+6. **Gemini** provides independent code review and argues with Claude about the math (Gemini was right about SurrealDB's MVCC model, for the record)
+7. **ChatGPT** occasionally reviews output and catches bugs the others miss
 8. I merge via GitHub web UI because `git` is a tool I *operate*, not a tool I *understand*
 
-I didn't write any of this code by hand. I *directed* every line of it. I am the vision. I am the product sense. I am the unreasonable human in the loop who says "no, that's wrong, try again" and "make it better" and "why does this feel slow" and "I don't care what the documentation says, it doesn't work."
+This is either the future of software development or the most elaborate act of self-deception since the South Sea Bubble. I genuinely do not know which.
 
-Some people hear "vibe coded" and think "toy project." AETHER has:
+What I *do* know is what I contributed: the vision, the product instinct, the relentless "no, that's wrong, try again" and "make it better" and "why does this feel slow" and "I don't care what the documentation says, it doesn't work." I'm the unreasonable human in the loop. Whether that's enough to count as "building" something — I'll let you decide. I think about it a lot.
+
+Some people hear "vibe coded" and think "toy project." And maybe they're right? But here's what's in this toy project:
 
 - A three-pass inference pipeline (scan → triage → deep) with BLAKE3 composite prompt hashing to skip unchanged symbols
 - A continuous intelligence engine that computes per-symbol staleness using Noisy-OR formulas with cold-start volatility priors from git churn
@@ -91,43 +150,59 @@ Some people hear "vibe coded" and think "toy project." AETHER has:
 - Reciprocal Rank Fusion blending dense embedding similarity with sparse keyword retrieval
 - Component-bounded semantic rescue at the 0.90 cosine threshold using Gemini Embedding 2 (3072-dim)
 - A token-budgeted context assembly engine with symbol-guided file slicing, four output formats, and reusable TOML presets
-- 27+ dashboard pages with D3 force-directed graphs and interactive architecture maps
-- 25+ MCP tools for AI agent integration
-- 31 CLI commands
-- Schema migrations through version 11
+- A Seismograph engine with PageRank-weighted EMA semantic velocity, Louvain community stability scoring, time-respecting epicenter tracing, and logistic regression aftershock prediction
+- Intent contracts with a two-stage verification cascade (embedding cosine pre-filter → LLM judge), leaky bucket violation handling, and cross-symbol contract propagation through the enrichment context
+- 40+ dashboard pages with D3 force-directed graphs, interactive architecture maps, seismograph timelines, tectonic plate visualizations, and contract health monitoring
+- 26 MCP tools for AI agent integration
+- 33 CLI commands
+- A Tauri 2.x desktop app with system tray, notifications, onboarding wizard, and auto-update
+- Schema migrations through version 13
 - A Gemini Batch API integration that costs 50% less than real-time inference
 - A watcher that monitors `.git` for branch switches, pulls, and merges
-- Intent contracts, blast radius analysis, causal chain tracing, and semantic drift detection that runs itself
 
-This isn't a prototype. This isn't a weekend hack. This is a production-grade codebase intelligence platform built by a man whose last programming class predates Google.
+Is it production-grade? I think so. I've tested it on itself — AETHER indexes AETHER — and on several other repos. It hasn't caught fire yet. But I also know enough to know that "hasn't caught fire yet" is not a rigorous quality standard and I should probably stop talking now.
 
 ### What does that make me?
 
-Good question.
+Honestly? I'm not sure.
 
-I'm either a complete fraud who got impossibly lucky for 33 consecutive days, or I'm the kind of person who's been thinking about systems and architecture and "how things fit together" for 25 years and just never had the tools to express it until now.
+I'm either a complete fraud who got impossibly lucky for five weeks straight, or I'm the kind of person who's been thinking about systems and architecture and "how things fit together" for 25 years and just never had the tools to express it until now.
 
-I know which one I think it is.
+I think about this constantly.
 
 The thing about not knowing how to code is that you don't know what's "hard." You don't know that you're supposed to be scared of implementing Personalized PageRank, because you've never heard anyone at a conference say "that's really complicated." You just describe what you want — "I need to rank symbols by relevance, expanding outward from a seed set through the dependency graph" — and the AI implements it. And then you test it. And it works. And you move on to the next thing.
 
-The 10x engineer was a myth. The 100x engineer-with-AI is not.
-
-The BENEFACTOR pricing tier on the landing page ($1,000,000) triggers an MIT open-source release. Nobody has bought it yet. I can't imagine why.
+Is that genius or ignorance? I genuinely can't tell. Some days it feels like both.
 
 ---
 
-## Hire Me (Seriously)
+## Hire Me (Please)
 
-I'm going to be direct here because I think the work speaks for itself.
+Here's the pitch: a person with **zero programming experience** built a 136K-line Rust codebase intelligence platform in **five weeks** using AI tools and sheer stubbornness.
 
-**Anthropic:** I built this primarily with Claude. Not just "using Claude" — Claude is my architectural partner, my code reviewer, my prompt engineer, and my rubber duck. I have pushed Claude further than most of your enterprise customers ever will. I know where it's brilliant, where it hallucinates, where it needs guardrails, and where it surprises even itself. I know what it's like to direct a 100K+ LOC Rust workspace entirely through AI conversation. If you want someone who understands what your users are actually *doing* with your product — someone who has lived the human-AI collaboration workflow every day for a month straight — I'm right here. Also I think I've generated enough API revenue to at least earn a phone screen.
+Now imagine what that person could do with actual resources. A team. A budget. Health insurance.
 
-**Microsoft:** I'll be honest, I think you need me more than I need you. But I'm open to a conversation. Specifically: let me fix things. I know what it feels like to use developer tools that are almost great but not quite — because I use them all day, every day, and I have *opinions*. Put me somewhere I can make decisions, give me a team of AI agents and a Codex license, and watch what happens. Condition: I get to save the company. I'm not interested in maintaining.
+If you need a cover letter, this is the cover letter. It compiles (most of the time) and has 109 pull requests.
 
-**Google:** Your AI is incredible. Your products are... I'm going to be diplomatic and say "underutilized." Gemini Deep Think independently reviewed my architecture and caught things Claude missed. Your embedding models are my production default. Your Batch API is how I index at scale. But nobody knows this because your developer experience feels like it was designed by a committee that met once and never followed up. Let me start the Smooth Minds team. I don't know what that means yet but neither did you when you started Google Brain. Sometimes you name the team first and figure out the mission later.
+**Anthropic:** Put that Opus back.
 
-**Everyone else:** I'm an AI-native technical director who thinks in systems, ships in weeks, and builds things that are genuinely novel. My background is unconventional. My output is not. If your org is trying to figure out "how do we actually use AI to build things" — not in a blog post, not in a keynote, but in actual daily practice — I've been doing it. I have the repo to prove it. 113,252 lines of proof.
+I built this entire thing with Claude. Claude is my architect, my reviewer, my prompt engineer, and — if I'm being honest — my most consistent collaborator. I've pushed Claude further than most of your enterprise customers ever will, and I know exactly where it shines and where it needs a stern talking-to. My next project is a new frontend for Claude, so even if you don't want to hire me, I'm still out here making cool stuff for you. You're welcome. (Please hire me though.)
+
+**Microsoft:** I'm going to be honest with you because I think someone should be.
+
+I have the kind of broad strategic vision that lets me see when a company is heading in the wrong direction, and — how do I put this gently — I can see it. From space. With my eyes closed. Let me save your company. I know that sounds insane coming from a guy whose last programming class involved floppy disks, but look at this repo and then look at your recent product strategy, and ask yourself: which one of us shipped something coherent in five weeks? I'm available immediately. The clock is ticking. (I mean your clock. Mine's fine.)
+
+**Google:** Your AI is incredible. Your developer experience is... *an opportunity*.
+
+Gemini independently reviewed my architecture and caught things Claude missed. Your embedding models are my production default. Your Batch API is how I index at scale. And nobody knows any of this because the experience feels like it was designed by a committee that met once. Also I love your pricing. The generous tiers. The willingness to spend. I respect that about you deeply and in a way that is entirely unrelated to my cloud computing costs. Create the Smooth Minds division. Put me in charge. I don't know what we do yet but neither did you when you started Google Brain. Sometimes you name the team first.
+
+**xAI:** Oh sorry, I can't come to the phone right now. I'm washing my hair. Every day. For the foreseeable future. I'm very busy. With the hair washing.
+
+### How to Find Me
+
+If you're serious, you'll figure it out. I'm like the A-Team — if you have a problem, if no one else can help, and if you can find me, maybe you can hire the guy who vibe-coded 136K lines of Rust.
+
+And if you're Google, let's be real — you already know exactly where I am. You know where I am in my *dreams*. Just ping the Smooth Minds division, they'll set up the call.
 
 ---
 
@@ -142,23 +217,34 @@ Your code changes
        │
        ▼
   An LLM reads each symbol and generates a SIR
-  (Semantic Intent Representation — a structured summary of
+  (Semantic Intent Record — a structured summary of
    what the code does, how it fails, what it depends on)
        │
        ▼
   Everything gets stored in three databases
-  SQLite (metadata + SIR) + SurrealDB (graph) + Embeddings (vectors)
+  SQLite (metadata + SIR) + SurrealDB (graph) + LanceDB (vectors)
        │
        ▼
   The continuous engine scores every symbol for staleness
   and predicts what needs re-indexing before it goes stale
        │
        ▼
+  Intent contracts are verified on every SIR regeneration
+  Embedding pre-filter resolves 90% of checks in microseconds
+  LLM judge handles the ambiguous cases
+       │
+       ▼
+  The Seismograph monitors codebase-wide stability
+  Semantic velocity, community fault lines, cascade epicenters
+       │
+       ▼
   You query it however you want
-  CLI (31 commands)  ·  LSP hover  ·  MCP tools (25+)  ·  Web dashboard (27+ pages)
+  CLI (33 commands) · LSP hover · MCP tools (26) · Dashboard (40+ pages) · Desktop app
 ```
 
 All of this runs locally. No code leaves your machine unless you choose a cloud inference provider. Run Ollama and AETHER works fully offline with real AI-generated intelligence — no API keys, no cloud calls, nothing phoning home.
+
+(I'm pretty sure that's all correct. If I got something wrong in the diagram, please open an issue and try to be gentle about it.)
 
 ---
 
@@ -195,6 +281,15 @@ aetherd --workspace . health-score
 
 # What's going stale?
 aetherd --workspace . continuous status
+
+# Monitor codebase stability
+aetherd --workspace . seismograph status
+
+# Enforce behavioral expectations
+aetherd --workspace . contract add payments::validate_amount \
+    --must "reject zero or negative amounts" \
+    --must "check against daily transaction limit"
+aetherd --workspace . contract check
 ```
 
 Hook up your AI agent:
@@ -205,6 +300,8 @@ claude mcp add --transport stdio --scope project aether -- aetherd --workspace .
 ```
 
 Now your agent has persistent, structured access to your entire codebase's meaning. It doesn't have to re-read files every session. It doesn't have to guess. It *knows*.
+
+(Assuming I set everything up correctly. Which I... believe I did.)
 
 ---
 
@@ -236,6 +333,46 @@ aetherd --workspace . context --symbol validate_amount --preset quick | pbcopy
 
 Four output formats: markdown (paste into chat), JSON (programmatic), XML (Claude API), compact (maximum density). File slicing reduces source token usage by 50-80% compared to dumping whole files. Save your favorite configurations as presets.
 
+### Enforce Behavioral Expectations with Intent Contracts
+
+Declare what a function MUST do, MUST NOT do, or MUST preserve. AETHER checks these on every SIR regeneration.
+
+```bash
+# Declare contracts
+aetherd --workspace . contract add payments::validate_amount \
+    --must "reject zero or negative amounts" \
+    --must "check against daily transaction limit" \
+    --must-not "modify account balance" \
+    --preserves "idempotency"
+
+# Check all contracts
+aetherd --workspace . contract check
+
+# List active contracts
+aetherd --workspace . contract list
+```
+
+Two-stage verification: embedding cosine pre-filter resolves ~90% of checks in microseconds, LLM judge handles the ambiguous middle band. Leaky bucket means the first violation is silent (LLM phrasing jitter). Second consecutive violation triggers the alert. Dismissed false positives become negative few-shot examples that improve accuracy over time.
+
+Contract clauses from callers automatically propagate into downstream symbols' SIR prompts. If `validate_amount` has a contract and calls `check_limit`, AETHER injects the contract context so the LLM naturally addresses it.
+
+### Monitor Codebase Stability with the Seismograph
+
+How fast is meaning changing? Which modules are active fault lines? Where did that cascade of changes originate?
+
+```bash
+# Current velocity, top unstable communities, active cascades
+aetherd --workspace . seismograph status
+
+# Trace the epicenter of a symbol's semantic shift
+aetherd --workspace . seismograph trace <symbol_id>
+
+# Run analysis on latest fingerprint data
+aetherd --workspace . seismograph run-once
+```
+
+Semantic velocity uses PageRank-weighted EMA with a noise floor that filters out LLM phrasing jitter. Community stability scores each Louvain community by what fraction of its importance is shifting. Epicenter tracing follows strict temporal monotonicity to trace cascades back to their source-change root cause.
+
 ### Predict What's Going Stale
 
 The continuous intelligence engine computes per-symbol staleness scores using Noisy-OR formulas with hard gates (source changed? model deprecated?), logistic sigmoid time decay, semantic-gated neighbor propagation, predictive coupling from temporal co-change, and cold-start volatility priors from git churn data. That's a lot of words for: *AETHER knows which symbols need re-indexing before they go stale.*
@@ -254,7 +391,7 @@ The Gemini Batch API costs half as much as real-time API calls. AETHER generates
 
 ```bash
 # Generate JSONL for scan pass
-aetherd --workspace . batch build --pass scan --model gemini-2.0-flash-lite
+aetherd --workspace . batch build --pass scan --model gemini-3.1-flash-lite-preview
 
 # Full pipeline: extract → build → submit → poll → ingest for all three passes
 aetherd --workspace . batch run --passes scan,triage,deep
@@ -321,27 +458,55 @@ aetherd --workspace .
 # → http://localhost:9730/dashboard
 ```
 
-27+ pages including:
+40+ pages organized into sections:
 
-| Page | What It Shows |
-|:-----|:-------------|
-| **Overview** | Symbol counts, SIR coverage, language breakdown, system health at a glance |
-| **X-Ray** | Hotspot analysis — most critical symbols by PageRank, churn, and risk |
-| **Blast Radius** | Interactive graph showing downstream impact when a symbol changes |
-| **Architecture Map** | Force-directed dependency graph with Louvain community coloring |
-| **Time Machine** | Semantic drift timelines — watch how symbol meanings evolve |
-| **Causal Explorer** | Trace breaking changes visually through the dependency chain |
-| **Smart Search** | One search bar across symbols, notes, coupling, and test intents |
-| **Health Score** | Per-crate structural health with archetypes and god file detection |
-| **Drift Analysis** | Boundary violations, structural anomalies, semantic shifts |
-| **Community View** | Dependency-graph communities with cross-boundary edge highlighting |
-| **Coupling Matrix** | Temporal, structural, and semantic coupling fused into one view |
+| Section | Pages |
+|:--------|:------|
+| **Explore** | Anatomy, Tour, Trace Flow, Glossary, Prompts, Recent Changes |
+| **Intelligence** | Overview, Graph, Blast Radius, Architecture Map, Causal Explorer, Time Machine, X-Ray, Drift Timeline, Memory Timeline |
+| **Context** | Context Export, Context Builder, Task Context, Presets |
+| **Operations** | Batch Pipeline, Continuous Monitor, Fingerprint History, Staleness Heatmap, Velocity Gauge, Seismograph Timeline, Tectonic Plates |
+| **Analysis** | Health, Health Score, Health Scorecard, Coupling Map, Coupling Chord, Drift Report, Contract Health |
+| **Search** | Unified semantic search |
+| **Settings** | Configuration editor, Setup Wizard |
+
+Highlights:
+- **Seismograph Timeline** — line chart of semantic velocity over time with cascade event markers
+- **Tectonic Plates** — treemap of Louvain communities colored by stability (green → amber → red)
+- **Velocity Gauge** — single-number morning glance with trend arrow, auto-refreshes every 30s
+- **Contract Health** — all contracts grouped by symbol with satisfaction/violation status badges
+- **Blast Radius** — radial tree showing downstream impact with PageRank-weighted node sizes
+- **Architecture Map** — force-directed dependency graph with community coloring
+- **Time Machine** — watch how symbol meanings evolve over SIR version history
+- **Causal Explorer** — trace breaking changes visually through the dependency chain
+
+I built 40+ dashboard pages and I'm still not entirely sure the CSS works on every screen size. If something looks weird, that's probably why.
+
+---
+
+## The Desktop App
+
+AETHER ships as a native desktop application built with Tauri 2.x. System tray integration, close-to-tray, notifications, onboarding wizard, auto-update. Runs `aetherd` embedded — no separate daemon process to manage.
+
+Installers for Windows (MSI), macOS (DMG), and Linux (AppImage/DEB).
+
+```bash
+# Build locally
+cargo tauri build
+
+# Or trigger a release via GitHub Actions
+# (creates cross-platform installers attached to a GitHub Release)
+```
+
+The desktop app wraps the same dashboard you get from `aetherd --workspace .` — but with a native window, system tray, first-run wizard, and update notifications. No browser required.
+
+(A desktop app written by someone whose last GUI experience was Visual Basic 6. What could go wrong.)
 
 ---
 
 ## The MCP Tools
 
-Register AETHER with any MCP-compatible agent (Claude Code, Codex, etc.) and it gets structured access to everything. 25+ tools, zero guessing.
+Register AETHER with any MCP-compatible agent (Claude Code, Codex, etc.) and it gets structured access to everything. 26 tools, zero guessing.
 
 ### Search & Lookup
 
@@ -383,6 +548,7 @@ Register AETHER with any MCP-compatible agent (Claude Code, Codex, etc.) and it 
 | `aether_why_changed` | Semantic diff between any two SIR versions |
 | `aether_refactor_prep` | Snapshot intent before refactoring |
 | `aether_verify_intent` | Compare current SIR against a saved snapshot |
+| `aether_verify` | Verify semantic contracts on a symbol |
 
 ### Memory
 
@@ -393,13 +559,13 @@ Register AETHER with any MCP-compatible agent (Claude Code, Codex, etc.) and it 
 | `aether_recall` | Retrieve notes by semantic search |
 | `aether_test_intents` | Test guard coverage for a symbol |
 
-Every response includes `schema_version` for forward compatibility. Your agent scripts won't break when AETHER updates.
+Every response includes `schema_version` for forward compatibility. Your agent scripts won't break when AETHER updates. (At least that was the goal. Forward compatibility is one of those things that's easy to claim and hard to prove.)
 
 ---
 
 ## The CLI
 
-31 commands organized by what you're trying to do:
+33 commands organized by what you're trying to do:
 
 ```
 INTELLIGENCE QUERIES
@@ -428,6 +594,18 @@ PRESETS
   preset show            Show preset details
   preset create          Scaffold a new preset
   preset delete          Remove a user preset
+
+CONTRACTS
+  contract add           Add contract clauses to a symbol
+  contract list          List active contracts
+  contract remove        Deactivate a contract clause
+  contract check         Force-run verification
+
+SEISMOGRAPH
+  seismograph status     Semantic velocity, unstable communities, cascades
+  seismograph trace      Trace epicenter of a symbol's shift
+  seismograph run-once   Run full analysis on latest data
+  seismograph train      Train aftershock prediction model
 
 BATCH & CONTINUOUS
   batch extract          Structural extraction only
@@ -466,7 +644,7 @@ cd vscode-extension && npm install && npm run build
 
 ## Configuration
 
-Everything lives in `.aether/config.toml`, auto-created on first run.
+Everything lives in `.aether/config.toml`, auto-created on first run. Or use the dashboard's visual settings editor at `http://localhost:9730/dashboard` → Configuration.
 
 ```toml
 [inference]
@@ -480,12 +658,12 @@ enabled = true
 provider = "gemini_native"
 model = "gemini-embedding-2-preview"
 dimensions = 3072
-vector_backend = "sqlite"
+vector_backend = "lancedb"
 
 [batch]
-scan_model = "gemini-2.0-flash-lite"
-triage_model = "gemini-2.0-flash-lite"
-deep_model = "gemini-2.5-pro"
+scan_model = "gemini-3.1-flash-lite-preview"
+triage_model = "gemini-3.1-flash-lite-preview"
+deep_model = "gemini-3.1-pro"
 scan_thinking = "low"
 triage_thinking = "medium"
 deep_thinking = "high"
@@ -503,6 +681,18 @@ staleness_half_life_days = 15.0
 max_requeue_per_run = 500
 requeue_pass = "triage"
 
+[seismograph]
+enabled = false
+noise_floor = 0.15
+ema_alpha = 0.2
+community_window_days = 30
+
+[contracts]
+enabled = false
+embedding_pass_threshold = 0.88
+embedding_fail_threshold = 0.50
+streak_threshold = 2
+
 [planner]
 semantic_rescue_threshold = 0.90
 
@@ -518,25 +708,25 @@ port = 9730
 | `ollama` | Local Ollama server | Full offline intelligence — no API keys, no cloud |
 | `gemini` | API key | Production-quality SIR (Gemini Flash/Pro) |
 | `openai_compat` | API key + URL | Z.ai, NanoGPT, OpenRouter, or anything OpenAI-compatible |
-| `mock` | Nothing | CI pipelines, testing, development |
 
 ---
 
 ## The Stack
 
-For the curious:
+For the curious (and the skeptical, which is probably all of you at this point):
 
 | Thing | What |
 |:------|:-----|
-| Language | Rust (16-crate workspace, ~113K LOC) |
+| Language | Rust (17-crate workspace, ~136K LOC) |
 | Parsing | tree-sitter (Rust, TypeScript/JS, Python) |
 | Graph DB | SurrealDB 3.0 + SurrealKV |
-| Vector Store | SQLite (operational) / LanceDB (planned) |
-| Metadata | SQLite (WAL mode, schema v11) |
+| Vector Store | LanceDB (production default) |
+| Metadata | SQLite (WAL mode, schema v13) |
 | Embeddings | Gemini Embedding 2 (3072-dim, production default) |
 | Local Embeddings | Qwen3-Embedding-0.6B via Candle |
 | Reranking | Qwen3-Reranker-0.6B via Candle |
 | Dashboard | HTMX + D3.js + Tailwind CSS (no build step) |
+| Desktop App | Tauri 2.x (Windows MSI, macOS DMG, Linux AppImage/DEB) |
 | HTTP | Axum + tower-http |
 | MCP Transport | stdio (LSP) + HTTP/SSE (query server) |
 | Git | gix (native Rust, no shelling out) |
@@ -547,6 +737,27 @@ For the curious:
 
 ## Why Not Just Use [Other Thing]?
 
+### vs. Context Exporters (RepoPrompt, Repomix, code2prompt)
+
+These are the closest tools in the "give your AI agent context" space. They're good at what they do. AETHER does something different.
+
+| | RepoPrompt | Repomix | code2prompt | AETHER |
+|:--|:-----------|:--------|:------------|:-------|
+| What it does | Visual file picker → prompt | Packs repo into one file | Similar to Repomix | Persistent semantic index + ranked context assembly |
+| Understands code meaning | No | No (tree-sitter compression, not semantics) | No | Yes — SIR per symbol |
+| Persistent index | No | No | No | Yes — survives across sessions |
+| Ranks by relevance | No — you pick files manually | No — includes everything | No | Yes — RRF + Personalized PageRank |
+| Token budget control | Manual file selection | Output-level truncation | Output-level truncation | Per-symbol slicing with budget allocation |
+| Platform | macOS | CLI, cross-platform | CLI | CLI + MCP + dashboard + desktop app |
+| MCP server | Yes | Yes | No | Yes (26 tools) |
+| Works offline | Yes | Yes | Yes | Yes |
+
+The core difference: they export files. AETHER understands what's in them and ranks it by what matters for your task.
+
+(I should note that RepoPrompt and Repomix are perfectly fine tools and I'm not trying to trash them. If all you need is "dump my files into a prompt," they'll do that well. AETHER is for when you need something that actually knows what the code *means*.)
+
+### vs. Everything Else
+
 | | grep / ctags | Copilot / Cursor | Augment Code | RAG tools | AETHER |
 |:--|:------------|:-----------------|:-------------|:----------|:-------|
 | Understands intent | No | Per-query, forgets | Indexes, no semantic model | Per-query, forgets | Persistent SIR per symbol |
@@ -555,12 +766,16 @@ For the curious:
 | Batch reindexing | N/A | N/A | Proprietary | N/A | Gemini Batch API (50% off) |
 | Works offline | Yes | No | No | Usually no | Yes — Ollama + Candle |
 | Tracks meaning changes | No | No | No | No | Git-linked SIR versioning |
-| Agent-accessible | No | Not really | Proprietary | Ad hoc | 25+ MCP tools |
+| Agent-accessible | No | Not really | Proprietary | Ad hoc | 26 MCP tools |
 | Detects drift | No | No | No | No | Automatic, zero config |
 | Finds root causes | No | No | No | No | Causal chain traversal |
 | Knows what's dangerous | No | No | No | No | PageRank × drift × tests |
+| Semantic contracts | No | No | No | No | Intent contracts + leaky bucket |
+| Codebase seismograph | No | No | No | No | Velocity + community stability |
 | Open / extensible | Yes | No | No | Varies | Open source, MCP-first |
-| Vibe coded by a Gen X-er | No | No | No | No | Absolutely yes |
+| Vibe coded by a Gen X-er | No | No | No | No | Unfortunately, yes |
+
+I filled in "No" for a lot of those columns and I realize that could come across as dismissive. It's not meant to be. Those tools are all good at what they're designed for. AETHER just... does different things. Whether those different things are actually useful is something I'm going to let you decide, because at this point my ability to objectively evaluate my own project is approximately zero.
 
 ---
 
@@ -582,8 +797,10 @@ cargo fmt --all --check
 cargo clippy --workspace -- -D warnings
 ```
 
+If you find bugs — and I'm sure there are bugs, there are always bugs, I lie awake thinking about the bugs I haven't found yet — please open an issue. Be as specific as you can. And maybe be a little gentle? I'm doing my best here.
+
 ---
 
 <p align="center">
-  <em>AETHER doesn't generate code. It makes sure you — and your AI — actually understand the code you already have.<br/>That's harder, and it matters more.<br/><br/>113,252 lines of Rust. 33 days. One guy. BASIC 2.<br/>The future is already here. It just doesn't know how to code.</em>
+  <em>AETHER doesn't generate code. It makes sure you — and your AI — actually understand the code you already have.<br/>That's harder. I think it matters more. But I've been wrong before.<br/><br/>136,000 lines of Rust. 17 crates. One guy. Five weeks. BASIC 2.<br/>Please be kind.</em>
 </p>
