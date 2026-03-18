@@ -35,6 +35,9 @@ mod overview;
 mod presets;
 mod prompts;
 mod search_results;
+mod seismograph_gauge;
+mod seismograph_plates;
+mod seismograph_timeline;
 pub(crate) mod settings;
 mod spec;
 mod staleness_heatmap;
@@ -161,6 +164,19 @@ pub(crate) fn fragment_router() -> Router<Arc<DashboardState>> {
         .route(
             "/dashboard/frag/staleness-heatmap",
             get(staleness_heatmap::staleness_heatmap_fragment),
+        )
+        // Phase 10.4: Seismograph
+        .route(
+            "/dashboard/frag/seismograph-timeline",
+            get(seismograph_timeline::seismograph_timeline_fragment),
+        )
+        .route(
+            "/dashboard/frag/seismograph-plates",
+            get(seismograph_plates::seismograph_plates_fragment),
+        )
+        .route(
+            "/dashboard/frag/seismograph-gauge",
+            get(seismograph_gauge::seismograph_gauge_fragment),
         )
         // Phase 9.3: Wizard (for "Run Setup Again" from sidebar)
         .route(

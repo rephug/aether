@@ -75,6 +75,9 @@
   <script src="/dashboard/static/js/charts/health-sparkline.js" defer></script>
   <script src="/dashboard/static/js/charts/staleness-heatmap.js" defer></script>
   <script src="/dashboard/static/js/charts/context-builder.js" defer></script>
+  <script src="/dashboard/static/js/charts/seismograph-timeline.js" defer></script>
+  <script src="/dashboard/static/js/charts/seismograph-plates.js" defer></script>
+  <script src="/dashboard/static/js/charts/seismograph-gauge.js" defer></script>
 </head>
 
 <body class="h-full complexity-beginner bg-gradient-to-br from-surface-0 via-surface-1 to-surface-2 text-text-primary dark:bg-slate-950 dark:text-slate-100">
@@ -115,6 +118,9 @@
         <a href="#" class="nav-link" hx-get="/dashboard/frag/continuous" hx-target="#main-content" hx-push-url="/dashboard/continuous" onclick="setActiveNav(this)"><span class="sidebar-label">Continuous Monitor</span></a>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/fingerprint" hx-target="#main-content" hx-push-url="/dashboard/fingerprint" onclick="setActiveNav(this)"><span class="sidebar-label">Fingerprint History</span></a>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/staleness-heatmap" hx-target="#main-content" hx-push-url="/dashboard/staleness-heatmap" onclick="setActiveNav(this)"><span class="sidebar-label">Staleness Heatmap</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/seismograph-gauge" hx-target="#main-content" hx-push-url="/dashboard/seismograph-gauge" onclick="setActiveNav(this)"><span class="sidebar-label">Velocity Gauge</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/seismograph-timeline" hx-target="#main-content" hx-push-url="/dashboard/seismograph-timeline" onclick="setActiveNav(this)"><span class="sidebar-label">Seismograph</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/seismograph-plates" hx-target="#main-content" hx-push-url="/dashboard/seismograph-plates" onclick="setActiveNav(this)"><span class="sidebar-label">Tectonic Plates</span></a>
 
         <div class="sidebar-section-header"><span class="sidebar-label">Analysis</span></div>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/health" hx-target="#main-content" hx-push-url="/dashboard/health" onclick="setActiveNav(this)"><span class="sidebar-label">Health</span></a>
@@ -356,6 +362,9 @@
       if (window.initHealthScorecard && document.getElementById('health-scorecard-grid')) window.initHealthScorecard();
       if (window.initStalenessHeatmap && document.getElementById('staleness-heatmap-chart')) window.initStalenessHeatmap();
       if (window.initContextBuilder && document.getElementById('context-builder-tree')) window.initContextBuilder();
+      if (window.initSeismographTimeline && document.getElementById('seismograph-timeline-chart')) window.initSeismographTimeline();
+      if (window.initSeismographPlates && document.getElementById('seismograph-plates-chart')) window.initSeismographPlates();
+      if (window.initSeismographGauge && document.getElementById('seismograph-gauge-container')) window.initSeismographGauge();
     }
 
     document.body.addEventListener('click', function(e) {

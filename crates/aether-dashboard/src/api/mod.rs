@@ -39,6 +39,7 @@ mod overview;
 pub(crate) mod presets;
 pub(crate) mod prompts;
 mod search;
+mod seismograph;
 pub(crate) mod settings;
 pub(crate) mod spec;
 mod staleness_heatmap;
@@ -165,6 +166,19 @@ pub(crate) fn api_router() -> Router<Arc<DashboardState>> {
         .route(
             "/api/v1/staleness-heatmap",
             get(staleness_heatmap::staleness_heatmap_handler),
+        )
+        // Phase 10.4: Seismograph APIs
+        .route(
+            "/api/v1/seismograph-timeline",
+            get(seismograph::seismograph_timeline_handler),
+        )
+        .route(
+            "/api/v1/seismograph-plates",
+            get(seismograph::seismograph_plates_handler),
+        )
+        .route(
+            "/api/v1/seismograph-gauge",
+            get(seismograph::seismograph_gauge_handler),
         )
         // Phase Repo R.5: Context Builder
         .route(
