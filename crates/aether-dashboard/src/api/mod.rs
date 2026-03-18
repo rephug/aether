@@ -16,6 +16,7 @@ mod causal_chain;
 pub(crate) mod changes;
 pub(crate) mod common;
 pub(crate) mod context;
+mod context_build;
 pub(crate) mod context_export;
 pub(crate) mod continuous;
 pub(crate) mod coupling;
@@ -164,5 +165,14 @@ pub(crate) fn api_router() -> Router<Arc<DashboardState>> {
         .route(
             "/api/v1/staleness-heatmap",
             get(staleness_heatmap::staleness_heatmap_handler),
+        )
+        // Phase Repo R.5: Context Builder
+        .route(
+            "/api/v1/context/file-tree",
+            get(context_build::file_tree_handler),
+        )
+        .route(
+            "/api/v1/context/build",
+            post(context_build::context_build_handler),
         )
 }

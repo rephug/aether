@@ -74,6 +74,7 @@
   <script src="/dashboard/static/js/charts/memory-timeline.js" defer></script>
   <script src="/dashboard/static/js/charts/health-sparkline.js" defer></script>
   <script src="/dashboard/static/js/charts/staleness-heatmap.js" defer></script>
+  <script src="/dashboard/static/js/charts/context-builder.js" defer></script>
 </head>
 
 <body class="h-full complexity-beginner bg-gradient-to-br from-surface-0 via-surface-1 to-surface-2 text-text-primary dark:bg-slate-950 dark:text-slate-100">
@@ -105,6 +106,7 @@
 
         <div class="sidebar-section-header"><span class="sidebar-label">Context</span></div>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/context-export" hx-target="#main-content" hx-push-url="/dashboard/context-export" onclick="setActiveNav(this)"><span class="sidebar-label">Context Export</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/context-builder" hx-target="#main-content" hx-push-url="/dashboard/context-builder" onclick="setActiveNav(this)"><span class="sidebar-label">Context Builder</span></a>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/task-context" hx-target="#main-content" hx-push-url="/dashboard/task-context" onclick="setActiveNav(this)"><span class="sidebar-label">Task Context</span></a>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/presets" hx-target="#main-content" hx-push-url="/dashboard/presets" onclick="setActiveNav(this)"><span class="sidebar-label">Presets</span></a>
 
@@ -353,6 +355,7 @@
       if (window.initMemoryTimeline && document.getElementById('memory-timeline-chart')) window.initMemoryTimeline();
       if (window.initHealthScorecard && document.getElementById('health-scorecard-grid')) window.initHealthScorecard();
       if (window.initStalenessHeatmap && document.getElementById('staleness-heatmap-chart')) window.initStalenessHeatmap();
+      if (window.initContextBuilder && document.getElementById('context-builder-tree')) window.initContextBuilder();
     }
 
     document.body.addEventListener('click', function(e) {
