@@ -1,7 +1,7 @@
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-use aether_config::InferenceProviderKind;
+use aether_config::{AetherConfig, InferenceProviderKind};
 use aether_core::{Language, Position, SourceRange, Symbol, SymbolKind};
 use aether_infer::ProviderOverrides;
 use aether_sir::SirAnnotation;
@@ -58,6 +58,7 @@ pub(crate) fn ingest_results(
     store: &SqliteStore,
     pass_config: &PassConfig,
     results_path: &Path,
+    config: &AetherConfig,
 ) -> Result<IngestSummary> {
     let file = std::fs::File::open(results_path)
         .with_context(|| format!("failed to open batch results {}", results_path.display()))?;
@@ -89,7 +90,7 @@ pub(crate) fn ingest_results(
             continue;
         }
 
-        match ingest_result_line(&pipeline, store, pass_config, line.as_str()) {
+        match ingest_result_line(&pipeline, store, pass_config, line.as_str(), config) {
             Ok(wrote_fingerprint) => {
                 summary.processed += 1;
                 if wrote_fingerprint {
@@ -115,6 +116,7 @@ fn ingest_result_line(
     store: &SqliteStore,
     pass_config: &PassConfig,
     raw_line: &str,
+    config: &AetherConfig,
 ) -> Result<bool> {
     let line: BatchResponseLine =
         serde_json::from_str(raw_line).context("failed to parse batch response JSONL line")?;
@@ -173,6 +175,25 @@ fn ingest_result_line(
     let current_embedding = pipeline
         .load_symbol_embedding(symbol_id)
         .with_context(|| format!("failed to read refreshed embedding for {symbol_id}"))?;
+
+    // Contract verification (non-fatal)
+    if let Some(ref contracts_config) = config.contracts
+        && contracts_config.enabled
+        && let Err(err) = crate::contracts::verify_symbol_contracts(
+            store,
+            symbol_id,
+            canonical_json.as_str(),
+            current_embedding.as_ref().map(|e| e.embedding.as_slice()),
+            config,
+            pipeline.workspace_root(),
+        )
+    {
+        tracing::warn!(
+            symbol_id = symbol_id,
+            error = %err,
+            "Contract verification failed during batch ingest"
+        );
+    }
 
     write_fingerprint_row(
         store,

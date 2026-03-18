@@ -895,6 +895,57 @@ pub struct SeismographRunOnceArgs {}
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
 pub struct SeismographTrainArgs {}
 
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct ContractArgs {
+    #[command(subcommand)]
+    pub command: ContractCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum ContractCommand {
+    /// Add contract clauses to a symbol
+    Add(ContractAddArgs),
+    /// List active contracts
+    List(ContractListArgs),
+    /// Remove (deactivate) a contract clause
+    Remove(ContractRemoveArgs),
+    /// Force-run contract verification
+    Check(ContractCheckArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Parser)]
+pub struct ContractAddArgs {
+    /// Symbol qualified name or ID
+    pub symbol: String,
+    /// Must-satisfy clauses
+    #[arg(long = "must", num_args = 1)]
+    pub must_clauses: Vec<String>,
+    /// Must-not-satisfy clauses
+    #[arg(long = "must-not", num_args = 1)]
+    pub must_not_clauses: Vec<String>,
+    /// Preserves clauses
+    #[arg(long = "preserves", num_args = 1)]
+    pub preserves_clauses: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Parser)]
+pub struct ContractListArgs {
+    /// Optional symbol filter (qualified name or ID)
+    pub symbol: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Parser)]
+pub struct ContractRemoveArgs {
+    /// Contract ID to deactivate
+    pub contract_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Parser)]
+pub struct ContractCheckArgs {
+    /// Optional symbol to check. If omitted, checks all contracted symbols.
+    pub symbol: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Subcommand)]
 pub enum Commands {
     /// Batch indexing operations
@@ -959,6 +1010,8 @@ pub enum Commands {
     Fsck(FsckArgs),
     /// Semantic change monitoring and stability analysis
     Seismograph(SeismographArgs),
+    /// Manage and verify semantic contracts on symbols
+    Contract(ContractArgs),
 }
 
 #[derive(Debug, Clone, Parser)]

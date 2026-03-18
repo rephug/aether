@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::from_str as json_from_str;
 use thiserror::Error;
 mod analysis;
+mod contracts;
 mod embeddings;
 mod fingerprint_history;
 mod graph;
@@ -58,6 +59,7 @@ pub use vector::{
 pub use analysis::{
     CommunitySnapshotRecord, CouplingMiningStateRecord, DriftAnalysisStateRecord, DriftResultRecord,
 };
+pub use contracts::{IntentContractRecord, IntentViolationRecord};
 pub use embeddings::{SemanticSearchResult, SymbolEmbeddingMetaRecord, SymbolEmbeddingRecord};
 pub use fingerprint_history::SirFingerprintHistoryRecord;
 pub use graph::{

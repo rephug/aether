@@ -45,7 +45,7 @@ fn migration_v6_renames_legacy_generation_pass_values_to_scan() {
     assert_eq!(single_meta.generation_pass, "scan");
     assert_eq!(
         store.get_schema_version().expect("schema version").version,
-        12
+        13
     );
 }
 
@@ -73,7 +73,7 @@ fn migration_v7_expands_symbol_edge_kinds() {
     let version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("query migrated version");
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM symbol_edges", [], |row| row.get(0))
@@ -216,13 +216,13 @@ fn run_migrations_sets_user_version_and_is_idempotent() {
     let first_version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("query first user_version");
-    assert_eq!(first_version, 12);
+    assert_eq!(first_version, 13);
 
     run_migrations(&conn).expect("run migrations twice");
     let second_version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("query second user_version");
-    assert_eq!(second_version, 12);
+    assert_eq!(second_version, 13);
 }
 
 #[test]
@@ -232,7 +232,7 @@ fn schema_version_table_is_populated() {
 
     let schema = store.get_schema_version().expect("get schema version");
     assert_eq!(schema.component, "core");
-    assert_eq!(schema.version, 12);
+    assert_eq!(schema.version, 13);
     assert!(schema.migrated_at > 0);
 }
 
@@ -479,7 +479,7 @@ fn migration_from_v2_to_v3_adds_write_intents_table() {
     let version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("query user_version");
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 
     let task_history_exists = conn
         .query_row(

@@ -9,6 +9,7 @@ use crate::{
     batch::BatchConfig,
     constants::{AETHER_DIR_NAME, CONFIG_FILE_NAME, DEFAULT_DASHBOARD_PORT, DEFAULT_LOG_LEVEL},
     continuous::ContinuousConfig,
+    contracts::ContractsConfig,
     embeddings::EmbeddingsConfig,
     health::{HealthConfig, HealthScoreConfig},
     inference::InferenceConfig,
@@ -58,6 +59,8 @@ pub struct AetherConfig {
     pub batch: Option<BatchConfig>,
     #[serde(default)]
     pub seismograph: Option<SeismographConfig>,
+    #[serde(default)]
+    pub contracts: Option<ContractsConfig>,
     #[serde(default, rename = "watcher")]
     pub watcher: Option<WatcherConfig>,
 }
