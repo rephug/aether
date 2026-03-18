@@ -691,6 +691,7 @@ fn build_enrichment_context(
             settings.confidence_threshold,
             current_generation_pass.as_deref(),
         ),
+        caller_contract_clauses: Vec::new(),
     })
 }
 

@@ -165,6 +165,7 @@ fn run_monitor_once_inner(
         .map(|(symbol_id, _)| symbol_id)
         .collect::<Vec<_>>();
 
+    let contracts_enabled = config.contracts.as_ref().is_some_and(|c| c.enabled);
     let pass_config = runtime.for_pass(requeue_pass).clone();
     let build_summary = build_pass_jsonl_for_ids(
         workspace,
@@ -173,6 +174,7 @@ fn run_monitor_once_inner(
         &pass_config,
         &current_symbols,
         Some(selected_ids.as_slice()),
+        contracts_enabled,
     )?;
 
     persist_staleness_scores(&store, &scored_rows)?;

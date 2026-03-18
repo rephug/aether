@@ -607,6 +607,7 @@ fn run_regenerate_command(workspace: &Path, args: RegenerateArgs) -> Result<()> 
             updated: vec![candidate.symbol.clone()],
         };
         let result = if args.deep {
+            let contracts_enabled = config.contracts.as_ref().is_some_and(|c| c.enabled);
             let enrichment = build_regeneration_enrichment_context(
                 &store,
                 &candidate,
@@ -614,6 +615,7 @@ fn run_regenerate_command(workspace: &Path, args: RegenerateArgs) -> Result<()> 
                 config.sir_quality.deep_max_neighbors,
                 config.sir_quality.deep_priority_threshold,
                 config.sir_quality.deep_confidence_threshold,
+                contracts_enabled,
             )?;
             let mut deep_specs = HashMap::new();
             deep_specs.insert(
@@ -676,6 +678,7 @@ fn build_regeneration_enrichment_context(
     max_neighbors: usize,
     deep_priority_threshold: f64,
     deep_confidence_threshold: f64,
+    contracts_enabled: bool,
 ) -> Result<SirEnrichmentContext> {
     build_enrichment_context(
         store,
@@ -686,6 +689,7 @@ fn build_regeneration_enrichment_context(
         deep_priority_threshold,
         deep_confidence_threshold,
         candidate.priority,
+        contracts_enabled,
     )
 }
 

@@ -244,6 +244,7 @@ fn make_quality_batch_items(symbols: &[aether_core::Symbol]) -> Vec<QualityBatch
                 neighbor_intents: Vec::new(),
                 baseline_sir: None,
                 priority_reason: "test batch".to_owned(),
+                caller_contract_clauses: Vec::new(),
             },
             use_cot: false,
         })

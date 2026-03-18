@@ -78,6 +78,7 @@
   <script src="/dashboard/static/js/charts/seismograph-timeline.js" defer></script>
   <script src="/dashboard/static/js/charts/seismograph-plates.js" defer></script>
   <script src="/dashboard/static/js/charts/seismograph-gauge.js" defer></script>
+  <script src="/dashboard/static/js/charts/contracts-health.js" defer></script>
 </head>
 
 <body class="h-full complexity-beginner bg-gradient-to-br from-surface-0 via-surface-1 to-surface-2 text-text-primary dark:bg-slate-950 dark:text-slate-100">
@@ -129,6 +130,7 @@
         <a href="#" class="nav-link" hx-get="/dashboard/frag/coupling" hx-target="#main-content" hx-push-url="/dashboard/coupling" onclick="setActiveNav(this)"><span class="sidebar-label">Coupling Map</span></a>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/coupling-chord" hx-target="#main-content" hx-push-url="/dashboard/coupling-chord" onclick="setActiveNav(this)"><span class="sidebar-label">Coupling Chord</span></a>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/drift-table" hx-target="#main-content" hx-push-url="/dashboard/drift" onclick="setActiveNav(this)"><span class="sidebar-label">Drift Report</span></a>
+        <a href="#" class="nav-link" hx-get="/dashboard/frag/contracts" hx-target="#main-content" hx-push-url="/dashboard/contracts" onclick="setActiveNav(this)"><span class="sidebar-label">Contract Health</span></a>
 
         <div class="sidebar-section-header"><span class="sidebar-label">Search</span></div>
         <a href="#" class="nav-link" hx-get="/dashboard/frag/search" hx-target="#main-content" hx-push-url="/dashboard/search" onclick="setActiveNav(this)"><span class="sidebar-label">Search</span></a>
@@ -365,6 +367,7 @@
       if (window.initSeismographTimeline && document.getElementById('seismograph-timeline-chart')) window.initSeismographTimeline();
       if (window.initSeismographPlates && document.getElementById('seismograph-plates-chart')) window.initSeismographPlates();
       if (window.initSeismographGauge && document.getElementById('seismograph-gauge-container')) window.initSeismographGauge();
+      if (window.initContractsHealth && document.getElementById('contracts-health-container')) window.initContractsHealth();
     }
 
     document.body.addEventListener('click', function(e) {

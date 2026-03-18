@@ -197,6 +197,26 @@ impl SqliteStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn list_recent_violations(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<IntentViolationRecord>, StoreError> {
+        let limit = limit.clamp(1, 1000);
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, contract_id, symbol_id, sir_version, violation_type,
+                   confidence, reason, detected_at, dismissed, dismissed_at,
+                   dismissed_reason
+            FROM intent_violations
+            ORDER BY detected_at DESC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = stmt.query_map(params![limit], map_violation_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn dismiss_violation(&self, violation_id: i64, reason: &str) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -437,5 +457,24 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].symbol_id, "sym_a");
         assert_eq!(all[1].symbol_id, "sym_b");
+    }
+
+    #[test]
+    fn list_recent_violations_returns_ordered_by_detected_at_desc() {
+        let (store, _dir) = open_test_store();
+        let cid = store
+            .insert_intent_contract("sym_a", "must", "clause a", None, "human")
+            .unwrap();
+        store
+            .insert_intent_violation(cid, "sym_a", 1, "embedding_fail", Some(0.3), None)
+            .unwrap();
+        store
+            .insert_intent_violation(cid, "sym_a", 2, "embedding_fail", Some(0.4), None)
+            .unwrap();
+
+        let violations = store.list_recent_violations(10).unwrap();
+        assert_eq!(violations.len(), 2);
+        // Most recent first
+        assert!(violations[0].detected_at >= violations[1].detected_at);
     }
 }

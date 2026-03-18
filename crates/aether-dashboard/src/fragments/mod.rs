@@ -17,6 +17,7 @@ mod context;
 mod context_builder;
 mod context_export;
 mod continuous;
+mod contracts;
 mod coupling;
 mod coupling_chord;
 mod decompose;
@@ -177,6 +178,11 @@ pub(crate) fn fragment_router() -> Router<Arc<DashboardState>> {
         .route(
             "/dashboard/frag/seismograph-gauge",
             get(seismograph_gauge::seismograph_gauge_fragment),
+        )
+        // Phase 10.5: Intent Contracts
+        .route(
+            "/dashboard/frag/contracts",
+            get(contracts::contracts_fragment),
         )
         // Phase 9.3: Wizard (for "Run Setup Again" from sidebar)
         .route(

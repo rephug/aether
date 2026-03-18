@@ -690,6 +690,10 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
 
     let workspace_config = ensure_workspace_config(&config.workspace)
         .context("failed to load workspace config for quality passes")?;
+    let contracts_enabled = workspace_config
+        .contracts
+        .as_ref()
+        .is_some_and(|c| c.enabled);
     let quality = workspace_config.sir_quality;
     let run_triage = quality.triage_pass || config.deep;
     let run_deep = quality.deep_pass || config.deep;
@@ -702,6 +706,7 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
             &priority_scores,
             &quality,
             &mut stdout,
+            contracts_enabled,
         )?;
     }
     if run_deep {
@@ -712,6 +717,7 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
             &priority_scores,
             &quality,
             &mut stdout,
+            contracts_enabled,
         )?;
     }
 
@@ -766,6 +772,7 @@ fn run_triage_pass(
     priority_scores: &HashMap<String, f64>,
     quality: &aether_config::SirQualityConfig,
     out: &mut dyn std::io::Write,
+    contracts_enabled: bool,
 ) -> Result<()> {
     let eligible_candidates =
         collect_quality_pass_candidates(store, symbols_by_id, priority_scores, |pass| {
@@ -824,6 +831,7 @@ fn run_triage_pass(
         out,
         SIR_GENERATION_PASS_TRIAGE,
         false,
+        contracts_enabled,
     )
 }
 
@@ -834,6 +842,7 @@ fn run_deep_pass(
     priority_scores: &HashMap<String, f64>,
     quality: &aether_config::SirQualityConfig,
     out: &mut dyn std::io::Write,
+    contracts_enabled: bool,
 ) -> Result<()> {
     let eligible_candidates =
         collect_quality_pass_candidates(store, symbols_by_id, priority_scores, |pass| {
@@ -888,6 +897,7 @@ fn run_deep_pass(
         out,
         SIR_GENERATION_PASS_DEEP,
         true,
+        contracts_enabled,
     )
 }
 
@@ -1003,6 +1013,7 @@ fn run_quality_pass(
     out: &mut dyn std::io::Write,
     generation_pass: &str,
     use_cot: bool,
+    contracts_enabled: bool,
 ) -> Result<()> {
     let use_cot = use_cot && pipeline.provider_name() == InferenceProviderKind::Qwen3Local.as_str();
     let total = candidates.len();
@@ -1018,6 +1029,7 @@ fn run_quality_pass(
             priority_threshold,
             confidence_threshold,
             candidate.priority_score,
+            contracts_enabled,
         )?;
         batch_items.push(QualityBatchItem {
             symbol: candidate.symbol,
@@ -1052,6 +1064,7 @@ pub fn build_enrichment_context(
     priority_threshold: f64,
     confidence_threshold: f64,
     priority_score: f64,
+    contracts_enabled: bool,
 ) -> Result<SirEnrichmentContext> {
     let file_rollup_id = synthetic_file_sir_id(symbol.language.as_str(), symbol.file_path.as_str());
     let file_intent = store
@@ -1107,12 +1120,59 @@ pub fn build_enrichment_context(
         confidence_threshold,
     );
 
+    let caller_contract_clauses = if contracts_enabled {
+        lookup_caller_contracts(store, symbol.qualified_name.as_str())
+    } else {
+        Vec::new()
+    };
+
     Ok(SirEnrichmentContext {
         file_intent: Some(file_intent),
         neighbor_intents,
         baseline_sir,
         priority_reason,
+        caller_contract_clauses,
     })
+}
+
+/// Look up contract clauses from callers of the given symbol.
+///
+/// For each symbol that calls `qualified_name` and has active contracts,
+/// collect (caller_qualified_name, clause_type, clause_text) triples.
+fn lookup_caller_contracts(
+    store: &SqliteStore,
+    qualified_name: &str,
+) -> Vec<(String, String, String)> {
+    let callers = match store.get_callers(qualified_name) {
+        Ok(edges) => edges,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut result = Vec::new();
+    for edge in callers {
+        let contracts = match store.list_active_contracts_for_symbol(edge.source_id.as_str()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if contracts.is_empty() {
+            continue;
+        }
+        // Resolve caller qualified name from symbol record
+        let caller_name = store
+            .get_symbol_record(edge.source_id.as_str())
+            .ok()
+            .flatten()
+            .map(|s| s.qualified_name)
+            .unwrap_or_else(|| edge.source_id.clone());
+        for contract in contracts {
+            result.push((
+                caller_name.clone(),
+                contract.clause_type,
+                contract.clause_text,
+            ));
+        }
+    }
+    result
 }
 
 fn format_priority_reason(
