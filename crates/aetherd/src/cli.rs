@@ -548,9 +548,9 @@ pub struct BatchArgs {
 pub enum BatchCommand {
     /// Run structural extraction only and populate the symbols/graph store
     Extract,
-    /// Build Gemini Batch API JSONL for a single pass
+    /// Build batch API JSONL for a single pass
     Build(BatchBuildArgs),
-    /// Ingest Gemini Batch API result JSONL for a single pass
+    /// Ingest batch API result JSONL for a single pass
     Ingest(BatchIngestArgs),
     /// Run extract -> build -> submit/poll/download -> ingest across one or more passes
     Run(BatchRunArgs),
@@ -575,6 +575,9 @@ pub struct BatchBuildArgs {
 
     #[arg(long, help = "Batch JSONL output directory override")]
     pub batch_dir: Option<String>,
+
+    #[arg(long, help = "Batch provider (gemini, openai)")]
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
@@ -585,8 +588,11 @@ pub struct BatchIngestArgs {
     #[arg(long, help = "Model override for this pass")]
     pub model: Option<String>,
 
-    #[arg(help = "Path to the Gemini result JSONL file")]
+    #[arg(help = "Path to the batch result JSONL file")]
     pub results_jsonl: PathBuf,
+
+    #[arg(long, help = "Batch provider (gemini, openai)")]
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
@@ -639,6 +645,9 @@ pub struct BatchRunArgs {
 
     #[arg(long, help = "Batch poll interval override in seconds")]
     pub poll_interval_secs: Option<u64>,
+
+    #[arg(long, help = "Batch provider (gemini, openai)")]
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]

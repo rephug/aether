@@ -353,10 +353,10 @@ mod tests {
         parse_workspace_config_str, save_workspace_config,
     };
     use crate::{
-        AetherConfig, BatchConfig, ContinuousConfig, DEFAULT_COHERE_API_KEY_ENV,
-        DEFAULT_DASHBOARD_PORT, DEFAULT_DRIFT_ANALYSIS_WINDOW, DEFAULT_DRIFT_HUB_PERCENTILE,
-        DEFAULT_DRIFT_THRESHOLD, DEFAULT_GEMINI_API_KEY_ENV, DEFAULT_HEALTH_DRIFT_WEIGHT,
-        DEFAULT_HEALTH_NO_SIR_WEIGHT, DEFAULT_HEALTH_PAGERANK_WEIGHT,
+        AetherConfig, BatchConfig, BatchProviderConfig, ContinuousConfig,
+        DEFAULT_COHERE_API_KEY_ENV, DEFAULT_DASHBOARD_PORT, DEFAULT_DRIFT_ANALYSIS_WINDOW,
+        DEFAULT_DRIFT_HUB_PERCENTILE, DEFAULT_DRIFT_THRESHOLD, DEFAULT_GEMINI_API_KEY_ENV,
+        DEFAULT_HEALTH_DRIFT_WEIGHT, DEFAULT_HEALTH_NO_SIR_WEIGHT, DEFAULT_HEALTH_PAGERANK_WEIGHT,
         DEFAULT_HEALTH_RECENCY_WEIGHT, DEFAULT_HEALTH_SCORE_AUTHOR_COUNT_HIGH,
         DEFAULT_HEALTH_SCORE_BLAME_AGE_SPREAD_HIGH_SECS,
         DEFAULT_HEALTH_SCORE_BOUNDARY_LEAKAGE_HIGH, DEFAULT_HEALTH_SCORE_CHURN_30D_HIGH,
@@ -1345,6 +1345,10 @@ trigger_on_build_success = true
                 poll_interval_secs: 120,
                 jsonl_chunk_size: 1234,
                 prompt_tier: "auto".to_owned(),
+                provider: "gemini".to_owned(),
+                gemini: BatchProviderConfig::default(),
+                openai: BatchProviderConfig::default(),
+                anthropic: BatchProviderConfig::default(),
             })
         );
         assert_eq!(

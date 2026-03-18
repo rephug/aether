@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# DEPRECATED: This script is superseded by native Rust batch providers (Phase 10.7a).
+# Kept for reference. Use `aether batch run --provider gemini` instead.
 set -euo pipefail
 
 if [[ $# -lt 4 ]]; then

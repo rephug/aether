@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use aether_config::AetherConfig;
 use aether_store::SqliteStore;
@@ -9,8 +8,8 @@ use crate::batch::build::{build_pass_jsonl, snapshot_workspace_symbols};
 use crate::batch::extract::run_extract;
 use crate::batch::ingest::ingest_results;
 use crate::batch::{
-    BatchRuntimeConfig, PassConfig, parse_batch_passes_csv, resolve_batch_runtime_config,
-    resolve_build_pass_config,
+    BatchPollStatus, BatchProvider, BatchRuntimeConfig, create_batch_provider,
+    parse_batch_passes_csv, resolve_batch_runtime_config, resolve_build_pass_config,
 };
 use crate::cli::{BatchArgs, BatchBuildArgs, BatchCommand, BatchIngestArgs, BatchRunArgs};
 
@@ -30,6 +29,9 @@ fn run_extract_command(workspace: &Path) -> Result<()> {
 }
 
 fn run_build_command(workspace: &Path, config: &AetherConfig, args: &BatchBuildArgs) -> Result<()> {
+    let batch_config = config.batch.clone().unwrap_or_default();
+    let provider = create_batch_provider(&batch_config, args.provider.as_deref())
+        .context("failed to create batch provider for build")?;
     let store = SqliteStore::open(workspace).context("failed to open store for batch build")?;
     let symbols_by_id = snapshot_workspace_symbols(workspace)?;
     let mut runtime = resolve_batch_runtime_config(workspace, config, None);
@@ -45,6 +47,7 @@ fn run_build_command(workspace: &Path, config: &AetherConfig, args: &BatchBuildA
         &pass_config,
         &symbols_by_id,
         contracts_enabled,
+        provider.as_ref(),
     )?;
     println!(
         "Built {} chunk(s), wrote {} request(s), skipped {}, unresolved {}",
@@ -61,6 +64,9 @@ fn run_ingest_command(
     config: &AetherConfig,
     args: &BatchIngestArgs,
 ) -> Result<()> {
+    let batch_config = config.batch.clone().unwrap_or_default();
+    let provider = create_batch_provider(&batch_config, args.provider.as_deref())
+        .context("failed to create batch provider for ingest")?;
     let store = SqliteStore::open(workspace).context("failed to open store for batch ingest")?;
     let runtime = resolve_batch_runtime_config(workspace, config, None);
     let mut pass_config = runtime.for_pass(args.pass).clone();
@@ -73,6 +79,8 @@ fn run_ingest_command(
         &pass_config,
         args.results_jsonl.as_path(),
         config,
+        provider.as_ref(),
+        provider.name(),
     )?;
     println!(
         "Ingested {} result(s), skipped {}, wrote {} fingerprint row(s)",
@@ -86,19 +94,23 @@ fn run_full_batch_command(
     config: &AetherConfig,
     args: &BatchRunArgs,
 ) -> Result<()> {
+    let batch_config = config.batch.clone().unwrap_or_default();
+    let provider = create_batch_provider(&batch_config, args.provider.as_deref())
+        .context("failed to create batch provider")?;
+
     let runtime = resolve_batch_runtime_config(workspace, config, Some(args));
     let passes = parse_batch_passes_csv(args.passes.as_str())?;
-    let script = workspace.join("scripts/gemini_batch_submit.sh");
-    if !script.exists() {
-        return Err(anyhow!(
-            "missing batch submit script at {}",
-            script.display()
-        ));
-    }
 
     let contracts_enabled = config.contracts.as_ref().is_some_and(|c| c.enabled);
     let extract_summary = run_extract(workspace)?;
     println!("Extracted {} symbols", extract_summary.symbol_count);
+
+    // Create a tokio runtime for async provider calls (submit/poll/download).
+    let tokio_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime for batch submission")?;
+
     for pass in passes {
         let pass_config = runtime.for_pass(pass).clone();
         let build_summary = build_pass_jsonl(
@@ -108,6 +120,7 @@ fn run_full_batch_command(
             &pass_config,
             &extract_summary.symbols_by_id,
             contracts_enabled,
+            provider.as_ref(),
         )?;
         println!(
             "Built {} chunk(s) for {}: wrote {}, skipped {}, unresolved {}",
@@ -119,28 +132,32 @@ fn run_full_batch_command(
         );
 
         for input_jsonl in build_summary.files {
-            let results_jsonl = submit_batch_chunk(
-                workspace,
-                &script,
+            let results_paths = tokio_rt.block_on(submit_and_wait(
+                provider.as_ref(),
+                &input_jsonl,
+                &pass_config.model,
                 &runtime,
-                &pass_config,
-                input_jsonl.as_path(),
-            )?;
-            let ingest_summary = ingest_results(
-                workspace,
-                &extract_summary.store,
-                &pass_config,
-                results_jsonl.as_path(),
-                config,
-            )?;
-            println!(
-                "Ingested {} chunk {}: processed {}, skipped {}, fingerprint rows {}",
-                pass.as_str(),
-                results_jsonl.display(),
-                ingest_summary.processed,
-                ingest_summary.skipped,
-                ingest_summary.fingerprint_rows
-            );
+            ))?;
+
+            for result_path in results_paths {
+                let ingest_summary = ingest_results(
+                    workspace,
+                    &extract_summary.store,
+                    &pass_config,
+                    result_path.as_path(),
+                    config,
+                    provider.as_ref(),
+                    provider.name(),
+                )?;
+                println!(
+                    "Ingested {} chunk {}: processed {}, skipped {}, fingerprint rows {}",
+                    pass.as_str(),
+                    result_path.display(),
+                    ingest_summary.processed,
+                    ingest_summary.skipped,
+                    ingest_summary.fingerprint_rows
+                );
+            }
         }
     }
 
@@ -168,47 +185,54 @@ fn run_full_batch_command(
     Ok(())
 }
 
-pub(crate) fn submit_batch_chunk(
-    workspace: &Path,
-    script: &Path,
+/// Submit a batch input file, poll until completion, and download results.
+async fn submit_and_wait(
+    provider: &dyn BatchProvider,
+    input_path: &Path,
+    model: &str,
     runtime: &BatchRuntimeConfig,
-    pass_config: &PassConfig,
-    input_jsonl: &Path,
-) -> Result<PathBuf> {
-    let output = Command::new("bash")
-        .arg(script)
-        .arg(input_jsonl)
-        .arg(pass_config.model.as_str())
-        .arg(&runtime.batch_dir)
-        .arg(runtime.poll_interval_secs.to_string())
-        .current_dir(workspace)
-        .output()
-        .with_context(|| format!("failed to launch batch submit script {}", script.display()))?;
+) -> Result<Vec<PathBuf>> {
+    let job_ids = provider
+        .submit(
+            input_path,
+            model,
+            &runtime.batch_dir,
+            runtime.poll_interval_secs,
+        )
+        .await
+        .with_context(|| format!("batch submit failed for {}", input_path.display()))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "batch submit script failed for {}: {}",
-            input_jsonl.display(),
-            stderr.trim()
-        ));
+    tracing::info!(
+        provider = provider.name(),
+        jobs = ?job_ids,
+        "batch job(s) submitted, polling for completion"
+    );
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(runtime.poll_interval_secs)).await;
+
+        match provider.poll(&job_ids).await? {
+            BatchPollStatus::Completed => {
+                tracing::info!("batch job completed, downloading results");
+                break;
+            }
+            BatchPollStatus::Failed { message } => {
+                return Err(anyhow!("batch job failed: {}", message));
+            }
+            BatchPollStatus::InProgress { completed, total } => {
+                if let (Some(c), Some(t)) = (completed, total) {
+                    tracing::info!(completed = c, total = t, "batch job in progress");
+                } else {
+                    tracing::info!("batch job in progress");
+                }
+            }
+        }
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let result_path = stdout
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .map(str::trim)
-        .ok_or_else(|| anyhow!("batch submit script did not print a result path"))?;
-    let result_path = normalize_batch_dir(workspace, result_path);
-    if !result_path.exists() {
-        return Err(anyhow!(
-            "batch submit script returned missing result path {}",
-            result_path.display()
-        ));
-    }
-    Ok(result_path)
+    provider
+        .download_results(&job_ids, &runtime.batch_dir)
+        .await
+        .context("failed to download batch results")
 }
 
 fn normalize_batch_dir(workspace: &Path, value: &str) -> PathBuf {

@@ -22,7 +22,8 @@ use super::staleness::{compute_staleness, effective_age, time_staleness};
 use super::{ensure_supported_schedule, parse_requeue_pass, resolve_continuous_config};
 use crate::batch::hash::{compute_source_hash_segment, decompose_prompt_hash};
 use crate::batch::{
-    build_pass_jsonl_for_ids, ingest_results, resolve_batch_runtime_config, submit_batch_chunk,
+    BatchPollStatus, build_pass_jsonl_for_ids, create_batch_provider, ingest_results,
+    resolve_batch_runtime_config,
 };
 use crate::indexer::run_structural_index_once;
 use crate::sir_pipeline::build_job;
@@ -167,6 +168,9 @@ fn run_monitor_once_inner(
 
     let contracts_enabled = config.contracts.as_ref().is_some_and(|c| c.enabled);
     let pass_config = runtime.for_pass(requeue_pass).clone();
+    let batch_config = config.batch.clone().unwrap_or_default();
+    let provider = create_batch_provider(&batch_config, None)
+        .context("failed to create batch provider for continuous monitor")?;
     let build_summary = build_pass_jsonl_for_ids(
         workspace,
         &store,
@@ -175,6 +179,7 @@ fn run_monitor_once_inner(
         &current_symbols,
         Some(selected_ids.as_slice()),
         contracts_enabled,
+        provider.as_ref(),
     )?;
 
     persist_staleness_scores(&store, &scored_rows)?;
@@ -183,18 +188,52 @@ fn run_monitor_once_inner(
     let mut ingested_results = 0usize;
     let mut fingerprint_rows = 0usize;
     if continuous.auto_submit && !build_summary.files.is_empty() {
-        let script = workspace.join("scripts/gemini_batch_submit.sh");
-        if !script.exists() {
-            anyhow::bail!("missing batch submit script at {}", script.display());
-        }
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build tokio runtime for continuous batch submission")?;
         for input_jsonl in &build_summary.files {
-            let results_jsonl =
-                submit_batch_chunk(workspace, &script, &runtime, &pass_config, input_jsonl)?;
+            let job_ids = tokio_rt
+                .block_on(provider.submit(
+                    input_jsonl,
+                    &pass_config.model,
+                    &runtime.batch_dir,
+                    runtime.poll_interval_secs,
+                ))
+                .with_context(|| {
+                    format!(
+                        "continuous batch submit failed for {}",
+                        input_jsonl.display()
+                    )
+                })?;
+            // Poll until completion
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(runtime.poll_interval_secs));
+                match tokio_rt.block_on(provider.poll(&job_ids))? {
+                    BatchPollStatus::Completed => break,
+                    BatchPollStatus::Failed { message } => {
+                        anyhow::bail!("continuous batch job failed: {}", message);
+                    }
+                    BatchPollStatus::InProgress { .. } => continue,
+                }
+            }
+            let result_paths = tokio_rt
+                .block_on(provider.download_results(&job_ids, &runtime.batch_dir))
+                .context("failed to download continuous batch results")?;
             submitted_chunks += 1;
-            let ingest_summary =
-                ingest_results(workspace, &store, &pass_config, &results_jsonl, config)?;
-            ingested_results += ingest_summary.processed;
-            fingerprint_rows += ingest_summary.fingerprint_rows;
+            for results_jsonl in &result_paths {
+                let ingest_summary = ingest_results(
+                    workspace,
+                    &store,
+                    &pass_config,
+                    results_jsonl,
+                    config,
+                    provider.as_ref(),
+                    provider.name(),
+                )?;
+                ingested_results += ingest_summary.processed;
+                fingerprint_rows += ingest_summary.fingerprint_rows;
+            }
         }
     }
 

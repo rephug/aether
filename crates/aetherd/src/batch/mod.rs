@@ -2,7 +2,9 @@ pub mod hash;
 
 mod build;
 mod extract;
+pub(crate) mod gemini;
 mod ingest;
+pub(crate) mod openai;
 mod run;
 
 use std::path::{Path, PathBuf};
@@ -15,7 +17,106 @@ use crate::cli::{BatchBuildArgs, BatchPass, BatchRunArgs};
 pub(crate) use build::build_pass_jsonl_for_ids;
 pub(crate) use ingest::{ingest_results, write_fingerprint_row};
 pub use run::run_batch_command;
-pub(crate) use run::submit_batch_chunk;
+
+// ---------------------------------------------------------------------------
+// BatchProvider trait + supporting types
+// ---------------------------------------------------------------------------
+
+/// Result from parsing one line of batch output.
+pub(crate) enum BatchResultLine {
+    Success {
+        key: String,
+        text: String,
+    },
+    Error {
+        key: Option<String>,
+        message: String,
+    },
+}
+
+/// Batch job completion status.
+pub(crate) enum BatchPollStatus {
+    InProgress {
+        completed: Option<u64>,
+        total: Option<u64>,
+    },
+    Completed,
+    Failed {
+        message: String,
+    },
+}
+
+/// Abstraction over provider-specific batch API mechanics.
+#[async_trait::async_trait]
+pub(crate) trait BatchProvider: Send + Sync {
+    /// Format one batch request line.
+    ///
+    /// * `key` — `"symbol_id|prompt_hash"`
+    /// * `system_prompt` — static SIR instruction (cacheable)
+    /// * `user_prompt` — per-symbol content
+    /// * `model` — provider-specific model string
+    /// * `thinking` — raw thinking level string ("off", "low", "medium", "high", "dynamic")
+    fn format_request(
+        &self,
+        key: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+        model: &str,
+        thinking: &str,
+    ) -> Result<String>;
+
+    /// Submit batch input. Returns one or more job IDs.
+    async fn submit(
+        &self,
+        input_path: &Path,
+        model: &str,
+        batch_dir: &Path,
+        poll_interval_secs: u64,
+    ) -> Result<Vec<String>>;
+
+    /// Poll jobs for completion.
+    async fn poll(&self, job_ids: &[String]) -> Result<BatchPollStatus>;
+
+    /// Download results to output_dir. Returns paths to result files.
+    async fn download_results(&self, job_ids: &[String], output_dir: &Path)
+    -> Result<Vec<PathBuf>>;
+
+    /// Parse one result line.
+    fn parse_result_line(&self, line: &str) -> Result<BatchResultLine>;
+
+    /// Provider name for logging.
+    fn name(&self) -> &str;
+}
+
+/// Create a batch provider from config with optional CLI override.
+pub(crate) fn create_batch_provider(
+    config: &BatchConfig,
+    provider_override: Option<&str>,
+) -> Result<Box<dyn BatchProvider>> {
+    let provider_name = provider_override
+        .filter(|s| !s.is_empty())
+        .unwrap_or(config.provider.as_str());
+    let api_key_env = config.resolve_api_key_env(provider_name);
+    let api_key = std::env::var(&api_key_env).map_err(|_| {
+        anyhow!(
+            "batch provider '{}' requires env var {} to be set",
+            provider_name,
+            api_key_env
+        )
+    })?;
+    match provider_name {
+        "gemini" => Ok(Box::new(gemini::GeminiBatchProvider::new(api_key))),
+        "openai" => Ok(Box::new(openai::OpenAiBatchProvider::new(api_key))),
+        other => anyhow::bail!(
+            "unknown batch provider '{}'; supported: gemini, openai",
+            other
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PassConfig / BatchRuntimeConfig (existing types)
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub(crate) struct PassConfig {
@@ -28,23 +129,13 @@ pub(crate) struct PassConfig {
 }
 
 impl PassConfig {
-    pub(crate) fn config_fingerprint(&self) -> String {
+    /// Fingerprint used for prompt hash deduplication. Includes provider to prevent
+    /// false matches when switching providers with the same model name.
+    pub(crate) fn config_fingerprint(&self, provider: &str) -> String {
         format!(
-            "{}:{}:{}:{}",
-            self.model, self.thinking, self.max_chars, self.prompt_tier
+            "{}:{}:{}:{}:{}",
+            provider, self.model, self.thinking, self.max_chars, self.prompt_tier
         )
-    }
-
-    pub(crate) fn thinking_level(&self) -> Result<&'static str> {
-        match self.thinking.trim().to_ascii_lowercase().as_str() {
-            "low" => Ok("LOW"),
-            "medium" => Ok("MEDIUM"),
-            "high" => Ok("HIGH"),
-            "dynamic" => Ok("DYNAMIC"),
-            other => Err(anyhow!(
-                "invalid batch thinking level '{other}', expected one of: low, medium, high, dynamic"
-            )),
-        }
     }
 }
 
