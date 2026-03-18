@@ -15,6 +15,7 @@ use crate::{
     normalize::normalize_config,
     planner::PlannerConfig,
     search::{ProvidersConfig, SearchConfig},
+    seismograph::SeismographConfig,
     sir_quality::SirQualityConfig,
     storage::StorageConfig,
     verification::VerifyConfig,
@@ -55,6 +56,8 @@ pub struct AetherConfig {
     pub continuous: Option<ContinuousConfig>,
     #[serde(default)]
     pub batch: Option<BatchConfig>,
+    #[serde(default)]
+    pub seismograph: Option<SeismographConfig>,
     #[serde(default, rename = "watcher")]
     pub watcher: Option<WatcherConfig>,
 }

@@ -314,6 +314,7 @@ mod tests {
             dashboard: DashboardConfig::default(),
             continuous: None,
             batch: None,
+            seismograph: None,
             watcher: None,
         };
 

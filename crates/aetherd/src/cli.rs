@@ -862,6 +862,39 @@ pub struct SirDiffArgs {
     pub selector: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct SeismographArgs {
+    #[command(subcommand)]
+    pub command: SeismographCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum SeismographCommand {
+    /// Show current semantic velocity, top unstable communities, and active cascades
+    Status(SeismographStatusArgs),
+    /// Trace the epicenter of a symbol's most recent semantic shift
+    Trace(SeismographTraceArgs),
+    /// Run seismograph analysis on latest fingerprint data
+    RunOnce(SeismographRunOnceArgs),
+    /// Train or retrain the aftershock prediction model
+    Train(SeismographTrainArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Parser)]
+pub struct SeismographStatusArgs {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Parser)]
+pub struct SeismographTraceArgs {
+    /// Symbol ID to trace
+    pub symbol_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Parser)]
+pub struct SeismographRunOnceArgs {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Parser)]
+pub struct SeismographTrainArgs {}
+
 #[derive(Debug, Clone, PartialEq, Subcommand)]
 pub enum Commands {
     /// Batch indexing operations
@@ -924,6 +957,8 @@ pub enum Commands {
     VerifyIntent(VerifyIntentArgs),
     /// Verify and optionally repair cross-store consistency
     Fsck(FsckArgs),
+    /// Semantic change monitoring and stability analysis
+    Seismograph(SeismographArgs),
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -1222,7 +1257,8 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        Cli, Commands, ContinuousCommand, PresetCommand, PresetShowArgs, parse_since_duration,
+        Cli, Commands, ContinuousCommand, PresetCommand, PresetShowArgs, SeismographCommand,
+        SeismographRunOnceArgs, SeismographStatusArgs, parse_since_duration,
     };
     use crate::init_agent::AgentPlatform;
 
@@ -2249,5 +2285,57 @@ mod tests {
     fn parse_since_duration_rejects_invalid_unit() {
         let err = parse_since_duration("7w").expect_err("expected error");
         assert!(err.contains("invalid duration unit"));
+    }
+
+    #[test]
+    fn seismograph_status_parses() {
+        let cli = Cli::try_parse_from(["aetherd", "--workspace", ".", "seismograph", "status"])
+            .expect("seismograph status should parse");
+        match cli.command {
+            Some(Commands::Seismograph(args)) => {
+                assert_eq!(
+                    args.command,
+                    SeismographCommand::Status(SeismographStatusArgs {})
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seismograph_trace_parses_symbol_id() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "seismograph",
+            "trace",
+            "sym_abc123",
+        ])
+        .expect("seismograph trace should parse");
+        match cli.command {
+            Some(Commands::Seismograph(args)) => match args.command {
+                SeismographCommand::Trace(trace_args) => {
+                    assert_eq!(trace_args.symbol_id, "sym_abc123");
+                }
+                other => panic!("unexpected subcommand: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seismograph_run_once_parses() {
+        let cli = Cli::try_parse_from(["aetherd", "--workspace", ".", "seismograph", "run-once"])
+            .expect("seismograph run-once should parse");
+        match cli.command {
+            Some(Commands::Seismograph(args)) => {
+                assert_eq!(
+                    args.command,
+                    SeismographCommand::RunOnce(SeismographRunOnceArgs {})
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 }

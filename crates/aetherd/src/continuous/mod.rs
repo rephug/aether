@@ -23,6 +23,27 @@ pub fn run_continuous_command(
         ContinuousCommand::RunOnce(_) => {
             let status = run_monitor_once(workspace, config)?;
             print_status_snapshot(&status);
+
+            // Post-continuous hook: run Seismograph analysis if enabled
+            if let Some(ref seismo_config) = config.seismograph
+                && seismo_config.enabled
+            {
+                tracing::info!("Running post-continuous Seismograph analysis");
+                match crate::seismograph::run_seismograph_analysis(workspace, config) {
+                    Ok(report) => {
+                        tracing::info!(
+                            velocity = report.semantic_velocity,
+                            shift = report.codebase_shift,
+                            cascades = report.cascade_count,
+                            "Seismograph analysis complete"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!("Seismograph analysis failed: {err:#}");
+                    }
+                }
+            }
+
             Ok(())
         }
         ContinuousCommand::Status(_) => run_status_command(workspace),

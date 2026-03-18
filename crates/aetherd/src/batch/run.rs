@@ -132,6 +132,27 @@ fn run_full_batch_command(
         }
     }
 
+    // Post-batch hook: run Seismograph analysis if enabled
+    if let Some(ref seismo_config) = config.seismograph
+        && seismo_config.enabled
+    {
+        tracing::info!("Running post-batch Seismograph analysis");
+        match crate::seismograph::run_seismograph_analysis(workspace, config) {
+            Ok(report) => {
+                tracing::info!(
+                    velocity = report.semantic_velocity,
+                    shift = report.codebase_shift,
+                    cascades = report.cascade_count,
+                    "Seismograph analysis complete"
+                );
+            }
+            Err(err) => {
+                tracing::warn!("Seismograph analysis failed: {err:#}");
+                // Non-fatal — batch still succeeded
+            }
+        }
+    }
+
     Ok(())
 }
 

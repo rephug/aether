@@ -468,6 +468,57 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         conn.execute("PRAGMA user_version = 11", [])?;
     }
 
+    if version < 12 {
+        conn.execute_batch(
+            r#"
+        CREATE TABLE IF NOT EXISTS metrics_seismograph (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_timestamp INTEGER NOT NULL,
+            codebase_shift REAL NOT NULL,
+            semantic_velocity REAL NOT NULL,
+            symbols_regenerated INTEGER NOT NULL,
+            symbols_above_noise INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_metrics_seismograph_time
+            ON metrics_seismograph(batch_timestamp DESC);
+
+        CREATE TABLE IF NOT EXISTS metrics_community_stability (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            community_id TEXT NOT NULL,
+            computed_at INTEGER NOT NULL,
+            stability REAL NOT NULL,
+            symbol_count INTEGER NOT NULL,
+            breach_count INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_metrics_community_stability_time
+            ON metrics_community_stability(computed_at DESC);
+
+        CREATE TABLE IF NOT EXISTS metrics_cascade (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            epicenter_symbol_id TEXT NOT NULL,
+            chain_json TEXT NOT NULL,
+            total_hops INTEGER NOT NULL,
+            max_delta_sem REAL NOT NULL,
+            detected_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_metrics_cascade_time
+            ON metrics_cascade(detected_at DESC);
+
+        CREATE TABLE IF NOT EXISTS metrics_aftershock_model (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trained_at INTEGER NOT NULL,
+            training_samples INTEGER NOT NULL,
+            weights_json TEXT NOT NULL,
+            auc_roc REAL
+        );
+        "#,
+        )?;
+        conn.execute("PRAGMA user_version = 12", [])?;
+    }
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_version (

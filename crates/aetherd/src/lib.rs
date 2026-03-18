@@ -20,6 +20,7 @@ pub mod priority_queue;
 pub mod quality;
 pub mod refactor_prep;
 pub mod search;
+pub mod seismograph;
 pub mod setup_local;
 pub mod sir_agent_support;
 pub mod sir_context;
