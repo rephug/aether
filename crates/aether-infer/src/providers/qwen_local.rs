@@ -32,7 +32,7 @@ impl Qwen3LocalProvider {
     }
 
     async fn request_candidate_json_with_prompt(&self, prompt: &str) -> Result<String, InferError> {
-        let body = build_ollama_generate_body(&self.model, prompt);
+        let body = build_ollama_generate_body(&self.model, prompt, 4096);
 
         let response_value: Value = self
             .client
@@ -51,7 +51,7 @@ impl Qwen3LocalProvider {
         &self,
         prompt: String,
     ) -> Result<String, InferError> {
-        let body = build_ollama_deep_generate_body(&self.model, &prompt);
+        let body = build_ollama_deep_generate_body(&self.model, &prompt, 8192);
 
         let response_value: Value = self
             .client
