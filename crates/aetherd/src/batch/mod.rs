@@ -1,5 +1,6 @@
 pub mod hash;
 
+pub(crate) mod anthropic;
 mod build;
 mod extract;
 pub(crate) mod gemini;
@@ -107,8 +108,9 @@ pub(crate) fn create_batch_provider(
     match provider_name {
         "gemini" => Ok(Box::new(gemini::GeminiBatchProvider::new(api_key))),
         "openai" => Ok(Box::new(openai::OpenAiBatchProvider::new(api_key))),
+        "anthropic" => Ok(Box::new(anthropic::AnthropicBatchProvider::new(api_key))),
         other => anyhow::bail!(
-            "unknown batch provider '{}'; supported: gemini, openai",
+            "unknown batch provider '{}'; supported: gemini, openai, anthropic",
             other
         ),
     }
