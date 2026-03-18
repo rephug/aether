@@ -1344,6 +1344,7 @@ trigger_on_build_success = true
                 batch_dir: ".aether/custom-batch".to_owned(),
                 poll_interval_secs: 120,
                 jsonl_chunk_size: 1234,
+                prompt_tier: "auto".to_owned(),
             })
         );
         assert_eq!(

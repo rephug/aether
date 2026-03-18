@@ -34,6 +34,10 @@ pub struct BatchConfig {
     pub poll_interval_secs: u64,
     #[serde(default = "default_jsonl_chunk_size")]
     pub jsonl_chunk_size: usize,
+    /// System prompt tier: "compact", "standard", "full", or "auto" (default).
+    /// "auto" selects based on provider: cloud providers get "full", local gets "compact".
+    #[serde(default = "default_prompt_tier")]
+    pub prompt_tier: String,
 }
 
 impl Default for BatchConfig {
@@ -55,6 +59,7 @@ impl Default for BatchConfig {
             batch_dir: String::new(),
             poll_interval_secs: default_poll_interval(),
             jsonl_chunk_size: default_jsonl_chunk_size(),
+            prompt_tier: default_prompt_tier(),
         }
     }
 }
@@ -101,4 +106,8 @@ fn default_poll_interval() -> u64 {
 
 fn default_jsonl_chunk_size() -> usize {
     5_000
+}
+
+fn default_prompt_tier() -> String {
+    "auto".to_owned()
 }

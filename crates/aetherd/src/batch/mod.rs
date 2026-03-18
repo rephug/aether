@@ -24,11 +24,15 @@ pub(crate) struct PassConfig {
     pub thinking: String,
     pub neighbor_depth: u32,
     pub max_chars: usize,
+    pub prompt_tier: String,
 }
 
 impl PassConfig {
     pub(crate) fn config_fingerprint(&self) -> String {
-        format!("{}:{}:{}", self.model, self.thinking, self.max_chars)
+        format!(
+            "{}:{}:{}:{}",
+            self.model, self.thinking, self.max_chars, self.prompt_tier
+        )
     }
 
     pub(crate) fn thinking_level(&self) -> Result<&'static str> {
@@ -104,6 +108,7 @@ pub(crate) fn resolve_build_pass_config(
         thinking: args.thinking.clone().unwrap_or(base.thinking),
         neighbor_depth: args.neighbor_depth.unwrap_or(base.neighbor_depth),
         max_chars: args.max_chars.unwrap_or(base.max_chars),
+        prompt_tier: base.prompt_tier,
     }
 }
 
@@ -191,6 +196,7 @@ fn resolve_pass_config(
             thinking: thinking.unwrap_or(config.scan_thinking),
             neighbor_depth: 0,
             max_chars: max_chars.unwrap_or(config.scan_max_chars),
+            prompt_tier: config.prompt_tier.clone(),
         },
         BatchPass::Triage => PassConfig {
             pass,
@@ -198,6 +204,7 @@ fn resolve_pass_config(
             thinking: thinking.unwrap_or(config.triage_thinking),
             neighbor_depth: neighbor_depth.unwrap_or(config.triage_neighbor_depth),
             max_chars: max_chars.unwrap_or(config.triage_max_chars),
+            prompt_tier: config.prompt_tier.clone(),
         },
         BatchPass::Deep => PassConfig {
             pass,
@@ -205,6 +212,7 @@ fn resolve_pass_config(
             thinking: thinking.unwrap_or(config.deep_thinking),
             neighbor_depth: neighbor_depth.unwrap_or(config.deep_neighbor_depth),
             max_chars: max_chars.unwrap_or(config.deep_max_chars),
+            prompt_tier: config.prompt_tier,
         },
     }
 }

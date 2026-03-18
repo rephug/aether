@@ -19,6 +19,7 @@ pub use loaders::{
 };
 pub use providers::{GeminiProvider, OpenAiCompatProvider, Qwen3LocalProvider, TieredProvider};
 pub use reranker::{MockRerankerProvider, RerankCandidate, RerankResult, RerankerProvider};
+pub use sir_prompt::PromptTier;
 pub use types::{
     EmbeddingProvider, EmbeddingProviderOverrides, EmbeddingPurpose, GEMINI_API_KEY_ENV,
     InferError, InferSirResult, InferenceProvider, LoadedEmbeddingProvider, LoadedProvider,
