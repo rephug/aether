@@ -7,10 +7,9 @@ use aether_infer::ProviderOverrides;
 use aether_sir::SirAnnotation;
 use aether_store::{SirFingerprintHistoryRecord, SirMetaRecord, SirStateStore, SqliteStore};
 use anyhow::{Context, Result, anyhow};
-use serde::Deserialize;
 
-use crate::batch::PassConfig;
 use crate::batch::hash::diff_prompt_hashes;
+use crate::batch::{BatchProvider, BatchResultLine, PassConfig};
 use crate::continuous::cosine_distance_from_embeddings;
 use crate::sir_pipeline::{SirPipeline, UpsertSirIntentPayload};
 
@@ -21,53 +20,36 @@ pub(crate) struct IngestSummary {
     pub fingerprint_rows: usize,
 }
 
-#[derive(Debug, Deserialize)]
-struct BatchResponseLine {
-    key: String,
-    #[serde(default)]
-    response: Option<BatchResponse>,
-    #[serde(default)]
-    error: Option<serde_json::Value>,
+/// Map batch provider name to the closest `InferenceProviderKind`.
+fn provider_kind_from_name(name: &str) -> InferenceProviderKind {
+    match name {
+        "gemini" => InferenceProviderKind::Gemini,
+        "openai" => InferenceProviderKind::OpenAiCompat,
+        "anthropic" => InferenceProviderKind::OpenAiCompat,
+        _ => InferenceProviderKind::Gemini,
+    }
 }
 
-#[derive(Debug, Deserialize)]
-struct BatchResponse {
-    #[serde(default)]
-    candidates: Vec<BatchCandidate>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BatchCandidate {
-    content: BatchContent,
-}
-
-#[derive(Debug, Deserialize)]
-struct BatchContent {
-    #[serde(default)]
-    parts: Vec<BatchPart>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BatchPart {
-    #[serde(default)]
-    text: Option<String>,
-}
-
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn ingest_results(
     workspace: &Path,
     store: &SqliteStore,
     pass_config: &PassConfig,
     results_path: &Path,
     config: &AetherConfig,
+    provider: &dyn BatchProvider,
+    provider_name: &str,
 ) -> Result<IngestSummary> {
     let file = std::fs::File::open(results_path)
         .with_context(|| format!("failed to open batch results {}", results_path.display()))?;
     let reader = BufReader::new(file);
+
+    let provider_kind = provider_kind_from_name(provider_name);
     let pipeline = SirPipeline::new(
         workspace.to_path_buf(),
         1,
         ProviderOverrides {
-            provider: Some(InferenceProviderKind::Gemini),
+            provider: Some(provider_kind),
             model: Some(pass_config.model.clone()),
             endpoint: None,
             api_key_env: None,
@@ -90,7 +72,15 @@ pub(crate) fn ingest_results(
             continue;
         }
 
-        match ingest_result_line(&pipeline, store, pass_config, line.as_str(), config) {
+        match ingest_result_line(
+            &pipeline,
+            store,
+            pass_config,
+            line.as_str(),
+            config,
+            provider,
+            provider_name,
+        ) {
             Ok(wrote_fingerprint) => {
                 summary.processed += 1;
                 if wrote_fingerprint {
@@ -111,38 +101,45 @@ pub(crate) fn ingest_results(
     Ok(summary)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ingest_result_line(
     pipeline: &SirPipeline,
     store: &SqliteStore,
     pass_config: &PassConfig,
     raw_line: &str,
     config: &AetherConfig,
+    provider: &dyn BatchProvider,
+    provider_name: &str,
 ) -> Result<bool> {
-    let line: BatchResponseLine =
-        serde_json::from_str(raw_line).context("failed to parse batch response JSONL line")?;
-    if line.error.is_some() {
-        return Err(anyhow!("batch response line contains an error envelope"));
-    }
+    // Use provider-specific parsing to extract key + text.
+    let (symbol_id, prompt_hash, sir_json) = match provider.parse_result_line(raw_line)? {
+        BatchResultLine::Success { key, text } => {
+            let (sid, phash) = parse_key(&key)?;
+            (sid.to_owned(), phash.to_owned(), text)
+        }
+        BatchResultLine::Error { key, message } => {
+            return Err(anyhow!("batch response error (key={:?}): {}", key, message));
+        }
+    };
 
-    let (symbol_id, prompt_hash) = parse_key(line.key.as_str())?;
-    let sir_json = extract_response_text(&line)?;
     let sir = serde_json::from_str::<SirAnnotation>(sir_json.as_str())
         .context("failed to parse SIR JSON from batch response")?;
     let symbol_record = store
-        .get_symbol_record(symbol_id)
+        .get_symbol_record(&symbol_id)
         .with_context(|| format!("failed to load symbol record for {symbol_id}"))?
         .ok_or_else(|| anyhow!("symbol '{symbol_id}' not found in symbols table"))?;
     let previous_meta = store
-        .get_sir_meta(symbol_id)
+        .get_sir_meta(&symbol_id)
         .with_context(|| format!("failed to read previous SIR metadata for {symbol_id}"))?;
     let previous_embedding = pipeline
-        .load_symbol_embedding(symbol_id)
+        .load_symbol_embedding(&symbol_id)
         .with_context(|| format!("failed to read previous embedding vector for {symbol_id}"))?;
 
+    let provider_kind = provider_kind_from_name(provider_name);
     let payload = UpsertSirIntentPayload {
         symbol: symbol_from_record(&symbol_record)?,
         sir,
-        provider_name: InferenceProviderKind::Gemini.as_str().to_owned(),
+        provider_name: provider_kind.as_str().to_owned(),
         model_name: pass_config.model.clone(),
         generation_pass: pass_config.pass.as_str().to_owned(),
         commit_hash: None,
@@ -152,19 +149,19 @@ fn ingest_result_line(
         .with_context(|| format!("failed to persist SIR payload for {symbol_id}"))?;
 
     let current_meta = store
-        .get_sir_meta(symbol_id)
+        .get_sir_meta(&symbol_id)
         .with_context(|| format!("failed to reload SIR metadata for {symbol_id}"))?
         .ok_or_else(|| anyhow!("missing persisted SIR metadata for {symbol_id}"))?;
     store
         .upsert_sir_meta(SirMetaRecord {
-            prompt_hash: Some(prompt_hash.to_owned()),
+            prompt_hash: Some(prompt_hash.clone()),
             ..current_meta
         })
         .with_context(|| format!("failed to persist prompt_hash for {symbol_id}"))?;
 
     pipeline
         .refresh_embedding_if_needed(
-            symbol_id,
+            &symbol_id,
             sir_hash_value.as_str(),
             canonical_json.as_str(),
             false,
@@ -173,7 +170,7 @@ fn ingest_result_line(
         )
         .with_context(|| format!("failed to refresh embedding for {symbol_id}"))?;
     let current_embedding = pipeline
-        .load_symbol_embedding(symbol_id)
+        .load_symbol_embedding(&symbol_id)
         .with_context(|| format!("failed to read refreshed embedding for {symbol_id}"))?;
 
     // Contract verification (non-fatal)
@@ -181,7 +178,7 @@ fn ingest_result_line(
         && contracts_config.enabled
         && let Err(err) = crate::contracts::verify_symbol_contracts(
             store,
-            symbol_id,
+            &symbol_id,
             canonical_json.as_str(),
             current_embedding.as_ref().map(|e| e.embedding.as_slice()),
             config,
@@ -189,7 +186,7 @@ fn ingest_result_line(
         )
     {
         tracing::warn!(
-            symbol_id = symbol_id,
+            symbol_id = %symbol_id,
             error = %err,
             "Contract verification failed during batch ingest"
         );
@@ -197,8 +194,8 @@ fn ingest_result_line(
 
     write_fingerprint_row(
         store,
-        symbol_id,
-        prompt_hash,
+        &symbol_id,
+        &prompt_hash,
         previous_meta
             .as_ref()
             .and_then(|record| record.prompt_hash.as_deref()),
@@ -256,22 +253,6 @@ fn parse_key(key: &str) -> Result<(&str, &str)> {
         ));
     }
     Ok((symbol_id, prompt_hash))
-}
-
-fn extract_response_text(line: &BatchResponseLine) -> Result<String> {
-    let response = line
-        .response
-        .as_ref()
-        .ok_or_else(|| anyhow!("batch response line missing 'response'"))?;
-    let text = response
-        .candidates
-        .first()
-        .and_then(|candidate| candidate.content.parts.first())
-        .and_then(|part| part.text.as_ref())
-        .map(|text| text.trim())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("batch response line missing candidate text"))?;
-    Ok(text.to_owned())
 }
 
 fn symbol_from_record(record: &aether_store::SymbolRecord) -> Result<Symbol> {

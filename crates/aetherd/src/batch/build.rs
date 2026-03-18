@@ -5,16 +5,15 @@ use std::path::{Path, PathBuf};
 
 use aether_core::Symbol;
 use aether_infer::sir_prompt::{
-    SirEnrichmentContext, build_enriched_sir_prompt, build_enriched_sir_prompt_with_cot,
-    build_sir_prompt_for_kind,
+    SirEnrichmentContext, resolve_prompt_tier, sir_enriched_system_prompt,
+    sir_enriched_user_prompt, sir_scan_system_prompt, sir_scan_user_prompt,
 };
 use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
 use aether_store::{GraphDependencyEdgeRecord, SirStateStore, SqliteStore};
 use anyhow::{Context, Result, anyhow};
-use serde_json::json;
 
 use crate::batch::hash::compute_prompt_hash;
-use crate::batch::{BatchRuntimeConfig, PassConfig};
+use crate::batch::{BatchProvider, BatchRuntimeConfig, PassConfig};
 use crate::cli::BatchPass;
 use crate::observer::ObserverState;
 use crate::sir_pipeline::build_job;
@@ -50,6 +49,7 @@ pub(crate) fn build_pass_jsonl(
     pass_config: &PassConfig,
     symbols_by_id: &HashMap<String, Symbol>,
     contracts_enabled: bool,
+    provider: &dyn BatchProvider,
 ) -> Result<BuildSummary> {
     build_pass_jsonl_for_ids(
         workspace,
@@ -59,9 +59,11 @@ pub(crate) fn build_pass_jsonl(
         symbols_by_id,
         None,
         contracts_enabled,
+        provider,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_pass_jsonl_for_ids(
     workspace: &Path,
     store: &SqliteStore,
@@ -70,6 +72,7 @@ pub(crate) fn build_pass_jsonl_for_ids(
     symbols_by_id: &HashMap<String, Symbol>,
     candidate_ids: Option<&[String]>,
     contracts_enabled: bool,
+    provider: &dyn BatchProvider,
 ) -> Result<BuildSummary> {
     if pass_config.model.trim().is_empty() {
         return Err(anyhow!(
@@ -85,6 +88,15 @@ pub(crate) fn build_pass_jsonl_for_ids(
             runtime.batch_dir.display()
         )
     })?;
+
+    // Resolve prompt tier and compute the static system prompt once for all symbols.
+    let tier = resolve_prompt_tier(&pass_config.prompt_tier, provider.name());
+    let system_prompt = match pass_config.pass {
+        BatchPass::Scan => sir_scan_system_prompt(tier),
+        BatchPass::Triage | BatchPass::Deep => sir_enriched_system_prompt(tier),
+    };
+
+    let provider_name = provider.name();
 
     let mut summary = BuildSummary {
         files: Vec::new(),
@@ -180,10 +192,11 @@ pub(crate) fn build_pass_jsonl_for_ids(
             }
         };
 
-        let (neighbor_entries, prompt) = match pass_config.pass {
+        // Build per-symbol user prompt and collect neighbor entries for hash.
+        let (neighbor_entries, user_prompt) = match pass_config.pass {
             BatchPass::Scan => (
                 Vec::new(),
-                build_sir_prompt_for_kind(&job.symbol_text, &job.context),
+                sir_scan_user_prompt(&job.symbol_text, &job.context),
             ),
             BatchPass::Triage | BatchPass::Deep => {
                 let Some(baseline_sir) = baseline_sirs.get(symbol_id.as_str()).cloned() else {
@@ -204,12 +217,14 @@ pub(crate) fn build_pass_jsonl_for_ids(
                     baseline_sir,
                     &caller_contracts_map,
                 );
-                let prompt = if matches!(pass_config.pass, BatchPass::Deep) {
-                    build_enriched_sir_prompt_with_cot(&job.symbol_text, &job.context, &enrichment)
-                } else {
-                    build_enriched_sir_prompt(&job.symbol_text, &job.context, &enrichment)
-                };
-                (enrichment.neighbor_intents, prompt)
+                let include_cot = matches!(pass_config.pass, BatchPass::Deep);
+                let user = sir_enriched_user_prompt(
+                    &job.symbol_text,
+                    &job.context,
+                    &enrichment,
+                    include_cot,
+                );
+                (enrichment.neighbor_intents, user)
             }
         };
 
@@ -220,7 +235,7 @@ pub(crate) fn build_pass_jsonl_for_ids(
         let prompt_hash = compute_prompt_hash(
             job.symbol_text.as_str(),
             &neighbor_texts,
-            pass_config.config_fingerprint().as_str(),
+            pass_config.config_fingerprint(provider_name).as_str(),
         );
         let existing_hash = store
             .get_sir_meta(symbol_id.as_str())
@@ -246,26 +261,18 @@ pub(crate) fn build_pass_jsonl_for_ids(
             summary.files.push(file_path);
         }
 
-        let line = json!({
-            "key": format!("{}|{}", symbol_id, prompt_hash),
-            "request": {
-                "contents": [{
-                    "parts": [{
-                        "text": prompt
-                    }]
-                }],
-                "generationConfig": {
-                    "responseMimeType": "application/json",
-                    "temperature": 0.0,
-                    "thinkingConfig": {
-                        "thinkingLevel": pass_config.thinking_level()?
-                    }
-                }
-            }
-        });
+        let key_str = format!("{}|{}", symbol_id, prompt_hash);
+        let line = provider.format_request(
+            &key_str,
+            &system_prompt,
+            &user_prompt,
+            &pass_config.model,
+            &pass_config.thinking,
+        )?;
         let writer_ref = writer.as_mut().expect("writer initialized");
-        serde_json::to_writer(&mut *writer_ref, &line)
-            .context("failed to serialize batch JSONL line")?;
+        writer_ref
+            .write_all(line.as_bytes())
+            .context("failed to write batch JSONL line")?;
         writer_ref
             .write_all(b"\n")
             .context("failed to terminate batch JSONL line")?;

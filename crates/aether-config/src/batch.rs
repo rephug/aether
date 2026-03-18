@@ -1,5 +1,24 @@
 use serde::{Deserialize, Serialize};
 
+/// Per-provider overrides for batch models and thinking levels.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct BatchProviderConfig {
+    #[serde(default)]
+    pub scan_model: Option<String>,
+    #[serde(default)]
+    pub triage_model: Option<String>,
+    #[serde(default)]
+    pub deep_model: Option<String>,
+    #[serde(default)]
+    pub scan_thinking: Option<String>,
+    #[serde(default)]
+    pub triage_thinking: Option<String>,
+    #[serde(default)]
+    pub deep_thinking: Option<String>,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BatchConfig {
     #[serde(default)]
@@ -38,6 +57,86 @@ pub struct BatchConfig {
     /// "auto" selects based on provider: cloud providers get "full", local gets "compact".
     #[serde(default = "default_prompt_tier")]
     pub prompt_tier: String,
+    /// Batch provider: "gemini", "openai", or "anthropic".
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    /// Provider-specific overrides for Gemini batch.
+    #[serde(default)]
+    pub gemini: BatchProviderConfig,
+    /// Provider-specific overrides for OpenAI batch.
+    #[serde(default)]
+    pub openai: BatchProviderConfig,
+    /// Provider-specific overrides for Anthropic batch (reserved for 10.7b).
+    #[serde(default)]
+    pub anthropic: BatchProviderConfig,
+}
+
+impl BatchConfig {
+    /// Resolve the model for a given pass, checking the provider subsection first,
+    /// then falling back to the top-level flat fields.
+    pub fn resolve_model(&self, pass: &str, provider: &str) -> &str {
+        let provider_config = self.provider_config(provider);
+        let override_val = match pass {
+            "scan" => provider_config.scan_model.as_deref(),
+            "triage" => provider_config.triage_model.as_deref(),
+            "deep" => provider_config.deep_model.as_deref(),
+            _ => None,
+        };
+        if let Some(val) = override_val.filter(|s| !s.is_empty()) {
+            return val;
+        }
+        match pass {
+            "scan" => self.scan_model.as_str(),
+            "triage" => self.triage_model.as_str(),
+            "deep" => self.deep_model.as_str(),
+            _ => "",
+        }
+    }
+
+    /// Resolve the thinking level for a given pass, checking the provider subsection first.
+    pub fn resolve_thinking(&self, pass: &str, provider: &str) -> &str {
+        let provider_config = self.provider_config(provider);
+        let override_val = match pass {
+            "scan" => provider_config.scan_thinking.as_deref(),
+            "triage" => provider_config.triage_thinking.as_deref(),
+            "deep" => provider_config.deep_thinking.as_deref(),
+            _ => None,
+        };
+        if let Some(val) = override_val.filter(|s| !s.is_empty()) {
+            return val;
+        }
+        match pass {
+            "scan" => self.scan_thinking.as_str(),
+            "triage" => self.triage_thinking.as_str(),
+            "deep" => self.deep_thinking.as_str(),
+            _ => "off",
+        }
+    }
+
+    /// Resolve the environment variable name holding the API key for a provider.
+    pub fn resolve_api_key_env(&self, provider: &str) -> String {
+        let provider_config = self.provider_config(provider);
+        if let Some(ref env_var) = provider_config.api_key_env
+            && !env_var.is_empty()
+        {
+            return env_var.clone();
+        }
+        match provider {
+            "gemini" => "GEMINI_API_KEY".to_owned(),
+            "openai" => "OPENAI_API_KEY".to_owned(),
+            "anthropic" => "ANTHROPIC_API_KEY".to_owned(),
+            other => format!("{}_API_KEY", other.to_ascii_uppercase()),
+        }
+    }
+
+    fn provider_config(&self, provider: &str) -> &BatchProviderConfig {
+        match provider {
+            "gemini" => &self.gemini,
+            "openai" => &self.openai,
+            "anthropic" => &self.anthropic,
+            _ => &self.gemini,
+        }
+    }
 }
 
 impl Default for BatchConfig {
@@ -60,8 +159,16 @@ impl Default for BatchConfig {
             poll_interval_secs: default_poll_interval(),
             jsonl_chunk_size: default_jsonl_chunk_size(),
             prompt_tier: default_prompt_tier(),
+            provider: default_provider(),
+            gemini: BatchProviderConfig::default(),
+            openai: BatchProviderConfig::default(),
+            anthropic: BatchProviderConfig::default(),
         }
     }
+}
+
+fn default_provider() -> String {
+    "gemini".to_owned()
 }
 
 fn default_scan_thinking() -> String {
