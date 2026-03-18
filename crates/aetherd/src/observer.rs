@@ -15,6 +15,7 @@ const IGNORED_PATH_MARKERS: &[&str] = &[
     ".aether",
     "target",
     "node_modules",
+    "vendor",
     ".venv",
     "venv",
     "pycache",
@@ -28,6 +29,7 @@ const IGNORED_PATH_MARKERS: &[&str] = &[
     ".nuxt",
     ".output",
     "coverage",
+    "vendor",
 ];
 
 #[derive(Debug, Clone)]
