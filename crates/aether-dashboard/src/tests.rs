@@ -1969,3 +1969,68 @@ async fn fingerprint_fragment_with_symbol_shows_timeline() {
     assert!(body.contains("demo::run"));
     assert!(body.contains("abc123def456"));
 }
+
+// ─── Phase 10.4: Seismograph API tests ───────────────────────────────
+
+#[tokio::test]
+async fn seismograph_timeline_returns_ok() {
+    let (_tmp, app) = empty_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/seismograph-timeline")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json.get("data").is_some());
+    assert!(json.get("meta").is_some());
+}
+
+#[tokio::test]
+async fn seismograph_plates_returns_ok() {
+    let (_tmp, app) = empty_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/seismograph-plates")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json.get("data").is_some());
+    assert!(json.get("meta").is_some());
+}
+
+#[tokio::test]
+async fn seismograph_gauge_returns_ok() {
+    let (_tmp, app) = empty_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/seismograph-gauge")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json.get("data").is_some());
+    assert!(json.get("meta").is_some());
+}
