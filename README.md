@@ -10,6 +10,7 @@
 
 <p align="center">
   <a href="#what-the-hell-is-this">What Is This</a> •
+  <a href="#what-aether-can-do-that-nothing-else-can">Capabilities</a> •
   <a href="#top-10-use-cases-for-programmers">For Programmers</a> •
   <a href="#top-10-use-cases-for-vibe-coders">For Vibe Coders</a> •
   <a href="#the-backstory-nobody-asked-for">Backstory</a> •
@@ -54,6 +55,127 @@ You run `aetherd context --task "fix the authentication bug"` and AETHER ranks e
 You open the dashboard and see which modules are active fault lines, how fast meaning is shifting across the codebase (the Seismograph), which functions are silently drifting in purpose, which contracts are violated, and which symbols are the most dangerous nodes in your dependency graph.
 
 That's AETHER. Or at least that's what AETHER is supposed to be. I think it actually works? People keep telling me to stop hedging but I genuinely don't know how to be confident about 136,000 lines of code I didn't technically write by hand.
+
+---
+
+## What AETHER Can Do That Nothing Else Can
+
+This is the full list. Not the highlights — everything. If another tool does any of these, I'd love to hear about it so I can stop losing sleep over whether this project is original.
+
+### Semantic Intelligence
+
+- **Persistent Semantic Intent Records (SIRs)** — Every function, struct, trait, and class gets a structured AI-generated annotation describing intent, dependencies, error modes, side effects, and edge cases. These survive across sessions. Your AI agent never starts from scratch.
+- **Three-Pass Inference Pipeline** — Scan (fast, no enrichment) → Triage (enriched with neighbor intents) → Deep (premium model, top-priority symbols). Each pass uses progressively richer context. Flash-lite with neighbor intents outperforms premium models without context.
+- **Cross-Symbol Enrichment** — When generating a SIR for function A, AETHER injects the intents of A's callers and callees into the prompt. The LLM understands each function in the context of its neighborhood, not in isolation.
+- **SIR Quality Scoring** — Every annotation gets a quality score. Low-quality SIRs are automatically queued for regeneration with a better model or richer context.
+- **SIR Versioning with Git Linkage** — Every SIR version is stored with its git commit hash. You can diff any two versions and see exactly how a function's meaning changed and which commit caused it.
+- **Semantic Diff** — Compare any two SIR versions field by field: purpose, edge cases, error handling, side effects. Not text diff — *meaning* diff.
+
+### Intent Contracts
+
+- **Behavioral Contract Declarations** — Declare what a function MUST do, MUST NOT do, or MUST preserve. Enforces *meaning*, not just types.
+- **Two-Stage Verification Cascade** — Embedding cosine pre-filter resolves ~90% of checks in microseconds. LLM judge handles the ambiguous middle band. Fast path for clear cases, expensive path only when needed.
+- **Leaky Bucket Violation Handling** — First violation is silent (LLM phrasing jitter). Second consecutive violation triggers the alert. Reduces false positives from nondeterministic LLM output.
+- **Cross-Symbol Contract Propagation** — Contract clauses from callers automatically inject into downstream symbols' SIR prompts. If `validate_amount` has a contract and calls `check_limit`, the contract context flows into `check_limit`'s SIR generation.
+- **Negative Few-Shot Learning** — Dismissed false positives become negative examples that improve future verification accuracy.
+
+### The Seismograph
+
+- **Semantic Velocity** — PageRank-weighted EMA measuring how fast meaning is changing across the codebase. Noise floor filters out LLM phrasing jitter.
+- **Community Stability Scoring** — Each Louvain community scored by what fraction of its importance is currently shifting. Identifies active fault lines.
+- **Epicenter Tracing** — Follows strict temporal monotonicity to trace cascades back to their source-change root cause. When meaning shifts ripple outward, find where they started.
+- **Aftershock Prediction** — Logistic regression model predicts which symbols are likely to shift next based on cascade patterns.
+
+### Drift & Health
+
+- **Automatic Drift Detection** — Compares current SIR embeddings against historical baselines. Detects scope creep without any manual architecture model.
+- **Louvain Community Detection** — Runs on the dependency graph to identify architectural communities. Flags boundary violations when functions start crossing community lines.
+- **Codebase Health Scoring** — Composite risk per crate: PageRank × betweenness centrality × drift magnitude × git churn × test coverage. The most dangerous code in your codebase, ranked.
+- **God File Detection** — Identifies files that are doing too much based on community membership, coupling scores, and method count.
+- **Archetype Classification** — Categorizes crates by structural pattern (utility, god file, stable core, volatile surface, etc.).
+- **Connected Components Analysis** — Identifies isolated subgraphs and orphan symbols in the dependency graph.
+
+### Causal & Impact Analysis
+
+- **Blast Radius Analysis** — Every downstream symbol affected by a change, with hop depth and test guard coverage per symbol.
+- **Causal Chain Tracing** — Traces breaking changes backward through the dependency graph, comparing SIR versions at each node. Finds which upstream semantic change broke your downstream code.
+- **Multi-Signal Coupling** — Three-signal fusion: git temporal co-change + AST static dependencies + SIR semantic similarity. Detects hidden operational coupling that no single signal reveals.
+- **Test Intent Extraction** — AST-level extraction of what tests actually check, linked to symbols via TESTED_BY graph edges.
+
+### Context Assembly
+
+- **Task-Scoped Context with RRF + Personalized PageRank** — Ranks every symbol by relevance to a task description, expands through the dependency graph, assembles a token-budgeted document.
+- **Four Output Formats** — Markdown (paste into chat), JSON (programmatic), XML (Claude API), compact (maximum density).
+- **Symbol-Guided File Slicing** — Includes only the relevant portions of source files, reducing token usage 50-80% vs. dumping whole files.
+- **Token Budget Management** — Greedy knapsack allocation with 9-tier priority ranking. Never exceeds the configured token limit.
+- **Reusable TOML Presets** — Save context configurations: `quick` (8K/depth 1), `review` (32K/depth 2), `deep` (64K/depth 3), `overview` (16K/depth 0). Create your own.
+- **Branch-Aware Context** — Pass `--branch feature/fix-auth` and AETHER automatically scopes context to the changed files and their neighborhoods.
+
+### Continuous Intelligence
+
+- **Noisy-OR Staleness Scoring** — Per-symbol staleness with hard gates (source changed? model deprecated?), logistic sigmoid time decay, semantic-gated neighbor propagation, predictive coupling from temporal co-change, and cold-start volatility priors from git churn.
+- **Smart Watcher** — Monitors `.git` for branch switches, pulls, merges, and rebases. Triggers targeted re-indexing automatically.
+- **Priority-Aware Model Selection** — Edited symbols get the best model. Background re-indexing uses the cheap model.
+- **Prompt Hashing via BLAKE3 Composites** — Deterministic fingerprint of symbol content + context. Unchanged symbols are skipped automatically across runs.
+
+### Batch Processing
+
+- **Gemini Batch API Integration** — 50% cost reduction vs. real-time inference. JSONL generation with per-pass prompt construction.
+- **Three-Pass Batch Pipeline** — Scan → triage → deep with independent model selection per pass.
+- **Skip-Unchanged Optimization** — BLAKE3 prompt hash comparison. Only pay for symbols whose content or context actually changed.
+- **Fingerprint History Tracking** — Every prompt hash stored with timestamp. Full audit trail of what was generated when.
+
+### Graph Intelligence
+
+- **SurrealDB Dependency Graph** — CALLS, DEPENDS_ON, TYPE_REF, and IMPLEMENTS edges extracted from tree-sitter AST.
+- **PageRank on the Dependency Graph** — Identifies the most critical symbols by structural importance.
+- **Betweenness Centrality** — Finds bottleneck symbols that sit on the most shortest paths.
+- **Component-Bounded Operations** — Community detection, semantic rescue, and merge operations all respect connected component boundaries.
+
+### Embeddings & Search
+
+- **Asymmetric Embeddings** — Documents use `RETRIEVAL_DOCUMENT` task type, queries use `CODE_RETRIEVAL_QUERY`. Different embedding strategies for indexing vs. searching.
+- **Semantic Search** — Find functions by meaning, not keywords. "Handles authentication" finds auth functions even if none contain "auth" in the name.
+- **Hybrid Search** — Lexical + semantic + hybrid modes with automatic fallback.
+- **Per-Language Adaptive Thresholds** — Cosine similarity thresholds tuned per language (Rust vs. TypeScript vs. Python).
+- **Component-Bounded Semantic Rescue** — At the 0.90 cosine threshold, symbols rescued from loner status only if they belong to the same connected component. Prevents false merges.
+- **Local Embeddings via Candle** — Qwen3-Embedding-0.6B runs entirely on-device. No cloud calls.
+- **Local Reranking via Candle** — Qwen3-Reranker-0.6B for result quality refinement. Also fully local.
+
+### Refactoring Support
+
+- **Pre-Refactor Intent Snapshots** — `refactor-prep` captures every symbol's SIR state before you touch anything.
+- **Post-Refactor Intent Verification** — `verify-intent` compares current SIRs against the snapshot. Classifies each symbol as preserved, shifted-minor, or shifted-major.
+- **SIR Injection Without Inference** — `sir-inject` lets you manually set a symbol's intent. Pin expectations, then verify the code matches.
+- **Cross-Store Consistency Check** — `fsck` command validates that SQLite, SurrealDB, and LanceDB are in sync.
+
+### Project Memory
+
+- **Persistent Project Notes** — Store architecture decisions, design rationale, "why we chose X" via CLI or MCP. Content-hash deduplication prevents bloat.
+- **Session Notes** — Quick in-session capture for agent workflows. Survives conversation boundaries.
+- **Semantic Note Retrieval** — Search project memory by meaning, not just keywords.
+
+### Surfaces
+
+- **33 CLI Commands** — Organized by purpose: intelligence queries, context assembly, presets, contracts, seismograph, batch/continuous, maintenance.
+- **26 MCP Tools** — Structured access for AI agents. Every response includes `schema_version` for forward compatibility.
+- **40+ Dashboard Pages** — HTMX + D3.js + Tailwind. Seismograph timelines, tectonic plate treemaps, velocity gauges, contract health monitors, blast radius radial trees, force-directed architecture maps, time machine, causal explorer.
+- **VS Code Extension** — Semantic hover intelligence. Status bar. Command palette integration.
+- **Tauri Desktop App** — System tray, onboarding wizard, native installers (MSI/DMG/AppImage/DEB), auto-update.
+- **LSP Hover Provider** — Enriched hover tooltips with SIR summary, not just type signatures.
+
+### Offline & Privacy
+
+- **Fully Offline Operation** — Ollama + qwen3.5:4b for inference, Candle for embeddings and reranking. Zero cloud calls. No API keys. No telemetry.
+- **No Code Leaves Your Machine** — Unless you explicitly choose a cloud provider, everything runs locally.
+- **Schema Migrations** — Through version 13. Forward-compatible. Your data survives upgrades.
+
+### Parsing
+
+- **Multi-Language Support** — Rust, TypeScript/JavaScript, Python via tree-sitter.
+- **Incremental Parsing** — Only re-parses changed files.
+- **Stable Symbol IDs** — BLAKE3 hash of qualified name + file path. Symbols keep their identity across renames within the same logical location.
+- **Structural Edge Extraction** — CALLS, DEPENDS_ON, TYPE_REF, and IMPLEMENTS edges extracted directly from AST. Not heuristic — structural.
 
 ---
 
@@ -117,6 +239,14 @@ Hi. I'm Robert.
 
 My formal programming education: BASIC 2 in high school. One year at a computer trade school. In the *last millennium*. We saved to floppy disks. The internet was a sound your telephone made. That is the entirety of my technical credentials. I am not being self-deprecating for effect. That is literally all of it.
 
+And I should be clear about something: I had never seen Rust before this project. Not "I knew a little Rust" — I had never *seen* it. I didn't know what a crate was. I didn't know what `cargo` was. SurrealDB, LanceDB, tree-sitter, Axum, Tauri, HTMX, D3.js, BLAKE3, Louvain community detection, Personalized PageRank — I had never heard of any of these things. The last time I touched web technology, HTML was the whole stack. Now apparently we have HTMX and I still don't fully understand what the X stands for.
+
+99% of the tools in this project were completely new to me. I learned what they were by asking Claude to explain them in simple words, or by asking for analogies. "What's a crate?" "It's like a folder of related code that gets compiled together." Okay, I can work with that. "What's PageRank?" "It's how Google decides which web pages are important — the more important pages link to you, the more important you are." Got it. Now do that but with functions instead of web pages.
+
+That's the whole secret, honestly. I don't understand the terminology. I understand the *concepts*. And it turns out the concepts are almost always simple. Every industry — programming especially — uses terminology as a gate. Fancy words for straightforward ideas. "Noisy-OR probabilistic staleness model" sounds terrifying until someone explains it as "if any of these bad things happened, the information is probably outdated, and the more bad things, the more outdated." That's... just common sense? With math?
+
+Everything in AETHER is a complex workflow built on simple decisions. I didn't need to understand Rust's borrow checker to know that "if a function changes, the things that depend on it might be wrong now." I didn't need a CS degree to know that "if something is really important and has no tests and is changing fast, that's dangerous." The AI handles the implementation. I handle the "what should exist and why."
+
 **327 commits. 109 pull requests. 17 Rust crates. 136,000 lines of code. Five weeks.**
 
 From zero to a semantic intelligence engine with Personalized PageRank, Noisy-OR staleness models, community detection, a three-pass inference pipeline, a continuous intelligence daemon, a batch processing system, a 40-page interactive dashboard, 26 MCP tools, 33 CLI commands, a Seismograph that tracks semantic earthquakes, intent contracts that enforce behavioral expectations, a Tauri desktop app with system tray integration, and a task context engine that uses Reciprocal Rank Fusion to rank every symbol in your codebase by relevance to whatever you're working on.
@@ -171,6 +301,10 @@ I'm either a complete fraud who got impossibly lucky for five weeks straight, or
 I think about this constantly.
 
 The thing about not knowing how to code is that you don't know what's "hard." You don't know that you're supposed to be scared of implementing Personalized PageRank, because you've never heard anyone at a conference say "that's really complicated." You just describe what you want — "I need to rank symbols by relevance, expanding outward from a seed set through the dependency graph" — and the AI implements it. And then you test it. And it works. And you move on to the next thing.
+
+Every complex system I've built in AETHER started as a sentence I could explain to a non-programmer. "Track when code meaning changes." "Figure out which code is the most dangerous." "If someone breaks a rule I set, tell me." The terminology came later — the AI taught me words like "cosine similarity" and "betweenness centrality" — but the *ideas* were always plain English first.
+
+I think that's what 25 years of thinking about systems actually teaches you. Not how to code. How to break big scary problems into small obvious decisions. The code is an implementation detail. It always was. We just didn't have tools that let non-coders prove it until now.
 
 Is that genius or ignorance? I genuinely can't tell. Some days it feels like both.
 
