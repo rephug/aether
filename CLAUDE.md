@@ -2,13 +2,13 @@
 
 ## What this project is
 
-Semantic intelligence engine for codebases. Indexes every symbol into a Semantic Intent Record (SIR), stores relationships across SQLite + SurrealDB + vector store, and surfaces intelligence via LSP, MCP tools, CLI (31 commands), a web dashboard (27+ HTMX pages), and clipboard-ready context export. Single developer, ~113K lines of Rust across a multi-crate workspace.
+Semantic intelligence engine for codebases. Indexes every symbol into a Semantic Intent Record (SIR), stores relationships across SQLite + SurrealDB + vector store, and surfaces intelligence via LSP, MCP tools, CLI (31 commands), a web dashboard (27+ HTMX pages), and clipboard-ready context export. Single developer, ~136K lines of Rust across a multi-crate workspace.
 
-**Repo:** `github.com/rephug/aether` (public)
+**Repo:** `github.com/rephug/aether` (private)
 **Dev environment:** WSL2 Ubuntu 24.04 on MSI laptop, RTX 2070 8GB, 16GB RAM
-**Schema version:** 11
+**Schema version:** 13
 
-## Crate map (16 crates)
+## Crate map (17 crates)
 
 ```
 crates/
@@ -143,6 +143,11 @@ All three must pass. No exceptions. Run per-crate, never `--workspace`.
 | R.1 | Context Export | `aether context` CLI — shared ExportDocument engine, clipboard-ready context assembly (~2050 LOC) |
 | 10.6 | Task Context Engine | Task-to-symbol ranking via RRF + Personalized PageRank, branch diff mode (~1450 LOC) |
 | R.2+R.3+R.4 | File Slicing + Presets + Formats | Symbol-range file slicing, preset library (`.aether/presets/`), XML/compact output formats (~2234 LOC) |
+| 10.4 | Seismograph | Semantic velocity tracking, codebase shift detection, cascade analysis |
+| 10.5 | Intent Contracts | Contract propagation, cross-symbol enrichment, Contract Health dashboard page |
+| R.5 | Context Prompter | Final context export stage |
+| 9.1-9.5 | The Beacon (all stages) | Tauri desktop app, config UI, onboarding wizard, enhanced viz, native installers |
+| 10.7-prep | Prompt Expansion | Three-tier SIR prompt system (compact/standard/full), system/user split, prompt caching readiness |
 
 ### Health score: 52/100 (Watch)
 
@@ -230,7 +235,7 @@ task-relevance                   # Task-to-symbol ranking without assembly
 preset list/show/create/delete   # Manage .aether/presets/*.toml
 
 # Batch + continuous (10.1 + 10.2)
-batch extract/build/ingest/run   # Gemini Batch API pipeline
+batch extract/build/ingest/run   # Multi-provider batch pipeline (Gemini, OpenAI, Anthropic)
 continuous run-once/status       # Drift monitor + staleness scoring
 
 # Maintenance
@@ -242,31 +247,29 @@ mine-coupling, refactor-prep, verify-intent
 
 ```bash
 # Create worktree for a stage
-git worktree add -b feature/phase9-stage9-1-tauri-shell /home/rephu/aether-phase9-tauri-shell
+git worktree add -B feature/<branch-name> /home/rephu/feature/<branch-name>
 
 # Work, validate, commit
 cargo fmt --all --check
 cargo clippy -p <crate> -- -D warnings
 cargo test -p <crate>
 git add -A
-git commit -m "feat(phase9): <descriptive message for semantic indexing>"
+git commit -m "feat(<scope>): <descriptive message for semantic indexing>"
 
 # Push and PR (descriptive title + body — PRs are indexed by AETHER)
-git push origin feature/phase9-stage9-1-tauri-shell
-gh pr create \
-  --title "Phase 9.1 — Tauri Shell + System Tray" \
-  --body "Embeds aetherd in Tauri 2.x native window, renders HTMX dashboard in webview, adds system tray with live status. Decision #90."
+git push origin feature/<branch-name>
+# Create PR via GitHub web UI with descriptive title + body (PRs are indexed by AETHER)
 
 # After merge
 git switch main
 git pull --ff-only
-git worktree remove /home/rephu/aether-phase9-tauri-shell
-git branch -d feature/phase9-stage9-1-tauri-shell
+git worktree remove /home/rephu/feature/<branch-name>
+git branch -D feature/<branch-name>
 ```
 
-**Worktree paths:** `/home/rephu/aether-phase9-*` (siblings of `projects/`, NOT inside it)
-**The `-b` flag is required** — omitting it causes commits directly on main.
-**NEVER commit directly to main.** Always create a feature branch, push, and create a PR via `gh pr create` with a descriptive title and body.
+**Worktree paths:** `/home/rephu/<branch-name>` (e.g., `/home/rephu/feature/phase10-7a-batch-provider`). NOT inside `projects/`.
+**The `-B` flag is required** (capital B) — creates or resets the branch.
+**NEVER commit directly to main.** Always create a feature branch, push, and create a PR via GitHub web UI with a descriptive title and body.
 
 ## Decision register
 
@@ -277,12 +280,15 @@ Decisions live in `docs/roadmap/DECISIONS_v4.md` and addendum files:
 - #83-89: Phase 8.12-8.17 embeddings (in addendum files)
 - #89.1: Boundary Leaker fix
 - #90-96: Phase 9 (Tauri=#90, HTMX=#91, binary=#92, tray=#93, installers=#94, updater=#95, tray alerts=#96)
-- #97-100: Phase 10 session (batch transport, build_job max_chars, daemon scheduler deferred, build trigger deferred)
-- **Next available: #101+**
+- #97-102: Phase Repo (context export decisions)
+- #103-105: Phase 10.7a (BatchProvider trait, native Rust batch, provider subsections)
+- #106-107: Phase 10.7b (Anthropic inline JSON, prompt caching)
+- #108: Phase 10.7-prep (three-tier prompt system)
+- **Next available: #109+**
 
-## Phase 9 stages
+## Phase 9 stages (COMPLETED)
 
-**CRITICAL:** These spec files must be committed to the repo before starting implementation. They exist in project knowledge but not yet in `docs/roadmap/`.
+All 5 stages merged (PRs #101-109). Specs in `docs/roadmap/`.
 
 Read the spec before starting each stage:
 
@@ -318,5 +324,5 @@ Feature-gated: `--features desktop` in workspace Cargo.toml. The headless CLI bi
 - Run brainstorming or planning phases — the stage spec has already been designed
 - Suggest model selections or provider changes
 - Use `/tmp/` or `/mnt/` for build artifacts
-- Create worktrees inside `/home/rephu/projects/aether/` — they go at `/home/rephu/aether-phase9-*`
+- Create worktrees inside `/home/rephu/projects/aether/` — they go at `/home/rephu/<branch-name>`
 - Refactor the god files listed above as part of Phase 9 (separate effort)
