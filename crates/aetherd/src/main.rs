@@ -19,9 +19,9 @@ use aetherd::cli::{
     AskArgs, BatchArgs, BlastRadiusArgs, Cli, Commands, CommunitiesArgs, ContextArgs,
     ContinuousArgs, CouplingReportArgs, DriftAckArgs, DriftReportArgs, FsckArgs, HealthArgs,
     HealthScoreArgs, InitAgentArgs, LogFormat, MineCouplingArgs, NotesArgs, PresetArgs, RecallArgs,
-    RefactorPrepArgs, RegenerateArgs, RememberArgs, SetupLocalArgs, SirContextArgs, SirDiffArgs,
-    SirInjectArgs, TaskHistoryArgs, TaskRelevanceArgs, TestIntentsArgs, TraceCauseArgs,
-    VerifyIntentArgs, parse_cli,
+    RefactorPrepArgs, RegenerateArgs, RememberArgs, SeismographArgs, SetupLocalArgs,
+    SirContextArgs, SirDiffArgs, SirInjectArgs, TaskHistoryArgs, TaskRelevanceArgs,
+    TestIntentsArgs, TraceCauseArgs, VerifyIntentArgs, parse_cli,
 };
 use aetherd::context_presets::run_preset_command;
 use aetherd::continuous::run_continuous_command;
@@ -43,6 +43,7 @@ use aetherd::memory::{
 use aetherd::observer::ObserverState;
 use aetherd::refactor_prep::run_refactor_prep_command;
 use aetherd::search::run_search_once;
+use aetherd::seismograph::run_seismograph_command;
 use aetherd::setup_local::{SetupLocalOptions, run_setup_local};
 use aetherd::sir_context::{run_context_command, run_sir_context_command};
 use aetherd::sir_diff::run_sir_diff_command;
@@ -349,6 +350,7 @@ fn run_subcommand(workspace: &Path, config: &AetherConfig, command: Commands) ->
         Commands::RefactorPrep(args) => run_refactor_prep_subcommand(workspace, config, args),
         Commands::VerifyIntent(args) => run_verify_intent_subcommand(workspace, config, args),
         Commands::Fsck(args) => run_fsck_subcommand(workspace, args),
+        Commands::Seismograph(args) => run_seismograph_subcommand(workspace, config, args),
     }
 }
 
@@ -811,6 +813,14 @@ fn run_fsck_subcommand(workspace: &Path, args: FsckArgs) -> Result<()> {
     run_fsck(workspace, args.repair, args.verbose)
         .map(|_| ())
         .context("fsck command failed")
+}
+
+fn run_seismograph_subcommand(
+    workspace: &Path,
+    config: &AetherConfig,
+    args: SeismographArgs,
+) -> Result<()> {
+    run_seismograph_command(workspace, config, args).context("seismograph command failed")
 }
 
 fn init_tracing_subscriber(log_format: LogFormat, configured_log_level: &str) -> Result<()> {

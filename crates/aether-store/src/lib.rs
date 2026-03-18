@@ -26,6 +26,7 @@ mod lexical;
 mod lifecycle;
 mod project_notes;
 mod schema;
+mod seismograph;
 mod sir_history;
 mod sir_meta;
 mod snapshots;
@@ -68,6 +69,9 @@ pub use project_notes::{
     ProjectNoteSemanticSearchResult,
 };
 pub use schema::SchemaVersion;
+pub use seismograph::{
+    AftershockModelRecord, CascadeRecord, CommunityStabilityRecord, SeismographMetricRecord,
+};
 pub use sir_history::{
     SirHistoryBaselineSelector, SirHistoryRecord, SirHistoryResolvedPair, SirHistorySelector,
     SirVersionWriteResult,

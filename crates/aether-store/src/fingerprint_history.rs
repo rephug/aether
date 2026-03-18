@@ -144,6 +144,112 @@ impl SqliteStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Return all fingerprint rows with `timestamp >= since_timestamp`, ordered by timestamp ASC.
+    pub fn list_fingerprint_history_since(
+        &self,
+        since_timestamp: i64,
+    ) -> Result<Vec<SirFingerprintHistoryRecord>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                symbol_id, timestamp, prompt_hash, prompt_hash_previous,
+                trigger, source_changed, neighbor_changed, config_changed,
+                generation_model, generation_pass, delta_sem
+            FROM sir_fingerprint_history
+            WHERE timestamp >= ?1
+            ORDER BY timestamp ASC, id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![since_timestamp], |row| {
+            Ok(SirFingerprintHistoryRecord {
+                symbol_id: row.get(0)?,
+                timestamp: row.get(1)?,
+                prompt_hash: row.get(2)?,
+                prompt_hash_previous: row.get(3)?,
+                trigger: row.get(4)?,
+                source_changed: row.get::<_, i64>(5)? != 0,
+                neighbor_changed: row.get::<_, i64>(6)? != 0,
+                config_changed: row.get::<_, i64>(7)? != 0,
+                generation_model: row.get(8)?,
+                generation_pass: row.get(9)?,
+                delta_sem: row.get(10)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Return all fingerprint rows for a specific batch timestamp.
+    pub fn list_fingerprint_history_for_batch(
+        &self,
+        batch_timestamp: i64,
+    ) -> Result<Vec<SirFingerprintHistoryRecord>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                symbol_id, timestamp, prompt_hash, prompt_hash_previous,
+                trigger, source_changed, neighbor_changed, config_changed,
+                generation_model, generation_pass, delta_sem
+            FROM sir_fingerprint_history
+            WHERE timestamp = ?1
+            ORDER BY id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![batch_timestamp], |row| {
+            Ok(SirFingerprintHistoryRecord {
+                symbol_id: row.get(0)?,
+                timestamp: row.get(1)?,
+                prompt_hash: row.get(2)?,
+                prompt_hash_previous: row.get(3)?,
+                trigger: row.get(4)?,
+                source_changed: row.get::<_, i64>(5)? != 0,
+                neighbor_changed: row.get::<_, i64>(6)? != 0,
+                config_changed: row.get::<_, i64>(7)? != 0,
+                generation_model: row.get(8)?,
+                generation_pass: row.get(9)?,
+                delta_sem: row.get(10)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Return all fingerprint rows within a time window [start, end].
+    pub fn list_fingerprint_history_window(
+        &self,
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<SirFingerprintHistoryRecord>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                symbol_id, timestamp, prompt_hash, prompt_hash_previous,
+                trigger, source_changed, neighbor_changed, config_changed,
+                generation_model, generation_pass, delta_sem
+            FROM sir_fingerprint_history
+            WHERE timestamp >= ?1 AND timestamp <= ?2
+            ORDER BY timestamp ASC, id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![start, end], |row| {
+            Ok(SirFingerprintHistoryRecord {
+                symbol_id: row.get(0)?,
+                timestamp: row.get(1)?,
+                prompt_hash: row.get(2)?,
+                prompt_hash_previous: row.get(3)?,
+                trigger: row.get(4)?,
+                source_changed: row.get::<_, i64>(5)? != 0,
+                neighbor_changed: row.get::<_, i64>(6)? != 0,
+                config_changed: row.get::<_, i64>(7)? != 0,
+                generation_model: row.get(8)?,
+                generation_pass: row.get(9)?,
+                delta_sem: row.get(10)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Count fingerprint changes per symbol, returning the top N most-changed symbols.
     pub fn count_fingerprint_changes_by_symbol(
         &self,
