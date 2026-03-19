@@ -248,8 +248,8 @@ impl BatchProvider for GeminiBatchProvider {
             .unwrap_or("");
 
         match state {
-            "JOB_STATE_SUCCEEDED" => Ok(BatchPollStatus::Completed),
-            "JOB_STATE_FAILED" => {
+            "BATCH_STATE_SUCCEEDED" => Ok(BatchPollStatus::Completed),
+            "BATCH_STATE_FAILED" => {
                 let msg = json
                     .pointer("/error/message")
                     .and_then(|v| v.as_str())
@@ -258,7 +258,7 @@ impl BatchProvider for GeminiBatchProvider {
                     message: msg.to_owned(),
                 })
             }
-            "JOB_STATE_CANCELLED" | "JOB_STATE_EXPIRED" => Ok(BatchPollStatus::Failed {
+            "BATCH_STATE_CANCELLED" | "BATCH_STATE_EXPIRED" => Ok(BatchPollStatus::Failed {
                 message: format!("batch job {}", state),
             }),
             "" => Err(anyhow!("Gemini batch poll response missing state field")),
