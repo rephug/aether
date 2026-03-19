@@ -3,7 +3,6 @@ use std::path::Path;
 
 use aether_config::{AetherConfig, InferenceProviderKind};
 use aether_core::{Language, Position, SourceRange, Symbol, SymbolKind};
-use aether_infer::ProviderOverrides;
 use aether_sir::SirAnnotation;
 use aether_store::{SirFingerprintHistoryRecord, SirMetaRecord, SirStateStore, SqliteStore};
 use anyhow::{Context, Result, anyhow};
@@ -44,19 +43,9 @@ pub(crate) fn ingest_results(
         .with_context(|| format!("failed to open batch results {}", results_path.display()))?;
     let reader = BufReader::new(file);
 
-    let provider_kind = provider_kind_from_name(provider_name);
-    let pipeline = SirPipeline::new(
-        workspace.to_path_buf(),
-        1,
-        ProviderOverrides {
-            provider: Some(provider_kind),
-            model: Some(pass_config.model.clone()),
-            endpoint: None,
-            api_key_env: None,
-        },
-    )
-    .map(|pipeline| pipeline.with_skip_surreal_sync(true))
-    .context("failed to initialize batch ingest pipeline")?;
+    let pipeline = SirPipeline::new_embeddings_only(workspace.to_path_buf())
+        .map(|pipeline| pipeline.with_skip_surreal_sync(true))
+        .context("failed to initialize batch ingest pipeline")?;
 
     let mut summary = IngestSummary::default();
     for (line_number, line) in reader.lines().enumerate() {
