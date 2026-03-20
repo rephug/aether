@@ -75,6 +75,12 @@ pub struct RegenerateArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct ComputeQualityArgs {
+    #[arg(long, help = "Recompute quality rows even when they already exist")]
+    pub recompute: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct SetupLocalArgs {
     #[arg(
         long,
@@ -979,6 +985,8 @@ pub enum Commands {
     InitAgent(InitAgentArgs),
     /// Regenerate low-quality SIR records with optional deep enrichment
     Regenerate(RegenerateArgs),
+    /// Compute model-independent SIR quality signals and normalized scores
+    ComputeQuality(ComputeQualityArgs),
     /// Set up local Ollama inference for offline SIR generation
     SetupLocal(SetupLocalArgs),
     /// Show local index health and SIR coverage
@@ -1896,6 +1904,25 @@ mod tests {
                 assert!(args.deep);
                 assert_eq!(args.max, Some(12));
                 assert!(args.dry_run);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compute_quality_subcommand_parses_recompute_flag() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "compute-quality",
+            "--recompute",
+        ])
+        .expect("compute-quality should parse");
+
+        match cli.command {
+            Some(Commands::ComputeQuality(args)) => {
+                assert!(args.recompute);
             }
             other => panic!("unexpected command: {other:?}"),
         }

@@ -4,6 +4,7 @@ mod drift;
 mod graph_algorithms;
 mod health;
 mod refactor;
+mod sir_quality_signals;
 mod test_intents;
 
 pub use causal::{
@@ -27,4 +28,8 @@ pub use graph_algorithms::{
 };
 pub use health::*;
 pub use refactor::*;
+pub use sir_quality_signals::{
+    SirQualitySignals, blend_normalized_quality, compute_confidence_percentiles,
+    compute_sir_quality_signals,
+};
 pub use test_intents::{InferredTestTarget, TestGuard, TestIntentAnalyzer};
