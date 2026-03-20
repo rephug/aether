@@ -87,6 +87,21 @@ pub struct QualityBatchItem {
     pub use_cot: bool,
 }
 
+/// Returned by `check_embedding_needed` when a symbol requires a new embedding.
+pub(crate) struct EmbeddingNeeded {
+    pub provider: String,
+    pub model: String,
+}
+
+/// Input data for batch embedding record construction.
+pub(crate) struct EmbeddingInput {
+    pub symbol_id: String,
+    pub sir_hash: String,
+    pub canonical_json: String,
+    pub provider: String,
+    pub model: String,
+}
+
 pub struct SirPipeline {
     workspace_root: PathBuf,
     provider: Arc<dyn InferenceProvider>,
@@ -1843,31 +1858,41 @@ impl SirPipeline {
         Ok(())
     }
 
-    /// Generate an embedding record for a symbol without storing it.
+    /// Flush a batch of embedding records to the vector store.
+    pub(crate) fn flush_embedding_batch(&self, records: Vec<SymbolEmbeddingRecord>) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        self.runtime
+            .block_on(self.vector_store.upsert_embedding_batch(records))
+            .context("failed to flush embedding batch to vector store")
+    }
+
+    /// Check whether a symbol needs a new embedding without generating one.
     ///
-    /// Returns `None` if no embedding provider is configured, the embedding is
-    /// already up-to-date (matching sir_hash + provider + model), or the
-    /// generated embedding is empty.
-    pub(crate) fn generate_embedding_record(
+    /// Returns `None` if no embedding provider is configured or the existing
+    /// embedding already matches the given sir_hash, provider, and model.
+    /// Returns `Some(EmbeddingNeeded)` with the provider/model names when
+    /// regeneration is required.
+    pub(crate) fn check_embedding_needed(
         &self,
         symbol_id: &str,
         sir_hash_value: &str,
-        canonical_json: &str,
         prefetched_meta: Option<&VectorEmbeddingMetaRecord>,
-    ) -> Result<Option<SymbolEmbeddingRecord>> {
-        let Some(embedding_provider) = self.embedding_provider.as_ref() else {
+    ) -> Result<Option<EmbeddingNeeded>> {
+        if self.embedding_provider.is_none() {
             return Ok(None);
-        };
+        }
 
         let provider_name = self
             .embedding_provider_name
             .as_deref()
-            .filter(|value| !value.trim().is_empty())
+            .filter(|v| !v.trim().is_empty())
             .unwrap_or("mock");
         let model_name = self
             .embedding_model_name
             .as_deref()
-            .filter(|value| !value.trim().is_empty())
+            .filter(|v| !v.trim().is_empty())
             .unwrap_or("mock");
 
         let existing_meta = match prefetched_meta {
@@ -1885,37 +1910,45 @@ impl SirPipeline {
             return Ok(None);
         }
 
-        let embedding = self
-            .runtime
-            .block_on(
-                embedding_provider
-                    .embed_text_with_purpose(canonical_json, EmbeddingPurpose::Document),
-            )
-            .with_context(|| format!("failed to generate embedding for {symbol_id}"))?;
-
-        if embedding.is_empty() {
-            return Ok(None);
-        }
-
-        let updated_at = unix_timestamp_secs();
-        Ok(Some(SymbolEmbeddingRecord {
-            symbol_id: symbol_id.to_owned(),
-            sir_hash: sir_hash_value.to_owned(),
+        Ok(Some(EmbeddingNeeded {
             provider: provider_name.to_owned(),
             model: model_name.to_owned(),
-            embedding,
-            updated_at,
         }))
     }
 
-    /// Flush a batch of embedding records to the vector store.
-    pub(crate) fn flush_embedding_batch(&self, records: Vec<SymbolEmbeddingRecord>) -> Result<()> {
-        if records.is_empty() {
-            return Ok(());
-        }
+    /// Batch-embed multiple texts in a single provider call.
+    pub(crate) fn batch_embed_texts(
+        &self,
+        texts: &[&str],
+        purpose: EmbeddingPurpose,
+    ) -> Result<Vec<Vec<f32>>> {
+        let Some(embedding_provider) = self.embedding_provider.as_ref() else {
+            return Ok(vec![Vec::new(); texts.len()]);
+        };
         self.runtime
-            .block_on(self.vector_store.upsert_embedding_batch(records))
-            .context("failed to flush embedding batch to vector store")
+            .block_on(embedding_provider.embed_texts_with_purpose(texts, purpose))
+            .context("batch embedding request failed")
+    }
+
+    /// Build `SymbolEmbeddingRecord`s from pre-computed embedding vectors.
+    pub(crate) fn build_embedding_records(
+        items: &[EmbeddingInput],
+        embeddings: Vec<Vec<f32>>,
+    ) -> Vec<SymbolEmbeddingRecord> {
+        let updated_at = unix_timestamp_secs();
+        items
+            .iter()
+            .zip(embeddings)
+            .filter(|(_, emb)| !emb.is_empty())
+            .map(|(item, embedding)| SymbolEmbeddingRecord {
+                symbol_id: item.symbol_id.clone(),
+                sir_hash: item.sir_hash.clone(),
+                provider: item.provider.clone(),
+                model: item.model.clone(),
+                embedding,
+                updated_at,
+            })
+            .collect()
     }
 
     pub(crate) fn refresh_embedding_if_needed(

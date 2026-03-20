@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use aether_config::{AetherConfig, InferenceProviderKind};
 use aether_core::{Language, Position, SourceRange, Symbol, SymbolKind};
+use aether_infer::EmbeddingPurpose;
 use aether_sir::SirAnnotation;
 use aether_store::{
     SirFingerprintHistoryRecord, SirMetaRecord, SirStateStore, SqliteStore, SymbolEmbeddingRecord,
@@ -12,18 +14,34 @@ use anyhow::{Context, Result, anyhow};
 use crate::batch::hash::diff_prompt_hashes;
 use crate::batch::{BatchProvider, BatchResultLine, PassConfig};
 use crate::continuous::cosine_distance_from_embeddings;
-use crate::sir_pipeline::{SirPipeline, UpsertSirIntentPayload};
+use crate::sir_pipeline::{EmbeddingInput, SirPipeline, UpsertSirIntentPayload};
 
 /// Number of embedding records to buffer before flushing to the vector store.
 /// Keeps memory modest (~600KB for 3072-dim f32 vectors) while reducing LanceDB
 /// merge_insert calls from one-per-symbol to one-per-batch.
 const INGEST_VECTOR_BATCH_SIZE: usize = 50;
 
+/// Number of symbols to collect before making a single batch embedding API call.
+/// Matches the Gemini `batchEmbedContents` limit of 100 texts per request.
+const EMBED_BATCH_SIZE: usize = 100;
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct IngestSummary {
     pub processed: usize,
     pub skipped: usize,
     pub fingerprint_rows: usize,
+}
+
+/// Per-symbol state collected during Phase 1 (parse + persist SIR).
+struct PreparedSymbol {
+    symbol_id: String,
+    prompt_hash: String,
+    canonical_json: String,
+    sir_hash: String,
+    previous_meta: Option<SirMetaRecord>,
+    previous_embedding: Option<SymbolEmbeddingRecord>,
+    /// Index into the batch embedding input vec, or `None` if embedding unchanged.
+    embedding_slot: Option<usize>,
 }
 
 /// Map batch provider name to the closest `InferenceProviderKind`.
@@ -58,6 +76,9 @@ pub(crate) fn ingest_results(
     let mut embedding_buffer: Vec<SymbolEmbeddingRecord> =
         Vec::with_capacity(INGEST_VECTOR_BATCH_SIZE);
 
+    // Collect raw lines into a buffer so we can process them in chunks.
+    let mut line_chunk: Vec<String> = Vec::with_capacity(EMBED_BATCH_SIZE);
+
     for (line_number, line) in reader.lines().enumerate() {
         let line = match line {
             Ok(line) => line,
@@ -71,41 +92,40 @@ pub(crate) fn ingest_results(
             continue;
         }
 
-        match ingest_result_line(
-            &pipeline,
-            store,
-            pass_config,
-            line.as_str(),
-            config,
-            provider,
-            provider_name,
-            &mut embedding_buffer,
-        ) {
-            Ok(wrote_fingerprint) => {
-                summary.processed += 1;
-                if wrote_fingerprint {
-                    summary.fingerprint_rows += 1;
-                }
-            }
-            Err(err) => {
-                summary.skipped += 1;
-                tracing::warn!(
-                    line_number = line_number + 1,
-                    error = %err,
-                    "skipping invalid batch result line"
-                );
-            }
-        }
+        line_chunk.push(line);
 
-        if embedding_buffer.len() >= INGEST_VECTOR_BATCH_SIZE {
-            let batch = std::mem::take(&mut embedding_buffer);
-            pipeline
-                .flush_embedding_batch(batch)
-                .context("failed to flush embedding batch during ingest")?;
+        if line_chunk.len() >= EMBED_BATCH_SIZE {
+            process_chunk(
+                &pipeline,
+                store,
+                pass_config,
+                config,
+                provider,
+                provider_name,
+                &line_chunk,
+                &mut summary,
+                &mut embedding_buffer,
+            )?;
+            line_chunk.clear();
         }
     }
 
-    // Flush any remaining buffered embeddings.
+    // Process any remaining lines.
+    if !line_chunk.is_empty() {
+        process_chunk(
+            &pipeline,
+            store,
+            pass_config,
+            config,
+            provider,
+            provider_name,
+            &line_chunk,
+            &mut summary,
+            &mut embedding_buffer,
+        )?;
+    }
+
+    // Flush any remaining buffered embeddings to vector store.
     if !embedding_buffer.is_empty() {
         pipeline
             .flush_embedding_batch(embedding_buffer)
@@ -115,18 +135,161 @@ pub(crate) fn ingest_results(
     Ok(summary)
 }
 
+/// Process a chunk of JSONL lines using batched embedding generation.
+///
+/// Phase 1: Parse + persist SIR for each line, determine which need embeddings.
+/// Phase 2: Batch-embed all texts that need new embeddings in a single API call.
+/// Phase 3: Finalize each symbol (contract verification, fingerprint, buffer).
 #[allow(clippy::too_many_arguments)]
-fn ingest_result_line(
+fn process_chunk(
+    pipeline: &SirPipeline,
+    store: &SqliteStore,
+    pass_config: &PassConfig,
+    config: &AetherConfig,
+    provider: &dyn BatchProvider,
+    provider_name: &str,
+    lines: &[String],
+    summary: &mut IngestSummary,
+    embedding_buffer: &mut Vec<SymbolEmbeddingRecord>,
+) -> Result<()> {
+    let mut prepared: Vec<PreparedSymbol> = Vec::with_capacity(lines.len());
+    let mut embed_inputs: Vec<EmbeddingInput> = Vec::new();
+
+    // Phase 1: Parse, persist SIR, determine if embedding needed.
+    for raw_line in lines {
+        match prepare_symbol(
+            pipeline,
+            store,
+            pass_config,
+            raw_line,
+            provider,
+            provider_name,
+        ) {
+            Ok(mut prep) => {
+                match pipeline.check_embedding_needed(&prep.symbol_id, &prep.sir_hash, None) {
+                    Ok(Some(needed)) => {
+                        prep.embedding_slot = Some(embed_inputs.len());
+                        embed_inputs.push(EmbeddingInput {
+                            symbol_id: prep.symbol_id.clone(),
+                            sir_hash: prep.sir_hash.clone(),
+                            canonical_json: prep.canonical_json.clone(),
+                            provider: needed.provider,
+                            model: needed.model,
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            symbol_id = %prep.symbol_id,
+                            error = %err,
+                            "failed to check embedding status; skipping embedding"
+                        );
+                    }
+                }
+                prepared.push(prep);
+            }
+            Err(err) => {
+                summary.skipped += 1;
+                tracing::warn!(error = %err, "skipping invalid batch result line");
+            }
+        }
+    }
+
+    // Phase 2: Batch-embed all texts that need new embeddings.
+    let texts: Vec<&str> = embed_inputs
+        .iter()
+        .map(|input| input.canonical_json.as_str())
+        .collect();
+    let embedding_records = if texts.is_empty() {
+        Vec::new()
+    } else {
+        let embeddings = pipeline
+            .batch_embed_texts(&texts, EmbeddingPurpose::Document)
+            .context("batch embedding failed during ingest")?;
+        SirPipeline::build_embedding_records(&embed_inputs, embeddings)
+    };
+
+    // Build lookup from symbol_id to the newly generated embedding record.
+    let record_map: HashMap<&str, &SymbolEmbeddingRecord> = embedding_records
+        .iter()
+        .map(|r| (r.symbol_id.as_str(), r))
+        .collect();
+
+    // Phase 3: Finalize each symbol.
+    for prep in &prepared {
+        let generated = record_map.get(prep.symbol_id.as_str()).copied();
+        let current_embedding = generated
+            .cloned()
+            .or_else(|| prep.previous_embedding.clone());
+
+        // Contract verification (non-fatal).
+        if let Some(ref contracts_config) = config.contracts
+            && contracts_config.enabled
+            && let Err(err) = crate::contracts::verify_symbol_contracts(
+                store,
+                &prep.symbol_id,
+                prep.canonical_json.as_str(),
+                current_embedding.as_ref().map(|e| e.embedding.as_slice()),
+                config,
+                pipeline.workspace_root(),
+            )
+        {
+            tracing::warn!(
+                symbol_id = %prep.symbol_id,
+                error = %err,
+                "Contract verification failed during batch ingest"
+            );
+        }
+
+        write_fingerprint_row(
+            store,
+            &prep.symbol_id,
+            &prep.prompt_hash,
+            prep.previous_meta
+                .as_ref()
+                .and_then(|record| record.prompt_hash.as_deref()),
+            format!("batch_{}", pass_config.pass.as_str()).as_str(),
+            pass_config.model.as_str(),
+            pass_config.pass.as_str(),
+            cosine_distance_from_embeddings(
+                prep.previous_embedding.as_ref(),
+                current_embedding.as_ref(),
+            ),
+        )
+        .with_context(|| format!("failed to write fingerprint row for {}", prep.symbol_id))?;
+
+        summary.processed += 1;
+        summary.fingerprint_rows += 1;
+    }
+
+    // Buffer new embedding records for vector store flush.
+    for record in embedding_records {
+        embedding_buffer.push(record);
+    }
+
+    // Flush to vector store if buffer exceeds threshold.
+    if embedding_buffer.len() >= INGEST_VECTOR_BATCH_SIZE {
+        let batch = std::mem::take(embedding_buffer);
+        pipeline
+            .flush_embedding_batch(batch)
+            .context("failed to flush embedding batch during ingest")?;
+    }
+
+    Ok(())
+}
+
+/// Phase 1: Parse a single batch result line and persist SIR to SQLite.
+///
+/// Does everything the old `ingest_result_line` did except embedding generation,
+/// contract verification, and fingerprint writing.
+fn prepare_symbol(
     pipeline: &SirPipeline,
     store: &SqliteStore,
     pass_config: &PassConfig,
     raw_line: &str,
-    config: &AetherConfig,
     provider: &dyn BatchProvider,
     provider_name: &str,
-    embedding_buffer: &mut Vec<SymbolEmbeddingRecord>,
-) -> Result<bool> {
-    // Use provider-specific parsing to extract key + text.
+) -> Result<PreparedSymbol> {
     let (symbol_id, prompt_hash, sir_json) = match provider.parse_result_line(raw_line)? {
         BatchResultLine::Success { key, text } => {
             let (sid, phash) = parse_key(&key)?;
@@ -174,62 +337,15 @@ fn ingest_result_line(
         })
         .with_context(|| format!("failed to persist prompt_hash for {symbol_id}"))?;
 
-    // Generate embedding in memory without storing — will be flushed in batch.
-    let generated = pipeline
-        .generate_embedding_record(
-            &symbol_id,
-            sir_hash_value.as_str(),
-            canonical_json.as_str(),
-            None,
-        )
-        .with_context(|| format!("failed to generate embedding for {symbol_id}"))?;
-
-    // If we just generated a new embedding, use it; otherwise the embedding is
-    // unchanged so the previous embedding IS the current one.
-    let current_embedding = generated
-        .as_ref()
-        .cloned()
-        .or_else(|| previous_embedding.clone());
-
-    // Contract verification (non-fatal)
-    if let Some(ref contracts_config) = config.contracts
-        && contracts_config.enabled
-        && let Err(err) = crate::contracts::verify_symbol_contracts(
-            store,
-            &symbol_id,
-            canonical_json.as_str(),
-            current_embedding.as_ref().map(|e| e.embedding.as_slice()),
-            config,
-            pipeline.workspace_root(),
-        )
-    {
-        tracing::warn!(
-            symbol_id = %symbol_id,
-            error = %err,
-            "Contract verification failed during batch ingest"
-        );
-    }
-
-    write_fingerprint_row(
-        store,
-        &symbol_id,
-        &prompt_hash,
-        previous_meta
-            .as_ref()
-            .and_then(|record| record.prompt_hash.as_deref()),
-        format!("batch_{}", pass_config.pass.as_str()).as_str(),
-        pass_config.model.as_str(),
-        pass_config.pass.as_str(),
-        cosine_distance_from_embeddings(previous_embedding.as_ref(), current_embedding.as_ref()),
-    )
-    .with_context(|| format!("failed to write fingerprint row for {symbol_id}"))?;
-
-    // Buffer new embedding for batch flush.
-    if let Some(record) = generated {
-        embedding_buffer.push(record);
-    }
-
-    Ok(true)
+    Ok(PreparedSymbol {
+        symbol_id,
+        prompt_hash,
+        canonical_json,
+        sir_hash: sir_hash_value,
+        previous_meta,
+        previous_embedding,
+        embedding_slot: None,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
