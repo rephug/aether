@@ -31,6 +31,13 @@ impl VectorStore for SqliteVectorStore {
         self.store.upsert_symbol_embedding(record)
     }
 
+    async fn upsert_embedding_batch(&self, records: Vec<VectorRecord>) -> Result<(), StoreError> {
+        for record in records {
+            self.store.upsert_symbol_embedding(record)?;
+        }
+        Ok(())
+    }
+
     async fn get_embedding_meta(
         &self,
         symbol_id: &str,
