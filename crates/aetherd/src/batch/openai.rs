@@ -7,6 +7,7 @@ use serde_json::json;
 use super::{BatchPollStatus, BatchProvider, BatchResultLine};
 
 const OPENAI_API_BASE: &str = "https://api.openai.com/v1";
+const OPENAI_RESPONSES_ENDPOINT: &str = "/v1/responses";
 
 pub(crate) struct OpenAiBatchProvider {
     client: reqwest::Client,
@@ -49,22 +50,26 @@ impl BatchProvider for OpenAiBatchProvider {
     ) -> Result<String> {
         let mut body = json!({
             "model": model,
-            "messages": [
-                { "role": "system", "content": system_prompt },
+            "instructions": system_prompt,
+            "input": [
                 { "role": "user", "content": user_prompt }
             ],
-            "temperature": 0.0,
-            "response_format": { "type": "json_object" }
+            "text": {
+                "format": { "type": "json_object" }
+            },
+            "store": false
         });
 
         if let Some(effort) = Self::openai_reasoning_effort(thinking) {
             body["reasoning"] = json!({ "effort": effort });
+        } else {
+            body["temperature"] = json!(0.0);
         }
 
         let line = json!({
             "custom_id": key,
             "method": "POST",
-            "url": "/v1/chat/completions",
+            "url": OPENAI_RESPONSES_ENDPOINT,
             "body": body
         });
 
@@ -132,7 +137,7 @@ impl BatchProvider for OpenAiBatchProvider {
         // --- Phase 2: Create batch ---
         let create_body = json!({
             "input_file_id": file_id,
-            "endpoint": "/v1/chat/completions",
+            "endpoint": OPENAI_RESPONSES_ENDPOINT,
             "completion_window": "24h"
         });
 
@@ -299,11 +304,11 @@ impl BatchProvider for OpenAiBatchProvider {
         let text = response
             .body
             .as_ref()
-            .and_then(|b| b.pointer("/choices/0/message/content"))
+            .and_then(Self::extract_text_from_body)
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|t| !t.is_empty())
-            .ok_or_else(|| anyhow!("OpenAI response line missing message content"))?;
+            .ok_or_else(|| anyhow!("OpenAI response line missing output text"))?;
 
         Ok(BatchResultLine::Success {
             key: parsed.custom_id,
@@ -317,6 +322,37 @@ impl BatchProvider for OpenAiBatchProvider {
 }
 
 impl OpenAiBatchProvider {
+    fn extract_text_from_body(body: &serde_json::Value) -> Option<&serde_json::Value> {
+        Self::extract_responses_output_text(body)
+            .or_else(|| body.pointer("/choices/0/message/content"))
+    }
+
+    fn extract_responses_output_text(body: &serde_json::Value) -> Option<&serde_json::Value> {
+        body.get("output")
+            .and_then(|output| output.as_array())
+            .and_then(|output| {
+                output.iter().find_map(|item| {
+                    if item.get("type").and_then(|value| value.as_str()) != Some("message") {
+                        return None;
+                    }
+
+                    item.get("content")
+                        .and_then(|content| content.as_array())
+                        .and_then(|content| {
+                            content.iter().find_map(|part| {
+                                if part.get("type").and_then(|value| value.as_str())
+                                    == Some("output_text")
+                                {
+                                    part.get("text")
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                })
+            })
+    }
+
     async fn download_file(&self, file_id: &str, dest: &Path) -> Result<()> {
         let resp = self
             .client
@@ -392,15 +428,13 @@ mod tests {
 
         assert_eq!(json["custom_id"], "sym1|hash1");
         assert_eq!(json["method"], "POST");
-        assert_eq!(json["url"], "/v1/chat/completions");
+        assert_eq!(json["url"], OPENAI_RESPONSES_ENDPOINT);
         assert_eq!(json["body"]["model"], "gpt-4o");
-        assert_eq!(json["body"]["messages"][0]["role"], "system");
-        assert_eq!(
-            json["body"]["messages"][0]["content"],
-            "System instructions."
-        );
-        assert_eq!(json["body"]["messages"][1]["role"], "user");
-        assert_eq!(json["body"]["messages"][1]["content"], "User content.");
+        assert_eq!(json["body"]["instructions"], "System instructions.");
+        assert_eq!(json["body"]["input"][0]["role"], "user");
+        assert_eq!(json["body"]["input"][0]["content"], "User content.");
+        assert_eq!(json["body"]["text"]["format"]["type"], "json_object");
+        assert_eq!(json["body"]["store"], false);
         assert_eq!(json["body"]["temperature"], 0.0);
         assert!(json["body"].get("reasoning").is_none());
     }
@@ -414,27 +448,61 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&line).unwrap();
 
         assert_eq!(json["body"]["reasoning"]["effort"], "medium");
+        assert!(json["body"].get("temperature").is_none());
     }
 
     #[test]
     fn format_request_omits_reasoning_for_none() {
         let p = provider();
-        let line = p
-            .format_request("sym3|hash3", "Sys.", "Usr.", "gpt-4o", "none")
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_str(&line).unwrap();
+        for level in ["none", "off", ""] {
+            let line = p
+                .format_request("sym3|hash3", "Sys.", "Usr.", "gpt-4o", level)
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_str(&line).unwrap();
 
-        assert!(json["body"].get("reasoning").is_none());
+            assert!(
+                json["body"].get("reasoning").is_none(),
+                "reasoning should be absent for level '{}'",
+                level
+            );
+            assert_eq!(json["body"]["temperature"], 0.0);
+        }
     }
 
     #[test]
-    fn parse_result_line_success() {
+    fn parse_result_line_success_responses_api() {
         let p = provider();
-        let input = r#"{"custom_id":"sym1|hash1","response":{"status_code":200,"body":{"choices":[{"message":{"content":"{\"intent\":\"test\"}"}}]}}}"#;
+        let input = r#"{"custom_id":"sym1|hash1","response":{"status_code":200,"body":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"intent\":\"test\"}"}]}]}}}"#;
         match p.parse_result_line(input).unwrap() {
             BatchResultLine::Success { key, text } => {
                 assert_eq!(key, "sym1|hash1");
                 assert_eq!(text, r#"{"intent":"test"}"#);
+            }
+            BatchResultLine::Error { .. } => panic!("expected success"),
+        }
+    }
+
+    #[test]
+    fn parse_result_line_success_responses_api_skips_reasoning_blocks() {
+        let p = provider();
+        let input = r#"{"custom_id":"sym1|hash1","response":{"status_code":200,"body":{"output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"thinking"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"intent\":\"reasoned\"}"}]}]}}}"#;
+        match p.parse_result_line(input).unwrap() {
+            BatchResultLine::Success { key, text } => {
+                assert_eq!(key, "sym1|hash1");
+                assert_eq!(text, r#"{"intent":"reasoned"}"#);
+            }
+            BatchResultLine::Error { .. } => panic!("expected success"),
+        }
+    }
+
+    #[test]
+    fn parse_result_line_success_legacy_chat_completions() {
+        let p = provider();
+        let input = r#"{"custom_id":"sym1|hash1","response":{"status_code":200,"body":{"choices":[{"message":{"content":"{\"intent\":\"legacy\"}"}}]}}}"#;
+        match p.parse_result_line(input).unwrap() {
+            BatchResultLine::Success { key, text } => {
+                assert_eq!(key, "sym1|hash1");
+                assert_eq!(text, r#"{"intent":"legacy"}"#);
             }
             BatchResultLine::Error { .. } => panic!("expected success"),
         }
