@@ -40,7 +40,7 @@ struct PreparedSymbol {
     sir_hash: String,
     previous_meta: Option<SirMetaRecord>,
     previous_embedding: Option<SymbolEmbeddingRecord>,
-    /// Index into the batch embedding input vec, or `None` if embedding unchanged.
+    /// Index into the batch embedding input vec, or `None` if embedding is disabled.
     embedding_slot: Option<usize>,
 }
 
@@ -154,8 +154,9 @@ fn process_chunk(
 ) -> Result<()> {
     let mut prepared: Vec<PreparedSymbol> = Vec::with_capacity(lines.len());
     let mut embed_inputs: Vec<EmbeddingInput> = Vec::new();
+    let embedding_identity = pipeline.embedding_identity();
 
-    // Phase 1: Parse, persist SIR, determine if embedding needed.
+    // Phase 1: Parse, persist SIR, queue embeddings for regeneration.
     for raw_line in lines {
         match prepare_symbol(
             pipeline,
@@ -166,25 +167,15 @@ fn process_chunk(
             provider_name,
         ) {
             Ok(mut prep) => {
-                match pipeline.check_embedding_needed(&prep.symbol_id, &prep.sir_hash, None) {
-                    Ok(Some(needed)) => {
-                        prep.embedding_slot = Some(embed_inputs.len());
-                        embed_inputs.push(EmbeddingInput {
-                            symbol_id: prep.symbol_id.clone(),
-                            sir_hash: prep.sir_hash.clone(),
-                            canonical_json: prep.canonical_json.clone(),
-                            provider: needed.provider,
-                            model: needed.model,
-                        });
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        tracing::warn!(
-                            symbol_id = %prep.symbol_id,
-                            error = %err,
-                            "failed to check embedding status; skipping embedding"
-                        );
-                    }
+                if let Some((provider, model)) = embedding_identity {
+                    prep.embedding_slot = Some(embed_inputs.len());
+                    embed_inputs.push(EmbeddingInput {
+                        symbol_id: prep.symbol_id.clone(),
+                        sir_hash: prep.sir_hash.clone(),
+                        canonical_json: prep.canonical_json.clone(),
+                        provider: provider.to_owned(),
+                        model: model.to_owned(),
+                    });
                 }
                 prepared.push(prep);
             }
