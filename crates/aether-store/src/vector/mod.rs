@@ -52,6 +52,7 @@ pub struct ProjectNoteVectorSearchResult {
 #[async_trait]
 pub trait VectorStore: Send + Sync {
     async fn upsert_embedding(&self, record: VectorRecord) -> Result<(), StoreError>;
+    async fn upsert_embedding_batch(&self, records: Vec<VectorRecord>) -> Result<(), StoreError>;
     async fn get_embedding_meta(
         &self,
         symbol_id: &str,

@@ -1843,6 +1843,81 @@ impl SirPipeline {
         Ok(())
     }
 
+    /// Generate an embedding record for a symbol without storing it.
+    ///
+    /// Returns `None` if no embedding provider is configured, the embedding is
+    /// already up-to-date (matching sir_hash + provider + model), or the
+    /// generated embedding is empty.
+    pub(crate) fn generate_embedding_record(
+        &self,
+        symbol_id: &str,
+        sir_hash_value: &str,
+        canonical_json: &str,
+        prefetched_meta: Option<&VectorEmbeddingMetaRecord>,
+    ) -> Result<Option<SymbolEmbeddingRecord>> {
+        let Some(embedding_provider) = self.embedding_provider.as_ref() else {
+            return Ok(None);
+        };
+
+        let provider_name = self
+            .embedding_provider_name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("mock");
+        let model_name = self
+            .embedding_model_name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("mock");
+
+        let existing_meta = match prefetched_meta {
+            Some(meta) => Some(meta.clone()),
+            None => self
+                .runtime
+                .block_on(self.vector_store.get_embedding_meta(symbol_id))
+                .with_context(|| format!("failed to read embedding metadata for {symbol_id}"))?,
+        };
+        if let Some(existing_meta) = existing_meta
+            && existing_meta.sir_hash == sir_hash_value
+            && existing_meta.provider == provider_name
+            && existing_meta.model == model_name
+        {
+            return Ok(None);
+        }
+
+        let embedding = self
+            .runtime
+            .block_on(
+                embedding_provider
+                    .embed_text_with_purpose(canonical_json, EmbeddingPurpose::Document),
+            )
+            .with_context(|| format!("failed to generate embedding for {symbol_id}"))?;
+
+        if embedding.is_empty() {
+            return Ok(None);
+        }
+
+        let updated_at = unix_timestamp_secs();
+        Ok(Some(SymbolEmbeddingRecord {
+            symbol_id: symbol_id.to_owned(),
+            sir_hash: sir_hash_value.to_owned(),
+            provider: provider_name.to_owned(),
+            model: model_name.to_owned(),
+            embedding,
+            updated_at,
+        }))
+    }
+
+    /// Flush a batch of embedding records to the vector store.
+    pub(crate) fn flush_embedding_batch(&self, records: Vec<SymbolEmbeddingRecord>) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        self.runtime
+            .block_on(self.vector_store.upsert_embedding_batch(records))
+            .context("failed to flush embedding batch to vector store")
+    }
+
     pub(crate) fn refresh_embedding_if_needed(
         &self,
         symbol_id: &str,

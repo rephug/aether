@@ -383,6 +383,40 @@ impl VectorStore for LanceVectorStore {
             .await
     }
 
+    async fn upsert_embedding_batch(&self, records: Vec<VectorRecord>) -> Result<(), StoreError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        self.migrate_from_sqlite_if_needed().await?;
+        let connection = self.connect().await?;
+
+        // Group records by table name (provider + model + dim) so each batch
+        // targets a single LanceDB table with one merge_insert call.
+        let mut by_table = std::collections::BTreeMap::<String, Vec<VectorRecord>>::new();
+        for record in records {
+            if record.embedding.is_empty() {
+                continue;
+            }
+            let table = table_name_for(
+                record.provider.as_str(),
+                record.model.as_str(),
+                record.embedding.len() as i32,
+            );
+            by_table.entry(table).or_default().push(record);
+        }
+
+        for (table_name, table_records) in by_table {
+            self.upsert_embedding_batch_with_connection(
+                &connection,
+                table_name.as_str(),
+                table_records.as_slice(),
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
     async fn get_embedding_meta(
         &self,
         symbol_id: &str,

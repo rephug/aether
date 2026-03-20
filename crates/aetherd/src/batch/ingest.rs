@@ -4,13 +4,20 @@ use std::path::Path;
 use aether_config::{AetherConfig, InferenceProviderKind};
 use aether_core::{Language, Position, SourceRange, Symbol, SymbolKind};
 use aether_sir::SirAnnotation;
-use aether_store::{SirFingerprintHistoryRecord, SirMetaRecord, SirStateStore, SqliteStore};
+use aether_store::{
+    SirFingerprintHistoryRecord, SirMetaRecord, SirStateStore, SqliteStore, SymbolEmbeddingRecord,
+};
 use anyhow::{Context, Result, anyhow};
 
 use crate::batch::hash::diff_prompt_hashes;
 use crate::batch::{BatchProvider, BatchResultLine, PassConfig};
 use crate::continuous::cosine_distance_from_embeddings;
 use crate::sir_pipeline::{SirPipeline, UpsertSirIntentPayload};
+
+/// Number of embedding records to buffer before flushing to the vector store.
+/// Keeps memory modest (~600KB for 3072-dim f32 vectors) while reducing LanceDB
+/// merge_insert calls from one-per-symbol to one-per-batch.
+const INGEST_VECTOR_BATCH_SIZE: usize = 50;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct IngestSummary {
@@ -48,6 +55,9 @@ pub(crate) fn ingest_results(
         .context("failed to initialize batch ingest pipeline")?;
 
     let mut summary = IngestSummary::default();
+    let mut embedding_buffer: Vec<SymbolEmbeddingRecord> =
+        Vec::with_capacity(INGEST_VECTOR_BATCH_SIZE);
+
     for (line_number, line) in reader.lines().enumerate() {
         let line = match line {
             Ok(line) => line,
@@ -69,6 +79,7 @@ pub(crate) fn ingest_results(
             config,
             provider,
             provider_name,
+            &mut embedding_buffer,
         ) {
             Ok(wrote_fingerprint) => {
                 summary.processed += 1;
@@ -85,6 +96,20 @@ pub(crate) fn ingest_results(
                 );
             }
         }
+
+        if embedding_buffer.len() >= INGEST_VECTOR_BATCH_SIZE {
+            let batch = std::mem::take(&mut embedding_buffer);
+            pipeline
+                .flush_embedding_batch(batch)
+                .context("failed to flush embedding batch during ingest")?;
+        }
+    }
+
+    // Flush any remaining buffered embeddings.
+    if !embedding_buffer.is_empty() {
+        pipeline
+            .flush_embedding_batch(embedding_buffer)
+            .context("failed to flush final embedding batch during ingest")?;
     }
 
     Ok(summary)
@@ -99,6 +124,7 @@ fn ingest_result_line(
     config: &AetherConfig,
     provider: &dyn BatchProvider,
     provider_name: &str,
+    embedding_buffer: &mut Vec<SymbolEmbeddingRecord>,
 ) -> Result<bool> {
     // Use provider-specific parsing to extract key + text.
     let (symbol_id, prompt_hash, sir_json) = match provider.parse_result_line(raw_line)? {
@@ -148,19 +174,22 @@ fn ingest_result_line(
         })
         .with_context(|| format!("failed to persist prompt_hash for {symbol_id}"))?;
 
-    pipeline
-        .refresh_embedding_if_needed(
+    // Generate embedding in memory without storing — will be flushed in batch.
+    let generated = pipeline
+        .generate_embedding_record(
             &symbol_id,
             sir_hash_value.as_str(),
             canonical_json.as_str(),
-            false,
-            &mut std::io::sink(),
             None,
         )
-        .with_context(|| format!("failed to refresh embedding for {symbol_id}"))?;
-    let current_embedding = pipeline
-        .load_symbol_embedding(&symbol_id)
-        .with_context(|| format!("failed to read refreshed embedding for {symbol_id}"))?;
+        .with_context(|| format!("failed to generate embedding for {symbol_id}"))?;
+
+    // If we just generated a new embedding, use it; otherwise the embedding is
+    // unchanged so the previous embedding IS the current one.
+    let current_embedding = generated
+        .as_ref()
+        .cloned()
+        .or_else(|| previous_embedding.clone());
 
     // Contract verification (non-fatal)
     if let Some(ref contracts_config) = config.contracts
@@ -194,6 +223,11 @@ fn ingest_result_line(
         cosine_distance_from_embeddings(previous_embedding.as_ref(), current_embedding.as_ref()),
     )
     .with_context(|| format!("failed to write fingerprint row for {symbol_id}"))?;
+
+    // Buffer new embedding for batch flush.
+    if let Some(record) = generated {
+        embedding_buffer.push(record);
+    }
 
     Ok(true)
 }
