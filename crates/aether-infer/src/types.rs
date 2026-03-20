@@ -191,6 +191,23 @@ pub trait EmbeddingProvider: Send + Sync {
     ) -> Result<Vec<f32>, InferError> {
         self.embed_text(text).await
     }
+
+    /// Embed multiple texts in a single batch call.
+    ///
+    /// The returned `Vec` has the same length and order as `texts`.
+    /// The default implementation calls `embed_text_with_purpose` sequentially;
+    /// providers with native batch APIs should override for efficiency.
+    async fn embed_texts_with_purpose(
+        &self,
+        texts: &[&str],
+        purpose: EmbeddingPurpose,
+    ) -> Result<Vec<Vec<f32>>, InferError> {
+        let mut results = Vec::with_capacity(texts.len());
+        for text in texts {
+            results.push(self.embed_text_with_purpose(text, purpose).await?);
+        }
+        Ok(results)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

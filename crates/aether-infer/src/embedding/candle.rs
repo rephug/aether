@@ -14,7 +14,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
-use crate::types::{EmbeddingProvider, InferError};
+use crate::types::{EmbeddingProvider, EmbeddingPurpose, InferError};
 
 pub const CANDLE_PROVIDER_NAME: &str = "candle";
 pub const CANDLE_MODEL_REPO: &str = "Qwen/Qwen3-Embedding-0.6B";
@@ -386,6 +386,26 @@ impl EmbeddingProvider for CandleEmbeddingProvider {
         Ok(output
             .pop()
             .unwrap_or_else(|| vec![0.0; CANDLE_EMBEDDING_DIM]))
+    }
+
+    async fn embed_texts_with_purpose(
+        &self,
+        texts: &[&str],
+        _purpose: EmbeddingPurpose,
+    ) -> Result<Vec<Vec<f32>>, InferError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let provider = self.clone();
+        let owned: Vec<String> = texts.iter().map(|t| (*t).to_owned()).collect();
+        tokio::task::spawn_blocking(move || {
+            let loaded = Arc::clone(provider.ensure_loaded()?);
+            Self::embed_texts_with_loaded(loaded.as_ref(), &owned)
+        })
+        .await
+        .map_err(|err| {
+            InferError::ModelUnavailable(format!("candle batch embedding join failed: {err}"))
+        })?
     }
 }
 
