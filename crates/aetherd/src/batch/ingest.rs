@@ -300,9 +300,9 @@ fn prepare_symbol(
     let previous_meta = store
         .get_sir_meta(&symbol_id)
         .with_context(|| format!("failed to read previous SIR metadata for {symbol_id}"))?;
-    let previous_embedding = pipeline
-        .load_symbol_embedding(&symbol_id)
-        .with_context(|| format!("failed to read previous embedding vector for {symbol_id}"))?;
+    // Skip per-symbol LanceDB lookup during batch ingest — previous
+    // embedding is only used for delta_sem in fingerprint rows.
+    let previous_embedding: Option<SymbolEmbeddingRecord> = None;
 
     let provider_kind = provider_kind_from_name(provider_name);
     let payload = UpsertSirIntentPayload {
