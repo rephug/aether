@@ -7,6 +7,8 @@ use super::{BatchPollStatus, BatchProvider, BatchResultLine};
 
 const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com/v1";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+const ANTHROPIC_BETA_EXTENDED_CACHE_TTL: &str = "extended-cache-ttl-2025-04-11";
+const ANTHROPIC_CACHE_TTL_SECS: u64 = 3600;
 
 /// Maximum requests per Anthropic batch job.
 const MAX_REQUESTS_PER_BATCH: usize = 10_000;
@@ -39,6 +41,13 @@ impl AnthropicBatchProvider {
             _ => None,
         }
     }
+
+    fn with_anthropic_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("anthropic-beta", ANTHROPIC_BETA_EXTENDED_CACHE_TTL)
+    }
 }
 
 #[async_trait::async_trait]
@@ -59,7 +68,7 @@ impl BatchProvider for AnthropicBatchProvider {
 
         // System prompt uses array-of-blocks form with cache_control for prompt caching.
         // Every request in the batch shares the same system prompt, so Anthropic caches
-        // it after the first read — subsequent reads cost 90% less.
+        // it after the first read; a 1-hour TTL keeps the cache warm for long-running batches.
         let mut params = json!({
             "model": model,
             "max_tokens": max_tokens,
@@ -67,7 +76,10 @@ impl BatchProvider for AnthropicBatchProvider {
                 {
                     "type": "text",
                     "text": system_prompt,
-                    "cache_control": { "type": "ephemeral" }
+                    "cache_control": {
+                        "type": "ephemeral",
+                        "ttl": ANTHROPIC_CACHE_TTL_SECS
+                    }
                 }
             ],
             "messages": [
@@ -137,10 +149,10 @@ impl BatchProvider for AnthropicBatchProvider {
             let body = json!({ "requests": requests });
 
             let response = self
-                .client
-                .post(format!("{}/messages/batches", ANTHROPIC_API_BASE))
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", ANTHROPIC_VERSION)
+                .with_anthropic_headers(
+                    self.client
+                        .post(format!("{}/messages/batches", ANTHROPIC_API_BASE)),
+                )
                 .header("content-type", "application/json")
                 .json(&body)
                 .send()
@@ -191,13 +203,10 @@ impl BatchProvider for AnthropicBatchProvider {
 
         for batch_id in job_ids {
             let resp = self
-                .client
-                .get(format!(
+                .with_anthropic_headers(self.client.get(format!(
                     "{}/messages/batches/{}",
                     ANTHROPIC_API_BASE, batch_id
-                ))
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", ANTHROPIC_VERSION)
+                )))
                 .send()
                 .await
                 .with_context(|| format!("Anthropic batch poll failed for {}", batch_id))?;
@@ -282,13 +291,10 @@ impl BatchProvider for AnthropicBatchProvider {
 
         for batch_id in job_ids {
             let resp = self
-                .client
-                .get(format!(
+                .with_anthropic_headers(self.client.get(format!(
                     "{}/messages/batches/{}/results",
                     ANTHROPIC_API_BASE, batch_id
-                ))
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", ANTHROPIC_VERSION)
+                )))
                 .send()
                 .await
                 .with_context(|| {
@@ -416,6 +422,10 @@ mod tests {
         assert_eq!(system[0]["type"], "text");
         assert_eq!(system[0]["text"], "System instructions.");
         assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            system[0]["cache_control"]["ttl"].as_u64(),
+            Some(ANTHROPIC_CACHE_TTL_SECS)
+        );
 
         // User message
         assert_eq!(json["params"]["messages"][0]["role"], "user");
