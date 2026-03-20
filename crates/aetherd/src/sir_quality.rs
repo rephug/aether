@@ -77,7 +77,8 @@ pub fn run_compute_quality_command(workspace: &Path, args: ComputeQualityArgs) -
     conn.busy_timeout(Duration::from_secs(5))
         .context("failed to set SQLite busy timeout")?;
 
-    let report = compute_quality_for_connection(&mut conn, args.recompute)?;
+    let report = compute_quality_for_connection(&mut conn, args.recompute)
+        .context("failed to compute SIR quality scores")?;
     let mut out = std::io::stdout();
     write_report(&mut out, &report)
 }
