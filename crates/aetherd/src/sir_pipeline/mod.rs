@@ -1329,6 +1329,23 @@ impl SirPipeline {
         self.model_name.as_str()
     }
 
+    pub(crate) fn embedding_identity(&self) -> Option<(&str, &str)> {
+        self.embedding_provider.as_ref()?;
+
+        let provider_name = self
+            .embedding_provider_name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("mock");
+        let model_name = self
+            .embedding_model_name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("mock");
+
+        Some((provider_name, model_name))
+    }
+
     pub(crate) fn load_symbol_embedding(
         &self,
         symbol_id: &str,
@@ -1960,35 +1977,15 @@ impl SirPipeline {
         out: &mut dyn Write,
         prefetched_meta: Option<&VectorEmbeddingMetaRecord>,
     ) -> Result<bool> {
+        let Some(needed) =
+            self.check_embedding_needed(symbol_id, sir_hash_value, prefetched_meta)?
+        else {
+            return Ok(false);
+        };
+
         let Some(embedding_provider) = self.embedding_provider.as_ref() else {
             return Ok(false);
         };
-
-        let provider_name = self
-            .embedding_provider_name
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or("mock");
-        let model_name = self
-            .embedding_model_name
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or("mock");
-
-        let existing_meta = match prefetched_meta {
-            Some(meta) => Some(meta.clone()),
-            None => self
-                .runtime
-                .block_on(self.vector_store.get_embedding_meta(symbol_id))
-                .with_context(|| format!("failed to read embedding metadata for {symbol_id}"))?,
-        };
-        if let Some(existing_meta) = existing_meta
-            && existing_meta.sir_hash == sir_hash_value
-            && existing_meta.provider == provider_name
-            && existing_meta.model == model_name
-        {
-            return Ok(false);
-        }
 
         let embedding = self
             .runtime
@@ -2007,8 +2004,8 @@ impl SirPipeline {
             .block_on(self.vector_store.upsert_embedding(SymbolEmbeddingRecord {
                 symbol_id: symbol_id.to_owned(),
                 sir_hash: sir_hash_value.to_owned(),
-                provider: provider_name.to_owned(),
-                model: model_name.to_owned(),
+                provider: needed.provider.clone(),
+                model: needed.model.clone(),
                 embedding,
                 updated_at,
             }))
@@ -2017,7 +2014,8 @@ impl SirPipeline {
         if print_sir {
             writeln!(
                 out,
-                "EMBEDDING_STORED symbol_id={symbol_id} provider={provider_name} model={model_name}"
+                "EMBEDDING_STORED symbol_id={symbol_id} provider={} model={}",
+                needed.provider, needed.model
             )
             .context("failed to write embedding print line")?;
         }
