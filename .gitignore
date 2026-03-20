@@ -15,3 +15,5 @@
 tests/stress/reports/*.md
 tests/stress/reports/*.json
 tests/stress/repos/
+.mcp.json
+.claude/
