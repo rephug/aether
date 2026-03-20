@@ -4,17 +4,30 @@ use std::time::Duration;
 
 use aether_config::AetherConfig;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonSource {
+    HttpApi,
+    LockFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonInfo {
     pub port: u16,
     pub pid: u32,
     pub workspace: String,
     pub uptime_seconds: u64,
+    pub source: DaemonSource,
+}
+
+impl DaemonInfo {
+    pub fn has_http_api(&self) -> bool {
+        matches!(self.source, DaemonSource::HttpApi)
+    }
 }
 
 /// Check if a daemon is running for the given workspace by probing the configured
-/// dashboard port. Returns `Some(DaemonInfo)` if a daemon responds and is serving
-/// the same workspace, `None` otherwise. Falls back to checking the SurrealKV LOCK
-/// file when the dashboard feature is disabled or the HTTP probe fails to connect.
+/// dashboard port. Returns `Some(DaemonInfo)` if either a same-workspace daemon
+/// responds or another process holds the graph lock, `None` otherwise.
 pub fn detect_running_daemon(config: &AetherConfig, workspace: &Path) -> Option<DaemonInfo> {
     let port = config.dashboard.port;
     let addr = format!("127.0.0.1:{port}");
@@ -49,6 +62,7 @@ fn probe_daemon_http(addr: &str, port: u16, workspace: &Path) -> Option<DaemonIn
         pid: body.get("pid")?.as_u64()? as u32,
         workspace: body.get("workspace")?.as_str()?.to_owned(),
         uptime_seconds: body.get("uptime_seconds")?.as_u64()?,
+        source: DaemonSource::HttpApi,
     };
 
     // Only match if the daemon is serving the same workspace
@@ -80,13 +94,14 @@ fn probe_lock_file(workspace: &Path, port: u16) -> Option<DaemonInfo> {
         pid: 0,
         workspace: workspace.display().to_string(),
         uptime_seconds: 0,
+        source: DaemonSource::LockFile,
     })
 }
 
 /// Print a user-friendly daemon-detected message and exit with code 1.
 pub fn exit_daemon_detected(daemon: &DaemonInfo, command_name: &str) -> ! {
     eprintln!();
-    if daemon.pid > 0 {
+    if daemon.has_http_api() {
         eprintln!(
             "  The AETHER daemon is running (PID {}, port {})",
             daemon.pid, daemon.port
@@ -101,11 +116,17 @@ pub fn exit_daemon_detected(daemon: &DaemonInfo, command_name: &str) -> ! {
     eprintln!();
     eprintln!("  The `{command_name}` command requires graph access. Options:");
     eprintln!();
-    eprintln!(
-        "    \u{2022} Use the dashboard:  http://127.0.0.1:{}/dashboard/",
-        daemon.port
-    );
-    eprintln!("    \u{2022} Stop the daemon:    pkill -f aetherd");
+    if daemon.has_http_api() {
+        eprintln!(
+            "    \u{2022} Use the dashboard:  http://127.0.0.1:{}/dashboard/",
+            daemon.port
+        );
+        eprintln!("    \u{2022} Stop the daemon:    pkill -f aetherd");
+    } else {
+        eprintln!("    \u{2022} If no daemon is running, remove the stale lock:");
+        eprintln!("      rm -f .aether/graph/LOCK");
+        eprintln!("    \u{2022} If another process is using the graph, stop that process first");
+    }
     eprintln!("    \u{2022} Use MCP tools for programmatic access");
     eprintln!();
     std::process::exit(1);
@@ -113,7 +134,7 @@ pub fn exit_daemon_detected(daemon: &DaemonInfo, command_name: &str) -> ! {
 
 /// Print a warning that graph data is unavailable due to daemon lock, then continue.
 pub fn warn_daemon_detected(daemon: &DaemonInfo, command_name: &str) {
-    if daemon.pid > 0 {
+    if daemon.has_http_api() {
         eprintln!(
             "  Warning: AETHER daemon is running (PID {}, port {}). \
              Graph data unavailable for `{command_name}` \u{2014} results may be incomplete. \
@@ -123,7 +144,8 @@ pub fn warn_daemon_detected(daemon: &DaemonInfo, command_name: &str) {
     } else {
         eprintln!(
             "  Warning: another process holds the graph database lock. \
-             Graph data unavailable for `{command_name}` \u{2014} results may be incomplete.",
+             Graph data unavailable for `{command_name}` \u{2014} results may be incomplete. \
+             If no daemon is running, remove the stale lock with `rm -f .aether/graph/LOCK`.",
         );
     }
 }

@@ -8,6 +8,7 @@ pub mod context_slicer;
 pub mod continuous;
 pub mod contracts;
 pub mod coupling;
+pub mod daemon_client;
 pub mod daemon_detect;
 pub mod drift;
 pub mod fsck;
