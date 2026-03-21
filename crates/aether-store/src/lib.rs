@@ -63,8 +63,9 @@ pub use contracts::{IntentContractRecord, IntentViolationRecord};
 pub use embeddings::{SemanticSearchResult, SymbolEmbeddingMetaRecord, SymbolEmbeddingRecord};
 pub use fingerprint_history::SirFingerprintHistoryRecord;
 pub use graph::{
-    CouplingEdgeRecord, GraphDependencyEdgeRecord, GraphSyncStats, ResolvedEdge, TestedByRecord,
-    UpstreamDependencyEdgeRecord, UpstreamDependencyNodeRecord, UpstreamDependencyTraversal,
+    CouplingEdgeRecord, GraphDependencyEdgeRecord, GraphSyncStats, ResolvedEdge,
+    SymbolNeighborRecord, TestedByRecord, UpstreamDependencyEdgeRecord,
+    UpstreamDependencyNodeRecord, UpstreamDependencyTraversal,
 };
 pub use project_notes::{
     ProjectEntityRefRecord, ProjectNoteEmbeddingRecord, ProjectNoteRecord,

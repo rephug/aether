@@ -2366,6 +2366,13 @@ impl SirPipeline {
             store
                 .upsert_edges(&extracted.edges)
                 .with_context(|| format!("failed to upsert edges for file {}", event.file_path))?;
+            if let Err(err) = store.populate_symbol_neighbors(event.file_path.as_str()) {
+                tracing::warn!(
+                    file_path = %event.file_path,
+                    error = %err,
+                    "failed to populate symbol_neighbors for file"
+                );
+            }
 
             let now_ms = unix_timestamp_millis();
             let test_intents = extracted

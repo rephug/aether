@@ -80,11 +80,27 @@ impl GraphStore for SqliteGraphStore {
         let conn = self.connection()?;
         let mut stmt = conn.prepare(
             r#"
-            SELECT s.id, s.file_path, s.language, s.kind, s.qualified_name, s.signature_fingerprint, s.last_seen_at
-            FROM symbol_edges e
-            JOIN symbols s ON s.id = e.source_id
-            WHERE e.edge_kind = 'calls'
-              AND e.target_qualified_name = ?1
+            SELECT DISTINCT
+                s.id,
+                s.file_path,
+                s.language,
+                s.kind,
+                s.qualified_name,
+                s.signature_fingerprint,
+                s.last_seen_at
+            FROM (
+                SELECT n.neighbor_id AS caller_id
+                FROM symbols target
+                JOIN symbol_neighbors n ON n.symbol_id = target.id
+                WHERE target.qualified_name = ?1
+                  AND n.edge_type = 'called_by'
+                UNION
+                SELECT e.source_id AS caller_id
+                FROM symbol_edges e
+                WHERE e.edge_kind = 'calls'
+                  AND e.target_qualified_name = ?1
+            ) callers
+            JOIN symbols s ON s.id = callers.caller_id
             ORDER BY s.qualified_name ASC, s.id ASC
             "#,
         )?;
@@ -112,11 +128,18 @@ impl GraphStore for SqliteGraphStore {
         let conn = self.connection()?;
         let mut stmt = conn.prepare(
             r#"
-            SELECT s.id, s.file_path, s.language, s.kind, s.qualified_name, s.signature_fingerprint, s.last_seen_at
-            FROM symbol_edges e
-            JOIN symbols s ON s.qualified_name = e.target_qualified_name
-            WHERE e.edge_kind = 'calls'
-              AND e.source_id = ?1
+            SELECT
+                s.id,
+                s.file_path,
+                s.language,
+                s.kind,
+                s.qualified_name,
+                s.signature_fingerprint,
+                s.last_seen_at
+            FROM symbol_neighbors n
+            JOIN symbols s ON s.id = n.neighbor_id
+            WHERE n.symbol_id = ?1
+              AND n.edge_type = 'calls'
             ORDER BY s.qualified_name ASC, s.id ASC
             "#,
         )?;
@@ -268,6 +291,9 @@ mod tests {
                 },
             ])
             .expect("upsert edges");
+        store
+            .populate_symbol_neighbors("src/lib.rs")
+            .expect("populate symbol neighbors");
 
         let callers = graph.get_callers("beta").await.expect("get callers");
         assert_eq!(callers.len(), 1);

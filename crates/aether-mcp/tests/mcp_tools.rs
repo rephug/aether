@@ -49,6 +49,47 @@ fn symbol_access_count(workspace: &Path, symbol_id: &str) -> Result<i64> {
     Ok(count)
 }
 
+fn rebuild_symbol_neighbors(workspace: &Path) -> Result<()> {
+    let conn = Connection::open(workspace.join(".aether/meta.sqlite"))?;
+    conn.execute("DELETE FROM symbol_neighbors", [])?;
+    conn.execute_batch(
+        r#"
+        INSERT OR REPLACE INTO symbol_neighbors (
+            symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file
+        )
+        SELECT
+            e.source_id,
+            s_target.id,
+            e.edge_kind,
+            s_target.qualified_name,
+            s_target.file_path
+        FROM symbol_edges e
+        JOIN symbols s_source ON s_source.id = e.source_id
+        JOIN symbols s_target ON s_target.qualified_name = e.target_qualified_name;
+
+        INSERT OR REPLACE INTO symbol_neighbors (
+            symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file
+        )
+        SELECT
+            s_target.id,
+            e.source_id,
+            CASE e.edge_kind
+                WHEN 'calls' THEN 'called_by'
+                WHEN 'depends_on' THEN 'depended_on_by'
+                WHEN 'implements' THEN 'implemented_by'
+                WHEN 'type_ref' THEN 'type_ref_by'
+                ELSE e.edge_kind || '_reverse'
+            END,
+            s_source.qualified_name,
+            s_source.file_path
+        FROM symbol_edges e
+        JOIN symbols s_source ON s_source.id = e.source_id
+        JOIN symbols s_target ON s_target.qualified_name = e.target_qualified_name;
+        "#,
+    )?;
+    Ok(())
+}
+
 fn write_test_config(workspace: &Path) {
     fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
     fs::write(
@@ -1259,6 +1300,7 @@ fn mcp_suggest_trait_split_returns_clusters() -> Result<()> {
             file_path: "src/store.rs".to_owned(),
         },
     ])?;
+    rebuild_symbol_neighbors(workspace)?;
 
     let trait_sir = SirAnnotation {
         intent: "Mock summary for ExampleStore".to_owned(),
@@ -1422,6 +1464,7 @@ fn mcp_suggest_trait_split_accepts_struct_targets() -> Result<()> {
             file_path: "src/store.rs".to_owned(),
         },
     ])?;
+    rebuild_symbol_neighbors(workspace)?;
 
     let struct_sir = SirAnnotation {
         intent: "Mock summary for ExampleStore".to_owned(),
@@ -1587,6 +1630,7 @@ fn mcp_suggest_trait_split_falls_back_to_same_file_implementor_methods() -> Resu
             file_path: "src/lib.rs".to_owned(),
         },
     ])?;
+    rebuild_symbol_neighbors(workspace)?;
 
     let sqlite_sir = SirAnnotation {
         intent: "Mock summary for SqliteStore".to_owned(),

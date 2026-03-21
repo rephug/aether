@@ -10,6 +10,7 @@ use aether_store::{
 };
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
+use rusqlite::{Connection, params};
 use serde_json::Value;
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -1313,6 +1314,63 @@ fn seed_workspace(workspace: &std::path::Path) {
             },
         ])
         .unwrap();
+    let conn = Connection::open(workspace.join(".aether/meta.sqlite")).unwrap();
+    conn.execute(
+        r#"
+        INSERT INTO symbol_neighbors (symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+        params![
+            "sym-demo-run",
+            "sym-demo-helper",
+            "calls",
+            "demo::helper",
+            "src/lib.rs"
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        r#"
+        INSERT INTO symbol_neighbors (symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+        params![
+            "sym-demo-helper",
+            "sym-demo-run",
+            "called_by",
+            "demo::run",
+            "src/lib.rs"
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        r#"
+        INSERT INTO symbol_neighbors (symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+        params![
+            "sym-demo-main",
+            "sym-demo-run",
+            "calls",
+            "demo::run",
+            "src/lib.rs"
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        r#"
+        INSERT INTO symbol_neighbors (symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+        params![
+            "sym-demo-run",
+            "sym-demo-main",
+            "called_by",
+            "demo::main",
+            "src/main.rs"
+        ],
+    )
+    .unwrap();
 
     store
         .upsert_sir_meta(SirMetaRecord {

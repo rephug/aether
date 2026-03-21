@@ -41,6 +41,15 @@ pub struct GraphDependencyEdgeRecord {
     pub edge_kind: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolNeighborRecord {
+    pub symbol_id: String,
+    pub neighbor_id: String,
+    pub edge_type: String,
+    pub neighbor_name: String,
+    pub neighbor_file: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphSyncStats {
     pub resolved_edges: usize,
@@ -375,6 +384,142 @@ impl SqliteStore {
         }
         tx.commit()?;
         Ok(())
+    }
+    pub fn populate_symbol_neighbors(&self, file_path: &str) -> Result<(), StoreError> {
+        let file_path = file_path.trim();
+        if file_path.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        tx.execute(
+            r#"
+            DELETE FROM symbol_neighbors
+            WHERE symbol_id IN (
+                SELECT id FROM symbols WHERE file_path = ?1
+            )
+            "#,
+            params![file_path],
+        )?;
+        tx.execute(
+            r#"
+            DELETE FROM symbol_neighbors
+            WHERE neighbor_id IN (
+                SELECT id FROM symbols WHERE file_path = ?1
+            )
+            "#,
+            params![file_path],
+        )?;
+        tx.execute(
+            r#"
+            INSERT OR REPLACE INTO symbol_neighbors (
+                symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file
+            )
+            SELECT
+                e.source_id,
+                s_target.id,
+                e.edge_kind,
+                s_target.qualified_name,
+                s_target.file_path
+            FROM symbol_edges e
+            JOIN symbols s_source ON s_source.id = e.source_id
+            JOIN symbols s_target ON s_target.qualified_name = e.target_qualified_name
+            WHERE s_source.file_path = ?1
+            "#,
+            params![file_path],
+        )?;
+        tx.execute(
+            r#"
+            INSERT OR REPLACE INTO symbol_neighbors (
+                symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file
+            )
+            SELECT
+                s_target.id,
+                e.source_id,
+                CASE e.edge_kind
+                    WHEN 'calls' THEN 'called_by'
+                    WHEN 'depends_on' THEN 'depended_on_by'
+                    WHEN 'implements' THEN 'implemented_by'
+                    WHEN 'type_ref' THEN 'type_ref_by'
+                    ELSE e.edge_kind || '_reverse'
+                END,
+                s_source.qualified_name,
+                s_source.file_path
+            FROM symbol_edges e
+            JOIN symbols s_source ON s_source.id = e.source_id
+            JOIN symbols s_target ON s_target.qualified_name = e.target_qualified_name
+            WHERE s_source.file_path = ?1
+            "#,
+            params![file_path],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    /// Get all denormalized neighbors for a symbol.
+    pub fn get_symbol_neighbors(
+        &self,
+        symbol_id: &str,
+    ) -> Result<Vec<SymbolNeighborRecord>, StoreError> {
+        let symbol_id = symbol_id.trim();
+        if symbol_id.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file
+            FROM symbol_neighbors
+            WHERE symbol_id = ?1
+            ORDER BY edge_type ASC, neighbor_name ASC, neighbor_id ASC, neighbor_file ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![symbol_id], |row| {
+            Ok(SymbolNeighborRecord {
+                symbol_id: row.get(0)?,
+                neighbor_id: row.get(1)?,
+                edge_type: row.get(2)?,
+                neighbor_name: row.get(3)?,
+                neighbor_file: row.get(4)?,
+            })
+        })?;
+
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+    /// Get denormalized neighbors for a symbol filtered by edge type.
+    pub fn get_symbol_neighbors_by_type(
+        &self,
+        symbol_id: &str,
+        edge_type: &str,
+    ) -> Result<Vec<SymbolNeighborRecord>, StoreError> {
+        let symbol_id = symbol_id.trim();
+        let edge_type = edge_type.trim();
+        if symbol_id.is_empty() || edge_type.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file
+            FROM symbol_neighbors
+            WHERE symbol_id = ?1
+              AND edge_type = ?2
+            ORDER BY neighbor_name ASC, neighbor_id ASC, neighbor_file ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![symbol_id, edge_type], |row| {
+            Ok(SymbolNeighborRecord {
+                symbol_id: row.get(0)?,
+                neighbor_id: row.get(1)?,
+                edge_type: row.get(2)?,
+                neighbor_name: row.get(3)?,
+                neighbor_file: row.get(4)?,
+            })
+        })?;
+
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
     pub(crate) fn store_get_callers(
         &self,

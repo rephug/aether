@@ -206,6 +206,7 @@ fn implements_edge(source_id: &str, target: &str, file_path: &str) -> SymbolEdge
 }
 
 mod basic;
+mod neighbors;
 mod notes_and_analysis;
 mod reconcile;
 mod schema_and_intents;

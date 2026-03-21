@@ -45,7 +45,7 @@ fn migration_v6_renames_legacy_generation_pass_values_to_scan() {
     assert_eq!(single_meta.generation_pass, "scan");
     assert_eq!(
         store.get_schema_version().expect("schema version").version,
-        14
+        15
     );
 }
 
@@ -73,7 +73,7 @@ fn migration_v7_expands_symbol_edge_kinds() {
     let version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("query migrated version");
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
 
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM symbol_edges", [], |row| row.get(0))
@@ -216,13 +216,13 @@ fn run_migrations_sets_user_version_and_is_idempotent() {
     let first_version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("query first user_version");
-    assert_eq!(first_version, 14);
+    assert_eq!(first_version, 15);
 
     run_migrations(&conn).expect("run migrations twice");
     let second_version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("query second user_version");
-    assert_eq!(second_version, 14);
+    assert_eq!(second_version, 15);
 }
 
 #[test]
@@ -232,7 +232,7 @@ fn schema_version_table_is_populated() {
 
     let schema = store.get_schema_version().expect("get schema version");
     assert_eq!(schema.component, "core");
-    assert_eq!(schema.version, 14);
+    assert_eq!(schema.version, 15);
     assert!(schema.migrated_at > 0);
 }
 
@@ -245,7 +245,7 @@ fn migration_v14_creates_sir_quality_table() {
     let version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("query migrated version");
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
 
     let columns = conn
         .prepare("PRAGMA table_info(sir_quality)")
@@ -268,6 +268,99 @@ fn migration_v14_creates_sir_quality_table() {
             "computed_at",
         ]
     );
+}
+
+#[test]
+fn migration_v15_creates_and_backfills_symbol_neighbors() {
+    let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+    conn.execute_batch(
+        r#"
+            CREATE TABLE symbols (
+                id TEXT PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                language TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                qualified_name TEXT NOT NULL,
+                signature_fingerprint TEXT NOT NULL,
+                last_seen_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE symbol_edges (
+                source_id TEXT NOT NULL,
+                target_qualified_name TEXT NOT NULL,
+                edge_kind TEXT NOT NULL CHECK (edge_kind IN ('calls', 'depends_on', 'type_ref', 'implements')),
+                file_path TEXT NOT NULL,
+                PRIMARY KEY (source_id, target_qualified_name, edge_kind)
+            );
+
+            INSERT INTO symbols (id, file_path, language, kind, qualified_name, signature_fingerprint, last_seen_at)
+            VALUES
+                ('sym-alpha', 'src/a.rs', 'rust', 'function', 'alpha', 'sig-alpha', 1),
+                ('sym-beta', 'src/b.rs', 'rust', 'function', 'beta', 'sig-beta', 2);
+
+            INSERT INTO symbol_edges (source_id, target_qualified_name, edge_kind, file_path)
+            VALUES ('sym-alpha', 'beta', 'calls', 'src/a.rs');
+
+            PRAGMA user_version = 14;
+            "#,
+    )
+    .expect("seed v14 schema");
+
+    run_migrations(&conn).expect("run migrations");
+
+    let version: i32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("query migrated version");
+    assert_eq!(version, 15);
+
+    let neighbors = conn
+        .prepare(
+            r#"
+            SELECT symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file
+            FROM symbol_neighbors
+            ORDER BY symbol_id ASC, edge_type ASC, neighbor_id ASC
+            "#,
+        )
+        .expect("prepare symbol_neighbors query")
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .expect("query symbol_neighbors")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect symbol_neighbors rows");
+    assert_eq!(
+        neighbors,
+        vec![
+            (
+                "sym-alpha".to_owned(),
+                "sym-beta".to_owned(),
+                "calls".to_owned(),
+                "beta".to_owned(),
+                "src/b.rs".to_owned(),
+            ),
+            (
+                "sym-beta".to_owned(),
+                "sym-alpha".to_owned(),
+                "called_by".to_owned(),
+                "alpha".to_owned(),
+                "src/a.rs".to_owned(),
+            ),
+        ]
+    );
+
+    run_migrations(&conn).expect("rerun migrations");
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM symbol_neighbors", [], |row| {
+            row.get(0)
+        })
+        .expect("count symbol_neighbors");
+    assert_eq!(count, 2);
 }
 
 #[test]
@@ -513,7 +606,7 @@ fn migration_from_v2_to_v3_adds_write_intents_table() {
     let version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("query user_version");
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
 
     let task_history_exists = conn
         .query_row(

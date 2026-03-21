@@ -129,7 +129,7 @@ impl SharedState {
             None => true,
         };
         let store = Arc::new(SqliteStore::open(&workspace)?);
-        store.check_compatibility("core", 14)?;
+        store.check_compatibility("core", 15)?;
         let graph = open_shared_graph(&workspace, &config, false)?;
         let surreal_graph = Arc::new(Mutex::new(None));
         let vector_store = open_vector_store_sync_optional(&workspace, &config)?;
@@ -159,7 +159,7 @@ impl SharedState {
             None => true,
         };
         let store = Arc::new(SqliteStore::open(&workspace)?);
-        store.check_compatibility("core", 14)?;
+        store.check_compatibility("core", 15)?;
         let (graph, surreal_graph) = open_shared_graph_async(&workspace, &config, false).await?;
         let surreal_graph = Arc::new(Mutex::new(surreal_graph));
         let vector_store = open_vector_store_async_optional(&workspace, &config).await?;
@@ -190,7 +190,7 @@ impl SharedState {
             None => true,
         };
         let store = Arc::new(SqliteStore::open_readonly(&workspace)?);
-        store.check_compatibility("core", 14)?;
+        store.check_compatibility("core", 15)?;
         let (graph, surreal_graph) = open_shared_graph_async(&workspace, &config, true).await?;
         let surreal_graph = Arc::new(Mutex::new(surreal_graph));
         let vector_store = open_vector_store_async_optional(&workspace, &config).await?;
@@ -221,7 +221,7 @@ impl SharedState {
             None => true,
         };
         let store = Arc::new(SqliteStore::open_readonly(&workspace)?);
-        store.check_compatibility("core", 14)?;
+        store.check_compatibility("core", 15)?;
         let graph = open_shared_graph(&workspace, &config, true)?;
         let surreal_graph = Arc::new(Mutex::new(None));
         let vector_store = open_vector_store_sync_optional(&workspace, &config)?;
@@ -362,25 +362,33 @@ async fn open_shared_graph_async(
     config: &AetherConfig,
     read_only: bool,
 ) -> Result<(Arc<dyn GraphStore>, Option<Arc<SurrealGraphStore>>), AetherMcpError> {
-    match config.storage.graph_backend {
-        GraphBackend::Sqlite | GraphBackend::Cozo => {
-            let graph: Arc<dyn GraphStore> = if read_only {
-                Arc::new(SqliteGraphStore::open_readonly(workspace)?)
-            } else {
-                Arc::new(SqliteGraphStore::open(workspace)?)
-            };
-            Ok((graph, None))
-        }
+    let graph: Arc<dyn GraphStore> = if read_only {
+        Arc::new(SqliteGraphStore::open_readonly(workspace)?)
+    } else {
+        Arc::new(SqliteGraphStore::open(workspace)?)
+    };
+
+    let surreal = match config.storage.graph_backend {
         GraphBackend::Surreal => {
-            let surreal = if read_only {
-                Arc::new(SurrealGraphStore::open_readonly(workspace).await?)
+            match if read_only {
+                SurrealGraphStore::open_readonly(workspace).await
             } else {
-                Arc::new(SurrealGraphStore::open(workspace).await?)
-            };
-            let graph: Arc<dyn GraphStore> = surreal.clone();
-            Ok((graph, Some(surreal)))
+                SurrealGraphStore::open(workspace).await
+            } {
+                Ok(store) => Some(Arc::new(store)),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "SurrealDB graph unavailable (daemon may hold lock), using SQLite only"
+                    );
+                    None
+                }
+            }
         }
-    }
+        GraphBackend::Sqlite | GraphBackend::Cozo => None,
+    };
+
+    Ok((graph, surreal))
 }
 
 #[cfg(test)]
@@ -390,30 +398,39 @@ mod tests {
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use aether_core::{EdgeKind, SymbolEdge};
+    use aether_store::{SymbolCatalogStore, SymbolRelationStore};
+    use rusqlite::{Connection, params};
     use tempfile::tempdir;
 
     use super::SharedState;
     use crate::AetherMcpError;
 
-    fn write_test_config(workspace: &Path) {
+    fn write_test_config_with_backend(workspace: &Path, backend: &str) {
         fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
         fs::write(
             workspace.join(".aether/config.toml"),
-            r#"[inference]
+            format!(
+                r#"[inference]
 provider = "qwen3_local"
 api_key_env = "GEMINI_API_KEY"
 
 [storage]
 mirror_sir_files = true
-graph_backend = "sqlite"
+graph_backend = "{backend}"
 
 [embeddings]
 enabled = false
 provider = "qwen3_local"
 vector_backend = "sqlite"
-"#,
+"#
+            ),
         )
         .expect("write config");
+    }
+
+    fn write_test_config(workspace: &Path) {
+        write_test_config_with_backend(workspace, "sqlite");
     }
 
     fn write_remote_embedding_config(workspace: &Path, api_key_env: &str) {
@@ -453,7 +470,7 @@ api_key_env = "{api_key_env}"
 
         assert!(ro.read_only);
         assert_eq!(ro.schema_version.component, "core");
-        assert_eq!(ro.schema_version.version, 14);
+        assert_eq!(ro.schema_version.version, 15);
         assert!(ro.schema_version.migrated_at > 0);
     }
 
@@ -493,5 +510,79 @@ api_key_env = "{api_key_env}"
 
         let state = SharedState::open_readwrite(workspace).expect("open readwrite state");
         assert!(!state.semantic_search_available);
+    }
+
+    fn seed_symbol_neighbors(workspace: &Path) {
+        let store = aether_store::SqliteStore::open(workspace).expect("open sqlite store");
+        let alpha = aether_store::SymbolRecord {
+            id: "sym-alpha".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            language: "rust".to_owned(),
+            kind: "function".to_owned(),
+            qualified_name: "alpha".to_owned(),
+            signature_fingerprint: "sig-alpha".to_owned(),
+            last_seen_at: 1,
+        };
+        let beta = aether_store::SymbolRecord {
+            id: "sym-beta".to_owned(),
+            file_path: "src/dep.rs".to_owned(),
+            language: "rust".to_owned(),
+            kind: "function".to_owned(),
+            qualified_name: "beta".to_owned(),
+            signature_fingerprint: "sig-beta".to_owned(),
+            last_seen_at: 2,
+        };
+        store.upsert_symbol(alpha.clone()).expect("upsert alpha");
+        store.upsert_symbol(beta.clone()).expect("upsert beta");
+        store
+            .upsert_edges(&[SymbolEdge {
+                source_id: alpha.id.clone(),
+                target_qualified_name: beta.qualified_name.clone(),
+                edge_kind: EdgeKind::Calls,
+                file_path: alpha.file_path.clone(),
+            }])
+            .expect("upsert edge");
+
+        let conn = Connection::open(workspace.join(".aether/meta.sqlite")).expect("open sqlite db");
+        conn.execute(
+            r#"
+            INSERT INTO symbol_neighbors (symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![alpha.id, beta.id, "calls", beta.qualified_name, beta.file_path],
+        )
+        .expect("insert forward neighbor");
+        conn.execute(
+            r#"
+            INSERT INTO symbol_neighbors (symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params!["sym-beta", "sym-alpha", "called_by", "alpha", "src/lib.rs"],
+        )
+        .expect("insert reverse neighbor");
+    }
+
+    #[tokio::test]
+    async fn shared_state_async_surreal_backend_uses_sqlite_primary_graph_reads() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_test_config_with_backend(workspace, "surreal");
+        seed_symbol_neighbors(workspace);
+
+        let state = SharedState::open_readonly_async(workspace)
+            .await
+            .expect("open readonly state");
+
+        let callers = state.graph.get_callers("beta").await.expect("load callers");
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].id, "sym-alpha");
+
+        let dependencies = state
+            .graph
+            .get_dependencies("sym-alpha")
+            .await
+            .expect("load dependencies");
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].id, "sym-beta");
     }
 }
