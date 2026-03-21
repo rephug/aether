@@ -579,14 +579,16 @@ impl SirPipeline {
         let results = if jobs.is_empty() {
             Vec::new()
         } else {
-            self.runtime.block_on(generate_sir_jobs(
-                self.provider.clone(),
-                self.tiered_parse_fallback_provider.clone(),
-                self.tiered_parse_fallback_model.clone(),
-                jobs,
-                self.sir_concurrency,
-                self.inference_timeout_secs,
-            ))?
+            self.runtime
+                .block_on(generate_sir_jobs(
+                    self.provider.clone(),
+                    self.tiered_parse_fallback_provider.clone(),
+                    self.tiered_parse_fallback_model.clone(),
+                    jobs,
+                    self.sir_concurrency,
+                    self.inference_timeout_secs,
+                ))
+                .context("failed to submit batched quality SIR generation jobs")?
         };
 
         for result in results {
@@ -1574,15 +1576,20 @@ impl SirPipeline {
             return Ok(());
         }
 
-        let _ = self.finish_bulk_scan_success(
-            store,
-            persisted,
-            intents_by_file,
-            stats,
-            print_sir,
-            out,
-            None,
-        )?;
+        let symbol_id = persisted.symbol_id.clone();
+        let _ = self
+            .finish_bulk_scan_success(
+                store,
+                persisted,
+                intents_by_file,
+                stats,
+                print_sir,
+                out,
+                None,
+            )
+            .with_context(|| {
+                format!("failed to finalize immediate vector stage for {symbol_id}")
+            })?;
         Ok(())
     }
 
