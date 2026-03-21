@@ -561,6 +561,25 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         conn.execute("PRAGMA user_version = 13", [])?;
     }
 
+    if version < 14 {
+        conn.execute_batch(
+            r#"
+        CREATE TABLE IF NOT EXISTS sir_quality (
+            sir_id TEXT PRIMARY KEY REFERENCES sir(id),
+            specificity REAL NOT NULL,
+            behavioral_depth REAL NOT NULL,
+            error_coverage REAL NOT NULL,
+            length_score REAL NOT NULL,
+            composite_quality REAL NOT NULL,
+            confidence_percentile REAL NOT NULL,
+            normalized_quality REAL NOT NULL,
+            computed_at INTEGER NOT NULL
+        );
+        "#,
+        )?;
+        conn.execute("PRAGMA user_version = 14", [])?;
+    }
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_version (

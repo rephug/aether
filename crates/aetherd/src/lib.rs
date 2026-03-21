@@ -29,6 +29,7 @@ pub mod sir_context;
 pub mod sir_diff;
 pub mod sir_inject;
 pub mod sir_pipeline;
+pub mod sir_quality;
 pub mod task_context;
 pub mod templates;
 pub mod test_intents;

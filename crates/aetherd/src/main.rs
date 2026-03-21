@@ -16,11 +16,11 @@ use aetherd::batch::run_batch_command;
 use aetherd::calibrate::run_calibration_once;
 use aetherd::causal::run_trace_cause_command;
 use aetherd::cli::{
-    AskArgs, BatchArgs, BlastRadiusArgs, Cli, Commands, CommunitiesArgs, ContextArgs,
-    ContinuousArgs, ContractArgs, CouplingReportArgs, DriftAckArgs, DriftReportArgs, FsckArgs,
-    HealthArgs, HealthScoreArgs, InitAgentArgs, LogFormat, MineCouplingArgs, NotesArgs, PresetArgs,
-    RecallArgs, RefactorPrepArgs, RegenerateArgs, RememberArgs, SeismographArgs, SetupLocalArgs,
-    SirContextArgs, SirDiffArgs, SirInjectArgs, TaskHistoryArgs, TaskRelevanceArgs,
+    AskArgs, BatchArgs, BlastRadiusArgs, Cli, Commands, CommunitiesArgs, ComputeQualityArgs,
+    ContextArgs, ContinuousArgs, ContractArgs, CouplingReportArgs, DriftAckArgs, DriftReportArgs,
+    FsckArgs, HealthArgs, HealthScoreArgs, InitAgentArgs, LogFormat, MineCouplingArgs, NotesArgs,
+    PresetArgs, RecallArgs, RefactorPrepArgs, RegenerateArgs, RememberArgs, SeismographArgs,
+    SetupLocalArgs, SirContextArgs, SirDiffArgs, SirInjectArgs, TaskHistoryArgs, TaskRelevanceArgs,
     TestIntentsArgs, TraceCauseArgs, VerifyIntentArgs, parse_cli,
 };
 use aetherd::context_presets::run_preset_command;
@@ -50,6 +50,7 @@ use aetherd::sir_context::{run_context_command, run_sir_context_command};
 use aetherd::sir_diff::run_sir_diff_command;
 use aetherd::sir_inject::run_sir_inject_command;
 use aetherd::sir_pipeline::{SIR_GENERATION_PASS_REGENERATED, SirDeepPromptSpec, SirPipeline};
+use aetherd::sir_quality::run_compute_quality_command;
 use aetherd::task_context::{run_task_history_command, run_task_relevance_command};
 use aetherd::test_intents::run_test_intents_command;
 use aetherd::verification::{VerificationRequest, run_verification};
@@ -332,6 +333,7 @@ fn run_subcommand(workspace: &Path, config: &AetherConfig, command: Commands) ->
         Commands::SirDiff(args) => run_sir_diff_subcommand(workspace, args),
         Commands::InitAgent(args) => run_init_agent_command(workspace, args),
         Commands::Regenerate(args) => run_regenerate_command(workspace, args),
+        Commands::ComputeQuality(args) => run_compute_quality_subcommand(workspace, args),
         Commands::SetupLocal(args) => run_setup_local_command(workspace, args),
         Commands::Status => run_status_subcommand(workspace),
         Commands::Remember(args) => run_remember_note_command(workspace, args),
@@ -386,6 +388,10 @@ fn run_sir_inject_subcommand(workspace: &Path, args: SirInjectArgs) -> Result<()
 
 fn run_sir_diff_subcommand(workspace: &Path, args: SirDiffArgs) -> Result<()> {
     run_sir_diff_command(workspace, args).context("sir-diff command failed")
+}
+
+fn run_compute_quality_subcommand(workspace: &Path, args: ComputeQualityArgs) -> Result<()> {
+    run_compute_quality_command(workspace, args).context("compute-quality command failed")
 }
 
 fn run_continuous_subcommand(

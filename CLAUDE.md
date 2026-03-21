@@ -2,11 +2,11 @@
 
 ## What this project is
 
-Semantic intelligence engine for codebases. Indexes every symbol into a Semantic Intent Record (SIR), stores relationships across SQLite + SurrealDB + vector store, and surfaces intelligence via LSP, MCP tools, CLI (31 commands), a web dashboard (27+ HTMX pages), and clipboard-ready context export. Single developer, ~136K lines of Rust across a multi-crate workspace.
+Semantic intelligence engine for codebases. Indexes every symbol into a Semantic Intent Record (SIR), stores relationships across SQLite + SurrealDB + vector store, and surfaces intelligence via LSP, MCP tools, CLI (33 commands), a web dashboard (27+ HTMX pages), and clipboard-ready context export. Single developer, ~136K lines of Rust across a multi-crate workspace.
 
 **Repo:** `github.com/rephug/aether` (private)
 **Dev environment:** WSL2 Ubuntu 24.04 on MSI laptop, RTX 2070 8GB, 16GB RAM
-**Schema version:** 13
+**Schema version:** 14
 
 ## Crate map (17 crates)
 
@@ -14,7 +14,7 @@ Semantic intelligence engine for codebases. Indexes every symbol into a Semantic
 crates/
 ├── aetherd/              # CLI binary + daemon + command dispatch (largest crate)
 │   ├── src/main.rs       # Entry point
-│   ├── src/cli.rs        # clap subcommand definitions (31 commands, ~2253 lines)
+│   ├── src/cli.rs        # clap subcommand definitions (33 commands)
 │   ├── src/batch/        # Phase 10.1: batch index pipeline (Gemini Batch API)
 │   ├── src/continuous/   # Phase 10.2: drift monitor + staleness scoring
 │   ├── src/sir_pipeline/ # Three-pass SIR generation: scan → triage → deep (~2063 lines)
@@ -211,7 +211,7 @@ This is what Phase 9's Tauri shell will wrap directly:
 
 This is the full surface the Configuration UI (Stage 9.2) must cover.
 
-## CLI commands (31 total)
+## CLI commands (33 total)
 
 ```
 # Daemon modes
@@ -239,7 +239,7 @@ batch extract/build/ingest/run   # Multi-provider batch pipeline (Gemini, OpenAI
 continuous run-once/status       # Drift monitor + staleness scoring
 
 # Maintenance
-regenerate, fsck, setup-local, init-agent, remember, recall, notes,
+compute-quality, regenerate, fsck, setup-local, init-agent, remember, recall, notes,
 mine-coupling, refactor-prep, verify-intent
 ```
 
