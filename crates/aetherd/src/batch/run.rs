@@ -13,6 +13,32 @@ use crate::batch::{
 };
 use crate::cli::{BatchArgs, BatchBuildArgs, BatchCommand, BatchIngestArgs, BatchRunArgs};
 
+/// Tracks a submitted batch chunk awaiting completion.
+struct PendingBatchJob {
+    /// Job IDs returned by the provider's submit call.
+    job_ids: Vec<String>,
+    /// Path to the JSONL input file for error reporting.
+    input_path: PathBuf,
+    /// Index in the original chunk list.
+    chunk_index: usize,
+}
+
+struct CompletedBatchJob {
+    chunk_index: usize,
+    result_paths: Vec<PathBuf>,
+}
+
+struct FailedBatchJob {
+    chunk_index: usize,
+    input_path: PathBuf,
+    message: String,
+}
+
+struct BatchPollOutcome {
+    completed: Vec<CompletedBatchJob>,
+    failed: Vec<FailedBatchJob>,
+}
+
 pub fn run_batch_command(workspace: &Path, config: &AetherConfig, args: BatchArgs) -> Result<()> {
     match args.command {
         BatchCommand::Extract => run_extract_command(workspace),
@@ -131,15 +157,21 @@ fn run_full_batch_command(
             build_summary.unresolved_symbols
         );
 
-        for input_jsonl in build_summary.files {
-            let results_paths = tokio_rt.block_on(submit_and_wait(
-                provider.as_ref(),
-                &input_jsonl,
-                &pass_config.model,
-                &runtime,
-            ))?;
+        let pending = tokio_rt.block_on(submit_all_chunks(
+            provider.as_ref(),
+            build_summary.files,
+            &pass_config.model,
+            &runtime,
+        ))?;
 
-            for result_path in results_paths {
+        let BatchPollOutcome {
+            mut completed,
+            mut failed,
+        } = tokio_rt.block_on(poll_and_download_all(provider.as_ref(), pending, &runtime))?;
+
+        completed.sort_by_key(|job| job.chunk_index);
+        for job in completed {
+            for result_path in job.result_paths {
                 let ingest_summary = ingest_results(
                     workspace,
                     &extract_summary.store,
@@ -152,12 +184,35 @@ fn run_full_batch_command(
                 println!(
                     "Ingested {} chunk {}: processed {}, skipped {}, fingerprint rows {}",
                     pass.as_str(),
-                    result_path.display(),
+                    job.chunk_index + 1,
                     ingest_summary.processed,
                     ingest_summary.skipped,
                     ingest_summary.fingerprint_rows
                 );
             }
+        }
+
+        if !failed.is_empty() {
+            failed.sort_by_key(|job| job.chunk_index);
+            let failed_count = failed.len();
+            let failure_summary = failed
+                .into_iter()
+                .map(|job| {
+                    format!(
+                        "chunk {} ({}): {}",
+                        job.chunk_index + 1,
+                        job.input_path.display(),
+                        job.message
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(anyhow!(
+                "{} batch chunk(s) failed during {}: {}",
+                failed_count,
+                pass.as_str(),
+                failure_summary
+            ));
         }
     }
 
@@ -185,54 +240,160 @@ fn run_full_batch_command(
     Ok(())
 }
 
-/// Submit a batch input file, poll until completion, and download results.
-async fn submit_and_wait(
+/// Submit all batch input files without waiting for completion.
+async fn submit_all_chunks(
     provider: &dyn BatchProvider,
-    input_path: &Path,
+    input_files: Vec<PathBuf>,
     model: &str,
     runtime: &BatchRuntimeConfig,
-) -> Result<Vec<PathBuf>> {
-    let job_ids = provider
-        .submit(
+) -> Result<Vec<PendingBatchJob>> {
+    let mut pending = Vec::with_capacity(input_files.len());
+
+    for (chunk_index, input_path) in input_files.into_iter().enumerate() {
+        let job_ids = provider
+            .submit(
+                &input_path,
+                model,
+                &runtime.batch_dir,
+                runtime.poll_interval_secs,
+            )
+            .await
+            .with_context(|| format!("batch submit failed for chunk {}", input_path.display()))?;
+
+        tracing::info!(
+            provider = provider.name(),
+            chunk = chunk_index + 1,
+            jobs = ?job_ids,
+            "submitted batch chunk"
+        );
+
+        pending.push(PendingBatchJob {
+            job_ids,
             input_path,
-            model,
-            &runtime.batch_dir,
-            runtime.poll_interval_secs,
-        )
-        .await
-        .with_context(|| format!("batch submit failed for {}", input_path.display()))?;
+            chunk_index,
+        });
+    }
 
     tracing::info!(
-        provider = provider.name(),
-        jobs = ?job_ids,
-        "batch job(s) submitted, polling for completion"
+        total_chunks = pending.len(),
+        "all batch chunks submitted, polling for completion"
     );
 
-    loop {
+    Ok(pending)
+}
+
+/// Poll all submitted chunks and download results as they complete.
+async fn poll_and_download_all(
+    provider: &dyn BatchProvider,
+    mut pending: Vec<PendingBatchJob>,
+    runtime: &BatchRuntimeConfig,
+) -> Result<BatchPollOutcome> {
+    let mut completed = Vec::new();
+    let mut failed = Vec::new();
+
+    while !pending.is_empty() {
         tokio::time::sleep(std::time::Duration::from_secs(runtime.poll_interval_secs)).await;
 
-        match provider.poll(&job_ids).await? {
-            BatchPollStatus::Completed => {
-                tracing::info!("batch job completed, downloading results");
-                break;
-            }
-            BatchPollStatus::Failed { message } => {
-                return Err(anyhow!("batch job failed: {}", message));
-            }
-            BatchPollStatus::InProgress { completed, total } => {
-                if let (Some(c), Some(t)) = (completed, total) {
-                    tracing::info!(completed = c, total = t, "batch job in progress");
-                } else {
-                    tracing::info!("batch job in progress");
+        let mut still_pending = Vec::with_capacity(pending.len());
+        for job in pending {
+            let poll_status =
+                match provider.poll(&job.job_ids).await.with_context(|| {
+                    format!("failed to poll batch chunk {}", job.input_path.display())
+                }) {
+                    Ok(status) => status,
+                    Err(err) => {
+                        tracing::error!(
+                            chunk = job.chunk_index + 1,
+                            error = %err,
+                            "batch chunk poll failed"
+                        );
+                        failed.push(FailedBatchJob {
+                            chunk_index: job.chunk_index,
+                            input_path: job.input_path,
+                            message: format!("{err:#}"),
+                        });
+                        continue;
+                    }
+                };
+
+            match poll_status {
+                BatchPollStatus::Completed => {
+                    tracing::info!(
+                        chunk = job.chunk_index + 1,
+                        "batch chunk completed, downloading results"
+                    );
+                    match provider
+                        .download_results(&job.job_ids, &runtime.batch_dir)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to download results for chunk {}",
+                                job.input_path.display()
+                            )
+                        }) {
+                        Ok(result_paths) => {
+                            completed.push(CompletedBatchJob {
+                                chunk_index: job.chunk_index,
+                                result_paths,
+                            });
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                chunk = job.chunk_index + 1,
+                                error = %err,
+                                "batch chunk download failed"
+                            );
+                            failed.push(FailedBatchJob {
+                                chunk_index: job.chunk_index,
+                                input_path: job.input_path,
+                                message: format!("{err:#}"),
+                            });
+                        }
+                    }
+                }
+                BatchPollStatus::Failed { message } => {
+                    tracing::error!(
+                        chunk = job.chunk_index + 1,
+                        error = %message,
+                        "batch chunk failed"
+                    );
+                    failed.push(FailedBatchJob {
+                        chunk_index: job.chunk_index,
+                        input_path: job.input_path,
+                        message,
+                    });
+                }
+                BatchPollStatus::InProgress {
+                    completed: done,
+                    total,
+                } => {
+                    if let (Some(completed_count), Some(total_count)) = (done, total) {
+                        tracing::info!(
+                            chunk = job.chunk_index + 1,
+                            completed = completed_count,
+                            total = total_count,
+                            "batch chunk in progress"
+                        );
+                    } else {
+                        tracing::info!(chunk = job.chunk_index + 1, "batch chunk in progress");
+                    }
+                    still_pending.push(job);
                 }
             }
         }
+
+        pending = still_pending;
+        if !pending.is_empty() {
+            tracing::info!(
+                remaining = pending.len(),
+                completed = completed.len(),
+                failed = failed.len(),
+                "polling remaining batch chunks"
+            );
+        }
     }
 
-    provider
-        .download_results(&job_ids, &runtime.batch_dir)
-        .await
-        .context("failed to download batch results")
+    Ok(BatchPollOutcome { completed, failed })
 }
 
 fn normalize_batch_dir(workspace: &Path, value: &str) -> PathBuf {
