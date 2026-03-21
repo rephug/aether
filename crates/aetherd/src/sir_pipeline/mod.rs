@@ -663,7 +663,13 @@ impl SirPipeline {
             let language = symbol.language;
             touched_files.entry(file_path.clone()).or_insert(language);
 
-            if !force && self.should_skip_sir_generation(store, &symbol)? {
+            if !force
+                && self
+                    .should_skip_sir_generation(store, &symbol)
+                    .with_context(|| {
+                        format!("failed to evaluate bulk-scan skip state for {}", symbol.id)
+                    })?
+            {
                 skipped_existing += 1;
                 if print_sir {
                     writeln!(
@@ -715,25 +721,34 @@ impl SirPipeline {
         let results = if jobs.is_empty() {
             Vec::new()
         } else {
-            self.runtime.block_on(generate_sir_jobs(
-                self.provider.clone(),
-                self.tiered_parse_fallback_provider.clone(),
-                self.tiered_parse_fallback_model.clone(),
-                jobs,
-                self.sir_concurrency,
-                self.inference_timeout_secs,
-            ))?
+            self.runtime
+                .block_on(generate_sir_jobs(
+                    self.provider.clone(),
+                    self.tiered_parse_fallback_provider.clone(),
+                    self.tiered_parse_fallback_model.clone(),
+                    jobs,
+                    self.sir_concurrency,
+                    self.inference_timeout_secs,
+                ))
+                .context("failed to submit bulk scan SIR generation jobs")?
         };
 
         for result in results {
             match result {
                 SirGenerationOutcome::Success(generated) => {
-                    let Some(persisted) = self.persist_successful_generation_sqlite(
-                        store,
-                        &generated,
-                        generation_pass,
-                        commit_hash.as_deref(),
-                    )?
+                    let Some(persisted) = self
+                        .persist_successful_generation_sqlite(
+                            store,
+                            &generated,
+                            generation_pass,
+                            commit_hash.as_deref(),
+                        )
+                        .with_context(|| {
+                            format!(
+                                "failed to persist bulk-scan SIR result for {}",
+                                generated.symbol.id
+                            )
+                        })?
                     else {
                         stats.failure_count += 1;
                         continue;
@@ -750,21 +765,39 @@ impl SirPipeline {
                             },
                             persisted,
                         });
-                    } else if self.finish_bulk_scan_success(
-                        store,
-                        persisted,
-                        &mut intents_by_file,
-                        &mut stats,
-                        print_sir,
-                        out,
-                        None,
-                    )? {
-                        // Counted in helper.
+                    } else {
+                        let symbol_id = persisted.symbol_id.clone();
+                        if self
+                            .finish_bulk_scan_success(
+                                store,
+                                persisted,
+                                &mut intents_by_file,
+                                &mut stats,
+                                print_sir,
+                                out,
+                                None,
+                            )
+                            .with_context(|| {
+                                format!(
+                                    "failed to finalize bulk-scan vector stage for {}",
+                                    symbol_id
+                                )
+                            })?
+                        {
+                            // Counted in helper.
+                        }
                     }
                 }
                 SirGenerationOutcome::Failure(failed) => {
                     stats.failure_count += 1;
-                    self.handle_failed_generation(store, *failed, generation_pass, print_sir, out)?;
+                    let symbol_id = failed.symbol.id.clone();
+                    self.handle_failed_generation(store, *failed, generation_pass, print_sir, out)
+                        .with_context(|| {
+                            format!(
+                                "failed to record bulk-scan generation failure for {}",
+                                symbol_id
+                            )
+                        })?;
                 }
             }
         }
@@ -835,7 +868,8 @@ impl SirPipeline {
                         },
                     });
                 } else {
-                    let _ = self.finish_bulk_scan_success(
+                    let symbol_id = item.persisted.symbol_id.clone();
+                    self.finish_bulk_scan_success(
                         store,
                         PersistedSuccessfulGeneration {
                             intent_id: item.persisted.intent_id.clone(),
@@ -851,7 +885,10 @@ impl SirPipeline {
                         print_sir,
                         out,
                         None,
-                    )?;
+                    )
+                    .with_context(|| {
+                        format!("failed to finalize bulk-scan vector stage for {symbol_id}")
+                    })?;
                 }
             }
 
@@ -863,7 +900,8 @@ impl SirPipeline {
                     &mut stats,
                     print_sir,
                     out,
-                )?;
+                )
+                .context("failed to flush buffered bulk-scan embeddings")?;
             }
         }
 
@@ -874,7 +912,8 @@ impl SirPipeline {
             &mut stats,
             print_sir,
             out,
-        )?;
+        )
+        .context("failed to flush remaining bulk-scan embeddings")?;
 
         tracing::info!(
             embedded = embedded_symbols,
@@ -895,7 +934,8 @@ impl SirPipeline {
                 out,
                 commit_hash.as_deref(),
                 generation_pass,
-            )?;
+            )
+            .with_context(|| format!("failed to upsert bulk-scan file rollup for {file_path}"))?;
         }
 
         Ok(stats)
