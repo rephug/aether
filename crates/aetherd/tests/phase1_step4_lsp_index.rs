@@ -52,6 +52,7 @@ vector_backend = "sqlite"
         force: false,
         full: false,
         deep: false,
+        turbo_concurrency: None,
         dry_run: false,
         sir_concurrency: 2,
         lifecycle_logs: true,

@@ -56,6 +56,7 @@ pub struct IndexerConfig {
     pub force: bool,
     pub full: bool,
     pub deep: bool,
+    pub turbo_concurrency: Option<usize>,
     pub dry_run: bool,
     pub sir_concurrency: usize,
     pub lifecycle_logs: bool,
@@ -656,37 +657,25 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
         );
     }
 
-    for (file_path, symbols) in symbols_by_file {
-        if symbols.is_empty() {
-            continue;
-        }
-        let max_priority = symbols
-            .iter()
-            .filter_map(|symbol| priority_scores.get(symbol.id.as_str()).copied())
-            .fold(0.0_f64, f64::max);
-        let event = SymbolChangeEvent {
-            file_path,
-            language: symbols[0].language,
-            added: Vec::new(),
-            removed: Vec::new(),
-            updated: symbols,
-        };
-        if let Err(err) = sir_pipeline.process_event_with_priority_and_pass(
-            &store,
-            &event,
-            config.force,
-            config.print_sir,
-            &mut stdout,
-            Some(max_priority),
-            SIR_GENERATION_PASS_SCAN,
-        ) {
-            tracing::error!(
-                file_path = %event.file_path,
-                error = %err,
-                "Scan pass SIR processing error"
-            );
-        }
+    let mut all_scan_symbols = Vec::with_capacity(scan_symbol_count);
+    for symbols in symbols_by_file.into_values() {
+        all_scan_symbols.extend(symbols);
     }
+
+    let scan_stats = sir_pipeline.process_bulk_scan(
+        &store,
+        all_scan_symbols,
+        &priority_scores,
+        config.force,
+        SIR_GENERATION_PASS_SCAN,
+        config.print_sir,
+        &mut stdout,
+    )?;
+    tracing::info!(
+        successes = scan_stats.success_count,
+        failures = scan_stats.failure_count,
+        "Bulk scan complete"
+    );
 
     let workspace_config = ensure_workspace_config(&config.workspace)
         .context("failed to load workspace config for quality passes")?;
@@ -1905,9 +1894,13 @@ fn initialize_full_indexer(
     observer.seed_from_disk()?;
 
     let store = SqliteStore::open(&config.workspace).context("failed to initialize local store")?;
+    let scan_concurrency = config
+        .turbo_concurrency
+        .unwrap_or(config.sir_concurrency)
+        .max(1);
     let sir_pipeline = SirPipeline::new(
         config.workspace.clone(),
-        config.sir_concurrency,
+        scan_concurrency,
         ProviderOverrides {
             provider: config.inference_provider,
             model: config.inference_model.clone(),

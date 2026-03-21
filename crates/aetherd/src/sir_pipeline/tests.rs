@@ -17,6 +17,8 @@ mod tests {
     #[derive(Clone)]
     struct CountingEmbeddingProvider {
         calls: Arc<AtomicUsize>,
+        batch_calls: Arc<AtomicUsize>,
+        batch_sizes: Arc<Mutex<Vec<usize>>>,
         purposes: Arc<Mutex<Vec<EmbeddingPurpose>>>,
     }
 
@@ -39,6 +41,20 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.purposes.lock().expect("purposes mutex").push(purpose);
             Ok(vec![1.0, 0.0])
+        }
+
+        async fn embed_texts_with_purpose(
+            &self,
+            texts: &[&str],
+            purpose: EmbeddingPurpose,
+        ) -> std::result::Result<Vec<Vec<f32>>, InferError> {
+            self.batch_calls.fetch_add(1, Ordering::SeqCst);
+            self.batch_sizes
+                .lock()
+                .expect("batch sizes mutex")
+                .push(texts.len());
+            self.purposes.lock().expect("purposes mutex").push(purpose);
+            Ok(vec![vec![1.0, 0.0]; texts.len()])
         }
     }
 
@@ -218,14 +234,25 @@ vector_backend = "sqlite"
     }
 
     fn build_write_pipeline(workspace: &Path, provider: Arc<dyn InferenceProvider>) -> SirPipeline {
+        build_write_pipeline_with_embeddings(workspace, provider, None)
+    }
+
+    fn build_write_pipeline_with_embeddings(
+        workspace: &Path,
+        provider: Arc<dyn InferenceProvider>,
+        embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
+    ) -> SirPipeline {
+        let embedding_identity = embedding_provider
+            .as_ref()
+            .map(|_| ("test_embedding".to_owned(), "test-model".to_owned()));
         SirPipeline::new_with_provider_and_embeddings(
             workspace.to_path_buf(),
             1,
             provider,
             "test_provider",
             "test_model",
-            None,
-            None,
+            embedding_provider,
+            embedding_identity,
             None,
             None,
         )
@@ -430,11 +457,15 @@ enabled = false
         }
 
         let calls = Arc::new(AtomicUsize::new(0));
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
         let purposes = Arc::new(Mutex::new(Vec::new()));
         let pipeline = build_embeddings_only_pipeline(
             workspace,
             Arc::new(CountingEmbeddingProvider {
                 calls: Arc::clone(&calls),
+                batch_calls: Arc::clone(&batch_calls),
+                batch_sizes: Arc::clone(&batch_sizes),
                 purposes: Arc::clone(&purposes),
             }),
         );
@@ -445,6 +476,8 @@ enabled = false
             .expect("run embeddings-only pass");
 
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 0);
+        assert!(batch_sizes.lock().expect("batch sizes mutex").is_empty());
         assert_eq!(
             purposes.lock().expect("purposes mutex").as_slice(),
             &[
@@ -484,11 +517,15 @@ enabled = false
         upsert_existing_embedding(workspace, "sym-b", hashes["sym-b"].as_str());
 
         let calls = Arc::new(AtomicUsize::new(0));
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
         let purposes = Arc::new(Mutex::new(Vec::new()));
         let pipeline = build_embeddings_only_pipeline(
             workspace,
             Arc::new(CountingEmbeddingProvider {
                 calls: Arc::clone(&calls),
+                batch_calls: Arc::clone(&batch_calls),
+                batch_sizes: Arc::clone(&batch_sizes),
                 purposes: Arc::clone(&purposes),
             }),
         );
@@ -499,6 +536,8 @@ enabled = false
             .expect("run embeddings-only pass");
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 0);
+        assert!(batch_sizes.lock().expect("batch sizes mutex").is_empty());
         assert_eq!(
             purposes.lock().expect("purposes mutex").as_slice(),
             &[EmbeddingPurpose::Document]
@@ -527,11 +566,15 @@ enabled = false
         seed_sir(&store, "sym-with-sir", &sir);
 
         let calls = Arc::new(AtomicUsize::new(0));
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
         let purposes = Arc::new(Mutex::new(Vec::new()));
         let pipeline = build_embeddings_only_pipeline(
             workspace,
             Arc::new(CountingEmbeddingProvider {
                 calls: Arc::clone(&calls),
+                batch_calls: Arc::clone(&batch_calls),
+                batch_sizes: Arc::clone(&batch_sizes),
                 purposes: Arc::clone(&purposes),
             }),
         );
@@ -550,6 +593,8 @@ enabled = false
             .expect("read missing embedding meta");
         assert!(missing.is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 0);
+        assert!(batch_sizes.lock().expect("batch sizes mutex").is_empty());
         assert_eq!(
             purposes.lock().expect("purposes mutex").as_slice(),
             &[EmbeddingPurpose::Document]
@@ -589,11 +634,15 @@ enabled = false
         let before_edges = count_table_rows(workspace, "symbol_edges");
 
         let calls = Arc::new(AtomicUsize::new(0));
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
         let purposes = Arc::new(Mutex::new(Vec::new()));
         let pipeline = build_embeddings_only_pipeline(
             workspace,
             Arc::new(CountingEmbeddingProvider {
                 calls: Arc::clone(&calls),
+                batch_calls: Arc::clone(&batch_calls),
+                batch_sizes: Arc::clone(&batch_sizes),
                 purposes: Arc::clone(&purposes),
             }),
         );
@@ -604,6 +653,8 @@ enabled = false
             .expect("run embeddings-only pass");
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 0);
+        assert!(batch_sizes.lock().expect("batch sizes mutex").is_empty());
         assert_eq!(
             purposes.lock().expect("purposes mutex").as_slice(),
             &[EmbeddingPurpose::Document, EmbeddingPurpose::Document]
@@ -776,5 +827,107 @@ impl Store {
             stored_sir.dependencies,
             vec!["Record".to_owned(), "helper".to_owned()]
         );
+    }
+
+    #[test]
+    fn process_bulk_scan_batches_embeddings_and_completes_intents() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_only_config(workspace);
+        fs::create_dir_all(workspace.join("src")).expect("create src");
+
+        let mut source = String::new();
+        for idx in 0..105 {
+            source.push_str(format!("pub fn symbol_{idx}() -> i32 {{ {idx} }}\n").as_str());
+        }
+        fs::write(workspace.join("src/lib.rs"), &source).expect("write source");
+
+        let mut extractor = SymbolExtractor::new().expect("symbol extractor");
+        let extracted = extractor
+            .extract_with_edges_from_path(Path::new("src/lib.rs"), &source)
+            .expect("extract source");
+        let symbols = extracted.symbols;
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        for symbol in &symbols {
+            store
+                .upsert_symbol(demo_symbol_record_with_kind(
+                    symbol.id.as_str(),
+                    symbol.qualified_name.as_str(),
+                    symbol.kind.as_str(),
+                    symbol.file_path.as_str(),
+                ))
+                .expect("upsert symbol");
+        }
+
+        let priority_scores = symbols
+            .iter()
+            .enumerate()
+            .map(|(idx, symbol)| (symbol.id.clone(), idx as f64))
+            .collect::<HashMap<_, _>>();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let purposes = Arc::new(Mutex::new(Vec::new()));
+        let pipeline = build_write_pipeline_with_embeddings(
+            workspace,
+            Arc::new(FixedInferenceProvider { sir: demo_sir() }),
+            Some(Arc::new(CountingEmbeddingProvider {
+                calls: Arc::clone(&calls),
+                batch_calls: Arc::clone(&batch_calls),
+                batch_sizes: Arc::clone(&batch_sizes),
+                purposes: Arc::clone(&purposes),
+            })),
+        )
+        .with_skip_surreal_sync(true);
+
+        let mut out = Vec::new();
+        let stats = pipeline
+            .process_bulk_scan(
+                &store,
+                symbols.clone(),
+                &priority_scores,
+                false,
+                SIR_GENERATION_PASS_SCAN,
+                false,
+                &mut out,
+            )
+            .expect("process bulk scan");
+
+        assert_eq!(stats.success_count, symbols.len());
+        assert_eq!(stats.failure_count, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            batch_sizes.lock().expect("batch sizes mutex").as_slice(),
+            &[100, 5]
+        );
+        assert_eq!(
+            purposes.lock().expect("purposes mutex").as_slice(),
+            &[EmbeddingPurpose::Document, EmbeddingPurpose::Document]
+        );
+        assert!(store
+            .get_incomplete_intents()
+            .expect("load incomplete intents")
+            .is_empty());
+        assert_eq!(
+            store
+                .count_intents_by_status()
+                .expect("count intents")
+                .get("complete"),
+            Some(&symbols.len())
+        );
+        for symbol in &symbols {
+            assert!(store
+                .get_symbol_embedding_meta(symbol.id.as_str())
+                .expect("read embedding meta")
+                .is_some());
+        }
+
+        let rollup_id = synthetic_file_sir_id("rust", "src/lib.rs");
+        assert!(store
+            .read_sir_blob(rollup_id.as_str())
+            .expect("read rollup blob")
+            .is_some());
     }
 }

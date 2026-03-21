@@ -53,6 +53,8 @@ const INFERENCE_MAX_RETRIES: usize = 2;
 const INFERENCE_ATTEMPT_TIMEOUT_SECS: u64 = 90;
 const INFERENCE_BACKOFF_BASE_MS: u64 = 200;
 const INFERENCE_BACKOFF_MAX_MS: u64 = 2_000;
+const EMBED_BATCH_SIZE: usize = 100;
+const BULK_SCAN_VECTOR_BATCH_SIZE: usize = 50;
 pub(crate) const MAX_SYMBOL_TEXT_CHARS: usize = 10_000;
 pub const SIR_GENERATION_PASS_SCAN: &str = "scan";
 pub const SIR_GENERATION_PASS_TRIAGE: &str = "triage";
@@ -125,6 +127,26 @@ pub struct SirPipeline {
 struct PreparedCandidateJobs {
     jobs: Vec<SirJob>,
     skipped_existing: usize,
+}
+
+struct PersistedSuccessfulGeneration {
+    intent_id: String,
+    symbol_id: String,
+    file_path: String,
+    sir_hash: String,
+    canonical_json: String,
+    provider_name: String,
+    embedding_needed: Option<EmbeddingNeeded>,
+}
+
+struct PendingBulkEmbedding {
+    persisted: PersistedSuccessfulGeneration,
+    input: EmbeddingInput,
+}
+
+struct BufferedEmbeddingWrite {
+    record: SymbolEmbeddingRecord,
+    persisted: PersistedSuccessfulGeneration,
 }
 
 impl SirPipeline {
@@ -613,6 +635,312 @@ impl SirPipeline {
         Ok(stats)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_bulk_scan(
+        &self,
+        store: &SqliteStore,
+        symbols: Vec<Symbol>,
+        priority_scores: &HashMap<String, f64>,
+        force: bool,
+        generation_pass: &str,
+        print_sir: bool,
+        out: &mut dyn Write,
+    ) -> Result<ProcessEventStats> {
+        let commit_hash = resolve_workspace_head_commit(&self.workspace_root);
+        let total_symbols = symbols.len();
+        let mut touched_files = BTreeMap::<String, Language>::new();
+        let mut intents_by_file = BTreeMap::<String, Vec<String>>::new();
+        let mut jobs = Vec::with_capacity(total_symbols);
+        let mut pending_embeddings = Vec::new();
+        let mut embedding_buffer = Vec::with_capacity(BULK_SCAN_VECTOR_BATCH_SIZE);
+        let mut stats = ProcessEventStats::default();
+        let mut skipped_existing = 0usize;
+
+        for symbol in symbols {
+            let symbol_id = symbol.id.clone();
+            let qualified_name = symbol.qualified_name.clone();
+            let file_path = symbol.file_path.clone();
+            let language = symbol.language;
+            touched_files.entry(file_path.clone()).or_insert(language);
+
+            if !force
+                && self
+                    .should_skip_sir_generation(store, &symbol)
+                    .with_context(|| {
+                        format!("failed to evaluate bulk-scan skip state for {}", symbol.id)
+                    })?
+            {
+                skipped_existing += 1;
+                if print_sir {
+                    writeln!(
+                        out,
+                        "SIR_SKIPPED symbol_id={} reason=already_exists",
+                        symbol.id
+                    )
+                    .context("failed to write skipped SIR print line")?;
+                }
+                continue;
+            }
+
+            let priority_score = Some(
+                priority_scores
+                    .get(symbol_id.as_str())
+                    .copied()
+                    .unwrap_or(0.0),
+            );
+            match build_job(&self.workspace_root, symbol, priority_score, None) {
+                Ok(job) => jobs.push(job),
+                Err(err) => {
+                    stats.failure_count += 1;
+                    tracing::warn!(
+                        symbol_id = %symbol_id,
+                        qualified_name = %qualified_name,
+                        file_path = %file_path,
+                        error = %err,
+                        "failed to build bulk scan SIR job; skipping symbol"
+                    );
+                }
+            }
+        }
+
+        tracing::info!(
+            built = jobs.len(),
+            total = total_symbols,
+            skipped = skipped_existing,
+            file_count = touched_files.len(),
+            "Building SIR jobs complete"
+        );
+        tracing::info!(
+            job_count = jobs.len(),
+            concurrency = self.sir_concurrency,
+            provider = %self.provider_name,
+            model = %self.model_name,
+            "Submitting bulk scan jobs"
+        );
+
+        let results = if jobs.is_empty() {
+            Vec::new()
+        } else {
+            self.runtime
+                .block_on(generate_sir_jobs(
+                    self.provider.clone(),
+                    self.tiered_parse_fallback_provider.clone(),
+                    self.tiered_parse_fallback_model.clone(),
+                    jobs,
+                    self.sir_concurrency,
+                    self.inference_timeout_secs,
+                ))
+                .context("failed to submit bulk scan SIR generation jobs")?
+        };
+
+        for result in results {
+            match result {
+                SirGenerationOutcome::Success(generated) => {
+                    let Some(persisted) = self
+                        .persist_successful_generation_sqlite(
+                            store,
+                            &generated,
+                            generation_pass,
+                            commit_hash.as_deref(),
+                        )
+                        .with_context(|| {
+                            format!(
+                                "failed to persist bulk-scan SIR result for {}",
+                                generated.symbol.id
+                            )
+                        })?
+                    else {
+                        stats.failure_count += 1;
+                        continue;
+                    };
+
+                    if let Some(needed) = persisted.embedding_needed.as_ref() {
+                        pending_embeddings.push(PendingBulkEmbedding {
+                            input: EmbeddingInput {
+                                symbol_id: persisted.symbol_id.clone(),
+                                sir_hash: persisted.sir_hash.clone(),
+                                canonical_json: persisted.canonical_json.clone(),
+                                provider: needed.provider.clone(),
+                                model: needed.model.clone(),
+                            },
+                            persisted,
+                        });
+                    } else {
+                        let symbol_id = persisted.symbol_id.clone();
+                        if self
+                            .finish_bulk_scan_success(
+                                store,
+                                persisted,
+                                &mut intents_by_file,
+                                &mut stats,
+                                print_sir,
+                                out,
+                                None,
+                            )
+                            .with_context(|| {
+                                format!(
+                                    "failed to finalize bulk-scan vector stage for {}",
+                                    symbol_id
+                                )
+                            })?
+                        {
+                            // Counted in helper.
+                        }
+                    }
+                }
+                SirGenerationOutcome::Failure(failed) => {
+                    stats.failure_count += 1;
+                    let symbol_id = failed.symbol.id.clone();
+                    self.handle_failed_generation(store, *failed, generation_pass, print_sir, out)
+                        .with_context(|| {
+                            format!(
+                                "failed to record bulk-scan generation failure for {}",
+                                symbol_id
+                            )
+                        })?;
+                }
+            }
+        }
+
+        let mut embedded_symbols = 0usize;
+        let mut embedding_calls = 0usize;
+        for chunk in pending_embeddings.chunks(EMBED_BATCH_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            embedding_calls += 1;
+            let texts = chunk
+                .iter()
+                .map(|item| item.input.canonical_json.as_str())
+                .collect::<Vec<_>>();
+            let embeddings = match self.batch_embed_texts(&texts, EmbeddingPurpose::Document) {
+                Ok(embeddings) => embeddings,
+                Err(err) => {
+                    let message = format!("{err:#}");
+                    tracing::error!(
+                        error = %err,
+                        chunk_size = chunk.len(),
+                        "batch embedding failed during bulk scan"
+                    );
+                    for item in chunk {
+                        self.mark_intent_failed_safely(
+                            store,
+                            item.persisted.intent_id.as_str(),
+                            message.as_str(),
+                        );
+                        stats.failure_count += 1;
+                    }
+                    continue;
+                }
+            };
+
+            let mut records_by_symbol = SirPipeline::build_embedding_records(
+                &chunk
+                    .iter()
+                    .map(|item| EmbeddingInput {
+                        symbol_id: item.input.symbol_id.clone(),
+                        sir_hash: item.input.sir_hash.clone(),
+                        canonical_json: item.input.canonical_json.clone(),
+                        provider: item.input.provider.clone(),
+                        model: item.input.model.clone(),
+                    })
+                    .collect::<Vec<_>>(),
+                embeddings,
+            )
+            .into_iter()
+            .map(|record| (record.symbol_id.clone(), record))
+            .collect::<HashMap<_, _>>();
+
+            embedded_symbols += records_by_symbol.len();
+
+            for item in chunk {
+                if let Some(record) = records_by_symbol.remove(item.persisted.symbol_id.as_str()) {
+                    embedding_buffer.push(BufferedEmbeddingWrite {
+                        record,
+                        persisted: PersistedSuccessfulGeneration {
+                            intent_id: item.persisted.intent_id.clone(),
+                            symbol_id: item.persisted.symbol_id.clone(),
+                            file_path: item.persisted.file_path.clone(),
+                            sir_hash: item.persisted.sir_hash.clone(),
+                            canonical_json: item.persisted.canonical_json.clone(),
+                            provider_name: item.persisted.provider_name.clone(),
+                            embedding_needed: None,
+                        },
+                    });
+                } else {
+                    let symbol_id = item.persisted.symbol_id.clone();
+                    self.finish_bulk_scan_success(
+                        store,
+                        PersistedSuccessfulGeneration {
+                            intent_id: item.persisted.intent_id.clone(),
+                            symbol_id: item.persisted.symbol_id.clone(),
+                            file_path: item.persisted.file_path.clone(),
+                            sir_hash: item.persisted.sir_hash.clone(),
+                            canonical_json: item.persisted.canonical_json.clone(),
+                            provider_name: item.persisted.provider_name.clone(),
+                            embedding_needed: None,
+                        },
+                        &mut intents_by_file,
+                        &mut stats,
+                        print_sir,
+                        out,
+                        None,
+                    )
+                    .with_context(|| {
+                        format!("failed to finalize bulk-scan vector stage for {symbol_id}")
+                    })?;
+                }
+            }
+
+            if embedding_buffer.len() >= BULK_SCAN_VECTOR_BATCH_SIZE {
+                self.flush_bulk_scan_embedding_buffer(
+                    store,
+                    &mut embedding_buffer,
+                    &mut intents_by_file,
+                    &mut stats,
+                    print_sir,
+                    out,
+                )
+                .context("failed to flush buffered bulk-scan embeddings")?;
+            }
+        }
+
+        self.flush_bulk_scan_embedding_buffer(
+            store,
+            &mut embedding_buffer,
+            &mut intents_by_file,
+            &mut stats,
+            print_sir,
+            out,
+        )
+        .context("failed to flush remaining bulk-scan embeddings")?;
+
+        tracing::info!(
+            embedded = embedded_symbols,
+            batch_calls = embedding_calls,
+            "Embedded bulk scan symbols"
+        );
+
+        for (_file_path, mut intent_ids) in intents_by_file {
+            self.complete_graph_stage_without_sync(store, &mut intent_ids);
+        }
+
+        for (file_path, language) in touched_files {
+            self.upsert_file_rollup(
+                store,
+                file_path.as_str(),
+                language,
+                print_sir,
+                out,
+                commit_hash.as_deref(),
+                generation_pass,
+            )
+            .with_context(|| format!("failed to upsert bulk-scan file rollup for {file_path}"))?;
+        }
+
+        Ok(stats)
+    }
+
     fn process_removed_symbols(
         &self,
         store: &SqliteStore,
@@ -903,6 +1231,71 @@ impl SirPipeline {
         print_sir: bool,
         out: &mut dyn Write,
     ) -> Result<Option<String>> {
+        let Some(persisted) = self.persist_successful_generation_sqlite(
+            store,
+            &generated,
+            generation_pass,
+            commit_hash,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        if let Err(err) = self.refresh_embedding_if_needed(
+            &generated.symbol.id,
+            &persisted.sir_hash,
+            &persisted.canonical_json,
+            print_sir,
+            out,
+            None,
+        ) {
+            let message = format!("{err:#}");
+            self.mark_intent_failed_safely(store, persisted.intent_id.as_str(), message.as_str());
+            tracing::error!(
+                symbol_id = %generated.symbol.id,
+                error = %err,
+                "embedding refresh error"
+            );
+            return Ok(None);
+        }
+
+        if let Err(err) =
+            store.update_intent_status(&persisted.intent_id, WriteIntentStatus::VectorDone)
+        {
+            let message = format!("{err:#}");
+            self.mark_intent_failed_safely(store, persisted.intent_id.as_str(), message.as_str());
+            tracing::error!(
+                symbol_id = %generated.symbol.id,
+                error = %err,
+                "failed to update write intent status to vector_done"
+            );
+            return Ok(None);
+        }
+
+        if print_sir {
+            writeln!(
+                out,
+                "SIR_STORED symbol_id={} sir_hash={} provider={}",
+                generated.symbol.id, persisted.sir_hash, generated.provider_name
+            )
+            .context("failed to write SIR print line")?;
+        }
+
+        tracing::debug!(
+            symbol_id = %generated.symbol.id,
+            "SIR generated successfully"
+        );
+
+        Ok(Some(persisted.intent_id))
+    }
+
+    fn persist_successful_generation_sqlite(
+        &self,
+        store: &SqliteStore,
+        generated: &GeneratedSir,
+        generation_pass: &str,
+        commit_hash: Option<&str>,
+    ) -> Result<Option<PersistedSuccessfulGeneration>> {
         self.record_generation_quality(generated.sir.confidence);
 
         let (sir, canonical_json, sir_hash_value) =
@@ -1033,52 +1426,34 @@ impl SirPipeline {
             return Ok(None);
         }
 
-        if let Err(err) = self.refresh_embedding_if_needed(
-            &generated.symbol.id,
-            &sir_hash_value,
-            &canonical_json,
-            print_sir,
-            out,
-            None,
-        ) {
-            let message = format!("{err:#}");
-            self.mark_intent_failed_safely(store, intent.intent_id.as_str(), message.as_str());
-            tracing::error!(
-                symbol_id = %generated.symbol.id,
-                error = %err,
-                "embedding refresh error"
-            );
-            return Ok(None);
-        }
+        let embedding_needed =
+            match self.check_embedding_needed(&generated.symbol.id, &sir_hash_value, None) {
+                Ok(needed) => needed,
+                Err(err) => {
+                    let message = format!("{err:#}");
+                    self.mark_intent_failed_safely(
+                        store,
+                        intent.intent_id.as_str(),
+                        message.as_str(),
+                    );
+                    tracing::error!(
+                        symbol_id = %generated.symbol.id,
+                        error = %err,
+                        "failed to determine whether embedding refresh is needed"
+                    );
+                    return Ok(None);
+                }
+            };
 
-        if let Err(err) =
-            store.update_intent_status(&intent.intent_id, WriteIntentStatus::VectorDone)
-        {
-            let message = format!("{err:#}");
-            self.mark_intent_failed_safely(store, intent.intent_id.as_str(), message.as_str());
-            tracing::error!(
-                symbol_id = %generated.symbol.id,
-                error = %err,
-                "failed to update write intent status to vector_done"
-            );
-            return Ok(None);
-        }
-
-        if print_sir {
-            writeln!(
-                out,
-                "SIR_STORED symbol_id={} sir_hash={} provider={}",
-                generated.symbol.id, sir_hash_value, generated.provider_name
-            )
-            .context("failed to write SIR print line")?;
-        }
-
-        tracing::debug!(
-            symbol_id = %generated.symbol.id,
-            "SIR generated successfully"
-        );
-
-        Ok(Some(intent.intent_id))
+        Ok(Some(PersistedSuccessfulGeneration {
+            intent_id: intent.intent_id,
+            symbol_id: generated.symbol.id.clone(),
+            file_path: generated.symbol.file_path.clone(),
+            sir_hash: sir_hash_value,
+            canonical_json,
+            provider_name: generated.provider_name.clone(),
+            embedding_needed,
+        }))
     }
 
     fn handle_failed_generation(
@@ -1253,6 +1628,108 @@ impl SirPipeline {
                 "SIR processing complete"
             );
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_bulk_scan_success(
+        &self,
+        store: &SqliteStore,
+        persisted: PersistedSuccessfulGeneration,
+        intents_by_file: &mut BTreeMap<String, Vec<String>>,
+        stats: &mut ProcessEventStats,
+        print_sir: bool,
+        out: &mut dyn Write,
+        embedding_record: Option<&SymbolEmbeddingRecord>,
+    ) -> Result<bool> {
+        if let Err(err) =
+            store.update_intent_status(&persisted.intent_id, WriteIntentStatus::VectorDone)
+        {
+            let message = format!("{err:#}");
+            self.mark_intent_failed_safely(store, persisted.intent_id.as_str(), message.as_str());
+            tracing::error!(
+                symbol_id = %persisted.symbol_id,
+                error = %err,
+                "failed to update write intent status to vector_done"
+            );
+            stats.failure_count += 1;
+            return Ok(false);
+        }
+
+        if print_sir && let Some(record) = embedding_record {
+            writeln!(
+                out,
+                "EMBEDDING_STORED symbol_id={} provider={} model={}",
+                record.symbol_id, record.provider, record.model
+            )
+            .context("failed to write embedding print line")?;
+        }
+
+        if print_sir {
+            writeln!(
+                out,
+                "SIR_STORED symbol_id={} sir_hash={} provider={}",
+                persisted.symbol_id, persisted.sir_hash, persisted.provider_name
+            )
+            .context("failed to write SIR print line")?;
+        }
+
+        intents_by_file
+            .entry(persisted.file_path)
+            .or_default()
+            .push(persisted.intent_id);
+        stats.success_count += 1;
+        Ok(true)
+    }
+
+    fn flush_bulk_scan_embedding_buffer(
+        &self,
+        store: &SqliteStore,
+        buffer: &mut Vec<BufferedEmbeddingWrite>,
+        intents_by_file: &mut BTreeMap<String, Vec<String>>,
+        stats: &mut ProcessEventStats,
+        print_sir: bool,
+        out: &mut dyn Write,
+    ) -> Result<()> {
+        if buffer.is_empty() {
+            return Ok(());
+        }
+
+        let pending = std::mem::take(buffer);
+        let records = pending
+            .iter()
+            .map(|item| item.record.clone())
+            .collect::<Vec<_>>();
+        if let Err(err) = self.flush_embedding_batch(records) {
+            let message = format!("{err:#}");
+            tracing::error!(
+                error = %err,
+                record_count = pending.len(),
+                "failed to flush bulk scan embedding batch"
+            );
+            for item in pending {
+                self.mark_intent_failed_safely(
+                    store,
+                    item.persisted.intent_id.as_str(),
+                    message.as_str(),
+                );
+                stats.failure_count += 1;
+            }
+            return Ok(());
+        }
+
+        for item in pending {
+            let _ = self.finish_bulk_scan_success(
+                store,
+                item.persisted,
+                intents_by_file,
+                stats,
+                print_sir,
+                out,
+                Some(&item.record),
+            )?;
+        }
+
+        Ok(())
     }
 
     fn mark_intent_failed_safely(&self, store: &SqliteStore, intent_id: &str, message: &str) {
