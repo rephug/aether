@@ -296,9 +296,27 @@ async fn poll_and_download_all(
 
         let mut still_pending = Vec::with_capacity(pending.len());
         for job in pending {
-            match provider.poll(&job.job_ids).await.with_context(|| {
-                format!("failed to poll batch chunk {}", job.input_path.display())
-            })? {
+            let poll_status =
+                match provider.poll(&job.job_ids).await.with_context(|| {
+                    format!("failed to poll batch chunk {}", job.input_path.display())
+                }) {
+                    Ok(status) => status,
+                    Err(err) => {
+                        tracing::error!(
+                            chunk = job.chunk_index + 1,
+                            error = %err,
+                            "batch chunk poll failed"
+                        );
+                        failed.push(FailedBatchJob {
+                            chunk_index: job.chunk_index,
+                            input_path: job.input_path,
+                            message: format!("{err:#}"),
+                        });
+                        continue;
+                    }
+                };
+
+            match poll_status {
                 BatchPollStatus::Completed => {
                     tracing::info!(
                         chunk = job.chunk_index + 1,
