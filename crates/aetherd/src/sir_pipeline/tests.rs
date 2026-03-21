@@ -101,6 +101,15 @@ mod tests {
         ) -> std::result::Result<SirAnnotation, InferError> {
             Ok(self.sir.clone())
         }
+
+        async fn generate_sir_from_prompt(
+            &self,
+            _prompt: &str,
+            _context: &SirContext,
+            _deep_mode: bool,
+        ) -> std::result::Result<SirAnnotation, InferError> {
+            Ok(self.sir.clone())
+        }
     }
 
     fn write_embeddings_only_config(workspace: &Path) {
@@ -257,6 +266,25 @@ vector_backend = "sqlite"
             None,
         )
         .expect("build pipeline")
+    }
+
+    fn make_quality_batch_items(symbols: &[Symbol]) -> Vec<QualityBatchItem> {
+        symbols
+            .iter()
+            .cloned()
+            .map(|symbol| QualityBatchItem {
+                symbol,
+                priority_score: 0.9,
+                enrichment: SirEnrichmentContext {
+                    file_intent: None,
+                    neighbor_intents: Vec::new(),
+                    baseline_sir: None,
+                    priority_reason: "test batch".to_owned(),
+                    caller_contract_clauses: Vec::new(),
+                },
+                use_cot: false,
+            })
+            .collect()
     }
 
     fn upsert_existing_embedding(workspace: &Path, symbol_id: &str, sir_hash: &str) {
@@ -893,6 +921,101 @@ impl Store {
                 &mut out,
             )
             .expect("process bulk scan");
+
+        assert_eq!(stats.success_count, symbols.len());
+        assert_eq!(stats.failure_count, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            batch_sizes.lock().expect("batch sizes mutex").as_slice(),
+            &[100, 5]
+        );
+        assert_eq!(
+            purposes.lock().expect("purposes mutex").as_slice(),
+            &[EmbeddingPurpose::Document, EmbeddingPurpose::Document]
+        );
+        assert!(store
+            .get_incomplete_intents()
+            .expect("load incomplete intents")
+            .is_empty());
+        assert_eq!(
+            store
+                .count_intents_by_status()
+                .expect("count intents")
+                .get("complete"),
+            Some(&symbols.len())
+        );
+        for symbol in &symbols {
+            assert!(store
+                .get_symbol_embedding_meta(symbol.id.as_str())
+                .expect("read embedding meta")
+                .is_some());
+        }
+
+        let rollup_id = synthetic_file_sir_id("rust", "src/lib.rs");
+        assert!(store
+            .read_sir_blob(rollup_id.as_str())
+            .expect("read rollup blob")
+            .is_some());
+    }
+
+    #[test]
+    fn process_quality_batch_batches_embeddings_and_completes_intents() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_only_config(workspace);
+        fs::create_dir_all(workspace.join("src")).expect("create src");
+
+        let mut source = String::new();
+        for idx in 0..105 {
+            source.push_str(format!("pub fn symbol_{idx}() -> i32 {{ {idx} }}\n").as_str());
+        }
+        fs::write(workspace.join("src/lib.rs"), &source).expect("write source");
+
+        let mut extractor = SymbolExtractor::new().expect("symbol extractor");
+        let extracted = extractor
+            .extract_with_edges_from_path(Path::new("src/lib.rs"), &source)
+            .expect("extract source");
+        let symbols = extracted.symbols;
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        for symbol in &symbols {
+            store
+                .upsert_symbol(demo_symbol_record_with_kind(
+                    symbol.id.as_str(),
+                    symbol.qualified_name.as_str(),
+                    symbol.kind.as_str(),
+                    symbol.file_path.as_str(),
+                ))
+                .expect("upsert symbol");
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let purposes = Arc::new(Mutex::new(Vec::new()));
+        let pipeline = build_write_pipeline_with_embeddings(
+            workspace,
+            Arc::new(FixedInferenceProvider { sir: demo_sir() }),
+            Some(Arc::new(CountingEmbeddingProvider {
+                calls: Arc::clone(&calls),
+                batch_calls: Arc::clone(&batch_calls),
+                batch_sizes: Arc::clone(&batch_sizes),
+                purposes: Arc::clone(&purposes),
+            })),
+        )
+        .with_skip_surreal_sync(true);
+
+        let mut out = Vec::new();
+        let stats = pipeline
+            .process_quality_batch(
+                &store,
+                make_quality_batch_items(&symbols),
+                SIR_GENERATION_PASS_TRIAGE,
+                false,
+                &mut out,
+            )
+            .expect("process quality batch");
 
         assert_eq!(stats.success_count, symbols.len());
         assert_eq!(stats.failure_count, 0);

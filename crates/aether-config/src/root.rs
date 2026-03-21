@@ -375,8 +375,8 @@ mod tests {
         DEFAULT_VERIFY_CONTAINER_WORKDIR, DEFAULT_VERIFY_MICROVM_MEMORY_MIB,
         DEFAULT_VERIFY_MICROVM_RUNTIME, DEFAULT_VERIFY_MICROVM_VCPU_COUNT,
         DEFAULT_VERIFY_MICROVM_WORKDIR, EmbeddingProviderKind, EmbeddingVectorBackend,
-        GraphBackend, InferenceProviderKind, SearchRerankerKind, VerifyMode, WatcherConfig,
-        health::default_health_score_stale_ref_patterns,
+        GEMINI_DEFAULT_CONCURRENCY, GraphBackend, InferenceProviderKind, SearchRerankerKind,
+        VerifyMode, WatcherConfig, health::default_health_score_stale_ref_patterns,
     };
 
     const LEGACY_COZO_GRAPH_STORE: &str = concat!("Cozo", "GraphStore");
@@ -396,14 +396,20 @@ mod tests {
         assert_eq!(config.sir_quality.triage_priority_threshold, 0.7);
         assert_eq!(config.sir_quality.triage_confidence_threshold, 0.85);
         assert_eq!(config.sir_quality.triage_max_symbols, 0);
-        assert_eq!(config.sir_quality.triage_concurrency, 4);
+        assert_eq!(
+            config.sir_quality.triage_concurrency,
+            GEMINI_DEFAULT_CONCURRENCY
+        );
         assert_eq!(config.sir_quality.triage_timeout_secs, 180);
         assert!(!config.sir_quality.deep_pass);
         assert_eq!(config.sir_quality.deep_priority_threshold, 0.9);
         assert_eq!(config.sir_quality.deep_confidence_threshold, 0.85);
         assert_eq!(config.sir_quality.deep_max_symbols, 20);
         assert_eq!(config.sir_quality.deep_max_neighbors, 10);
-        assert_eq!(config.sir_quality.deep_concurrency, 4);
+        assert_eq!(
+            config.sir_quality.deep_concurrency,
+            GEMINI_DEFAULT_CONCURRENCY
+        );
         assert_eq!(config.sir_quality.deep_timeout_secs, 180);
         assert!(config.storage.mirror_sir_files);
         assert_eq!(config.storage.graph_backend, GraphBackend::Surreal);
@@ -1136,13 +1142,19 @@ deep_timeout_secs = 0
         assert!(config.sir_quality.triage_pass);
         assert_eq!(config.sir_quality.triage_priority_threshold, 0.25);
         assert_eq!(config.sir_quality.triage_confidence_threshold, 0.5);
-        assert_eq!(config.sir_quality.triage_concurrency, 4);
+        assert_eq!(
+            config.sir_quality.triage_concurrency,
+            GEMINI_DEFAULT_CONCURRENCY
+        );
         assert_eq!(config.sir_quality.triage_timeout_secs, 180);
         assert!(config.sir_quality.deep_pass);
         assert_eq!(config.sir_quality.deep_priority_threshold, 0.95);
         assert_eq!(config.sir_quality.deep_confidence_threshold, 0.8);
         assert_eq!(config.sir_quality.deep_max_symbols, 7);
-        assert_eq!(config.sir_quality.deep_concurrency, 4);
+        assert_eq!(
+            config.sir_quality.deep_concurrency,
+            GEMINI_DEFAULT_CONCURRENCY
+        );
         assert_eq!(config.sir_quality.deep_timeout_secs, 180);
     }
 

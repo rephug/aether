@@ -90,12 +90,14 @@ pub struct QualityBatchItem {
 }
 
 /// Returned by `check_embedding_needed` when a symbol requires a new embedding.
+#[derive(Debug, Clone)]
 pub(crate) struct EmbeddingNeeded {
     pub provider: String,
     pub model: String,
 }
 
 /// Input data for batch embedding record construction.
+#[derive(Debug, Clone)]
 pub(crate) struct EmbeddingInput {
     pub symbol_id: String,
     pub sir_hash: String,
@@ -129,6 +131,7 @@ struct PreparedCandidateJobs {
     skipped_existing: usize,
 }
 
+#[derive(Debug, Clone)]
 struct PersistedSuccessfulGeneration {
     intent_id: String,
     symbol_id: String,
@@ -139,11 +142,13 @@ struct PersistedSuccessfulGeneration {
     embedding_needed: Option<EmbeddingNeeded>,
 }
 
+#[derive(Debug, Clone)]
 struct PendingBulkEmbedding {
     persisted: PersistedSuccessfulGeneration,
     input: EmbeddingInput,
 }
 
+#[derive(Debug, Clone)]
 struct BufferedEmbeddingWrite {
     record: SymbolEmbeddingRecord,
     persisted: PersistedSuccessfulGeneration,
@@ -516,6 +521,7 @@ impl SirPipeline {
         let mut touched_files = BTreeMap::<String, Language>::new();
         let mut intents_by_file = BTreeMap::<String, Vec<String>>::new();
         let mut jobs = Vec::with_capacity(items.len());
+        let mut pending_embeddings = Vec::new();
         let mut stats = ProcessEventStats::default();
 
         for item in items {
@@ -573,37 +579,52 @@ impl SirPipeline {
         let results = if jobs.is_empty() {
             Vec::new()
         } else {
-            self.runtime.block_on(generate_sir_jobs(
-                self.provider.clone(),
-                self.tiered_parse_fallback_provider.clone(),
-                self.tiered_parse_fallback_model.clone(),
-                jobs,
-                self.sir_concurrency,
-                self.inference_timeout_secs,
-            ))?
+            self.runtime
+                .block_on(generate_sir_jobs(
+                    self.provider.clone(),
+                    self.tiered_parse_fallback_provider.clone(),
+                    self.tiered_parse_fallback_model.clone(),
+                    jobs,
+                    self.sir_concurrency,
+                    self.inference_timeout_secs,
+                ))
+                .context("failed to submit batched quality SIR generation jobs")?
         };
 
         for result in results {
             match result {
                 SirGenerationOutcome::Success(generated) => {
-                    let file_path = generated.symbol.file_path.clone();
-                    match self.commit_successful_generation(
+                    let Some(persisted) = self
+                        .persist_successful_generation_sqlite(
+                            store,
+                            &generated,
+                            generation_pass,
+                            commit_hash.as_deref(),
+                        )
+                        .with_context(|| {
+                            format!(
+                                "failed to persist quality-batch SIR result for {}",
+                                generated.symbol.id
+                            )
+                        })?
+                    else {
+                        stats.failure_count += 1;
+                        continue;
+                    };
+
+                    let symbol_id = persisted.symbol_id.clone();
+                    self.enqueue_or_finish_persisted_generation(
                         store,
-                        *generated,
-                        generation_pass,
-                        commit_hash.as_deref(),
+                        persisted,
+                        &mut pending_embeddings,
+                        &mut intents_by_file,
+                        &mut stats,
                         print_sir,
                         out,
-                    )? {
-                        Some(intent_id) => {
-                            intents_by_file
-                                .entry(file_path)
-                                .or_default()
-                                .push(intent_id);
-                            stats.success_count += 1;
-                        }
-                        None => stats.failure_count += 1,
-                    }
+                    )
+                    .with_context(|| {
+                        format!("failed to stage quality-batch vector work for {symbol_id}")
+                    })?;
                 }
                 SirGenerationOutcome::Failure(failed) => {
                     stats.failure_count += 1;
@@ -611,6 +632,24 @@ impl SirPipeline {
                 }
             }
         }
+
+        let (embedded_symbols, embedding_calls) = self
+            .process_pending_embeddings(
+                store,
+                &pending_embeddings,
+                &mut intents_by_file,
+                &mut stats,
+                print_sir,
+                out,
+                "quality batch",
+            )
+            .context("failed to process quality-batch embedding batches")?;
+
+        tracing::info!(
+            embedded = embedded_symbols,
+            batch_calls = embedding_calls,
+            "Embedded quality batch symbols"
+        );
 
         for (file_path, mut intent_ids) in intents_by_file {
             if self.skip_surreal_sync {
@@ -652,7 +691,6 @@ impl SirPipeline {
         let mut intents_by_file = BTreeMap::<String, Vec<String>>::new();
         let mut jobs = Vec::with_capacity(total_symbols);
         let mut pending_embeddings = Vec::new();
-        let mut embedding_buffer = Vec::with_capacity(BULK_SCAN_VECTOR_BATCH_SIZE);
         let mut stats = ProcessEventStats::default();
         let mut skipped_existing = 0usize;
 
@@ -754,39 +792,19 @@ impl SirPipeline {
                         continue;
                     };
 
-                    if let Some(needed) = persisted.embedding_needed.as_ref() {
-                        pending_embeddings.push(PendingBulkEmbedding {
-                            input: EmbeddingInput {
-                                symbol_id: persisted.symbol_id.clone(),
-                                sir_hash: persisted.sir_hash.clone(),
-                                canonical_json: persisted.canonical_json.clone(),
-                                provider: needed.provider.clone(),
-                                model: needed.model.clone(),
-                            },
-                            persisted,
-                        });
-                    } else {
-                        let symbol_id = persisted.symbol_id.clone();
-                        if self
-                            .finish_bulk_scan_success(
-                                store,
-                                persisted,
-                                &mut intents_by_file,
-                                &mut stats,
-                                print_sir,
-                                out,
-                                None,
-                            )
-                            .with_context(|| {
-                                format!(
-                                    "failed to finalize bulk-scan vector stage for {}",
-                                    symbol_id
-                                )
-                            })?
-                        {
-                            // Counted in helper.
-                        }
-                    }
+                    let symbol_id = persisted.symbol_id.clone();
+                    self.enqueue_or_finish_persisted_generation(
+                        store,
+                        persisted,
+                        &mut pending_embeddings,
+                        &mut intents_by_file,
+                        &mut stats,
+                        print_sir,
+                        out,
+                    )
+                    .with_context(|| {
+                        format!("failed to stage bulk-scan vector work for {symbol_id}")
+                    })?;
                 }
                 SirGenerationOutcome::Failure(failed) => {
                     stats.failure_count += 1;
@@ -802,118 +820,17 @@ impl SirPipeline {
             }
         }
 
-        let mut embedded_symbols = 0usize;
-        let mut embedding_calls = 0usize;
-        for chunk in pending_embeddings.chunks(EMBED_BATCH_SIZE) {
-            if chunk.is_empty() {
-                continue;
-            }
-            embedding_calls += 1;
-            let texts = chunk
-                .iter()
-                .map(|item| item.input.canonical_json.as_str())
-                .collect::<Vec<_>>();
-            let embeddings = match self.batch_embed_texts(&texts, EmbeddingPurpose::Document) {
-                Ok(embeddings) => embeddings,
-                Err(err) => {
-                    let message = format!("{err:#}");
-                    tracing::error!(
-                        error = %err,
-                        chunk_size = chunk.len(),
-                        "batch embedding failed during bulk scan"
-                    );
-                    for item in chunk {
-                        self.mark_intent_failed_safely(
-                            store,
-                            item.persisted.intent_id.as_str(),
-                            message.as_str(),
-                        );
-                        stats.failure_count += 1;
-                    }
-                    continue;
-                }
-            };
-
-            let mut records_by_symbol = SirPipeline::build_embedding_records(
-                &chunk
-                    .iter()
-                    .map(|item| EmbeddingInput {
-                        symbol_id: item.input.symbol_id.clone(),
-                        sir_hash: item.input.sir_hash.clone(),
-                        canonical_json: item.input.canonical_json.clone(),
-                        provider: item.input.provider.clone(),
-                        model: item.input.model.clone(),
-                    })
-                    .collect::<Vec<_>>(),
-                embeddings,
+        let (embedded_symbols, embedding_calls) = self
+            .process_pending_embeddings(
+                store,
+                &pending_embeddings,
+                &mut intents_by_file,
+                &mut stats,
+                print_sir,
+                out,
+                "bulk scan",
             )
-            .into_iter()
-            .map(|record| (record.symbol_id.clone(), record))
-            .collect::<HashMap<_, _>>();
-
-            embedded_symbols += records_by_symbol.len();
-
-            for item in chunk {
-                if let Some(record) = records_by_symbol.remove(item.persisted.symbol_id.as_str()) {
-                    embedding_buffer.push(BufferedEmbeddingWrite {
-                        record,
-                        persisted: PersistedSuccessfulGeneration {
-                            intent_id: item.persisted.intent_id.clone(),
-                            symbol_id: item.persisted.symbol_id.clone(),
-                            file_path: item.persisted.file_path.clone(),
-                            sir_hash: item.persisted.sir_hash.clone(),
-                            canonical_json: item.persisted.canonical_json.clone(),
-                            provider_name: item.persisted.provider_name.clone(),
-                            embedding_needed: None,
-                        },
-                    });
-                } else {
-                    let symbol_id = item.persisted.symbol_id.clone();
-                    self.finish_bulk_scan_success(
-                        store,
-                        PersistedSuccessfulGeneration {
-                            intent_id: item.persisted.intent_id.clone(),
-                            symbol_id: item.persisted.symbol_id.clone(),
-                            file_path: item.persisted.file_path.clone(),
-                            sir_hash: item.persisted.sir_hash.clone(),
-                            canonical_json: item.persisted.canonical_json.clone(),
-                            provider_name: item.persisted.provider_name.clone(),
-                            embedding_needed: None,
-                        },
-                        &mut intents_by_file,
-                        &mut stats,
-                        print_sir,
-                        out,
-                        None,
-                    )
-                    .with_context(|| {
-                        format!("failed to finalize bulk-scan vector stage for {symbol_id}")
-                    })?;
-                }
-            }
-
-            if embedding_buffer.len() >= BULK_SCAN_VECTOR_BATCH_SIZE {
-                self.flush_bulk_scan_embedding_buffer(
-                    store,
-                    &mut embedding_buffer,
-                    &mut intents_by_file,
-                    &mut stats,
-                    print_sir,
-                    out,
-                )
-                .context("failed to flush buffered bulk-scan embeddings")?;
-            }
-        }
-
-        self.flush_bulk_scan_embedding_buffer(
-            store,
-            &mut embedding_buffer,
-            &mut intents_by_file,
-            &mut stats,
-            print_sir,
-            out,
-        )
-        .context("failed to flush remaining bulk-scan embeddings")?;
+            .context("failed to process bulk-scan embedding batches")?;
 
         tracing::info!(
             embedded = embedded_symbols,
@@ -1631,6 +1548,162 @@ impl SirPipeline {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn enqueue_or_finish_persisted_generation(
+        &self,
+        store: &SqliteStore,
+        persisted: PersistedSuccessfulGeneration,
+        pending_embeddings: &mut Vec<PendingBulkEmbedding>,
+        intents_by_file: &mut BTreeMap<String, Vec<String>>,
+        stats: &mut ProcessEventStats,
+        print_sir: bool,
+        out: &mut dyn Write,
+    ) -> Result<()> {
+        if let Some((provider, model)) = persisted
+            .embedding_needed
+            .as_ref()
+            .map(|needed| (needed.provider.clone(), needed.model.clone()))
+        {
+            pending_embeddings.push(PendingBulkEmbedding {
+                input: EmbeddingInput {
+                    symbol_id: persisted.symbol_id.clone(),
+                    sir_hash: persisted.sir_hash.clone(),
+                    canonical_json: persisted.canonical_json.clone(),
+                    provider,
+                    model,
+                },
+                persisted,
+            });
+            return Ok(());
+        }
+
+        let symbol_id = persisted.symbol_id.clone();
+        let _ = self
+            .finish_bulk_scan_success(
+                store,
+                persisted,
+                intents_by_file,
+                stats,
+                print_sir,
+                out,
+                None,
+            )
+            .with_context(|| {
+                format!("failed to finalize immediate vector stage for {symbol_id}")
+            })?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_pending_embeddings(
+        &self,
+        store: &SqliteStore,
+        pending_embeddings: &[PendingBulkEmbedding],
+        intents_by_file: &mut BTreeMap<String, Vec<String>>,
+        stats: &mut ProcessEventStats,
+        print_sir: bool,
+        out: &mut dyn Write,
+        phase_name: &str,
+    ) -> Result<(usize, usize)> {
+        let mut embedding_buffer = Vec::with_capacity(BULK_SCAN_VECTOR_BATCH_SIZE);
+        let mut embedded_symbols = 0usize;
+        let mut embedding_calls = 0usize;
+
+        for chunk in pending_embeddings.chunks(EMBED_BATCH_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+
+            embedding_calls += 1;
+            let texts = chunk
+                .iter()
+                .map(|item| item.input.canonical_json.as_str())
+                .collect::<Vec<_>>();
+            let embeddings = match self.batch_embed_texts(&texts, EmbeddingPurpose::Document) {
+                Ok(embeddings) => embeddings,
+                Err(err) => {
+                    let message = format!("{err:#}");
+                    tracing::error!(
+                        phase = phase_name,
+                        error = %err,
+                        chunk_size = chunk.len(),
+                        "batch embedding failed during SIR pipeline"
+                    );
+                    for item in chunk {
+                        self.mark_intent_failed_safely(
+                            store,
+                            item.persisted.intent_id.as_str(),
+                            message.as_str(),
+                        );
+                        stats.failure_count += 1;
+                    }
+                    continue;
+                }
+            };
+
+            let mut records_by_symbol = SirPipeline::build_embedding_records(
+                &chunk
+                    .iter()
+                    .map(|item| item.input.clone())
+                    .collect::<Vec<_>>(),
+                embeddings,
+            )
+            .into_iter()
+            .map(|record| (record.symbol_id.clone(), record))
+            .collect::<HashMap<_, _>>();
+
+            embedded_symbols += records_by_symbol.len();
+
+            for item in chunk {
+                let persisted = PersistedSuccessfulGeneration {
+                    embedding_needed: None,
+                    ..item.persisted.clone()
+                };
+                if let Some(record) = records_by_symbol.remove(item.persisted.symbol_id.as_str()) {
+                    embedding_buffer.push(BufferedEmbeddingWrite { record, persisted });
+                } else {
+                    let symbol_id = persisted.symbol_id.clone();
+                    self.finish_bulk_scan_success(
+                        store,
+                        persisted,
+                        intents_by_file,
+                        stats,
+                        print_sir,
+                        out,
+                        None,
+                    )
+                    .with_context(|| {
+                        format!("failed to finalize {phase_name} vector stage for {symbol_id}")
+                    })?;
+                }
+            }
+
+            if embedding_buffer.len() >= BULK_SCAN_VECTOR_BATCH_SIZE {
+                self.flush_bulk_scan_embedding_buffer(
+                    store,
+                    &mut embedding_buffer,
+                    intents_by_file,
+                    stats,
+                    print_sir,
+                    out,
+                )
+                .with_context(|| format!("failed to flush buffered {phase_name} embeddings"))?;
+            }
+        }
+
+        self.flush_bulk_scan_embedding_buffer(
+            store,
+            &mut embedding_buffer,
+            intents_by_file,
+            stats,
+            print_sir,
+            out,
+        )
+        .with_context(|| format!("failed to flush remaining {phase_name} embeddings"))?;
+
+        Ok((embedded_symbols, embedding_calls))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn finish_bulk_scan_success(
         &self,
         store: &SqliteStore,
@@ -1704,7 +1777,7 @@ impl SirPipeline {
             tracing::error!(
                 error = %err,
                 record_count = pending.len(),
-                "failed to flush bulk scan embedding batch"
+                "failed to flush embedding batch"
             );
             for item in pending {
                 self.mark_intent_failed_safely(

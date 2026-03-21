@@ -799,9 +799,15 @@ deep_concurrency = 0
         assert!(config.sir_quality.triage_pass);
         assert_eq!(config.sir_quality.triage_priority_threshold, 1.0);
         assert_eq!(config.sir_quality.triage_confidence_threshold, 0.0);
-        assert_eq!(config.sir_quality.triage_concurrency, 4);
+        assert_eq!(
+            config.sir_quality.triage_concurrency,
+            GEMINI_DEFAULT_CONCURRENCY
+        );
         assert_eq!(config.sir_quality.deep_max_neighbors, 10);
-        assert_eq!(config.sir_quality.deep_concurrency, 4);
+        assert_eq!(
+            config.sir_quality.deep_concurrency,
+            GEMINI_DEFAULT_CONCURRENCY
+        );
         assert_eq!(config.sir_quality.deep_timeout_secs, 180);
     }
 

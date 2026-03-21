@@ -1,3 +1,4 @@
+use crate::GEMINI_DEFAULT_CONCURRENCY;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -107,7 +108,7 @@ pub(crate) fn default_triage_max_symbols() -> usize {
 }
 
 pub(crate) fn default_triage_concurrency() -> usize {
-    4
+    GEMINI_DEFAULT_CONCURRENCY
 }
 
 pub(crate) fn default_triage_timeout_secs() -> u64 {
@@ -131,7 +132,7 @@ pub(crate) fn default_deep_max_neighbors() -> usize {
 }
 
 pub(crate) fn default_deep_concurrency() -> usize {
-    4
+    GEMINI_DEFAULT_CONCURRENCY
 }
 
 pub(crate) fn default_deep_timeout_secs() -> u64 {
