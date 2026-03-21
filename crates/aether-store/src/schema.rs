@@ -580,6 +580,26 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         conn.execute("PRAGMA user_version = 14", [])?;
     }
 
+    if version < 15 {
+        conn.execute_batch(
+            r#"
+        CREATE TABLE IF NOT EXISTS symbol_neighbors (
+            symbol_id     TEXT NOT NULL,
+            neighbor_id   TEXT NOT NULL,
+            edge_type     TEXT NOT NULL,
+            neighbor_name TEXT NOT NULL,
+            neighbor_file TEXT NOT NULL,
+            PRIMARY KEY (symbol_id, neighbor_id, edge_type)
+        );
+        CREATE INDEX IF NOT EXISTS idx_neighbors_symbol ON symbol_neighbors(symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_neighbors_neighbor ON symbol_neighbors(neighbor_id);
+        CREATE INDEX IF NOT EXISTS idx_neighbors_file ON symbol_neighbors(neighbor_file);
+        "#,
+        )?;
+        rebuild_symbol_neighbors(conn)?;
+        conn.execute("PRAGMA user_version = 15", [])?;
+    }
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -602,6 +622,53 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
             END
         "#,
         params![current_user_version],
+    )?;
+
+    Ok(())
+}
+fn rebuild_symbol_neighbors(conn: &Connection) -> Result<(), StoreError> {
+    if !table_exists(conn, "symbol_neighbors")?
+        || !table_exists(conn, "symbol_edges")?
+        || !table_exists(conn, "symbols")?
+    {
+        return Ok(());
+    }
+
+    conn.execute("DELETE FROM symbol_neighbors", [])?;
+    conn.execute_batch(
+        r#"
+        INSERT OR REPLACE INTO symbol_neighbors (
+            symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file
+        )
+        SELECT
+            e.source_id,
+            s_target.id,
+            e.edge_kind,
+            s_target.qualified_name,
+            s_target.file_path
+        FROM symbol_edges e
+        JOIN symbols s_source ON s_source.id = e.source_id
+        JOIN symbols s_target ON s_target.qualified_name = e.target_qualified_name;
+
+        INSERT OR REPLACE INTO symbol_neighbors (
+            symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file
+        )
+        SELECT
+            s_target.id,
+            e.source_id,
+            CASE e.edge_kind
+                WHEN 'calls' THEN 'called_by'
+                WHEN 'depends_on' THEN 'depended_on_by'
+                WHEN 'implements' THEN 'implemented_by'
+                WHEN 'type_ref' THEN 'type_ref_by'
+                ELSE e.edge_kind || '_reverse'
+            END,
+            s_source.qualified_name,
+            s_source.file_path
+        FROM symbol_edges e
+        JOIN symbols s_source ON s_source.id = e.source_id
+        JOIN symbols s_target ON s_target.qualified_name = e.target_qualified_name;
+        "#,
     )?;
 
     Ok(())
