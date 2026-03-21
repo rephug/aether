@@ -277,6 +277,7 @@ fn run(cli: Cli) -> Result<()> {
         force: cli.force,
         full: cli.full,
         deep: cli.deep,
+        turbo_concurrency: cli.turbo_concurrency,
         dry_run: cli.dry_run,
         sir_concurrency: cli
             .sir_concurrency

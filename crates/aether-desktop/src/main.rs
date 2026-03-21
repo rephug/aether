@@ -147,6 +147,7 @@ fn start_normal_mode(workspace: PathBuf) {
             force: false,
             full: false,
             deep: false,
+            turbo_concurrency: None,
             dry_run: false,
             sir_concurrency,
             lifecycle_logs: false,

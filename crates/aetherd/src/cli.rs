@@ -1160,6 +1160,13 @@ pub struct Cli {
     #[arg(
         long,
         requires_all = ["index_once", "full"],
+        help = "Override inference concurrency for bulk scan. Set high (64-128) to saturate API rate limits for fast cold-start indexing"
+    )]
+    pub turbo_concurrency: Option<usize>,
+
+    #[arg(
+        long,
+        requires_all = ["index_once", "full"],
         help = "With --index-once --full, report stale symbol reconciliations and prunes without mutating the store"
     )]
     pub dry_run: bool,
@@ -1444,6 +1451,38 @@ mod tests {
     #[test]
     fn cli_dry_run_requires_full_index_once() {
         let result = Cli::try_parse_from(["aetherd", "--workspace", ".", "--dry-run"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_turbo_concurrency_flag_parses_with_full_index_once() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "--index-once",
+            "--full",
+            "--turbo-concurrency",
+            "96",
+        ])
+        .expect("turbo concurrency should parse");
+
+        assert!(cli.index_once);
+        assert!(cli.full);
+        assert_eq!(cli.turbo_concurrency, Some(96));
+    }
+
+    #[test]
+    fn cli_turbo_concurrency_requires_full_index_once() {
+        let result = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "--index-once",
+            "--turbo-concurrency",
+            "96",
+        ]);
+
         assert!(result.is_err());
     }
 
