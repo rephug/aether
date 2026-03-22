@@ -45,6 +45,59 @@ impl std::str::FromStr for InferenceProviderKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeminiThinkingLevel {
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+impl GeminiThinkingLevel {
+    pub fn api_value(self) -> &'static str {
+        match self {
+            Self::Minimal => "MINIMAL",
+            Self::Low => "LOW",
+            Self::Medium => "MEDIUM",
+            Self::High => "HIGH",
+        }
+    }
+
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+/// Returns the explicit Gemini 3 thinking level to send.
+///
+/// `None` means omit `thinkingConfig` and let Gemini use its default dynamic behavior.
+pub fn parse_gemini_thinking_level(thinking: Option<&str>) -> Option<GeminiThinkingLevel> {
+    match thinking
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("minimal") => Some(GeminiThinkingLevel::Minimal),
+        Some("low") => Some(GeminiThinkingLevel::Low),
+        Some("medium") => Some(GeminiThinkingLevel::Medium),
+        Some("high") => Some(GeminiThinkingLevel::High),
+        _ => None,
+    }
+}
+
+/// Stable label that matches the effective Gemini behavior for hashing / telemetry.
+pub fn gemini_thinking_fingerprint(thinking: Option<&str>) -> &'static str {
+    parse_gemini_thinking_level(thinking)
+        .map(GeminiThinkingLevel::config_value)
+        .unwrap_or("dynamic")
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InferenceConfig {
     #[serde(default)]
@@ -143,7 +196,10 @@ fn default_tiered_retry_with_fallback() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::InferenceProviderKind;
+    use super::{
+        GeminiThinkingLevel, InferenceProviderKind, gemini_thinking_fingerprint,
+        parse_gemini_thinking_level,
+    };
 
     #[test]
     fn inference_provider_kind_from_str_accepts_openai_compat() {
@@ -158,5 +214,42 @@ mod tests {
             InferenceProviderKind::OpenAiCompat.as_str(),
             "openai_compat"
         );
+    }
+
+    #[test]
+    fn parse_gemini_thinking_level_accepts_supported_values() {
+        assert_eq!(
+            parse_gemini_thinking_level(Some("minimal")),
+            Some(GeminiThinkingLevel::Minimal)
+        );
+        assert_eq!(
+            parse_gemini_thinking_level(Some(" low ")),
+            Some(GeminiThinkingLevel::Low)
+        );
+        assert_eq!(
+            parse_gemini_thinking_level(Some("MEDIUM")),
+            Some(GeminiThinkingLevel::Medium)
+        );
+        assert_eq!(
+            parse_gemini_thinking_level(Some("high")),
+            Some(GeminiThinkingLevel::High)
+        );
+    }
+
+    #[test]
+    fn parse_gemini_thinking_level_omits_dynamic_and_invalid_values() {
+        assert_eq!(parse_gemini_thinking_level(Some("dynamic")), None);
+        assert_eq!(parse_gemini_thinking_level(Some("off")), None);
+        assert_eq!(parse_gemini_thinking_level(Some("none")), None);
+        assert_eq!(parse_gemini_thinking_level(Some("bogus")), None);
+        assert_eq!(parse_gemini_thinking_level(None), None);
+    }
+
+    #[test]
+    fn gemini_thinking_fingerprint_tracks_effective_behavior() {
+        assert_eq!(gemini_thinking_fingerprint(Some("minimal")), "minimal");
+        assert_eq!(gemini_thinking_fingerprint(Some("dynamic")), "dynamic");
+        assert_eq!(gemini_thinking_fingerprint(Some("off")), "dynamic");
+        assert_eq!(gemini_thinking_fingerprint(None), "dynamic");
     }
 }

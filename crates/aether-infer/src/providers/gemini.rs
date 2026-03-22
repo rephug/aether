@@ -1,6 +1,6 @@
 use std::env;
 
-use aether_config::InferenceProviderKind;
+use aether_config::{InferenceProviderKind, parse_gemini_thinking_level};
 use aether_core::Secret;
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -53,28 +53,14 @@ impl GeminiProvider {
         format!("{}/models/{}:generateContent", self.api_base, self.model)
     }
 
-    fn gemini_thinking_level(thinking: &str) -> Option<&'static str> {
-        match thinking.trim().to_ascii_lowercase().as_str() {
-            "minimal" => Some("MINIMAL"),
-            "low" => Some("LOW"),
-            "medium" => Some("MEDIUM"),
-            "high" => Some("HIGH"),
-            _ => None,
-        }
-    }
-
     fn generation_config(&self) -> Value {
         let mut gen_config = json!({
             "responseMimeType": "application/json",
             "temperature": 0.0
         });
 
-        if let Some(level) = self
-            .thinking
-            .as_deref()
-            .and_then(Self::gemini_thinking_level)
-        {
-            gen_config["thinkingConfig"] = json!({ "thinkingLevel": level });
+        if let Some(level) = parse_gemini_thinking_level(self.thinking.as_deref()) {
+            gen_config["thinkingConfig"] = json!({ "thinkingLevel": level.api_value() });
         }
 
         gen_config
@@ -200,6 +186,7 @@ pub(crate) fn resolve_gemini_model(model: Option<String>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use aether_config::{GeminiThinkingLevel, parse_gemini_thinking_level};
     use aether_core::Secret;
 
     use super::GeminiProvider;
@@ -207,23 +194,29 @@ mod tests {
     #[test]
     fn gemini_thinking_level_maps_supported_values() {
         assert_eq!(
-            GeminiProvider::gemini_thinking_level("minimal"),
-            Some("MINIMAL")
+            parse_gemini_thinking_level(Some("minimal")),
+            Some(GeminiThinkingLevel::Minimal)
         );
-        assert_eq!(GeminiProvider::gemini_thinking_level(" low "), Some("LOW"));
         assert_eq!(
-            GeminiProvider::gemini_thinking_level("MeDiuM"),
-            Some("MEDIUM")
+            parse_gemini_thinking_level(Some(" low ")),
+            Some(GeminiThinkingLevel::Low)
         );
-        assert_eq!(GeminiProvider::gemini_thinking_level("high"), Some("HIGH"));
+        assert_eq!(
+            parse_gemini_thinking_level(Some("MeDiuM")),
+            Some(GeminiThinkingLevel::Medium)
+        );
+        assert_eq!(
+            parse_gemini_thinking_level(Some("high")),
+            Some(GeminiThinkingLevel::High)
+        );
     }
 
     #[test]
     fn gemini_thinking_level_omits_unsupported_values() {
-        assert_eq!(GeminiProvider::gemini_thinking_level(""), None);
-        assert_eq!(GeminiProvider::gemini_thinking_level("off"), None);
-        assert_eq!(GeminiProvider::gemini_thinking_level("none"), None);
-        assert_eq!(GeminiProvider::gemini_thinking_level("dynamic"), None);
+        assert_eq!(parse_gemini_thinking_level(Some("")), None);
+        assert_eq!(parse_gemini_thinking_level(Some("off")), None);
+        assert_eq!(parse_gemini_thinking_level(Some("none")), None);
+        assert_eq!(parse_gemini_thinking_level(Some("dynamic")), None);
     }
 
     #[test]

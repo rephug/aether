@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use aether_config::parse_gemini_thinking_level;
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::json;
@@ -18,18 +19,6 @@ impl GeminiBatchProvider {
         Self {
             client: reqwest::Client::new(),
             api_key,
-        }
-    }
-
-    /// Map raw thinking string to Gemini's thinkingLevel constant.
-    fn gemini_thinking_level(thinking: &str) -> Option<&'static str> {
-        match thinking.trim().to_ascii_lowercase().as_str() {
-            "low" => Some("LOW"),
-            "medium" => Some("MEDIUM"),
-            "high" => Some("HIGH"),
-            "dynamic" => Some("DYNAMIC"),
-            // "off", "none", "" → omit thinkingConfig entirely
-            _ => None,
         }
     }
 }
@@ -53,8 +42,8 @@ impl BatchProvider for GeminiBatchProvider {
             "temperature": 0.0,
         });
 
-        if let Some(level) = Self::gemini_thinking_level(thinking) {
-            gen_config["thinkingConfig"] = json!({ "thinkingLevel": level });
+        if let Some(level) = parse_gemini_thinking_level(Some(thinking)) {
+            gen_config["thinkingConfig"] = json!({ "thinkingLevel": level.api_value() });
         }
 
         let line = json!({
@@ -456,6 +445,20 @@ mod tests {
     }
 
     #[test]
+    fn format_request_supports_minimal_thinking() {
+        let p = provider();
+        let line = p
+            .format_request("sym-min", "System.", "User.", "gemini-2.0-flash", "minimal")
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(
+            json["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "MINIMAL"
+        );
+    }
+
+    #[test]
     fn format_request_omits_thinking_when_off() {
         let p = provider();
         let line = p
@@ -475,6 +478,21 @@ mod tests {
         let p = provider();
         let line = p
             .format_request("sym3|hash3", "Sys.", "Usr.", "model", "none")
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        assert!(
+            json["request"]["generationConfig"]
+                .get("thinkingConfig")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn format_request_omits_thinking_when_dynamic() {
+        let p = provider();
+        let line = p
+            .format_request("sym4|hash4", "Sys.", "Usr.", "model", "dynamic")
             .unwrap();
         let json: serde_json::Value = serde_json::from_str(&line).unwrap();
 
