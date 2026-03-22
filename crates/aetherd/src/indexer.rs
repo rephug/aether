@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aether_analysis::TestIntentAnalyzer;
-use aether_config::{InferenceProviderKind, WatcherConfig, ensure_workspace_config};
+use aether_config::{
+    InferenceProviderKind, WatcherConfig, ensure_workspace_config, gemini_thinking_fingerprint,
+};
 use aether_core::{GitContext, Symbol, SymbolChangeEvent, content_hash, normalize_path};
 use aether_graph_algo::{GraphAlgorithmEdge, page_rank_sync};
 use aether_infer::ProviderOverrides;
@@ -74,6 +76,8 @@ struct WatcherRuntimeConfig {
     watcher: WatcherConfig,
     premium_provider: Option<InferenceProviderKind>,
     premium_model: Option<String>,
+    inference_thinking: Option<String>,
+    tiered_primary_uses_gemini_thinking: bool,
     generation_pass: &'static str,
 }
 
@@ -102,10 +106,22 @@ impl WatcherRuntimeConfig {
         } else {
             SIR_GENERATION_PASS_SCAN
         };
+        let tiered_primary_uses_gemini_thinking = workspace_config
+            .inference
+            .tiered
+            .as_ref()
+            .is_some_and(|tiered| {
+                tiered
+                    .primary
+                    .trim()
+                    .eq_ignore_ascii_case(InferenceProviderKind::Gemini.as_str())
+            });
         Ok(Self {
             watcher,
             premium_provider,
             premium_model,
+            inference_thinking: workspace_config.inference.thinking,
+            tiered_primary_uses_gemini_thinking,
             generation_pass,
         })
     }
@@ -117,6 +133,7 @@ impl WatcherRuntimeConfig {
                 model: Some(model.clone()),
                 endpoint: config.inference_endpoint.clone(),
                 api_key_env: config.inference_api_key_env.clone(),
+                thinking: None,
             }
         } else {
             ProviderOverrides {
@@ -124,6 +141,7 @@ impl WatcherRuntimeConfig {
                 model: config.inference_model.clone(),
                 endpoint: config.inference_endpoint.clone(),
                 api_key_env: config.inference_api_key_env.clone(),
+                thinking: None,
             }
         }
     }
@@ -136,9 +154,25 @@ impl WatcherRuntimeConfig {
         format!(
             "{}:{}:{}",
             pipeline.model_name(),
-            "low",
+            self.prompt_thinking_fingerprint(pipeline.provider_name()),
             MAX_SYMBOL_TEXT_CHARS
         )
+    }
+
+    fn prompt_thinking_fingerprint(&self, provider_name: &str) -> &'static str {
+        let uses_gemini_thinking = match provider_name {
+            name if name == InferenceProviderKind::Gemini.as_str() => true,
+            name if name == InferenceProviderKind::Tiered.as_str() => {
+                self.tiered_primary_uses_gemini_thinking
+            }
+            _ => false,
+        };
+
+        if uses_gemini_thinking {
+            gemini_thinking_fingerprint(self.inference_thinking.as_deref())
+        } else {
+            "none"
+        }
     }
 }
 
@@ -803,6 +837,7 @@ fn run_triage_pass(
                 .triage_api_key_env
                 .clone()
                 .or_else(|| config.inference_api_key_env.clone()),
+            thinking: quality.triage_thinking.clone(),
         },
     )
     .map(|pipeline| pipeline.with_inference_timeout_secs(quality.triage_timeout_secs))
@@ -869,6 +904,7 @@ fn run_deep_pass(
                 .deep_api_key_env
                 .clone()
                 .or_else(|| config.inference_api_key_env.clone()),
+            thinking: quality.deep_thinking.clone(),
         },
     )
     .map(|pipeline| pipeline.with_inference_timeout_secs(quality.deep_timeout_secs))
@@ -1906,6 +1942,7 @@ fn initialize_full_indexer(
             model: config.inference_model.clone(),
             endpoint: config.inference_endpoint.clone(),
             api_key_env: config.inference_api_key_env.clone(),
+            thinking: None,
         },
     )
     .context("failed to initialize SIR pipeline")?;
@@ -2497,6 +2534,7 @@ fn unix_timestamp_millis() -> i64 {
 mod tests {
     use std::fs;
 
+    use aether_config::WatcherConfig;
     use aether_core::{Language, Position, SourceRange, SymbolKind};
     use tempfile::tempdir;
 
@@ -2537,6 +2575,48 @@ vector_backend = "sqlite"
 "#,
         )
         .expect("write test config");
+    }
+
+    #[test]
+    fn watcher_prompt_thinking_fingerprint_tracks_effective_provider_behavior() {
+        let runtime = WatcherRuntimeConfig {
+            watcher: WatcherConfig::default(),
+            premium_provider: None,
+            premium_model: None,
+            inference_thinking: Some("high".to_owned()),
+            tiered_primary_uses_gemini_thinking: true,
+            generation_pass: SIR_GENERATION_PASS_SCAN,
+        };
+
+        assert_eq!(
+            runtime.prompt_thinking_fingerprint(InferenceProviderKind::Gemini.as_str()),
+            "high"
+        );
+        assert_eq!(
+            runtime.prompt_thinking_fingerprint(InferenceProviderKind::Tiered.as_str()),
+            "high"
+        );
+        assert_eq!(
+            runtime.prompt_thinking_fingerprint(InferenceProviderKind::Qwen3Local.as_str()),
+            "none"
+        );
+    }
+
+    #[test]
+    fn watcher_prompt_thinking_fingerprint_uses_dynamic_for_omitted_gemini_thinking() {
+        let runtime = WatcherRuntimeConfig {
+            watcher: WatcherConfig::default(),
+            premium_provider: None,
+            premium_model: None,
+            inference_thinking: Some("dynamic".to_owned()),
+            tiered_primary_uses_gemini_thinking: true,
+            generation_pass: SIR_GENERATION_PASS_SCAN,
+        };
+
+        assert_eq!(
+            runtime.prompt_thinking_fingerprint(InferenceProviderKind::Gemini.as_str()),
+            "dynamic"
+        );
     }
 
     fn upsert_symbol_snapshot(store: &SqliteStore, symbol: &Symbol, last_seen_at: i64) {

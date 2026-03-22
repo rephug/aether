@@ -269,6 +269,7 @@ fn run_deep_scan_with_pipeline(
         if local {
             ProviderOverrides {
                 provider: Some(InferenceProviderKind::Qwen3Local),
+                thinking: None,
                 ..ProviderOverrides::default()
             }
         } else {
@@ -292,6 +293,7 @@ fn run_deep_scan_with_pipeline(
                 model: config.sir_quality.deep_model.clone(),
                 endpoint: config.sir_quality.deep_endpoint.clone(),
                 api_key_env: config.sir_quality.deep_api_key_env.clone(),
+                thinking: config.sir_quality.deep_thinking.clone(),
             }
         },
     )

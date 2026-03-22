@@ -24,6 +24,9 @@ pub struct SirQualityConfig {
     #[serde(default)]
     pub triage_api_key_env: Option<String>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage_thinking: Option<String>,
+
     #[serde(default = "default_triage_max_symbols")]
     pub triage_max_symbols: usize,
 
@@ -54,6 +57,9 @@ pub struct SirQualityConfig {
     #[serde(default)]
     pub deep_api_key_env: Option<String>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deep_thinking: Option<String>,
+
     #[serde(default = "default_deep_max_symbols")]
     pub deep_max_symbols: usize,
 
@@ -77,6 +83,7 @@ impl Default for SirQualityConfig {
             triage_model: None,
             triage_endpoint: None,
             triage_api_key_env: None,
+            triage_thinking: None,
             triage_max_symbols: default_triage_max_symbols(),
             triage_concurrency: default_triage_concurrency(),
             triage_timeout_secs: default_triage_timeout_secs(),
@@ -87,6 +94,7 @@ impl Default for SirQualityConfig {
             deep_model: None,
             deep_endpoint: None,
             deep_api_key_env: None,
+            deep_thinking: None,
             deep_max_symbols: default_deep_max_symbols(),
             deep_max_neighbors: default_deep_max_neighbors(),
             deep_concurrency: default_deep_concurrency(),

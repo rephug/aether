@@ -56,7 +56,7 @@ pub(crate) trait BatchProvider: Send + Sync {
     /// * `system_prompt` — static SIR instruction (cacheable)
     /// * `user_prompt` — per-symbol content
     /// * `model` — provider-specific model string
-    /// * `thinking` — raw thinking level string ("off", "low", "medium", "high", "dynamic")
+    /// * `thinking` — raw thinking level string ("off", "none", "minimal", "low", "medium", "high", "dynamic")
     fn format_request(
         &self,
         key: &str,

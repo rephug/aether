@@ -1,7 +1,7 @@
 use crate::{
     constants::{DEFAULT_COHERE_API_KEY_ENV, DEFAULT_GEMINI_API_KEY_ENV},
     embeddings::EmbeddingProviderKind,
-    inference::InferenceProviderKind,
+    inference::{InferenceProviderKind, TieredConfig},
     root::AetherConfig,
     search::SearchRerankerKind,
     storage::GraphBackend,
@@ -12,6 +12,51 @@ use crate::{
 pub struct ConfigWarning {
     pub code: &'static str,
     pub message: String,
+}
+
+fn provider_ignores_gemini_thinking(
+    provider: InferenceProviderKind,
+    tiered: Option<&TieredConfig>,
+) -> bool {
+    match provider {
+        InferenceProviderKind::Gemini | InferenceProviderKind::Auto => false,
+        InferenceProviderKind::Qwen3Local | InferenceProviderKind::OpenAiCompat => true,
+        InferenceProviderKind::Tiered => tiered.is_some_and(|tiered| {
+            !tiered
+                .primary
+                .trim()
+                .eq_ignore_ascii_case(InferenceProviderKind::Gemini.as_str())
+        }),
+    }
+}
+
+fn provider_thinking_label(
+    provider: InferenceProviderKind,
+    tiered: Option<&TieredConfig>,
+) -> String {
+    match provider {
+        InferenceProviderKind::Tiered => {
+            if let Some(tiered) = tiered {
+                format!("tiered(primary={})", tiered.primary.trim())
+            } else {
+                InferenceProviderKind::Tiered.as_str().to_owned()
+            }
+        }
+        _ => provider.as_str().to_owned(),
+    }
+}
+
+fn effective_quality_provider(
+    pass_provider: Option<&str>,
+    default_provider: InferenceProviderKind,
+) -> Option<InferenceProviderKind> {
+    match pass_provider
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => value.parse::<InferenceProviderKind>().ok(),
+        None => Some(default_provider),
+    }
 }
 
 pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
@@ -167,6 +212,56 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
         InferenceProviderKind::OpenAiCompat => {}
     }
 
+    if config.inference.thinking.is_some()
+        && provider_ignores_gemini_thinking(
+            config.inference.provider,
+            config.inference.tiered.as_ref(),
+        )
+    {
+        warnings.push(ConfigWarning {
+            code: "inference_thinking_ignored_for_provider",
+            message: format!(
+                "inference.thinking is ignored for inference.provider={}",
+                provider_thinking_label(
+                    config.inference.provider,
+                    config.inference.tiered.as_ref()
+                )
+            ),
+        });
+    }
+
+    if config.sir_quality.triage_thinking.is_some()
+        && let Some(provider) = effective_quality_provider(
+            config.sir_quality.triage_provider.as_deref(),
+            config.inference.provider,
+        )
+        && provider_ignores_gemini_thinking(provider, config.inference.tiered.as_ref())
+    {
+        warnings.push(ConfigWarning {
+            code: "sir_quality_triage_thinking_ignored_for_provider",
+            message: format!(
+                "sir_quality.triage_thinking is ignored for effective provider {}",
+                provider_thinking_label(provider, config.inference.tiered.as_ref())
+            ),
+        });
+    }
+
+    if config.sir_quality.deep_thinking.is_some()
+        && let Some(provider) = effective_quality_provider(
+            config.sir_quality.deep_provider.as_deref(),
+            config.inference.provider,
+        )
+        && provider_ignores_gemini_thinking(provider, config.inference.tiered.as_ref())
+    {
+        warnings.push(ConfigWarning {
+            code: "sir_quality_deep_thinking_ignored_for_provider",
+            message: format!(
+                "sir_quality.deep_thinking is ignored for effective provider {}",
+                provider_thinking_label(provider, config.inference.tiered.as_ref())
+            ),
+        });
+    }
+
     if config.verify.commands.is_empty() {
         warnings.push(ConfigWarning {
             code: "verify_commands_empty",
@@ -282,6 +377,7 @@ mod tests {
                 endpoint: Some("http://127.0.0.1:11434".to_owned()),
                 api_key_env: DEFAULT_GEMINI_API_KEY_ENV.to_owned(),
                 concurrency: default_sir_concurrency(),
+                thinking: None,
                 tiered: None,
             },
             sir_quality: SirQualityConfig::default(),
@@ -409,6 +505,41 @@ task_type = "RETRIEVAL_DOCUMENT"
         let codes = warning_codes(&validate_config(&config));
         assert!(codes.contains(&"embeddings_endpoint_unused_for_gemini_native"));
         assert!(codes.contains(&"embeddings_task_type_unused_for_gemini_native"));
+    }
+
+    #[test]
+    fn validate_config_warns_when_inference_thinking_is_ignored() {
+        let config = parse_workspace_config_str(
+            r#"
+[inference]
+provider = "qwen3_local"
+thinking = "high"
+"#,
+        )
+        .expect("parse config");
+
+        let codes = warning_codes(&validate_config(&config));
+        assert!(codes.contains(&"inference_thinking_ignored_for_provider"));
+    }
+
+    #[test]
+    fn validate_config_warns_when_quality_thinking_is_ignored() {
+        let config = parse_workspace_config_str(
+            r#"
+[inference]
+provider = "qwen3_local"
+
+[sir_quality]
+triage_thinking = "high"
+deep_provider = "openai_compat"
+deep_thinking = "medium"
+"#,
+        )
+        .expect("parse config");
+
+        let codes = warning_codes(&validate_config(&config));
+        assert!(codes.contains(&"sir_quality_triage_thinking_ignored_for_provider"));
+        assert!(codes.contains(&"sir_quality_deep_thinking_ignored_for_provider"));
     }
 
     #[test]

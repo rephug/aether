@@ -144,6 +144,7 @@ fn normalize_sir_quality_config(config: &mut SirQualityConfig) {
     config.triage_model = normalize_optional(config.triage_model.take());
     config.triage_endpoint = normalize_optional(config.triage_endpoint.take());
     config.triage_api_key_env = normalize_optional(config.triage_api_key_env.take());
+    config.triage_thinking = normalize_optional(config.triage_thinking.take());
     if config.triage_concurrency == 0 {
         config.triage_concurrency = default_triage_concurrency();
     }
@@ -163,6 +164,7 @@ fn normalize_sir_quality_config(config: &mut SirQualityConfig) {
     config.deep_model = normalize_optional(config.deep_model.take());
     config.deep_endpoint = normalize_optional(config.deep_endpoint.take());
     config.deep_api_key_env = normalize_optional(config.deep_api_key_env.take());
+    config.deep_thinking = normalize_optional(config.deep_thinking.take());
     if config.deep_max_neighbors == 0 {
         config.deep_max_neighbors = default_deep_max_neighbors();
     }
@@ -418,6 +420,7 @@ pub(crate) fn normalize_config(mut config: AetherConfig) -> AetherConfig {
     );
     config.inference.model = normalize_optional(config.inference.model.take());
     config.inference.endpoint = normalize_optional(config.inference.endpoint.take());
+    config.inference.thinking = normalize_optional(config.inference.thinking.take());
     if config.inference.concurrency == 0 {
         config.inference.concurrency = default_sir_concurrency();
     }
@@ -785,17 +788,25 @@ semantic_weight = -2.0
 [inference]
 provider = "gemini"
 concurrency = 0
+thinking = " medium "
 
 [sir_quality]
+triage_pass = true
+triage_priority_threshold = 9.9
+triage_confidence_threshold = -3.0
+triage_concurrency = 0
 deep_pass = true
 deep_priority_threshold = 9.9
 deep_confidence_threshold = -3.0
 deep_max_neighbors = 0
 deep_concurrency = 0
+triage_thinking = " low "
+deep_thinking = " high "
 "#,
         );
 
         assert_eq!(config.inference.concurrency, GEMINI_DEFAULT_CONCURRENCY);
+        assert_eq!(config.inference.thinking.as_deref(), Some("medium"));
         assert!(config.sir_quality.triage_pass);
         assert_eq!(config.sir_quality.triage_priority_threshold, 1.0);
         assert_eq!(config.sir_quality.triage_confidence_threshold, 0.0);
@@ -803,12 +814,14 @@ deep_concurrency = 0
             config.sir_quality.triage_concurrency,
             GEMINI_DEFAULT_CONCURRENCY
         );
+        assert_eq!(config.sir_quality.triage_thinking.as_deref(), Some("low"));
         assert_eq!(config.sir_quality.deep_max_neighbors, 10);
         assert_eq!(
             config.sir_quality.deep_concurrency,
             GEMINI_DEFAULT_CONCURRENCY
         );
         assert_eq!(config.sir_quality.deep_timeout_secs, 180);
+        assert_eq!(config.sir_quality.deep_thinking.as_deref(), Some("high"));
     }
 
     #[test]

@@ -25,6 +25,13 @@ use crate::types::{
     first_non_empty, normalize_optional,
 };
 
+fn resolve_inference_thinking(
+    override_thinking: Option<String>,
+    configured_thinking: Option<String>,
+) -> Option<String> {
+    first_non_empty(override_thinking, configured_thinking)
+}
+
 pub fn load_inference_provider_from_config(
     workspace_root: impl AsRef<Path>,
     overrides: ProviderOverrides,
@@ -36,10 +43,12 @@ pub fn load_inference_provider_from_config(
         model,
         endpoint,
         api_key_env,
+        thinking,
     } = overrides;
     let selected_provider = provider.unwrap_or(config.inference.provider);
     let selected_model = first_non_empty(model, config.inference.model);
     let selected_endpoint = first_non_empty(endpoint, config.inference.endpoint);
+    let selected_thinking = resolve_inference_thinking(thinking, config.inference.thinking);
     let selected_api_key_env = resolve_inference_api_key_env(
         selected_provider,
         api_key_env,
@@ -71,7 +80,11 @@ pub fn load_inference_provider_from_config(
                     "Auto provider selected gemini after finding API key"
                 );
                 Ok(LoadedProvider {
-                    provider: Box::new(GeminiProvider::new(Secret::new(api_key), model.clone())),
+                    provider: Box::new(GeminiProvider::new(
+                        Secret::new(api_key),
+                        model.clone(),
+                        selected_thinking.clone(),
+                    )),
                     provider_name: InferenceProviderKind::Gemini.as_str().to_owned(),
                     model_name: model,
                 })
@@ -92,10 +105,15 @@ pub fn load_inference_provider_from_config(
                 selected_model,
                 selected_endpoint,
                 selected_api_key_env,
+                selected_thinking,
             )
         }
         InferenceProviderKind::Gemini => {
-            let provider = GeminiProvider::from_env_key(&selected_api_key_env, selected_model)?;
+            let provider = GeminiProvider::from_env_key(
+                &selected_api_key_env,
+                selected_model,
+                selected_thinking,
+            )?;
             Ok(LoadedProvider {
                 model_name: provider.model_name(),
                 provider: Box::new(provider),
@@ -416,6 +434,7 @@ fn load_tiered_provider(
     selected_model: Option<String>,
     selected_endpoint: Option<String>,
     selected_api_key_env: String,
+    selected_thinking: Option<String>,
 ) -> Result<LoadedProvider, InferError> {
     let primary_kind = tiered.primary.trim().to_ascii_lowercase();
     let primary_model = first_non_empty(selected_model, tiered.primary_model.clone());
@@ -430,7 +449,11 @@ fn load_tiered_provider(
         String,
     ) = match primary_kind.as_str() {
         "gemini" => {
-            let provider = GeminiProvider::from_env_key(&primary_api_key_env, primary_model)?;
+            let provider = GeminiProvider::from_env_key(
+                &primary_api_key_env,
+                primary_model,
+                selected_thinking,
+            )?;
             let model_name = provider.model_name();
             (
                 Box::new(provider),
@@ -1022,6 +1045,22 @@ dimensions = 3072
             Ok(_) => panic!("expected no provider available error, got Ok result"),
             Err(err) => panic!("expected no provider available error, got {err}"),
         }
+    }
+
+    #[test]
+    fn resolve_inference_thinking_prefers_override() {
+        assert_eq!(
+            resolve_inference_thinking(Some(" high ".to_owned()), Some("low".to_owned())),
+            Some("high".to_owned())
+        );
+    }
+
+    #[test]
+    fn resolve_inference_thinking_falls_back_to_config() {
+        assert_eq!(
+            resolve_inference_thinking(None, Some(" medium ".to_owned())),
+            Some("medium".to_owned())
+        );
     }
 
     #[test]
