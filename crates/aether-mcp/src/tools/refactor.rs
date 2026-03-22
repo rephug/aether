@@ -290,6 +290,7 @@ impl AetherMcpServer {
                     model: self.state.config.sir_quality.deep_model.clone(),
                     endpoint: self.state.config.sir_quality.deep_endpoint.clone(),
                     api_key_env: self.state.config.sir_quality.deep_api_key_env.clone(),
+                    thinking: self.state.config.sir_quality.deep_thinking.clone(),
                 }
             },
         )?;
