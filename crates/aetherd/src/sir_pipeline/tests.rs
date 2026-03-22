@@ -65,6 +65,15 @@ mod tests {
         sir: SirAnnotation,
     }
 
+    #[derive(Clone)]
+    struct CountingInferenceProvider {
+        symbol_sir: SirAnnotation,
+        prompt_sir: SirAnnotation,
+        standard_calls: Arc<AtomicUsize>,
+        prompt_calls: Arc<AtomicUsize>,
+        file_calls: Arc<AtomicUsize>,
+    }
+
     #[async_trait]
     impl InferenceProvider for PanicInferenceProvider {
         fn provider_name(&self) -> String {
@@ -109,6 +118,46 @@ mod tests {
             _deep_mode: bool,
         ) -> std::result::Result<SirAnnotation, InferError> {
             Ok(self.sir.clone())
+        }
+    }
+
+    #[async_trait]
+    impl InferenceProvider for CountingInferenceProvider {
+        fn provider_name(&self) -> String {
+            "counting".to_owned()
+        }
+
+        fn model_name(&self) -> String {
+            "counting-model".to_owned()
+        }
+
+        async fn generate_sir(
+            &self,
+            _symbol_text: &str,
+            context: &SirContext,
+        ) -> std::result::Result<SirAnnotation, InferError> {
+            if context.kind == "file" {
+                self.file_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(self.prompt_sir.clone())
+            } else {
+                self.standard_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(self.symbol_sir.clone())
+            }
+        }
+
+        async fn generate_sir_from_prompt(
+            &self,
+            _prompt: &str,
+            context: &SirContext,
+            _deep_mode: bool,
+        ) -> std::result::Result<SirAnnotation, InferError> {
+            if context.kind == "file" {
+                self.file_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(self.prompt_sir.clone())
+            } else {
+                self.prompt_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(self.symbol_sir.clone())
+            }
         }
     }
 
@@ -196,6 +245,13 @@ vector_backend = "sqlite"
             error_modes: Vec::new(),
             confidence: 0.9,
             method_dependencies: None,
+        }
+    }
+
+    fn demo_rollup_sir() -> SirAnnotation {
+        SirAnnotation {
+            intent: "File rollup summary".to_owned(),
+            ..demo_sir()
         }
     }
 
@@ -893,13 +949,22 @@ impl Store {
             .enumerate()
             .map(|(idx, symbol)| (symbol.id.clone(), idx as f64))
             .collect::<HashMap<_, _>>();
+        let standard_calls = Arc::new(AtomicUsize::new(0));
+        let prompt_calls = Arc::new(AtomicUsize::new(0));
+        let file_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
         let batch_calls = Arc::new(AtomicUsize::new(0));
         let batch_sizes = Arc::new(Mutex::new(Vec::new()));
         let purposes = Arc::new(Mutex::new(Vec::new()));
         let pipeline = build_write_pipeline_with_embeddings(
             workspace,
-            Arc::new(FixedInferenceProvider { sir: demo_sir() }),
+            Arc::new(CountingInferenceProvider {
+                symbol_sir: demo_sir(),
+                prompt_sir: demo_rollup_sir(),
+                standard_calls: Arc::clone(&standard_calls),
+                prompt_calls: Arc::clone(&prompt_calls),
+                file_calls: Arc::clone(&file_calls),
+            }),
             Some(Arc::new(CountingEmbeddingProvider {
                 calls: Arc::clone(&calls),
                 batch_calls: Arc::clone(&batch_calls),
@@ -924,6 +989,9 @@ impl Store {
 
         assert_eq!(stats.success_count, symbols.len());
         assert_eq!(stats.failure_count, 0);
+        assert_eq!(standard_calls.load(Ordering::SeqCst), symbols.len());
+        assert_eq!(prompt_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(file_calls.load(Ordering::SeqCst), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(batch_calls.load(Ordering::SeqCst), 2);
         assert_eq!(
@@ -951,6 +1019,87 @@ impl Store {
                 .expect("read embedding meta")
                 .is_some());
         }
+
+        let rollup_id = synthetic_file_sir_id("rust", "src/lib.rs");
+        assert!(store
+            .read_sir_blob(rollup_id.as_str())
+            .expect("read rollup blob")
+            .is_some());
+    }
+
+    #[test]
+    fn process_bulk_scan_uses_local_rollup_for_small_files() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_only_config(workspace);
+        fs::create_dir_all(workspace.join("src")).expect("create src");
+
+        let mut source = String::new();
+        for idx in 0..5 {
+            source.push_str(format!("pub fn symbol_{idx}() -> i32 {{ {idx} }}\n").as_str());
+        }
+        fs::write(workspace.join("src/lib.rs"), &source).expect("write source");
+
+        let mut extractor = SymbolExtractor::new().expect("symbol extractor");
+        let extracted = extractor
+            .extract_with_edges_from_path(Path::new("src/lib.rs"), &source)
+            .expect("extract source");
+        let symbols = extracted.symbols;
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        for symbol in &symbols {
+            store
+                .upsert_symbol(demo_symbol_record_with_kind(
+                    symbol.id.as_str(),
+                    symbol.qualified_name.as_str(),
+                    symbol.kind.as_str(),
+                    symbol.file_path.as_str(),
+                ))
+                .expect("upsert symbol");
+        }
+
+        let priority_scores = symbols
+            .iter()
+            .enumerate()
+            .map(|(idx, symbol)| (symbol.id.clone(), idx as f64))
+            .collect::<HashMap<_, _>>();
+        let standard_calls = Arc::new(AtomicUsize::new(0));
+        let prompt_calls = Arc::new(AtomicUsize::new(0));
+        let file_calls = Arc::new(AtomicUsize::new(0));
+        let pipeline = build_write_pipeline(
+            workspace,
+            Arc::new(CountingInferenceProvider {
+                symbol_sir: demo_sir(),
+                prompt_sir: demo_rollup_sir(),
+                standard_calls: Arc::clone(&standard_calls),
+                prompt_calls: Arc::clone(&prompt_calls),
+                file_calls: Arc::clone(&file_calls),
+            }),
+        )
+        .with_skip_surreal_sync(true);
+
+        let mut out = Vec::new();
+        let stats = pipeline
+            .process_bulk_scan(
+                &store,
+                symbols.clone(),
+                &priority_scores,
+                false,
+                SIR_GENERATION_PASS_SCAN,
+                false,
+                &mut out,
+            )
+            .expect("process bulk scan");
+
+        assert_eq!(stats.success_count, symbols.len());
+        assert_eq!(stats.failure_count, 0);
+        assert_eq!(standard_calls.load(Ordering::SeqCst), symbols.len());
+        assert_eq!(prompt_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(file_calls.load(Ordering::SeqCst), 0);
+        assert!(store
+            .get_incomplete_intents()
+            .expect("load incomplete intents")
+            .is_empty());
 
         let rollup_id = synthetic_file_sir_id("rust", "src/lib.rs");
         assert!(store
@@ -990,13 +1139,22 @@ impl Store {
                 .expect("upsert symbol");
         }
 
+        let standard_calls = Arc::new(AtomicUsize::new(0));
+        let prompt_calls = Arc::new(AtomicUsize::new(0));
+        let file_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
         let batch_calls = Arc::new(AtomicUsize::new(0));
         let batch_sizes = Arc::new(Mutex::new(Vec::new()));
         let purposes = Arc::new(Mutex::new(Vec::new()));
         let pipeline = build_write_pipeline_with_embeddings(
             workspace,
-            Arc::new(FixedInferenceProvider { sir: demo_sir() }),
+            Arc::new(CountingInferenceProvider {
+                symbol_sir: demo_sir(),
+                prompt_sir: demo_rollup_sir(),
+                standard_calls: Arc::clone(&standard_calls),
+                prompt_calls: Arc::clone(&prompt_calls),
+                file_calls: Arc::clone(&file_calls),
+            }),
             Some(Arc::new(CountingEmbeddingProvider {
                 calls: Arc::clone(&calls),
                 batch_calls: Arc::clone(&batch_calls),
@@ -1019,6 +1177,9 @@ impl Store {
 
         assert_eq!(stats.success_count, symbols.len());
         assert_eq!(stats.failure_count, 0);
+        assert_eq!(standard_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(prompt_calls.load(Ordering::SeqCst), symbols.len());
+        assert_eq!(file_calls.load(Ordering::SeqCst), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(batch_calls.load(Ordering::SeqCst), 2);
         assert_eq!(

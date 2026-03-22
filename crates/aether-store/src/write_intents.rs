@@ -12,6 +12,13 @@ pub struct WriteIntent {
     pub completed_at: Option<i64>,
     pub error_message: Option<String>,
 }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BatchCompleteResult {
+    pub completed: usize,
+    pub failed: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WriteIntentStatus {
     Pending,
@@ -195,6 +202,101 @@ impl SqliteStore {
             params![intent_id, WriteIntentStatus::Complete.to_string()],
         )?;
         Ok(())
+    }
+    pub fn batch_complete_intents(
+        &self,
+        intent_ids: &[String],
+    ) -> Result<BatchCompleteResult, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Deferred)?;
+
+        let (completed, failed) = {
+            let mut update_status = tx.prepare(
+                r#"
+                UPDATE write_intents
+                SET status = ?2
+                WHERE intent_id = ?1
+                "#,
+            )?;
+            let mut mark_complete = tx.prepare(
+                r#"
+                UPDATE write_intents
+                SET status = ?2,
+                    completed_at = unixepoch(),
+                    error_message = NULL
+                WHERE intent_id = ?1
+                "#,
+            )?;
+            let mut mark_failed = tx.prepare(
+                r#"
+                UPDATE write_intents
+                SET status = ?2,
+                    error_message = ?3,
+                    completed_at = NULL
+                WHERE intent_id = ?1
+                "#,
+            )?;
+
+            let mut completed = 0usize;
+            let mut failed = 0usize;
+
+            for intent_id in intent_ids {
+                if let Err(err) = update_status
+                    .execute(params![intent_id, WriteIntentStatus::GraphDone.to_string()])
+                {
+                    let message = format!("graph_done update failed: {err:#}");
+                    tracing::warn!(
+                        intent_id = %intent_id,
+                        error = %err,
+                        "failed to update write intent status to graph_done in batch"
+                    );
+                    failed += 1;
+                    if let Err(mark_err) = mark_failed.execute(params![
+                        intent_id,
+                        WriteIntentStatus::Failed.to_string(),
+                        message.as_str(),
+                    ]) {
+                        tracing::error!(
+                            intent_id = %intent_id,
+                            error = %mark_err,
+                            "failed to mark batched write intent as failed"
+                        );
+                    }
+                    continue;
+                }
+
+                if let Err(err) = mark_complete
+                    .execute(params![intent_id, WriteIntentStatus::Complete.to_string()])
+                {
+                    let message = format!("intent completion failed: {err:#}");
+                    tracing::warn!(
+                        intent_id = %intent_id,
+                        error = %err,
+                        "failed to mark batched write intent complete"
+                    );
+                    failed += 1;
+                    if let Err(mark_err) = mark_failed.execute(params![
+                        intent_id,
+                        WriteIntentStatus::Failed.to_string(),
+                        message.as_str(),
+                    ]) {
+                        tracing::error!(
+                            intent_id = %intent_id,
+                            error = %mark_err,
+                            "failed to mark batched write intent as failed"
+                        );
+                    }
+                    continue;
+                }
+
+                completed += 1;
+            }
+
+            (completed, failed)
+        };
+
+        tx.commit()?;
+        Ok(BatchCompleteResult { completed, failed })
     }
     pub fn get_incomplete_intents(&self) -> Result<Vec<WriteIntent>, StoreError> {
         let conn = self.conn.lock().unwrap();

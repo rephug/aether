@@ -495,6 +495,37 @@ fn write_intent_crud_updates_complete_and_failed() {
 }
 
 #[test]
+fn batch_complete_intents_marks_all_rows_complete() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+
+    for intent_id in ["intent-1", "intent-2"] {
+        store
+            .create_write_intent(&write_intent_record(
+                intent_id,
+                WriteIntentStatus::VectorDone,
+            ))
+            .expect("create write intent");
+    }
+
+    let result = store
+        .batch_complete_intents(&["intent-1".to_owned(), "intent-2".to_owned()])
+        .expect("batch complete intents");
+    assert_eq!(result.completed, 2);
+    assert_eq!(result.failed, 0);
+
+    for intent_id in ["intent-1", "intent-2"] {
+        let loaded = store
+            .get_intent(intent_id)
+            .expect("get intent")
+            .expect("intent exists");
+        assert_eq!(loaded.status, WriteIntentStatus::Complete);
+        assert!(loaded.completed_at.is_some());
+        assert_eq!(loaded.error_message, None);
+    }
+}
+
+#[test]
 fn get_incomplete_intents_excludes_complete_and_failed() {
     let temp = tempdir().expect("tempdir");
     let store = SqliteStore::open(temp.path()).expect("open store");

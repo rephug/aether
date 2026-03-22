@@ -21,8 +21,8 @@ use aether_infer::{
 use aether_infer::{InferError, SirContext};
 use aether_parse::SymbolExtractor;
 use aether_sir::{
-    SirAnnotation, canonicalize_file_sir_json, canonicalize_sir_json, file_sir_hash, sir_hash,
-    synthetic_file_sir_id, validate_sir,
+    FileSir, SirAnnotation, canonicalize_file_sir_json, canonicalize_sir_json, file_sir_hash,
+    sir_hash, synthetic_file_sir_id, validate_sir,
 };
 #[cfg(test)]
 use aether_store::SymbolRecord;
@@ -34,12 +34,17 @@ use aether_store::{
 };
 use anyhow::{Context, Result, anyhow};
 use tokio::runtime::Runtime;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 pub(crate) use self::infer::build_job;
 use self::infer::{GeneratedSir, SirGenerationOutcome, SirJob, generate_sir_jobs};
 pub(crate) use self::persist::UpsertSirIntentPayload;
 use self::persist::{flatten_error_line, to_symbol_record, to_test_intent_record};
-use self::rollup::{FileLeafSir, aggregate_file_sir};
+use self::rollup::{
+    FileLeafSir, aggregate_file_sir, concatenate_file_sir, file_sir_from_summary,
+    summarize_file_intent_async,
+};
 use crate::quality::SirQualityMonitor;
 
 mod infer;
@@ -152,6 +157,20 @@ struct PendingBulkEmbedding {
 struct BufferedEmbeddingWrite {
     record: SymbolEmbeddingRecord,
     persisted: PersistedSuccessfulGeneration,
+}
+
+#[derive(Debug, Clone)]
+struct RollupJob {
+    file_path: String,
+    language: Language,
+    leaf_sirs: Vec<FileLeafSir>,
+}
+
+#[derive(Debug)]
+struct CompletedRollup {
+    file_path: String,
+    language: Language,
+    file_sir: FileSir,
 }
 
 impl SirPipeline {
@@ -651,25 +670,23 @@ impl SirPipeline {
             "Embedded quality batch symbols"
         );
 
-        for (file_path, mut intent_ids) in intents_by_file {
-            if self.skip_surreal_sync {
-                self.complete_graph_stage_without_sync(store, &mut intent_ids);
-            } else {
+        if self.skip_surreal_sync {
+            self.batch_complete_graph_stage_without_sync(store, intents_by_file);
+        } else {
+            for (file_path, mut intent_ids) in intents_by_file {
                 self.finalize_graph_stage(store, file_path.as_str(), &mut intent_ids);
             }
         }
 
-        for (file_path, language) in touched_files {
-            self.upsert_file_rollup(
-                store,
-                file_path.as_str(),
-                language,
-                print_sir,
-                out,
-                commit_hash.as_deref(),
-                generation_pass,
-            )?;
-        }
+        self.bulk_upsert_file_rollups(
+            store,
+            touched_files,
+            print_sir,
+            out,
+            commit_hash.as_deref(),
+            generation_pass,
+        )
+        .context("failed to upsert quality-batch file rollups")?;
 
         Ok(stats)
     }
@@ -838,22 +855,17 @@ impl SirPipeline {
             "Embedded bulk scan symbols"
         );
 
-        for (_file_path, mut intent_ids) in intents_by_file {
-            self.complete_graph_stage_without_sync(store, &mut intent_ids);
-        }
+        self.batch_complete_graph_stage_without_sync(store, intents_by_file);
 
-        for (file_path, language) in touched_files {
-            self.upsert_file_rollup(
-                store,
-                file_path.as_str(),
-                language,
-                print_sir,
-                out,
-                commit_hash.as_deref(),
-                generation_pass,
-            )
-            .with_context(|| format!("failed to upsert bulk-scan file rollup for {file_path}"))?;
-        }
+        self.bulk_upsert_file_rollups(
+            store,
+            touched_files,
+            print_sir,
+            out,
+            commit_hash.as_deref(),
+            generation_pass,
+        )
+        .context("failed to upsert bulk-scan file rollups")?;
 
         Ok(stats)
     }
@@ -1526,6 +1538,42 @@ impl SirPipeline {
                     "failed to mark write intent complete"
                 );
                 self.mark_intent_failed_safely(store, intent_id.as_str(), message.as_str());
+            }
+        }
+    }
+
+    fn batch_complete_graph_stage_without_sync(
+        &self,
+        store: &SqliteStore,
+        intents_by_file: BTreeMap<String, Vec<String>>,
+    ) -> usize {
+        let intent_ids = intents_by_file.into_values().flatten().collect::<Vec<_>>();
+
+        if intent_ids.is_empty() {
+            return 0;
+        }
+
+        match store.batch_complete_intents(&intent_ids) {
+            Ok(result) => {
+                tracing::info!(
+                    intent_count = intent_ids.len(),
+                    completed = result.completed,
+                    failed = result.failed,
+                    "completed batched graph stage without sync"
+                );
+                result.completed
+            }
+            Err(err) => {
+                let message = format!("batched graph completion failed: {err:#}");
+                for intent_id in &intent_ids {
+                    self.mark_intent_failed_safely(store, intent_id.as_str(), message.as_str());
+                }
+                tracing::error!(
+                    intent_count = intent_ids.len(),
+                    error = %err,
+                    "failed to complete batched graph stage without sync"
+                );
+                0
             }
         }
     }
@@ -2581,29 +2629,182 @@ impl SirPipeline {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn upsert_file_rollup(
+    fn bulk_upsert_file_rollups(
         &self,
         store: &SqliteStore,
-        file_path: &str,
-        language: Language,
+        touched_files: BTreeMap<String, Language>,
         print_sir: bool,
         out: &mut dyn Write,
         commit_hash: Option<&str>,
         generation_pass: &str,
     ) -> Result<()> {
-        let rollup_id = synthetic_file_sir_id(language.as_str(), file_path);
+        let mut stale_rollups = Vec::new();
+        let mut local_only = Vec::new();
+        let mut needs_api = Vec::new();
+
+        for (file_path, language) in touched_files {
+            let leaf_sirs = self
+                .load_file_rollup_leaf_sirs(store, file_path.as_str())
+                .with_context(|| format!("failed to prepare file rollup inputs for {file_path}"))?;
+
+            if leaf_sirs.is_empty() {
+                stale_rollups.push((file_path, language));
+                continue;
+            }
+
+            let job = RollupJob {
+                file_path,
+                language,
+                leaf_sirs,
+            };
+
+            if job.leaf_sirs.len() <= 5 {
+                local_only.push(job);
+            } else {
+                needs_api.push(job);
+            }
+        }
+
+        tracing::info!(
+            stale = stale_rollups.len(),
+            local_only = local_only.len(),
+            api_jobs = needs_api.len(),
+            "prepared bulk file rollup jobs"
+        );
+
+        for (file_path, language) in stale_rollups {
+            self.remove_file_rollup(store, file_path.as_str(), language)
+                .with_context(|| format!("failed to remove stale file rollup for {file_path}"))?;
+        }
+
+        for job in local_only {
+            let file_sir = concatenate_file_sir(&job.leaf_sirs);
+            self.persist_file_rollup(
+                store,
+                job.file_path.as_str(),
+                job.language,
+                &file_sir,
+                print_sir,
+                out,
+                commit_hash,
+                generation_pass,
+            )
+            .with_context(|| {
+                format!("failed to persist local file rollup for {}", job.file_path)
+            })?;
+        }
+
+        for rollup in self
+            .generate_api_file_rollups(needs_api)
+            .context("failed to generate API-backed file rollups")?
+        {
+            self.persist_file_rollup(
+                store,
+                rollup.file_path.as_str(),
+                rollup.language,
+                &rollup.file_sir,
+                print_sir,
+                out,
+                commit_hash,
+                generation_pass,
+            )
+            .with_context(|| format!("failed to persist file rollup for {}", rollup.file_path))?;
+        }
+
+        Ok(())
+    }
+
+    fn generate_api_file_rollups(&self, jobs: Vec<RollupJob>) -> Result<Vec<CompletedRollup>> {
+        if jobs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let provider = self.provider.clone();
+        let concurrency = self.sir_concurrency.max(1);
+        let timeout_secs = self.inference_timeout_secs;
+        let total_jobs = jobs.len();
+
+        let mut completed = self.runtime.block_on(async move {
+            let semaphore = Arc::new(Semaphore::new(concurrency));
+            let mut join_set = JoinSet::new();
+
+            for job in jobs {
+                let provider = provider.clone();
+                let semaphore = semaphore.clone();
+                join_set.spawn(async move {
+                    let file_path = job.file_path;
+                    let language = job.language;
+                    let leaf_sirs = job.leaf_sirs;
+
+                    let summary = match semaphore.acquire_owned().await {
+                        Ok(permit) => {
+                            let _permit = permit;
+                            summarize_file_intent_async(
+                                file_path.as_str(),
+                                language,
+                                &leaf_sirs,
+                                provider,
+                                timeout_secs,
+                            )
+                            .await
+                        }
+                        Err(_) => Err(anyhow!("file rollup semaphore closed")),
+                    };
+
+                    let file_sir = match summary {
+                        Ok(summary) if !summary.trim().is_empty() => {
+                            file_sir_from_summary(&leaf_sirs, summary)
+                        }
+                        Ok(_) => concatenate_file_sir(&leaf_sirs),
+                        Err(err) => {
+                            tracing::debug!(
+                                file_path = %file_path,
+                                error = %err,
+                                "file rollup summarization failed, using deterministic concatenation"
+                            );
+                            concatenate_file_sir(&leaf_sirs)
+                        }
+                    };
+
+                    CompletedRollup {
+                        file_path,
+                        language,
+                        file_sir,
+                    }
+                });
+            }
+
+            let mut completed = Vec::with_capacity(total_jobs);
+            while let Some(joined) = join_set.join_next().await {
+                completed.push(
+                    joined.map_err(|err| anyhow!("file rollup task join failed: {err}"))?,
+                );
+            }
+
+            Ok::<Vec<CompletedRollup>, anyhow::Error>(completed)
+        })?;
+
+        completed.sort_by(|left, right| left.file_path.cmp(&right.file_path));
+
+        tracing::info!(
+            job_count = total_jobs,
+            concurrency,
+            "completed bulk API file rollup generation"
+        );
+
+        Ok(completed)
+    }
+
+    fn load_file_rollup_leaf_sirs(
+        &self,
+        store: &SqliteStore,
+        file_path: &str,
+    ) -> Result<Vec<FileLeafSir>> {
         let symbols = store
             .list_symbols_for_file(file_path)
             .with_context(|| format!("failed to list symbols for file {file_path}"))?;
-
-        if symbols.is_empty() {
-            store
-                .mark_removed(&rollup_id)
-                .with_context(|| format!("failed to remove stale file rollup {rollup_id}"))?;
-            return Ok(());
-        }
-
         let mut leaf_sirs = Vec::new();
+
         for symbol in symbols {
             let Some(blob) = store
                 .read_sir_blob(&symbol.id)
@@ -2638,24 +2839,36 @@ impl SirPipeline {
             });
         }
 
-        if leaf_sirs.is_empty() {
-            store
-                .mark_removed(&rollup_id)
-                .with_context(|| format!("failed to remove stale file rollup {rollup_id}"))?;
-            return Ok(());
-        }
+        Ok(leaf_sirs)
+    }
 
-        let file_sir = aggregate_file_sir(
-            file_path,
-            language,
-            &leaf_sirs,
-            self.provider.clone(),
-            &self.runtime,
-            self.inference_timeout_secs,
-        )
-        .with_context(|| format!("failed to aggregate file rollup for {file_path}"))?;
-        let canonical_json = canonicalize_file_sir_json(&file_sir);
-        let sir_hash_value = file_sir_hash(&file_sir);
+    fn remove_file_rollup(
+        &self,
+        store: &SqliteStore,
+        file_path: &str,
+        language: Language,
+    ) -> Result<()> {
+        let rollup_id = synthetic_file_sir_id(language.as_str(), file_path);
+        store
+            .mark_removed(&rollup_id)
+            .with_context(|| format!("failed to remove stale file rollup {rollup_id}"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn persist_file_rollup(
+        &self,
+        store: &SqliteStore,
+        file_path: &str,
+        language: Language,
+        file_sir: &FileSir,
+        print_sir: bool,
+        out: &mut dyn Write,
+        commit_hash: Option<&str>,
+        generation_pass: &str,
+    ) -> Result<()> {
+        let rollup_id = synthetic_file_sir_id(language.as_str(), file_path);
+        let canonical_json = canonicalize_file_sir_json(file_sir);
+        let sir_hash_value = file_sir_hash(file_sir);
         let attempted_at = unix_timestamp_secs();
         let version_write = store
             .record_sir_version_if_changed(
@@ -2702,6 +2915,49 @@ impl SirPipeline {
         }
 
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upsert_file_rollup(
+        &self,
+        store: &SqliteStore,
+        file_path: &str,
+        language: Language,
+        print_sir: bool,
+        out: &mut dyn Write,
+        commit_hash: Option<&str>,
+        generation_pass: &str,
+    ) -> Result<()> {
+        let leaf_sirs = self
+            .load_file_rollup_leaf_sirs(store, file_path)
+            .with_context(|| format!("failed to load file rollup inputs for {file_path}"))?;
+
+        if leaf_sirs.is_empty() {
+            self.remove_file_rollup(store, file_path, language)
+                .with_context(|| format!("failed to remove stale file rollup for {file_path}"))?;
+            return Ok(());
+        }
+
+        let file_sir = aggregate_file_sir(
+            file_path,
+            language,
+            &leaf_sirs,
+            self.provider.clone(),
+            &self.runtime,
+            self.inference_timeout_secs,
+        )
+        .with_context(|| format!("failed to aggregate file rollup for {file_path}"))?;
+
+        self.persist_file_rollup(
+            store,
+            file_path,
+            language,
+            &file_sir,
+            print_sir,
+            out,
+            commit_hash,
+            generation_pass,
+        )
     }
 }
 

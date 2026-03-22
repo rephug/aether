@@ -22,8 +22,7 @@ pub(super) fn aggregate_file_sir(
     runtime: &Runtime,
     inference_timeout_secs: u64,
 ) -> Result<FileSir> {
-    let mut sorted = leaf_sirs.to_vec();
-    sorted.sort_by(|left, right| left.qualified_name.cmp(&right.qualified_name));
+    let sorted = sorted_leaf_sirs(leaf_sirs);
 
     let intent = if sorted.len() <= 5 {
         concatenate_leaf_intents(&sorted)
@@ -49,13 +48,56 @@ pub(super) fn aggregate_file_sir(
         }
     };
 
+    Ok(assemble_file_sir(&sorted, intent))
+}
+
+pub(super) fn concatenate_file_sir(leaf_sirs: &[FileLeafSir]) -> FileSir {
+    let sorted = sorted_leaf_sirs(leaf_sirs);
+    let intent = concatenate_leaf_intents(&sorted);
+    assemble_file_sir(&sorted, intent)
+}
+
+pub(super) fn file_sir_from_summary(
+    leaf_sirs: &[FileLeafSir],
+    summary: impl Into<String>,
+) -> FileSir {
+    let sorted = sorted_leaf_sirs(leaf_sirs);
+    let summary = summary.into();
+    let intent = if summary.trim().is_empty() {
+        concatenate_leaf_intents(&sorted)
+    } else {
+        summary.trim().to_owned()
+    };
+
+    assemble_file_sir(&sorted, intent)
+}
+
+pub(super) async fn summarize_file_intent_async(
+    file_path: &str,
+    language: Language,
+    leaf_sirs: &[FileLeafSir],
+    provider: Arc<dyn InferenceProvider>,
+    inference_timeout_secs: u64,
+) -> Result<String> {
+    let sorted = sorted_leaf_sirs(leaf_sirs);
+    summarize_file_intent_sorted_async(
+        file_path,
+        language,
+        &sorted,
+        provider,
+        inference_timeout_secs,
+    )
+    .await
+}
+
+fn assemble_file_sir(leaf_sirs: &[FileLeafSir], intent: String) -> FileSir {
     let mut exports = Vec::new();
     let mut side_effects = Vec::new();
     let mut dependencies = Vec::new();
     let mut error_modes = Vec::new();
     let mut confidence = 1.0f32;
 
-    for entry in &sorted {
+    for entry in leaf_sirs {
         exports.push(entry.qualified_name.clone());
         side_effects.extend(entry.sir.side_effects.clone());
         dependencies.extend(entry.sir.dependencies.clone());
@@ -68,15 +110,15 @@ pub(super) fn aggregate_file_sir(
     sort_and_dedup(&mut dependencies);
     sort_and_dedup(&mut error_modes);
 
-    Ok(FileSir {
+    FileSir {
         intent,
         exports,
         side_effects,
         dependencies,
         error_modes,
-        symbol_count: sorted.len(),
+        symbol_count: leaf_sirs.len(),
         confidence,
-    })
+    }
 }
 
 fn summarize_file_intent(
@@ -87,6 +129,35 @@ fn summarize_file_intent(
     runtime: &Runtime,
     inference_timeout_secs: u64,
 ) -> Result<String> {
+    let sorted = sorted_leaf_sirs(leaf_sirs);
+    runtime.block_on(summarize_file_intent_sorted_async(
+        file_path,
+        language,
+        &sorted,
+        provider,
+        inference_timeout_secs,
+    ))
+}
+
+async fn summarize_file_intent_sorted_async(
+    file_path: &str,
+    language: Language,
+    leaf_sirs: &[FileLeafSir],
+    provider: Arc<dyn InferenceProvider>,
+    inference_timeout_secs: u64,
+) -> Result<String> {
+    let summary_input = build_file_rollup_prompt(leaf_sirs);
+    let context = build_file_rollup_context(file_path, language, &summary_input);
+
+    let summarized =
+        generate_sir_with_retries(provider, summary_input, context, inference_timeout_secs)
+            .await
+            .with_context(|| format!("failed to summarize file intent for {file_path}"))?;
+
+    Ok(summarized.sir.intent.trim().to_owned())
+}
+
+fn build_file_rollup_prompt(leaf_sirs: &[FileLeafSir]) -> String {
     let mut prompt_sections = Vec::with_capacity(leaf_sirs.len());
     for entry in leaf_sirs {
         prompt_sections.push(format!(
@@ -99,11 +170,18 @@ fn summarize_file_intent(
         ));
     }
 
-    let summary_input = format!(
+    format!(
         "Generate a concise file-level intent summary from the following leaf SIR entries.\n\n{}",
         prompt_sections.join("\n\n")
-    );
-    let context = SirContext {
+    )
+}
+
+fn build_file_rollup_context(
+    file_path: &str,
+    language: Language,
+    summary_input: &str,
+) -> SirContext {
+    SirContext {
         language: language.as_str().to_owned(),
         file_path: file_path.to_owned(),
         qualified_name: format!("file::{file_path}"),
@@ -111,18 +189,13 @@ fn summarize_file_intent(
         kind: "file".to_owned(),
         is_public: true,
         line_count: summary_input.lines().count(),
-    };
+    }
+}
 
-    let summarized = runtime
-        .block_on(generate_sir_with_retries(
-            provider,
-            summary_input,
-            context,
-            inference_timeout_secs,
-        ))
-        .with_context(|| format!("failed to summarize file intent for {file_path}"))?;
-
-    Ok(summarized.sir.intent.trim().to_owned())
+fn sorted_leaf_sirs(leaf_sirs: &[FileLeafSir]) -> Vec<FileLeafSir> {
+    let mut sorted = leaf_sirs.to_vec();
+    sorted.sort_by(|left, right| left.qualified_name.cmp(&right.qualified_name));
+    sorted
 }
 
 fn concatenate_leaf_intents(leaf_sirs: &[FileLeafSir]) -> String {
