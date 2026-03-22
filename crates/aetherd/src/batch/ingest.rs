@@ -64,6 +64,14 @@ pub(crate) fn ingest_results(
     provider: &dyn BatchProvider,
     provider_name: &str,
 ) -> Result<IngestSummary> {
+    let keymap = load_keymap(results_path, pass_config.pass.as_str());
+    if !keymap.is_empty() {
+        tracing::debug!(
+            keys = keymap.len(),
+            "loaded batch keymap for prompt-hash recovery"
+        );
+    }
+
     let file = std::fs::File::open(results_path)
         .with_context(|| format!("failed to open batch results {}", results_path.display()))?;
     let reader = BufReader::new(file);
@@ -102,6 +110,7 @@ pub(crate) fn ingest_results(
                 config,
                 provider,
                 provider_name,
+                &keymap,
                 &line_chunk,
                 &mut summary,
                 &mut embedding_buffer,
@@ -119,6 +128,7 @@ pub(crate) fn ingest_results(
             config,
             provider,
             provider_name,
+            &keymap,
             &line_chunk,
             &mut summary,
             &mut embedding_buffer,
@@ -148,6 +158,7 @@ fn process_chunk(
     config: &AetherConfig,
     provider: &dyn BatchProvider,
     provider_name: &str,
+    keymap: &HashMap<String, String>,
     lines: &[String],
     summary: &mut IngestSummary,
     embedding_buffer: &mut Vec<SymbolEmbeddingRecord>,
@@ -165,6 +176,7 @@ fn process_chunk(
             raw_line,
             provider,
             provider_name,
+            keymap,
         ) {
             Ok(mut prep) => {
                 if let Some((provider, model)) = embedding_identity {
@@ -280,10 +292,18 @@ fn prepare_symbol(
     raw_line: &str,
     provider: &dyn BatchProvider,
     provider_name: &str,
+    keymap: &HashMap<String, String>,
 ) -> Result<PreparedSymbol> {
     let (symbol_id, prompt_hash, sir_json) = match provider.parse_result_line(raw_line)? {
         BatchResultLine::Success { key, text } => {
-            let (sid, phash) = parse_key(&key)?;
+            // If the key lacks a delimiter (e.g. Anthropic truncated custom_id),
+            // try to recover the full key from the build-time keymap.
+            let resolved_key = if !key.contains('|') {
+                keymap.get(&key).map(String::as_str).unwrap_or(&key)
+            } else {
+                &key
+            };
+            let (sid, phash) = parse_key(resolved_key)?;
             (sid.to_owned(), phash.to_owned(), text)
         }
         BatchResultLine::Error { key, message } => {
@@ -426,6 +446,30 @@ fn parse_key(key: &str) -> Result<(&str, &str)> {
         ));
     }
     Ok((symbol_id, prompt_hash))
+}
+
+/// Try to load a keymap sidecar written during JSONL build.
+///
+/// The keymap maps `symbol_id → symbol_id|prompt_hash`, allowing ingest to
+/// recover full batch keys from providers that truncate custom_id
+/// (e.g. Anthropic's 64-char limit).
+fn load_keymap(results_path: &Path, pass: &str) -> HashMap<String, String> {
+    let batch_dir = match results_path.parent() {
+        Some(dir) => dir,
+        None => return HashMap::new(),
+    };
+    let keymap_path = batch_dir.join(format!("{pass}.keymap.json"));
+    match std::fs::read_to_string(&keymap_path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|err| {
+            tracing::warn!(
+                path = %keymap_path.display(),
+                error = %err,
+                "failed to parse batch keymap, prompt hashes may be unavailable"
+            );
+            HashMap::new()
+        }),
+        Err(_) => HashMap::new(),
+    }
 }
 
 fn symbol_from_record(record: &aether_store::SymbolRecord) -> Result<Symbol> {
