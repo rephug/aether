@@ -363,6 +363,25 @@ vector_backend = "sqlite"
             .expect("seed embedding");
     }
 
+    fn install_graph_done_failure_trigger(workspace: &Path, symbol_id: &str) {
+        let conn =
+            Connection::open(workspace.join(".aether/meta.sqlite")).expect("open sqlite database");
+        conn.execute_batch(
+            format!(
+                r#"
+                CREATE TRIGGER fail_graph_done_for_test
+                BEFORE UPDATE OF status ON write_intents
+                WHEN NEW.status = 'graph_done' AND OLD.symbol_id = '{symbol_id}'
+                BEGIN
+                    SELECT RAISE(FAIL, 'graph_done blocked for test');
+                END;
+                "#
+            )
+            .as_str(),
+        )
+        .expect("install graph_done failure trigger");
+    }
+
     fn count_table_rows(workspace: &Path, table: &str) -> i64 {
         let conn =
             Connection::open(workspace.join(".aether/meta.sqlite")).expect("open sqlite database");
@@ -1106,6 +1125,78 @@ impl Store {
             .read_sir_blob(rollup_id.as_str())
             .expect("read rollup blob")
             .is_some());
+    }
+
+    #[test]
+    fn process_bulk_scan_counts_batched_graph_completion_failures() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_only_config(workspace);
+        fs::create_dir_all(workspace.join("src")).expect("create src");
+
+        let mut source = String::new();
+        for idx in 0..2 {
+            source.push_str(format!("pub fn symbol_{idx}() -> i32 {{ {idx} }}\n").as_str());
+        }
+        fs::write(workspace.join("src/lib.rs"), &source).expect("write source");
+
+        let mut extractor = SymbolExtractor::new().expect("symbol extractor");
+        let extracted = extractor
+            .extract_with_edges_from_path(Path::new("src/lib.rs"), &source)
+            .expect("extract source");
+        let symbols = extracted.symbols;
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        for symbol in &symbols {
+            store
+                .upsert_symbol(demo_symbol_record_with_kind(
+                    symbol.id.as_str(),
+                    symbol.qualified_name.as_str(),
+                    symbol.kind.as_str(),
+                    symbol.file_path.as_str(),
+                ))
+                .expect("upsert symbol");
+        }
+
+        install_graph_done_failure_trigger(workspace, symbols[0].id.as_str());
+
+        let priority_scores = symbols
+            .iter()
+            .enumerate()
+            .map(|(idx, symbol)| (symbol.id.clone(), idx as f64))
+            .collect::<HashMap<_, _>>();
+        let pipeline = build_write_pipeline(workspace, Arc::new(FixedInferenceProvider { sir: demo_sir() }))
+            .with_skip_surreal_sync(true);
+
+        let mut out = Vec::new();
+        let stats = pipeline
+            .process_bulk_scan(
+                &store,
+                symbols.clone(),
+                &priority_scores,
+                false,
+                SIR_GENERATION_PASS_SCAN,
+                false,
+                &mut out,
+            )
+            .expect("process bulk scan");
+
+        assert_eq!(stats.success_count, symbols.len());
+        assert_eq!(stats.failure_count, 1);
+        assert_eq!(
+            store
+                .count_intents_by_status()
+                .expect("count intents")
+                .get("complete"),
+            Some(&1usize)
+        );
+        assert_eq!(
+            store
+                .count_intents_by_status()
+                .expect("count intents")
+                .get("failed"),
+            Some(&1usize)
+        );
     }
 
     #[test]

@@ -27,8 +27,8 @@ use aether_sir::{
 #[cfg(test)]
 use aether_store::SymbolRecord;
 use aether_store::{
-    IntentOperation, SirHistoryStore, SirMetaRecord, SirStateStore, SqliteStore,
-    SymbolCatalogStore, SymbolEmbeddingRecord, SymbolRelationStore, TestIntentStore,
+    BatchCompleteResult, IntentOperation, SirHistoryStore, SirMetaRecord, SirStateStore,
+    SqliteStore, SymbolCatalogStore, SymbolEmbeddingRecord, SymbolRelationStore, TestIntentStore,
     VectorEmbeddingMetaRecord, VectorStore, WriteIntent, WriteIntentStatus, open_graph_store,
     open_surreal_graph_store_sync, open_vector_store,
 };
@@ -671,7 +671,8 @@ impl SirPipeline {
         );
 
         if self.skip_surreal_sync {
-            self.batch_complete_graph_stage_without_sync(store, intents_by_file);
+            let batch_result = self.batch_complete_graph_stage_without_sync(store, intents_by_file);
+            stats.failure_count += batch_result.failed;
         } else {
             for (file_path, mut intent_ids) in intents_by_file {
                 self.finalize_graph_stage(store, file_path.as_str(), &mut intent_ids);
@@ -855,7 +856,8 @@ impl SirPipeline {
             "Embedded bulk scan symbols"
         );
 
-        self.batch_complete_graph_stage_without_sync(store, intents_by_file);
+        let batch_result = self.batch_complete_graph_stage_without_sync(store, intents_by_file);
+        stats.failure_count += batch_result.failed;
 
         self.bulk_upsert_file_rollups(
             store,
@@ -1546,11 +1548,11 @@ impl SirPipeline {
         &self,
         store: &SqliteStore,
         intents_by_file: BTreeMap<String, Vec<String>>,
-    ) -> usize {
+    ) -> BatchCompleteResult {
         let intent_ids = intents_by_file.into_values().flatten().collect::<Vec<_>>();
 
         if intent_ids.is_empty() {
-            return 0;
+            return BatchCompleteResult::default();
         }
 
         match store.batch_complete_intents(&intent_ids) {
@@ -1561,7 +1563,7 @@ impl SirPipeline {
                     failed = result.failed,
                     "completed batched graph stage without sync"
                 );
-                result.completed
+                result
             }
             Err(err) => {
                 let message = format!("batched graph completion failed: {err:#}");
@@ -1573,7 +1575,10 @@ impl SirPipeline {
                     error = %err,
                     "failed to complete batched graph stage without sync"
                 );
-                0
+                BatchCompleteResult {
+                    completed: 0,
+                    failed: intent_ids.len(),
+                }
             }
         }
     }
