@@ -24,6 +24,9 @@ pub(crate) struct BuildSummary {
     pub written: usize,
     pub skipped: usize,
     pub unresolved_symbols: usize,
+    /// Maps symbol_id → full batch key (`symbol_id|prompt_hash`) for providers
+    /// that truncate the key in their custom_id field (e.g. Anthropic's 64-char limit).
+    pub keymap: HashMap<String, String>,
 }
 
 pub(crate) fn snapshot_workspace_symbols(workspace: &Path) -> Result<HashMap<String, Symbol>> {
@@ -103,6 +106,7 @@ pub(crate) fn build_pass_jsonl_for_ids(
         written: 0,
         skipped: 0,
         unresolved_symbols: 0,
+        keymap: HashMap::new(),
     };
     let symbol_ids = match candidate_ids {
         Some(ids) => ids.to_vec(),
@@ -262,6 +266,7 @@ pub(crate) fn build_pass_jsonl_for_ids(
         }
 
         let key_str = format!("{}|{}", symbol_id, prompt_hash);
+        summary.keymap.insert(symbol_id.clone(), key_str.clone());
         let line = provider.format_request(
             &key_str,
             &system_prompt,
@@ -284,6 +289,18 @@ pub(crate) fn build_pass_jsonl_for_ids(
         writer
             .flush()
             .context("failed to flush batch JSONL output")?;
+    }
+
+    // Write keymap sidecar so ingest can recover full keys from providers that
+    // truncate custom_id (e.g. Anthropic's 64-char limit).
+    if !summary.keymap.is_empty() {
+        let keymap_path = runtime
+            .batch_dir
+            .join(format!("{}.keymap.json", pass_config.pass.as_str()));
+        let keymap_json =
+            serde_json::to_string(&summary.keymap).context("failed to serialize batch keymap")?;
+        fs::write(&keymap_path, keymap_json)
+            .with_context(|| format!("failed to write batch keymap {}", keymap_path.display()))?;
     }
 
     Ok(summary)

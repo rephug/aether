@@ -370,14 +370,24 @@ async fn process_all_chunks(
     // Collect all results
     let mut completed = Vec::new();
     let mut failed = Vec::new();
+    let mut panicked = 0usize;
     while let Some(join_result) = join_set.join_next().await {
         match join_result {
             Ok(Ok(job)) => completed.push(job),
             Ok(Err(job)) => failed.push(job),
             Err(join_err) => {
                 tracing::error!(error = %join_err, "batch chunk task panicked");
+                panicked += 1;
             }
         }
+    }
+
+    // Treat panics as hard failures — a panic indicates a programming bug
+    // and must not silently reduce the processed chunk count.
+    if panicked > 0 {
+        return Err(anyhow!(
+            "{panicked} batch chunk task(s) panicked — this is a bug, please report it"
+        ));
     }
 
     tracing::info!(
