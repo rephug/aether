@@ -85,7 +85,7 @@ pub use symbols::{SymbolMetadata, SymbolRecord, SymbolSearchResult};
 pub use task_context_history::TaskContextHistoryRecord;
 pub use test_intents::TestIntentRecord;
 pub use thresholds::{CalibrationEmbeddingRecord, ThresholdCalibrationRecord};
-pub use write_intents::{IntentOperation, WriteIntent, WriteIntentStatus};
+pub use write_intents::{BatchCompleteResult, IntentOperation, WriteIntent, WriteIntentStatus};
 
 pub(crate) use graph::STRUCTURAL_EDGE_KINDS;
 pub(crate) use lexical::project_note_lexical_terms;
