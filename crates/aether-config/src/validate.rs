@@ -282,6 +282,7 @@ mod tests {
                 endpoint: Some("http://127.0.0.1:11434".to_owned()),
                 api_key_env: DEFAULT_GEMINI_API_KEY_ENV.to_owned(),
                 concurrency: default_sir_concurrency(),
+                thinking: None,
                 tiered: None,
             },
             sir_quality: SirQualityConfig::default(),

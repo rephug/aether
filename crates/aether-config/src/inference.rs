@@ -58,6 +58,8 @@ pub struct InferenceConfig {
     #[serde(default = "default_sir_concurrency")]
     pub concurrency: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tiered: Option<TieredConfig>,
 }
 
@@ -69,6 +71,7 @@ impl Default for InferenceConfig {
             endpoint: None,
             api_key_env: default_api_key_env(),
             concurrency: default_sir_concurrency(),
+            thinking: None,
             tiered: None,
         }
     }

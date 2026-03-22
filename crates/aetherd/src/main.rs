@@ -587,6 +587,7 @@ fn run_regenerate_command(workspace: &Path, args: RegenerateArgs) -> Result<()> 
                     model: config.sir_quality.deep_model.clone(),
                     endpoint: config.sir_quality.deep_endpoint.clone(),
                     api_key_env: config.sir_quality.deep_api_key_env.clone(),
+                    thinking: config.sir_quality.deep_thinking.clone(),
                 },
             )
             .map(|pipeline| {

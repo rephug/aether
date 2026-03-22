@@ -24,6 +24,7 @@ pub struct ProviderOverrides {
     pub model: Option<String>,
     pub endpoint: Option<String>,
     pub api_key_env: Option<String>,
+    pub thinking: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

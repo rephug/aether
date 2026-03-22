@@ -994,6 +994,7 @@ log_level = ""
 [inference]
 provider = "qwen3_local"
 api_key_env = "CUSTOM_KEY"
+thinking = " low "
 
 [storage]
 mirror_sir_files = false
@@ -1033,6 +1034,7 @@ fallback_to_host_on_unavailable = true
         assert_eq!(config.general.log_level, DEFAULT_LOG_LEVEL);
         assert_eq!(config.inference.provider, InferenceProviderKind::Qwen3Local);
         assert_eq!(config.inference.api_key_env, "CUSTOM_KEY");
+        assert_eq!(config.inference.thinking.as_deref(), Some("low"));
         assert!(!config.storage.mirror_sir_files);
         assert_eq!(config.storage.graph_backend, GraphBackend::Sqlite);
         assert!(config.embeddings.enabled);
@@ -1129,12 +1131,14 @@ triage_priority_threshold = 0.25
 triage_confidence_threshold = 0.5
 triage_concurrency = 0
 triage_timeout_secs = 0
+triage_thinking = " low "
 deep_pass = true
 deep_priority_threshold = 0.95
 deep_confidence_threshold = 0.8
 deep_max_symbols = 7
 deep_concurrency = 0
 deep_timeout_secs = 0
+deep_thinking = " high "
 "#;
         fs::write(config_path(workspace), raw).expect("write config");
 
@@ -1147,6 +1151,7 @@ deep_timeout_secs = 0
             GEMINI_DEFAULT_CONCURRENCY
         );
         assert_eq!(config.sir_quality.triage_timeout_secs, 180);
+        assert_eq!(config.sir_quality.triage_thinking.as_deref(), Some("low"));
         assert!(config.sir_quality.deep_pass);
         assert_eq!(config.sir_quality.deep_priority_threshold, 0.95);
         assert_eq!(config.sir_quality.deep_confidence_threshold, 0.8);
@@ -1156,6 +1161,7 @@ deep_timeout_secs = 0
             GEMINI_DEFAULT_CONCURRENCY
         );
         assert_eq!(config.sir_quality.deep_timeout_secs, 180);
+        assert_eq!(config.sir_quality.deep_thinking.as_deref(), Some("high"));
     }
 
     #[test]

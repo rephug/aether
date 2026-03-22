@@ -117,6 +117,7 @@ impl WatcherRuntimeConfig {
                 model: Some(model.clone()),
                 endpoint: config.inference_endpoint.clone(),
                 api_key_env: config.inference_api_key_env.clone(),
+                thinking: None,
             }
         } else {
             ProviderOverrides {
@@ -124,6 +125,7 @@ impl WatcherRuntimeConfig {
                 model: config.inference_model.clone(),
                 endpoint: config.inference_endpoint.clone(),
                 api_key_env: config.inference_api_key_env.clone(),
+                thinking: None,
             }
         }
     }
@@ -803,6 +805,7 @@ fn run_triage_pass(
                 .triage_api_key_env
                 .clone()
                 .or_else(|| config.inference_api_key_env.clone()),
+            thinking: quality.triage_thinking.clone(),
         },
     )
     .map(|pipeline| pipeline.with_inference_timeout_secs(quality.triage_timeout_secs))
@@ -869,6 +872,7 @@ fn run_deep_pass(
                 .deep_api_key_env
                 .clone()
                 .or_else(|| config.inference_api_key_env.clone()),
+            thinking: quality.deep_thinking.clone(),
         },
     )
     .map(|pipeline| pipeline.with_inference_timeout_secs(quality.deep_timeout_secs))
@@ -1906,6 +1910,7 @@ fn initialize_full_indexer(
             model: config.inference_model.clone(),
             endpoint: config.inference_endpoint.clone(),
             api_key_env: config.inference_api_key_env.clone(),
+            thinking: None,
         },
     )
     .context("failed to initialize SIR pipeline")?;
