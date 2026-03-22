@@ -652,7 +652,13 @@ pub struct BatchRunArgs {
     #[arg(long, help = "Batch poll interval override in seconds")]
     pub poll_interval_secs: Option<u64>,
 
-    #[arg(long, help = "Batch provider (gemini, openai)")]
+    #[arg(
+        long,
+        help = "Maximum concurrent active batch jobs (default 4, Gemini limit is ~4)"
+    )]
+    pub max_concurrent_jobs: Option<usize>,
+
+    #[arg(long, help = "Batch provider (gemini, openai, anthropic)")]
     pub provider: Option<String>,
 }
 

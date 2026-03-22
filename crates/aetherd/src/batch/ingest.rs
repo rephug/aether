@@ -291,7 +291,52 @@ fn prepare_symbol(
         }
     };
 
-    let sir = serde_json::from_str::<SirAnnotation>(sir_json.as_str())
+    // Strip markdown fences and trailing prose from model responses.
+    // Some models wrap JSON in ```json...``` fences and/or append explanatory text.
+    let sir_json_clean = {
+        let s = sir_json.trim();
+        let s = s
+            .strip_prefix("```json")
+            .or_else(|| s.strip_prefix("```"))
+            .unwrap_or(s);
+        let s = s.trim();
+        let s = s.strip_suffix("```").unwrap_or(s);
+        let s = s.trim();
+        // Find the end of the top-level JSON object by matching braces
+        let mut depth = 0i32;
+        let mut end = s.len();
+        let mut in_string = false;
+        let mut escape_next = false;
+        for (i, ch) in s.char_indices() {
+            if escape_next {
+                escape_next = false;
+                continue;
+            }
+            if ch == '\\' && in_string {
+                escape_next = true;
+                continue;
+            }
+            if ch == '"' {
+                in_string = !in_string;
+                continue;
+            }
+            if in_string {
+                continue;
+            }
+            if ch == '{' {
+                depth += 1;
+            }
+            if ch == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    end = i + 1;
+                    break;
+                }
+            }
+        }
+        &s[..end]
+    };
+    let sir = serde_json::from_str::<SirAnnotation>(sir_json_clean)
         .context("failed to parse SIR JSON from batch response")?;
     let symbol_record = store
         .get_symbol_record(&symbol_id)
@@ -372,9 +417,7 @@ pub(crate) fn write_fingerprint_row(
 }
 
 fn parse_key(key: &str) -> Result<(&str, &str)> {
-    let (symbol_id, prompt_hash) = key
-        .split_once('|')
-        .ok_or_else(|| anyhow!("batch response key missing prompt hash delimiter"))?;
+    let (symbol_id, prompt_hash) = key.split_once('|').unwrap_or((key, "unknown"));
     let symbol_id = symbol_id.trim();
     let prompt_hash = prompt_hash.trim();
     if symbol_id.is_empty() || prompt_hash.is_empty() {

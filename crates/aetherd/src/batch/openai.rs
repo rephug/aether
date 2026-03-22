@@ -52,7 +52,7 @@ impl BatchProvider for OpenAiBatchProvider {
             "model": model,
             "instructions": system_prompt,
             "input": [
-                { "role": "user", "content": user_prompt }
+                { "role": "user", "content": format!("{user_prompt}\n\nRespond with ONLY valid JSON.") }
             ],
             "text": {
                 "format": { "type": "json_object" }
@@ -432,7 +432,10 @@ mod tests {
         assert_eq!(json["body"]["model"], "gpt-4o");
         assert_eq!(json["body"]["instructions"], "System instructions.");
         assert_eq!(json["body"]["input"][0]["role"], "user");
-        assert_eq!(json["body"]["input"][0]["content"], "User content.");
+        assert_eq!(
+            json["body"]["input"][0]["content"],
+            "User content.\n\nRespond with ONLY valid JSON."
+        );
         assert_eq!(json["body"]["text"]["format"]["type"], "json_object");
         assert_eq!(json["body"]["store"], false);
         assert_eq!(json["body"]["temperature"], 0.0);
