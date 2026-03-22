@@ -8,7 +8,7 @@ use super::{BatchPollStatus, BatchProvider, BatchResultLine};
 const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com/v1";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const ANTHROPIC_BETA_EXTENDED_CACHE_TTL: &str = "extended-cache-ttl-2025-04-11";
-const ANTHROPIC_CACHE_TTL_SECS: u64 = 3600;
+const ANTHROPIC_CACHE_TTL: &str = "1h";
 
 /// Maximum requests per Anthropic batch job.
 const MAX_REQUESTS_PER_BATCH: usize = 10_000;
@@ -78,7 +78,7 @@ impl BatchProvider for AnthropicBatchProvider {
                     "text": system_prompt,
                     "cache_control": {
                         "type": "ephemeral",
-                        "ttl": ANTHROPIC_CACHE_TTL_SECS
+                        "ttl": ANTHROPIC_CACHE_TTL
                     }
                 }
             ],
@@ -94,8 +94,21 @@ impl BatchProvider for AnthropicBatchProvider {
             });
         }
 
+        // Anthropic limits custom_id to 64 chars matching ^[a-zA-Z0-9_-]{1,64}$.
+        // Compound key is symbol_id|hashes... which exceeds 64 chars.
+        // Use just the symbol_id (64 hex chars) which fits exactly.
+        let truncated_key: String = match key.find('|') {
+            Some(pos) => key[..pos].to_string(),
+            None => {
+                if key.len() > 64 {
+                    key[..64].to_string()
+                } else {
+                    key.to_string()
+                }
+            }
+        };
         let line = json!({
-            "custom_id": key,
+            "custom_id": truncated_key,
             "params": params
         });
 
@@ -412,7 +425,8 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_str(&line).unwrap();
 
-        assert_eq!(json["custom_id"], "sym1|hash1");
+        // custom_id is truncated to the symbol_id portion (before first '|')
+        assert_eq!(json["custom_id"], "sym1");
         assert_eq!(json["params"]["model"], "claude-haiku-4-5-20251001");
         assert_eq!(json["params"]["max_tokens"], 4096);
 
@@ -423,8 +437,8 @@ mod tests {
         assert_eq!(system[0]["text"], "System instructions.");
         assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
         assert_eq!(
-            system[0]["cache_control"]["ttl"].as_u64(),
-            Some(ANTHROPIC_CACHE_TTL_SECS)
+            system[0]["cache_control"]["ttl"].as_str(),
+            Some(ANTHROPIC_CACHE_TTL)
         );
 
         // User message

@@ -1,8 +1,12 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use aether_config::AetherConfig;
 use aether_store::SqliteStore;
 use anyhow::{Context, Result, anyhow};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::batch::build::{build_pass_jsonl, snapshot_workspace_symbols};
 use crate::batch::extract::run_extract;
@@ -13,15 +17,17 @@ use crate::batch::{
 };
 use crate::cli::{BatchArgs, BatchBuildArgs, BatchCommand, BatchIngestArgs, BatchRunArgs};
 
-/// Tracks a submitted batch chunk awaiting completion.
-struct PendingBatchJob {
-    /// Job IDs returned by the provider's submit call.
-    job_ids: Vec<String>,
-    /// Path to the JSONL input file for error reporting.
-    input_path: PathBuf,
-    /// Index in the original chunk list.
-    chunk_index: usize,
-}
+// ---------------------------------------------------------------------------
+// Retry constants for 429 / rate-limit errors during batch submission
+// ---------------------------------------------------------------------------
+
+const SUBMIT_MAX_RETRIES: usize = 5;
+const SUBMIT_BACKOFF_BASE_SECS: u64 = 30;
+const SUBMIT_BACKOFF_CAP_SECS: u64 = 300;
+
+// ---------------------------------------------------------------------------
+// Result types
+// ---------------------------------------------------------------------------
 
 struct CompletedBatchJob {
     chunk_index: usize,
@@ -38,6 +44,10 @@ struct BatchPollOutcome {
     completed: Vec<CompletedBatchJob>,
     failed: Vec<FailedBatchJob>,
 }
+
+// ---------------------------------------------------------------------------
+// Command dispatch
+// ---------------------------------------------------------------------------
 
 pub fn run_batch_command(workspace: &Path, config: &AetherConfig, args: BatchArgs) -> Result<()> {
     match args.command {
@@ -115,14 +125,20 @@ fn run_ingest_command(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Full batch pipeline: extract -> build -> submit -> poll -> download -> ingest
+// ---------------------------------------------------------------------------
+
 fn run_full_batch_command(
     workspace: &Path,
     config: &AetherConfig,
     args: &BatchRunArgs,
 ) -> Result<()> {
     let batch_config = config.batch.clone().unwrap_or_default();
-    let provider = create_batch_provider(&batch_config, args.provider.as_deref())
-        .context("failed to create batch provider")?;
+    let provider: Arc<dyn BatchProvider> = Arc::from(
+        create_batch_provider(&batch_config, args.provider.as_deref())
+            .context("failed to create batch provider")?,
+    );
 
     let runtime = resolve_batch_runtime_config(workspace, config, Some(args));
     let passes = parse_batch_passes_csv(args.passes.as_str())?;
@@ -157,17 +173,22 @@ fn run_full_batch_command(
             build_summary.unresolved_symbols
         );
 
-        let pending = tokio_rt.block_on(submit_all_chunks(
-            provider.as_ref(),
-            build_summary.files,
-            &pass_config.model,
-            &runtime,
-        ))?;
+        tracing::info!(
+            max_concurrent_jobs = runtime.max_concurrent_jobs,
+            total_chunks = build_summary.files.len(),
+            pass = pass.as_str(),
+            "starting batch submission"
+        );
 
         let BatchPollOutcome {
             mut completed,
             mut failed,
-        } = tokio_rt.block_on(poll_and_download_all(provider.as_ref(), pending, &runtime))?;
+        } = tokio_rt.block_on(process_all_chunks(
+            provider.clone(),
+            build_summary.files,
+            pass_config.model.clone(),
+            &runtime,
+        ))?;
 
         completed.sort_by_key(|job| job.chunk_index);
         for job in completed {
@@ -240,160 +261,230 @@ fn run_full_batch_command(
     Ok(())
 }
 
-/// Submit all batch input files without waiting for completion.
-async fn submit_all_chunks(
-    provider: &dyn BatchProvider,
+// ---------------------------------------------------------------------------
+// Concurrent chunk processing: submit -> poll -> download per chunk,
+// gated by a semaphore to limit active provider-side jobs.
+// ---------------------------------------------------------------------------
+
+async fn process_all_chunks(
+    provider: Arc<dyn BatchProvider>,
     input_files: Vec<PathBuf>,
-    model: &str,
+    model: String,
     runtime: &BatchRuntimeConfig,
-) -> Result<Vec<PendingBatchJob>> {
-    let mut pending = Vec::with_capacity(input_files.len());
+) -> Result<BatchPollOutcome> {
+    let total_chunks = input_files.len();
+    let semaphore = Arc::new(Semaphore::new(runtime.max_concurrent_jobs.max(1)));
+    let poll_interval = Duration::from_secs(runtime.poll_interval_secs);
+    let batch_dir = runtime.batch_dir.clone();
+    let poll_secs = runtime.poll_interval_secs;
+    let mut join_set = JoinSet::new();
 
     for (chunk_index, input_path) in input_files.into_iter().enumerate() {
-        let job_ids = provider
-            .submit(
+        let provider = provider.clone();
+        let semaphore = semaphore.clone();
+        let model = model.clone();
+        let batch_dir = batch_dir.clone();
+
+        join_set.spawn(async move {
+            // Acquire permit — blocks until a slot opens
+            let permit = match semaphore.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    return Err(FailedBatchJob {
+                        chunk_index,
+                        input_path,
+                        message: "batch semaphore closed".to_owned(),
+                    });
+                }
+            };
+
+            tracing::info!(
+                chunk = chunk_index + 1,
+                total = total_chunks,
+                "acquired concurrency permit, submitting chunk"
+            );
+
+            // Submit with retry on 429
+            let job_ids = match submit_with_retry(
+                provider.as_ref(),
                 &input_path,
-                model,
-                &runtime.batch_dir,
-                runtime.poll_interval_secs,
+                &model,
+                &batch_dir,
+                poll_secs,
             )
             .await
-            .with_context(|| format!("batch submit failed for chunk {}", input_path.display()))?;
+            {
+                Ok(ids) => ids,
+                Err(err) => {
+                    drop(permit);
+                    return Err(FailedBatchJob {
+                        chunk_index,
+                        input_path,
+                        message: format!("{err:#}"),
+                    });
+                }
+            };
 
-        tracing::info!(
-            provider = provider.name(),
-            chunk = chunk_index + 1,
-            jobs = ?job_ids,
-            "submitted batch chunk"
-        );
+            tracing::info!(
+                provider = provider.name(),
+                chunk = chunk_index + 1,
+                jobs = ?job_ids,
+                "submitted batch chunk"
+            );
 
-        pending.push(PendingBatchJob {
-            job_ids,
-            input_path,
-            chunk_index,
+            // Poll until complete or failed
+            if let Err(msg) =
+                poll_until_done(provider.as_ref(), &job_ids, chunk_index, poll_interval).await
+            {
+                drop(permit);
+                return Err(FailedBatchJob {
+                    chunk_index,
+                    input_path,
+                    message: msg,
+                });
+            }
+
+            // Download results
+            let result = match provider
+                .download_results(&job_ids, &batch_dir)
+                .await
+                .with_context(|| format!("download failed for chunk {}", chunk_index + 1))
+            {
+                Ok(result_paths) => Ok(CompletedBatchJob {
+                    chunk_index,
+                    result_paths,
+                }),
+                Err(err) => Err(FailedBatchJob {
+                    chunk_index,
+                    input_path,
+                    message: format!("{err:#}"),
+                }),
+            };
+
+            // Release permit — next chunk can now start
+            drop(permit);
+            result
         });
     }
 
-    tracing::info!(
-        total_chunks = pending.len(),
-        "all batch chunks submitted, polling for completion"
-    );
-
-    Ok(pending)
-}
-
-/// Poll all submitted chunks and download results as they complete.
-async fn poll_and_download_all(
-    provider: &dyn BatchProvider,
-    mut pending: Vec<PendingBatchJob>,
-    runtime: &BatchRuntimeConfig,
-) -> Result<BatchPollOutcome> {
+    // Collect all results
     let mut completed = Vec::new();
     let mut failed = Vec::new();
-
-    while !pending.is_empty() {
-        tokio::time::sleep(std::time::Duration::from_secs(runtime.poll_interval_secs)).await;
-
-        let mut still_pending = Vec::with_capacity(pending.len());
-        for job in pending {
-            let poll_status =
-                match provider.poll(&job.job_ids).await.with_context(|| {
-                    format!("failed to poll batch chunk {}", job.input_path.display())
-                }) {
-                    Ok(status) => status,
-                    Err(err) => {
-                        tracing::error!(
-                            chunk = job.chunk_index + 1,
-                            error = %err,
-                            "batch chunk poll failed"
-                        );
-                        failed.push(FailedBatchJob {
-                            chunk_index: job.chunk_index,
-                            input_path: job.input_path,
-                            message: format!("{err:#}"),
-                        });
-                        continue;
-                    }
-                };
-
-            match poll_status {
-                BatchPollStatus::Completed => {
-                    tracing::info!(
-                        chunk = job.chunk_index + 1,
-                        "batch chunk completed, downloading results"
-                    );
-                    match provider
-                        .download_results(&job.job_ids, &runtime.batch_dir)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "failed to download results for chunk {}",
-                                job.input_path.display()
-                            )
-                        }) {
-                        Ok(result_paths) => {
-                            completed.push(CompletedBatchJob {
-                                chunk_index: job.chunk_index,
-                                result_paths,
-                            });
-                        }
-                        Err(err) => {
-                            tracing::error!(
-                                chunk = job.chunk_index + 1,
-                                error = %err,
-                                "batch chunk download failed"
-                            );
-                            failed.push(FailedBatchJob {
-                                chunk_index: job.chunk_index,
-                                input_path: job.input_path,
-                                message: format!("{err:#}"),
-                            });
-                        }
-                    }
-                }
-                BatchPollStatus::Failed { message } => {
-                    tracing::error!(
-                        chunk = job.chunk_index + 1,
-                        error = %message,
-                        "batch chunk failed"
-                    );
-                    failed.push(FailedBatchJob {
-                        chunk_index: job.chunk_index,
-                        input_path: job.input_path,
-                        message,
-                    });
-                }
-                BatchPollStatus::InProgress {
-                    completed: done,
-                    total,
-                } => {
-                    if let (Some(completed_count), Some(total_count)) = (done, total) {
-                        tracing::info!(
-                            chunk = job.chunk_index + 1,
-                            completed = completed_count,
-                            total = total_count,
-                            "batch chunk in progress"
-                        );
-                    } else {
-                        tracing::info!(chunk = job.chunk_index + 1, "batch chunk in progress");
-                    }
-                    still_pending.push(job);
-                }
+    while let Some(join_result) = join_set.join_next().await {
+        match join_result {
+            Ok(Ok(job)) => completed.push(job),
+            Ok(Err(job)) => failed.push(job),
+            Err(join_err) => {
+                tracing::error!(error = %join_err, "batch chunk task panicked");
             }
-        }
-
-        pending = still_pending;
-        if !pending.is_empty() {
-            tracing::info!(
-                remaining = pending.len(),
-                completed = completed.len(),
-                failed = failed.len(),
-                "polling remaining batch chunks"
-            );
         }
     }
 
+    tracing::info!(
+        completed = completed.len(),
+        failed = failed.len(),
+        "all batch chunks processed"
+    );
+
     Ok(BatchPollOutcome { completed, failed })
+}
+
+// ---------------------------------------------------------------------------
+// Submit a single chunk with exponential backoff retry on 429 / rate-limit.
+// ---------------------------------------------------------------------------
+
+async fn submit_with_retry(
+    provider: &dyn BatchProvider,
+    input_path: &Path,
+    model: &str,
+    batch_dir: &Path,
+    poll_interval_secs: u64,
+) -> Result<Vec<String>> {
+    for attempt in 0..=SUBMIT_MAX_RETRIES {
+        match provider
+            .submit(input_path, model, batch_dir, poll_interval_secs)
+            .await
+        {
+            Ok(job_ids) => return Ok(job_ids),
+            Err(err) => {
+                let err_str = format!("{err:#}");
+                let err_lower = err_str.to_ascii_lowercase();
+                let is_rate_limit = err_str.contains("429")
+                    || err_lower.contains("rate limit")
+                    || err_lower.contains("resource_exhausted");
+
+                if is_rate_limit && attempt < SUBMIT_MAX_RETRIES {
+                    let backoff_secs =
+                        (SUBMIT_BACKOFF_BASE_SECS << attempt).min(SUBMIT_BACKOFF_CAP_SECS);
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        max_retries = SUBMIT_MAX_RETRIES,
+                        backoff_secs,
+                        error = %err,
+                        "batch submit rate limited, retrying"
+                    );
+                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                } else {
+                    return Err(err).with_context(|| {
+                        format!("batch submit failed for {}", input_path.display())
+                    });
+                }
+            }
+        }
+    }
+    unreachable!()
+}
+
+// ---------------------------------------------------------------------------
+// Poll a single batch job until it completes or fails.
+// ---------------------------------------------------------------------------
+
+async fn poll_until_done(
+    provider: &dyn BatchProvider,
+    job_ids: &[String],
+    chunk_index: usize,
+    poll_interval: Duration,
+) -> std::result::Result<(), String> {
+    loop {
+        tokio::time::sleep(poll_interval).await;
+
+        let poll_status = match provider.poll(job_ids).await {
+            Ok(status) => status,
+            Err(err) => {
+                return Err(format!("poll failed: {err:#}"));
+            }
+        };
+
+        match poll_status {
+            BatchPollStatus::Completed => {
+                tracing::info!(
+                    chunk = chunk_index + 1,
+                    "batch chunk completed, downloading results"
+                );
+                return Ok(());
+            }
+            BatchPollStatus::Failed { message } => {
+                tracing::error!(
+                    chunk = chunk_index + 1,
+                    error = %message,
+                    "batch chunk failed"
+                );
+                return Err(message);
+            }
+            BatchPollStatus::InProgress { completed, total } => {
+                if let (Some(completed_count), Some(total_count)) = (completed, total) {
+                    tracing::info!(
+                        chunk = chunk_index + 1,
+                        completed = completed_count,
+                        total = total_count,
+                        "batch chunk in progress"
+                    );
+                } else {
+                    tracing::info!(chunk = chunk_index + 1, "batch chunk in progress");
+                }
+            }
+        }
+    }
 }
 
 fn normalize_batch_dir(workspace: &Path, value: &str) -> PathBuf {

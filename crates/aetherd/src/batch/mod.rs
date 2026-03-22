@@ -146,6 +146,7 @@ pub(crate) struct BatchRuntimeConfig {
     pub batch_dir: PathBuf,
     pub jsonl_chunk_size: usize,
     pub poll_interval_secs: u64,
+    pub max_concurrent_jobs: usize,
     pub scan: PassConfig,
     pub triage: PassConfig,
     pub deep: PassConfig,
@@ -183,6 +184,11 @@ pub(crate) fn resolve_batch_runtime_config(
             .and_then(|args| args.poll_interval_secs)
             .or_else(|| batch_config.map(|value| value.poll_interval_secs))
             .unwrap_or(60)
+            .max(1),
+        max_concurrent_jobs: run_args
+            .and_then(|args| args.max_concurrent_jobs)
+            .or_else(|| batch_config.map(|c| c.max_concurrent_jobs))
+            .unwrap_or(4)
             .max(1),
         scan: resolve_pass_config(batch_config, run_args, BatchPass::Scan),
         triage: resolve_pass_config(batch_config, run_args, BatchPass::Triage),
