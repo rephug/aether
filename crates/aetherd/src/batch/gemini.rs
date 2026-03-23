@@ -43,7 +43,10 @@ impl BatchProvider for GeminiBatchProvider {
         });
 
         if let Some(level) = parse_gemini_thinking_level(Some(thinking)) {
-            gen_config["thinkingConfig"] = json!({ "thinkingLevel": level.api_value() });
+            gen_config["thinkingConfig"] = json!({
+                "thinkingLevel": level.api_value(),
+                "includeThoughts": true
+            });
         }
 
         let line = json!({
@@ -348,19 +351,38 @@ impl BatchProvider for GeminiBatchProvider {
             });
         }
 
-        let text = parsed
+        let parts = parsed
             .response
             .as_ref()
             .and_then(|r| r.candidates.first())
-            .and_then(|c| c.content.parts.first())
-            .and_then(|p| p.text.as_ref())
-            .map(|t| t.trim())
-            .filter(|t| !t.is_empty())
-            .ok_or_else(|| anyhow!("Gemini response line missing candidate text"))?;
+            .map(|c| c.content.parts.as_slice())
+            .ok_or_else(|| anyhow!("Gemini response line missing candidate parts"))?;
+
+        let mut text = None;
+        let mut reasoning_trace = None;
+        for part in parts {
+            if part.thought.unwrap_or(false) {
+                reasoning_trace = part
+                    .text
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned);
+            } else if text.is_none() {
+                text = part
+                    .text
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned);
+            }
+        }
+        let text = text.ok_or_else(|| anyhow!("Gemini response line missing candidate text"))?;
 
         Ok(BatchResultLine::Success {
             key: parsed.key,
-            text: text.to_owned(),
+            text,
+            reasoning_trace,
         })
     }
 
@@ -403,6 +425,8 @@ struct GeminiContent {
 struct GeminiPart {
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    thought: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -440,6 +464,10 @@ mod tests {
         assert_eq!(
             json["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "HIGH"
+        );
+        assert_eq!(
+            json["request"]["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            true
         );
         assert_eq!(json["request"]["generationConfig"]["temperature"], 0.0);
     }
@@ -508,9 +536,32 @@ mod tests {
         let p = provider();
         let input = r#"{"key":"sym1|hash1","response":{"candidates":[{"content":{"parts":[{"text":"{\"intent\":\"test\"}"}]}}]}}"#;
         match p.parse_result_line(input).unwrap() {
-            BatchResultLine::Success { key, text } => {
+            BatchResultLine::Success {
+                key,
+                text,
+                reasoning_trace,
+            } => {
                 assert_eq!(key, "sym1|hash1");
                 assert_eq!(text, r#"{"intent":"test"}"#);
+                assert_eq!(reasoning_trace, None);
+            }
+            BatchResultLine::Error { .. } => panic!("expected success"),
+        }
+    }
+
+    #[test]
+    fn parse_result_line_extracts_thinking_trace() {
+        let p = provider();
+        let input = r#"{"key":"sym1|hash1","response":{"candidates":[{"content":{"parts":[{"text":"reasoning","thought":true},{"text":"{\"intent\":\"test\"}","thoughtSignature":"sig"}]}}]}}"#;
+        match p.parse_result_line(input).unwrap() {
+            BatchResultLine::Success {
+                key,
+                text,
+                reasoning_trace,
+            } => {
+                assert_eq!(key, "sym1|hash1");
+                assert_eq!(text, r#"{"intent":"test"}"#);
+                assert_eq!(reasoning_trace, Some("reasoning".to_owned()));
             }
             BatchResultLine::Error { .. } => panic!("expected success"),
         }

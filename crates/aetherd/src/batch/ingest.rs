@@ -294,22 +294,27 @@ fn prepare_symbol(
     provider_name: &str,
     keymap: &HashMap<String, String>,
 ) -> Result<PreparedSymbol> {
-    let (symbol_id, prompt_hash, sir_json) = match provider.parse_result_line(raw_line)? {
-        BatchResultLine::Success { key, text } => {
-            // If the key lacks a delimiter (e.g. Anthropic truncated custom_id),
-            // try to recover the full key from the build-time keymap.
-            let resolved_key = if !key.contains('|') {
-                keymap.get(&key).map(String::as_str).unwrap_or(&key)
-            } else {
-                &key
-            };
-            let (sid, phash) = parse_key(resolved_key)?;
-            (sid.to_owned(), phash.to_owned(), text)
-        }
-        BatchResultLine::Error { key, message } => {
-            return Err(anyhow!("batch response error (key={:?}): {}", key, message));
-        }
-    };
+    let (symbol_id, prompt_hash, sir_json, reasoning_trace) =
+        match provider.parse_result_line(raw_line)? {
+            BatchResultLine::Success {
+                key,
+                text,
+                reasoning_trace,
+            } => {
+                // If the key lacks a delimiter (e.g. Anthropic truncated custom_id),
+                // try to recover the full key from the build-time keymap.
+                let resolved_key = if !key.contains('|') {
+                    keymap.get(&key).map(String::as_str).unwrap_or(&key)
+                } else {
+                    &key
+                };
+                let (sid, phash) = parse_key(resolved_key)?;
+                (sid.to_owned(), phash.to_owned(), text, reasoning_trace)
+            }
+            BatchResultLine::Error { key, message } => {
+                return Err(anyhow!("batch response error (key={:?}): {}", key, message));
+            }
+        };
 
     // Strip markdown fences and trailing prose from model responses.
     // Some models wrap JSON in ```json...``` fences and/or append explanatory text.
@@ -376,6 +381,7 @@ fn prepare_symbol(
         provider_name: provider_kind.as_str().to_owned(),
         model_name: pass_config.model.clone(),
         generation_pass: pass_config.pass.as_str().to_owned(),
+        reasoning_trace,
         commit_hash: None,
     };
     let (canonical_json, sir_hash_value) = pipeline

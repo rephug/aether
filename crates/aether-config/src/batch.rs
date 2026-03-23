@@ -53,6 +53,9 @@ pub struct BatchConfig {
     pub poll_interval_secs: u64,
     #[serde(default = "default_jsonl_chunk_size")]
     pub jsonl_chunk_size: usize,
+    /// Maximum symbols to process per batch pass. 0 = unlimited.
+    #[serde(default)]
+    pub max_symbols: usize,
     /// Maximum number of batch jobs active simultaneously.
     /// Gemini enforces ~4 concurrent jobs; Anthropic and OpenAI have higher limits.
     #[serde(default = "default_max_concurrent_jobs")]
@@ -162,6 +165,7 @@ impl Default for BatchConfig {
             batch_dir: String::new(),
             poll_interval_secs: default_poll_interval(),
             jsonl_chunk_size: default_jsonl_chunk_size(),
+            max_symbols: 0,
             max_concurrent_jobs: default_max_concurrent_jobs(),
             prompt_tier: default_prompt_tier(),
             provider: default_provider(),

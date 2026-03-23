@@ -640,6 +640,11 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         conn.execute("PRAGMA user_version = 16", [])?;
     }
 
+    if version < 17 {
+        ensure_sir_column(conn, "reasoning_trace", "TEXT")?;
+        conn.execute("PRAGMA user_version = 17", [])?;
+    }
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_version (

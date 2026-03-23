@@ -432,6 +432,7 @@ impl AetherMcpServer {
             provider: provider_name.to_owned(),
             model: model_name.to_owned(),
             generation_pass: "deep".to_owned(),
+            reasoning_trace: generated.reasoning_trace.clone(),
             prompt_hash: None,
             staleness_score: None,
             updated_at: version.updated_at,
@@ -472,6 +473,9 @@ impl AetherMcpServer {
                 .as_ref()
                 .map(|meta| meta.generation_pass.clone())
                 .unwrap_or_else(|| "scan".to_owned()),
+            reasoning_trace: current
+                .as_ref()
+                .and_then(|meta| meta.reasoning_trace.clone()),
             prompt_hash: current.as_ref().and_then(|meta| meta.prompt_hash.clone()),
             staleness_score: current.as_ref().and_then(|meta| meta.staleness_score),
             updated_at,
@@ -529,6 +533,7 @@ impl AetherMcpServer {
 #[derive(Debug)]
 struct GeneratedSirWithMeta {
     sir: aether_sir::SirAnnotation,
+    reasoning_trace: Option<String>,
 }
 
 fn refactor_scope_from_request(
@@ -681,7 +686,10 @@ async fn generate_sir_from_prompt_with_retries(
 
         match timeout_result {
             Ok(Ok(result)) => {
-                return Ok(GeneratedSirWithMeta { sir: result.sir });
+                return Ok(GeneratedSirWithMeta {
+                    sir: result.sir,
+                    reasoning_trace: result.reasoning_trace,
+                });
             }
             Ok(Err(err)) => {
                 last_error = Some(anyhow::Error::new(err).context(format!(

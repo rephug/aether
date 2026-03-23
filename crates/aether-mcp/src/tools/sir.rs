@@ -503,6 +503,7 @@ impl AetherMcpServer {
             provider: "rollup".to_owned(),
             model: "deterministic".to_owned(),
             generation_pass: "single".to_owned(),
+            reasoning_trace: None,
             prompt_hash: None,
             staleness_score: None,
             updated_at: version_write.updated_at,

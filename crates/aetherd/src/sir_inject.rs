@@ -155,6 +155,7 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
         provider_name: "manual".to_owned(),
         model_name: "manual".to_owned(),
         generation_pass: "injected".to_owned(),
+        reasoning_trace: None,
         commit_hash: None,
     };
     let (canonical_json, sir_hash) = persist_pipeline
@@ -360,6 +361,7 @@ vector_backend = "sqlite"
                 provider: "mock".to_owned(),
                 model: "mock".to_owned(),
                 generation_pass: "scan".to_owned(),
+                reasoning_trace: None,
                 prompt_hash: Some("srcold|nbrold|cfgold".to_owned()),
                 staleness_score: Some(0.4),
                 updated_at: 1_700_000_001,

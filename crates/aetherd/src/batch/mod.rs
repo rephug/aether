@@ -28,6 +28,7 @@ pub(crate) enum BatchResultLine {
     Success {
         key: String,
         text: String,
+        reasoning_trace: Option<String>,
     },
     Error {
         key: Option<String>,
@@ -146,6 +147,7 @@ pub(crate) struct BatchRuntimeConfig {
     pub batch_dir: PathBuf,
     pub jsonl_chunk_size: usize,
     pub poll_interval_secs: u64,
+    pub max_symbols: usize,
     pub max_concurrent_jobs: usize,
     pub scan: PassConfig,
     pub triage: PassConfig,
@@ -190,6 +192,14 @@ pub(crate) fn resolve_batch_runtime_config(
             .or_else(|| batch_config.map(|value| value.poll_interval_secs))
             .unwrap_or(60)
             .max(1),
+        max_symbols: run_args
+            .and_then(|args| args.max_symbols)
+            .or_else(|| {
+                batch_config
+                    .map(|value| value.max_symbols)
+                    .filter(|&v| v > 0)
+            })
+            .unwrap_or(0),
         max_concurrent_jobs: run_args
             .and_then(|args| args.max_concurrent_jobs)
             .or_else(|| batch_config.map(|c| c.max_concurrent_jobs))

@@ -31,6 +31,7 @@ pub(super) struct GeneratedSir {
     pub(super) sir: SirAnnotation,
     pub(super) provider_name: String,
     pub(super) model_name: String,
+    pub(super) reasoning_trace: Option<String>,
 }
 
 #[derive(Debug)]
@@ -221,6 +222,7 @@ pub(super) async fn generate_sir_jobs(
                     sir: result.sir,
                     provider_name: result.provider,
                     model_name: result.model,
+                    reasoning_trace: result.reasoning_trace,
                 })),
                 Err(err)
                     if is_parse_validation_exhausted_error(&err)
@@ -271,6 +273,7 @@ pub(super) async fn generate_sir_jobs(
                             sir: result.sir,
                             provider_name: result.provider,
                             model_name: result.model,
+                            reasoning_trace: result.reasoning_trace,
                         })),
                         Err(fallback_err) => {
                             SirGenerationOutcome::Failure(Box::new(FailedSirGeneration {

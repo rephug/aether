@@ -141,7 +141,7 @@ fn looks_like_sir_shape(value: &Value) -> bool {
     .all(|key| obj.contains_key(*key))
 }
 
-fn parse_and_validate_sir(candidate_json: &str) -> Result<SirAnnotation, String> {
+pub(crate) fn parse_and_validate_sir(candidate_json: &str) -> Result<SirAnnotation, String> {
     let normalized = normalize_candidate_json(candidate_json);
 
     let sir: SirAnnotation =
