@@ -173,6 +173,11 @@ pub(crate) fn resolve_batch_runtime_config(
         batch_config,
         run_args.and_then(|args| args.batch_dir.as_deref()),
     );
+    let provider_name = run_args
+        .and_then(|args| args.provider.as_deref())
+        .filter(|s| !s.is_empty())
+        .or_else(|| batch_config.map(|c| c.provider.as_str()))
+        .unwrap_or("gemini");
     BatchRuntimeConfig {
         batch_dir,
         jsonl_chunk_size: run_args
@@ -190,9 +195,9 @@ pub(crate) fn resolve_batch_runtime_config(
             .or_else(|| batch_config.map(|c| c.max_concurrent_jobs))
             .unwrap_or(4)
             .max(1),
-        scan: resolve_pass_config(batch_config, run_args, BatchPass::Scan),
-        triage: resolve_pass_config(batch_config, run_args, BatchPass::Triage),
-        deep: resolve_pass_config(batch_config, run_args, BatchPass::Deep),
+        scan: resolve_pass_config(batch_config, run_args, BatchPass::Scan, provider_name),
+        triage: resolve_pass_config(batch_config, run_args, BatchPass::Triage, provider_name),
+        deep: resolve_pass_config(batch_config, run_args, BatchPass::Deep, provider_name),
     }
 }
 
@@ -265,6 +270,7 @@ fn resolve_pass_config(
     batch_config: Option<&BatchConfig>,
     run_args: Option<&BatchRunArgs>,
     pass: BatchPass,
+    provider: &str,
 ) -> PassConfig {
     let (model, thinking, neighbor_depth, max_chars) = match pass {
         BatchPass::Scan => (
@@ -291,24 +297,27 @@ fn resolve_pass_config(
     match pass {
         BatchPass::Scan => PassConfig {
             pass,
-            model: model.unwrap_or(config.scan_model),
-            thinking: thinking.unwrap_or(config.scan_thinking),
+            model: model.unwrap_or_else(|| config.resolve_model("scan", provider).to_owned()),
+            thinking: thinking
+                .unwrap_or_else(|| config.resolve_thinking("scan", provider).to_owned()),
             neighbor_depth: 0,
             max_chars: max_chars.unwrap_or(config.scan_max_chars),
             prompt_tier: config.prompt_tier.clone(),
         },
         BatchPass::Triage => PassConfig {
             pass,
-            model: model.unwrap_or(config.triage_model),
-            thinking: thinking.unwrap_or(config.triage_thinking),
+            model: model.unwrap_or_else(|| config.resolve_model("triage", provider).to_owned()),
+            thinking: thinking
+                .unwrap_or_else(|| config.resolve_thinking("triage", provider).to_owned()),
             neighbor_depth: neighbor_depth.unwrap_or(config.triage_neighbor_depth),
             max_chars: max_chars.unwrap_or(config.triage_max_chars),
             prompt_tier: config.prompt_tier.clone(),
         },
         BatchPass::Deep => PassConfig {
             pass,
-            model: model.unwrap_or(config.deep_model),
-            thinking: thinking.unwrap_or(config.deep_thinking),
+            model: model.unwrap_or_else(|| config.resolve_model("deep", provider).to_owned()),
+            thinking: thinking
+                .unwrap_or_else(|| config.resolve_thinking("deep", provider).to_owned()),
             neighbor_depth: neighbor_depth.unwrap_or(config.deep_neighbor_depth),
             max_chars: max_chars.unwrap_or(config.deep_max_chars),
             prompt_tier: config.prompt_tier,

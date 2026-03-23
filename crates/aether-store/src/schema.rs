@@ -600,6 +600,45 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         conn.execute("PRAGMA user_version = 15", [])?;
     }
 
+    if version < 16 {
+        // Recreate sir_quality with ON DELETE CASCADE if both sir_quality and sir exist.
+        // Guard with table existence checks for test fixtures that start at early
+        // schema versions where these tables were never created.
+        // CASCADE is meaningless without the referenced table, so skip recreation
+        // when sir doesn't exist.
+        let both_exist: bool = conn.query_row(
+            r#"SELECT EXISTS(
+                SELECT 1 FROM sqlite_master WHERE type='table' AND name='sir_quality'
+            ) AND EXISTS(
+                SELECT 1 FROM sqlite_master WHERE type='table' AND name='sir'
+            )"#,
+            [],
+            |row| row.get(0),
+        )?;
+        if both_exist {
+            conn.execute_batch("DELETE FROM sir_quality WHERE sir_id NOT IN (SELECT id FROM sir)")?;
+            conn.execute_batch(
+                r#"
+            CREATE TABLE IF NOT EXISTS sir_quality_new (
+                sir_id TEXT PRIMARY KEY REFERENCES sir(id) ON DELETE CASCADE,
+                specificity REAL NOT NULL,
+                behavioral_depth REAL NOT NULL,
+                error_coverage REAL NOT NULL,
+                length_score REAL NOT NULL,
+                composite_quality REAL NOT NULL,
+                confidence_percentile REAL NOT NULL,
+                normalized_quality REAL NOT NULL,
+                computed_at INTEGER NOT NULL
+            );
+            INSERT INTO sir_quality_new SELECT * FROM sir_quality;
+            DROP TABLE IF EXISTS sir_quality;
+            ALTER TABLE sir_quality_new RENAME TO sir_quality;
+            "#,
+            )?;
+        }
+        conn.execute("PRAGMA user_version = 16", [])?;
+    }
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_version (
