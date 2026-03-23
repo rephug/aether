@@ -619,7 +619,8 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
             conn.execute_batch("DELETE FROM sir_quality WHERE sir_id NOT IN (SELECT id FROM sir)")?;
             conn.execute_batch(
                 r#"
-            CREATE TABLE IF NOT EXISTS sir_quality_new (
+            DROP TABLE IF EXISTS sir_quality_new;
+            CREATE TABLE sir_quality_new (
                 sir_id TEXT PRIMARY KEY REFERENCES sir(id) ON DELETE CASCADE,
                 specificity REAL NOT NULL,
                 behavioral_depth REAL NOT NULL,
