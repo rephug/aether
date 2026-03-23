@@ -60,6 +60,7 @@ fn delete_symbol_records_for_ids(
             ("write_intents", "symbol_id"),
             ("sir_requests", "symbol_id"),
             ("sir_history", "symbol_id"),
+            ("sir_quality", "sir_id"),
             ("sir", "id"),
             ("symbol_neighbors", "symbol_id"),
             ("symbol_neighbors", "neighbor_id"),
@@ -283,6 +284,10 @@ impl SqliteStore {
                 params![symbol_id],
             )?;
             conn.execute("DELETE FROM symbols WHERE id = ?1", params![symbol_id])?;
+            conn.execute(
+                "DELETE FROM sir_quality WHERE sir_id = ?1",
+                params![symbol_id],
+            )?;
             conn.execute("DELETE FROM sir WHERE id = ?1", params![symbol_id])?;
         }
 

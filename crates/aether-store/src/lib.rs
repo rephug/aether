@@ -525,6 +525,7 @@ impl SqliteStore {
         if !read_only {
             run_migrations(&conn)?;
         }
+        conn.execute_batch("PRAGMA foreign_keys = ON")?;
 
         Ok(Self {
             conn: Mutex::new(conn),
