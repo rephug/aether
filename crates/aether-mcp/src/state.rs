@@ -470,7 +470,7 @@ api_key_env = "{api_key_env}"
 
         assert!(ro.read_only);
         assert_eq!(ro.schema_version.component, "core");
-        assert_eq!(ro.schema_version.version, 15);
+        assert_eq!(ro.schema_version.version, 16);
         assert!(ro.schema_version.migrated_at > 0);
     }
 
