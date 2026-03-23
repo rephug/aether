@@ -269,6 +269,7 @@ vector_backend = "sqlite"
                 provider: "test".to_owned(),
                 model: "test".to_owned(),
                 generation_pass: SIR_GENERATION_PASS_SCAN.to_owned(),
+                reasoning_trace: None,
                 prompt_hash: None,
                 staleness_score: None,
                 updated_at: 1_700_000_100,
@@ -460,6 +461,7 @@ vector_backend = "sqlite"
             },
             provider_name: "test_provider".to_owned(),
             model_name: "test_model".to_owned(),
+            reasoning_trace: None,
         };
 
         let mut out = Vec::new();

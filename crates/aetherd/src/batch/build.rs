@@ -142,6 +142,17 @@ pub(crate) fn build_pass_jsonl_for_ids(
         }
     }
     candidate_ids.sort();
+    if runtime.max_symbols > 0 && candidate_ids.len() > runtime.max_symbols {
+        let original_total = candidate_ids.len();
+        candidate_ids.truncate(runtime.max_symbols);
+        tracing::info!(
+            pass = pass_config.pass.as_str(),
+            max_symbols = runtime.max_symbols,
+            original_total,
+            truncated_total = candidate_ids.len(),
+            "truncated batch build candidate set to symbol limit"
+        );
+    }
 
     let baseline_sirs = if matches!(pass_config.pass, BatchPass::Scan) {
         HashMap::new()

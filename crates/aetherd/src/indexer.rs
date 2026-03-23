@@ -2654,6 +2654,7 @@ vector_backend = "sqlite"
                 provider: "mock".to_owned(),
                 model: "mock-model".to_owned(),
                 generation_pass: "scan".to_owned(),
+                reasoning_trace: None,
                 prompt_hash: None,
                 staleness_score: None,
                 updated_at: version.updated_at,

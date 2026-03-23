@@ -14,6 +14,7 @@ pub(crate) struct UpsertSirIntentPayload {
     pub(crate) provider_name: String,
     pub(crate) model_name: String,
     pub(crate) generation_pass: String,
+    pub(crate) reasoning_trace: Option<String>,
     pub(crate) commit_hash: Option<String>,
 }
 
@@ -25,6 +26,7 @@ impl UpsertSirIntentPayload {
             "provider_name": self.provider_name,
             "model_name": self.model_name,
             "generation_pass": self.generation_pass,
+            "reasoning_trace": self.reasoning_trace,
             "commit_hash": self.commit_hash,
         }))
         .context("failed to serialize upsert intent payload")
@@ -47,6 +49,15 @@ impl UpsertSirIntentPayload {
         let model_name = payload_required_string(object, "model_name")?;
         let generation_pass = payload_required_string(object, "generation_pass")
             .unwrap_or_else(|_| SIR_GENERATION_PASS_SCAN.to_owned());
+        let reasoning_trace = match object.get("reasoning_trace") {
+            Some(Value::String(value)) if !value.trim().is_empty() => Some(value.clone()),
+            Some(Value::String(_)) | Some(Value::Null) | None => None,
+            Some(_) => {
+                return Err(anyhow!(
+                    "payload field 'reasoning_trace' must be a string or null"
+                ));
+            }
+        };
         let commit_hash = match object.get("commit_hash") {
             Some(Value::String(value)) => Some(value.clone()),
             Some(Value::Null) | None => None,
@@ -63,6 +74,7 @@ impl UpsertSirIntentPayload {
             provider_name,
             model_name,
             generation_pass,
+            reasoning_trace,
             commit_hash,
         })
     }

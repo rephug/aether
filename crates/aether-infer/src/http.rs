@@ -275,19 +275,51 @@ fn parse_pull_progress(value: &Value) -> OllamaPullProgress {
 }
 
 pub(crate) fn extract_gemini_text_part(response: &Value) -> Result<&str, InferError> {
-    response
+    extract_gemini_parts(response).map(|parts| parts.text)
+}
+
+pub(crate) struct GeminiExtractedParts<'a> {
+    pub text: &'a str,
+    pub thinking: Option<&'a str>,
+}
+
+pub(crate) fn extract_gemini_parts(
+    response: &Value,
+) -> Result<GeminiExtractedParts<'_>, InferError> {
+    let parts = response
         .get("candidates")
         .and_then(Value::as_array)
         .and_then(|candidates| candidates.first())
         .and_then(|candidate| candidate.get("content"))
         .and_then(|content| content.get("parts"))
         .and_then(Value::as_array)
-        .and_then(|parts| parts.first())
-        .and_then(|part| part.get("text"))
-        .and_then(Value::as_str)
         .ok_or_else(|| {
-            InferError::InvalidResponse("missing candidates[0].content.parts[0].text".to_owned())
-        })
+            InferError::InvalidResponse("missing candidates[0].content.parts".to_owned())
+        })?;
+
+    let mut text_part = None;
+    let mut thinking_part = None;
+
+    for part in parts {
+        let is_thought = part
+            .get("thought")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if is_thought {
+            thinking_part = part.get("text").and_then(Value::as_str);
+        } else if text_part.is_none() {
+            text_part = part.get("text").and_then(Value::as_str);
+        }
+    }
+
+    let text = text_part.ok_or_else(|| {
+        InferError::InvalidResponse("no non-thought text part in Gemini response".to_owned())
+    })?;
+
+    Ok(GeminiExtractedParts {
+        text,
+        thinking: thinking_part,
+    })
 }
 
 pub(crate) fn extract_embedding_vector(response: &Value) -> Result<Vec<f32>, InferError> {
@@ -429,5 +461,40 @@ mod tests {
             }
             _ => panic!("expected invalid response"),
         }
+    }
+
+    #[test]
+    fn extract_gemini_parts_prefers_non_thought_text_and_captures_thinking() {
+        let response = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"text": "reasoning", "thought": true},
+                        {"text": "{\"intent\":\"ok\"}", "thoughtSignature": "sig"}
+                    ]
+                }
+            }]
+        });
+
+        let parts = extract_gemini_parts(&response).expect("gemini parts");
+        assert_eq!(parts.text, r#"{"intent":"ok"}"#);
+        assert_eq!(parts.thinking, Some("reasoning"));
+    }
+
+    #[test]
+    fn extract_gemini_text_part_uses_non_thought_text() {
+        let response = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"text": "reasoning", "thought": true},
+                        {"text": "{\"intent\":\"ok\"}"}
+                    ]
+                }
+            }]
+        });
+
+        let text = extract_gemini_text_part(&response).expect("gemini text");
+        assert_eq!(text, r#"{"intent":"ok"}"#);
     }
 }

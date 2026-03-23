@@ -61,7 +61,7 @@ impl BatchProvider for OpenAiBatchProvider {
         });
 
         if let Some(effort) = Self::openai_reasoning_effort(thinking) {
-            body["reasoning"] = json!({ "effort": effort });
+            body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
         } else {
             body["temperature"] = json!(0.0);
         }
@@ -309,10 +309,15 @@ impl BatchProvider for OpenAiBatchProvider {
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .ok_or_else(|| anyhow!("OpenAI response line missing output text"))?;
+        let reasoning_trace = response
+            .body
+            .as_ref()
+            .and_then(Self::extract_responses_reasoning_summary);
 
         Ok(BatchResultLine::Success {
             key: parsed.custom_id,
             text: text.to_owned(),
+            reasoning_trace,
         })
     }
 
@@ -351,6 +356,28 @@ impl OpenAiBatchProvider {
                         })
                 })
             })
+    }
+
+    fn extract_responses_reasoning_summary(body: &serde_json::Value) -> Option<String> {
+        let joined = body
+            .get("output")
+            .and_then(|output| output.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("reasoning"))
+            .flat_map(|item| {
+                item.get("summary")
+                    .and_then(|summary| summary.as_array())
+                    .into_iter()
+                    .flatten()
+            })
+            .filter_map(|summary| summary.get("text").and_then(|value| value.as_str()))
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        (!joined.is_empty()).then_some(joined)
     }
 
     async fn download_file(&self, file_id: &str, dest: &Path) -> Result<()> {
@@ -451,6 +478,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&line).unwrap();
 
         assert_eq!(json["body"]["reasoning"]["effort"], "medium");
+        assert_eq!(json["body"]["reasoning"]["summary"], "auto");
         assert!(json["body"].get("temperature").is_none());
     }
 
@@ -477,9 +505,14 @@ mod tests {
         let p = provider();
         let input = r#"{"custom_id":"sym1|hash1","response":{"status_code":200,"body":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"intent\":\"test\"}"}]}]}}}"#;
         match p.parse_result_line(input).unwrap() {
-            BatchResultLine::Success { key, text } => {
+            BatchResultLine::Success {
+                key,
+                text,
+                reasoning_trace,
+            } => {
                 assert_eq!(key, "sym1|hash1");
                 assert_eq!(text, r#"{"intent":"test"}"#);
+                assert_eq!(reasoning_trace, None);
             }
             BatchResultLine::Error { .. } => panic!("expected success"),
         }
@@ -490,9 +523,14 @@ mod tests {
         let p = provider();
         let input = r#"{"custom_id":"sym1|hash1","response":{"status_code":200,"body":{"output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"thinking"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"intent\":\"reasoned\"}"}]}]}}}"#;
         match p.parse_result_line(input).unwrap() {
-            BatchResultLine::Success { key, text } => {
+            BatchResultLine::Success {
+                key,
+                text,
+                reasoning_trace,
+            } => {
                 assert_eq!(key, "sym1|hash1");
                 assert_eq!(text, r#"{"intent":"reasoned"}"#);
+                assert_eq!(reasoning_trace, Some("thinking".to_owned()));
             }
             BatchResultLine::Error { .. } => panic!("expected success"),
         }
@@ -503,9 +541,14 @@ mod tests {
         let p = provider();
         let input = r#"{"custom_id":"sym1|hash1","response":{"status_code":200,"body":{"choices":[{"message":{"content":"{\"intent\":\"legacy\"}"}}]}}}"#;
         match p.parse_result_line(input).unwrap() {
-            BatchResultLine::Success { key, text } => {
+            BatchResultLine::Success {
+                key,
+                text,
+                reasoning_trace,
+            } => {
                 assert_eq!(key, "sym1|hash1");
                 assert_eq!(text, r#"{"intent":"legacy"}"#);
+                assert_eq!(reasoning_trace, None);
             }
             BatchResultLine::Error { .. } => panic!("expected success"),
         }

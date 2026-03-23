@@ -559,7 +559,7 @@ pub enum BatchCommand {
     /// Ingest batch API result JSONL for a single pass
     Ingest(BatchIngestArgs),
     /// Run extract -> build -> submit/poll/download -> ingest across one or more passes
-    Run(BatchRunArgs),
+    Run(Box<BatchRunArgs>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
@@ -651,6 +651,12 @@ pub struct BatchRunArgs {
 
     #[arg(long, help = "Batch poll interval override in seconds")]
     pub poll_interval_secs: Option<u64>,
+
+    #[arg(
+        long,
+        help = "Maximum total symbols to process per pass (default: unlimited)"
+    )]
+    pub max_symbols: Option<usize>,
 
     #[arg(
         long,

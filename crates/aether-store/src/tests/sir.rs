@@ -39,6 +39,7 @@ fn read_sir_blob_backfills_sqlite_from_mirror_without_overwriting_meta() {
         provider: "legacy-provider".to_owned(),
         model: "legacy-model".to_owned(),
         generation_pass: "scan".to_owned(),
+        reasoning_trace: Some("legacy thinking".to_owned()),
         prompt_hash: Some("legacy-source|legacy-neighbor|legacy-config".to_owned()),
         staleness_score: None,
         updated_at: 1_700_111_222,
@@ -149,6 +150,27 @@ fn sir_meta_round_trips_prompt_hash_and_fingerprint_rows() {
     assert!(rows[0].source_changed);
     assert!(!rows[0].neighbor_changed);
     assert!(rows[0].config_changed);
+}
+
+#[test]
+fn sir_meta_round_trips_reasoning_trace() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    let store = SqliteStore::open(workspace).expect("open store");
+
+    let meta = SirMetaRecord {
+        reasoning_trace: Some("reasoning text".to_owned()),
+        ..sir_meta_record()
+    };
+    store
+        .upsert_sir_meta(meta.clone())
+        .expect("upsert sir meta");
+
+    let loaded = store
+        .get_sir_meta(meta.id.as_str())
+        .expect("load sir meta")
+        .expect("sir meta exists");
+    assert_eq!(loaded.reasoning_trace, meta.reasoning_trace);
 }
 
 #[test]

@@ -1380,6 +1380,7 @@ fn seed_workspace(workspace: &std::path::Path) {
             provider: "mock".to_owned(),
             model: "mock-model".to_owned(),
             generation_pass: "single".to_owned(),
+            reasoning_trace: None,
             prompt_hash: None,
             staleness_score: None,
             updated_at: 1_700_000_100,

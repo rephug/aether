@@ -370,11 +370,20 @@ impl BatchProvider for AnthropicBatchProvider {
                     .map(str::trim)
                     .filter(|t| !t.is_empty())
                     .ok_or_else(|| anyhow!("no text block in Anthropic response content"))?;
+                let reasoning_trace = content
+                    .iter()
+                    .filter(|block| block["type"].as_str() == Some("thinking"))
+                    .filter_map(|block| block["thinking"].as_str())
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
 
                 Ok(BatchResultLine::Success {
                     key: custom_id
                         .ok_or_else(|| anyhow!("missing custom_id in Anthropic result"))?,
                     text: text.to_owned(),
+                    reasoning_trace: (!reasoning_trace.is_empty()).then_some(reasoning_trace),
                 })
             }
             "errored" => {
@@ -509,9 +518,14 @@ mod tests {
         let p = provider();
         let input = r#"{"custom_id":"sym1|hash1","result":{"type":"succeeded","message":{"content":[{"type":"text","text":"{\"intent\":\"test\"}"}]}}}"#;
         match p.parse_result_line(input).unwrap() {
-            BatchResultLine::Success { key, text } => {
+            BatchResultLine::Success {
+                key,
+                text,
+                reasoning_trace,
+            } => {
                 assert_eq!(key, "sym1|hash1");
                 assert_eq!(text, r#"{"intent":"test"}"#);
+                assert_eq!(reasoning_trace, None);
             }
             BatchResultLine::Error { .. } => panic!("expected success"),
         }
@@ -522,9 +536,14 @@ mod tests {
         let p = provider();
         let input = r#"{"custom_id":"sym2|hash2","result":{"type":"succeeded","message":{"content":[{"type":"thinking","thinking":"Let me analyze..."},{"type":"text","text":"{\"intent\":\"analyzed\"}"}]}}}"#;
         match p.parse_result_line(input).unwrap() {
-            BatchResultLine::Success { key, text } => {
+            BatchResultLine::Success {
+                key,
+                text,
+                reasoning_trace,
+            } => {
                 assert_eq!(key, "sym2|hash2");
                 assert_eq!(text, r#"{"intent":"analyzed"}"#);
+                assert_eq!(reasoning_trace, Some("Let me analyze...".to_owned()));
             }
             BatchResultLine::Error { .. } => panic!("expected success"),
         }

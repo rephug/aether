@@ -69,6 +69,7 @@ pub struct InferSirResult {
     pub sir: SirAnnotation,
     pub provider: String,
     pub model: String,
+    pub reasoning_trace: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +150,7 @@ pub trait InferenceProvider: Send + Sync {
             sir,
             provider: self.provider_name(),
             model: self.model_name(),
+            reasoning_trace: None,
         })
     }
 
@@ -177,6 +179,7 @@ pub trait InferenceProvider: Send + Sync {
             sir,
             provider: self.provider_name(),
             model: self.model_name(),
+            reasoning_trace: None,
         })
     }
 }

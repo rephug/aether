@@ -2,14 +2,17 @@ use std::env;
 
 use aether_config::{InferenceProviderKind, parse_gemini_thinking_level};
 use aether_core::Secret;
+use aether_sir::SirAnnotation;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::http::{GEMINI_API_BASE, extract_gemini_text_part, inference_http_client};
+use crate::http::{
+    GEMINI_API_BASE, extract_gemini_parts, extract_gemini_text_part, inference_http_client,
+};
 use crate::providers::PARSE_VALIDATION_RETRIES;
-use crate::sir_parsing::run_sir_parse_validation_retries;
+use crate::sir_parsing::parse_and_validate_sir;
 use crate::sir_prompt;
-use crate::types::{InferError, InferenceProvider, SirContext, normalize_optional};
+use crate::types::{InferError, InferSirResult, InferenceProvider, SirContext, normalize_optional};
 
 pub(crate) const GEMINI_DEFAULT_MODEL: &str = "gemini-3.1-flash-lite-preview";
 
@@ -60,7 +63,10 @@ impl GeminiProvider {
         });
 
         if let Some(level) = parse_gemini_thinking_level(self.thinking.as_deref()) {
-            gen_config["thinkingConfig"] = json!({ "thinkingLevel": level.api_value() });
+            gen_config["thinkingConfig"] = json!({
+                "thinkingLevel": level.api_value(),
+                "includeThoughts": true
+            });
         }
 
         gen_config
@@ -81,7 +87,10 @@ impl GeminiProvider {
         })
     }
 
-    async fn request_candidate_json_with_prompt(&self, prompt: &str) -> Result<String, InferError> {
+    async fn request_candidate_parts_with_prompt(
+        &self,
+        prompt: &str,
+    ) -> Result<(String, Option<String>), InferError> {
         let body = self.build_generate_content_body(prompt);
 
         let response_value: Value = self
@@ -95,17 +104,46 @@ impl GeminiProvider {
             .json()
             .await?;
 
-        extract_gemini_text_part(&response_value).map(|text| text.to_owned())
+        let parts = extract_gemini_parts(&response_value)?;
+        Ok((
+            parts.text.to_owned(),
+            normalize_optional(parts.thinking.map(str::to_owned)),
+        ))
     }
 
-    async fn request_candidate_json(
+    async fn generate_sir_result_from_prompt(
         &self,
-        symbol_text: &str,
-        context: &SirContext,
-    ) -> Result<String, InferError> {
-        let prompt = sir_prompt::build_sir_prompt_for_kind(symbol_text, context);
-        self.request_candidate_json_with_prompt(prompt.as_str())
-            .await
+        prompt: &str,
+    ) -> Result<InferSirResult, InferError> {
+        let mut last_error = String::from("unknown parse/validation failure");
+
+        for attempt in 0..=PARSE_VALIDATION_RETRIES {
+            let (candidate_json, reasoning_trace) =
+                self.request_candidate_parts_with_prompt(prompt).await?;
+
+            match parse_and_validate_sir(&candidate_json) {
+                Ok(sir) => {
+                    return Ok(InferSirResult {
+                        sir,
+                        provider: self.provider_name(),
+                        model: self.model_name(),
+                        reasoning_trace,
+                    });
+                }
+                Err(message) => {
+                    last_error = message;
+                    if attempt == PARSE_VALIDATION_RETRIES {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Err(InferError::ParseValidationExhausted(last_error))
+    }
+
+    fn build_context_prompt(&self, symbol_text: &str, context: &SirContext) -> String {
+        sir_prompt::build_sir_prompt_for_kind(symbol_text, context)
     }
 }
 
@@ -123,11 +161,20 @@ impl InferenceProvider for GeminiProvider {
         &self,
         symbol_text: &str,
         context: &SirContext,
-    ) -> Result<aether_sir::SirAnnotation, InferError> {
-        run_sir_parse_validation_retries(PARSE_VALIDATION_RETRIES, || async {
-            self.request_candidate_json(symbol_text, context).await
-        })
-        .await
+    ) -> Result<SirAnnotation, InferError> {
+        let prompt = self.build_context_prompt(symbol_text, context);
+        self.generate_sir_result_from_prompt(prompt.as_str())
+            .await
+            .map(|result| result.sir)
+    }
+
+    async fn generate_sir_with_meta(
+        &self,
+        symbol_text: &str,
+        context: &SirContext,
+    ) -> Result<InferSirResult, InferError> {
+        let prompt = self.build_context_prompt(symbol_text, context);
+        self.generate_sir_result_from_prompt(prompt.as_str()).await
     }
 
     async fn generate_sir_from_prompt(
@@ -135,11 +182,19 @@ impl InferenceProvider for GeminiProvider {
         prompt: &str,
         _context: &SirContext,
         _deep_mode: bool,
-    ) -> Result<aether_sir::SirAnnotation, InferError> {
-        run_sir_parse_validation_retries(PARSE_VALIDATION_RETRIES, || async {
-            self.request_candidate_json_with_prompt(prompt).await
-        })
-        .await
+    ) -> Result<SirAnnotation, InferError> {
+        self.generate_sir_result_from_prompt(prompt)
+            .await
+            .map(|result| result.sir)
+    }
+
+    async fn generate_sir_from_prompt_with_meta(
+        &self,
+        prompt: &str,
+        _context: &SirContext,
+        _deep_mode: bool,
+    ) -> Result<InferSirResult, InferError> {
+        self.generate_sir_result_from_prompt(prompt).await
     }
 }
 
@@ -232,6 +287,10 @@ mod tests {
         assert_eq!(
             body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "MEDIUM"
+        );
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            true
         );
     }
 

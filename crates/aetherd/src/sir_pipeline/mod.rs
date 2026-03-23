@@ -1248,6 +1248,7 @@ impl SirPipeline {
             provider_name: generated.provider_name.clone(),
             model_name: generated.model_name.clone(),
             generation_pass: generation_pass.to_owned(),
+            reasoning_trace: generated.reasoning_trace.clone(),
             commit_hash: commit_hash.map(str::to_owned),
         };
         let payload_json = match payload.to_json_string() {
@@ -1327,6 +1328,7 @@ impl SirPipeline {
             provider: generated.provider_name.clone(),
             model: generated.model_name.clone(),
             generation_pass: generation_pass.to_owned(),
+            reasoning_trace: generated.reasoning_trace.clone(),
             prompt_hash: None,
             staleness_score: None,
             updated_at: version_write.updated_at,
@@ -1408,6 +1410,7 @@ impl SirPipeline {
                 provider: self.provider_name.clone(),
                 model: self.model_name.clone(),
                 generation_pass: generation_pass.to_owned(),
+                reasoning_trace: None,
                 prompt_hash: None,
                 staleness_score: None,
                 updated_at: 0,
@@ -1434,6 +1437,7 @@ impl SirPipeline {
                 } else {
                     record.generation_pass
                 },
+                reasoning_trace: record.reasoning_trace,
                 prompt_hash: record.prompt_hash,
                 staleness_score: record.staleness_score,
                 updated_at: record.updated_at,
@@ -2348,6 +2352,7 @@ impl SirPipeline {
             provider: payload.provider_name.clone(),
             model: payload.model_name.clone(),
             generation_pass: payload.generation_pass.clone(),
+            reasoning_trace: payload.reasoning_trace.clone(),
             prompt_hash: None,
             staleness_score: None,
             updated_at: version_write.updated_at,
@@ -2901,6 +2906,7 @@ impl SirPipeline {
                 provider: self.provider_name.clone(),
                 model: self.model_name.clone(),
                 generation_pass: generation_pass.to_owned(),
+                reasoning_trace: None,
                 prompt_hash: None,
                 staleness_score: None,
                 updated_at: version_write.updated_at,
