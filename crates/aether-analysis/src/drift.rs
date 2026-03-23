@@ -1921,6 +1921,7 @@ mod tests {
                 provider: "mock".to_owned(),
                 model: "mock".to_owned(),
                 generation_pass: "single".to_owned(),
+                reasoning_trace: None,
                 prompt_hash: None,
                 staleness_score: None,
                 updated_at: now_millis(),
