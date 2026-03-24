@@ -1,3 +1,4 @@
+pub mod audit_changes_cmd;
 pub mod audit_cmd;
 pub mod audit_report_cmd;
 pub mod claude_md;
@@ -6,6 +7,7 @@ pub mod cursor_rules;
 pub mod refactor_cmd;
 pub mod skill_md;
 
+pub use audit_changes_cmd::AuditChangesCommandTemplate;
 pub use audit_cmd::AuditCommandTemplate;
 pub use audit_report_cmd::AuditReportCommandTemplate;
 pub use claude_md::ClaudeTemplate;

@@ -8,8 +8,9 @@ use anyhow::{Context, Result};
 use clap::ValueEnum;
 
 use crate::templates::{
-    AuditCommandTemplate, AuditReportCommandTemplate, ClaudeTemplate, CodexInstructionsTemplate,
-    CursorRulesTemplate, RefactorCommandTemplate, SkillTemplate, TemplateContext,
+    AuditChangesCommandTemplate, AuditCommandTemplate, AuditReportCommandTemplate, ClaudeTemplate,
+    CodexInstructionsTemplate, CursorRulesTemplate, RefactorCommandTemplate, SkillTemplate,
+    TemplateContext,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -114,6 +115,10 @@ fn files_for_platform(platform: AgentPlatform, context: &TemplateContext) -> Vec
             relative_path: PathBuf::from(".claude/commands/audit-report.md"),
             content: AuditReportCommandTemplate::render(context),
         });
+        files.push(GeneratedFile {
+            relative_path: PathBuf::from(".claude/commands/audit-changes.md"),
+            content: AuditChangesCommandTemplate::render(context),
+        });
     }
 
     if matches!(platform, AgentPlatform::Codex | AgentPlatform::All) {
@@ -210,6 +215,7 @@ mod tests {
         assert!(workspace.join(".claude/commands/audit.md").exists());
         assert!(workspace.join(".claude/commands/refactor.md").exists());
         assert!(workspace.join(".claude/commands/audit-report.md").exists());
+        assert!(workspace.join(".claude/commands/audit-changes.md").exists());
         assert!(
             workspace
                 .join(".agents/skills/aether-context/SKILL.md")
@@ -346,6 +352,14 @@ mod tests {
             .expect("read audit-report command");
         assert!(report.contains("aether_audit_report"));
         assert!(report.contains("aether_recall"));
+
+        let changes = fs::read_to_string(workspace.join(".claude/commands/audit-changes.md"))
+            .expect("read audit-changes command");
+        assert!(changes.contains("argument-hint:"));
+        assert!(changes.contains("git diff"));
+        assert!(changes.contains("aether_search"));
+        assert!(changes.contains("aether_get_sir"));
+        assert!(changes.contains("aether_sir_inject"));
     }
 
     #[test]
