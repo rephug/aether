@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::from_str as json_from_str;
 use thiserror::Error;
 mod analysis;
+mod audit;
 mod contracts;
 mod embeddings;
 mod fingerprint_history;
@@ -59,6 +60,7 @@ pub use vector::{
 pub use analysis::{
     CommunitySnapshotRecord, CouplingMiningStateRecord, DriftAnalysisStateRecord, DriftResultRecord,
 };
+pub use audit::{AuditFinding, AuditFindingFilters, AuditSeverityCounts, NewAuditFinding};
 pub use contracts::{IntentContractRecord, IntentViolationRecord};
 pub use embeddings::{SemanticSearchResult, SymbolEmbeddingMetaRecord, SymbolEmbeddingRecord};
 pub use fingerprint_history::SirFingerprintHistoryRecord;
@@ -334,6 +336,19 @@ pub trait TestIntentStore {
     ) -> Result<Vec<TestIntentRecord>, StoreError>;
 }
 
+pub trait AuditStore {
+    fn insert_audit_finding(&self, record: NewAuditFinding) -> Result<i64, StoreError>;
+    fn query_audit_findings(
+        &self,
+        filters: &AuditFindingFilters,
+    ) -> Result<Vec<AuditFinding>, StoreError>;
+    fn resolve_audit_finding(&self, finding_id: i64, status: &str) -> Result<bool, StoreError>;
+    fn count_audit_findings_by_severity(
+        &self,
+        filters: &AuditFindingFilters,
+    ) -> Result<AuditSeverityCounts, StoreError>;
+}
+
 pub trait Store:
     SymbolCatalogStore
     + SymbolRelationStore
@@ -344,6 +359,7 @@ pub trait Store:
     + ThresholdStore
     + ProjectNoteStore
     + ProjectNoteEmbeddingStore
+    + AuditStore
     + CouplingStateStore
     + DriftStore
     + TestIntentStore
@@ -360,6 +376,7 @@ impl<T> Store for T where
         + ThresholdStore
         + ProjectNoteStore
         + ProjectNoteEmbeddingStore
+        + AuditStore
         + CouplingStateStore
         + DriftStore
         + TestIntentStore
@@ -698,6 +715,30 @@ impl SnapshotStore for SqliteStore {
 
     fn delete_snapshot(&self, snapshot_id: &str) -> Result<(), StoreError> {
         self.store_delete_snapshot(snapshot_id)
+    }
+}
+
+impl AuditStore for SqliteStore {
+    fn insert_audit_finding(&self, record: NewAuditFinding) -> Result<i64, StoreError> {
+        self.store_insert_audit_finding(record)
+    }
+
+    fn query_audit_findings(
+        &self,
+        filters: &AuditFindingFilters,
+    ) -> Result<Vec<AuditFinding>, StoreError> {
+        self.store_query_audit_findings(filters)
+    }
+
+    fn resolve_audit_finding(&self, finding_id: i64, status: &str) -> Result<bool, StoreError> {
+        self.store_resolve_audit_finding(finding_id, status)
+    }
+
+    fn count_audit_findings_by_severity(
+        &self,
+        filters: &AuditFindingFilters,
+    ) -> Result<AuditSeverityCounts, StoreError> {
+        self.store_count_audit_findings_by_severity(filters)
     }
 }
 

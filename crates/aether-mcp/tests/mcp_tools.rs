@@ -12,14 +12,16 @@ use aether_core::{
     SearchMode, SymbolEdge,
 };
 use aether_mcp::{
+    AetherAuditReportRequest, AetherAuditResolveRequest, AetherAuditSubmitRequest,
     AetherBlastRadiusRequest, AetherCallChainRequest, AetherDependenciesRequest,
     AetherExplainRequest, AetherGetSirRequest, AetherHealthExplainRequest,
     AetherHealthHotspotsRequest, AetherHealthRequest, AetherMcpServer, AetherRecallRequest,
-    AetherRefactorPrepRequest, AetherRememberRequest, AetherSearchRequest,
+    AetherRefactorPrepRequest, AetherRememberRequest, AetherSearchRequest, AetherSirInjectRequest,
     AetherSuggestTraitSplitRequest, AetherSymbolLookupRequest, AetherSymbolTimelineRequest,
     AetherTestIntentsRequest, AetherTraitSplitResolutionMode, AetherUsageMatrixRequest,
     AetherVerifyIntentRequest, AetherWhyChangedReason, AetherWhyChangedRequest,
-    AetherWhySelectorMode, MCP_SCHEMA_VERSION, MEMORY_SCHEMA_VERSION, SharedState, SirLevelRequest,
+    AetherWhySelectorMode, AuditCategory, AuditCertainty, AuditSeverity, AuditStatus,
+    MCP_SCHEMA_VERSION, MEMORY_SCHEMA_VERSION, SharedState, SirLevelRequest,
 };
 #[cfg(feature = "verification")]
 use aether_mcp::{AetherVerifyMode, AetherVerifyRequest};
@@ -2983,6 +2985,199 @@ vector_backend = "sqlite"
             .contains(&"charges correctly".to_owned())
     );
     assert_eq!(blast.test_guards[0].inference_method, "naming_convention");
+
+    Ok(())
+}
+
+#[test]
+fn mcp_audit_tools_submit_report_and_resolve_findings() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    write_test_config(workspace);
+
+    let store = SqliteStore::open(workspace)?;
+    store.upsert_symbol(custom_symbol_record(
+        "sym-audit",
+        "crate::audit::handle",
+        "crates/aether-store/src/lib.rs",
+        "function",
+    ))?;
+    store.write_sir_blob(
+        "sym-audit",
+        r#"{
+            "intent":"seed audit sir",
+            "inputs":[],
+            "outputs":[],
+            "side_effects":[],
+            "dependencies":[],
+            "error_modes":[],
+            "confidence":0.8
+        }"#,
+    )?;
+    drop(store);
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+
+    let submit = rt
+        .block_on(
+            server.aether_audit_submit(Parameters(AetherAuditSubmitRequest {
+                symbol_id: "sym-audit".to_owned(),
+                audit_type: None,
+                severity: AuditSeverity::High,
+                category: AuditCategory::SilentFailure,
+                certainty: AuditCertainty::Confirmed,
+                trigger_condition: "rollback path skipped".to_owned(),
+                impact: "partial writes remain committed".to_owned(),
+                description: "reconcile skips rollback on partial failure".to_owned(),
+                related_symbols: Some(vec!["sym-helper".to_owned()]),
+                model: None,
+                provider: None,
+                reasoning: Some("reproduced with targeted fixture".to_owned()),
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert!(submit.finding_id > 0);
+    assert_eq!(submit.status, AuditStatus::Open);
+
+    let report = rt
+        .block_on(
+            server.aether_audit_report(Parameters(AetherAuditReportRequest {
+                crate_filter: Some("aether-store".to_owned()),
+                min_severity: Some(AuditSeverity::Low),
+                category: None,
+                status: None,
+                limit: Some(25),
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert_eq!(report.summary.total, 1);
+    assert_eq!(report.summary.high, 1);
+    assert_eq!(report.findings.len(), 1);
+    assert_eq!(
+        report.findings[0].qualified_name.as_deref(),
+        Some("crate::audit::handle")
+    );
+    assert_eq!(
+        report.findings[0].file_path.as_deref(),
+        Some("crates/aether-store/src/lib.rs")
+    );
+
+    let resolve = rt
+        .block_on(
+            server.aether_audit_resolve(Parameters(AetherAuditResolveRequest {
+                finding_id: submit.finding_id,
+                status: AuditStatus::Fixed,
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert!(resolve.resolved);
+    assert_eq!(resolve.new_status, AuditStatus::Fixed);
+
+    let fixed_report = rt
+        .block_on(
+            server.aether_audit_report(Parameters(AetherAuditReportRequest {
+                crate_filter: Some("aether-store".to_owned()),
+                min_severity: Some(AuditSeverity::Low),
+                category: None,
+                status: Some(AuditStatus::Fixed),
+                limit: Some(25),
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert_eq!(fixed_report.summary.total, 1);
+    assert_eq!(fixed_report.findings.len(), 1);
+    assert_eq!(fixed_report.findings[0].status, AuditStatus::Fixed);
+
+    Ok(())
+}
+
+#[test]
+fn mcp_sir_inject_tool_injects_blocks_and_forces_overwrites() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    write_test_config(workspace);
+
+    let store = SqliteStore::open(workspace)?;
+    store.upsert_symbol(custom_symbol_record(
+        "sym-inject",
+        "crate::inject::target",
+        "src/lib.rs",
+        "function",
+    ))?;
+    drop(store);
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+
+    let first = rt
+        .block_on(server.aether_sir_inject(Parameters(AetherSirInjectRequest {
+            symbol: "sym-inject".to_owned(),
+            intent: "Initial injected intent".to_owned(),
+            side_effects: Some(vec!["writes cache".to_owned()]),
+            error_modes: Some(vec!["io".to_owned()]),
+            confidence: Some(0.9),
+            generation_pass: None,
+            model: None,
+            provider: None,
+            force: None,
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert_eq!(first.status, "injected");
+    assert_eq!(first.sir_version, 1);
+    assert!(
+        first
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("Embeddings not refreshed"))
+    );
+
+    let blocked = rt
+        .block_on(server.aether_sir_inject(Parameters(AetherSirInjectRequest {
+            symbol: "crate::inject::target".to_owned(),
+            intent: "Blocked overwrite".to_owned(),
+            side_effects: None,
+            error_modes: None,
+            confidence: Some(0.4),
+            generation_pass: None,
+            model: None,
+            provider: None,
+            force: Some(false),
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert_eq!(blocked.status, "blocked");
+    assert_eq!(blocked.previous_confidence, Some(0.9));
+
+    let forced = rt
+        .block_on(server.aether_sir_inject(Parameters(AetherSirInjectRequest {
+            symbol: "sym-inject".to_owned(),
+            intent: "Forced overwrite".to_owned(),
+            side_effects: Some(vec!["updates cache".to_owned()]),
+            error_modes: Some(vec!["network".to_owned()]),
+            confidence: Some(0.4),
+            generation_pass: Some("deep".to_owned()),
+            model: Some("claude_code".to_owned()),
+            provider: Some("manual".to_owned()),
+            force: Some(true),
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert_eq!(forced.status, "injected");
+    assert_eq!(forced.previous_confidence, Some(0.9));
+    assert!(forced.sir_version >= 2);
+
+    let store = SqliteStore::open(workspace)?;
+    let meta = store
+        .get_sir_meta("sym-inject")?
+        .expect("injected sir meta exists");
+    assert_eq!(meta.sir_hash, forced.sir_hash);
+    assert_eq!(meta.sir_version, forced.sir_version);
 
     Ok(())
 }

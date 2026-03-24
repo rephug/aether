@@ -1,3 +1,4 @@
+pub mod audit_report;
 pub mod batch;
 pub mod calibrate;
 pub mod causal;

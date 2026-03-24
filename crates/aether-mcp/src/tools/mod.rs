@@ -12,6 +12,7 @@ use rmcp::transport::stdio;
 use crate::AetherMcpError;
 use crate::state::SharedState;
 
+mod audit;
 mod common;
 mod drift;
 mod health;
@@ -22,12 +23,14 @@ mod refactor;
 mod router;
 mod search;
 mod sir;
+mod sir_inject;
 mod status;
 mod trait_split;
 mod usage_matrix;
 #[cfg(feature = "verification")]
 mod verification;
 
+pub use audit::*;
 pub use drift::*;
 pub use health::*;
 pub use history::*;
@@ -36,6 +39,7 @@ pub use memory::*;
 pub use refactor::*;
 pub use search::*;
 pub use sir::*;
+pub use sir_inject::*;
 pub use status::*;
 pub use trait_split::*;
 pub use usage_matrix::*;

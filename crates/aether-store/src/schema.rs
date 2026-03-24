@@ -645,6 +645,37 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         conn.execute("PRAGMA user_version = 17", [])?;
     }
 
+    if version < 18 {
+        conn.execute_batch(
+            r#"
+        CREATE TABLE IF NOT EXISTS sir_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol_id TEXT NOT NULL,
+            audit_type TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            category TEXT NOT NULL,
+            certainty TEXT NOT NULL,
+            trigger_condition TEXT NOT NULL,
+            impact TEXT NOT NULL,
+            description TEXT NOT NULL,
+            related_symbols TEXT DEFAULT '[]',
+            model TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            reasoning TEXT,
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at INTEGER NOT NULL,
+            resolved_at INTEGER,
+            FOREIGN KEY (symbol_id) REFERENCES sir(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_symbol ON sir_audit(symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_audit_severity ON sir_audit(severity);
+        CREATE INDEX IF NOT EXISTS idx_audit_status ON sir_audit(status);
+        CREATE INDEX IF NOT EXISTS idx_audit_category ON sir_audit(category);
+        "#,
+        )?;
+        conn.execute("PRAGMA user_version = 18", [])?;
+    }
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_version (
