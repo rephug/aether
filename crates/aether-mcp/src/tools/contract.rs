@@ -6,6 +6,7 @@ use aether_store::{
     SymbolRecord,
 };
 use aetherd::contracts::{ClauseStatus, ContractVerifier};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +18,8 @@ const MAX_VIOLATION_LIMIT: u32 = 1000;
 const CLAUDE_CODE_CREATOR: &str = "claude_code";
 const NOTE_ACTIVE_ONLY: &str =
     "include_inactive is not yet supported - showing active contracts only";
+const NOTE_INVALID_CLAUSE_EMBEDDING: &str =
+    "Stored clause embedding is invalid and could not be compared.";
 const NOTE_NO_EMBEDDING: &str = "No embedding available for comparison.";
 const NOTE_NO_SIR: &str = "No SIR available for comparison.";
 const NOTE_INCOMPATIBLE_EMBEDDING: &str = "Stored embeddings are incompatible for comparison.";
@@ -318,6 +321,22 @@ fn embeddings_comparable(left: &[f32], right: &[f32]) -> bool {
     left_norm_sq > f64::EPSILON && right_norm_sq > f64::EPSILON
 }
 
+fn violation_exists(
+    sqlite_path: &std::path::Path,
+    violation_id: i64,
+) -> Result<bool, AetherMcpError> {
+    let conn = Connection::open_with_flags(sqlite_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM intent_violations WHERE id = ?1 LIMIT 1",
+            params![violation_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+    Ok(exists)
+}
+
 fn build_contract_output(
     contract: IntentContractRecord,
     qualified_name: Option<String>,
@@ -547,11 +566,23 @@ impl AetherMcpServer {
             let mut ambiguous = 0_u32;
 
             for contract in contracts {
-                let clause_embedding = contract
-                    .clause_embedding_json
-                    .as_deref()
-                    .map(serde_json::from_str::<Vec<f32>>)
-                    .transpose()?;
+                let mut invalid_clause_embedding = false;
+                let clause_embedding = match contract.clause_embedding_json.as_deref() {
+                    Some(json) => match serde_json::from_str::<Vec<f32>>(json) {
+                        Ok(embedding) => Some(embedding),
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                contract_id = contract.id,
+                                symbol_id = symbol_id.as_str(),
+                                "failed to parse stored contract clause embedding"
+                            );
+                            invalid_clause_embedding = true;
+                            None
+                        }
+                    },
+                    None => None,
+                };
 
                 let (status, similarity, note) = match sir_blob.as_ref() {
                     None => (ClauseStatus::Ambiguous, None, Some(NOTE_NO_SIR.to_owned())),
@@ -568,11 +599,14 @@ impl AetherMcpServer {
                             None,
                             Some(NOTE_INCOMPATIBLE_EMBEDDING.to_owned()),
                         ),
-                        _ => (
-                            ClauseStatus::Ambiguous,
-                            None,
-                            Some(NOTE_NO_EMBEDDING.to_owned()),
-                        ),
+                        _ => {
+                            let note = if invalid_clause_embedding {
+                                NOTE_INVALID_CLAUSE_EMBEDDING
+                            } else {
+                                NOTE_NO_EMBEDDING
+                            };
+                            (ClauseStatus::Ambiguous, None, Some(note.to_owned()))
+                        }
                     },
                 };
 
@@ -673,6 +707,12 @@ impl AetherMcpServer {
                 "reason must not be empty".to_owned(),
             ));
         }
+        if !violation_exists(self.sqlite_path().as_path(), request.violation_id)? {
+            return Err(AetherMcpError::Message(format!(
+                "violation #{} not found",
+                request.violation_id
+            )));
+        }
         self.state
             .store
             .dismiss_violation(request.violation_id, reason)?;
@@ -692,7 +732,7 @@ mod tests {
     use super::{
         AetherContractAddRequest, AetherContractCheckRequest, AetherContractDismissRequest,
         AetherContractListRequest, AetherContractRemoveRequest, AetherContractViolationsRequest,
-        CLAUDE_CODE_CREATOR, NOTE_ACTIVE_ONLY, NOTE_NO_EMBEDDING,
+        CLAUDE_CODE_CREATOR, NOTE_ACTIVE_ONLY, NOTE_INVALID_CLAUSE_EMBEDDING, NOTE_NO_EMBEDDING,
     };
     use crate::AetherMcpServer;
     use aether_store::{
@@ -949,6 +989,59 @@ model = "{embedding_model}"
     }
 
     #[test]
+    fn contract_check_invalid_clause_embedding_marks_only_that_clause_ambiguous() {
+        let temp = tempdir().expect("tempdir");
+        write_test_config(temp.path(), true, "mock-64d");
+        seed_symbol(temp.path(), "sym-check", "crate::check::run");
+        seed_sir_blob(temp.path(), "sym-check", "reject zero amounts");
+        seed_symbol_embedding(temp.path(), "sym-check", vec![1.0, 0.0], "mock-64d");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        let valid_embedding =
+            serde_json::to_string(&vec![1.0_f32, 0.0]).expect("serialize embedding");
+        store
+            .insert_intent_contract(
+                "sym-check",
+                "must",
+                "reject zero amounts",
+                Some(valid_embedding.as_str()),
+                "tester",
+            )
+            .expect("insert valid contract");
+        store
+            .insert_intent_contract(
+                "sym-check",
+                "must_not",
+                "panic on invalid input",
+                Some("{not-json"),
+                "tester",
+            )
+            .expect("insert malformed contract");
+        let server = AetherMcpServer::new(temp.path(), false).expect("server");
+
+        let response = server
+            .aether_contract_check_logic(AetherContractCheckRequest {
+                symbol: Some("sym-check".to_owned()),
+            })
+            .expect("check contracts");
+
+        assert_eq!(response.summary.total_clauses, 2);
+        assert_eq!(response.summary.passed, 1);
+        assert_eq!(response.summary.ambiguous, 1);
+        assert_eq!(response.symbols_checked.len(), 1);
+        assert_eq!(response.symbols_checked[0].clause_results[0].status, "pass");
+        assert_eq!(
+            response.symbols_checked[0].clause_results[1].status,
+            "ambiguous"
+        );
+        assert_eq!(
+            response.symbols_checked[0].clause_results[1]
+                .note
+                .as_deref(),
+            Some(NOTE_INVALID_CLAUSE_EMBEDDING)
+        );
+    }
+
+    #[test]
     fn contract_violations_returns_history() {
         let temp = tempdir().expect("tempdir");
         write_test_config(temp.path(), false, "mock-64d");
@@ -1037,5 +1130,21 @@ model = "{embedding_model}"
             violations[0].dismissed_reason.as_deref(),
             Some("expected semantic drift during refactor")
         );
+    }
+
+    #[test]
+    fn contract_dismiss_rejects_unknown_violation_id() {
+        let temp = tempdir().expect("tempdir");
+        write_test_config(temp.path(), false, "mock-64d");
+        let server = AetherMcpServer::new(temp.path(), false).expect("server");
+
+        let err = server
+            .aether_contract_dismiss_logic(AetherContractDismissRequest {
+                violation_id: 9999,
+                reason: "not real".to_owned(),
+            })
+            .expect_err("unknown violation id must fail");
+
+        assert!(err.to_string().contains("violation #9999 not found"));
     }
 }
