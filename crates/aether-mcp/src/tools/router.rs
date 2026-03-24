@@ -9,21 +9,25 @@ use super::{
     AetherAuditReportResponse, AetherAuditResolveRequest, AetherAuditResolveResponse,
     AetherAuditSubmitRequest, AetherAuditSubmitResponse, AetherBlastRadiusRequest,
     AetherBlastRadiusResponse, AetherCallChainRequest, AetherCallChainResponse,
-    AetherDependenciesRequest, AetherDependenciesResponse, AetherDriftReportRequest,
-    AetherDriftReportResponse, AetherExplainRequest, AetherExplainResponse, AetherGetSirRequest,
-    AetherGetSirResponse, AetherHealthExplainRequest, AetherHealthHotspotsRequest,
-    AetherHealthRequest, AetherHealthResponse, AetherMcpServer, AetherRecallRequest,
-    AetherRecallResponse, AetherRefactorPrepRequest, AetherRefactorPrepResponse,
-    AetherRememberRequest, AetherRememberResponse, AetherSearchRequest, AetherSearchResponse,
-    AetherSessionNoteResponse, AetherSirContextRequest, AetherSirContextResponse,
-    AetherSirInjectRequest, AetherSirInjectResponse, AetherStatusResponse,
-    AetherSuggestTraitSplitRequest, AetherSuggestTraitSplitResponse, AetherSymbolLookupRequest,
-    AetherSymbolLookupResponse, AetherSymbolTimelineRequest, AetherSymbolTimelineResponse,
-    AetherTestIntentsRequest, AetherTestIntentsResponse, AetherTextResponse,
-    AetherTraceCauseRequest, AetherTraceCauseResponse, AetherUsageMatrixRequest,
-    AetherUsageMatrixResponse, AetherVerifyIntentRequest, AetherVerifyIntentResponse,
-    AetherWhyChangedRequest, AetherWhyChangedResponse, SERVER_DESCRIPTION, SERVER_NAME,
-    SERVER_VERSION,
+    AetherContractAddRequest, AetherContractAddResponse, AetherContractCheckRequest,
+    AetherContractCheckResponse, AetherContractDismissRequest, AetherContractDismissResponse,
+    AetherContractListRequest, AetherContractListResponse, AetherContractRemoveRequest,
+    AetherContractRemoveResponse, AetherContractViolationsRequest,
+    AetherContractViolationsResponse, AetherDependenciesRequest, AetherDependenciesResponse,
+    AetherDriftReportRequest, AetherDriftReportResponse, AetherExplainRequest,
+    AetherExplainResponse, AetherGetSirRequest, AetherGetSirResponse, AetherHealthExplainRequest,
+    AetherHealthHotspotsRequest, AetherHealthRequest, AetherHealthResponse, AetherMcpServer,
+    AetherRecallRequest, AetherRecallResponse, AetherRefactorPrepRequest,
+    AetherRefactorPrepResponse, AetherRememberRequest, AetherRememberResponse, AetherSearchRequest,
+    AetherSearchResponse, AetherSessionNoteResponse, AetherSirContextRequest,
+    AetherSirContextResponse, AetherSirInjectRequest, AetherSirInjectResponse,
+    AetherStatusResponse, AetherSuggestTraitSplitRequest, AetherSuggestTraitSplitResponse,
+    AetherSymbolLookupRequest, AetherSymbolLookupResponse, AetherSymbolTimelineRequest,
+    AetherSymbolTimelineResponse, AetherTestIntentsRequest, AetherTestIntentsResponse,
+    AetherTextResponse, AetherTraceCauseRequest, AetherTraceCauseResponse,
+    AetherUsageMatrixRequest, AetherUsageMatrixResponse, AetherVerifyIntentRequest,
+    AetherVerifyIntentResponse, AetherWhyChangedRequest, AetherWhyChangedResponse,
+    SERVER_DESCRIPTION, SERVER_NAME, SERVER_VERSION,
 };
 #[cfg(feature = "verification")]
 use super::{AetherVerifyRequest, AetherVerifyResponse};
@@ -281,6 +285,114 @@ impl AetherMcpServer {
         self.verbose_log("MCP tool called: aether_audit_resolve");
         let server = self.clone();
         tokio::task::spawn_blocking(move || server.aether_audit_resolve_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_contract_add",
+        description = "Add a behavioral contract (must/must_not/preserves) on a symbol"
+    )]
+    pub async fn aether_contract_add(
+        &self,
+        Parameters(request): Parameters<AetherContractAddRequest>,
+    ) -> Result<Json<AetherContractAddResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_contract_add");
+        self.state.require_writable().map_err(to_mcp_error)?;
+        let embedding_json = self
+            .maybe_embed_contract_clause(request.clause_text.as_str())
+            .await;
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || {
+            server.aether_contract_add_logic(request, embedding_json)
+        })
+        .await
+        .map_err(|err| McpError::internal_error(err.to_string(), None))?
+        .map(Json)
+        .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_contract_list",
+        description = "List active intent contracts, optionally filtered by symbol"
+    )]
+    pub async fn aether_contract_list(
+        &self,
+        Parameters(request): Parameters<AetherContractListRequest>,
+    ) -> Result<Json<AetherContractListResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_contract_list");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_contract_list_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_contract_remove",
+        description = "Deactivate an intent contract by ID"
+    )]
+    pub async fn aether_contract_remove(
+        &self,
+        Parameters(request): Parameters<AetherContractRemoveRequest>,
+    ) -> Result<Json<AetherContractRemoveResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_contract_remove");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_contract_remove_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_contract_check",
+        description = "Verify intent contracts against current SIR using embedding similarity"
+    )]
+    pub async fn aether_contract_check(
+        &self,
+        Parameters(request): Parameters<AetherContractCheckRequest>,
+    ) -> Result<Json<AetherContractCheckResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_contract_check");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_contract_check_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_contract_violations",
+        description = "Query contract violation history by symbol or contract"
+    )]
+    pub async fn aether_contract_violations(
+        &self,
+        Parameters(request): Parameters<AetherContractViolationsRequest>,
+    ) -> Result<Json<AetherContractViolationsResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_contract_violations");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_contract_violations_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_contract_dismiss",
+        description = "Dismiss a contract violation with a reason"
+    )]
+    pub async fn aether_contract_dismiss(
+        &self,
+        Parameters(request): Parameters<AetherContractDismissRequest>,
+    ) -> Result<Json<AetherContractDismissResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_contract_dismiss");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_contract_dismiss_logic(request))
             .await
             .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)

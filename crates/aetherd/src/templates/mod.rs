@@ -26,7 +26,7 @@ pub struct TemplateContext {
     pub mcp_binary_hint: String,
 }
 
-pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 33] = [
+pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 39] = [
     ("aether_status", "Get AETHER local store status"),
     (
         "aether_symbol_lookup",
@@ -88,6 +88,21 @@ pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 33] = [
         "aether_audit_resolve",
         "Mark an audit finding as fixed, wontfix, or confirmed",
     ),
+    (
+        "aether_contract_add",
+        "add a behavioral contract on a symbol",
+    ),
+    ("aether_contract_list", "list active intent contracts"),
+    ("aether_contract_remove", "deactivate an intent contract"),
+    (
+        "aether_contract_check",
+        "verify contracts against current SIR",
+    ),
+    (
+        "aether_contract_violations",
+        "query contract violation history",
+    ),
+    ("aether_contract_dismiss", "dismiss a contract violation"),
     (
         "aether_sir_inject",
         "Write an improved SIR annotation back to the store for a symbol",
