@@ -1,5 +1,6 @@
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::future::Future;
+use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,6 +10,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::process::Command;
 
 use crate::support::{self, DashboardState};
 
@@ -77,53 +79,55 @@ pub(crate) async fn enhance_handler(
     }
 }
 
-async fn run_enhance_request<F>(
+async fn run_enhance_request<F, Fut>(
     workspace: PathBuf,
     request: EnhanceApiRequest,
     runner: F,
 ) -> Result<EnhanceApiResponse, EnhanceApiError>
 where
-    F: FnOnce(&Path, &EnhanceApiRequest) -> Result<EnhanceApiResponse, String> + Send + 'static,
+    F: FnOnce(PathBuf, EnhanceApiRequest) -> Fut,
+    Fut: Future<Output = Result<EnhanceApiResponse, String>>,
 {
-    let join = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(ENHANCE_TIMEOUT_SECS),
-        tokio::task::spawn_blocking(move || runner(workspace.as_path(), &request)),
+        runner(workspace, request),
     )
     .await
-    .map_err(|_| EnhanceApiError::Timeout(ENHANCE_TIMEOUT_MESSAGE.to_owned()))?;
-
-    match join {
-        Ok(result) => result.map_err(EnhanceApiError::Internal),
-        Err(err) => Err(EnhanceApiError::Internal(format!(
-            "dashboard task join failure: {err}"
-        ))),
-    }
+    .map_err(|_| EnhanceApiError::Timeout(ENHANCE_TIMEOUT_MESSAGE.to_owned()))?
+    .map_err(EnhanceApiError::Internal)
 }
 
-fn execute_enhance_subprocess(
-    workspace: &Path,
-    request: &EnhanceApiRequest,
+async fn execute_enhance_subprocess(
+    workspace: PathBuf,
+    request: EnhanceApiRequest,
 ) -> Result<EnhanceApiResponse, String> {
     let executable = std::env::current_exe()
         .map_err(|err| format!("failed to locate current executable: {err}"))?;
 
     let mut command = Command::new(&executable);
     command
+        .kill_on_drop(true)
         .arg("--workspace")
-        .arg(workspace)
+        .arg(&workspace)
         .arg("enhance")
-        .arg(request.prompt.as_str())
+        .arg(&request.prompt)
         .arg("--output")
         .arg("json")
         .arg("--budget")
-        .arg(request.budget.to_string());
+        .arg(request.budget.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if request.rewrite {
         command.arg("--rewrite");
     }
 
-    let output = command
-        .output()
+    let child = command
+        .spawn()
         .map_err(|err| format!("failed to execute {}: {err}", executable.display()))?;
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|err| format!("failed to wait for {}: {err}", executable.display()))?;
 
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -176,6 +180,8 @@ mod tests {
         EnhanceApiResponse, parse_enhance_response, run_enhance_request,
     };
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     #[test]
@@ -224,7 +230,7 @@ mod tests {
         let response = run_enhance_request(
             PathBuf::from("/tmp/workspace"),
             request,
-            |_workspace, request| {
+            |_workspace, request| async move {
                 Ok(EnhanceApiResponse {
                     enhanced_prompt: format!("enhanced {}", request.prompt),
                     resolved_symbols: vec!["demo::auth".to_owned()],
@@ -244,17 +250,28 @@ mod tests {
 
     #[tokio::test]
     async fn run_enhance_request_times_out() {
+        struct DropGuard {
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl Drop for DropGuard {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
         let request = EnhanceApiRequest {
             prompt: "fix auth".to_owned(),
             budget: 8_000,
             rewrite: false,
         };
+        let dropped = Arc::new(AtomicBool::new(false));
 
-        let err = run_enhance_request(
-            PathBuf::from("/tmp/workspace"),
-            request,
-            |_workspace, _request| {
-                std::thread::sleep(Duration::from_secs(ENHANCE_TIMEOUT_SECS + 1));
+        let err = run_enhance_request(PathBuf::from("/tmp/workspace"), request, {
+            let dropped = Arc::clone(&dropped);
+            move |_workspace, _request| async move {
+                let _guard = DropGuard { dropped };
+                tokio::time::sleep(Duration::from_secs(ENHANCE_TIMEOUT_SECS + 1)).await;
                 Ok(EnhanceApiResponse {
                     enhanced_prompt: String::new(),
                     resolved_symbols: Vec::new(),
@@ -263,8 +280,8 @@ mod tests {
                     token_count: 0,
                     warnings: Vec::new(),
                 })
-            },
-        )
+            }
+        })
         .await
         .expect_err("runner should time out");
 
@@ -272,5 +289,6 @@ mod tests {
             err,
             EnhanceApiError::Timeout(ENHANCE_TIMEOUT_MESSAGE.to_owned())
         );
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }
