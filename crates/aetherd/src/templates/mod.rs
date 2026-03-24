@@ -1,11 +1,17 @@
+pub mod audit_cmd;
+pub mod audit_report_cmd;
 pub mod claude_md;
 pub mod codex_instructions;
 pub mod cursor_rules;
+pub mod refactor_cmd;
 pub mod skill_md;
 
+pub use audit_cmd::AuditCommandTemplate;
+pub use audit_report_cmd::AuditReportCommandTemplate;
 pub use claude_md::ClaudeTemplate;
 pub use codex_instructions::CodexInstructionsTemplate;
 pub use cursor_rules::CursorRulesTemplate;
+pub use refactor_cmd::RefactorCommandTemplate;
 pub use skill_md::SkillTemplate;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,46 +24,104 @@ pub struct TemplateContext {
     pub mcp_binary_hint: String,
 }
 
-pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 10] = [
-    (
-        "aether_status",
-        "check local index/store freshness and symbol/SIR counts",
-    ),
+pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 26] = [
+    ("aether_status", "Get AETHER local store status"),
     (
         "aether_symbol_lookup",
-        "find symbols by name/path/language using lexical lookup",
-    ),
-    (
-        "aether_search",
-        "search symbols using lexical, semantic, or hybrid ranking",
-    ),
-    (
-        "aether_symbol_timeline",
-        "inspect how a symbol changed across SIR versions",
-    ),
-    (
-        "aether_why_changed",
-        "compare symbol versions and summarize what changed",
-    ),
-    (
-        "aether_get_sir",
-        "fetch canonical SIR for symbol/file/module before edits",
+        "Lookup symbols by qualified name or file path",
     ),
     (
         "aether_dependencies",
-        "list direct callers and dependencies for a symbol",
+        "Get resolved callers and call dependencies for a symbol",
+    ),
+    (
+        "aether_usage_matrix",
+        "Get a consumer-by-method usage matrix for a trait or struct, showing which files call which methods and suggesting method clusters for trait decomposition",
+    ),
+    (
+        "aether_suggest_trait_split",
+        "Suggest how to decompose a large trait or struct into smaller capability groups based on consumer usage patterns",
     ),
     (
         "aether_call_chain",
-        "trace call-chain levels to understand blast radius",
+        "Get transitive call-chain levels for a symbol",
+    ),
+    (
+        "aether_search",
+        "Search symbols by name, path, language, or kind",
+    ),
+    (
+        "aether_remember",
+        "Store project memory note content with deterministic deduplication",
+    ),
+    (
+        "aether_session_note",
+        "Capture an in-session project note with source_type=session",
+    ),
+    (
+        "aether_recall",
+        "Recall project memory notes using lexical, semantic, or hybrid retrieval",
+    ),
+    (
+        "aether_ask",
+        "Search symbols, notes, coupling, and test intents with unified ranking",
+    ),
+    (
+        "aether_blast_radius",
+        "Analyze coupled files and risk levels for blast-radius impact",
+    ),
+    (
+        "aether_test_intents",
+        "Query extracted behavioral test intents for a file or symbol",
+    ),
+    (
+        "aether_drift_report",
+        "Run semantic drift analysis with boundary and structural anomaly detection",
+    ),
+    (
+        "aether_health",
+        "Get codebase health metrics including critical symbols, bottlenecks, dependency cycles, orphaned code, and risk hotspots.",
+    ),
+    (
+        "aether_health_hotspots",
+        "Return the hottest workspace crates by health score with archetypes and top violations.",
+    ),
+    (
+        "aether_health_explain",
+        "Explain one crate's health score, signals, violations, and split suggestions.",
+    ),
+    (
+        "aether_refactor_prep",
+        "Prepare a file or crate for refactoring by deep-scanning the highest-risk symbols and saving an intent snapshot",
+    ),
+    (
+        "aether_verify_intent",
+        "Compare current SIR against a saved refactor-prep snapshot and flag semantic drift",
+    ),
+    (
+        "aether_trace_cause",
+        "Trace likely upstream semantic causes of a downstream breakage",
+    ),
+    (
+        "aether_acknowledge_drift",
+        "Acknowledge drift findings and create a project note",
+    ),
+    (
+        "aether_symbol_timeline",
+        "Get ordered SIR timeline entries for a symbol",
+    ),
+    (
+        "aether_why_changed",
+        "Explain why a symbol changed between two SIR versions or timestamps",
+    ),
+    ("aether_get_sir", "Get SIR for leaf/file/module level"),
+    (
+        "aether_explain",
+        "Explain symbol at a file position using local SIR",
     ),
     (
         "aether_verify",
-        "run configured verification commands after code changes",
-    ),
-    (
-        "aether_explain",
-        "summarize intent for a symbol or file-level rollup",
+        "Run allowlisted verification commands in host, container, or microvm mode",
     ),
 ];
 

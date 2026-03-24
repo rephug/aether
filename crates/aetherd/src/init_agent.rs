@@ -8,7 +8,8 @@ use anyhow::{Context, Result};
 use clap::ValueEnum;
 
 use crate::templates::{
-    ClaudeTemplate, CodexInstructionsTemplate, CursorRulesTemplate, SkillTemplate, TemplateContext,
+    AuditCommandTemplate, AuditReportCommandTemplate, ClaudeTemplate, CodexInstructionsTemplate,
+    CursorRulesTemplate, RefactorCommandTemplate, SkillTemplate, TemplateContext,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -100,6 +101,18 @@ fn files_for_platform(platform: AgentPlatform, context: &TemplateContext) -> Vec
         files.push(GeneratedFile {
             relative_path: PathBuf::from(".agents/skills/aether-context/SKILL.md"),
             content: SkillTemplate::render(context),
+        });
+        files.push(GeneratedFile {
+            relative_path: PathBuf::from(".claude/commands/audit.md"),
+            content: AuditCommandTemplate::render(context),
+        });
+        files.push(GeneratedFile {
+            relative_path: PathBuf::from(".claude/commands/refactor.md"),
+            content: RefactorCommandTemplate::render(context),
+        });
+        files.push(GeneratedFile {
+            relative_path: PathBuf::from(".claude/commands/audit-report.md"),
+            content: AuditReportCommandTemplate::render(context),
         });
     }
 
@@ -194,6 +207,9 @@ mod tests {
         assert!(workspace.join("CLAUDE.md").exists());
         assert!(workspace.join(".codex-instructions").exists());
         assert!(workspace.join(".cursor/rules").exists());
+        assert!(workspace.join(".claude/commands/audit.md").exists());
+        assert!(workspace.join(".claude/commands/refactor.md").exists());
+        assert!(workspace.join(".claude/commands/audit-report.md").exists());
         assert!(
             workspace
                 .join(".agents/skills/aether-context/SKILL.md")
@@ -229,6 +245,9 @@ mod tests {
             "custom content\n"
         );
         assert!(workspace.join(".codex-instructions").exists());
+        assert!(workspace.join(".claude/commands/audit.md").exists());
+        assert!(workspace.join(".claude/commands/refactor.md").exists());
+        assert!(workspace.join(".claude/commands/audit-report.md").exists());
     }
 
     #[test]
@@ -275,6 +294,58 @@ mod tests {
             "Agent Schema Version: {}",
             AETHER_AGENT_SCHEMA_VERSION
         )));
+    }
+
+    #[test]
+    fn generated_claude_contains_audit_workflow() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+
+        write_config_with_embeddings(workspace, true);
+
+        run_init_agent(
+            workspace,
+            InitAgentOptions {
+                platform: AgentPlatform::Claude,
+                force: false,
+            },
+        )
+        .expect("init-agent should succeed");
+
+        let claude = fs::read_to_string(workspace.join("CLAUDE.md")).expect("read claude");
+        assert!(claude.contains("## Audit Workflow"));
+    }
+
+    #[test]
+    fn generated_commands_contain_expected_content() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_config_with_embeddings(workspace, true);
+        run_init_agent(
+            workspace,
+            InitAgentOptions {
+                platform: AgentPlatform::Claude,
+                force: false,
+            },
+        )
+        .expect("init-agent should succeed");
+
+        let audit = fs::read_to_string(workspace.join(".claude/commands/audit.md"))
+            .expect("read audit command");
+        assert!(audit.contains("argument-hint:"));
+        assert!(audit.contains("aether_health"));
+        assert!(audit.contains("ARITHMETIC"));
+        assert!(audit.contains("aether_audit_submit"));
+
+        let refactor = fs::read_to_string(workspace.join(".claude/commands/refactor.md"))
+            .expect("read refactor command");
+        assert!(refactor.contains("aether_suggest_trait_split"));
+        assert!(refactor.contains("aether_refactor_prep"));
+
+        let report = fs::read_to_string(workspace.join(".claude/commands/audit-report.md"))
+            .expect("read audit-report command");
+        assert!(report.contains("aether_audit_report"));
+        assert!(report.contains("aether_recall"));
     }
 
     #[test]
