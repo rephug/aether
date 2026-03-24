@@ -31,11 +31,13 @@ Collect the list of changed files. If no files changed, report that and stop.
 ## Step 2: Get AETHER intelligence for changed files
 
 For each changed file:
-1. Call `aether_symbol_lookup` with the file path to get all symbols in it.
-2. Call `aether_health` scoped to the file for structural risk scores.
-3. If `aether_audit_candidates` is available, call it with a file filter
+1. Call `aether_search` with the normalized file path, `mode` set to `lexical`,
+   and `limit` set to 100 to enumerate symbols in that file.
+2. Keep only matches whose `file_path` exactly matches the changed file.
+3. Call `aether_health` scoped to the file for structural risk scores.
+4. If `aether_audit_candidates` is available, call it with a file filter
    for a pre-ranked target list.
-4. Prioritize symbols with high betweenness (bottlenecks), low test coverage,
+5. Prioritize symbols with high betweenness (bottlenecks), low test coverage,
    or symbols that callers depend on heavily.
 
 ## Step 3: Compare changes against SIR

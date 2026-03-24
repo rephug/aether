@@ -357,6 +357,7 @@ mod tests {
             .expect("read audit-changes command");
         assert!(changes.contains("argument-hint:"));
         assert!(changes.contains("git diff"));
+        assert!(changes.contains("aether_search"));
         assert!(changes.contains("aether_get_sir"));
         assert!(changes.contains("aether_sir_inject"));
     }
