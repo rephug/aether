@@ -215,54 +215,52 @@ fn resolve_symbol_selector(
 }
 
 fn truncate_by_char_count(content: &str, max_chars: usize) -> String {
-    if content.len() <= max_chars {
+    if content.chars().count() <= max_chars {
         return content.to_owned();
     }
 
-    let mut end = 0usize;
-    for (index, ch) in content.char_indices() {
-        let next = index + ch.len_utf8();
-        if next > max_chars {
-            break;
-        }
-        end = next;
-    }
+    let end = content
+        .char_indices()
+        .nth(max_chars)
+        .map(|(index, _)| index)
+        .unwrap_or(content.len());
 
     content[..end].to_owned()
+}
+
+fn take_last_chars(content: &str, max_chars: usize) -> String {
+    let total_chars = content.chars().count();
+    if total_chars <= max_chars {
+        return content.to_owned();
+    }
+
+    let start = content
+        .char_indices()
+        .nth(total_chars.saturating_sub(max_chars))
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+
+    content[start..].to_owned()
 }
 
 fn middle_truncate_by_chars(content: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
     }
-    if content.len() <= max_chars {
+    if content.chars().count() <= max_chars {
         return content.to_owned();
     }
 
     let marker = "[... truncated ...]";
-    if max_chars <= marker.len() + 8 {
+    let marker_chars = marker.chars().count();
+    if max_chars <= marker_chars + 8 {
         return truncate_by_char_count(marker, max_chars.max(1));
     }
 
-    let prefix_chars = (max_chars - marker.len()) / 2;
-    let suffix_chars = max_chars - marker.len() - prefix_chars;
+    let prefix_chars = (max_chars - marker_chars) / 2;
+    let suffix_chars = max_chars - marker_chars - prefix_chars;
     let prefix = truncate_by_char_count(content, prefix_chars);
-
-    let mut suffix_start = content.len();
-    let mut remaining = suffix_chars;
-    for (index, ch) in content.char_indices().rev() {
-        let char_len = ch.len_utf8();
-        if remaining < char_len {
-            break;
-        }
-        remaining -= char_len;
-        suffix_start = index;
-        if remaining == 0 {
-            break;
-        }
-    }
-
-    let suffix = &content[suffix_start..];
+    let suffix = take_last_chars(content, suffix_chars);
     format!("{prefix}{marker}{suffix}")
 }
 
@@ -536,7 +534,9 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    use super::{AetherAuditCrossSymbolRequest, NodeRole};
+    use super::{
+        AetherAuditCrossSymbolRequest, NodeRole, middle_truncate_by_chars, truncate_by_char_count,
+    };
     use crate::AetherMcpServer;
 
     fn write_test_config(workspace: &Path) {
@@ -928,5 +928,24 @@ pub fn root() -> i32 { helper() }
             .expect_err("missing symbol should fail");
 
         assert!(err.to_string().contains("symbol not found"));
+    }
+
+    #[test]
+    fn truncate_by_char_count_preserves_multibyte_chars_with_char_limits() {
+        let content = "😀😀😀";
+
+        assert_eq!(truncate_by_char_count(content, 8), content);
+        assert_eq!(truncate_by_char_count(content, 2), "😀😀");
+    }
+
+    #[test]
+    fn middle_truncate_by_chars_counts_multibyte_prefix_and_suffix_by_char() {
+        let content = format!("{}payload{}", "😀".repeat(12), "界".repeat(12));
+
+        let truncated = middle_truncate_by_chars(&content, 30);
+
+        assert_eq!(truncated.chars().count(), 30);
+        assert!(truncated.starts_with(&"😀".repeat(5)));
+        assert!(truncated.ends_with(&"界".repeat(6)));
     }
 }
