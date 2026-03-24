@@ -15,6 +15,7 @@ use crate::state::SharedState;
 mod audit;
 mod common;
 mod context;
+mod contract;
 mod cross_symbol;
 mod drift;
 mod health;
@@ -34,6 +35,7 @@ mod verification;
 
 pub use audit::*;
 pub use context::*;
+pub use contract::*;
 pub use cross_symbol::*;
 pub use drift::*;
 pub use health::*;
