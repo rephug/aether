@@ -12,6 +12,8 @@ pub mod coupling;
 pub mod daemon_client;
 pub mod daemon_detect;
 pub mod drift;
+pub mod enhance;
+pub mod enhance_templates;
 pub mod fsck;
 pub mod health;
 pub mod health_score;

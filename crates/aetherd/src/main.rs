@@ -19,11 +19,11 @@ use aetherd::causal::run_trace_cause_command;
 use aetherd::cli::{
     AskArgs, AuditReportArgs, BatchArgs, BlastRadiusArgs, Cli, Commands, CommunitiesArgs,
     ComputeQualityArgs, ContextArgs, ContinuousArgs, ContractArgs, CouplingReportArgs,
-    DriftAckArgs, DriftReportArgs, FsckArgs, HealthArgs, HealthScoreArgs, InitAgentArgs, LogFormat,
-    MineCouplingArgs, NotesArgs, PresetArgs, RecallArgs, RefactorPrepArgs, RegenerateArgs,
-    RememberArgs, SeismographArgs, SetupLocalArgs, SirContextArgs, SirDiffArgs, SirInjectArgs,
-    TaskHistoryArgs, TaskRelevanceArgs, TestIntentsArgs, TraceCauseArgs, VerifyIntentArgs,
-    parse_cli,
+    DriftAckArgs, DriftReportArgs, EnhanceArgs, FsckArgs, HealthArgs, HealthScoreArgs,
+    InitAgentArgs, LogFormat, MineCouplingArgs, NotesArgs, PresetArgs, RecallArgs,
+    RefactorPrepArgs, RegenerateArgs, RememberArgs, SeismographArgs, SetupLocalArgs,
+    SirContextArgs, SirDiffArgs, SirInjectArgs, TaskHistoryArgs, TaskRelevanceArgs,
+    TestIntentsArgs, TraceCauseArgs, VerifyIntentArgs, parse_cli,
 };
 use aetherd::context_presets::run_preset_command;
 use aetherd::continuous::run_continuous_command;
@@ -32,6 +32,7 @@ use aetherd::coupling::{
     run_blast_radius_command, run_coupling_report_command, run_mine_coupling_command,
 };
 use aetherd::drift::{run_communities_command, run_drift_ack_command, run_drift_report_command};
+use aetherd::enhance::run_enhance_command;
 use aetherd::fsck::run_fsck;
 use aetherd::health::run_health_command;
 use aetherd::health_score::run_health_score_command;
@@ -331,6 +332,7 @@ fn run_subcommand(workspace: &Path, config: &AetherConfig, command: Commands) ->
         Commands::Context(args) => run_context_subcommand(workspace, args),
         Commands::TaskHistory(args) => run_task_history_subcommand(workspace, args),
         Commands::TaskRelevance(args) => run_task_relevance_subcommand(workspace, args),
+        Commands::Enhance(args) => run_enhance_subcommand(workspace, args),
         Commands::SirContext(args) => run_sir_context_subcommand(workspace, args),
         Commands::SirInject(args) => run_sir_inject_subcommand(workspace, args),
         Commands::SirDiff(args) => run_sir_diff_subcommand(workspace, args),
@@ -380,6 +382,10 @@ fn run_task_history_subcommand(workspace: &Path, args: TaskHistoryArgs) -> Resul
 
 fn run_task_relevance_subcommand(workspace: &Path, args: TaskRelevanceArgs) -> Result<()> {
     run_task_relevance_command(workspace, args).context("task-relevance command failed")
+}
+
+fn run_enhance_subcommand(workspace: &Path, args: EnhanceArgs) -> Result<()> {
+    run_enhance_command(workspace, args).context("enhance command failed")
 }
 
 fn run_sir_context_subcommand(workspace: &Path, args: SirContextArgs) -> Result<()> {

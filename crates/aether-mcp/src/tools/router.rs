@@ -14,20 +14,21 @@ use super::{
     AetherContractListRequest, AetherContractListResponse, AetherContractRemoveRequest,
     AetherContractRemoveResponse, AetherContractViolationsRequest,
     AetherContractViolationsResponse, AetherDependenciesRequest, AetherDependenciesResponse,
-    AetherDriftReportRequest, AetherDriftReportResponse, AetherExplainRequest,
-    AetherExplainResponse, AetherGetSirRequest, AetherGetSirResponse, AetherHealthExplainRequest,
-    AetherHealthHotspotsRequest, AetherHealthRequest, AetherHealthResponse, AetherMcpServer,
-    AetherRecallRequest, AetherRecallResponse, AetherRefactorPrepRequest,
-    AetherRefactorPrepResponse, AetherRememberRequest, AetherRememberResponse, AetherSearchRequest,
-    AetherSearchResponse, AetherSessionNoteResponse, AetherSirContextRequest,
-    AetherSirContextResponse, AetherSirInjectRequest, AetherSirInjectResponse,
-    AetherStatusResponse, AetherSuggestTraitSplitRequest, AetherSuggestTraitSplitResponse,
-    AetherSymbolLookupRequest, AetherSymbolLookupResponse, AetherSymbolTimelineRequest,
-    AetherSymbolTimelineResponse, AetherTestIntentsRequest, AetherTestIntentsResponse,
-    AetherTextResponse, AetherTraceCauseRequest, AetherTraceCauseResponse,
-    AetherUsageMatrixRequest, AetherUsageMatrixResponse, AetherVerifyIntentRequest,
-    AetherVerifyIntentResponse, AetherWhyChangedRequest, AetherWhyChangedResponse,
-    SERVER_DESCRIPTION, SERVER_NAME, SERVER_VERSION,
+    AetherDriftReportRequest, AetherDriftReportResponse, AetherEnhancePromptRequest,
+    AetherEnhancePromptResponse, AetherExplainRequest, AetherExplainResponse, AetherGetSirRequest,
+    AetherGetSirResponse, AetherHealthExplainRequest, AetherHealthHotspotsRequest,
+    AetherHealthRequest, AetherHealthResponse, AetherMcpServer, AetherRecallRequest,
+    AetherRecallResponse, AetherRefactorPrepRequest, AetherRefactorPrepResponse,
+    AetherRememberRequest, AetherRememberResponse, AetherSearchRequest, AetherSearchResponse,
+    AetherSessionNoteResponse, AetherSirContextRequest, AetherSirContextResponse,
+    AetherSirInjectRequest, AetherSirInjectResponse, AetherStatusResponse,
+    AetherSuggestTraitSplitRequest, AetherSuggestTraitSplitResponse, AetherSymbolLookupRequest,
+    AetherSymbolLookupResponse, AetherSymbolTimelineRequest, AetherSymbolTimelineResponse,
+    AetherTestIntentsRequest, AetherTestIntentsResponse, AetherTextResponse,
+    AetherTraceCauseRequest, AetherTraceCauseResponse, AetherUsageMatrixRequest,
+    AetherUsageMatrixResponse, AetherVerifyIntentRequest, AetherVerifyIntentResponse,
+    AetherWhyChangedRequest, AetherWhyChangedResponse, SERVER_DESCRIPTION, SERVER_NAME,
+    SERVER_VERSION,
 };
 #[cfg(feature = "verification")]
 use super::{AetherVerifyRequest, AetherVerifyResponse};
@@ -78,6 +79,23 @@ impl AetherMcpServer {
         self.verbose_log("MCP tool called: aether_dependencies");
         self.aether_dependencies_logic(request)
             .await
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_enhance_prompt",
+        description = "Enhance a coding prompt with AETHER codebase intelligence context"
+    )]
+    pub async fn aether_enhance_prompt(
+        &self,
+        Parameters(request): Parameters<AetherEnhancePromptRequest>,
+    ) -> Result<Json<AetherEnhancePromptResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_enhance_prompt");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_enhance_prompt_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)
             .map_err(to_mcp_error)
     }

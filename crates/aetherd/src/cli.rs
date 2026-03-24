@@ -860,6 +860,36 @@ pub struct SirContextArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct EnhanceArgs {
+    #[arg(help = "The prompt to enhance")]
+    pub prompt: String,
+
+    #[arg(long, help = "Copy enhanced output to the clipboard using shell tools")]
+    pub clipboard: bool,
+
+    #[arg(long, help = "Use LLM rewrite mode after template assembly")]
+    pub rewrite: bool,
+
+    #[arg(
+        long,
+        default_value = "text",
+        value_parser = ["text", "json"],
+        help = "Output format"
+    )]
+    pub output: String,
+
+    #[arg(
+        long,
+        default_value_t = 8000,
+        help = "Token budget for context assembly"
+    )]
+    pub budget: usize,
+
+    #[arg(long, help = "Skip LLM extraction and use keyword matching only")]
+    pub offline: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct SirInjectArgs {
     #[arg(help = "Symbol selector")]
     pub selector: String,
@@ -1014,6 +1044,8 @@ pub enum Commands {
     TaskHistory(TaskHistoryArgs),
     /// Show task-to-symbol relevance scores without assembling context
     TaskRelevance(TaskRelevanceArgs),
+    /// Enhance a prompt with AETHER codebase intelligence
+    Enhance(EnhanceArgs),
     /// Assemble semantic context for a symbol
     SirContext(SirContextArgs),
     /// Inject or update a symbol's SIR intent
@@ -1834,6 +1866,37 @@ mod tests {
                 assert_eq!(args.task, "stabilize auth context selection");
                 assert_eq!(args.branch.as_deref(), Some("feature/fix-auth"));
                 assert_eq!(args.top, 12);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enhance_subcommand_parses_all_flags() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "enhance",
+            "fix the login bug",
+            "--clipboard",
+            "--rewrite",
+            "--output",
+            "json",
+            "--budget",
+            "16000",
+            "--offline",
+        ])
+        .expect("enhance should parse");
+
+        match cli.command {
+            Some(Commands::Enhance(args)) => {
+                assert_eq!(args.prompt, "fix the login bug");
+                assert!(args.clipboard);
+                assert!(args.rewrite);
+                assert_eq!(args.output, "json");
+                assert_eq!(args.budget, 16000);
+                assert!(args.offline);
             }
             other => panic!("unexpected command: {other:?}"),
         }
