@@ -417,7 +417,7 @@ fn assemble_context(
     let mut seen_files = HashSet::<String>::new();
     let mut file_symbol_cache = HashMap::<String, Vec<SymbolRecord>>::new();
 
-    for query in intent.target_symbols.iter().take(MAX_CONCEPTS) {
+    for query in intent.target_symbols.iter().take(MAX_SYMBOL_CONTEXTS) {
         let matches = resolve_symbol_query(store, query, MAX_EXPLICIT_MATCHES)?;
         if matches.is_empty() {
             warnings.push(format!("no symbol matched '{query}'"));
@@ -747,7 +747,7 @@ fn collect_coupling_notes(workspace: &Path, files: &[String]) -> Vec<String> {
             continue;
         };
         for entry in result.coupled_files.into_iter().take(3) {
-            if !(file_set.contains(entry.file.as_str()) || entry.fused_score >= 0.2) {
+            if file_set.contains(entry.file.as_str()) || entry.fused_score < 0.2 {
                 continue;
             }
             notes.insert(format!(

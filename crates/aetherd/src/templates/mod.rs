@@ -26,7 +26,7 @@ pub struct TemplateContext {
     pub mcp_binary_hint: String,
 }
 
-pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 39] = [
+pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 40] = [
     ("aether_status", "Get AETHER local store status"),
     (
         "aether_symbol_lookup",
@@ -110,6 +110,10 @@ pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 39] = [
     (
         "aether_sir_context",
         "Assemble token-budgeted context for a symbol including source, SIR, graph neighbors, health, reasoning trace, and test intents in one call",
+    ),
+    (
+        "aether_enhance_prompt",
+        "Enhance a raw coding prompt with indexed codebase context, symbol matches, files, and architectural notes",
     ),
     (
         "aether_blast_radius",
@@ -256,7 +260,7 @@ pub(crate) fn plain_tool_list() -> String {
 mod tests {
     use super::{
         ClaudeTemplate, CodexInstructionsTemplate, CursorRulesTemplate, SkillTemplate,
-        TemplateContext,
+        TOOL_DESCRIPTIONS, TemplateContext,
     };
 
     fn sample_context() -> TemplateContext {
@@ -327,5 +331,15 @@ mod tests {
         let rendered = ClaudeTemplate::render(&context);
         assert!(rendered.contains("no verify commands configured"));
         assert!(rendered.contains("lexical only"));
+    }
+
+    #[test]
+    fn tool_descriptions_include_enhance_prompt_tool() {
+        assert_eq!(TOOL_DESCRIPTIONS.len(), 40);
+        assert!(
+            TOOL_DESCRIPTIONS
+                .iter()
+                .any(|(name, _)| *name == "aether_enhance_prompt")
+        );
     }
 }

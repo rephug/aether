@@ -251,50 +251,95 @@ fn middle_truncate(content: &str, max_tokens: usize) -> String {
     }
 
     let max_chars = max_tokens.saturating_mul(CHARS_PER_TOKEN);
-    if content.len() <= max_chars {
+    if content.chars().count() <= max_chars {
         return content.to_owned();
     }
 
     let marker = "\n[... truncated ...]\n";
-    if max_chars <= marker.len() + 8 {
-        return marker.chars().take(max_chars.max(1)).collect::<String>();
+    let marker_chars = marker.chars().count();
+    if max_chars <= marker_chars + 8 {
+        return truncate_by_char_count(marker, max_chars.max(1));
     }
 
-    let prefix_chars = (max_chars - marker.len()) / 2;
-    let suffix_chars = max_chars - marker.len() - prefix_chars;
+    let prefix_chars = (max_chars - marker_chars) / 2;
+    let suffix_chars = max_chars - marker_chars - prefix_chars;
     let prefix = truncate_by_char_count(content, prefix_chars);
-
-    let mut suffix_start = content.len();
-    let mut remaining = suffix_chars;
-    for (index, ch) in content.char_indices().rev() {
-        let char_len = ch.len_utf8();
-        if remaining < char_len {
-            break;
-        }
-        remaining -= char_len;
-        suffix_start = index;
-        if remaining == 0 {
-            break;
-        }
-    }
-
-    let suffix = &content[suffix_start..];
+    let suffix = take_last_chars(content, suffix_chars);
     format!("{prefix}{marker}{suffix}")
 }
 
 fn truncate_by_char_count(content: &str, max_chars: usize) -> String {
-    if content.len() <= max_chars {
+    if content.chars().count() <= max_chars {
         return content.to_owned();
     }
 
-    let mut end = 0usize;
-    for (index, ch) in content.char_indices() {
-        let next = index + ch.len_utf8();
-        if next > max_chars {
-            break;
-        }
-        end = next;
-    }
+    let end = content
+        .char_indices()
+        .nth(max_chars)
+        .map(|(index, _)| index)
+        .unwrap_or(content.len());
 
     content[..end].to_owned()
+}
+
+fn take_last_chars(content: &str, max_chars: usize) -> String {
+    let total_chars = content.chars().count();
+    if total_chars <= max_chars {
+        return content.to_owned();
+    }
+
+    let start = content
+        .char_indices()
+        .nth(total_chars.saturating_sub(max_chars))
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+
+    content[start..].to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{middle_truncate, render_enhanced_document};
+    use crate::enhance::{
+        AssembledEnhanceContext, EnhanceFileContext, EnhanceSymbolContext, TaskType,
+    };
+
+    #[test]
+    fn middle_truncate_counts_multibyte_characters() {
+        let content = "prefix ééé very long middle section with café suffix";
+        let truncated = middle_truncate(content, 8);
+
+        assert!(truncated.contains("[... truncated ...]"));
+        assert!(truncated.is_char_boundary(truncated.len()));
+        assert!(truncated.chars().count() <= 32);
+    }
+
+    #[test]
+    fn render_enhanced_document_keeps_multibyte_sections_valid_utf8() {
+        let context = AssembledEnhanceContext {
+            task_type: TaskType::BugFix,
+            symbols: vec![EnhanceSymbolContext {
+                qualified_name: "crate::login::handle_login".to_owned(),
+                kind: "function".to_owned(),
+                file_path: "src/login.rs".to_owned(),
+                intent: Some("Handle résumé parsing for café users.".to_owned()),
+                ..EnhanceSymbolContext::default()
+            }],
+            files: vec![EnhanceFileContext {
+                file_path: "src/login.rs".to_owned(),
+                symbol_count: 1,
+                top_symbols: vec![
+                    "`crate::login::handle_login` — Handles naïve retries.".to_owned(),
+                ],
+            }],
+            architectural_notes: vec!["Touches façade and résumé state.".to_owned()],
+            conventions: vec!["Preserve UTF-8 handling.".to_owned()],
+        };
+
+        let rendered =
+            render_enhanced_document("Fix the café login flow", &context, 18, false).unwrap();
+
+        assert!(rendered.is_char_boundary(rendered.len()));
+        assert!(rendered.contains("## Enhanced Prompt"));
+    }
 }
