@@ -5,24 +5,25 @@ use rmcp::{ErrorData as McpError, Json, ServerHandler, tool, tool_handler, tool_
 use super::{
     AetherAcknowledgeDriftRequest, AetherAcknowledgeDriftResponse, AetherAskRequest,
     AetherAskResponse, AetherAuditCandidatesRequest, AetherAuditCandidatesResponse,
-    AetherAuditReportRequest, AetherAuditReportResponse, AetherAuditResolveRequest,
-    AetherAuditResolveResponse, AetherAuditSubmitRequest, AetherAuditSubmitResponse,
-    AetherBlastRadiusRequest, AetherBlastRadiusResponse, AetherCallChainRequest,
-    AetherCallChainResponse, AetherDependenciesRequest, AetherDependenciesResponse,
-    AetherDriftReportRequest, AetherDriftReportResponse, AetherExplainRequest,
-    AetherExplainResponse, AetherGetSirRequest, AetherGetSirResponse, AetherHealthExplainRequest,
-    AetherHealthHotspotsRequest, AetherHealthRequest, AetherHealthResponse, AetherMcpServer,
-    AetherRecallRequest, AetherRecallResponse, AetherRefactorPrepRequest,
-    AetherRefactorPrepResponse, AetherRememberRequest, AetherRememberResponse, AetherSearchRequest,
-    AetherSearchResponse, AetherSessionNoteResponse, AetherSirContextRequest,
-    AetherSirContextResponse, AetherSirInjectRequest, AetherSirInjectResponse,
-    AetherStatusResponse, AetherSuggestTraitSplitRequest, AetherSuggestTraitSplitResponse,
-    AetherSymbolLookupRequest, AetherSymbolLookupResponse, AetherSymbolTimelineRequest,
-    AetherSymbolTimelineResponse, AetherTestIntentsRequest, AetherTestIntentsResponse,
-    AetherTextResponse, AetherTraceCauseRequest, AetherTraceCauseResponse,
-    AetherUsageMatrixRequest, AetherUsageMatrixResponse, AetherVerifyIntentRequest,
-    AetherVerifyIntentResponse, AetherWhyChangedRequest, AetherWhyChangedResponse,
-    SERVER_DESCRIPTION, SERVER_NAME, SERVER_VERSION,
+    AetherAuditCrossSymbolRequest, AetherAuditCrossSymbolResponse, AetherAuditReportRequest,
+    AetherAuditReportResponse, AetherAuditResolveRequest, AetherAuditResolveResponse,
+    AetherAuditSubmitRequest, AetherAuditSubmitResponse, AetherBlastRadiusRequest,
+    AetherBlastRadiusResponse, AetherCallChainRequest, AetherCallChainResponse,
+    AetherDependenciesRequest, AetherDependenciesResponse, AetherDriftReportRequest,
+    AetherDriftReportResponse, AetherExplainRequest, AetherExplainResponse, AetherGetSirRequest,
+    AetherGetSirResponse, AetherHealthExplainRequest, AetherHealthHotspotsRequest,
+    AetherHealthRequest, AetherHealthResponse, AetherMcpServer, AetherRecallRequest,
+    AetherRecallResponse, AetherRefactorPrepRequest, AetherRefactorPrepResponse,
+    AetherRememberRequest, AetherRememberResponse, AetherSearchRequest, AetherSearchResponse,
+    AetherSessionNoteResponse, AetherSirContextRequest, AetherSirContextResponse,
+    AetherSirInjectRequest, AetherSirInjectResponse, AetherStatusResponse,
+    AetherSuggestTraitSplitRequest, AetherSuggestTraitSplitResponse, AetherSymbolLookupRequest,
+    AetherSymbolLookupResponse, AetherSymbolTimelineRequest, AetherSymbolTimelineResponse,
+    AetherTestIntentsRequest, AetherTestIntentsResponse, AetherTextResponse,
+    AetherTraceCauseRequest, AetherTraceCauseResponse, AetherUsageMatrixRequest,
+    AetherUsageMatrixResponse, AetherVerifyIntentRequest, AetherVerifyIntentResponse,
+    AetherWhyChangedRequest, AetherWhyChangedResponse, SERVER_DESCRIPTION, SERVER_NAME,
+    SERVER_VERSION,
 };
 #[cfg(feature = "verification")]
 use super::{AetherVerifyRequest, AetherVerifyResponse};
@@ -212,6 +213,23 @@ impl AetherMcpServer {
         self.verbose_log("MCP tool called: aether_audit_candidates");
         let server = self.clone();
         tokio::task::spawn_blocking(move || server.aether_audit_candidates_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_audit_cross_symbol",
+        description = "Trace callers and callees from a root symbol with full SIR, source, and reasoning context for cross-boundary audit analysis"
+    )]
+    pub async fn aether_audit_cross_symbol(
+        &self,
+        Parameters(request): Parameters<AetherAuditCrossSymbolRequest>,
+    ) -> Result<Json<AetherAuditCrossSymbolResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_audit_cross_symbol");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_audit_cross_symbol_logic(request))
             .await
             .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)
