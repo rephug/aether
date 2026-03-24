@@ -20,7 +20,8 @@
     "onCommand:aether.selectInferenceProvider",
     "onCommand:aether.indexOnce",
     "onCommand:aether.searchSymbols",
-    "onCommand:aether.openSymbolResult"
+    "onCommand:aether.openSymbolResult",
+    "onCommand:aether.enhancePrompt"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -44,6 +45,19 @@
       {
         "command": "aether.openSymbolResult",
         "title": "AETHER: Open Symbol Result"
+      },
+      {
+        "command": "aether.enhancePrompt",
+        "title": "AETHER: Enhance Prompt",
+        "category": "AETHER"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "aether.enhancePrompt",
+        "key": "ctrl+alt+e",
+        "mac": "cmd+alt+e",
+        "when": "editorTextFocus"
       }
     ],
     "configuration": {
@@ -80,6 +94,21 @@
           "enum": ["lexical", "semantic", "hybrid"],
           "default": "lexical",
           "description": "Search mode used by AETHER symbol search commands."
+        },
+        "aether.enhance.budget": {
+          "type": "number",
+          "default": 8000,
+          "description": "Token budget used for prompt enhancement context."
+        },
+        "aether.enhance.rewrite": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether AETHER should rewrite enhanced prompts into natural prose."
+        },
+        "aether.daemonPort": {
+          "type": "number",
+          "default": 9730,
+          "description": "Port for the AETHER daemon HTTP API."
         }
       }
     }

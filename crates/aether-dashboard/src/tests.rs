@@ -153,6 +153,29 @@ async fn ask_api_returns_envelope_and_summary() {
 }
 
 #[tokio::test]
+async fn enhance_api_rejects_empty_prompt() {
+    let (_tmp, app, _ids) = seeded_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/enhance")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"prompt":"   ","budget":8000}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "bad_request");
+    assert_eq!(json["message"], "prompt must not be empty");
+}
+
+#[tokio::test]
 async fn overview_fragment_contains_stat_cards_and_chart() {
     let (_tmp, app, _ids) = seeded_app().await;
     let response = app
