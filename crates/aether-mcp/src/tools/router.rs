@@ -14,14 +14,14 @@ use super::{
     AetherHealthResponse, AetherMcpServer, AetherRecallRequest, AetherRecallResponse,
     AetherRefactorPrepRequest, AetherRefactorPrepResponse, AetherRememberRequest,
     AetherRememberResponse, AetherSearchRequest, AetherSearchResponse, AetherSessionNoteResponse,
-    AetherSirInjectRequest, AetherSirInjectResponse, AetherStatusResponse,
-    AetherSuggestTraitSplitRequest, AetherSuggestTraitSplitResponse, AetherSymbolLookupRequest,
-    AetherSymbolLookupResponse, AetherSymbolTimelineRequest, AetherSymbolTimelineResponse,
-    AetherTestIntentsRequest, AetherTestIntentsResponse, AetherTextResponse,
-    AetherTraceCauseRequest, AetherTraceCauseResponse, AetherUsageMatrixRequest,
-    AetherUsageMatrixResponse, AetherVerifyIntentRequest, AetherVerifyIntentResponse,
-    AetherWhyChangedRequest, AetherWhyChangedResponse, SERVER_DESCRIPTION, SERVER_NAME,
-    SERVER_VERSION,
+    AetherSirContextRequest, AetherSirContextResponse, AetherSirInjectRequest,
+    AetherSirInjectResponse, AetherStatusResponse, AetherSuggestTraitSplitRequest,
+    AetherSuggestTraitSplitResponse, AetherSymbolLookupRequest, AetherSymbolLookupResponse,
+    AetherSymbolTimelineRequest, AetherSymbolTimelineResponse, AetherTestIntentsRequest,
+    AetherTestIntentsResponse, AetherTextResponse, AetherTraceCauseRequest,
+    AetherTraceCauseResponse, AetherUsageMatrixRequest, AetherUsageMatrixResponse,
+    AetherVerifyIntentRequest, AetherVerifyIntentResponse, AetherWhyChangedRequest,
+    AetherWhyChangedResponse, SERVER_DESCRIPTION, SERVER_NAME, SERVER_VERSION,
 };
 #[cfg(feature = "verification")]
 use super::{AetherVerifyRequest, AetherVerifyResponse};
@@ -262,6 +262,23 @@ impl AetherMcpServer {
         self.verbose_log("MCP tool called: aether_sir_inject");
         let server = self.clone();
         tokio::task::spawn_blocking(move || server.aether_sir_inject_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_sir_context",
+        description = "Assemble token-budgeted context for a symbol including source, SIR, graph neighbors, health, reasoning trace, and test intents in one call"
+    )]
+    pub async fn aether_sir_context(
+        &self,
+        Parameters(request): Parameters<AetherSirContextRequest>,
+    ) -> Result<Json<AetherSirContextResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_sir_context");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_sir_context_logic(request))
             .await
             .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)

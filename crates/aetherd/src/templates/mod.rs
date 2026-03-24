@@ -24,7 +24,7 @@ pub struct TemplateContext {
     pub mcp_binary_hint: String,
 }
 
-pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 30] = [
+pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 31] = [
     ("aether_status", "Get AETHER local store status"),
     (
         "aether_symbol_lookup",
@@ -81,6 +81,10 @@ pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 30] = [
     (
         "aether_sir_inject",
         "Write an improved SIR annotation back to the store for a symbol",
+    ),
+    (
+        "aether_sir_context",
+        "Assemble token-budgeted context for a symbol including source, SIR, graph neighbors, health, reasoning trace, and test intents in one call",
     ),
     (
         "aether_blast_radius",
@@ -258,6 +262,7 @@ mod tests {
         assert!(rendered.contains("aether_get_sir"));
         assert!(rendered.contains("aether_audit_submit"));
         assert!(rendered.contains("aether_sir_inject"));
+        assert!(rendered.contains("aether_sir_context"));
     }
 
     #[test]
