@@ -220,7 +220,6 @@ async function requestEnhancementFromCli(
 ): Promise<EnhanceResult> {
   const binaryPath = await deps.ensureAetherdBinary(repoRoot);
   const args = [
-    '--',
     '--workspace',
     workspacePath,
     'enhance',
