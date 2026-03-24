@@ -27,6 +27,7 @@ pub(crate) mod decompose;
 pub(crate) mod difficulty;
 pub(crate) mod drift;
 mod drift_timeline;
+mod enhance;
 pub(crate) mod file;
 pub(crate) mod fingerprint;
 pub(crate) mod flow;
@@ -82,6 +83,7 @@ pub(crate) fn api_router() -> Router<Arc<DashboardState>> {
         .route("/api/v1/changes", get(changes::changes_handler))
         .route("/api/v1/search", get(search::search_handler))
         .route("/api/v1/ask", post(ask::ask_handler))
+        .route("/api/enhance", post(enhance::enhance_handler))
         .route("/api/v1/graph", get(graph::graph_handler))
         .route("/api/v1/drift", get(drift::drift_handler))
         .route("/api/v1/coupling", get(coupling::coupling_handler))

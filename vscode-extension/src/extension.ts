@@ -8,6 +8,7 @@ import {
   ServerOptions,
   Executable,
 } from 'vscode-languageclient/node';
+import { createEnhancePromptCommand } from './enhancePrompt';
 
 let client: LanguageClient | undefined;
 let outputChannel: vscode.OutputChannel | undefined;
@@ -148,6 +149,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand('aether.openSymbolResult', async () => {
       await openCachedSearchResult();
     })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      'aether.enhancePrompt',
+      createEnhancePromptCommand(context, {
+        outputChannel,
+        ensureAetherdBinary,
+        runAetherdProcess,
+      })
+    )
   );
 
   await startClient(context);
