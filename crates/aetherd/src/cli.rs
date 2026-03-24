@@ -890,6 +890,33 @@ pub struct SirDiffArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct AuditReportArgs {
+    #[arg(long = "crate", help = "Optional crate name or file path prefix scope")]
+    pub crate_name: Option<String>,
+
+    #[arg(
+        long,
+        default_value = "low",
+        help = "Minimum severity to include: critical, high, medium, low, informational"
+    )]
+    pub min_severity: String,
+
+    #[arg(
+        long,
+        default_value = "open",
+        help = "Status to include: open, confirmed, fixed, wontfix"
+    )]
+    pub status: String,
+
+    #[arg(
+        long,
+        default_value_t = 50,
+        help = "Maximum number of findings to display"
+    )]
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct SeismographArgs {
     #[command(subcommand)]
     pub command: SeismographCommand,
@@ -993,6 +1020,8 @@ pub enum Commands {
     SirInject(SirInjectArgs),
     /// Show SIR vs source code delta
     SirDiff(SirDiffArgs),
+    /// Show audit findings grouped by severity for a crate or path prefix
+    AuditReport(AuditReportArgs),
     /// Generate agent configuration files for AI coding agents
     InitAgent(InitAgentArgs),
     /// Regenerate low-quality SIR records with optional deep enrichment
@@ -1922,6 +1951,35 @@ mod tests {
         match cli.command {
             Some(Commands::SirDiff(args)) => {
                 assert_eq!(args.selector, "demo::alpha");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audit_report_subcommand_parses_filters() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "audit-report",
+            "--crate",
+            "aether-store",
+            "--min-severity",
+            "medium",
+            "--status",
+            "fixed",
+            "--limit",
+            "25",
+        ])
+        .expect("audit-report should parse");
+
+        match cli.command {
+            Some(Commands::AuditReport(args)) => {
+                assert_eq!(args.crate_name.as_deref(), Some("aether-store"));
+                assert_eq!(args.min_severity, "medium");
+                assert_eq!(args.status, "fixed");
+                assert_eq!(args.limit, 25);
             }
             other => panic!("unexpected command: {other:?}"),
         }

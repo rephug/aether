@@ -207,6 +207,7 @@ fn implements_edge(source_id: &str, target: &str, file_path: &str) -> SymbolEdge
     }
 }
 
+mod audit;
 mod basic;
 mod neighbors;
 mod notes_and_analysis;
@@ -221,6 +222,7 @@ fn sqlite_store_implements_split_store_traits() {
             + SymbolRelationStore
             + SirStateStore
             + SirHistoryStore
+            + AuditStore
             + SemanticIndexStore
             + ThresholdStore
             + ProjectNoteStore

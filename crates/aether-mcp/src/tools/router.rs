@@ -4,14 +4,17 @@ use rmcp::{ErrorData as McpError, Json, ServerHandler, tool, tool_handler, tool_
 
 use super::{
     AetherAcknowledgeDriftRequest, AetherAcknowledgeDriftResponse, AetherAskRequest,
-    AetherAskResponse, AetherBlastRadiusRequest, AetherBlastRadiusResponse, AetherCallChainRequest,
-    AetherCallChainResponse, AetherDependenciesRequest, AetherDependenciesResponse,
-    AetherDriftReportRequest, AetherDriftReportResponse, AetherExplainRequest,
-    AetherExplainResponse, AetherGetSirRequest, AetherGetSirResponse, AetherHealthExplainRequest,
-    AetherHealthHotspotsRequest, AetherHealthRequest, AetherHealthResponse, AetherMcpServer,
-    AetherRecallRequest, AetherRecallResponse, AetherRefactorPrepRequest,
-    AetherRefactorPrepResponse, AetherRememberRequest, AetherRememberResponse, AetherSearchRequest,
-    AetherSearchResponse, AetherSessionNoteResponse, AetherStatusResponse,
+    AetherAskResponse, AetherAuditReportRequest, AetherAuditReportResponse,
+    AetherAuditResolveRequest, AetherAuditResolveResponse, AetherAuditSubmitRequest,
+    AetherAuditSubmitResponse, AetherBlastRadiusRequest, AetherBlastRadiusResponse,
+    AetherCallChainRequest, AetherCallChainResponse, AetherDependenciesRequest,
+    AetherDependenciesResponse, AetherDriftReportRequest, AetherDriftReportResponse,
+    AetherExplainRequest, AetherExplainResponse, AetherGetSirRequest, AetherGetSirResponse,
+    AetherHealthExplainRequest, AetherHealthHotspotsRequest, AetherHealthRequest,
+    AetherHealthResponse, AetherMcpServer, AetherRecallRequest, AetherRecallResponse,
+    AetherRefactorPrepRequest, AetherRefactorPrepResponse, AetherRememberRequest,
+    AetherRememberResponse, AetherSearchRequest, AetherSearchResponse, AetherSessionNoteResponse,
+    AetherSirInjectRequest, AetherSirInjectResponse, AetherStatusResponse,
     AetherSuggestTraitSplitRequest, AetherSuggestTraitSplitResponse, AetherSymbolLookupRequest,
     AetherSymbolLookupResponse, AetherSymbolTimelineRequest, AetherSymbolTimelineResponse,
     AetherTestIntentsRequest, AetherTestIntentsResponse, AetherTextResponse,
@@ -193,6 +196,74 @@ impl AetherMcpServer {
         self.verbose_log("MCP tool called: aether_ask");
         self.aether_ask_logic(request)
             .await
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_audit_submit",
+        description = "Submit a structured audit finding for a symbol"
+    )]
+    pub async fn aether_audit_submit(
+        &self,
+        Parameters(request): Parameters<AetherAuditSubmitRequest>,
+    ) -> Result<Json<AetherAuditSubmitResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_audit_submit");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_audit_submit_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_audit_report",
+        description = "Query audit findings by crate, severity, category, or status"
+    )]
+    pub async fn aether_audit_report(
+        &self,
+        Parameters(request): Parameters<AetherAuditReportRequest>,
+    ) -> Result<Json<AetherAuditReportResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_audit_report");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_audit_report_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_audit_resolve",
+        description = "Mark an audit finding as fixed, wontfix, or confirmed"
+    )]
+    pub async fn aether_audit_resolve(
+        &self,
+        Parameters(request): Parameters<AetherAuditResolveRequest>,
+    ) -> Result<Json<AetherAuditResolveResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_audit_resolve");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_audit_resolve_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_sir_inject",
+        description = "Write an improved SIR annotation back to the store for a symbol"
+    )]
+    pub async fn aether_sir_inject(
+        &self,
+        Parameters(request): Parameters<AetherSirInjectRequest>,
+    ) -> Result<Json<AetherSirInjectResponse>, McpError> {
+        self.verbose_log("MCP tool called: aether_sir_inject");
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_sir_inject_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)
             .map_err(to_mcp_error)
     }

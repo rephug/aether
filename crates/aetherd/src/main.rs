@@ -6,22 +6,24 @@ use aether_config::{
     AetherConfig, DEFAULT_LOG_LEVEL, InferenceProviderKind, SearchRerankerKind,
     ensure_workspace_config, load_workspace_config, validate_config,
 };
-use aether_core::{Symbol, SymbolChangeEvent};
+use aether_core::{Symbol, SymbolChangeEvent, normalize_path};
 use aether_infer::ProviderOverrides;
 use aether_infer::sir_prompt::SirEnrichmentContext;
 use aether_infer::{download_candle_embedding_model, download_candle_reranker_model};
 use aether_sir::SirAnnotation;
-use aether_store::{SirStateStore, SqliteStore};
+use aether_store::{AuditFindingFilters, AuditStore, SirStateStore, SqliteStore};
+use aetherd::audit_report::render_audit_report;
 use aetherd::batch::run_batch_command;
 use aetherd::calibrate::run_calibration_once;
 use aetherd::causal::run_trace_cause_command;
 use aetherd::cli::{
-    AskArgs, BatchArgs, BlastRadiusArgs, Cli, Commands, CommunitiesArgs, ComputeQualityArgs,
-    ContextArgs, ContinuousArgs, ContractArgs, CouplingReportArgs, DriftAckArgs, DriftReportArgs,
-    FsckArgs, HealthArgs, HealthScoreArgs, InitAgentArgs, LogFormat, MineCouplingArgs, NotesArgs,
-    PresetArgs, RecallArgs, RefactorPrepArgs, RegenerateArgs, RememberArgs, SeismographArgs,
-    SetupLocalArgs, SirContextArgs, SirDiffArgs, SirInjectArgs, TaskHistoryArgs, TaskRelevanceArgs,
-    TestIntentsArgs, TraceCauseArgs, VerifyIntentArgs, parse_cli,
+    AskArgs, AuditReportArgs, BatchArgs, BlastRadiusArgs, Cli, Commands, CommunitiesArgs,
+    ComputeQualityArgs, ContextArgs, ContinuousArgs, ContractArgs, CouplingReportArgs,
+    DriftAckArgs, DriftReportArgs, FsckArgs, HealthArgs, HealthScoreArgs, InitAgentArgs, LogFormat,
+    MineCouplingArgs, NotesArgs, PresetArgs, RecallArgs, RefactorPrepArgs, RegenerateArgs,
+    RememberArgs, SeismographArgs, SetupLocalArgs, SirContextArgs, SirDiffArgs, SirInjectArgs,
+    TaskHistoryArgs, TaskRelevanceArgs, TestIntentsArgs, TraceCauseArgs, VerifyIntentArgs,
+    parse_cli,
 };
 use aetherd::context_presets::run_preset_command;
 use aetherd::continuous::run_continuous_command;
@@ -332,6 +334,7 @@ fn run_subcommand(workspace: &Path, config: &AetherConfig, command: Commands) ->
         Commands::SirContext(args) => run_sir_context_subcommand(workspace, args),
         Commands::SirInject(args) => run_sir_inject_subcommand(workspace, args),
         Commands::SirDiff(args) => run_sir_diff_subcommand(workspace, args),
+        Commands::AuditReport(args) => run_audit_report_subcommand(workspace, args),
         Commands::InitAgent(args) => run_init_agent_command(workspace, args),
         Commands::Regenerate(args) => run_regenerate_command(workspace, args),
         Commands::ComputeQuality(args) => run_compute_quality_subcommand(workspace, args),
@@ -389,6 +392,68 @@ fn run_sir_inject_subcommand(workspace: &Path, args: SirInjectArgs) -> Result<()
 
 fn run_sir_diff_subcommand(workspace: &Path, args: SirDiffArgs) -> Result<()> {
     run_sir_diff_command(workspace, args).context("sir-diff command failed")
+}
+
+fn audit_report_scope_label(crate_filter: Option<&str>) -> String {
+    crate_filter
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("all crates")
+        .to_owned()
+}
+
+fn audit_report_file_path_prefix(crate_filter: Option<&str>) -> Option<String> {
+    let trimmed = crate_filter
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+
+    if trimmed.contains('/') {
+        return Some(normalize_path(trimmed));
+    }
+
+    Some(format!("crates/{trimmed}/"))
+}
+
+fn run_audit_report_subcommand(workspace: &Path, args: AuditReportArgs) -> Result<()> {
+    let store = SqliteStore::open(workspace).context("failed to open local store")?;
+    let min_severity = args.min_severity.trim().to_ascii_lowercase();
+    let status = args.status.trim().to_ascii_lowercase();
+    let filters = AuditFindingFilters {
+        symbol_id: None,
+        file_path_prefix: audit_report_file_path_prefix(args.crate_name.as_deref()),
+        min_severity: Some(min_severity.clone()),
+        category: None,
+        status: Some(status.clone()),
+        limit: Some(args.limit.clamp(1, 200)),
+    };
+
+    let findings = store
+        .query_audit_findings(&filters)
+        .context("failed to query audit findings")?;
+    let summary = store
+        .count_audit_findings_by_severity(&AuditFindingFilters {
+            limit: None,
+            ..filters.clone()
+        })
+        .context("failed to summarize audit findings")?;
+    let symbol_ids = findings
+        .iter()
+        .map(|finding| finding.symbol_id.clone())
+        .collect::<Vec<_>>();
+    let symbol_records = store
+        .get_symbol_search_results_batch(symbol_ids.as_slice())
+        .context("failed to enrich audit findings with symbol metadata")?;
+
+    let rendered = render_audit_report(
+        audit_report_scope_label(args.crate_name.as_deref()).as_str(),
+        status.as_str(),
+        min_severity.as_str(),
+        findings.as_slice(),
+        &symbol_records,
+        &summary,
+    );
+    print!("{rendered}");
+    Ok(())
 }
 
 fn run_compute_quality_subcommand(workspace: &Path, args: ComputeQualityArgs) -> Result<()> {

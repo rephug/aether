@@ -24,7 +24,7 @@ pub struct TemplateContext {
     pub mcp_binary_hint: String,
 }
 
-pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 26] = [
+pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 30] = [
     ("aether_status", "Get AETHER local store status"),
     (
         "aether_symbol_lookup",
@@ -65,6 +65,22 @@ pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 26] = [
     (
         "aether_ask",
         "Search symbols, notes, coupling, and test intents with unified ranking",
+    ),
+    (
+        "aether_audit_submit",
+        "Submit a structured audit finding for a symbol",
+    ),
+    (
+        "aether_audit_report",
+        "Query audit findings by crate, severity, category, or status",
+    ),
+    (
+        "aether_audit_resolve",
+        "Mark an audit finding as fixed, wontfix, or confirmed",
+    ),
+    (
+        "aether_sir_inject",
+        "Write an improved SIR annotation back to the store for a symbol",
     ),
     (
         "aether_blast_radius",
@@ -240,6 +256,8 @@ mod tests {
         assert!(rendered.contains("cargo clippy --workspace -- -D warnings"));
         assert!(rendered.contains("cargo test --workspace"));
         assert!(rendered.contains("aether_get_sir"));
+        assert!(rendered.contains("aether_audit_submit"));
+        assert!(rendered.contains("aether_sir_inject"));
     }
 
     #[test]
