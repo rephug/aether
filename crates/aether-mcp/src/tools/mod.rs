@@ -14,6 +14,7 @@ use crate::state::SharedState;
 
 mod audit;
 mod common;
+mod context;
 mod drift;
 mod health;
 mod history;
@@ -31,6 +32,7 @@ mod usage_matrix;
 mod verification;
 
 pub use audit::*;
+pub use context::*;
 pub use drift::*;
 pub use health::*;
 pub use history::*;
