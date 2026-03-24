@@ -24,7 +24,7 @@ pub struct TemplateContext {
     pub mcp_binary_hint: String,
 }
 
-pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 31] = [
+pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 32] = [
     ("aether_status", "Get AETHER local store status"),
     (
         "aether_symbol_lookup",
@@ -65,6 +65,10 @@ pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 31] = [
     (
         "aether_ask",
         "Search symbols, notes, coupling, and test intents with unified ranking",
+    ),
+    (
+        "aether_audit_candidates",
+        "Get ranked list of symbols most in need of deep audit review, combining structural risk with SIR confidence and reasoning trace uncertainty",
     ),
     (
         "aether_audit_submit",

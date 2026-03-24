@@ -40,6 +40,22 @@ const UNCERTAINTY_TERMS: [&str; 9] = [
     "difficult to assess",
 ];
 
+fn clamp_to_char_boundary_start(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn clamp_to_char_boundary_end(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditType {
@@ -605,8 +621,12 @@ fn find_uncertainty_match(text: &str) -> Option<(usize, usize)> {
 fn extract_reasoning_hint(text: &str) -> Option<String> {
     let (match_index, match_len) = find_uncertainty_match(text)?;
     let len = text.len();
-    let start = match_index.saturating_sub(REASONING_HINT_WINDOW / 2);
-    let end = (match_index + match_len + (REASONING_HINT_WINDOW / 2)).min(len);
+    let start =
+        clamp_to_char_boundary_start(text, match_index.saturating_sub(REASONING_HINT_WINDOW / 2));
+    let end = clamp_to_char_boundary_end(
+        text,
+        (match_index + match_len + (REASONING_HINT_WINDOW / 2)).min(len),
+    );
     let hint = text
         .get(start..end)?
         .split_whitespace()
@@ -1485,6 +1505,15 @@ vector_backend = "sqlite"
 
         assert!(hint.contains("uncertain"));
         assert!(hint.len() <= REASONING_HINT_WINDOW);
+    }
+
+    #[test]
+    fn audit_candidates_extract_reasoning_hint_handles_multibyte_prefixes() {
+        let text = format!("{} uncertain path after multibyte prefix", "あ".repeat(40));
+
+        let hint = extract_reasoning_hint(&text).expect("hint");
+
+        assert!(hint.contains("uncertain"));
     }
 
     #[test]
