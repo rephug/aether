@@ -2345,6 +2345,8 @@ impl SirPipeline {
             store.write_sir_blob(payload.symbol.id.as_str(), canonical_json.as_str())?;
         }
 
+        // Higher-quality passes still need to promote metadata even when the
+        // canonical SIR content is identical to an earlier pass.
         store.upsert_sir_meta(SirMetaRecord {
             id: payload.symbol.id.clone(),
             sir_hash: sir_hash_value.clone(),

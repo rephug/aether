@@ -393,10 +393,12 @@ fn prepare_symbol(
         .with_context(|| format!("failed to reload SIR metadata for {symbol_id}"))?
         .ok_or_else(|| anyhow!("missing persisted SIR metadata for {symbol_id}"))?;
     store
-        .upsert_sir_meta(SirMetaRecord {
-            prompt_hash: Some(prompt_hash.clone()),
-            ..current_meta
-        })
+        .upsert_sir_meta(prompt_hash_meta_record(
+            current_meta,
+            prompt_hash.clone(),
+            payload.generation_pass.clone(),
+            payload.reasoning_trace.clone(),
+        ))
         .with_context(|| format!("failed to persist prompt_hash for {symbol_id}"))?;
 
     Ok(PreparedSymbol {
@@ -452,6 +454,20 @@ fn parse_key(key: &str) -> Result<(&str, &str)> {
         ));
     }
     Ok((symbol_id, prompt_hash))
+}
+
+fn prompt_hash_meta_record(
+    current_meta: SirMetaRecord,
+    prompt_hash: String,
+    generation_pass: String,
+    reasoning_trace: Option<String>,
+) -> SirMetaRecord {
+    SirMetaRecord {
+        prompt_hash: Some(prompt_hash),
+        generation_pass,
+        reasoning_trace,
+        ..current_meta
+    }
 }
 
 /// Try to load a keymap sidecar written during JSONL build.
@@ -535,4 +551,213 @@ fn unix_timestamp_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use aether_store::{SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord};
+    use async_trait::async_trait;
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::batch::{BatchPollStatus, BatchProvider, BatchResultLine};
+    use crate::cli::BatchPass;
+
+    struct StubBatchProvider {
+        key: String,
+        text: String,
+        reasoning_trace: Option<String>,
+    }
+
+    #[async_trait]
+    impl BatchProvider for StubBatchProvider {
+        fn format_request(
+            &self,
+            _key: &str,
+            _system_prompt: &str,
+            _user_prompt: &str,
+            _model: &str,
+            _thinking: &str,
+        ) -> Result<String> {
+            unreachable!("format_request is not used in ingest tests")
+        }
+
+        async fn submit(
+            &self,
+            _input_path: &Path,
+            _model: &str,
+            _batch_dir: &Path,
+            _poll_interval_secs: u64,
+        ) -> Result<Vec<String>> {
+            unreachable!("submit is not used in ingest tests")
+        }
+
+        async fn poll(&self, _job_ids: &[String]) -> Result<BatchPollStatus> {
+            unreachable!("poll is not used in ingest tests")
+        }
+
+        async fn download_results(
+            &self,
+            _job_ids: &[String],
+            _output_dir: &Path,
+        ) -> Result<Vec<PathBuf>> {
+            unreachable!("download_results is not used in ingest tests")
+        }
+
+        fn parse_result_line(&self, _line: &str) -> Result<BatchResultLine> {
+            Ok(BatchResultLine::Success {
+                key: self.key.clone(),
+                text: self.text.clone(),
+                reasoning_trace: self.reasoning_trace.clone(),
+            })
+        }
+
+        fn name(&self) -> &str {
+            "stub"
+        }
+    }
+
+    fn write_embeddings_only_config(workspace: &Path) {
+        fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
+        fs::write(
+            workspace.join(".aether/config.toml"),
+            r#"[storage]
+graph_backend = "sqlite"
+
+[embeddings]
+enabled = true
+provider = "qwen3_local"
+vector_backend = "sqlite"
+"#,
+        )
+        .expect("write config");
+    }
+
+    fn demo_symbol_record(symbol_id: &str, qualified_name: &str) -> SymbolRecord {
+        SymbolRecord {
+            id: symbol_id.to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            language: "rust".to_owned(),
+            kind: "function".to_owned(),
+            qualified_name: qualified_name.to_owned(),
+            signature_fingerprint: format!("sig-{symbol_id}"),
+            last_seen_at: 1_700_000_000,
+        }
+    }
+
+    fn triage_pass_config() -> PassConfig {
+        PassConfig {
+            pass: BatchPass::Triage,
+            model: "triage-model".to_owned(),
+            thinking: "low".to_owned(),
+            neighbor_depth: 1,
+            max_chars: 8_000,
+            prompt_tier: "standard".to_owned(),
+        }
+    }
+
+    fn demo_sir() -> SirAnnotation {
+        SirAnnotation {
+            intent: "Demo intent".to_owned(),
+            behavior: None,
+            inputs: vec!["input".to_owned()],
+            outputs: vec!["output".to_owned()],
+            side_effects: Vec::new(),
+            dependencies: Vec::new(),
+            error_modes: Vec::new(),
+            confidence: 0.9,
+            edge_cases: None,
+            complexity: None,
+            method_dependencies: None,
+        }
+    }
+
+    #[test]
+    fn prompt_hash_meta_record_overrides_stale_generation_fields() {
+        let updated = prompt_hash_meta_record(
+            SirMetaRecord {
+                id: "sym-1".to_owned(),
+                sir_hash: "hash-1".to_owned(),
+                sir_version: 1,
+                provider: "scan-provider".to_owned(),
+                model: "scan-model".to_owned(),
+                generation_pass: "scan".to_owned(),
+                reasoning_trace: None,
+                prompt_hash: None,
+                staleness_score: None,
+                updated_at: 1_700_000_000,
+                sir_status: "fresh".to_owned(),
+                last_error: None,
+                last_attempt_at: 1_700_000_000,
+            },
+            "prompt-123".to_owned(),
+            "triage".to_owned(),
+            Some("triage reasoning".to_owned()),
+        );
+
+        assert_eq!(updated.prompt_hash.as_deref(), Some("prompt-123"));
+        assert_eq!(updated.generation_pass, "triage");
+        assert_eq!(updated.reasoning_trace.as_deref(), Some("triage reasoning"));
+    }
+
+    #[test]
+    fn prepare_symbol_promotes_metadata_when_sir_hash_is_unchanged() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_only_config(workspace);
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        let record = demo_symbol_record("sym-batch", "demo::run");
+        store.upsert_symbol(record.clone()).expect("upsert symbol");
+
+        let pipeline = SirPipeline::new_embeddings_only(workspace.to_path_buf())
+            .map(|pipeline| pipeline.with_skip_surreal_sync(true))
+            .expect("build embeddings-only pipeline");
+        let sir = demo_sir();
+        let symbol = symbol_from_record(&record).expect("build symbol");
+
+        pipeline
+            .persist_sir_payload_into_sqlite(
+                &store,
+                &UpsertSirIntentPayload {
+                    symbol: symbol.clone(),
+                    sir: sir.clone(),
+                    provider_name: "gemini".to_owned(),
+                    model_name: "scan-model".to_owned(),
+                    generation_pass: "scan".to_owned(),
+                    reasoning_trace: None,
+                    commit_hash: None,
+                },
+            )
+            .expect("persist scan payload");
+
+        let provider = StubBatchProvider {
+            key: "sym-batch|prompt-123".to_owned(),
+            text: serde_json::to_string(&sir).expect("serialize sir"),
+            reasoning_trace: Some("triage reasoning".to_owned()),
+        };
+        prepare_symbol(
+            &pipeline,
+            &store,
+            &triage_pass_config(),
+            "ignored",
+            &provider,
+            "gemini",
+            &HashMap::new(),
+        )
+        .expect("prepare symbol");
+
+        let meta = store
+            .get_sir_meta("sym-batch")
+            .expect("load sir meta")
+            .expect("sir meta exists");
+        assert_eq!(meta.sir_version, 1);
+        assert_eq!(meta.generation_pass, "triage");
+        assert_eq!(meta.prompt_hash.as_deref(), Some("prompt-123"));
+        assert_eq!(meta.reasoning_trace.as_deref(), Some("triage reasoning"));
+    }
 }

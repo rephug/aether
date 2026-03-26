@@ -549,6 +549,75 @@ enabled = false
     }
 
     #[test]
+    fn persist_sir_payload_updates_metadata_when_hash_is_unchanged() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_only_config(workspace);
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        let pipeline = build_write_pipeline(workspace, Arc::new(PanicInferenceProvider));
+        let symbol = demo_type_symbol(
+            "sym-triage",
+            "run",
+            "demo::run",
+            "src/lib.rs",
+            SymbolKind::Function,
+            "fn run() {}\n",
+        );
+        let sir = demo_sir();
+
+        pipeline
+            .persist_sir_payload_into_sqlite(
+                &store,
+                &UpsertSirIntentPayload {
+                    symbol: symbol.clone(),
+                    sir: sir.clone(),
+                    provider_name: "scan-provider".to_owned(),
+                    model_name: "scan-model".to_owned(),
+                    generation_pass: SIR_GENERATION_PASS_SCAN.to_owned(),
+                    reasoning_trace: None,
+                    commit_hash: None,
+                },
+            )
+            .expect("persist scan payload");
+
+        let (canonical_json, sir_hash_value) = pipeline
+            .persist_sir_payload_into_sqlite(
+                &store,
+                &UpsertSirIntentPayload {
+                    symbol: symbol.clone(),
+                    sir: sir.clone(),
+                    provider_name: "triage-provider".to_owned(),
+                    model_name: "triage-model".to_owned(),
+                    generation_pass: SIR_GENERATION_PASS_TRIAGE.to_owned(),
+                    reasoning_trace: Some("triage reasoning".to_owned()),
+                    commit_hash: None,
+                },
+            )
+            .expect("persist triage payload");
+
+        assert_eq!(canonical_json, canonicalize_sir_json(&sir));
+        assert_eq!(sir_hash_value, sir_hash(&sir));
+
+        let meta = store
+            .get_sir_meta(symbol.id.as_str())
+            .expect("load sir meta")
+            .expect("sir meta exists");
+        assert_eq!(meta.sir_hash, sir_hash_value);
+        assert_eq!(meta.sir_version, 1);
+        assert_eq!(meta.provider, "triage-provider");
+        assert_eq!(meta.model, "triage-model");
+        assert_eq!(meta.generation_pass, SIR_GENERATION_PASS_TRIAGE);
+        assert_eq!(meta.reasoning_trace.as_deref(), Some("triage reasoning"));
+
+        let history = store
+            .list_sir_history(symbol.id.as_str())
+            .expect("load sir history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].sir_hash, sir_hash_value);
+    }
+
+    #[test]
     fn embeddings_only_calls_embedding_provider_not_inference() {
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();
