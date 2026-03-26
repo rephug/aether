@@ -238,12 +238,15 @@ vector_backend = "sqlite"
     fn demo_sir() -> SirAnnotation {
         SirAnnotation {
             intent: "Demo intent".to_owned(),
+            behavior: None,
             inputs: vec!["input".to_owned()],
             outputs: vec!["output".to_owned()],
             side_effects: Vec::new(),
             dependencies: Vec::new(),
             error_modes: Vec::new(),
             confidence: 0.9,
+            edge_cases: None,
+            complexity: None,
             method_dependencies: None,
         }
     }
@@ -448,12 +451,15 @@ vector_backend = "sqlite"
             symbol: parent_symbol.clone(),
             sir: SirAnnotation {
                 intent: "Storage interface".to_owned(),
+                behavior: None,
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 side_effects: Vec::new(),
                 dependencies: vec!["stale".to_owned()],
                 error_modes: Vec::new(),
                 confidence: 0.9,
+                edge_cases: None,
+                complexity: None,
                 method_dependencies: Some(HashMap::from([(
                     "stale".to_owned(),
                     vec!["stale".to_owned()],
@@ -845,12 +851,15 @@ impl Store {
         let provider = Arc::new(FixedInferenceProvider {
             sir: SirAnnotation {
                 intent: "Storage interface".to_owned(),
+                behavior: None,
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 side_effects: Vec::new(),
                 dependencies: Vec::new(),
                 error_modes: Vec::new(),
                 confidence: 0.9,
+                edge_cases: None,
+                complexity: None,
                 method_dependencies: None,
             },
         });

@@ -118,12 +118,15 @@ pub struct AetherExplainResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SirAnnotationView {
     pub intent: String,
+    pub behavior: Option<String>,
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
     pub side_effects: Vec<String>,
     pub dependencies: Vec<String>,
     pub error_modes: Vec<String>,
     pub confidence: f32,
+    pub edge_cases: Option<String>,
+    pub complexity: Option<String>,
     pub method_dependencies: Option<HashMap<String, Vec<String>>>,
 }
 
@@ -142,12 +145,15 @@ impl From<aether_sir::SirAnnotation> for SirAnnotationView {
     fn from(value: aether_sir::SirAnnotation) -> Self {
         Self {
             intent: value.intent,
+            behavior: value.behavior,
             inputs: value.inputs,
             outputs: value.outputs,
             side_effects: value.side_effects,
             dependencies: value.dependencies,
             error_modes: value.error_modes,
             confidence: value.confidence,
+            edge_cases: value.edge_cases,
+            complexity: value.complexity,
             method_dependencies: value.method_dependencies,
         }
     }

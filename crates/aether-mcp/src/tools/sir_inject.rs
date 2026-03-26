@@ -1,4 +1,7 @@
-use aether_sir::{SirAnnotation, canonicalize_sir_json, sir_hash, validate_sir};
+use aether_sir::{
+    SirAnnotation, canonicalize_sir_json, normalize_complexity_label, normalize_optional_text,
+    sir_hash, validate_sir,
+};
 use aether_store::{
     SirHistoryStore, SirMetaRecord, SirStateStore, SymbolCatalogStore, SymbolRecord,
 };
@@ -8,21 +11,44 @@ use serde::{Deserialize, Serialize};
 use super::{AetherMcpServer, current_unix_timestamp};
 use crate::AetherMcpError;
 
+const FORCE_CONFIDENCE_THRESHOLD: f32 = 0.5;
+const DEFAULT_INJECT_CONFIDENCE: f32 = 0.95;
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherSirInjectRequest {
     /// Symbol ID or qualified name selector
     pub symbol: String,
     /// New intent text (required)
     pub intent: String,
-    /// Side effects / behavior summary (optional; merged if provided)
+    /// Free-text behavior summary (optional; replaced if provided, preserved when omitted)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavior: Option<String>,
+    /// Free-text edge case notes (optional; replaced if provided, preserved when omitted)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_cases: Option<String>,
+    /// Side effects (optional; replaced if provided, preserved when omitted)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub side_effects: Option<Vec<String>>,
-    /// Error modes / edge cases (optional; merged if provided)
+    /// Dependencies (optional; replaced if provided, preserved when omitted)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependencies: Option<Vec<String>>,
+    /// Error modes (optional; replaced if provided, preserved when omitted)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_modes: Option<Vec<String>>,
-    /// Confidence score (0.0-1.0, default 0.5)
+    /// Inputs (optional; replaced if provided, preserved when omitted)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<Vec<String>>,
+    /// Outputs (optional; replaced if provided, preserved when omitted)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<Vec<String>>,
+    /// Complexity label (optional; replaced if provided, preserved when omitted)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complexity: Option<String>,
+    /// Confidence score (0.0-1.0, default 0.95)
     pub confidence: Option<f32>,
     /// Generation pass label (default "deep")
     pub generation_pass: Option<String>,
-    /// Model name for provenance (default "claude_code")
+    /// Model name for provenance (default "manual")
     pub model: Option<String>,
     /// Provider name for provenance (default "manual")
     pub provider: Option<String>,
@@ -45,17 +71,20 @@ pub struct AetherSirInjectResponse {
 fn empty_sir_annotation(confidence: f32) -> SirAnnotation {
     SirAnnotation {
         intent: String::new(),
+        behavior: None,
         inputs: Vec::new(),
         outputs: Vec::new(),
         side_effects: Vec::new(),
         dependencies: Vec::new(),
         error_modes: Vec::new(),
         confidence,
+        edge_cases: None,
+        complexity: None,
         method_dependencies: None,
     }
 }
 
-fn normalize_optional_text(value: Option<String>, default: &str) -> String {
+fn normalize_optional_text_with_default(value: Option<String>, default: &str) -> String {
     value
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
@@ -70,6 +99,29 @@ fn normalize_optional_string_list(values: Option<Vec<String>>) -> Option<Vec<Str
             .filter(|value| !value.is_empty())
             .collect::<Vec<_>>()
     })
+}
+
+fn normalize_optional_note(value: Option<String>) -> Option<Option<String>> {
+    value
+        .as_deref()
+        .map(|value| normalize_optional_text(Some(value)))
+}
+
+fn normalize_optional_complexity(
+    value: Option<String>,
+) -> Result<Option<Option<String>>, AetherMcpError> {
+    match value {
+        None => Ok(None),
+        Some(value) => {
+            let value = value.trim();
+            if value.is_empty() {
+                return Ok(Some(None));
+            }
+            let normalized = normalize_complexity_label(Some(value))
+                .ok_or_else(|| AetherMcpError::Message(format!("invalid complexity '{value}'")))?;
+            Ok(Some(Some(normalized)))
+        }
+    }
 }
 
 fn resolve_symbol_selector(
@@ -168,14 +220,14 @@ impl AetherMcpServer {
             .map(serde_json::from_str::<SirAnnotation>)
             .transpose()?;
         let previous_confidence = previous_sir.as_ref().map(|sir| sir.confidence);
-        let new_confidence = request.confidence.unwrap_or(0.5);
+        let new_confidence = request.confidence.unwrap_or(DEFAULT_INJECT_CONFIDENCE);
 
-        if previous_confidence.is_some_and(|confidence| confidence > 0.5)
+        if previous_confidence.is_some_and(|confidence| confidence > FORCE_CONFIDENCE_THRESHOLD)
             && !request.force.unwrap_or(false)
         {
             let note = previous_confidence.map(|confidence| {
                 format!(
-                    "existing SIR confidence {confidence:.2} exceeds 0.5 threshold; rerun with force=true to override"
+                    "existing SIR confidence {confidence:.2} exceeds {FORCE_CONFIDENCE_THRESHOLD:.2} threshold; rerun with force=true to override"
                 )
             });
             return Ok(AetherSirInjectResponse {
@@ -205,20 +257,38 @@ impl AetherMcpServer {
 
         let mut updated = previous_sir.unwrap_or_else(|| empty_sir_annotation(new_confidence));
         updated.intent = intent.to_owned();
+        if let Some(behavior) = normalize_optional_note(request.behavior) {
+            updated.behavior = behavior;
+        }
+        if let Some(edge_cases) = normalize_optional_note(request.edge_cases) {
+            updated.edge_cases = edge_cases;
+        }
         if let Some(side_effects) = normalize_optional_string_list(request.side_effects) {
             updated.side_effects = side_effects;
         }
+        if let Some(dependencies) = normalize_optional_string_list(request.dependencies) {
+            updated.dependencies = dependencies;
+        }
         if let Some(error_modes) = normalize_optional_string_list(request.error_modes) {
             updated.error_modes = error_modes;
+        }
+        if let Some(inputs) = normalize_optional_string_list(request.inputs) {
+            updated.inputs = inputs;
+        }
+        if let Some(outputs) = normalize_optional_string_list(request.outputs) {
+            updated.outputs = outputs;
+        }
+        if let Some(complexity) = normalize_optional_complexity(request.complexity)? {
+            updated.complexity = complexity;
         }
         updated.confidence = new_confidence;
         validate_sir(&updated)?;
 
         let canonical_json = canonicalize_sir_json(&updated);
         let hash = sir_hash(&updated);
-        let provider = normalize_optional_text(request.provider, "manual");
-        let model = normalize_optional_text(request.model, "claude_code");
-        let generation_pass = normalize_optional_text(request.generation_pass, "deep");
+        let provider = normalize_optional_text_with_default(request.provider, "manual");
+        let model = normalize_optional_text_with_default(request.model, "manual");
+        let generation_pass = normalize_optional_text_with_default(request.generation_pass, "deep");
         let now = current_unix_timestamp();
         let version_write = store.record_sir_version_if_changed(
             symbol_id.as_str(),
@@ -268,10 +338,11 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
+    use aether_sir::SirAnnotation;
     use aether_store::{SirHistoryStore, SirStateStore, SymbolCatalogStore, SymbolRecord};
     use tempfile::tempdir;
 
-    use super::{AetherSirInjectRequest, resolve_symbol_selector};
+    use super::{AetherSirInjectRequest, DEFAULT_INJECT_CONFIDENCE, resolve_symbol_selector};
     use crate::AetherMcpServer;
 
     fn write_test_config(workspace: &Path) {
@@ -378,9 +449,15 @@ vector_backend = "sqlite"
             .aether_sir_inject_logic(AetherSirInjectRequest {
                 symbol: "sym-new".to_owned(),
                 intent: "Persist a new SIR annotation".to_owned(),
+                behavior: Some("Reads inputs and stores audit metadata".to_owned()),
+                edge_cases: Some("Blank inputs are rejected before persistence".to_owned()),
                 side_effects: Some(vec!["writes audit history".to_owned()]),
+                dependencies: Some(vec!["sqlx::PgPool".to_owned()]),
                 error_modes: Some(vec!["io".to_owned()]),
                 confidence: Some(0.6),
+                inputs: Some(vec!["payload: CreateRequest".to_owned()]),
+                outputs: Some(vec!["Result<(), io::Error>".to_owned()]),
+                complexity: Some("medium".to_owned()),
                 generation_pass: None,
                 model: None,
                 provider: None,
@@ -404,6 +481,7 @@ vector_backend = "sqlite"
             .expect("sir meta exists");
         assert_eq!(meta.sir_hash, response.sir_hash);
         assert_eq!(meta.sir_version, response.sir_version);
+        assert_eq!(meta.model, "manual");
     }
 
     #[test]
@@ -418,9 +496,15 @@ vector_backend = "sqlite"
             .aether_sir_inject_logic(AetherSirInjectRequest {
                 symbol: "sym-block".to_owned(),
                 intent: "Attempted overwrite".to_owned(),
+                behavior: None,
+                edge_cases: None,
                 side_effects: None,
+                dependencies: None,
                 error_modes: None,
-                confidence: Some(0.5),
+                confidence: Some(0.95),
+                inputs: None,
+                outputs: None,
+                complexity: None,
                 generation_pass: None,
                 model: None,
                 provider: None,
@@ -450,11 +534,17 @@ vector_backend = "sqlite"
             .aether_sir_inject_logic(AetherSirInjectRequest {
                 symbol: "crate::forced".to_owned(),
                 intent: "Forced overwrite".to_owned(),
+                behavior: Some("Overwrites existing SIR metadata".to_owned()),
+                edge_cases: Some("Existing history row is preserved".to_owned()),
                 side_effects: Some(vec!["updates sir row".to_owned()]),
+                dependencies: Some(vec!["sqlite".to_owned()]),
                 error_modes: Some(vec!["network".to_owned()]),
                 confidence: Some(0.4),
+                inputs: Some(vec!["symbol selector".to_owned()]),
+                outputs: Some(vec!["AetherSirInjectResponse".to_owned()]),
+                complexity: Some("High".to_owned()),
                 generation_pass: Some("deep".to_owned()),
-                model: Some("claude_code".to_owned()),
+                model: Some("claude-opus-4-6".to_owned()),
                 provider: Some("manual".to_owned()),
                 force: Some(true),
             })
@@ -471,11 +561,54 @@ vector_backend = "sqlite"
             .expect("read sir blob")
             .expect("sir blob exists");
         assert!(blob.contains("Forced overwrite"));
+        assert!(blob.contains("\"behavior\":\"Overwrites existing SIR metadata\""));
+        assert!(blob.contains("\"complexity\":\"High\""));
         let meta = store
             .get_sir_meta("sym-force")
             .expect("get sir meta")
             .expect("sir meta exists");
         assert_eq!(meta.sir_hash, response.sir_hash);
         assert_eq!(meta.sir_version, response.sir_version);
+        assert_eq!(meta.model, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn sir_inject_defaults_confidence_to_agent_default_when_omitted_for_existing_sir() {
+        let temp = tempdir().expect("tempdir");
+        write_test_config(temp.path());
+        seed_symbol(temp.path(), "sym-default", "crate::defaulted");
+        seed_existing_sir(temp.path(), "sym-default", 0.4);
+        let server = AetherMcpServer::new(temp.path(), false).expect("server");
+
+        let response = server
+            .aether_sir_inject_logic(AetherSirInjectRequest {
+                symbol: "sym-default".to_owned(),
+                intent: "Default confidence overwrite".to_owned(),
+                behavior: None,
+                edge_cases: None,
+                side_effects: None,
+                dependencies: None,
+                error_modes: None,
+                confidence: None,
+                inputs: None,
+                outputs: None,
+                complexity: None,
+                generation_pass: None,
+                model: None,
+                provider: None,
+                force: Some(false),
+            })
+            .expect("inject sir");
+
+        assert_eq!(response.status, "injected");
+        assert_eq!(response.new_confidence, DEFAULT_INJECT_CONFIDENCE);
+
+        let store = aether_store::SqliteStore::open(temp.path()).expect("open store");
+        let blob = store
+            .read_sir_blob("sym-default")
+            .expect("read sir blob")
+            .expect("sir blob exists");
+        let sir: SirAnnotation = serde_json::from_str(&blob).expect("parse sir");
+        assert_eq!(sir.confidence, DEFAULT_INJECT_CONFIDENCE);
     }
 }

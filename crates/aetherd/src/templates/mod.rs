@@ -105,7 +105,7 @@ pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 40] = [
     ("aether_contract_dismiss", "dismiss a contract violation"),
     (
         "aether_sir_inject",
-        "Write an improved SIR annotation back to the store for a symbol",
+        "Inject or update a symbol's complete SIR annotation, including intent, behavior, edge_cases, side_effects, dependencies, error_modes, inputs, outputs, complexity, confidence, and model provenance",
     ),
     (
         "aether_sir_context",
@@ -216,12 +216,13 @@ pub(crate) fn search_modes_line(context: &TemplateContext) -> String {
     }
 }
 
-pub(crate) fn required_actions() -> [&'static str; 4] {
+pub(crate) fn required_actions() -> [&'static str; 5] {
     [
         "Always call `aether_get_sir` before reverting, deleting, or refactoring symbols.",
         "Always call `aether_why_changed` before reverting recent changes.",
         "Always call `aether_verify` after modifying code.",
         "If `aether_verify` fails, fix the issue before proceeding.",
+        "After creating or significantly modifying key symbols, call `aether_sir_inject` with the full fields you know: intent, behavior, edge_cases, side_effects, dependencies, error_modes, inputs, outputs, complexity, confidence, and model.",
     ]
 }
 

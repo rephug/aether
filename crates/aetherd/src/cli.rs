@@ -889,7 +889,7 @@ pub struct EnhanceArgs {
     pub offline: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Args)]
+#[derive(Debug, Clone, PartialEq, Args)]
 pub struct SirInjectArgs {
     #[arg(help = "Symbol selector")]
     pub selector: String,
@@ -902,6 +902,48 @@ pub struct SirInjectArgs {
 
     #[arg(long, help = "Edge cases")]
     pub edge_cases: Option<String>,
+
+    #[arg(
+        long,
+        help = "Comma-separated side effects (e.g., \"database write,audit log,network call\")"
+    )]
+    pub side_effects: Option<String>,
+
+    #[arg(
+        long,
+        help = "Comma-separated dependencies (e.g., \"sqlx::PgPool,chrono::Utc,tokio::fs\")"
+    )]
+    pub dependencies: Option<String>,
+
+    #[arg(
+        long,
+        help = "Comma-separated error modes (e.g., \"PaymentError::InsufficientFunds,sqlx::Error\")"
+    )]
+    pub error_modes: Option<String>,
+
+    #[arg(
+        long,
+        help = "Comma-separated input descriptions (e.g., \"amount: f64,account_id: String\")"
+    )]
+    pub inputs: Option<String>,
+
+    #[arg(
+        long,
+        help = "Comma-separated output descriptions (e.g., \"Result<(), PaymentError>\")"
+    )]
+    pub outputs: Option<String>,
+
+    #[arg(long, help = "Complexity: Low, Medium, High, Critical, Unknown")]
+    pub complexity: Option<String>,
+
+    #[arg(
+        long,
+        help = "Confidence score 0.0-1.0 (default: 0.95 for agent-authored SIRs)"
+    )]
+    pub confidence: Option<f32>,
+
+    #[arg(long, value_name = "MODEL", help = "Model that authored this SIR")]
+    pub model: Option<String>,
 
     #[arg(long, help = "Overwrite even if existing SIR has higher quality")]
     pub force: bool,
@@ -1048,7 +1090,7 @@ pub enum Commands {
     Enhance(EnhanceArgs),
     /// Assemble semantic context for a symbol
     SirContext(SirContextArgs),
-    /// Inject or update a symbol's SIR intent
+    /// Inject or update a symbol's SIR annotation
     SirInject(SirInjectArgs),
     /// Show SIR vs source code delta
     SirDiff(SirDiffArgs),
@@ -1986,6 +2028,22 @@ mod tests {
             "writes cache",
             "--edge-cases",
             "io",
+            "--side-effects",
+            "database read,audit log write",
+            "--dependencies",
+            "sqlx::PgPool,chrono::Utc",
+            "--error-modes",
+            "PaymentError::InsufficientFunds,sqlx::Error",
+            "--inputs",
+            "amount: f64,account_id: String",
+            "--outputs",
+            "Result<(), PaymentError>",
+            "--complexity",
+            "Medium",
+            "--confidence",
+            "0.95",
+            "--model",
+            "claude-opus-4-6",
             "--force",
             "--dry-run",
             "--no-embed",
@@ -1998,6 +2056,26 @@ mod tests {
                 assert_eq!(args.intent, "updated intent");
                 assert_eq!(args.behavior.as_deref(), Some("writes cache"));
                 assert_eq!(args.edge_cases.as_deref(), Some("io"));
+                assert_eq!(
+                    args.side_effects.as_deref(),
+                    Some("database read,audit log write")
+                );
+                assert_eq!(
+                    args.dependencies.as_deref(),
+                    Some("sqlx::PgPool,chrono::Utc")
+                );
+                assert_eq!(
+                    args.error_modes.as_deref(),
+                    Some("PaymentError::InsufficientFunds,sqlx::Error")
+                );
+                assert_eq!(
+                    args.inputs.as_deref(),
+                    Some("amount: f64,account_id: String")
+                );
+                assert_eq!(args.outputs.as_deref(), Some("Result<(), PaymentError>"));
+                assert_eq!(args.complexity.as_deref(), Some("Medium"));
+                assert_eq!(args.confidence, Some(0.95));
+                assert_eq!(args.model.as_deref(), Some("claude-opus-4-6"));
                 assert!(args.force);
                 assert!(args.dry_run);
                 assert!(args.no_embed);

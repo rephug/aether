@@ -135,26 +135,6 @@ pub(crate) fn symbol_from_record(record: &SymbolRecord) -> Result<Symbol> {
     })
 }
 
-pub(crate) fn parse_text_list(raw: &str) -> Vec<String> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Vec::new();
-    }
-
-    let split = if raw.contains('\n') {
-        raw.lines().collect::<Vec<_>>()
-    } else {
-        raw.split(';').collect::<Vec<_>>()
-    };
-
-    split
-        .into_iter()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
 pub(crate) fn first_sentence(value: &str) -> String {
     value
         .split(['\n', '.', '!', '?'])
@@ -296,7 +276,7 @@ mod tests {
     use aether_store::{SymbolCatalogStore, SymbolRecord};
     use tempfile::tempdir;
 
-    use super::{load_fresh_symbol_source, parse_text_list, resolve_symbol};
+    use super::{load_fresh_symbol_source, resolve_symbol};
 
     fn symbol_record(
         id: &str,
@@ -409,17 +389,5 @@ mod tests {
         .expect("load fresh symbol");
 
         assert!(fresh.symbol_source.contains("pub fn alpha() -> i32"));
-    }
-
-    #[test]
-    fn parse_text_list_supports_semicolons_and_lines() {
-        assert_eq!(
-            parse_text_list("writes cache; logs metrics"),
-            vec!["writes cache".to_owned(), "logs metrics".to_owned()]
-        );
-        assert_eq!(
-            parse_text_list("writes cache\nlogs metrics"),
-            vec!["writes cache".to_owned(), "logs metrics".to_owned()]
-        );
     }
 }
