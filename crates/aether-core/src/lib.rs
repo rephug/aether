@@ -13,7 +13,7 @@ pub use secret::Secret;
 pub type SymbolId = String;
 pub const NO_SIR_MESSAGE: &str =
     "AETHER: No SIR yet for this symbol. Run aetherd indexing and try again.";
-pub const AETHER_AGENT_SCHEMA_VERSION: u32 = 1;
+pub const AETHER_AGENT_SCHEMA_VERSION: u32 = 2;
 
 pub const SIR_STATUS_STALE: &str = "stale";
 pub const SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED: &str = "local store not initialized";

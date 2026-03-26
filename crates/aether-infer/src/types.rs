@@ -250,12 +250,15 @@ mod tests {
         ) -> Result<SirAnnotation, InferError> {
             Ok(SirAnnotation {
                 intent: format!("Test {}", context.qualified_name),
+                behavior: None,
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 side_effects: Vec::new(),
                 dependencies: Vec::new(),
                 error_modes: Vec::new(),
                 confidence: 0.9,
+                edge_cases: None,
+                complexity: None,
                 method_dependencies: None,
             })
         }

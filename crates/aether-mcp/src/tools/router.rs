@@ -419,7 +419,7 @@ impl AetherMcpServer {
 
     #[tool(
         name = "aether_sir_inject",
-        description = "Write an improved SIR annotation back to the store for a symbol"
+        description = "Inject or update a symbol's complete SIR annotation. Accepts intent, behavior, edge_cases, side_effects, dependencies, error_modes, inputs, outputs, complexity, confidence, and model provenance."
     )]
     pub async fn aether_sir_inject(
         &self,

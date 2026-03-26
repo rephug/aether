@@ -254,24 +254,30 @@ mod tests {
     fn validates_smoke_test_sir_output() {
         let valid = SirAnnotation {
             intent: "Adds two numbers".to_owned(),
+            behavior: None,
             inputs: vec!["a".to_owned(), "b".to_owned()],
             outputs: vec!["sum".to_owned()],
             side_effects: Vec::new(),
             dependencies: Vec::new(),
             error_modes: Vec::new(),
             confidence: 0.8,
+            edge_cases: None,
+            complexity: None,
             method_dependencies: None,
         };
         validate_smoke_test_sir(&valid).expect("valid sir");
 
         let invalid = SirAnnotation {
             intent: "   ".to_owned(),
+            behavior: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
             side_effects: Vec::new(),
             dependencies: Vec::new(),
             error_modes: Vec::new(),
             confidence: 0.8,
+            edge_cases: None,
+            complexity: None,
             method_dependencies: None,
         };
         let err = validate_smoke_test_sir(&invalid).expect_err("expected invalid sir");

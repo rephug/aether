@@ -3,7 +3,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use aether_infer::{InferenceProvider, Qwen3LocalProvider};
-use aether_sir::SirAnnotation;
+use aether_sir::{
+    SirAnnotation, normalize_complexity_label, normalize_optional_text, validate_sir,
+};
 use aether_store::{SirMetaRecord, SirStateStore, SqliteStore};
 use anyhow::{Context, Result, anyhow};
 
@@ -11,27 +13,15 @@ use crate::batch::hash::compute_prompt_hash;
 use crate::batch::write_fingerprint_row;
 use crate::cli::SirInjectArgs;
 use crate::continuous::cosine_distance_from_embeddings;
-use crate::sir_agent_support::{
-    load_fresh_symbol_source, parse_text_list, resolve_symbol, symbol_from_record,
-};
+use crate::sir_agent_support::{load_fresh_symbol_source, resolve_symbol, symbol_from_record};
 use crate::sir_pipeline::{SirPipeline, UpsertSirIntentPayload};
 
 const FORCE_CONFIDENCE_THRESHOLD: f32 = 0.5;
+const DEFAULT_INJECT_CONFIDENCE: f32 = 0.95;
 
 #[derive(Debug)]
 struct InjectExecution {
     rendered: String,
-}
-
-struct DiffPreview<'a> {
-    old_intent: &'a str,
-    new_intent: &'a str,
-    old_side_effects: &'a [String],
-    new_side_effects: &'a [String],
-    old_error_modes: &'a [String],
-    new_error_modes: &'a [String],
-    old_confidence: f32,
-    new_confidence: f32,
 }
 
 pub fn run_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<()> {
@@ -66,40 +56,46 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
         .is_some_and(|sir| sir.confidence > FORCE_CONFIDENCE_THRESHOLD)
         && !args.force;
 
-    let mut updated = existing_sir.clone().unwrap_or_else(empty_sir);
-    let old_intent = updated.intent.clone();
-    let old_side_effects = updated.side_effects.clone();
-    let old_error_modes = updated.error_modes.clone();
-    let old_confidence = updated.confidence;
-
+    let previous_sir = existing_sir.clone();
+    let mut updated = existing_sir
+        .clone()
+        .unwrap_or_else(|| empty_sir(DEFAULT_INJECT_CONFIDENCE));
     updated.intent = args.intent.trim().to_owned();
-    if let Some(behavior) = args.behavior.as_deref() {
-        updated.side_effects = parse_text_list(behavior);
+    if let Some(behavior) = optional_text_override(&args.behavior) {
+        updated.behavior = behavior;
     }
-    if let Some(edge_cases) = args.edge_cases.as_deref() {
-        updated.error_modes = parse_text_list(edge_cases);
+    if let Some(edge_cases) = optional_text_override(&args.edge_cases) {
+        updated.edge_cases = edge_cases;
     }
-    updated.confidence = FORCE_CONFIDENCE_THRESHOLD;
+    if args.inputs.is_some() {
+        updated.inputs = parse_comma_list(&args.inputs);
+    }
+    if args.outputs.is_some() {
+        updated.outputs = parse_comma_list(&args.outputs);
+    }
+    if args.side_effects.is_some() {
+        updated.side_effects = parse_comma_list(&args.side_effects);
+    }
+    if args.dependencies.is_some() {
+        updated.dependencies = parse_comma_list(&args.dependencies);
+    }
+    if args.error_modes.is_some() {
+        updated.error_modes = parse_comma_list(&args.error_modes);
+    }
+    if let Some(complexity) = complexity_override(&args.complexity)? {
+        updated.complexity = complexity;
+    }
+    if let Some(confidence) = args.confidence {
+        updated.confidence = confidence;
+    }
+    validate_sir(&updated).context("injected SIR failed schema validation")?;
 
-    if updated.intent.trim().is_empty() {
-        return Err(anyhow!("intent must not be empty"));
-    }
-
-    let diff = render_diff(DiffPreview {
-        old_intent: old_intent.as_str(),
-        new_intent: updated.intent.as_str(),
-        old_side_effects: &old_side_effects,
-        new_side_effects: &updated.side_effects,
-        old_error_modes: &old_error_modes,
-        new_error_modes: &updated.error_modes,
-        old_confidence,
-        new_confidence: updated.confidence,
-    });
+    let preview = render_preview(previous_sir.as_ref(), &updated)?;
 
     if args.dry_run {
         let mut rendered = String::new();
         rendered.push_str(&format!("Dry run for {}\n\n", record.qualified_name));
-        rendered.push_str(diff.as_str());
+        rendered.push_str(preview.as_str());
         if would_block {
             rendered.push_str(&format!(
                 "\nWrite would be blocked because existing confidence ({:.2}) exceeds {:.2}. Re-run with --force.\n",
@@ -125,6 +121,8 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
         .as_ref()
         .and_then(|meta| meta.prompt_hash.as_deref())
         .map(str::to_owned);
+    let generation_model =
+        normalize_optional_text(args.model.as_deref()).unwrap_or_else(|| "manual".to_owned());
 
     let persist_pipeline = build_persist_pipeline(workspace)?;
     let mut embedding_warning = None;
@@ -153,7 +151,7 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
         symbol: symbol_from_record(&record)?,
         sir: updated.clone(),
         provider_name: "manual".to_owned(),
-        model_name: "manual".to_owned(),
+        model_name: generation_model.clone(),
         generation_pass: "injected".to_owned(),
         reasoning_trace: None,
         commit_hash: None,
@@ -200,7 +198,7 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
         prompt_hash.as_str(),
         previous_prompt_hash.as_deref(),
         "inject",
-        "manual",
+        generation_model.as_str(),
         "injected",
         delta_sem,
     )
@@ -210,7 +208,7 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
         "Updated SIR for {}. Intent: {}\n\n{}",
         record.qualified_name,
         truncate_preview(updated.intent.as_str(), 80),
-        diff
+        preview
     );
     if let Some(warning) = embedding_warning {
         rendered.push('\n');
@@ -233,16 +231,112 @@ fn build_persist_pipeline(workspace: &Path) -> Result<SirPipeline> {
     .context("failed to initialize inject persistence pipeline")
 }
 
-fn empty_sir() -> SirAnnotation {
+fn empty_sir(confidence: f32) -> SirAnnotation {
     SirAnnotation {
         intent: String::new(),
+        behavior: None,
         inputs: Vec::new(),
         outputs: Vec::new(),
         side_effects: Vec::new(),
         dependencies: Vec::new(),
         error_modes: Vec::new(),
-        confidence: 0.0,
+        confidence,
+        edge_cases: None,
+        complexity: None,
         method_dependencies: None,
+    }
+}
+
+fn optional_text_override(input: &Option<String>) -> Option<Option<String>> {
+    input
+        .as_ref()
+        .map(|value| normalize_optional_text(Some(value.as_str())))
+}
+
+fn parse_comma_list(input: &Option<String>) -> Vec<String> {
+    input
+        .as_deref()
+        .map(split_top_level_commas)
+        .unwrap_or_default()
+}
+
+fn split_top_level_commas(raw: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut angle_depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+
+    for ch in raw.chars() {
+        match ch {
+            '<' => {
+                angle_depth += 1;
+                current.push(ch);
+            }
+            '>' => {
+                angle_depth = angle_depth.saturating_sub(1);
+                current.push(ch);
+            }
+            '(' => {
+                paren_depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                current.push(ch);
+            }
+            '[' => {
+                bracket_depth += 1;
+                current.push(ch);
+            }
+            ']' => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                current.push(ch);
+            }
+            '{' => {
+                brace_depth += 1;
+                current.push(ch);
+            }
+            '}' => {
+                brace_depth = brace_depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' if angle_depth == 0
+                && paren_depth == 0
+                && bracket_depth == 0
+                && brace_depth == 0 =>
+            {
+                let item = current.trim();
+                if !item.is_empty() {
+                    items.push(item.to_owned());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    let item = current.trim();
+    if !item.is_empty() {
+        items.push(item.to_owned());
+    }
+
+    items
+}
+
+fn complexity_override(input: &Option<String>) -> Result<Option<Option<String>>> {
+    match input {
+        None => Ok(None),
+        Some(value) => {
+            let value = value.trim();
+            if value.is_empty() {
+                return Ok(Some(None));
+            }
+            let normalized = normalize_complexity_label(Some(value))
+                .ok_or_else(|| anyhow!("invalid complexity '{value}'"))?;
+            Ok(Some(Some(normalized)))
+        }
     }
 }
 
@@ -257,31 +351,25 @@ fn truncate_preview(value: &str, max_chars: usize) -> String {
     preview
 }
 
-fn render_diff(diff: DiffPreview<'_>) -> String {
-    format!(
-        "intent:\n- old: {}\n- new: {}\n\nbehavior:\n- old: {}\n- new: {}\n\nedge_cases:\n- old: {}\n- new: {}\n\nconfidence:\n- old: {:.2}\n- new: {:.2}\n",
-        render_list_preview(diff.old_intent, false),
-        render_list_preview(diff.new_intent, false),
-        render_list_preview(&diff.old_side_effects.join("; "), true),
-        render_list_preview(&diff.new_side_effects.join("; "), true),
-        render_list_preview(&diff.old_error_modes.join("; "), true),
-        render_list_preview(&diff.new_error_modes.join("; "), true),
-        diff.old_confidence,
-        diff.new_confidence
-    )
-}
-
-fn render_list_preview(value: &str, allow_empty_label: bool) -> String {
-    let value = value.trim();
-    if value.is_empty() {
-        if allow_empty_label {
-            "(empty)".to_owned()
-        } else {
-            "(none)".to_owned()
-        }
-    } else {
-        value.to_owned()
+fn render_preview(previous: Option<&SirAnnotation>, updated: &SirAnnotation) -> Result<String> {
+    let mut rendered = String::new();
+    if let Some(previous) = previous {
+        rendered.push_str("Existing SIR:\n");
+        rendered.push_str(
+            serde_json::to_string_pretty(previous)
+                .context("failed to render existing SIR preview")?
+                .as_str(),
+        );
+        rendered.push_str("\n\n");
     }
+    rendered.push_str("Merged SIR:\n");
+    rendered.push_str(
+        serde_json::to_string_pretty(updated)
+            .context("failed to render merged SIR preview")?
+            .as_str(),
+    );
+    rendered.push('\n');
+    Ok(rendered)
 }
 
 #[cfg(test)]
@@ -293,7 +381,7 @@ mod tests {
     use aether_store::{SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord};
     use tempfile::tempdir;
 
-    use super::execute_sir_inject_command;
+    use super::{execute_sir_inject_command, split_top_level_commas};
     use crate::cli::SirInjectArgs;
 
     fn write_test_config(workspace: &Path) {
@@ -383,6 +471,14 @@ vector_backend = "sqlite"
                 intent: "new intent".to_owned(),
                 behavior: Some("writes cache".to_owned()),
                 edge_cases: Some("io".to_owned()),
+                side_effects: Some("database read,audit log write".to_owned()),
+                dependencies: Some("sqlx::PgPool,chrono::Utc".to_owned()),
+                error_modes: Some("PaymentError::InsufficientFunds,sqlx::Error".to_owned()),
+                inputs: Some("amount: f64,account_id: String".to_owned()),
+                outputs: Some("Result<(), PaymentError>".to_owned()),
+                complexity: Some("Medium".to_owned()),
+                confidence: Some(0.95),
+                model: Some("claude-opus-4-6".to_owned()),
                 force: false,
                 dry_run: true,
                 no_embed: true,
@@ -411,6 +507,14 @@ vector_backend = "sqlite"
                 intent: "new intent".to_owned(),
                 behavior: None,
                 edge_cases: None,
+                side_effects: None,
+                dependencies: None,
+                error_modes: None,
+                inputs: None,
+                outputs: None,
+                complexity: None,
+                confidence: None,
+                model: None,
                 force: false,
                 dry_run: false,
                 no_embed: true,
@@ -431,6 +535,14 @@ vector_backend = "sqlite"
                 intent: "updated intent".to_owned(),
                 behavior: Some("writes cache".to_owned()),
                 edge_cases: Some("io".to_owned()),
+                side_effects: Some("database read,audit log write".to_owned()),
+                dependencies: Some("sqlx::PgPool,chrono::Utc".to_owned()),
+                error_modes: Some("PaymentError::InsufficientFunds,sqlx::Error".to_owned()),
+                inputs: Some("amount: f64,account_id: String".to_owned()),
+                outputs: Some("Result<(), PaymentError>".to_owned()),
+                complexity: Some("Medium".to_owned()),
+                confidence: Some(0.95),
+                model: Some("claude-opus-4-6".to_owned()),
                 force: false,
                 dry_run: false,
                 no_embed: true,
@@ -460,5 +572,16 @@ vector_backend = "sqlite"
             .expect("list history");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].trigger, "inject");
+    }
+
+    #[test]
+    fn split_top_level_commas_keeps_generic_type_commas_intact() {
+        assert_eq!(
+            split_top_level_commas("Result<(), PaymentError>,Option<Vec<String>>"),
+            vec![
+                "Result<(), PaymentError>".to_owned(),
+                "Option<Vec<String>>".to_owned()
+            ]
+        );
     }
 }

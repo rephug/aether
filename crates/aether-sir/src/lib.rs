@@ -15,12 +15,18 @@ pub enum SirLevel {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SirAnnotation {
     pub intent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavior: Option<String>,
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
     pub side_effects: Vec<String>,
     pub dependencies: Vec<String>,
     pub error_modes: Vec<String>,
     pub confidence: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_cases: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complexity: Option<String>,
     /// Per-method dependency map for traits/structs. None for functions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method_dependencies: Option<HashMap<String, Vec<String>>>,
@@ -43,6 +49,8 @@ pub enum SirError {
     EmptyIntent,
     #[error("confidence must be between 0.0 and 1.0")]
     InvalidConfidence,
+    #[error("complexity must be one of: Low, Medium, High, Critical, Unknown")]
+    InvalidComplexity,
 }
 
 pub fn validate_sir(sir: &SirAnnotation) -> Result<(), SirError> {
@@ -54,15 +62,22 @@ pub fn validate_sir(sir: &SirAnnotation) -> Result<(), SirError> {
         return Err(SirError::InvalidConfidence);
     }
 
+    if sir.complexity.is_some() && normalize_complexity_label(sir.complexity.as_deref()).is_none() {
+        return Err(SirError::InvalidComplexity);
+    }
+
     Ok(())
 }
 
 pub fn canonicalize_sir_json(sir: &SirAnnotation) -> String {
+    let behavior = normalize_optional_text(sir.behavior.as_deref());
     let mut inputs = sir.inputs.clone();
     let mut outputs = sir.outputs.clone();
     let mut side_effects = sir.side_effects.clone();
     let mut dependencies = sir.dependencies.clone();
     let mut error_modes = sir.error_modes.clone();
+    let edge_cases = normalize_optional_text(sir.edge_cases.as_deref());
+    let complexity = normalize_complexity_label(sir.complexity.as_deref());
 
     inputs.sort();
     outputs.sort();
@@ -71,8 +86,17 @@ pub fn canonicalize_sir_json(sir: &SirAnnotation) -> String {
     error_modes.sort();
 
     let mut canonical = BTreeMap::<&str, Value>::new();
+    if let Some(behavior) = behavior {
+        canonical.insert("behavior", Value::from(behavior));
+    }
+    if let Some(complexity) = complexity {
+        canonical.insert("complexity", Value::from(complexity));
+    }
     canonical.insert("confidence", Value::from(sir.confidence));
     canonical.insert("dependencies", Value::from(dependencies));
+    if let Some(edge_cases) = edge_cases {
+        canonical.insert("edge_cases", Value::from(edge_cases));
+    }
     canonical.insert("error_modes", Value::from(error_modes));
     canonical.insert("inputs", Value::from(inputs));
     canonical.insert("intent", Value::from(sir.intent.clone()));
@@ -152,6 +176,25 @@ fn normalize_path(path: &str) -> String {
     path.replace('\\', "/")
 }
 
+pub fn normalize_optional_text(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+pub fn normalize_complexity_label(value: Option<&str>) -> Option<String> {
+    let normalized = normalize_optional_text(value)?;
+    match normalized.to_ascii_lowercase().as_str() {
+        "low" => Some("Low".to_owned()),
+        "medium" => Some("Medium".to_owned()),
+        "high" => Some("High".to_owned()),
+        "critical" => Some("Critical".to_owned()),
+        "unknown" => Some("Unknown".to_owned()),
+        _ => None,
+    }
+}
+
 fn sort_and_dedupe(values: &mut Vec<String>) {
     values.sort();
     values.dedup();
@@ -164,12 +207,15 @@ mod tests {
     fn sample_sir() -> SirAnnotation {
         SirAnnotation {
             intent: "Summarize behavior".to_owned(),
+            behavior: None,
             inputs: vec!["b".to_owned(), "a".to_owned()],
             outputs: vec!["result".to_owned()],
             side_effects: vec!["network".to_owned(), "db".to_owned()],
             dependencies: vec!["serde".to_owned(), "tokio".to_owned()],
             error_modes: vec!["io_error".to_owned(), "timeout".to_owned()],
             confidence: 0.75,
+            edge_cases: None,
+            complexity: None,
             method_dependencies: None,
         }
     }
@@ -207,12 +253,15 @@ mod tests {
         let sir_a = sample_sir();
         let sir_b = SirAnnotation {
             intent: sir_a.intent.clone(),
+            behavior: None,
             inputs: vec!["a".to_owned(), "b".to_owned()],
             outputs: vec!["result".to_owned()],
             side_effects: vec!["db".to_owned(), "network".to_owned()],
             dependencies: vec!["tokio".to_owned(), "serde".to_owned()],
             error_modes: vec!["timeout".to_owned(), "io_error".to_owned()],
             confidence: 0.75,
+            edge_cases: None,
+            complexity: None,
             method_dependencies: None,
         };
 
@@ -246,6 +295,9 @@ mod tests {
 
         let sir: SirAnnotation = serde_json::from_str(json).expect("sir should deserialize");
         assert_eq!(sir.method_dependencies, None);
+        assert_eq!(sir.behavior, None);
+        assert_eq!(sir.edge_cases, None);
+        assert_eq!(sir.complexity, None);
     }
 
     #[test]
@@ -293,6 +345,28 @@ mod tests {
         let encoded = serde_json::to_string(&sir).expect("sir should serialize");
 
         assert!(!encoded.contains("method_dependencies"));
+    }
+
+    #[test]
+    fn validate_sir_rejects_invalid_complexity() {
+        let mut sir = sample_sir();
+        sir.complexity = Some("hard-ish".to_owned());
+
+        let err = validate_sir(&sir).expect_err("expected invalid complexity");
+        assert_eq!(err, SirError::InvalidComplexity);
+    }
+
+    #[test]
+    fn complexity_normalizes_during_canonicalization() {
+        let mut sir = sample_sir();
+        sir.behavior = Some("  Performs work in stages.  ".to_owned());
+        sir.edge_cases = Some("  Retries once on timeout. ".to_owned());
+        sir.complexity = Some("critical".to_owned());
+
+        assert_eq!(
+            canonicalize_sir_json(&sir),
+            "{\"behavior\":\"Performs work in stages.\",\"complexity\":\"Critical\",\"confidence\":0.75,\"dependencies\":[\"serde\",\"tokio\"],\"edge_cases\":\"Retries once on timeout.\",\"error_modes\":[\"io_error\",\"timeout\"],\"inputs\":[\"a\",\"b\"],\"intent\":\"Summarize behavior\",\"outputs\":[\"result\"],\"side_effects\":[\"db\",\"network\"]}"
+        );
     }
 
     #[test]

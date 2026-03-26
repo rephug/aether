@@ -238,12 +238,15 @@ fn run_index_and_seed_sir(workspace: &Path) -> Result<()> {
             .unwrap_or(symbol.qualified_name.as_str());
         let sir = SirAnnotation {
             intent: format!("Mock summary for {symbol_name}"),
+            behavior: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
             side_effects: Vec::new(),
             dependencies: Vec::new(),
             error_modes: Vec::new(),
             confidence: 0.9,
+            edge_cases: None,
+            complexity: None,
             method_dependencies: None,
         };
         let sir_json = serde_json::to_string(&sir)?;
@@ -622,12 +625,15 @@ fn mcp_get_sir_returns_method_dependencies_when_present() -> Result<()> {
 
     let sir = SirAnnotation {
         intent: "Mock summary for alpha".to_owned(),
+        behavior: None,
         inputs: Vec::new(),
         outputs: Vec::new(),
         side_effects: Vec::new(),
         dependencies: vec!["StoreError".to_owned(), "SymbolRecord".to_owned()],
         error_modes: Vec::new(),
         confidence: 0.9,
+        edge_cases: None,
+        complexity: None,
         method_dependencies: Some(HashMap::from([(
             "load".to_owned(),
             vec!["StoreError".to_owned(), "SymbolRecord".to_owned()],
@@ -1309,12 +1315,15 @@ fn mcp_suggest_trait_split_returns_clusters() -> Result<()> {
 
     let trait_sir = SirAnnotation {
         intent: "Mock summary for ExampleStore".to_owned(),
+        behavior: None,
         inputs: Vec::new(),
         outputs: Vec::new(),
         side_effects: Vec::new(),
         dependencies: Vec::new(),
         error_modes: Vec::new(),
         confidence: 0.9,
+        edge_cases: None,
+        complexity: None,
         method_dependencies: None,
     };
     store.write_sir_blob(
@@ -1473,12 +1482,15 @@ fn mcp_suggest_trait_split_accepts_struct_targets() -> Result<()> {
 
     let struct_sir = SirAnnotation {
         intent: "Mock summary for ExampleStore".to_owned(),
+        behavior: None,
         inputs: Vec::new(),
         outputs: Vec::new(),
         side_effects: Vec::new(),
         dependencies: Vec::new(),
         error_modes: Vec::new(),
         confidence: 0.9,
+        edge_cases: None,
+        complexity: None,
         method_dependencies: None,
     };
     store.write_sir_blob(
@@ -1639,12 +1651,15 @@ fn mcp_suggest_trait_split_falls_back_to_same_file_implementor_methods() -> Resu
 
     let sqlite_sir = SirAnnotation {
         intent: "Mock summary for SqliteStore".to_owned(),
+        behavior: None,
         inputs: Vec::new(),
         outputs: Vec::new(),
         side_effects: Vec::new(),
         dependencies: Vec::new(),
         error_modes: Vec::new(),
         confidence: 0.9,
+        edge_cases: None,
+        complexity: None,
         method_dependencies: None,
     };
     store.write_sir_blob(
@@ -3118,9 +3133,15 @@ fn mcp_sir_inject_tool_injects_blocks_and_forces_overwrites() -> Result<()> {
         .block_on(server.aether_sir_inject(Parameters(AetherSirInjectRequest {
             symbol: "sym-inject".to_owned(),
             intent: "Initial injected intent".to_owned(),
+            behavior: Some("Loads state and writes cache".to_owned()),
+            edge_cases: Some("Cold cache triggers a full reload".to_owned()),
             side_effects: Some(vec!["writes cache".to_owned()]),
+            dependencies: Some(vec!["SqliteStore".to_owned()]),
             error_modes: Some(vec!["io".to_owned()]),
             confidence: Some(0.9),
+            inputs: Some(vec!["symbol_id".to_owned()]),
+            outputs: Some(vec!["Result<(), io::Error>".to_owned()]),
+            complexity: Some("Medium".to_owned()),
             generation_pass: None,
             model: None,
             provider: None,
@@ -3141,9 +3162,15 @@ fn mcp_sir_inject_tool_injects_blocks_and_forces_overwrites() -> Result<()> {
         .block_on(server.aether_sir_inject(Parameters(AetherSirInjectRequest {
             symbol: "crate::inject::target".to_owned(),
             intent: "Blocked overwrite".to_owned(),
+            behavior: None,
+            edge_cases: None,
             side_effects: None,
+            dependencies: None,
             error_modes: None,
             confidence: Some(0.4),
+            inputs: None,
+            outputs: None,
+            complexity: None,
             generation_pass: None,
             model: None,
             provider: None,
@@ -3158,11 +3185,17 @@ fn mcp_sir_inject_tool_injects_blocks_and_forces_overwrites() -> Result<()> {
         .block_on(server.aether_sir_inject(Parameters(AetherSirInjectRequest {
             symbol: "sym-inject".to_owned(),
             intent: "Forced overwrite".to_owned(),
+            behavior: Some("Updates cache and metadata".to_owned()),
+            edge_cases: Some("Network failures leave stale cache entries".to_owned()),
             side_effects: Some(vec!["updates cache".to_owned()]),
+            dependencies: Some(vec!["SqliteStore".to_owned()]),
             error_modes: Some(vec!["network".to_owned()]),
             confidence: Some(0.4),
+            inputs: Some(vec!["symbol_id".to_owned()]),
+            outputs: Some(vec!["AetherSirInjectResponse".to_owned()]),
+            complexity: Some("High".to_owned()),
             generation_pass: Some("deep".to_owned()),
-            model: Some("claude_code".to_owned()),
+            model: Some("claude-opus-4-6".to_owned()),
             provider: Some("manual".to_owned()),
             force: Some(true),
         })))

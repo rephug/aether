@@ -1755,12 +1755,15 @@ model = "qwen3-embeddings-4B"
 
         let trait_sir = SirAnnotation {
             intent: "Mock summary for Store".to_owned(),
+            behavior: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
             side_effects: Vec::new(),
             dependencies: Vec::new(),
             error_modes: Vec::new(),
             confidence: 0.9,
+            edge_cases: None,
+            complexity: None,
             method_dependencies: Some(HashMap::from([
                 (
                     "alpha".to_owned(),

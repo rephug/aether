@@ -35,12 +35,15 @@ impl InferenceProvider for HashingMockProvider {
                 "Hashing mock summary for {} :: {}",
                 context.qualified_name, normalized
             ),
+            behavior: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
             side_effects: Vec::new(),
             dependencies: Vec::new(),
             error_modes: Vec::new(),
             confidence: 1.0,
+            edge_cases: None,
+            complexity: None,
             method_dependencies: None,
         })
     }
@@ -77,12 +80,15 @@ impl InferenceProvider for RollupUnionMockProvider {
 
         Ok(SirAnnotation {
             intent,
+            behavior: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
             side_effects,
             dependencies: Vec::new(),
             error_modes: Vec::new(),
             confidence: 0.9,
+            edge_cases: None,
+            complexity: None,
             method_dependencies: None,
         })
     }
@@ -130,12 +136,15 @@ impl InferenceProvider for PromptTrackingProvider {
 fn prompt_tracking_sir(context: &SirContext) -> SirAnnotation {
     SirAnnotation {
         intent: format!("Prompt summary for {}", context.qualified_name),
+        behavior: None,
         inputs: Vec::new(),
         outputs: Vec::new(),
         side_effects: Vec::new(),
         dependencies: Vec::new(),
         error_modes: Vec::new(),
         confidence: 0.95,
+        edge_cases: None,
+        complexity: None,
         method_dependencies: None,
     }
 }
