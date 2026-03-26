@@ -339,7 +339,7 @@ side_effects, dependencies, error_modes, confidence."
 
 pub fn build_sir_prompt_for_kind(symbol_text: &str, context: &SirContext) -> String {
     format!(
-        "You are generating a Leaf SIR annotation.\n\
+        "You are generating a Leaf SIR (Semantic Intent Record) annotation.\n\
 {}\
 Context:\n\
 - language: {}\n\
@@ -398,7 +398,7 @@ fn build_enriched_prompt_core(
     include_cot: bool,
 ) -> String {
     let mut prompt = format!(
-        "You are improving an existing SIR annotation with deeper analysis.\n\n\
+        "You are improving an existing SIR (Semantic Intent Record) annotation with deeper analysis.\n\n\
 Context:\n\
 - language: {}\n\
 - file_path: {}\n\
@@ -503,7 +503,7 @@ fn append_full_sections(prompt: &mut String) {
 /// Static system instruction for scan pass at the given tier.
 /// This is the cacheable prefix shared across all symbols in a batch.
 pub fn sir_scan_system_prompt(tier: PromptTier) -> String {
-    let mut prompt = String::from("You are generating a Leaf SIR annotation.\n");
+    let mut prompt = String::from("You are generating a Leaf SIR (Semantic Intent Record) annotation.\n");
     prompt.push_str(RESPONSE_CONTRACT);
     prompt.push('\n');
     prompt.push_str(FEW_SHOT_EXAMPLES);
@@ -543,7 +543,7 @@ Symbol text:\n{}",
 /// Static system instruction for enriched (triage/deep) pass at the given tier.
 pub fn sir_enriched_system_prompt(tier: PromptTier) -> String {
     let mut prompt = String::from(
-        "You are improving an existing SIR annotation with deeper analysis.\n\n\
+        "You are improving an existing SIR (Semantic Intent Record) annotation with deeper analysis.\n\n\
 Your task: given a baseline SIR (from a previous pass), neighboring symbol intents, \
 file-level context, and the full source code, produce a strictly better SIR. \"Better\" means:\n\
 - More specific intent (capture architectural decisions, not just behavior)\n\
@@ -760,7 +760,7 @@ mod tests {
         };
 
         let prompt = build_enriched_sir_prompt("pub fn run() {}", &context, &enrichment);
-        assert!(prompt.contains("You are improving an existing SIR annotation"));
+        assert!(prompt.contains("You are improving an existing SIR (Semantic Intent Record) annotation"));
         assert!(prompt.contains("high PageRank + public method"));
         assert!(prompt.contains("Other symbols in this file"));
         assert!(prompt.contains("Previous SIR (improve upon this):"));
