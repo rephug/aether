@@ -87,6 +87,8 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
     }
     if let Some(confidence) = args.confidence {
         updated.confidence = confidence;
+    } else {
+        updated.confidence = DEFAULT_INJECT_CONFIDENCE;
     }
     validate_sir(&updated).context("injected SIR failed schema validation")?;
 
@@ -378,10 +380,11 @@ mod tests {
     use std::path::Path;
 
     use aether_core::Language;
+    use aether_sir::SirAnnotation;
     use aether_store::{SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord};
     use tempfile::tempdir;
 
-    use super::{execute_sir_inject_command, split_top_level_commas};
+    use super::{DEFAULT_INJECT_CONFIDENCE, execute_sir_inject_command, split_top_level_commas};
     use crate::cli::SirInjectArgs;
 
     fn write_test_config(workspace: &Path) {
@@ -572,6 +575,40 @@ vector_backend = "sqlite"
             .expect("list history");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].trigger, "inject");
+    }
+
+    #[test]
+    fn inject_defaults_confidence_to_agent_default_when_omitted_for_existing_sir() {
+        let (temp, record) = seed_workspace(0.4);
+        execute_sir_inject_command(
+            temp.path(),
+            SirInjectArgs {
+                selector: record.id.clone(),
+                intent: "updated intent".to_owned(),
+                behavior: None,
+                edge_cases: None,
+                side_effects: None,
+                dependencies: None,
+                error_modes: None,
+                inputs: None,
+                outputs: None,
+                complexity: None,
+                confidence: None,
+                model: None,
+                force: false,
+                dry_run: false,
+                no_embed: true,
+            },
+        )
+        .expect("inject");
+
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        let blob = store
+            .read_sir_blob(record.id.as_str())
+            .expect("read blob")
+            .expect("blob");
+        let sir: SirAnnotation = serde_json::from_str(&blob).expect("parse sir");
+        assert_eq!(sir.confidence, DEFAULT_INJECT_CONFIDENCE);
     }
 
     #[test]

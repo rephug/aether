@@ -220,10 +220,7 @@ impl AetherMcpServer {
             .map(serde_json::from_str::<SirAnnotation>)
             .transpose()?;
         let previous_confidence = previous_sir.as_ref().map(|sir| sir.confidence);
-        let new_confidence = request
-            .confidence
-            .or(previous_confidence)
-            .unwrap_or(DEFAULT_INJECT_CONFIDENCE);
+        let new_confidence = request.confidence.unwrap_or(DEFAULT_INJECT_CONFIDENCE);
 
         if previous_confidence.is_some_and(|confidence| confidence > FORCE_CONFIDENCE_THRESHOLD)
             && !request.force.unwrap_or(false)
@@ -341,10 +338,11 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
+    use aether_sir::SirAnnotation;
     use aether_store::{SirHistoryStore, SirStateStore, SymbolCatalogStore, SymbolRecord};
     use tempfile::tempdir;
 
-    use super::{AetherSirInjectRequest, resolve_symbol_selector};
+    use super::{AetherSirInjectRequest, DEFAULT_INJECT_CONFIDENCE, resolve_symbol_selector};
     use crate::AetherMcpServer;
 
     fn write_test_config(workspace: &Path) {
@@ -572,5 +570,45 @@ vector_backend = "sqlite"
         assert_eq!(meta.sir_hash, response.sir_hash);
         assert_eq!(meta.sir_version, response.sir_version);
         assert_eq!(meta.model, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn sir_inject_defaults_confidence_to_agent_default_when_omitted_for_existing_sir() {
+        let temp = tempdir().expect("tempdir");
+        write_test_config(temp.path());
+        seed_symbol(temp.path(), "sym-default", "crate::defaulted");
+        seed_existing_sir(temp.path(), "sym-default", 0.4);
+        let server = AetherMcpServer::new(temp.path(), false).expect("server");
+
+        let response = server
+            .aether_sir_inject_logic(AetherSirInjectRequest {
+                symbol: "sym-default".to_owned(),
+                intent: "Default confidence overwrite".to_owned(),
+                behavior: None,
+                edge_cases: None,
+                side_effects: None,
+                dependencies: None,
+                error_modes: None,
+                confidence: None,
+                inputs: None,
+                outputs: None,
+                complexity: None,
+                generation_pass: None,
+                model: None,
+                provider: None,
+                force: Some(false),
+            })
+            .expect("inject sir");
+
+        assert_eq!(response.status, "injected");
+        assert_eq!(response.new_confidence, DEFAULT_INJECT_CONFIDENCE);
+
+        let store = aether_store::SqliteStore::open(temp.path()).expect("open store");
+        let blob = store
+            .read_sir_blob("sym-default")
+            .expect("read sir blob")
+            .expect("sir blob exists");
+        let sir: SirAnnotation = serde_json::from_str(&blob).expect("parse sir");
+        assert_eq!(sir.confidence, DEFAULT_INJECT_CONFIDENCE);
     }
 }
