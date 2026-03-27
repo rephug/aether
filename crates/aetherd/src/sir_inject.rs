@@ -159,7 +159,7 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
         commit_hash: None,
     };
     let (canonical_json, sir_hash) = persist_pipeline
-        .persist_sir_payload_into_sqlite(&store, &payload)
+        .persist_sir_payload_into_sqlite(&store, &payload, None)
         .with_context(|| format!("failed to persist injected SIR for {}", record.id))?;
 
     let persisted_meta = store

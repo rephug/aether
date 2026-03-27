@@ -386,6 +386,25 @@ vector_backend = "sqlite"
         .expect("install graph_done failure trigger");
     }
 
+    fn install_sqlite_done_failure_trigger(workspace: &Path, symbol_id: &str) {
+        let conn =
+            Connection::open(workspace.join(".aether/meta.sqlite")).expect("open sqlite database");
+        conn.execute_batch(
+            format!(
+                r#"
+                CREATE TRIGGER fail_sqlite_done_for_test
+                BEFORE UPDATE OF status ON write_intents
+                WHEN NEW.status = 'sqlite_done' AND OLD.symbol_id = '{symbol_id}'
+                BEGIN
+                    SELECT RAISE(FAIL, 'sqlite_done blocked for test');
+                END;
+                "#
+            )
+            .as_str(),
+        )
+        .expect("install sqlite_done failure trigger");
+    }
+
     fn count_table_rows(workspace: &Path, table: &str) -> i64 {
         let conn =
             Connection::open(workspace.join(".aether/meta.sqlite")).expect("open sqlite database");
@@ -578,6 +597,7 @@ enabled = false
                     reasoning_trace: None,
                     commit_hash: None,
                 },
+                None,
             )
             .expect("persist scan payload");
 
@@ -593,6 +613,7 @@ enabled = false
                     reasoning_trace: Some("triage reasoning".to_owned()),
                     commit_hash: None,
                 },
+                None,
             )
             .expect("persist triage payload");
 
@@ -615,6 +636,61 @@ enabled = false
             .expect("load sir history");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].sir_hash, sir_hash_value);
+    }
+
+    #[test]
+    fn persist_successful_generation_sqlite_rolls_back_when_sqlite_done_fails() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_only_config(workspace);
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        let pipeline = build_write_pipeline(workspace, Arc::new(PanicInferenceProvider));
+        let symbol_id = "sym-sqlite-rollback";
+        store
+            .upsert_symbol(demo_symbol(symbol_id, "demo::rollback"))
+            .expect("upsert symbol");
+        install_sqlite_done_failure_trigger(workspace, symbol_id);
+
+        let generated = infer::GeneratedSir {
+            symbol: demo_type_symbol(
+                symbol_id,
+                "rollback",
+                "demo::rollback",
+                "src/lib.rs",
+                SymbolKind::Function,
+                "fn rollback() {}\n",
+            ),
+            sir: demo_sir(),
+            provider_name: "test_provider".to_owned(),
+            model_name: "test_model".to_owned(),
+            reasoning_trace: None,
+        };
+
+        let persisted = pipeline
+            .persist_successful_generation_sqlite(
+                &store,
+                &generated,
+                SIR_GENERATION_PASS_SCAN,
+                None,
+            )
+            .expect("sqlite stage should handle failure");
+        assert!(persisted.is_none());
+        assert_eq!(count_table_rows(workspace, "sir_history"), 0);
+        assert_eq!(count_table_rows(workspace, "sir"), 0);
+        assert_eq!(count_table_rows(workspace, "write_intents"), 1);
+        assert_eq!(store.read_sir_blob(symbol_id).expect("read sir blob"), None);
+
+        let failed = store.get_failed_intents().expect("load failed intents");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].symbol_id, symbol_id);
+        assert_eq!(failed[0].status, WriteIntentStatus::Failed);
+        assert!(
+            failed[0]
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("sqlite_done blocked for test"))
+        );
     }
 
     #[test]

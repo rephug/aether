@@ -44,39 +44,49 @@ fn delete_symbol_embeddings_batch(
     }
     Ok(())
 }
+fn delete_symbol_fully(tx: &Transaction<'_>, symbol_id: &str) -> Result<(), StoreError> {
+    let symbol_id = symbol_id.trim();
+    if symbol_id.is_empty() {
+        return Ok(());
+    }
+
+    for (table, column) in [
+        ("sir_embeddings", "symbol_id"),
+        ("sir_history", "symbol_id"),
+        ("write_intents", "symbol_id"),
+        ("sir_requests", "symbol_id"),
+        ("sir_fingerprint_history", "symbol_id"),
+        ("symbol_edges", "source_id"),
+        ("intent_violations", "symbol_id"),
+        ("intent_contracts", "symbol_id"),
+        ("test_intents", "symbol_id"),
+        ("community_snapshot", "symbol_id"),
+        ("drift_results", "symbol_id"),
+        ("sir_quality", "sir_id"),
+        ("sir", "id"),
+        ("symbols", "id"),
+    ] {
+        let sql = format!("DELETE FROM {table} WHERE {column} = ?1");
+        tx.execute(sql.as_str(), params![symbol_id])?;
+    }
+    tx.execute(
+        "DELETE FROM symbol_neighbors WHERE symbol_id = ?1 OR neighbor_id = ?1",
+        params![symbol_id],
+    )?;
+
+    Ok(())
+}
 fn delete_symbol_records_for_ids(
     tx: &Transaction<'_>,
     symbol_ids: &[String],
 ) -> Result<(), StoreError> {
-    if symbol_ids.is_empty() {
+    let normalized = normalize_symbol_ids(symbol_ids);
+    if normalized.is_empty() {
         return Ok(());
     }
 
-    for chunk in symbol_ids.chunks(RECONCILE_PARAM_CHUNK) {
-        let placeholders = std::iter::repeat_n("?", chunk.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let tables = [
-            ("write_intents", "symbol_id"),
-            ("sir_requests", "symbol_id"),
-            ("sir_history", "symbol_id"),
-            ("sir_quality", "sir_id"),
-            ("sir", "id"),
-            ("symbol_neighbors", "symbol_id"),
-            ("symbol_neighbors", "neighbor_id"),
-            ("symbol_edges", "source_id"),
-            ("symbols", "id"),
-        ];
-
-        for (table, column) in tables {
-            let sql = format!("DELETE FROM {table} WHERE {column} IN ({placeholders})");
-            let params_vec = chunk
-                .iter()
-                .cloned()
-                .map(SqlValue::Text)
-                .collect::<Vec<_>>();
-            tx.execute(sql.as_str(), params_from_iter(params_vec))?;
-        }
+    for symbol_id in &normalized {
+        delete_symbol_fully(tx, symbol_id)?;
     }
 
     Ok(())
@@ -269,26 +279,15 @@ impl SqliteStore {
         Ok((migrated_count, pruned_count))
     }
     pub(crate) fn store_mark_removed(&self, symbol_id: &str) -> Result<(), StoreError> {
+        let symbol_id = symbol_id.trim();
+        if symbol_id.is_empty() {
+            return Ok(());
+        }
         {
             let conn = self.conn.lock().unwrap();
-            conn.execute(
-                "DELETE FROM sir_embeddings WHERE symbol_id = ?1",
-                params![symbol_id],
-            )?;
-            conn.execute(
-                "DELETE FROM sir_history WHERE symbol_id = ?1",
-                params![symbol_id],
-            )?;
-            conn.execute(
-                "DELETE FROM symbol_neighbors WHERE symbol_id = ?1 OR neighbor_id = ?1",
-                params![symbol_id],
-            )?;
-            conn.execute("DELETE FROM symbols WHERE id = ?1", params![symbol_id])?;
-            conn.execute(
-                "DELETE FROM sir_quality WHERE sir_id = ?1",
-                params![symbol_id],
-            )?;
-            conn.execute("DELETE FROM sir WHERE id = ?1", params![symbol_id])?;
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+            delete_symbol_fully(&tx, symbol_id)?;
+            tx.commit()?;
         }
 
         let path = self.sir_blob_path(symbol_id);

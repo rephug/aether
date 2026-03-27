@@ -385,7 +385,7 @@ fn prepare_symbol(
         commit_hash: None,
     };
     let (canonical_json, sir_hash_value) = pipeline
-        .persist_sir_payload_into_sqlite(store, &payload)
+        .persist_sir_payload_into_sqlite(store, &payload, None)
         .with_context(|| format!("failed to persist SIR payload for {symbol_id}"))?;
 
     let current_meta = store
@@ -732,6 +732,7 @@ vector_backend = "sqlite"
                     reasoning_trace: None,
                     commit_hash: None,
                 },
+                None,
             )
             .expect("persist scan payload");
 
