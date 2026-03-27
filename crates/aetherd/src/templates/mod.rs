@@ -5,6 +5,7 @@ pub mod claude_md;
 pub mod codex_instructions;
 pub mod cursor_rules;
 pub mod refactor_cmd;
+pub mod refactor_deep_cmd;
 pub mod skill_md;
 
 pub use audit_changes_cmd::AuditChangesCommandTemplate;
@@ -14,6 +15,7 @@ pub use claude_md::ClaudeTemplate;
 pub use codex_instructions::CodexInstructionsTemplate;
 pub use cursor_rules::CursorRulesTemplate;
 pub use refactor_cmd::RefactorCommandTemplate;
+pub use refactor_deep_cmd::RefactorDeepCommandTemplate;
 pub use skill_md::SkillTemplate;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
