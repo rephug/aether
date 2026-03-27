@@ -9,8 +9,8 @@ use clap::ValueEnum;
 
 use crate::templates::{
     AuditChangesCommandTemplate, AuditCommandTemplate, AuditReportCommandTemplate, ClaudeTemplate,
-    CodexInstructionsTemplate, CursorRulesTemplate, RefactorCommandTemplate, SkillTemplate,
-    TemplateContext,
+    CodexInstructionsTemplate, CursorRulesTemplate, RefactorCommandTemplate,
+    RefactorDeepCommandTemplate, SkillTemplate, TemplateContext,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -110,6 +110,10 @@ fn files_for_platform(platform: AgentPlatform, context: &TemplateContext) -> Vec
         files.push(GeneratedFile {
             relative_path: PathBuf::from(".claude/commands/refactor.md"),
             content: RefactorCommandTemplate::render(context),
+        });
+        files.push(GeneratedFile {
+            relative_path: PathBuf::from(".claude/commands/refactor-deep.md"),
+            content: RefactorDeepCommandTemplate::render(context),
         });
         files.push(GeneratedFile {
             relative_path: PathBuf::from(".claude/commands/audit-report.md"),
@@ -214,6 +218,7 @@ mod tests {
         assert!(workspace.join(".cursor/rules").exists());
         assert!(workspace.join(".claude/commands/audit.md").exists());
         assert!(workspace.join(".claude/commands/refactor.md").exists());
+        assert!(workspace.join(".claude/commands/refactor-deep.md").exists());
         assert!(workspace.join(".claude/commands/audit-report.md").exists());
         assert!(workspace.join(".claude/commands/audit-changes.md").exists());
         assert!(
@@ -347,6 +352,15 @@ mod tests {
             .expect("read refactor command");
         assert!(refactor.contains("aether_suggest_trait_split"));
         assert!(refactor.contains("aether_refactor_prep"));
+
+        let refactor_deep = fs::read_to_string(workspace.join(".claude/commands/refactor-deep.md"))
+            .expect("read refactor-deep command");
+        assert!(refactor_deep.contains("argument-hint: [file-path]"));
+        assert!(refactor_deep.contains("aether_sir_inject"));
+        assert!(refactor_deep.contains("aether_refactor_prep"));
+        assert!(refactor_deep.contains("refactor-prep"));
+        assert!(refactor_deep.contains("aether_verify_intent"));
+        assert!(refactor_deep.contains("verify-intent"));
 
         let report = fs::read_to_string(workspace.join(".claude/commands/audit-report.md"))
             .expect("read audit-report command");
