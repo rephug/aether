@@ -1,4 +1,6 @@
 use super::*;
+use crate::sir_history::record_sir_version_if_changed_tx;
+use crate::write_intents::update_intent_status_tx;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SirMetaRecord {
@@ -133,6 +135,64 @@ pub(crate) fn upsert_sir_row_state(
             &row.sir_json,
         ],
     )?;
+    Ok(())
+}
+fn upsert_sir_json_only_tx(
+    tx: &Transaction<'_>,
+    symbol_id: &str,
+    sir_json_string: &str,
+) -> Result<(), StoreError> {
+    tx.execute(
+        r#"
+        INSERT INTO sir (id, sir_hash, sir_version, provider, model, updated_at, sir_json)
+        VALUES (?1, '', 1, '', '', unixepoch(), ?2)
+        ON CONFLICT(id) DO UPDATE SET
+            sir_json = excluded.sir_json
+        "#,
+        params![symbol_id, sir_json_string],
+    )?;
+
+    Ok(())
+}
+fn upsert_sir_meta_tx(tx: &Transaction<'_>, record: &SirMetaRecord) -> Result<(), StoreError> {
+    tx.execute(
+        r#"
+        INSERT INTO sir (
+            id, sir_hash, sir_version, provider, model, generation_pass, reasoning_trace,
+            prompt_hash, staleness_score, updated_at, sir_status, last_error, last_attempt_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        ON CONFLICT(id) DO UPDATE SET
+            sir_hash = excluded.sir_hash,
+            sir_version = excluded.sir_version,
+            provider = excluded.provider,
+            model = excluded.model,
+            generation_pass = excluded.generation_pass,
+            reasoning_trace = excluded.reasoning_trace,
+            prompt_hash = excluded.prompt_hash,
+            staleness_score = excluded.staleness_score,
+            updated_at = excluded.updated_at,
+            sir_status = excluded.sir_status,
+            last_error = excluded.last_error,
+            last_attempt_at = excluded.last_attempt_at
+        "#,
+        params![
+            record.id.as_str(),
+            record.sir_hash.as_str(),
+            record.sir_version.max(1),
+            record.provider.as_str(),
+            record.model.as_str(),
+            record.generation_pass.as_str(),
+            record.reasoning_trace.as_deref(),
+            record.prompt_hash.as_deref(),
+            record.staleness_score,
+            record.updated_at.max(0),
+            record.sir_status.as_str(),
+            record.last_error.as_deref(),
+            record.last_attempt_at.max(0),
+        ],
+    )?;
+
     Ok(())
 }
 
@@ -370,45 +430,65 @@ impl SqliteStore {
         Ok(Some(content))
     }
     pub(crate) fn store_upsert_sir_meta(&self, record: SirMetaRecord) -> Result<(), StoreError> {
-        self.conn.lock().unwrap().execute(
-            r#"
-            INSERT INTO sir (
-                id, sir_hash, sir_version, provider, model, generation_pass, reasoning_trace,
-                prompt_hash, staleness_score, updated_at, sir_status, last_error, last_attempt_at
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-            ON CONFLICT(id) DO UPDATE SET
-                sir_hash = excluded.sir_hash,
-                sir_version = excluded.sir_version,
-                provider = excluded.provider,
-                model = excluded.model,
-                generation_pass = excluded.generation_pass,
-                reasoning_trace = excluded.reasoning_trace,
-                prompt_hash = excluded.prompt_hash,
-                staleness_score = excluded.staleness_score,
-                updated_at = excluded.updated_at,
-                sir_status = excluded.sir_status,
-                last_error = excluded.last_error,
-                last_attempt_at = excluded.last_attempt_at
-            "#,
-            params![
-                record.id,
-                record.sir_hash,
-                record.sir_version,
-                record.provider,
-                record.model,
-                record.generation_pass,
-                record.reasoning_trace,
-                record.prompt_hash,
-                record.staleness_score,
-                record.updated_at,
-                record.sir_status,
-                record.last_error,
-                record.last_attempt_at,
-            ],
-        )?;
-
+        let conn = self.conn.lock().unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        upsert_sir_meta_tx(&tx, &record)?;
+        tx.commit()?;
         Ok(())
+    }
+    pub fn persist_sir_state_atomically(
+        &self,
+        mut record: SirMetaRecord,
+        sir_json_string: &str,
+        commit_hash: Option<&str>,
+        write_intent_id: Option<&str>,
+    ) -> Result<SirVersionWriteResult, StoreError> {
+        let symbol_id = record.id.trim();
+        if symbol_id.is_empty() {
+            return Err(StoreError::Compatibility(
+                "SIR metadata id must be non-empty".to_owned(),
+            ));
+        }
+        record.id = symbol_id.to_owned();
+
+        let conn = self.conn.lock().unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        let current_json =
+            load_sir_row_state(&tx, record.id.as_str())?.and_then(|row| row.sir_json);
+        let write_result = record_sir_version_if_changed_tx(
+            &tx,
+            record.id.as_str(),
+            record.sir_hash.as_str(),
+            record.provider.as_str(),
+            record.model.as_str(),
+            sir_json_string,
+            record.updated_at,
+            commit_hash,
+        )?;
+        let should_write_json = current_json.as_deref() != Some(sir_json_string);
+        if should_write_json {
+            upsert_sir_json_only_tx(&tx, record.id.as_str(), sir_json_string)?;
+        }
+        record.sir_version = write_result.version;
+        record.updated_at = write_result.updated_at;
+        upsert_sir_meta_tx(&tx, &record)?;
+        if let Some(intent_id) = write_intent_id {
+            update_intent_status_tx(&tx, intent_id, WriteIntentStatus::SqliteDone)?;
+        }
+        tx.commit()?;
+
+        if should_write_json && self.mirror_sir_files {
+            let path = self.sir_blob_path(record.id.as_str());
+            if let Err(err) = fs::write(path, sir_json_string) {
+                tracing::warn!(
+                    symbol_id = %record.id,
+                    error = %err,
+                    "aether-store mirror write failed"
+                );
+            }
+        }
+
+        Ok(write_result)
     }
     pub(crate) fn store_get_sir_meta(
         &self,

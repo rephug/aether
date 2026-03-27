@@ -292,6 +292,91 @@ fn mark_removed_deletes_symbol_row() {
 }
 
 #[test]
+fn mark_removed_cleans_all_live_symbol_tables_and_preserves_history() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    let symbol_id = "sym-cleanup";
+
+    seed_live_symbol_cleanup_state(&store, symbol_id);
+    let mirrored_sir_path = store.sir_dir().join(format!("{symbol_id}.json"));
+    assert!(mirrored_sir_path.exists());
+
+    store.mark_removed(symbol_id).expect("mark removed");
+
+    assert_live_symbol_cleanup_empty(&store, symbol_id);
+    assert_preserved_symbol_history_retained(&store, symbol_id);
+    assert_eq!(
+        store
+            .read_sir_blob(symbol_id)
+            .expect("read sir after cleanup"),
+        None
+    );
+    assert!(!mirrored_sir_path.exists());
+}
+
+#[test]
+fn mark_removed_rolls_back_when_delete_fails() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    let symbol_id = "sym-rollback";
+
+    seed_live_symbol_cleanup_state(&store, symbol_id);
+    {
+        let conn = store.conn.lock().expect("lock store connection");
+        conn.execute_batch(
+            format!(
+                r#"
+                CREATE TRIGGER fail_symbol_delete_for_test
+                BEFORE DELETE ON symbols
+                WHEN OLD.id = '{symbol_id}'
+                BEGIN
+                    SELECT RAISE(FAIL, 'symbol delete blocked for test');
+                END;
+                "#
+            )
+            .as_str(),
+        )
+        .expect("install rollback trigger");
+    }
+
+    let err = store
+        .mark_removed(symbol_id)
+        .expect_err("mark removed should roll back on trigger failure");
+    assert!(err.to_string().contains("symbol delete blocked for test"));
+    assert!(
+        count_symbol_rows(
+            &store,
+            "SELECT COUNT(*) FROM sir_embeddings WHERE symbol_id = ?1",
+            symbol_id,
+        ) > 0
+    );
+    assert!(
+        count_symbol_rows(
+            &store,
+            "SELECT COUNT(*) FROM sir_history WHERE symbol_id = ?1",
+            symbol_id,
+        ) > 0
+    );
+    assert!(
+        count_symbol_rows(
+            &store,
+            "SELECT COUNT(*) FROM write_intents WHERE symbol_id = ?1",
+            symbol_id,
+        ) > 0
+    );
+    assert!(count_symbol_rows(&store, "SELECT COUNT(*) FROM sir WHERE id = ?1", symbol_id,) > 0);
+    assert!(
+        count_symbol_rows(
+            &store,
+            "SELECT COUNT(*) FROM symbols WHERE id = ?1",
+            symbol_id,
+        ) > 0
+    );
+    assert_preserved_symbol_history_retained(&store, symbol_id);
+    assert!(store.sir_dir().join(format!("{symbol_id}.json")).exists());
+}
+
+#[test]
 fn search_symbols_matches_by_name_path_language_and_kind() {
     let temp = tempdir().expect("tempdir");
     let store = SqliteStore::open(temp.path()).expect("open store");

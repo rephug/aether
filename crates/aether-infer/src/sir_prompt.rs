@@ -503,7 +503,8 @@ fn append_full_sections(prompt: &mut String) {
 /// Static system instruction for scan pass at the given tier.
 /// This is the cacheable prefix shared across all symbols in a batch.
 pub fn sir_scan_system_prompt(tier: PromptTier) -> String {
-    let mut prompt = String::from("You are generating a Leaf SIR (Semantic Intent Record) annotation.\n");
+    let mut prompt =
+        String::from("You are generating a Leaf SIR (Semantic Intent Record) annotation.\n");
     prompt.push_str(RESPONSE_CONTRACT);
     prompt.push('\n');
     prompt.push_str(FEW_SHOT_EXAMPLES);
@@ -760,7 +761,10 @@ mod tests {
         };
 
         let prompt = build_enriched_sir_prompt("pub fn run() {}", &context, &enrichment);
-        assert!(prompt.contains("You are improving an existing SIR (Semantic Intent Record) annotation"));
+        assert!(
+            prompt
+                .contains("You are improving an existing SIR (Semantic Intent Record) annotation")
+        );
         assert!(prompt.contains("high PageRank + public method"));
         assert!(prompt.contains("Other symbols in this file"));
         assert!(prompt.contains("Previous SIR (improve upon this):"));

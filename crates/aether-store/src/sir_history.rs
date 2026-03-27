@@ -153,6 +153,101 @@ pub(crate) fn append_sir_history_records(
 
     Ok(latest_version)
 }
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_sir_version_if_changed_tx(
+    tx: &Transaction<'_>,
+    symbol_id: &str,
+    sir_hash: &str,
+    provider: &str,
+    model: &str,
+    sir_json: &str,
+    created_at: i64,
+    commit_hash: Option<&str>,
+) -> Result<SirVersionWriteResult, StoreError> {
+    let created_at = created_at.max(0);
+    let commit_hash = normalize_commit_hash(commit_hash);
+
+    let mut latest_stmt = tx.prepare(
+        r#"
+        SELECT version, sir_hash, created_at
+        FROM sir_history
+        WHERE symbol_id = ?1
+        ORDER BY version DESC
+        LIMIT 1
+        "#,
+    )?;
+
+    let latest = latest_stmt
+        .query_row(params![symbol_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .optional()?;
+    drop(latest_stmt);
+
+    if let Some((latest_version, latest_hash, _latest_created_at)) = latest {
+        if latest_hash == sir_hash {
+            Ok(SirVersionWriteResult {
+                version: latest_version,
+                updated_at: created_at,
+                changed: false,
+            })
+        } else {
+            let next_version = latest_version + 1;
+            tx.execute(
+                r#"
+                INSERT INTO sir_history (
+                    symbol_id, version, sir_hash, provider, model, created_at, sir_json, commit_hash
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "#,
+                params![
+                    symbol_id,
+                    next_version,
+                    sir_hash,
+                    provider,
+                    model,
+                    created_at,
+                    sir_json,
+                    commit_hash.as_deref(),
+                ],
+            )?;
+
+            Ok(SirVersionWriteResult {
+                version: next_version,
+                updated_at: created_at,
+                changed: true,
+            })
+        }
+    } else {
+        tx.execute(
+            r#"
+            INSERT INTO sir_history (
+                symbol_id, version, sir_hash, provider, model, created_at, sir_json, commit_hash
+            )
+            VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            params![
+                symbol_id,
+                sir_hash,
+                provider,
+                model,
+                created_at,
+                sir_json,
+                commit_hash.as_deref(),
+            ],
+        )?;
+
+        Ok(SirVersionWriteResult {
+            version: 1,
+            updated_at: created_at,
+            changed: true,
+        })
+    }
+}
 
 impl SqliteStore {
     pub(crate) fn store_list_sir_history(
@@ -233,92 +328,18 @@ impl SqliteStore {
         created_at: i64,
         commit_hash: Option<&str>,
     ) -> Result<SirVersionWriteResult, StoreError> {
-        let created_at = created_at.max(0);
-        let commit_hash = normalize_commit_hash(commit_hash);
         let conn = self.conn.lock().unwrap();
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
-
-        let write_result = {
-            let mut latest_stmt = tx.prepare(
-                r#"
-                SELECT version, sir_hash, created_at
-                FROM sir_history
-                WHERE symbol_id = ?1
-                ORDER BY version DESC
-                LIMIT 1
-                "#,
-            )?;
-
-            let latest = latest_stmt
-                .query_row(params![symbol_id], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                })
-                .optional()?;
-
-            if let Some((latest_version, latest_hash, _latest_created_at)) = latest {
-                if latest_hash == sir_hash {
-                    SirVersionWriteResult {
-                        version: latest_version,
-                        updated_at: created_at,
-                        changed: false,
-                    }
-                } else {
-                    let next_version = latest_version + 1;
-                    tx.execute(
-                        r#"
-                        INSERT INTO sir_history (
-                            symbol_id, version, sir_hash, provider, model, created_at, sir_json, commit_hash
-                        )
-                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                        "#,
-                        params![
-                            symbol_id,
-                            next_version,
-                            sir_hash,
-                            provider,
-                            model,
-                            created_at,
-                            sir_json,
-                            commit_hash.as_deref(),
-                        ],
-                    )?;
-
-                    SirVersionWriteResult {
-                        version: next_version,
-                        updated_at: created_at,
-                        changed: true,
-                    }
-                }
-            } else {
-                tx.execute(
-                    r#"
-                    INSERT INTO sir_history (
-                        symbol_id, version, sir_hash, provider, model, created_at, sir_json, commit_hash
-                    )
-                    VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, ?7)
-                    "#,
-                    params![
-                        symbol_id,
-                        sir_hash,
-                        provider,
-                        model,
-                        created_at,
-                        sir_json,
-                        commit_hash.as_deref(),
-                    ],
-                )?;
-
-                SirVersionWriteResult {
-                    version: 1,
-                    updated_at: created_at,
-                    changed: true,
-                }
-            }
-        };
+        let write_result = record_sir_version_if_changed_tx(
+            &tx,
+            symbol_id,
+            sir_hash,
+            provider,
+            model,
+            sir_json,
+            created_at,
+            commit_hash,
+        )?;
 
         tx.commit()?;
         Ok(write_result)

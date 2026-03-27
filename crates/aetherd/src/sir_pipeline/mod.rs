@@ -1286,75 +1286,33 @@ impl SirPipeline {
         }
 
         let attempted_at = unix_timestamp_secs();
-        let version_write = match store.record_sir_version_if_changed(
-            &generated.symbol.id,
-            &sir_hash_value,
-            payload.provider_name.as_str(),
-            payload.model_name.as_str(),
-            &canonical_json,
-            attempted_at,
-            payload.commit_hash.as_deref(),
-        ) {
-            Ok(version_write) => version_write,
-            Err(err) => {
-                let message = format!("{err:#}");
-                self.mark_intent_failed_safely(store, intent.intent_id.as_str(), message.as_str());
-                tracing::error!(
-                    symbol_id = %generated.symbol.id,
-                    error = %err,
-                    "failed to record SIR history"
-                );
-                return Ok(None);
-            }
-        };
-
-        if version_write.changed
-            && let Err(err) = store.write_sir_blob(&generated.symbol.id, &canonical_json)
-        {
-            let message = format!("{err:#}");
-            self.mark_intent_failed_safely(store, intent.intent_id.as_str(), message.as_str());
-            tracing::error!(
-                symbol_id = %generated.symbol.id,
-                error = %err,
-                "failed to write SIR blob"
-            );
-            return Ok(None);
-        }
-
-        if let Err(err) = store.upsert_sir_meta(SirMetaRecord {
+        let meta = SirMetaRecord {
             id: generated.symbol.id.clone(),
             sir_hash: sir_hash_value.clone(),
-            sir_version: version_write.version,
+            sir_version: 1,
             provider: generated.provider_name.clone(),
             model: generated.model_name.clone(),
             generation_pass: generation_pass.to_owned(),
             reasoning_trace: generated.reasoning_trace.clone(),
             prompt_hash: None,
             staleness_score: None,
-            updated_at: version_write.updated_at,
+            updated_at: attempted_at,
             sir_status: SIR_STATUS_FRESH.to_owned(),
             last_error: None,
             last_attempt_at: attempted_at,
-        }) {
+        };
+        if let Err(err) = store.persist_sir_state_atomically(
+            meta,
+            &canonical_json,
+            payload.commit_hash.as_deref(),
+            Some(intent.intent_id.as_str()),
+        ) {
             let message = format!("{err:#}");
             self.mark_intent_failed_safely(store, intent.intent_id.as_str(), message.as_str());
             tracing::error!(
                 symbol_id = %generated.symbol.id,
                 error = %err,
-                "failed to upsert SIR metadata"
-            );
-            return Ok(None);
-        }
-
-        if let Err(err) =
-            store.update_intent_status(&intent.intent_id, WriteIntentStatus::SqliteDone)
-        {
-            let message = format!("{err:#}");
-            self.mark_intent_failed_safely(store, intent.intent_id.as_str(), message.as_str());
-            tracing::error!(
-                symbol_id = %generated.symbol.id,
-                error = %err,
-                "failed to update write intent status to sqlite_done"
+                "failed to persist sqlite SIR state"
             );
             return Ok(None);
         }
@@ -2209,15 +2167,10 @@ impl SirPipeline {
 
         if status == WriteIntentStatus::Pending {
             let persisted = self
-                .persist_sir_payload_into_sqlite(store, payload)
+                .persist_sir_payload_into_sqlite(store, payload, Some(intent_id))
                 .with_context(|| format!("failed sqlite write stage for intent {intent_id}"))?;
             canonical_json = persisted.0;
             sir_hash_value = persisted.1;
-            store
-                .update_intent_status(intent_id, WriteIntentStatus::SqliteDone)
-                .with_context(|| {
-                    format!("failed to update status sqlite_done for intent {intent_id}")
-                })?;
             status = WriteIntentStatus::SqliteDone;
         } else {
             let stored_blob = store
@@ -2231,17 +2184,12 @@ impl SirPipeline {
             };
             if needs_sqlite_refresh {
                 let persisted = self
-                    .persist_sir_payload_into_sqlite(store, payload)
+                    .persist_sir_payload_into_sqlite(store, payload, Some(intent_id))
                     .with_context(|| {
                         format!("failed sqlite refresh stage for intent {intent_id}")
                     })?;
                 canonical_json = persisted.0;
                 sir_hash_value = persisted.1;
-                store
-                    .update_intent_status(intent_id, WriteIntentStatus::SqliteDone)
-                    .with_context(|| {
-                        format!("failed to update status sqlite_done for intent {intent_id}")
-                    })?;
                 status = WriteIntentStatus::SqliteDone;
             }
         }
@@ -2327,41 +2275,33 @@ impl SirPipeline {
         &self,
         store: &SqliteStore,
         payload: &UpsertSirIntentPayload,
+        write_intent_id: Option<&str>,
     ) -> Result<(String, String)> {
         let (_, canonical_json, sir_hash_value) =
             self.prepare_sir_for_persistence(store, &payload.symbol, &payload.sir)?;
         let attempted_at = unix_timestamp_secs();
-        let version_write = store.record_sir_version_if_changed(
-            payload.symbol.id.as_str(),
-            sir_hash_value.as_str(),
-            payload.provider_name.as_str(),
-            payload.model_name.as_str(),
-            canonical_json.as_str(),
-            attempted_at,
-            payload.commit_hash.as_deref(),
-        )?;
-
-        if version_write.changed {
-            store.write_sir_blob(payload.symbol.id.as_str(), canonical_json.as_str())?;
-        }
-
         // Higher-quality passes still need to promote metadata even when the
         // canonical SIR content is identical to an earlier pass.
-        store.upsert_sir_meta(SirMetaRecord {
-            id: payload.symbol.id.clone(),
-            sir_hash: sir_hash_value.clone(),
-            sir_version: version_write.version,
-            provider: payload.provider_name.clone(),
-            model: payload.model_name.clone(),
-            generation_pass: payload.generation_pass.clone(),
-            reasoning_trace: payload.reasoning_trace.clone(),
-            prompt_hash: None,
-            staleness_score: None,
-            updated_at: version_write.updated_at,
-            sir_status: SIR_STATUS_FRESH.to_owned(),
-            last_error: None,
-            last_attempt_at: attempted_at,
-        })?;
+        store.persist_sir_state_atomically(
+            SirMetaRecord {
+                id: payload.symbol.id.clone(),
+                sir_hash: sir_hash_value.clone(),
+                sir_version: 1,
+                provider: payload.provider_name.clone(),
+                model: payload.model_name.clone(),
+                generation_pass: payload.generation_pass.clone(),
+                reasoning_trace: payload.reasoning_trace.clone(),
+                prompt_hash: None,
+                staleness_score: None,
+                updated_at: attempted_at,
+                sir_status: SIR_STATUS_FRESH.to_owned(),
+                last_error: None,
+                last_attempt_at: attempted_at,
+            },
+            canonical_json.as_str(),
+            payload.commit_hash.as_deref(),
+            write_intent_id,
+        )?;
 
         Ok((canonical_json, sir_hash_value))
     }

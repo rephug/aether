@@ -122,6 +122,21 @@ fn write_intent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WriteInten
         error_message: row.get(8)?,
     })
 }
+pub(crate) fn update_intent_status_tx(
+    tx: &Transaction<'_>,
+    intent_id: &str,
+    status: WriteIntentStatus,
+) -> Result<(), StoreError> {
+    tx.execute(
+        r#"
+        UPDATE write_intents
+        SET status = ?2
+        WHERE intent_id = ?1
+        "#,
+        params![intent_id, status.to_string()],
+    )?;
+    Ok(())
+}
 
 impl SqliteStore {
     pub fn create_write_intent(&self, intent: &WriteIntent) -> Result<(), StoreError> {
@@ -161,14 +176,9 @@ impl SqliteStore {
         status: WriteIntentStatus,
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            r#"
-            UPDATE write_intents
-            SET status = ?2
-            WHERE intent_id = ?1
-            "#,
-            params![intent_id, status.to_string()],
-        )?;
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        update_intent_status_tx(&tx, intent_id, status)?;
+        tx.commit()?;
         Ok(())
     }
     pub fn mark_intent_failed(&self, intent_id: &str, error: &str) -> Result<(), StoreError> {

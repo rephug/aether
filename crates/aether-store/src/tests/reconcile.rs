@@ -153,6 +153,23 @@ fn prune_removes_orphans_not_in_snapshot() {
 }
 
 #[test]
+fn prune_removes_symbol_rows_from_all_live_tables_and_preserves_history() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    let symbol_id = "sym-prune-cleanup";
+
+    seed_live_symbol_cleanup_state(&store, symbol_id);
+
+    let (migrated, pruned) = store
+        .reconcile_and_prune(&[], &[symbol_id.to_owned()])
+        .expect("prune cleanup symbol");
+    assert_eq!((migrated, pruned), (0, 1));
+
+    assert_live_symbol_cleanup_empty(&store, symbol_id);
+    assert_preserved_symbol_history_retained(&store, symbol_id);
+}
+
+#[test]
 fn reconcile_preserves_sir_history() {
     let temp = tempdir().expect("tempdir");
     let store = SqliteStore::open(temp.path()).expect("open store");
