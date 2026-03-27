@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 use aether_config::{AetherConfig, GraphBackend, aether_dir};
 use aether_core::{GitContext, Symbol};
@@ -720,10 +720,7 @@ fn file_was_modified_after(workspace: &Path, file_path: &str, cutoff_secs: i64) 
 }
 
 fn unix_timestamp_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
+    crate::time::current_unix_timestamp_secs()
 }
 
 #[cfg(test)]

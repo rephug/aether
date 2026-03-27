@@ -2849,8 +2849,18 @@ fn prepare_transitive_dependencies(
 }
 
 fn read_intent_summary(store: &SqliteStore, symbol_id: &str) -> Option<String> {
-    let blob = store.read_sir_blob(symbol_id).ok().flatten()?;
-    let sir = serde_json::from_str::<SirAnnotation>(&blob).ok()?;
+    let sir = match read_sir_annotation(store, symbol_id) {
+        Ok(Some(sir)) => sir,
+        Ok(None) => return None,
+        Err(err) => {
+            tracing::warn!(
+                symbol_id,
+                error = %err,
+                "failed to load SIR summary for dependency context"
+            );
+            return None;
+        }
+    };
     let sentence = first_sentence(sir.intent.as_str());
     if sentence.is_empty() {
         None
@@ -3501,8 +3511,10 @@ fn parse_include_sections(raw: Option<&str>) -> Result<IncludeSections> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{self, Write};
     use std::path::Path;
     use std::process::Command;
+    use std::sync::{Arc, Mutex};
 
     use aether_core::Language;
     use aether_sir::{FileSir, synthetic_file_sir_id};
@@ -3511,13 +3523,56 @@ mod tests {
         SymbolRecord, SymbolRelationStore, TestIntentRecord, TestIntentStore,
     };
     use tempfile::tempdir;
+    use tracing::dispatcher::{self, Dispatch};
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::{
         ContextArgs, ExportDocument, LegacyContextDocument, TestGuard, canonicalize_file_sir_json,
-        parse_include_sections, render_export_markdown, render_legacy_markdown,
-        run_context_command, run_sir_context_command,
+        parse_include_sections, read_intent_summary, render_export_markdown,
+        render_legacy_markdown, run_context_command, run_sir_context_command,
     };
     use crate::cli::SirContextArgs;
+
+    #[derive(Clone, Default)]
+    struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> MakeWriter<'a> for SharedLogBuffer {
+        type Writer = SharedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogWriter(self.0.clone())
+        }
+    }
+
+    impl Write for SharedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_logs<T>(run: impl FnOnce() -> T) -> (T, String) {
+        let buffer = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(buffer.clone())
+            .finish();
+        let result = dispatcher::with_default(&Dispatch::new(subscriber), run);
+        let logs = String::from_utf8(buffer.0.lock().expect("log buffer lock").clone())
+            .expect("utf8 logs");
+        (result, logs)
+    }
 
     fn write_test_config(workspace: &Path) {
         fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
@@ -4014,5 +4069,21 @@ vector_backend = "sqlite"
             notices: Vec::new(),
         });
         assert!(export.contains("## Budget Usage"));
+    }
+
+    #[test]
+    fn read_intent_summary_returns_none_and_logs_on_parse_error() {
+        let temp = tempdir().expect("tempdir");
+        write_test_config(temp.path());
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        store
+            .write_sir_blob("sym-invalid", "{invalid")
+            .expect("write invalid sir");
+
+        let (summary, logs) = capture_logs(|| read_intent_summary(&store, "sym-invalid"));
+
+        assert!(summary.is_none());
+        assert!(logs.contains("failed to load SIR summary for dependency context"));
+        assert!(logs.contains("sym-invalid"));
     }
 }

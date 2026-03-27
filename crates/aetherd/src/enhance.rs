@@ -734,6 +734,7 @@ fn collect_coupling_notes(workspace: &Path, files: &[String]) -> Vec<String> {
         Ok(analyzer) => analyzer,
         Err(_) => return Vec::new(),
     };
+    // Intentional best effort: coupling notes are optional prompt enrichment only.
     let file_set = files.iter().cloned().collect::<HashSet<_>>();
     let mut notes = BTreeSet::<String>::new();
 
@@ -988,8 +989,29 @@ fn resolve_file_token(
 }
 
 fn read_sir_annotation(store: &SqliteStore, symbol_id: &str) -> Option<SirAnnotation> {
-    let blob = store.read_sir_blob(symbol_id).ok().flatten()?;
-    serde_json::from_str::<SirAnnotation>(&blob).ok()
+    let blob = match store.read_sir_blob(symbol_id) {
+        Ok(Some(blob)) => blob,
+        Ok(None) => return None,
+        Err(err) => {
+            tracing::warn!(
+                symbol_id,
+                error = %err,
+                "failed to read SIR blob for enhancement context"
+            );
+            return None;
+        }
+    };
+    match serde_json::from_str::<SirAnnotation>(&blob) {
+        Ok(sir) => Some(sir),
+        Err(err) => {
+            tracing::warn!(
+                symbol_id,
+                error = %err,
+                "failed to parse SIR blob for enhancement context"
+            );
+            None
+        }
+    }
 }
 
 fn extraction_user_prompt(prompt: &str) -> String {
@@ -1256,18 +1278,63 @@ fn try_clipboard_command(program: &str, args: &[&str], text: &str) -> io::Result
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{self, Write};
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
 
     use aether_core::{EdgeKind, SymbolEdge};
     use aether_store::{
         SirMetaRecord, SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRelationStore,
     };
     use tempfile::tempdir;
+    use tracing::dispatcher::{self, Dispatch};
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::{
         EnhanceDocumentFormat, EnhanceRequest, TaskType, enhance_prompt_core,
-        extract_intent_via_keywords,
+        extract_intent_via_keywords, read_sir_annotation,
     };
+
+    #[derive(Clone, Default)]
+    struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> MakeWriter<'a> for SharedLogBuffer {
+        type Writer = SharedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogWriter(self.0.clone())
+        }
+    }
+
+    impl Write for SharedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_logs<T>(run: impl FnOnce() -> T) -> (T, String) {
+        let buffer = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(buffer.clone())
+            .finish();
+        let result = dispatcher::with_default(&Dispatch::new(subscriber), run);
+        let logs = String::from_utf8(buffer.0.lock().expect("log buffer lock").clone())
+            .expect("utf8 logs");
+        (result, logs)
+    }
 
     fn write_test_config(workspace: &Path) {
         fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
@@ -1483,5 +1550,21 @@ enabled = true
 
         assert!(result.token_count <= 120);
         assert!(result.enhanced_prompt.contains("[... truncated ...]"));
+    }
+
+    #[test]
+    fn read_sir_annotation_returns_none_and_logs_on_parse_error() {
+        let temp = tempdir().expect("tempdir");
+        write_test_config(temp.path());
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        store
+            .write_sir_blob("sym-invalid", "{invalid")
+            .expect("write invalid sir");
+
+        let (sir, logs) = capture_logs(|| read_sir_annotation(&store, "sym-invalid"));
+
+        assert!(sir.is_none());
+        assert!(logs.contains("failed to parse SIR blob for enhancement context"));
+        assert!(logs.contains("sym-invalid"));
     }
 }

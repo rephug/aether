@@ -1,7 +1,3 @@
-use std::collections::{BTreeSet, HashSet};
-use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use aether_config::{EmbeddingVectorBackend, GraphBackend, load_workspace_config};
 use aether_core::{Language, Position, SourceRange, Symbol, SymbolKind, content_hash};
 use aether_infer::ProviderOverrides;
@@ -11,6 +7,8 @@ use aether_store::{
     WriteIntentStatus, open_vector_store,
 };
 use anyhow::{Context, Result};
+use std::collections::{BTreeSet, HashSet};
+use std::path::Path;
 
 use crate::sir_pipeline::{DEFAULT_SIR_CONCURRENCY, SirPipeline};
 
@@ -462,17 +460,11 @@ fn parse_kind(raw: &str) -> SymbolKind {
 }
 
 fn unix_timestamp_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
+    crate::time::current_unix_timestamp_secs()
 }
 
 fn unix_timestamp_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
+    crate::time::current_unix_timestamp_millis()
 }
 
 #[cfg(test)]

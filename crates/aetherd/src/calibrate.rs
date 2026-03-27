@@ -1,7 +1,3 @@
-use std::collections::HashMap;
-use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use aether_config::{
     MAX_SEARCH_THRESHOLD, MIN_SEARCH_THRESHOLD, ensure_workspace_config, save_workspace_config,
 };
@@ -11,6 +7,8 @@ use aether_store::{
     ThresholdStore,
 };
 use anyhow::{Result, anyhow};
+use std::collections::HashMap;
+use std::path::Path;
 
 const MIN_SYMBOLS_PER_LANGUAGE: usize = 20;
 const MAX_INTRA_FILE_PAIRS: usize = 500;
@@ -259,11 +257,7 @@ fn normalize_language(language: &str) -> &'static str {
 }
 
 fn calibration_timestamp() -> String {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default();
-    seconds.to_string()
+    crate::time::current_unix_timestamp_secs().to_string()
 }
 
 #[cfg(test)]

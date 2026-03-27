@@ -1,6 +1,5 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use super::*;
+use crate::time::current_unix_timestamp_secs;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditFinding {
@@ -71,10 +70,7 @@ END
 "#;
 
 fn current_unix_timestamp() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
+    current_unix_timestamp_secs()
 }
 
 fn normalize_optional_filter(value: Option<&str>) -> Option<String> {

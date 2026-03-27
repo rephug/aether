@@ -1,8 +1,3 @@
-use std::io::Write;
-use std::path::Path;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
 use aether_core::{
     SEARCH_FALLBACK_EMBEDDING_EMPTY_QUERY_VECTOR, SEARCH_FALLBACK_EMBEDDINGS_DISABLED, SearchMode,
 };
@@ -17,6 +12,9 @@ use aether_memory::{
 use aether_store::open_surreal_graph_store_readonly;
 use anyhow::{Context, Result};
 use serde_json::json;
+use std::io::Write;
+use std::path::Path;
+use std::sync::Arc;
 
 use crate::cli::{AskArgs, AskIncludeArg, NotesArgs, RecallArgs, RememberArgs};
 
@@ -301,10 +299,7 @@ fn build_runtime() -> Result<tokio::runtime::Runtime> {
 }
 
 fn current_unix_timestamp_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0))
-        .as_millis() as i64
+    crate::time::current_unix_timestamp_millis()
 }
 
 fn write_json_to_stdout(value: &serde_json::Value) -> Result<()> {

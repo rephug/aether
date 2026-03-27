@@ -76,8 +76,9 @@ pub fn verify_symbol_contracts(
     let verifier = ContractVerifier::from_config(contracts_config);
     let sir_version = store
         .get_sir_meta(symbol_id)
-        .ok()
-        .flatten()
+        .with_context(|| {
+            format!("failed to load SIR metadata for contract verification on {symbol_id}")
+        })?
         .map(|m| m.sir_version)
         .unwrap_or(0);
 

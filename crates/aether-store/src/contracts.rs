@@ -1,8 +1,6 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use rusqlite::{OptionalExtension, params};
 
-use crate::{SqliteStore, StoreError};
+use crate::{SqliteStore, StoreError, time::current_unix_timestamp_secs};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct IntentContractRecord {
@@ -33,10 +31,7 @@ pub struct IntentViolationRecord {
 }
 
 fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+    current_unix_timestamp_secs()
 }
 
 impl SqliteStore {
