@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::AetherMcpServer;
 use crate::AetherMcpError;
@@ -432,10 +431,7 @@ fn normalize_generation_pass(value: Option<&str>) -> Option<String> {
 }
 
 fn current_time_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
+    super::current_unix_timestamp_millis()
 }
 
 fn recency_factor(last_accessed_at: Option<i64>, now_ms: i64) -> f64 {
@@ -476,17 +472,26 @@ fn latest_semantic_drift_by_symbol(
     Ok(drift_by_symbol)
 }
 
-fn parse_confidence(sir_json: Option<&str>) -> Option<f64> {
+fn parse_confidence(symbol_id: &str, sir_json: Option<&str>) -> Option<f64> {
     let sir_json = sir_json?.trim();
     if sir_json.is_empty() {
         return None;
     }
 
-    serde_json::from_str::<JsonValue>(sir_json)
-        .ok()?
-        .get("confidence")?
-        .as_f64()
-        .map(|value| value.clamp(0.0, 1.0))
+    match serde_json::from_str::<JsonValue>(sir_json) {
+        Ok(value) => value
+            .get("confidence")?
+            .as_f64()
+            .map(|value| value.clamp(0.0, 1.0)),
+        Err(err) => {
+            tracing::warn!(
+                symbol_id,
+                error = %err,
+                "failed to parse SIR JSON while loading audit metadata"
+            );
+            None
+        }
+    }
 }
 
 fn load_sir_metadata_batch(
@@ -546,13 +551,14 @@ fn load_sir_metadata_batch(
             let has_blob = sir_json
                 .as_deref()
                 .is_some_and(|value| !value.trim().is_empty());
+            let confidence = parse_confidence(symbol_id.as_str(), sir_json.as_deref());
 
             metadata.insert(
                 symbol_id,
                 AuditSirMetadata {
                     generation_pass: normalized_generation_pass,
                     reasoning_trace: normalized_reasoning,
-                    confidence: parse_confidence(sir_json.as_deref()),
+                    confidence,
                     has_sir: sir_ready || has_blob,
                 },
             );

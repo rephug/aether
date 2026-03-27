@@ -3,10 +3,6 @@ mod community;
 mod epicenter;
 mod velocity;
 
-use std::collections::HashMap;
-use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use aether_config::{AetherConfig, SeismographConfig};
 use aether_graph_algo::{GraphAlgorithmEdge, page_rank_sync};
 use aether_store::{
@@ -14,6 +10,8 @@ use aether_store::{
     SeismographMetricRecord, SqliteStore,
 };
 use anyhow::{Context, Result};
+use std::collections::HashMap;
+use std::path::Path;
 
 pub use aftershock::{AftershockModel, AftershockPrediction, TrainingSample};
 pub use community::CommunityStabilityResult;
@@ -531,8 +529,5 @@ pub(crate) fn resolve_seismograph_config(config: &AetherConfig) -> SeismographCo
 }
 
 fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+    crate::time::current_unix_timestamp_secs()
 }

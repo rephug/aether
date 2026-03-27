@@ -352,8 +352,16 @@ fn read_cross_symbol_sir(
     let Some(blob) = blob else {
         return Ok(None);
     };
-    let Ok(sir) = serde_json::from_str::<SirAnnotation>(&blob) else {
-        return Ok(None);
+    let sir = match serde_json::from_str::<SirAnnotation>(&blob) {
+        Ok(sir) => sir,
+        Err(err) => {
+            tracing::warn!(
+                symbol_id,
+                error = %err,
+                "failed to parse SIR blob for cross-symbol audit context"
+            );
+            return Ok(None);
+        }
     };
 
     Ok(Some(CrossSymbolSir {
@@ -525,19 +533,66 @@ impl AetherMcpServer {
 mod tests {
     use std::collections::HashMap;
     use std::fs;
+    use std::io::{self, Write};
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
 
     use aether_core::{EdgeKind, SymbolEdge};
     use aether_parse::SymbolExtractor;
     use aether_store::{
-        SirMetaRecord, SirStateStore, SymbolCatalogStore, SymbolRecord, SymbolRelationStore,
+        SirMetaRecord, SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord,
+        SymbolRelationStore,
     };
     use tempfile::tempdir;
+    use tracing::dispatcher::{self, Dispatch};
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::{
-        AetherAuditCrossSymbolRequest, NodeRole, middle_truncate_by_chars, truncate_by_char_count,
+        AetherAuditCrossSymbolRequest, NodeRole, middle_truncate_by_chars, read_cross_symbol_sir,
+        truncate_by_char_count,
     };
     use crate::AetherMcpServer;
+
+    #[derive(Clone, Default)]
+    struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> MakeWriter<'a> for SharedLogBuffer {
+        type Writer = SharedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogWriter(self.0.clone())
+        }
+    }
+
+    impl Write for SharedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_logs<T>(run: impl FnOnce() -> T) -> (T, String) {
+        let buffer = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(buffer.clone())
+            .finish();
+        let result = dispatcher::with_default(&Dispatch::new(subscriber), run);
+        let logs = String::from_utf8(buffer.0.lock().expect("log buffer lock").clone())
+            .expect("utf8 logs");
+        (result, logs)
+    }
 
     fn write_test_config(workspace: &Path) {
         fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
@@ -947,5 +1002,23 @@ pub fn root() -> i32 { helper() }
         assert_eq!(truncated.chars().count(), 30);
         assert!(truncated.starts_with(&"😀".repeat(5)));
         assert!(truncated.ends_with(&"界".repeat(6)));
+    }
+
+    #[test]
+    fn read_cross_symbol_sir_returns_none_and_logs_on_parse_error() {
+        let temp = tempdir().expect("tempdir");
+        write_test_config(temp.path());
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        store
+            .write_sir_blob("sym-invalid", "{invalid")
+            .expect("write invalid sir");
+
+        let (sir, logs) = capture_logs(|| {
+            read_cross_symbol_sir(&store, "sym-invalid").expect("cross-symbol read")
+        });
+
+        assert!(sir.is_none());
+        assert!(logs.contains("failed to parse SIR blob for cross-symbol audit context"));
+        assert!(logs.contains("sym-invalid"));
     }
 }

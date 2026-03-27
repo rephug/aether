@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 use aether_analysis::TestIntentAnalyzer;
 use aether_config::{
@@ -2216,22 +2216,33 @@ impl SirPipeline {
         if status == WriteIntentStatus::VectorDone
             && let Some(ref contracts_config) = self.contracts_config
             && contracts_config.enabled
-            && let Ok(Some(emb_record)) = self.load_symbol_embedding(payload.symbol.id.as_str())
         {
-            let config = load_workspace_config(&self.workspace_root).unwrap_or_default();
-            if let Err(err) = crate::contracts::verify_symbol_contracts(
-                store,
-                payload.symbol.id.as_str(),
-                canonical_json.as_str(),
-                Some(emb_record.embedding.as_slice()),
-                &config,
-                &self.workspace_root,
-            ) {
-                tracing::warn!(
-                    symbol_id = %payload.symbol.id,
-                    error = %err,
-                    "Contract verification failed during SIR pipeline"
-                );
+            match self.load_symbol_embedding(payload.symbol.id.as_str()) {
+                Ok(Some(emb_record)) => {
+                    let config = load_workspace_config(&self.workspace_root).unwrap_or_default();
+                    if let Err(err) = crate::contracts::verify_symbol_contracts(
+                        store,
+                        payload.symbol.id.as_str(),
+                        canonical_json.as_str(),
+                        Some(emb_record.embedding.as_slice()),
+                        &config,
+                        &self.workspace_root,
+                    ) {
+                        tracing::warn!(
+                            symbol_id = %payload.symbol.id,
+                            error = %err,
+                            "Contract verification failed during SIR pipeline"
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        symbol_id = %payload.symbol.id,
+                        error = %err,
+                        "failed to load symbol embedding for contract verification"
+                    );
+                }
             }
         }
 
@@ -2945,17 +2956,11 @@ fn resolve_workspace_head_commit(workspace_root: &Path) -> Option<String> {
 }
 
 fn unix_timestamp_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
+    crate::time::current_unix_timestamp_secs()
 }
 
 fn unix_timestamp_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
+    crate::time::current_unix_timestamp_millis()
 }
 
 fn source_modified_unix_millis(path: &Path) -> Option<i64> {

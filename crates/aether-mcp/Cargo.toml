@@ -35,3 +35,4 @@ tracing.workspace = true
 [dev-dependencies]
 aetherd = { path = "../aetherd" }
 tempfile.workspace = true
+tracing-subscriber.workspace = true

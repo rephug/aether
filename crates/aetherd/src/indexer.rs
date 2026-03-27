@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::time::{Duration, Instant};
 
 use aether_analysis::TestIntentAnalyzer;
 use aether_config::{
@@ -245,80 +245,81 @@ impl SharedQueueState {
         }
     }
 
+    fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, mutex_name: &'static str) -> MutexGuard<'a, T> {
+        mutex.lock().unwrap_or_else(|err| {
+            tracing::error!(
+                mutex = mutex_name,
+                error = %err,
+                "SharedQueueState mutex poisoned; recovering"
+            );
+            err.into_inner()
+        })
+    }
+
+    fn lock_queue(&self) -> MutexGuard<'_, SirPriorityQueue> {
+        Self::lock_or_recover(&self.queue, "queue")
+    }
+
+    fn lock_symbol_index(&self) -> MutexGuard<'_, HashMap<String, Symbol>> {
+        Self::lock_or_recover(&self.symbol_index, "symbol_index")
+    }
+
+    fn lock_in_progress(&self) -> MutexGuard<'_, HashSet<String>> {
+        Self::lock_or_recover(&self.in_progress, "in_progress")
+    }
+
+    fn requeue(&self, symbol_id: String, score: f64) {
+        let _ = self.lock_queue().push(symbol_id, score.clamp(0.0, 1.0));
+    }
+
     fn remove_symbol(&self, symbol_id: &str) {
-        if let Ok(mut symbols) = self.symbol_index.lock() {
-            symbols.remove(symbol_id);
-        }
-        if let Ok(mut queue) = self.queue.lock() {
-            queue.remove(symbol_id);
-        }
-        if let Ok(mut in_progress) = self.in_progress.lock() {
-            in_progress.remove(symbol_id);
-        }
+        self.lock_symbol_index().remove(symbol_id);
+        self.lock_queue().remove(symbol_id);
+        self.lock_in_progress().remove(symbol_id);
     }
 
     fn upsert_symbol(&self, symbol: Symbol) {
-        if let Ok(mut symbols) = self.symbol_index.lock() {
-            symbols.insert(symbol.id.clone(), symbol);
-        }
+        self.lock_symbol_index().insert(symbol.id.clone(), symbol);
     }
 
     fn bump_to_front(&self, symbol_id: &str) -> bool {
-        if let Ok(in_progress) = self.in_progress.lock()
-            && in_progress.contains(symbol_id)
-        {
+        if self.lock_in_progress().contains(symbol_id) {
             return false;
         }
-        if let Ok(mut queue) = self.queue.lock()
-            && queue.bump_to_front(symbol_id)
-        {
+        if self.lock_queue().bump_to_front(symbol_id) {
             return true;
         }
 
-        let maybe_symbol = self
-            .symbol_index
-            .lock()
-            .ok()
-            .and_then(|symbols| symbols.get(symbol_id).cloned());
+        let maybe_symbol = self.lock_symbol_index().get(symbol_id).cloned();
         let Some(symbol) = maybe_symbol else {
             return false;
         };
-        if let Ok(mut queue) = self.queue.lock() {
-            let _ = queue.push(symbol.id.clone(), 1.0);
-            queue.bump_to_front(symbol_id)
-        } else {
-            false
-        }
+        let mut queue = self.lock_queue();
+        let _ = queue.push(symbol.id.clone(), 1.0);
+        queue.bump_to_front(symbol_id)
     }
 
     fn pop_task(&self) -> Option<(f64, Symbol)> {
         let (score, symbol_id) = {
-            let mut queue = self.queue.lock().ok()?;
+            let mut queue = self.lock_queue();
             queue.pop()?
         };
         {
-            let mut in_progress = self.in_progress.lock().ok()?;
+            let mut in_progress = self.lock_in_progress();
             if !in_progress.insert(symbol_id.clone()) {
                 return None;
             }
         }
-        let symbol = self
-            .symbol_index
-            .lock()
-            .ok()
-            .and_then(|symbols| symbols.get(&symbol_id).cloned());
-        if symbol.is_none()
-            && let Ok(mut in_progress) = self.in_progress.lock()
-        {
+        let symbol = self.lock_symbol_index().get(&symbol_id).cloned();
+        if symbol.is_none() {
+            let mut in_progress = self.lock_in_progress();
             in_progress.remove(&symbol_id);
         }
         symbol.map(|symbol| (score, symbol))
     }
 
     fn complete_task(&self, symbol_id: &str) {
-        if let Ok(mut in_progress) = self.in_progress.lock() {
-            in_progress.remove(symbol_id);
-        }
+        self.lock_in_progress().remove(symbol_id);
     }
 }
 
@@ -955,8 +956,16 @@ where
         let Some(blob) = store.read_sir_blob(symbol.id.as_str())? else {
             continue;
         };
-        let Ok(baseline_sir) = serde_json::from_str::<SirAnnotation>(&blob) else {
-            continue;
+        let baseline_sir = match serde_json::from_str::<SirAnnotation>(&blob) {
+            Ok(sir) => sir,
+            Err(err) => {
+                tracing::warn!(
+                    symbol_id = %symbol.id,
+                    error = %err,
+                    "failed to parse baseline SIR while selecting quality pass candidates"
+                );
+                continue;
+            }
         };
         candidates.push(QualityPassCandidate {
             symbol: symbol.clone(),
@@ -1094,7 +1103,17 @@ pub fn build_enrichment_context(
     let file_rollup_id = synthetic_file_sir_id(symbol.language.as_str(), symbol.file_path.as_str());
     let file_intent = store
         .read_sir_blob(file_rollup_id.as_str())?
-        .and_then(|blob| serde_json::from_str::<FileSir>(&blob).ok())
+        .and_then(|blob| match serde_json::from_str::<FileSir>(&blob) {
+            Ok(sir) => Some(sir),
+            Err(err) => {
+                tracing::warn!(
+                    symbol_id = %file_rollup_id,
+                    error = %err,
+                    "failed to parse file rollup SIR while building enrichment context"
+                );
+                None
+            }
+        })
         .map(|sir| sir.intent.trim().to_owned())
         .unwrap_or_default();
 
@@ -1106,8 +1125,16 @@ pub fn build_enrichment_context(
         let Some(blob) = store.read_sir_blob(peer.id.as_str())? else {
             continue;
         };
-        let Ok(peer_sir) = serde_json::from_str::<SirAnnotation>(&blob) else {
-            continue;
+        let peer_sir = match serde_json::from_str::<SirAnnotation>(&blob) {
+            Ok(sir) => sir,
+            Err(err) => {
+                tracing::warn!(
+                    symbol_id = %peer.id,
+                    error = %err,
+                    "failed to parse peer SIR while building enrichment context"
+                );
+                continue;
+            }
         };
         neighbors.push((
             priority_scores
@@ -1994,9 +2021,17 @@ fn spawn_semantic_worker(
         .name(format!("aether-sir-{worker_id}"))
         .spawn(move || {
             loop {
-                if let Ok(requested) = store.consume_sir_requests(REQUEST_POLL_BATCH) {
-                    for symbol_id in requested {
-                        let _ = queue_state.bump_to_front(symbol_id.as_str());
+                match store.consume_sir_requests(REQUEST_POLL_BATCH) {
+                    Ok(requested) => {
+                        for symbol_id in requested {
+                            let _ = queue_state.bump_to_front(symbol_id.as_str());
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "failed to consume SIR requests for watcher worker, will retry"
+                        );
                     }
                 }
 
@@ -2006,20 +2041,45 @@ fn spawn_semantic_worker(
                 };
 
                 let symbol_id = symbol.id.clone();
-                let exists = store
-                    .get_symbol_record(symbol_id.as_str())
-                    .map(|record| record.is_some())
-                    .unwrap_or(false);
+                let exists = match store.get_symbol_record(symbol_id.as_str()) {
+                    Ok(record) => record.is_some(),
+                    Err(err) => {
+                        tracing::warn!(
+                            symbol_id = %symbol_id,
+                            error = %err,
+                            "failed to confirm queued symbol before watcher generation"
+                        );
+                        queue_state.complete_task(symbol_id.as_str());
+                        continue;
+                    }
+                };
                 if !exists {
                     queue_state.complete_task(symbol_id.as_str());
                     continue;
                 }
 
-                let previous_meta = store.get_sir_meta(symbol_id.as_str()).ok().flatten();
-                let previous_embedding = pipeline
-                    .load_symbol_embedding(symbol_id.as_str())
-                    .ok()
-                    .flatten();
+                let previous_meta = match store.get_sir_meta(symbol_id.as_str()) {
+                    Ok(meta) => meta,
+                    Err(err) => {
+                        tracing::warn!(
+                            symbol_id = %symbol_id,
+                            error = %err,
+                            "failed to read prior SIR metadata for queued watcher symbol"
+                        );
+                        None
+                    }
+                };
+                let previous_embedding = match pipeline.load_symbol_embedding(symbol_id.as_str()) {
+                    Ok(embedding) => embedding,
+                    Err(err) => {
+                        tracing::warn!(
+                            symbol_id = %symbol_id,
+                            error = %err,
+                            "failed to read prior embedding for queued watcher symbol"
+                        );
+                        None
+                    }
+                };
                 let event = SymbolChangeEvent {
                     file_path: symbol.file_path.clone(),
                     language: symbol.language,
@@ -2064,9 +2124,7 @@ fn spawn_semantic_worker(
                             error = %err,
                             "semantic indexing failed for queued symbol"
                         );
-                        let _ = queue_state.queue.lock().map(|mut queue| {
-                            queue.push(symbol_id.clone(), score.clamp(0.0, 1.0));
-                        });
+                        queue_state.requeue(symbol_id.clone(), score);
                     }
                 }
 
@@ -2155,10 +2213,7 @@ fn enqueue_changed_symbols(
     }
 
     let scores = compute_symbol_priority_scores(workspace, store, changed_symbols);
-    let in_progress = queue_state
-        .in_progress
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
+    let in_progress = queue_state.lock_in_progress();
     let mut queued = 0usize;
 
     for symbol in changed_symbols {
@@ -2166,10 +2221,7 @@ fn enqueue_changed_symbols(
             continue;
         }
         let score = scores.get(symbol.id.as_str()).copied().unwrap_or(0.0);
-        let mut queue = queue_state
-            .queue
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
+        let mut queue = queue_state.lock_queue();
         if queue.push(symbol.id.clone(), score) {
             queued += 1;
             drop(queue);
@@ -2517,28 +2569,67 @@ fn to_test_intent_record(intent: TestIntent, now_ms: i64) -> TestIntentRecord {
 }
 
 fn unix_timestamp_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
+    crate::time::current_unix_timestamp_secs()
 }
 
 fn unix_timestamp_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
+    crate::time::current_unix_timestamp_millis()
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
 
     use aether_config::WatcherConfig;
     use aether_core::{Language, Position, SourceRange, SymbolKind};
     use tempfile::tempdir;
+    use tracing::dispatcher::{self, Dispatch};
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> MakeWriter<'a> for SharedLogBuffer {
+        type Writer = SharedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogWriter(self.0.clone())
+        }
+    }
+
+    impl Write for SharedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_logs<T>(run: impl FnOnce() -> T) -> (T, String) {
+        let buffer = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(buffer.clone())
+            .finish();
+        let result = dispatcher::with_default(&Dispatch::new(subscriber), run);
+        let logs = String::from_utf8(buffer.0.lock().expect("log buffer lock").clone())
+            .expect("utf8 logs");
+        (result, logs)
+    }
 
     fn test_symbol(symbol_id: &str, signature: &str) -> Symbol {
         Symbol {
@@ -2617,6 +2708,25 @@ vector_backend = "sqlite"
             runtime.prompt_thinking_fingerprint(InferenceProviderKind::Gemini.as_str()),
             "dynamic"
         );
+    }
+
+    #[test]
+    fn shared_queue_state_recovers_from_poisoned_queue_lock() {
+        let symbol = test_symbol("sym-poison", "sig-poison");
+        let queue_state =
+            SharedQueueState::new(HashMap::from_iter([(symbol.id.clone(), symbol.clone())]));
+        let poisoned_queue = queue_state.queue.clone();
+
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poisoned_queue.lock().expect("lock queue");
+            panic!("poison queue");
+        });
+
+        let (bumped, logs) = capture_logs(|| queue_state.bump_to_front(symbol.id.as_str()));
+
+        assert!(bumped);
+        assert!(logs.contains("SharedQueueState mutex poisoned; recovering"));
+        assert!(logs.contains("queue"));
     }
 
     fn upsert_symbol_snapshot(store: &SqliteStore, symbol: &Symbol, last_seen_at: i64) {

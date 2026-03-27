@@ -1,11 +1,9 @@
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use aether_core::{Language, Position, SourceRange, Symbol, SymbolKind};
 use aether_parse::SymbolExtractor;
 use aether_store::{SqliteStore, SymbolCatalogStore, SymbolRecord};
 use anyhow::{Context, Result, anyhow};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 pub(crate) struct FreshSymbolSource {
     pub(crate) symbol: Symbol,
@@ -154,10 +152,7 @@ pub(crate) fn first_line(value: &str) -> String {
 }
 
 pub(crate) fn current_unix_timestamp_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
+    crate::time::current_unix_timestamp_secs()
 }
 
 pub(crate) fn format_relative_age(timestamp: i64) -> String {
