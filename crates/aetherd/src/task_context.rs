@@ -520,7 +520,7 @@ pub(crate) fn resolve_task_symbols_with_context(
 }
 
 pub fn run_task_history_command(workspace: &Path, args: TaskHistoryArgs) -> Result<()> {
-    let store = SqliteStore::open_readonly(workspace).context("failed to open local store")?;
+    let store = SqliteStore::open(workspace).context("failed to open local store")?;
     let history = store
         .list_recent_task_history(args.limit)
         .context("failed to list recent task history")?;
@@ -529,7 +529,7 @@ pub fn run_task_history_command(workspace: &Path, args: TaskHistoryArgs) -> Resu
 }
 
 pub fn run_task_relevance_command(workspace: &Path, args: TaskRelevanceArgs) -> Result<()> {
-    let store = SqliteStore::open_readonly(workspace).context("failed to open local store")?;
+    let store = SqliteStore::open(workspace).context("failed to open local store")?;
     let resolution = resolve_task_symbols_with_context(
         workspace,
         &store,
@@ -964,6 +964,42 @@ vector_backend = "sqlite"
                 .any(|notice| notice.contains("sparse-only"))
         );
         assert_eq!(resolution.ranked_symbols[0].0, "sym-auth");
+    }
+
+    #[test]
+    fn task_history_command_initializes_store_on_fresh_workspace() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_test_config(workspace);
+
+        run_task_history_command(workspace, TaskHistoryArgs { limit: 10 })
+            .expect("run task-history");
+
+        assert!(workspace.join(".aether").join("meta.sqlite").exists());
+        let reopened = SqliteStore::open(workspace).expect("reopen store");
+        let history = reopened
+            .list_recent_task_history(10)
+            .expect("list recent task history");
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn task_relevance_command_initializes_store_on_fresh_workspace() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_test_config(workspace);
+
+        run_task_relevance_command(
+            workspace,
+            TaskRelevanceArgs {
+                task: "repair auth flow".to_owned(),
+                branch: None,
+                top: 5,
+            },
+        )
+        .expect("run task-relevance");
+
+        assert!(workspace.join(".aether").join("meta.sqlite").exists());
     }
 
     #[test]

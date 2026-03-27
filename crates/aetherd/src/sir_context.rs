@@ -462,12 +462,18 @@ pub fn run_context_command(workspace: &Path, args: ContextArgs) -> Result<()> {
         }
     };
     let overview = build_project_overview(workspace, &store, health_report.as_ref(), &mut notices)?;
+    let graph_store = if layers.coupling {
+        resolve_context_graph_store(workspace)
+    } else {
+        None
+    };
 
     let mut prepared = Vec::new();
     for target in &targets {
         prepared.push(prepare_target_section(
             workspace,
             &store,
+            graph_store.as_ref(),
             target,
             layers,
             resolved.depth,
@@ -517,6 +523,11 @@ pub fn run_sir_context_command(workspace: &Path, args: SirContextArgs) -> Result
     let include = parse_include_sections(args.include.as_deref())?;
     let selectors = context_selectors(workspace, &args)?;
     let store = SqliteStore::open(workspace).context("failed to open local store")?;
+    let graph_store = if include.coupling {
+        resolve_context_graph_store(workspace)
+    } else {
+        None
+    };
 
     let mut resolution_errors = Vec::new();
     let mut resolved = Vec::new();
@@ -539,6 +550,7 @@ pub fn run_sir_context_command(workspace: &Path, args: SirContextArgs) -> Result
             prepare_symbol_context(
                 workspace,
                 &store,
+                graph_store.as_ref(),
                 selector.as_str(),
                 record,
                 include,
@@ -568,6 +580,21 @@ pub fn run_sir_context_command(workspace: &Path, args: SirContextArgs) -> Result
         writeln!(&mut out).context("failed to write trailing newline")?;
     }
     Ok(())
+}
+
+fn resolve_context_graph_store(workspace: &Path) -> Option<SurrealGraphStore> {
+    let cfg = aether_config::load_workspace_config(workspace).ok()?;
+    if !matches!(
+        cfg.storage.graph_backend,
+        aether_config::GraphBackend::Surreal | aether_config::GraphBackend::Cozo
+    ) {
+        return None;
+    }
+    if let Some(daemon) = crate::daemon_detect::detect_running_daemon(&cfg, workspace) {
+        crate::daemon_detect::warn_daemon_detected(&daemon, "context");
+        return None;
+    }
+    open_surreal_graph_store_readonly(workspace).ok()
 }
 
 fn context_targets(workspace: &Path, args: &ContextArgs) -> Result<Vec<ContextTarget>> {
@@ -743,6 +770,7 @@ pub(crate) fn build_project_overview(
 pub(crate) fn prepare_target_section(
     workspace: &Path,
     store: &SqliteStore,
+    graph_store: Option<&SurrealGraphStore>,
     target: &ContextTarget,
     layers: LayerSelection,
     depth: u32,
@@ -754,6 +782,7 @@ pub(crate) fn prepare_target_section(
         ContextTarget::File { path } => prepare_file_target(
             workspace,
             store,
+            graph_store,
             path.as_str(),
             layers,
             depth,
@@ -767,6 +796,7 @@ pub(crate) fn prepare_target_section(
         } => prepare_symbol_target(
             workspace,
             store,
+            graph_store,
             selector.as_str(),
             file_hint.as_deref(),
             layers,
@@ -782,6 +812,7 @@ pub(crate) fn prepare_target_section(
 fn prepare_file_target(
     workspace: &Path,
     store: &SqliteStore,
+    graph_store: Option<&SurrealGraphStore>,
     path: &str,
     layers: LayerSelection,
     depth: u32,
@@ -821,27 +852,6 @@ fn prepare_file_target(
         }
     };
 
-    let graph_store = {
-        let skip = aether_config::load_workspace_config(workspace)
-            .ok()
-            .and_then(|cfg| {
-                if matches!(
-                    cfg.storage.graph_backend,
-                    aether_config::GraphBackend::Surreal | aether_config::GraphBackend::Cozo
-                ) {
-                    crate::daemon_detect::detect_running_daemon(&cfg, workspace)
-                } else {
-                    None
-                }
-            });
-        if let Some(ref daemon) = skip {
-            crate::daemon_detect::warn_daemon_detected(daemon, "context");
-            None
-        } else {
-            open_surreal_graph_store_readonly(workspace).ok()
-        }
-    };
-
     if symbol_records.is_empty() {
         output
             .notices
@@ -878,7 +888,7 @@ fn prepare_file_target(
             tests = prepare_tests_for_file(store, path, task)?;
         }
         if layers.coupling {
-            let (entries, notice) = prepare_coupling_for_file(graph_store.as_ref(), path)?;
+            let (entries, notice) = prepare_coupling_for_file(graph_store, path)?;
             if let Some(notice) = notice {
                 output.notices.push(notice);
             }
@@ -950,6 +960,7 @@ fn prepare_file_target(
 fn prepare_symbol_target(
     workspace: &Path,
     store: &SqliteStore,
+    graph_store: Option<&SurrealGraphStore>,
     selector: &str,
     file_hint: Option<&str>,
     layers: LayerSelection,
@@ -968,7 +979,15 @@ fn prepare_symbol_target(
         changes: false,
         health: layers.health,
     };
-    let prepared = prepare_symbol_context(workspace, store, selector, &record, include, depth)?;
+    let prepared = prepare_symbol_context(
+        workspace,
+        store,
+        graph_store,
+        selector,
+        &record,
+        include,
+        depth,
+    )?;
     let mut output = TargetSection::symbol(
         selector.to_owned(),
         record.file_path.clone(),
@@ -2416,6 +2435,7 @@ fn context_selectors(workspace: &Path, args: &SirContextArgs) -> Result<Vec<Stri
 fn prepare_symbol_context(
     workspace: &Path,
     store: &SqliteStore,
+    graph_store: Option<&SurrealGraphStore>,
     selector: &str,
     record: &SymbolRecord,
     include: IncludeSections,
@@ -2472,29 +2492,8 @@ fn prepare_symbol_context(
     } else {
         Vec::new()
     };
-    let graph_store = {
-        let skip = aether_config::load_workspace_config(workspace)
-            .ok()
-            .and_then(|cfg| {
-                if matches!(
-                    cfg.storage.graph_backend,
-                    aether_config::GraphBackend::Surreal | aether_config::GraphBackend::Cozo
-                ) {
-                    crate::daemon_detect::detect_running_daemon(&cfg, workspace)
-                } else {
-                    None
-                }
-            });
-        if let Some(ref daemon) = skip {
-            crate::daemon_detect::warn_daemon_detected(daemon, "context");
-            None
-        } else {
-            open_surreal_graph_store_readonly(workspace).ok()
-        }
-    };
     let coupling = if include.coupling {
-        let (entries, notice) =
-            prepare_coupling_for_file(graph_store.as_ref(), record.file_path.as_str())?;
+        let (entries, notice) = prepare_coupling_for_file(graph_store, record.file_path.as_str())?;
         if let Some(notice) = notice {
             base_output.notices.push(notice);
         }
