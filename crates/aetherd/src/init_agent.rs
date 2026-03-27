@@ -357,6 +357,7 @@ mod tests {
             .expect("read refactor-deep command");
         assert!(refactor_deep.contains("argument-hint: [file-path]"));
         assert!(refactor_deep.contains("aether_sir_inject"));
+        assert!(refactor_deep.contains("\"file_filter\": \"$ARGUMENTS\""));
         assert!(refactor_deep.contains("aether_refactor_prep"));
         assert!(refactor_deep.contains("refactor-prep"));
         assert!(refactor_deep.contains("aether_verify_intent"));

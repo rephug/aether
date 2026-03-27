@@ -16,12 +16,16 @@ snapshot, performs the refactoring, and verifies nothing drifted.
 
 ## Phase 1: Assess
 
-1. Call `aether_health` scoped to $ARGUMENTS to get structural risk scores.
-2. Call `aether_audit_candidates` scoped to $ARGUMENTS with `top_n` set to 30.
-   Note which symbols have weak SIRs (low confidence, scan/triage-only,
-   missing error modes or side effects).
-3. Call `aether_suggest_trait_split` if the target is a large trait or impl
-   block. Use the clustering suggestions to inform split decisions later.
+1. Call `aether_health` to get workspace structural risk scores. Filter the
+   returned `critical_symbols`, `bottlenecks`, and `risk_hotspots` down to
+   entries whose `file` matches $ARGUMENTS.
+2. Call `aether_audit_candidates` with `{ "file_filter": "$ARGUMENTS",
+   "top_n": 30 }`. Note which symbols have weak SIRs (low confidence,
+   scan/triage-only, missing error modes or side effects).
+3. If the file contains a large trait, struct, or impl block, call
+   `aether_suggest_trait_split` with that symbol's name plus
+   `{ "file": "$ARGUMENTS" }`. Use the clustering suggestions to inform
+   split decisions later.
 
 Report: "Found N symbols, M have weak SIRs, K are high-risk."
 
@@ -64,9 +68,10 @@ Save the snapshot ID for Phase 5.
 
 Now perform the actual refactoring. Use AETHER intelligence throughout:
 
-1. Call `aether_sir_context` for the primary symbol or file-level target in
-   $ARGUMENTS to get the full multi-layer context (source + SIR + graph +
-   health + coupling).
+1. Call `aether_sir_context` for the highest-risk symbol selected in Phase 1
+   using its symbol ID or qualified name. Repeat for any additional symbols
+   you need full multi-layer context for (source + SIR + graph + health +
+   coupling).
 2. For each split, move, or extract decision:
    - Check `aether_dependencies` to understand what breaks if this moves.
    - Check the enhanced SIR for implicit contracts callers depend on.
