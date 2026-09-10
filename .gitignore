@@ -17,3 +17,4 @@ tests/stress/reports/*.json
 tests/stress/repos/
 .mcp.json
 .claude/
+RUN_STATUS.md
