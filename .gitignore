@@ -17,3 +17,6 @@ tests/stress/reports/*.json
 tests/stress/repos/
 .mcp.json
 .claude/
+
+# Run-series state file (never committed)
+RUN_STATUS.md
