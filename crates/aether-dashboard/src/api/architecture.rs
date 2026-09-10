@@ -179,7 +179,7 @@ pub(crate) fn load_architecture_data(
         })
         .collect::<Vec<_>>();
 
-    communities.sort_by(|left, right| left.community_id.cmp(&right.community_id));
+    communities.sort_by_key(|left| left.community_id);
 
     let misplaced_count = symbols.iter().filter(|symbol| symbol.misplaced).count();
 

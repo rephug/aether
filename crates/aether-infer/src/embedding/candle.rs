@@ -276,7 +276,7 @@ impl CandleEmbeddingProvider {
             let batch_inputs = chunk.iter().map(|(_, text)| *text).collect::<Vec<_>>();
             let batch_outputs = Self::embed_chunk(loaded, &batch_inputs)?;
 
-            for ((index, _), embedding) in chunk.iter().zip(batch_outputs.into_iter()) {
+            for ((index, _), embedding) in chunk.iter().zip(batch_outputs) {
                 outputs[*index] = embedding;
             }
         }

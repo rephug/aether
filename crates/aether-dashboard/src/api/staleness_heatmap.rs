@@ -314,7 +314,7 @@ fn build_heatmap_from_date_data(
             (module.clone(), total)
         })
         .collect();
-    module_activity.sort_by(|a, b| b.1.cmp(&a.1));
+    module_activity.sort_by_key(|a| std::cmp::Reverse(a.1));
     module_activity.truncate(MAX_MODULES);
 
     let modules: Vec<String> = module_activity.into_iter().map(|(name, _)| name).collect();
