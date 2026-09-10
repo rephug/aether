@@ -52,7 +52,7 @@ impl WeightedGraph {
                 }
             })
             .collect::<Vec<_>>();
-        neighbors.sort_by(|left, right| left.0.cmp(&right.0));
+        neighbors.sort_by_key(|left| left.0);
         neighbors
     }
 

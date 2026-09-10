@@ -132,7 +132,7 @@ fn scan_workspace_quick(workspace: &std::path::Path) -> (Vec<(String, usize)>, u
         .into_iter()
         .map(|(lang, count)| (lang.to_owned(), count))
         .collect();
-    result.sort_by(|a, b| b.1.cmp(&a.1));
+    result.sort_by_key(|a| std::cmp::Reverse(a.1));
 
     (result, total)
 }

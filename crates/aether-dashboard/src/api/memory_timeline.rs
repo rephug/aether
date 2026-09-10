@@ -85,7 +85,7 @@ fn load_memory_timeline(
     }
 
     // Sort all events by timestamp descending
-    events.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    events.sort_by_key(|a| std::cmp::Reverse(a.timestamp));
     events.truncate(MAX_EVENTS);
 
     let total = events.len();
