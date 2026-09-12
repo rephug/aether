@@ -5,6 +5,7 @@ use aether_sir::{
 use aether_store::{
     SirHistoryStore, SirMetaRecord, SirStateStore, SymbolCatalogStore, SymbolRecord,
 };
+use aetherd::sir_pipeline::SirPipeline;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -62,10 +63,43 @@ pub struct AetherSirInjectResponse {
     pub qualified_name: String,
     pub sir_hash: String,
     pub sir_version: i64,
+    /// Rounded to 4 decimal places for display; stored precision is untouched.
+    #[serde(serialize_with = "serialize_optional_rounded_confidence")]
     pub previous_confidence: Option<f32>,
+    /// Rounded to 4 decimal places for display; stored precision is untouched.
+    #[serde(serialize_with = "serialize_rounded_confidence")]
     pub new_confidence: f32,
     pub status: String,
     pub note: Option<String>,
+    /// What happened to the symbol's embedding: `refreshed`, `unchanged`,
+    /// `skipped: <reason>` or `failed: <error>`.
+    pub embedding_status: String,
+}
+
+/// Round an f32 confidence to 4 decimal places as f64, so the JSON response reads
+/// `0.97` rather than the widened-f32 artifact `0.9700000286102295`.
+pub(crate) fn round_confidence_for_display(value: f32) -> f64 {
+    (f64::from(value) * 10_000.0).round() / 10_000.0
+}
+
+fn serialize_rounded_confidence<S>(value: &f32, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_f64(round_confidence_for_display(*value))
+}
+
+fn serialize_optional_rounded_confidence<S>(
+    value: &Option<f32>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Some(value) => serializer.serialize_some(&round_confidence_for_display(*value)),
+        None => serializer.serialize_none(),
+    }
 }
 
 fn empty_sir_annotation(confidence: f32) -> SirAnnotation {
@@ -245,6 +279,7 @@ impl AetherMcpServer {
                 new_confidence,
                 status: "blocked".to_owned(),
                 note,
+                embedding_status: "skipped: inject blocked".to_owned(),
             });
         }
 
@@ -317,6 +352,16 @@ impl AetherMcpServer {
             last_attempt_at: version_write.updated_at,
         })?;
 
+        let embedding_status =
+            self.refresh_embedding_after_inject(symbol_id.as_str(), hash.as_str(), &canonical_json);
+        let note = match embedding_status.as_str() {
+            "refreshed" | "unchanged" => None,
+            _ => Some(format!(
+                "embedding {embedding_status}; run 'aetherd --index-once --embeddings-only' \
+                 if semantic search accuracy matters"
+            )),
+        };
+
         Ok(AetherSirInjectResponse {
             symbol_id,
             qualified_name,
@@ -325,11 +370,40 @@ impl AetherMcpServer {
             previous_confidence,
             new_confidence,
             status: "injected".to_owned(),
-            note: Some(
-                "Embeddings not refreshed - run 'aetherd regenerate --embed-only' if semantic search accuracy matters"
-                    .to_owned(),
-            ),
+            note,
+            embedding_status,
         })
+    }
+
+    /// Refresh the symbol's embedding right after an inject so semantic search sees the
+    /// enriched SIR immediately (the same path `aetherd sir inject` and the
+    /// embeddings-only index pass use). Never fails the inject: problems are reported
+    /// in the returned status.
+    fn refresh_embedding_after_inject(
+        &self,
+        symbol_id: &str,
+        sir_hash: &str,
+        canonical_json: &str,
+    ) -> String {
+        if !self.state.config.embeddings.enabled {
+            return "skipped: embeddings disabled".to_owned();
+        }
+        let pipeline = match SirPipeline::new_embeddings_only(self.state.workspace.clone()) {
+            Ok(pipeline) => pipeline,
+            Err(err) => return format!("failed: {err:#}"),
+        };
+        match pipeline.refresh_embedding_if_needed(
+            symbol_id,
+            sir_hash,
+            canonical_json,
+            false,
+            &mut std::io::sink(),
+            None,
+        ) {
+            Ok(true) => "refreshed".to_owned(),
+            Ok(false) => "unchanged".to_owned(),
+            Err(err) => format!("failed: {err:#}"),
+        }
     }
 }
 
@@ -342,7 +416,10 @@ mod tests {
     use aether_store::{SirHistoryStore, SirStateStore, SymbolCatalogStore, SymbolRecord};
     use tempfile::tempdir;
 
-    use super::{AetherSirInjectRequest, DEFAULT_INJECT_CONFIDENCE, resolve_symbol_selector};
+    use super::{
+        AetherSirInjectRequest, AetherSirInjectResponse, DEFAULT_INJECT_CONFIDENCE,
+        resolve_symbol_selector, round_confidence_for_display,
+    };
     use crate::AetherMcpServer;
 
     fn write_test_config(workspace: &Path) {
@@ -610,5 +687,32 @@ vector_backend = "sqlite"
             .expect("sir blob exists");
         let sir: SirAnnotation = serde_json::from_str(&blob).expect("parse sir");
         assert_eq!(sir.confidence, DEFAULT_INJECT_CONFIDENCE);
+    }
+
+    #[test]
+    fn inject_response_rounds_confidence_for_display() {
+        assert_eq!(round_confidence_for_display(0.97), 0.97);
+        assert_eq!(round_confidence_for_display(0.123_456), 0.1235);
+        let response = AetherSirInjectResponse {
+            symbol_id: "sym".to_owned(),
+            qualified_name: "crate::sym".to_owned(),
+            sir_hash: "hash".to_owned(),
+            sir_version: 1,
+            previous_confidence: Some(0.83),
+            new_confidence: 0.97,
+            status: "injected".to_owned(),
+            note: None,
+            embedding_status: "skipped: embeddings disabled".to_owned(),
+        };
+        let rendered = serde_json::to_string(&response).expect("serialize");
+        assert!(rendered.contains("\"new_confidence\":0.97"), "{rendered}");
+        assert!(
+            rendered.contains("\"previous_confidence\":0.83"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("0.9700000"), "{rendered}");
+        // serde_json::Value goes through f64 too, which is where the artifact used to appear.
+        let value = serde_json::to_value(&response).expect("to_value");
+        assert_eq!(value["new_confidence"].to_string(), "0.97");
     }
 }

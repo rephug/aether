@@ -141,6 +141,60 @@ fn looks_like_sir_shape(value: &Value) -> bool {
     .all(|key| obj.contains_key(*key))
 }
 
+/// Reasoning tag pairs a deep-mode reply may carry: Ollama's native `<think>` block and
+/// the `<thinking>` block the repository's CoT prompt (`sir_prompt.rs`) asks for.
+const THINK_TAGS: [(&str, &str); 2] = [("<thinking>", "</thinking>"), ("<think>", "</think>")];
+
+/// Find the earliest reasoning tag in `text`, returning its byte offset and tag pair.
+fn find_think_open(text: &str) -> Option<(usize, (&'static str, &'static str))> {
+    THINK_TAGS
+        .iter()
+        .filter_map(|tags| text.find(tags.0).map(|index| (index, *tags)))
+        .min_by_key(|(index, _)| *index)
+}
+
+/// Split an Ollama deep-mode response into its reasoning block(s) and the remainder that
+/// carries the SIR JSON.
+///
+/// Both `<think>...</think>` (Ollama's native tag) and `<thinking>...</thinking>` (what the
+/// deep prompt requests) are recognised. Every block is collected (joined by blank lines)
+/// and removed from the remainder; an unterminated block swallows the rest of the text as
+/// reasoning so a truncated trace never leaks into the JSON parser. Returns `None`
+/// reasoning when the response has no block or only an empty one.
+pub(crate) fn split_think_block(raw: &str) -> (Option<String>, String) {
+    let mut reasoning_parts = Vec::new();
+    let mut remainder = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some((start, (open, close))) = find_think_open(rest) {
+        remainder.push_str(&rest[..start]);
+        let after_open = &rest[start + open.len()..];
+        match after_open.find(close) {
+            Some(end) => {
+                let thought = after_open[..end].trim();
+                if !thought.is_empty() {
+                    reasoning_parts.push(thought.to_owned());
+                }
+                rest = &after_open[end + close.len()..];
+            }
+            None => {
+                let thought = after_open.trim();
+                if !thought.is_empty() {
+                    reasoning_parts.push(thought.to_owned());
+                }
+                rest = "";
+            }
+        }
+    }
+    remainder.push_str(rest);
+
+    let reasoning = if reasoning_parts.is_empty() {
+        None
+    } else {
+        Some(reasoning_parts.join("\n\n"))
+    };
+    (reasoning, remainder)
+}
+
 pub(crate) fn parse_and_validate_sir(candidate_json: &str) -> Result<SirAnnotation, String> {
     let normalized = normalize_candidate_json(candidate_json);
 
@@ -348,5 +402,59 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].0, "not json");
         assert!(captured[0].1.contains("json parse error"));
+    }
+}
+
+#[cfg(test)]
+mod think_block_tests {
+    use super::{parse_and_validate_sir, split_think_block};
+
+    const SIR_JSON: &str = r#"{"intent":"Parses config","inputs":["path"],"outputs":["Config"],"side_effects":[],"dependencies":[],"error_modes":["io error"],"confidence":0.8}"#;
+
+    #[test]
+    fn split_think_block_extracts_reasoning_and_leaves_json() {
+        let raw = format!(
+            "<think>\nFirst I look at the signature.\nThen the body.\n</think>\n{SIR_JSON}"
+        );
+        let (reasoning, remainder) = split_think_block(&raw);
+        assert_eq!(
+            reasoning.as_deref(),
+            Some("First I look at the signature.\nThen the body.")
+        );
+        assert_eq!(remainder.trim(), SIR_JSON);
+        assert!(parse_and_validate_sir(&remainder).is_ok());
+    }
+
+    #[test]
+    fn split_think_block_without_block_is_passthrough() {
+        let (reasoning, remainder) = split_think_block(SIR_JSON);
+        assert_eq!(reasoning, None);
+        assert_eq!(remainder, SIR_JSON);
+        let (reasoning, remainder) = split_think_block("<think></think>  {}");
+        assert_eq!(reasoning, None);
+        assert_eq!(remainder.trim(), "{}");
+    }
+
+    #[test]
+    fn split_think_block_accepts_the_prompted_thinking_tag() {
+        // sir_prompt.rs asks deep runs to wrap analysis in <thinking> tags.
+        let raw = format!("<thinking>\nCompare with neighbours.\n</thinking>\n{SIR_JSON}");
+        let (reasoning, remainder) = split_think_block(&raw);
+        assert_eq!(reasoning.as_deref(), Some("Compare with neighbours."));
+        assert_eq!(remainder.trim(), SIR_JSON);
+        // Mixed tags in one reply are all captured, in order.
+        let (reasoning, remainder) = split_think_block("<think>a</think><thinking>b</thinking>{}");
+        assert_eq!(reasoning.as_deref(), Some("a\n\nb"));
+        assert_eq!(remainder, "{}");
+    }
+
+    #[test]
+    fn split_think_block_handles_multiple_and_unterminated_blocks() {
+        let (reasoning, remainder) = split_think_block("<think>a</think>x<think>b</think>y");
+        assert_eq!(reasoning.as_deref(), Some("a\n\nb"));
+        assert_eq!(remainder, "xy");
+        let (reasoning, remainder) = split_think_block("{}<think>never closed");
+        assert_eq!(reasoning.as_deref(), Some("never closed"));
+        assert_eq!(remainder, "{}");
     }
 }
