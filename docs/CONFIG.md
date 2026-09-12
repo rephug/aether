@@ -22,7 +22,7 @@ concurrency = 2
   - `qwen3_local`: always Ollama-compatible local inference.
   - `openai_compat`: always OpenAI-compatible chat completions.
   - `omp`: the Oh My Pi auth gateway (see [Oh My Pi models and batch pricing](#oh-my-pi-models-and-batch-pricing)).
-  - `mock`: no model at all. Every symbol gets a `[MOCK]` placeholder SIR at confidence 0.1 from tree-sitter facts, so `aether_audit_candidates` ranks it first for `/scan` (zero-Gemini onboarding, Decision #121).
+  - `mock`: no model at all. Every symbol gets a `[MOCK]` placeholder SIR at confidence 0.1 from tree-sitter facts, so `aether_audit_candidates` ranks it first for `/scan` (zero-key onboarding, Decision #121).
 - `model`
   - Optional provider-specific override.
   - Gemini default: `gemini-3.1-flash-lite-preview`

@@ -2,7 +2,7 @@
 description: Fast baseline SIR coverage for a crate — replaces [MOCK] and low-confidence SIRs, coverage over depth
 ---
 
-# /scan — zero-Gemini baseline coverage
+# /scan — zero-key baseline coverage
 
 Usage: `/scan <crate> [batch-size]`
 
@@ -13,13 +13,15 @@ symbols this session processes before stopping.
 
 ## Procedure
 
-1. Resolve the crate's directories. In a Cargo workspace run
-   `cargo metadata --no-deps --format-version 1` and take the directory of the
-   `manifest_path` for the package named `<crate>`, relative to the workspace root
-   (for example `crates/<crate>` or `packages/<crate>`). Call it `<dir>`. Without
-   Cargo (TypeScript, Python, ...), or when `<crate>` names no package, `<crate>` is a
-   directory (or a single file) relative to the workspace root. If the
-   manifest sits at the workspace root, the package owns only its own targets: use
+1. Resolve the crate's directories. All paths below are relative to THIS project's
+   root (the directory holding `.aether/`, the same root the indexed `file_path`s use),
+   never to an enclosing Cargo workspace root when the two differ. In a Cargo project
+   run `cargo metadata --no-deps --format-version 1` and take the directory of the
+   `manifest_path` for the package named `<crate>`, made relative to the project root
+   (for example `crates/<crate>` or `packages/<crate>`); ignore packages outside the
+   project. Call it `<dir>`. Without Cargo (TypeScript, Python, ...), or when `<crate>`
+   names no package, `<crate>` is a directory (or a single file) relative to the project
+   root. If the manifest sits at the project root, the package owns only its own targets: use
    the top-level directory of each target's `src_path` (typically `src`, `tests`,
    `benches`, `examples`) as the `<dir>` set, and match a target file stored at the
    root itself (for example `path = "lib.rs"`) by exact `file_path`. Never treat a

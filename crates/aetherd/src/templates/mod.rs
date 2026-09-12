@@ -302,7 +302,8 @@ mod tests {
         assert!(rendered.contains("aether_audit_submit"));
         assert!(rendered.contains("aether_sir_inject"));
         assert!(rendered.contains("aether_sir_context"));
-        assert!(rendered.contains("## Zero-Gemini Onboarding"));
+        assert!(rendered.contains("## Zero-Key Onboarding"));
+        assert!(!rendered.contains("recommended path"));
         assert!(rendered.contains("--inference-provider mock"));
         assert!(rendered.contains("./scripts/scan_all.sh"));
     }
