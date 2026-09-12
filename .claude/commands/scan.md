@@ -22,9 +22,12 @@ symbols this session processes before stopping.
    project. Call it `<dir>`. Without Cargo (TypeScript, Python, ...), or when `<crate>`
    names no package, `<crate>` is a directory (or a single file) relative to the project
    root. A package also owns every target whose `src_path` lies outside its manifest
-   directory (for example `[lib] path = "../../shared/foo.rs"`): add that file (exact
-   `file_path`) and its `<stem>/` module directory (`shared/foo`) to the scope set, never
-   the whole external directory, so `shared/bar.rs` of another package stays out. Paths
+   directory (for example `[lib] path = "../../shared/foo.rs"`): when it is the only
+   package with a target in that directory, add the directory (`shared`, so sibling
+   modules such as `mod util;` → `shared/util.rs` are covered); when several packages
+   target the same directory, add only that file (exact `file_path`) and its `<stem>/`
+   module directory (`shared/foo`), so `shared/bar.rs` of another package stays out and
+   the directory's remainder is scanned as its own unit by `scripts/scan_all.sh`. Paths
    never start with `./`. If the manifest sits at the
    project root, the package owns only its own targets: use the top-level directory of
    each target's `src_path` (typically `src`, `tests`, `benches`, `examples`) as the

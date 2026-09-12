@@ -82,9 +82,12 @@ index_top_level_scopes() {
 # Prints "name<TAB>scope[<TAB>scope...]" per scan unit, scopes relative to the workspace
 # root; a scope prefixed with "-" is an exclusion (a nested member's directory carved out
 # of its parent's scope, so no two units overlap). A target declared outside its package
-# directory contributes the target file itself plus its `<stem>/` module directory (the
-# Rust module-tree convention), never the whole shared directory, so two packages with
-# targets in the same external directory stay disjoint. Cargo workspaces: one unit per package, parsed structurally from the metadata
+# directory brings that directory in when this package is the only one targeting it (so
+# sibling modules such as `mod util;` → shared/util.rs are covered); when several
+# packages target the same external directory each gets only its target file plus its
+# `<stem>/` module directory, and the directory's remainder becomes its own unit.
+# An indexed top-level directory whose name collides with a package is emitted as
+# `dir:<name>`; explicit arguments may use that form too. Cargo workspaces: one unit per package, parsed structurally from the metadata
 # JSON (packages[].name / manifest_path / targets; never the dependency or target names
 # that also carry a "name" key). A package owns its manifest directory (unless that is
 # the workspace root) plus, for every target whose src_path lies outside that directory,
@@ -109,6 +112,17 @@ def inside(path):
     return None if rel == ".." or rel.startswith(".." + os.sep) else rel
 def covered(scope, scopes):
     return any(scope == s or scope.startswith(s + os.sep) for s in scopes)
+# Which packages declare targets in each external directory (outside their manifest dir).
+external_owners = {}
+for pkg in meta["packages"]:
+    rel = inside(os.path.dirname(pkg["manifest_path"]))
+    if rel is None or rel == ".":
+        continue
+    for target in pkg.get("targets", []):
+        src = inside(target["src_path"])
+        if src is None or src == rel or src.startswith(rel + os.sep):
+            continue
+        external_owners.setdefault(os.path.dirname(src) or ".", set()).add(pkg["name"])
 units = []
 for pkg in meta["packages"]:
     manifest_dir = os.path.dirname(pkg["manifest_path"])
@@ -125,7 +139,11 @@ for pkg in meta["packages"]:
         elif src == rel or src.startswith(rel + os.sep):
             continue
         else:
-            candidates = [src, os.path.splitext(src)[0]]
+            ext_dir = os.path.dirname(src) or "."
+            if ext_dir != "." and external_owners.get(ext_dir) == {pkg["name"]}:
+                candidates = [ext_dir]
+            else:
+                candidates = [src, os.path.splitext(src)[0]]
         for scope in candidates:
             if scope and scope != "." and not covered(scope, scopes):
                 scopes = [s for s in scopes if not (s == scope or s.startswith(scope + os.sep))]
@@ -150,12 +168,13 @@ package_scopes = [s for _, scopes in units for s in scopes]
 unit_names = {name for name, _ in units}
 for top in os.environ.get("AETHER_INDEX_TOPS", "").split("\n"):
     top = top.strip()
-    if not top or top in unit_names:
+    if not top:
         continue
     if any(top == s or top.startswith(s + os.sep) for s in package_scopes):
         continue
-    inside = [s for s in package_scopes if s.startswith(top + os.sep)]
-    print(top + "\t" + "\t".join([top] + ["-" + s for s in inside]))
+    carved = [s for s in package_scopes if s.startswith(top + os.sep)]
+    name = "dir:" + top if top in unit_names else top
+    print(name + "\t" + "\t".join([top] + ["-" + s for s in carved]))
 ' 2>/dev/null || true)"
   fi
   if [ -n "$table" ]; then
@@ -172,16 +191,17 @@ PACKAGE_TABLE="$(discover_packages)"
 # spellings (`./src`, `src/`) to the form the index stores. `.` is not a unit: run with no
 # arguments to scan everything.
 normalize_unit() {
-  local u="$1"
+  local u="$1" prefix=""
+  if [ "${u#dir:}" != "$u" ]; then prefix="dir:"; u="${u#dir:}"; fi
   while [ "${u#./}" != "$u" ]; do u="${u#./}"; done
   u="${u%/}"
-  printf '%s' "$u"
+  [ -n "$u" ] && [ "$u" != "." ] && printf '%s%s' "$prefix" "$u"
 }
 CRATES=()
 if [ "$#" -gt 0 ]; then
   for name in "$@"; do
     unit="$(normalize_unit "$name")"
-    if [ -z "$unit" ] || [ "$unit" = "." ]; then
+    if [ -z "$unit" ]; then
       echo "error: '$name' is not a scan unit; run scripts/scan_all.sh with no names to scan everything" >&2
       exit 1
     fi
@@ -197,14 +217,16 @@ else
   fi
 fi
 
-# Tab-separated scopes (directories or root-level target files) for one unit. Names that
-# are not discovered units are taken as paths relative to the workspace root when they
-# exist, else as crates/<name>.
+# Tab-separated scopes (directories or root-level target files) for one unit. `dir:<path>`
+# always means that path; other names that are not discovered units are taken as paths
+# relative to the workspace root when they exist, else as crates/<name>.
 crate_scopes() {
   local found
   found="$(printf '%s\n' "$PACKAGE_TABLE" | awk -F '\t' -v crate="$1" '$1 == crate { sub(/^[^\t]*\t/, ""); print; exit }')"
   if [ -n "$found" ]; then
     printf '%s' "$found"
+  elif [ "${1#dir:}" != "$1" ]; then
+    printf '%s' "${1#dir:}"
   elif [ -e "$1" ]; then
     printf '%s' "${1%/}"
   else
