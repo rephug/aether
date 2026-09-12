@@ -2764,46 +2764,7 @@ impl SirPipeline {
         store: &SqliteStore,
         file_path: &str,
     ) -> Result<Vec<FileLeafSir>> {
-        let symbols = store
-            .list_symbols_for_file(file_path)
-            .with_context(|| format!("failed to list symbols for file {file_path}"))?;
-        let mut leaf_sirs = Vec::new();
-
-        for symbol in symbols {
-            let Some(blob) = store
-                .read_sir_blob(&symbol.id)
-                .with_context(|| format!("failed to read SIR blob for symbol {}", symbol.id))?
-            else {
-                continue;
-            };
-
-            let parsed = serde_json::from_str::<SirAnnotation>(&blob);
-            let Ok(sir) = parsed else {
-                tracing::warn!(
-                    symbol_id = %symbol.id,
-                    file_path = %file_path,
-                    "skipping invalid leaf SIR JSON while aggregating file rollup"
-                );
-                continue;
-            };
-
-            if let Err(err) = validate_sir(&sir) {
-                tracing::warn!(
-                    symbol_id = %symbol.id,
-                    file_path = %file_path,
-                    error = %err,
-                    "skipping invalid leaf SIR annotation while aggregating file rollup"
-                );
-                continue;
-            }
-
-            leaf_sirs.push(FileLeafSir {
-                qualified_name: symbol.qualified_name,
-                sir,
-            });
-        }
-
-        Ok(leaf_sirs)
+        load_file_leaf_sirs(store, file_path)
     }
 
     fn remove_file_rollup(
@@ -2950,6 +2911,110 @@ fn resolve_tiered_parse_fallback_provider(
     );
     let model_name = fallback.model_name();
     Ok(Some((Arc::new(fallback), model_name)))
+}
+
+/// Leaf SIRs of every symbol in `file_path` that carries a valid annotation.
+fn load_file_leaf_sirs(store: &SqliteStore, file_path: &str) -> Result<Vec<FileLeafSir>> {
+    let symbols = store
+        .list_symbols_for_file(file_path)
+        .with_context(|| format!("failed to list symbols for file {file_path}"))?;
+    let mut leaf_sirs = Vec::new();
+
+    for symbol in symbols {
+        let Some(blob) = store
+            .read_sir_blob(&symbol.id)
+            .with_context(|| format!("failed to read SIR blob for symbol {}", symbol.id))?
+        else {
+            continue;
+        };
+
+        let parsed = serde_json::from_str::<SirAnnotation>(&blob);
+        let Ok(sir) = parsed else {
+            tracing::warn!(
+                symbol_id = %symbol.id,
+                file_path = %file_path,
+                "skipping invalid leaf SIR JSON while aggregating file rollup"
+            );
+            continue;
+        };
+
+        if let Err(err) = validate_sir(&sir) {
+            tracing::warn!(
+                symbol_id = %symbol.id,
+                file_path = %file_path,
+                error = %err,
+                "skipping invalid leaf SIR annotation while aggregating file rollup"
+            );
+            continue;
+        }
+
+        leaf_sirs.push(FileLeafSir {
+            qualified_name: symbol.qualified_name,
+            sir,
+        });
+    }
+
+    Ok(leaf_sirs)
+}
+
+/// Rebuild the deterministic (concatenated, no model call) file rollup for `file_path`
+/// from its current leaf SIRs and persist it under the synthetic file SIR id, so file
+/// and module level reads reflect leaf injections immediately. Removes the rollup when
+/// the file has no valid leaf SIR left. Returns `true` when a rollup was written.
+pub fn refresh_local_file_rollup(
+    store: &SqliteStore,
+    file_path: &str,
+    language: Language,
+    provider: &str,
+    model: &str,
+    generation_pass: &str,
+) -> Result<bool> {
+    let leaf_sirs = load_file_leaf_sirs(store, file_path)?;
+    let rollup_id = synthetic_file_sir_id(language.as_str(), file_path);
+    if leaf_sirs.is_empty() {
+        store
+            .mark_removed(&rollup_id)
+            .with_context(|| format!("failed to remove stale file rollup {rollup_id}"))?;
+        return Ok(false);
+    }
+    let file_sir = concatenate_file_sir(&leaf_sirs);
+    let canonical_json = canonicalize_file_sir_json(&file_sir);
+    let sir_hash_value = file_sir_hash(&file_sir);
+    let attempted_at = unix_timestamp_secs();
+    let version_write = store
+        .record_sir_version_if_changed(
+            &rollup_id,
+            &sir_hash_value,
+            provider,
+            model,
+            &canonical_json,
+            attempted_at,
+            None,
+        )
+        .with_context(|| format!("failed to record file rollup history for {file_path}"))?;
+    if version_write.changed {
+        store
+            .write_sir_blob(&rollup_id, &canonical_json)
+            .with_context(|| format!("failed to write file rollup for {file_path}"))?;
+    }
+    store
+        .upsert_sir_meta(SirMetaRecord {
+            id: rollup_id,
+            sir_hash: sir_hash_value,
+            sir_version: version_write.version,
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            generation_pass: generation_pass.to_owned(),
+            reasoning_trace: None,
+            prompt_hash: None,
+            staleness_score: None,
+            updated_at: version_write.updated_at,
+            sir_status: SIR_STATUS_FRESH.to_owned(),
+            last_error: None,
+            last_attempt_at: attempted_at,
+        })
+        .with_context(|| format!("failed to upsert file rollup metadata for {file_path}"))?;
+    Ok(true)
 }
 
 fn resolve_workspace_head_commit(workspace_root: &Path) -> Option<String> {

@@ -5,7 +5,10 @@ use aether_sir::{
 use aether_store::{
     SirHistoryStore, SirMetaRecord, SirStateStore, SymbolCatalogStore, SymbolRecord,
 };
-use aetherd::sir_pipeline::SirPipeline;
+use std::path::Path;
+
+use aether_parse::language_for_path;
+use aetherd::sir_pipeline::{SirPipeline, refresh_local_file_rollup};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -74,6 +77,8 @@ pub struct AetherSirInjectResponse {
     /// What happened to the symbol's embedding: `refreshed`, `unchanged`,
     /// `skipped: <reason>` or `failed: <error>`.
     pub embedding_status: String,
+    /// Whether the file rollup (and therefore module reads) was rebuilt from the leaves.
+    pub file_rollup_status: String,
 }
 
 /// Round an f32 confidence to 4 decimal places as f64, so the JSON response reads
@@ -280,6 +285,7 @@ impl AetherMcpServer {
                 status: "blocked".to_owned(),
                 note,
                 embedding_status: "skipped: inject blocked".to_owned(),
+                file_rollup_status: "skipped: inject blocked".to_owned(),
             });
         }
 
@@ -324,6 +330,7 @@ impl AetherMcpServer {
         let provider = normalize_optional_text_with_default(request.provider, "manual");
         let model = normalize_optional_text_with_default(request.model, "manual");
         let generation_pass = normalize_optional_text_with_default(request.generation_pass, "deep");
+        let rollup_identity = (provider.clone(), model.clone(), generation_pass.clone());
         let now = current_unix_timestamp();
         let version_write = store.record_sir_version_if_changed(
             symbol_id.as_str(),
@@ -354,6 +361,15 @@ impl AetherMcpServer {
 
         let embedding_status =
             self.refresh_embedding_after_inject(symbol_id.as_str(), hash.as_str(), &canonical_json);
+        // Aggregate reads (file and module level) are served from the file rollup, so
+        // rebuild it from the leaves now rather than leaving the indexing-time rollup
+        // (a [MOCK] concatenation after a mock index) in place.
+        let file_rollup_status = self.refresh_file_rollup_after_inject(
+            symbol.file_path.as_str(),
+            &rollup_identity.0,
+            &rollup_identity.1,
+            &rollup_identity.2,
+        );
         let note = match embedding_status.as_str() {
             "refreshed" | "unchanged" => None,
             _ => Some(format!(
@@ -372,7 +388,32 @@ impl AetherMcpServer {
             status: "injected".to_owned(),
             note,
             embedding_status,
+            file_rollup_status,
         })
+    }
+
+    fn refresh_file_rollup_after_inject(
+        &self,
+        file_path: &str,
+        provider: &str,
+        model: &str,
+        generation_pass: &str,
+    ) -> String {
+        let Some(language) = language_for_path(Path::new(file_path)) else {
+            return "skipped: unknown language".to_owned();
+        };
+        match refresh_local_file_rollup(
+            self.state.store.as_ref(),
+            file_path,
+            language,
+            provider,
+            model,
+            generation_pass,
+        ) {
+            Ok(true) => "refreshed".to_owned(),
+            Ok(false) => "removed: no leaf SIRs".to_owned(),
+            Err(err) => format!("failed: {err:#}"),
+        }
     }
 
     /// Refresh the symbol's embedding right after an inject so semantic search sees the
@@ -547,8 +588,18 @@ vector_backend = "sqlite"
         assert_eq!(response.previous_confidence, None);
         assert_eq!(response.new_confidence, 0.6);
         assert!(!response.sir_hash.is_empty());
+        assert_eq!(response.file_rollup_status, "refreshed");
 
         let store = aether_store::SqliteStore::open(temp.path()).expect("open store");
+        let rollup_id = aether_sir::synthetic_file_sir_id("rust", "src/lib.rs");
+        let rollup = store
+            .read_sir_blob(&rollup_id)
+            .expect("read file rollup")
+            .expect("file rollup rebuilt from the injected leaf");
+        assert!(
+            rollup.contains("Persist a new SIR annotation"),
+            "file rollup must reflect the injected leaf: {rollup}"
+        );
         let history = store.list_sir_history("sym-new").expect("list sir history");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].version, 1);
@@ -703,6 +754,7 @@ vector_backend = "sqlite"
             status: "injected".to_owned(),
             note: None,
             embedding_status: "skipped: embeddings disabled".to_owned(),
+            file_rollup_status: "refreshed".to_owned(),
         };
         let rendered = serde_json::to_string(&response).expect("serialize");
         assert!(rendered.contains("\"new_confidence\":0.97"), "{rendered}");
