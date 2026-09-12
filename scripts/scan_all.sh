@@ -75,7 +75,7 @@ fi
 # directory (or root-level file) that holds indexed symbols, straight from the index.
 discover_packages() {
   if command -v cargo >/dev/null 2>&1 && [ -f Cargo.toml ] && command -v python3 >/dev/null 2>&1; then
-    AETHER_WORKSPACE="$WORKSPACE" cargo metadata --no-deps --format-version 1 2>/dev/null | python3 -c '
+    cargo metadata --no-deps --format-version 1 2>/dev/null | AETHER_WORKSPACE="$WORKSPACE" python3 -c '
 import json, os, sys
 meta = json.load(sys.stdin)
 # Scopes are relative to the AETHER workspace (where the index lives), which may be a
@@ -140,6 +140,15 @@ crate_scopes() {
 }
 crate_scopes_display() { crate_scopes "$1" | tr '\t' ','; }
 
+# SQL string literal: single quotes doubled.
+sql_str() { printf '%s' "${1//\'/\'\'}"; }
+# LIKE pattern for "everything under <dir>/": `\`, `%` and `_` in the path are escaped so
+# they match literally (ESCAPE '\'), then the SQL quoting is applied.
+sql_prefix_pattern() {
+  local p="$1"
+  p="${p//\\/\\\\}"; p="${p//%/\\%}"; p="${p//_/\\_}"
+  sql_str "$p/%"
+}
 # SQL scope for the given units: only symbols under their own directories (or equal to
 # a root-level target file).
 scope_clause() {
@@ -149,9 +158,9 @@ scope_clause() {
     for scope in "${scopes[@]}"; do
       [ -z "$scope" ] && continue
       if [ -f "$scope" ]; then
-        clauses+=("s.file_path = '${scope//\'/\'\'}'")
+        clauses+=("s.file_path = '$(sql_str "$scope")'")
       else
-        clauses+=("s.file_path LIKE '${scope//\'/\'\'}/%'")
+        clauses+=("s.file_path LIKE '$(sql_prefix_pattern "$scope")' ESCAPE '\\'")
       fi
     done
   done

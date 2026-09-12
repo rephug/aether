@@ -30,16 +30,21 @@ symbols this session processes before stopping.
    Query `.aether/meta.sqlite` directly, so symbols that were already scanned can never
    crowd the remaining placeholders out of a truncated result:
    `SELECT s.id, s.qualified_name, s.file_path FROM symbols s JOIN sir ON sir.id = s.id
-   WHERE s.file_path LIKE '<dir>/%'
+   WHERE s.file_path LIKE '<dir>/%' ESCAPE '\'
      AND (json_extract(sir.sir_json, '$.confidence') < 0.2 OR sir.sir_json LIKE '%"intent":"[MOCK]%')
    ORDER BY s.file_path, s.qualified_name`
-   (for several `<dir>`s, OR one `LIKE` clause per directory). If SQL is not available to
-   you, call `aether_audit_candidates` with a `top_n` well above the crate's symbol
-   count (for example 1000), then keep only candidates under `<dir>` whose
-   `current_confidence` is below 0.2 or whose SIR intent starts with `[MOCK]`; note
-   the tool's `crate_filter` assumes a `crates/<crate>/` layout, so filter on
-   `file_path` yourself when the crate lives elsewhere. Never pass `batch-size` as
-   `top_n`: the tool ranks by a composite score in which confidence is only one factor.
+   (for several `<dir>`s, OR one `LIKE` clause per directory; a root-level file is
+   matched with `s.file_path = '<file>'`; escape `_`, `%` and `\` in `<dir>` with a
+   backslash so they match literally). Run it with the `sqlite3` CLI, or, when that is
+   not installed, with Python's built-in module:
+   `python3 -c "import sqlite3; [print(*r) for r in sqlite3.connect('.aether/meta.sqlite').execute(\"<query>\")]"`.
+   Only if neither is available fall back to `aether_audit_candidates`: its `top_n` is
+   capped at 200 and it ranks by a composite score in which confidence is only one
+   factor, so it is reliable only for crates with fewer than 200 symbols; call it with
+   `top_n: 200`, keep only candidates under `<dir>` whose `current_confidence` is below
+   0.2 or whose SIR intent starts with `[MOCK]`, and note that its `crate_filter`
+   assumes a `crates/<crate>/` layout, so filter on `file_path` yourself. Never pass
+   `batch-size` as `top_n`.
 3. Take the first `batch-size` targets and group them by source file.
 4. Work in batches of 10 symbols per reasoning turn: read each source file ONCE,
    produce the SIRs for all of its symbols together, then fire every

@@ -333,7 +333,7 @@ mod tests {
         let command = ScanCommandTemplate::render(&context);
         assert!(command.contains("/scan <crate> [batch-size]"));
         assert!(command.contains("aether_sir_inject"));
-        assert!(command.contains("Never pass `batch-size` as"));
+        assert!(command.contains("`batch-size` as `top_n`"));
         let script = ScanAllScriptTemplate::render(&context);
         assert!(script.starts_with("#!/usr/bin/env bash"));
         assert!(script.contains("cargo metadata --no-deps"));
