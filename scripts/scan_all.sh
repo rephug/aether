@@ -68,14 +68,18 @@ fi
 # Prints "name<TAB>scope[<TAB>scope...]" per scan unit, scopes relative to the workspace
 # root. Cargo workspaces: one unit per package, parsed structurally from the metadata
 # JSON (packages[].name / manifest_path / targets; never the dependency or target names
-# that also carry a "name" key). A package whose manifest sits at the workspace root owns
-# only its own targets: the top-level directory of each target's src_path (src/, tests/,
-# benches/, ...) or, for a target file stored at the root itself (e.g. `path = "lib.rs"`),
-# that file. Never the whole workspace. Without Cargo (or python3), one unit per top-level
-# directory (or root-level file) that holds indexed symbols, straight from the index.
+# that also carry a "name" key). A package owns its manifest directory (unless that is
+# the workspace root) plus, for every target whose src_path lies outside that directory,
+# the directory holding the target file (the workspace root itself contributes the file
+# only); so a root package owns just src/, tests/, benches/, ... or a root-level
+# `path = "lib.rs"`, never the whole workspace, and `[lib] path = "../../shared/foo.rs"`
+# brings shared/ in. When cargo metadata cannot be loaded, or without Cargo (or
+# python3), one unit per top-level directory (or root-level file) that holds indexed
+# symbols, straight from the index.
 discover_packages() {
+  local table=""
   if command -v cargo >/dev/null 2>&1 && [ -f Cargo.toml ] && command -v python3 >/dev/null 2>&1; then
-    cargo metadata --no-deps --format-version 1 2>/dev/null | AETHER_WORKSPACE="$WORKSPACE" python3 -c '
+    table="$(cargo metadata --no-deps --format-version 1 2>/dev/null | AETHER_WORKSPACE="$WORKSPACE" python3 -c '
 import json, os, sys
 meta = json.load(sys.stdin)
 # Scopes are relative to the AETHER workspace (where the index lives), which may be a
@@ -84,24 +88,33 @@ root = os.path.realpath(os.environ["AETHER_WORKSPACE"])
 def inside(path):
     rel = os.path.relpath(os.path.realpath(path), root)
     return None if rel == ".." or rel.startswith(".." + os.sep) else rel
+def covered(scope, scopes):
+    return any(scope == s or scope.startswith(s + os.sep) for s in scopes)
 for pkg in meta["packages"]:
-    rel = inside(os.path.dirname(pkg["manifest_path"]))
+    manifest_dir = os.path.dirname(pkg["manifest_path"])
+    rel = inside(manifest_dir)
     if rel is None:
         continue
-    if rel != ".":
-        dirs = [rel]
-    else:
-        dirs = []
-        for target in pkg.get("targets", []):
-            src = inside(target["src_path"])
-            if src is None:
-                continue
+    scopes = [] if rel == "." else [rel]
+    for target in pkg.get("targets", []):
+        src = inside(target["src_path"])
+        if src is None:
+            continue
+        if rel == ".":
             scope = src.split(os.sep)[0]
-            if scope and scope != "." and scope not in dirs:
-                dirs.append(scope)
-    if dirs:
-        print(pkg["name"] + "\t" + "\t".join(dirs))
-'
+        elif src == rel or src.startswith(rel + os.sep):
+            continue
+        else:
+            scope = os.path.dirname(src) or src
+        if scope and scope != "." and not covered(scope, scopes):
+            scopes = [s for s in scopes if not (s == scope or s.startswith(scope + os.sep))]
+            scopes.append(scope)
+    if scopes:
+        print(pkg["name"] + "\t" + "\t".join(scopes))
+' 2>/dev/null || true)"
+  fi
+  if [ -n "$table" ]; then
+    printf '%s\n' "$table"
   else
     sqlite3 "$DB" "SELECT DISTINCT CASE WHEN instr(file_path, '/') > 0 THEN substr(file_path, 1, instr(file_path, '/') - 1) ELSE file_path END FROM symbols ORDER BY 1;" \
       | awk 'NF { printf "%s\t%s\n", $0, $0 }'

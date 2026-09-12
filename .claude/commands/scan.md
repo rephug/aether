@@ -21,11 +21,15 @@ symbols this session processes before stopping.
    (for example `crates/<crate>` or `packages/<crate>`); ignore packages outside the
    project. Call it `<dir>`. Without Cargo (TypeScript, Python, ...), or when `<crate>`
    names no package, `<crate>` is a directory (or a single file) relative to the project
-   root. If the manifest sits at the project root, the package owns only its own targets: use
-   the top-level directory of each target's `src_path` (typically `src`, `tests`,
-   `benches`, `examples`) as the `<dir>` set, and match a target file stored at the
-   root itself (for example `path = "lib.rs"`) by exact `file_path`. Never treat a
-   root package as "the whole workspace": other members live beside it.
+   root. A package also owns every target whose `src_path` lies outside its manifest
+   directory (for example `[lib] path = "../../shared/foo.rs"` adds `shared`): add the
+   directory holding that target file to the `<dir>` set. If the manifest sits at the
+   project root, the package owns only its own targets: use the top-level directory of
+   each target's `src_path` (typically `src`, `tests`, `benches`, `examples`) as the
+   `<dir>` set, and match a target file stored at the root itself (for example
+   `path = "lib.rs"`) by exact `file_path`. Never treat a root package as "the whole
+   workspace": other members live beside it. If `cargo metadata` fails, fall back to
+   the directory rule above.
 2. Build the target list from the low-confidence set, not from a ranked window.
    Query `.aether/meta.sqlite` directly, so symbols that were already scanned can never
    crowd the remaining placeholders out of a truncated result:
