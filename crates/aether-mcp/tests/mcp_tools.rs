@@ -3407,6 +3407,28 @@ fn mcp_audit_candidates_excludes_deep_sirs_unless_requested() -> Result<()> {
     ))?;
     seed_sir_with_pass(&store, "sym-scan", "scan")?;
     seed_sir_with_pass(&store, "sym-deep", "deep")?;
+    // A deep attempt that failed: pass label says deep, but there is no SIR at all.
+    store.upsert_symbol(custom_symbol_record(
+        "sym-deep-failed",
+        "crate::audit::deep_failed",
+        "src/failed.rs",
+        "function",
+    ))?;
+    store.upsert_sir_meta(SirMetaRecord {
+        id: "sym-deep-failed".to_owned(),
+        sir_hash: String::new(),
+        sir_version: 1,
+        provider: "seed".to_owned(),
+        model: "seed".to_owned(),
+        generation_pass: "deep".to_owned(),
+        reasoning_trace: None,
+        prompt_hash: None,
+        staleness_score: None,
+        updated_at: 0,
+        sir_status: "stale".to_owned(),
+        last_error: Some("provider timed out".to_owned()),
+        last_attempt_at: 1_700_000_100,
+    })?;
     drop(store);
 
     let server = AetherMcpServer::new(workspace, false)?;
@@ -3425,13 +3447,14 @@ fn mcp_audit_candidates_excludes_deep_sirs_unless_requested() -> Result<()> {
         )
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
-    let default_ids = default_response
+    let mut default_ids = default_response
         .candidates
         .iter()
         .map(|candidate| candidate.symbol_id.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(default_ids, vec!["sym-scan"]);
-    assert_eq!(default_response.total_in_scope, 1);
+    default_ids.sort_unstable();
+    assert_eq!(default_ids, vec!["sym-deep-failed", "sym-scan"]);
+    assert_eq!(default_response.total_in_scope, 2);
 
     let with_deep = rt
         .block_on(
@@ -3452,8 +3475,11 @@ fn mcp_audit_candidates_excludes_deep_sirs_unless_requested() -> Result<()> {
         .map(|candidate| candidate.symbol_id.as_str())
         .collect::<Vec<_>>();
     with_deep_ids.sort_unstable();
-    assert_eq!(with_deep_ids, vec!["sym-deep", "sym-scan"]);
-    assert_eq!(with_deep.total_in_scope, 2);
+    assert_eq!(
+        with_deep_ids,
+        vec!["sym-deep", "sym-deep-failed", "sym-scan"]
+    );
+    assert_eq!(with_deep.total_in_scope, 3);
 
     Ok(())
 }

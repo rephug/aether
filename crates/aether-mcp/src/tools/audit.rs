@@ -982,10 +982,15 @@ impl AetherMcpServer {
                 )
             })
             .filter(|row| {
+                // Only a deep pass that actually produced a SIR is "done"; a failed deep
+                // attempt leaves generation_pass = "deep" with no blob and stale status,
+                // and that symbol still needs auditing.
                 include_deep
                     || !sir_metadata_by_symbol
                         .get(row.symbol_id.as_str())
-                        .is_some_and(|metadata| is_deep_pass(metadata.generation_pass.as_deref()))
+                        .is_some_and(|metadata| {
+                            metadata.has_sir && is_deep_pass(metadata.generation_pass.as_deref())
+                        })
             })
             .map(|row| {
                 let metadata = sir_metadata_by_symbol.get(row.symbol_id.as_str());
