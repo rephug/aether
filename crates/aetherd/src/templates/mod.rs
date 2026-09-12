@@ -336,8 +336,11 @@ mod tests {
         let script = ScanAllScriptTemplate::render(&context);
         assert!(script.starts_with("#!/usr/bin/env bash"));
         assert!(script.contains("cargo metadata --no-deps"));
-        assert!(script.contains("stop_workspace_processes"));
-        assert!(!script.contains("pkill -f aetherd"));
+        assert!(!script.contains("pkill"));
+        assert!(!script.contains("declare -A"));
+        assert!(!script.contains("mapfile"));
+        assert!(!script.contains("wait -n"));
+        assert!(!script.contains("git rev-parse"));
         assert!(script.contains("--inference-provider mock"));
         assert!(!script.contains("enrich_all.sh"));
     }

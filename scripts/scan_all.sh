@@ -5,10 +5,11 @@
 # Usage: scripts/scan_all.sh [BATCH_SIZE=100] [MAX_PARALLEL=4] [crate ...]
 #
 # With no crate arguments every workspace package from `cargo metadata` is scanned
-# (falling back to the directories under crates/). Preflight stops the aetherd /
-# aether-mcp processes that belong to THIS workspace (the graph store holds an
-# exclusive lock), checks the index exists, and counts [MOCK] / low-confidence SIRs
-# in the selected crates before and after.
+# (falling back to the directories under crates/). Preflight checks the index exists
+# and counts [MOCK] / low-confidence SIRs in the selected crates before and after.
+# A running aetherd is left alone: the MCP server the sessions use falls back to the
+# SQLite graph when the daemon holds the SurrealKV lock, so `aether_sir_inject` works
+# either way. Runs on Bash 3.2 (stock macOS) and later.
 set -euo pipefail
 
 # Leading numeric arguments are BATCH_SIZE then MAX_PARALLEL; everything else is a crate
@@ -26,7 +27,9 @@ if [ "$BATCH_SIZE" -lt 1 ] || [ "$MAX_PARALLEL" -lt 1 ]; then
   exit 1
 fi
 
-WORKSPACE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+# The workspace is the directory this script was generated into (its parent), not the
+# Git root: an AETHER workspace may sit inside a larger repository.
+WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$WORKSPACE"
 DB=".aether/meta.sqlite"
 LOG_DIR=".aether/scan_logs"
@@ -36,11 +39,12 @@ mkdir -p "$LOG_DIR"
 
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$MASTER_LOG"; }
 
-# Prints "name<TAB>dir[<TAB>dir...]" per workspace package, dirs relative to the workspace
-# root. Parses the metadata JSON structurally (packages[].name / manifest_path / targets);
-# never the dependency or target names that also carry a "name" key. A package whose
-# manifest sits at the workspace root owns only the top-level directories of its own
-# targets (src/, tests/, benches/, ...), never the whole workspace.
+# Prints "name<TAB>scope[<TAB>scope...]" per workspace package, scopes relative to the
+# workspace root. Parses the metadata JSON structurally (packages[].name / manifest_path /
+# targets); never the dependency or target names that also carry a "name" key. A package
+# whose manifest sits at the workspace root owns only its own targets: the top-level
+# directory of each target's src_path (src/, tests/, benches/, ...) or, for a target file
+# stored at the root itself (e.g. `path = "lib.rs"`), that file. Never the whole workspace.
 discover_packages() {
   if command -v cargo >/dev/null 2>&1 && [ -f Cargo.toml ] && command -v python3 >/dev/null 2>&1; then
     cargo metadata --no-deps --format-version 1 2>/dev/null | python3 -c '
@@ -56,9 +60,9 @@ for pkg in meta["packages"]:
         dirs = []
         for target in pkg.get("targets", []):
             src = os.path.relpath(os.path.realpath(target["src_path"]), root)
-            top = src.split(os.sep)[0]
-            if top and top != "." and not top.startswith("..") and top not in dirs and os.sep in src:
-                dirs.append(top)
+            scope = src.split(os.sep)[0]
+            if scope and scope != "." and not scope.startswith("..") and scope not in dirs:
+                dirs.append(scope)
     if dirs:
         print(pkg["name"] + "\t" + "\t".join(dirs))
 '
@@ -70,40 +74,30 @@ for pkg in meta["packages"]:
   fi
 }
 
-declare -A CRATE_DIRS=()
-while IFS=$'\t' read -r name dirs; do
-  [ -n "$name" ] && CRATE_DIRS["$name"]="$dirs"
-done < <(discover_packages)
+# One "name<TAB>scopes" line per package (no associative arrays: Bash 3.2 lacks them).
+PACKAGE_TABLE="$(discover_packages)"
 
+CRATES=()
 if [ "$#" -gt 0 ]; then
   CRATES=("$@")
 else
-  mapfile -t CRATES < <(printf '%s\n' "${!CRATE_DIRS[@]}" | sort)
+  while IFS= read -r name; do
+    [ -n "$name" ] && CRATES+=("$name")
+  done < <(printf '%s\n' "$PACKAGE_TABLE" | cut -f1 | sort)
   if [ "${#CRATES[@]}" -eq 0 ]; then
     echo "error: no crates discovered (no Cargo workspace or crates/ directory); pass crate names explicitly" >&2
     exit 1
   fi
 fi
 
-# Tab-separated directory prefixes per selected crate; unknown names fall back to crates/<name>.
-crate_dirs() {
-  if [ -n "${CRATE_DIRS[$1]+x}" ]; then printf '%s' "${CRATE_DIRS[$1]}"; else printf 'crates/%s' "$1"; fi
+# Tab-separated scopes (directories or root-level target files) for one crate; unknown
+# names fall back to crates/<name>.
+crate_scopes() {
+  local found
+  found="$(printf '%s\n' "$PACKAGE_TABLE" | awk -F '\t' -v crate="$1" '$1 == crate { sub(/^[^\t]*\t/, ""); print; exit }')"
+  if [ -n "$found" ]; then printf '%s' "$found"; else printf 'crates/%s' "$1"; fi
 }
-crate_dirs_display() { crate_dirs "$1" | tr '\t' ','; }
-
-# Stop only the aetherd / aether-mcp processes that belong to this workspace: by cwd on
-# Linux (/proc), otherwise by a --workspace argument naming this path.
-stop_workspace_processes() {
-  local pid cwd
-  for pid in $(pgrep -f 'aetherd|aether-mcp' 2>/dev/null || true); do
-    [ "$pid" = "$$" ] && continue
-    cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null || true)"
-    if [ "$cwd" = "$WORKSPACE" ] || tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF -- "$WORKSPACE"; then
-      kill "$pid" 2>/dev/null || true
-    fi
-  done
-}
-stop_workspace_processes
+crate_scopes_display() { crate_scopes "$1" | tr '\t' ','; }
 
 if [ ! -f "$DB" ]; then
   echo "error: $DB not found. Index first with:" >&2
@@ -119,13 +113,19 @@ if ! command -v claude >/dev/null 2>&1; then
   exit 1
 fi
 
-# SQL scope: only symbols under the selected crates' own directories.
+# SQL scope: only symbols under the selected crates' own directories (or equal to a
+# root-level target file).
 scope_clause() {
-  local clauses=() crate dir dirs
+  local clauses=() crate scope scopes
   for crate in "${CRATES[@]}"; do
-    IFS=$'\t' read -ra dirs <<< "$(crate_dirs "$crate")"
-    for dir in "${dirs[@]}"; do
-      [ -n "$dir" ] && clauses+=("s.file_path LIKE '${dir//\'/\'\'}/%'")
+    IFS=$'\t' read -ra scopes <<< "$(crate_scopes "$crate")"
+    for scope in "${scopes[@]}"; do
+      [ -z "$scope" ] && continue
+      if [ -f "$scope" ]; then
+        clauses+=("s.file_path = '${scope//\'/\'\'}'")
+      else
+        clauses+=("s.file_path LIKE '${scope//\'/\'\'}/%'")
+      fi
     done
   done
   if [ "${#clauses[@]}" -eq 0 ]; then
@@ -151,17 +151,16 @@ if [ "$BEFORE" = "0" ]; then
 fi
 
 log "scanning ${#CRATES[@]} crate(s), batch size $BATCH_SIZE, up to $MAX_PARALLEL parallel sessions"
-running=0
+# Bash 3.2 cannot wait for "any one job": poll the running job count instead.
+running_jobs() { jobs -rp | wc -l | tr -d ' '; }
 for crate in "${CRATES[@]}"; do
   crate_log="$LOG_DIR/${crate}_${STAMP}.log"
-  log "start $crate ($(crate_dirs_display "$crate")) -> $crate_log"
+  log "start $crate ($(crate_scopes_display "$crate")) -> $crate_log"
   ( claude -p "/scan $crate $BATCH_SIZE" > "$crate_log" 2>&1 \
       && echo "done $crate" || echo "FAILED $crate (see $crate_log)" ) | tee -a "$MASTER_LOG" &
-  running=$((running + 1))
-  if [ "$running" -ge "$MAX_PARALLEL" ]; then
-    wait -n
-    running=$((running - 1))
-  fi
+  while [ "$(running_jobs)" -ge "$MAX_PARALLEL" ]; do
+    sleep 2
+  done
 done
 wait
 

@@ -19,8 +19,9 @@ symbols this session processes before stopping.
    (for example `crates/<crate>` or `packages/<crate>`). Call it `<dir>`. If the
    manifest sits at the workspace root, the package owns only its own targets: use
    the top-level directory of each target's `src_path` (typically `src`, `tests`,
-   `benches`, `examples`) as the `<dir>` set. Never treat a root package as "the
-   whole workspace": other members live beside it.
+   `benches`, `examples`) as the `<dir>` set, and match a target file stored at the
+   root itself (for example `path = "lib.rs"`) by exact `file_path`. Never treat a
+   root package as "the whole workspace": other members live beside it.
 2. Build the target list from the low-confidence set, not from a ranked window.
    Query `.aether/meta.sqlite` directly, so symbols that were already scanned can never
    crowd the remaining placeholders out of a truncated result:
