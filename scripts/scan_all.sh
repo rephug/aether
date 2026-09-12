@@ -124,17 +124,27 @@ def covered(scope, scopes):
     return any(scope == s or scope.startswith(s + os.sep) for s in scopes)
 # Which packages declare targets in each directory outside their manifest dir. A root
 # package counts as an owner of every directory its targets live in (src/, tests/, ...),
-# so a member pointing a target into one of those never becomes its sole owner.
+# and a non-root package owns everything under its manifest dir, so a member pointing a
+# target into either never becomes the sole owner of that directory.
 external_owners = {}
+manifest_dirs = {}
 for pkg in meta["packages"]:
     rel = inside(os.path.dirname(pkg["manifest_path"]))
     if rel is None:
         continue
+    if rel != ".":
+        manifest_dirs[pkg["name"]] = rel
     for target in pkg.get("targets", []):
         src = inside(target["src_path"])
         if src is None or (rel != "." and (src == rel or src.startswith(rel + os.sep))):
             continue
         external_owners.setdefault(os.path.dirname(src) or ".", set()).add(pkg["name"])
+def owners_of(directory):
+    owners = set(external_owners.get(directory, set()))
+    for name, mdir in manifest_dirs.items():
+        if directory == mdir or directory.startswith(mdir + os.sep):
+            owners.add(name)
+    return owners
 units = []
 for pkg in meta["packages"]:
     manifest_dir = os.path.dirname(pkg["manifest_path"])
@@ -152,7 +162,7 @@ for pkg in meta["packages"]:
             continue
         else:
             ext_dir = os.path.dirname(src) or "."
-            if ext_dir != "." and external_owners.get(ext_dir) == {pkg["name"]}:
+            if ext_dir != "." and owners_of(ext_dir) == {pkg["name"]}:
                 candidates = [ext_dir]
             else:
                 candidates = [src, os.path.splitext(src)[0]]

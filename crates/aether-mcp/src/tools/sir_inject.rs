@@ -371,8 +371,6 @@ impl AetherMcpServer {
             last_attempt_at: version_write.updated_at,
         })?;
 
-        let embedding_status =
-            self.refresh_embedding_after_inject(symbol_id.as_str(), hash.as_str(), &canonical_json);
         // Aggregate reads (file and module level) are served from the file rollup, so
         // rebuild it from the leaves now rather than leaving the indexing-time rollup
         // (a [MOCK] concatenation after a mock index) in place.
@@ -382,6 +380,11 @@ impl AetherMcpServer {
             &rollup_identity.1,
             &rollup_identity.2,
         );
+        // The embedding refresh may call a local or remote model: release the lock first
+        // so concurrent injections into other files are not serialized behind it.
+        drop(_inject_guard);
+        let embedding_status =
+            self.refresh_embedding_after_inject(symbol_id.as_str(), hash.as_str(), &canonical_json);
         let note = match embedding_status.as_str() {
             "refreshed" | "unchanged" => None,
             _ => Some(format!(
