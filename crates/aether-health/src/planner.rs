@@ -144,7 +144,7 @@ pub fn suggest_split(
             }
         })
         .collect::<Vec<_>>();
-    plans.sort_by(|left, right| left.community_id.cmp(&right.community_id));
+    plans.sort_by_key(|plan| plan.community_id);
 
     let unique_names = disambiguated_module_names(plans.as_slice());
     let suggested_modules = plans

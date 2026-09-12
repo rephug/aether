@@ -1,5 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+use crate::omp::{
+    batch_pricing_providers_list, batch_target_for_omp_route, strip_omp_route_prefix,
+};
+
+/// `[batch].provider` value that derives the batch provider from the omp route in
+/// `[inference].model` (see [`BatchConfig::resolve_provider`]).
+pub const BATCH_PROVIDER_AUTO: &str = "auto";
+
 /// Per-provider overrides for batch models and thinking levels.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct BatchProviderConfig {
@@ -64,7 +72,12 @@ pub struct BatchConfig {
     /// "auto" selects based on provider: cloud providers get "full", local gets "compact".
     #[serde(default = "default_prompt_tier")]
     pub prompt_tier: String,
-    /// Batch provider: "gemini", "openai", or "anthropic".
+    /// Batch provider: "gemini", "openai", "anthropic", or "auto".
+    ///
+    /// "auto" follows the omp route configured in `[inference].model`: an
+    /// `anthropic/...` route submits to the Anthropic Message Batches API, `openai/...` to the
+    /// OpenAI Batch API, `google/...` to Gemini Batch Mode. Routes whose provider offers no
+    /// batch pricing (subscription-only or local routes) fail with an explicit error.
     #[serde(default = "default_provider")]
     pub provider: String,
     /// Provider-specific overrides for Gemini batch.
@@ -79,8 +92,51 @@ pub struct BatchConfig {
 }
 
 impl BatchConfig {
+    /// Resolve the effective batch provider name.
+    ///
+    /// Precedence: `override_name` (CLI `--provider`), then `[batch].provider`. A value of
+    /// `"auto"` derives the provider from `inference_route`, the omp route configured in
+    /// `[inference].model`; routes with no batch API are an error naming the providers that
+    /// do offer batch pricing.
+    pub fn resolve_provider(
+        &self,
+        override_name: Option<&str>,
+        inference_route: Option<&str>,
+    ) -> Result<String, String> {
+        let selected = override_name
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| self.provider.trim());
+        if !selected.eq_ignore_ascii_case(BATCH_PROVIDER_AUTO) {
+            return Ok(selected.to_owned());
+        }
+        let route = inference_route
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "batch.provider=auto needs an omp route in inference.model (provider/model); \
+                     set one or choose a batch provider explicitly ({})",
+                    batch_pricing_providers_list()
+                )
+            })?;
+        batch_target_for_omp_route(route)
+            .map(|(provider, _)| provider.to_owned())
+            .ok_or_else(|| {
+                format!(
+                    "batch.provider=auto: route '{route}' has no batch pricing (only {} offer a \
+                     batch API); pick one of those routes or set batch.provider explicitly",
+                    batch_pricing_providers_list()
+                )
+            })
+    }
+
     /// Resolve the model for a given pass, checking the provider subsection first,
     /// then falling back to the top-level flat fields.
+    ///
+    /// omp-style routes are accepted anywhere a model is configured: an `anthropic/` prefix
+    /// is stripped for the anthropic batch provider (and likewise for openai and gemini), so
+    /// the same route string can be shared with `[inference].model`.
     pub fn resolve_model(&self, pass: &str, provider: &str) -> &str {
         let provider_config = self.provider_config(provider);
         let override_val = match pass {
@@ -90,14 +146,37 @@ impl BatchConfig {
             _ => None,
         };
         if let Some(val) = override_val.filter(|s| !s.is_empty()) {
-            return val;
+            return strip_omp_route_prefix(val, provider);
         }
-        match pass {
+        let flat = match pass {
             "scan" => self.scan_model.as_str(),
             "triage" => self.triage_model.as_str(),
             "deep" => self.deep_model.as_str(),
             _ => "",
+        };
+        strip_omp_route_prefix(flat, provider)
+    }
+
+    /// Like [`Self::resolve_model`], but when no batch model is configured for the pass,
+    /// fall back to the bare model of `inference_route` if that route maps to `provider`.
+    ///
+    /// This is what lets `[inference] model = "anthropic/claude-fable-5"` drive both the
+    /// online (gateway) path and the batch path without repeating the model name.
+    pub fn resolve_model_for_route(
+        &self,
+        pass: &str,
+        provider: &str,
+        inference_route: Option<&str>,
+    ) -> String {
+        let configured = self.resolve_model(pass, provider);
+        if !configured.is_empty() {
+            return configured.to_owned();
         }
+        inference_route
+            .and_then(batch_target_for_omp_route)
+            .filter(|(route_provider, _)| *route_provider == provider)
+            .map(|(_, model)| model.to_owned())
+            .unwrap_or_default()
     }
 
     /// Resolve the thinking level for a given pass, checking the provider subsection first.
@@ -230,4 +309,116 @@ fn default_max_concurrent_jobs() -> usize {
 
 fn default_prompt_tier() -> String {
     "auto".to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_provider(provider: &str) -> BatchConfig {
+        BatchConfig {
+            provider: provider.to_owned(),
+            ..BatchConfig::default()
+        }
+    }
+
+    #[test]
+    fn resolve_provider_prefers_cli_override_then_config() {
+        let config = config_with_provider("gemini");
+        assert_eq!(
+            config.resolve_provider(Some("anthropic"), None).unwrap(),
+            "anthropic"
+        );
+        assert_eq!(config.resolve_provider(Some("  "), None).unwrap(), "gemini");
+        assert_eq!(config.resolve_provider(None, None).unwrap(), "gemini");
+    }
+
+    #[test]
+    fn resolve_provider_auto_follows_omp_route() {
+        let config = config_with_provider("auto");
+        assert_eq!(
+            config
+                .resolve_provider(None, Some("anthropic/claude-fable-5"))
+                .unwrap(),
+            "anthropic"
+        );
+        assert_eq!(
+            config
+                .resolve_provider(None, Some("google/gemini-3.1-pro"))
+                .unwrap(),
+            "gemini"
+        );
+        assert_eq!(
+            config
+                .resolve_provider(Some("auto"), Some("openai/gpt-5.6-sol"))
+                .unwrap(),
+            "openai"
+        );
+    }
+
+    #[test]
+    fn resolve_provider_auto_rejects_routes_without_batch_pricing() {
+        let config = config_with_provider("auto");
+        let error = config
+            .resolve_provider(None, Some("openai-codex/gpt-5.6-sol"))
+            .unwrap_err();
+        assert!(error.contains("no batch pricing"), "{error}");
+        assert!(error.contains("anthropic, openai, gemini"), "{error}");
+
+        let error = config.resolve_provider(None, None).unwrap_err();
+        assert!(error.contains("needs an omp route"), "{error}");
+
+        let error = config
+            .resolve_provider(None, Some("claude-fable-5"))
+            .unwrap_err();
+        assert!(error.contains("no batch pricing"), "{error}");
+    }
+
+    #[test]
+    fn resolve_model_strips_matching_omp_prefix() {
+        let config = BatchConfig {
+            scan_model: "anthropic/claude-haiku-4-5".to_owned(),
+            anthropic: BatchProviderConfig {
+                deep_model: Some("anthropic/claude-fable-5".to_owned()),
+                ..BatchProviderConfig::default()
+            },
+            ..BatchConfig::default()
+        };
+        assert_eq!(
+            config.resolve_model("scan", "anthropic"),
+            "claude-haiku-4-5"
+        );
+        assert_eq!(config.resolve_model("deep", "anthropic"), "claude-fable-5");
+        // A route for another provider is left intact so the provider can reject it.
+        assert_eq!(
+            config.resolve_model("scan", "openai"),
+            "anthropic/claude-haiku-4-5"
+        );
+    }
+
+    #[test]
+    fn resolve_model_for_route_falls_back_to_inference_route() {
+        let config = BatchConfig::default();
+        assert_eq!(
+            config.resolve_model_for_route("scan", "anthropic", Some("anthropic/claude-fable-5")),
+            "claude-fable-5"
+        );
+        // A route for a different provider must not leak into this provider's batch.
+        assert_eq!(
+            config.resolve_model_for_route("scan", "openai", Some("anthropic/claude-fable-5")),
+            ""
+        );
+        let configured = BatchConfig {
+            scan_model: "claude-haiku-4-5".to_owned(),
+            ..BatchConfig::default()
+        };
+        assert_eq!(
+            configured.resolve_model_for_route(
+                "scan",
+                "anthropic",
+                Some("anthropic/claude-fable-5")
+            ),
+            "claude-haiku-4-5"
+        );
+    }
 }

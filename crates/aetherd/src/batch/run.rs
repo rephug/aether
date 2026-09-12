@@ -65,12 +65,11 @@ fn run_extract_command(workspace: &Path) -> Result<()> {
 }
 
 fn run_build_command(workspace: &Path, config: &AetherConfig, args: &BatchBuildArgs) -> Result<()> {
-    let batch_config = config.batch.clone().unwrap_or_default();
-    let provider = create_batch_provider(&batch_config, args.provider.as_deref())
+    let provider = create_batch_provider(config, args.provider.as_deref())
         .context("failed to create batch provider for build")?;
     let store = SqliteStore::open(workspace).context("failed to open store for batch build")?;
     let symbols_by_id = snapshot_workspace_symbols(workspace)?;
-    let mut runtime = resolve_batch_runtime_config(workspace, config, None);
+    let mut runtime = resolve_batch_runtime_config(workspace, config, None)?;
     if let Some(batch_dir) = args.batch_dir.as_deref() {
         runtime.batch_dir = normalize_batch_dir(workspace, batch_dir);
     }
@@ -100,11 +99,10 @@ fn run_ingest_command(
     config: &AetherConfig,
     args: &BatchIngestArgs,
 ) -> Result<()> {
-    let batch_config = config.batch.clone().unwrap_or_default();
-    let provider = create_batch_provider(&batch_config, args.provider.as_deref())
+    let provider = create_batch_provider(config, args.provider.as_deref())
         .context("failed to create batch provider for ingest")?;
     let store = SqliteStore::open(workspace).context("failed to open store for batch ingest")?;
-    let runtime = resolve_batch_runtime_config(workspace, config, None);
+    let runtime = resolve_batch_runtime_config(workspace, config, None)?;
     let mut pass_config = runtime.for_pass(args.pass).clone();
     if let Some(model) = args.model.as_ref() {
         pass_config.model = model.clone();
@@ -134,13 +132,12 @@ fn run_full_batch_command(
     config: &AetherConfig,
     args: &BatchRunArgs,
 ) -> Result<()> {
-    let batch_config = config.batch.clone().unwrap_or_default();
     let provider: Arc<dyn BatchProvider> = Arc::from(
-        create_batch_provider(&batch_config, args.provider.as_deref())
+        create_batch_provider(config, args.provider.as_deref())
             .context("failed to create batch provider")?,
     );
 
-    let runtime = resolve_batch_runtime_config(workspace, config, Some(args));
+    let runtime = resolve_batch_runtime_config(workspace, config, Some(args))?;
     let passes = parse_batch_passes_csv(args.passes.as_str())?;
 
     let contracts_enabled = config.contracts.as_ref().is_some_and(|c| c.enabled);

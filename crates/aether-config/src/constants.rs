@@ -2,6 +2,20 @@ pub const AETHER_DIR_NAME: &str = ".aether";
 pub const CONFIG_FILE_NAME: &str = "config.toml";
 pub const DEFAULT_GEMINI_API_KEY_ENV: &str = "GEMINI_API_KEY";
 pub const DEFAULT_OPENAI_COMPAT_API_KEY_ENV: &str = "OPENAI_COMPAT_API_KEY";
+/// OpenAI-compatible base URL served by `omp auth-gateway serve` (loopback default bind).
+pub const DEFAULT_OMP_GATEWAY_ENDPOINT: &str = "http://127.0.0.1:4000/v1";
+/// Env var consulted first for the gateway bearer token.
+pub const DEFAULT_OMP_GATEWAY_TOKEN_ENV: &str = "OMP_GATEWAY_TOKEN";
+/// Token file written by `omp auth-gateway token`, relative to `$HOME`.
+pub const OMP_GATEWAY_TOKEN_FILE: &str = ".omp/auth-gateway.token";
+/// The omp CLI binary AETHER spawns for `aetherd omp up` / autostart.
+pub const DEFAULT_OMP_COMMAND: &str = "omp";
+/// Default bind of `omp auth-broker serve`.
+pub const DEFAULT_OMP_BROKER_BIND: &str = "127.0.0.1:8765";
+/// Default bind of `omp auth-gateway serve`.
+pub const DEFAULT_OMP_GATEWAY_BIND: &str = "127.0.0.1:4000";
+/// How long autostart waits for the broker and gateway health endpoints.
+pub const DEFAULT_OMP_STARTUP_TIMEOUT_SECS: u64 = 20;
 pub const DEFAULT_QWEN_ENDPOINT: &str = "http://127.0.0.1:11434";
 pub const DEFAULT_QWEN_MODEL: &str = "qwen3.5:4b";
 pub const DEFAULT_QWEN_EMBEDDING_ENDPOINT: &str = "http://127.0.0.1:11434/api/embeddings";

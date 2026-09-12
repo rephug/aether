@@ -118,7 +118,7 @@ fn run_monitor_once_inner(
     let last_successful_at = previous_status
         .as_ref()
         .and_then(|status| status.last_successful_completed_at);
-    let runtime = resolve_batch_runtime_config(workspace, config, None);
+    let runtime = resolve_batch_runtime_config(workspace, config, None)?;
 
     let (store, symbols_by_id, total_symbols) = run_structural_index_once(workspace)
         .context("continuous run-once failed to refresh structural index")?;
@@ -168,8 +168,7 @@ fn run_monitor_once_inner(
 
     let contracts_enabled = config.contracts.as_ref().is_some_and(|c| c.enabled);
     let pass_config = runtime.for_pass(requeue_pass).clone();
-    let batch_config = config.batch.clone().unwrap_or_default();
-    let provider = create_batch_provider(&batch_config, None)
+    let provider = create_batch_provider(config, None)
         .context("failed to create batch provider for continuous monitor")?;
     let build_summary = build_pass_jsonl_for_ids(
         workspace,
