@@ -88,12 +88,38 @@ fn acquire_inject_write_lock(workspace: &Path) -> anyhow::Result<std::fs::File> 
     Ok(file)
 }
 /// One lock per symbol for the embedding refresh, so two injections into the same symbol
-/// embed in order (the later SIR wins) while unrelated symbols stay concurrent.
+/// embed in order (the later SIR wins) while unrelated symbols stay concurrent. This is
+/// the in-process half; `acquire_embed_lock` adds the cross-process half, since every
+/// MCP client runs its own stdio `aether-mcp` process against the same store.
 static EMBED_LOCKS: Mutex<Option<HashMap<String, Arc<Mutex<()>>>>> = Mutex::new(None);
+/// Directory under `.aether/` holding one lock file per symbol (named by the BLAKE3 hash
+/// of the symbol id, so arbitrary ids map to safe, bounded file names).
+const EMBED_LOCK_DIR: &str = "embed-locks";
 /// `sir_status` recorded when a leaf was written but its file rollup could not be
 /// rebuilt: the confidence guard lets such a symbol be re-injected without `force`, and
 /// the scan queries keep selecting it, so the retry is never blocked.
 pub const SIR_STATUS_ROLLUP_FAILED: &str = "rollup_failed";
+
+/// Exclusive, cross-process lock for one symbol's embedding refresh, so a slower embedding
+/// computed by another `aether-mcp` process for an older SIR cannot overwrite the vector
+/// of a newer one. Released when the returned handle is dropped.
+fn acquire_embed_lock(workspace: &Path, symbol_id: &str) -> anyhow::Result<std::fs::File> {
+    let dir = workspace.join(".aether").join(EMBED_LOCK_DIR);
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let path = dir.join(format!(
+        "{}.lock",
+        blake3::hash(symbol_id.as_bytes()).to_hex()
+    ));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.lock()
+        .with_context(|| format!("failed to lock {}", path.display()))?;
+    Ok(file)
+}
 
 fn embed_lock_for(symbol_id: &str) -> Arc<Mutex<()>> {
     let mut locks = EMBED_LOCKS
@@ -520,12 +546,18 @@ impl AetherMcpServer {
             return "skipped: embeddings disabled".to_owned();
         }
         // Per-symbol ordering: a slower embedding for an older SIR must never overwrite
-        // the embedding of a newer one, so embed under the symbol's lock and only when
-        // the store still holds the SIR this call wrote.
+        // the embedding of a newer one, so embed under the symbol's in-process and
+        // cross-process locks, and only when the store still holds the SIR this call
+        // wrote (the check happens after both locks are held, so no other injector can
+        // be mid-embedding for this symbol while it runs).
         let symbol_lock = embed_lock_for(symbol_id);
         let _symbol_guard = symbol_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _cross_process_guard = match acquire_embed_lock(&self.state.workspace, symbol_id) {
+            Ok(guard) => guard,
+            Err(err) => return format!("failed: {err:#}"),
+        };
         match self.state.store.get_sir_meta(symbol_id) {
             Ok(Some(meta)) if meta.sir_hash != sir_hash => {
                 return "superseded: a newer SIR was injected".to_owned();
