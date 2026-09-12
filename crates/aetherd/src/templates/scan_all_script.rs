@@ -11,12 +11,15 @@ impl ScanAllScriptTemplate {
 #
 # Usage: scripts/scan_all.sh [BATCH_SIZE=100] [MAX_PARALLEL=4] [crate ...]
 #
-# With no crate arguments every workspace package from `cargo metadata` is scanned
-# (falling back to the directories under crates/). Preflight checks the index exists
-# and counts [MOCK] / low-confidence SIRs in the selected crates before and after.
-# A running aetherd is left alone: the MCP server the sessions use falls back to the
-# SQLite graph when the daemon holds the SurrealKV lock, so `aether_sir_inject` works
-# either way. Runs on Bash 3.2 (stock macOS) and later.
+# With no arguments every workspace package from `cargo metadata` is scanned; in a
+# workspace without Cargo (TypeScript, Python, ...) every top-level directory that holds
+# indexed symbols is scanned instead. Arguments may be package names or directories
+# relative to the workspace root. Preflight checks the index and the project-scoped
+# AETHER MCP registration (.mcp.json, written by `aetherd init-agent`) that the Claude
+# sessions need for `aether_sir_inject`, then counts [MOCK] / low-confidence SIRs in the
+# selected scopes before and after. A running aetherd is left alone: the MCP server
+# falls back to the SQLite graph when the daemon holds the SurrealKV lock. Runs on
+# Bash 3.2 (stock macOS) and later.
 set -euo pipefail
 
 # Leading numeric arguments are BATCH_SIZE then MAX_PARALLEL; everything else is a crate
@@ -46,12 +49,37 @@ mkdir -p "$LOG_DIR"
 
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$MASTER_LOG"; }
 
-# Prints "name<TAB>scope[<TAB>scope...]" per workspace package, scopes relative to the
-# workspace root. Parses the metadata JSON structurally (packages[].name / manifest_path /
-# targets); never the dependency or target names that also carry a "name" key. A package
-# whose manifest sits at the workspace root owns only its own targets: the top-level
-# directory of each target's src_path (src/, tests/, benches/, ...) or, for a target file
-# stored at the root itself (e.g. `path = "lib.rs"`), that file. Never the whole workspace.
+if [ ! -f "$DB" ]; then
+  echo "error: $DB not found. Index first with:" >&2
+  echo "  aetherd --workspace . --index-once --full --inference-provider mock" >&2
+  exit 1
+fi
+if ! command -v sqlite3 >/dev/null 2>&1; then
+  echo "error: sqlite3 is required to count scan targets" >&2
+  exit 1
+fi
+if ! command -v claude >/dev/null 2>&1; then
+  echo "error: the claude CLI is required (each scope runs as: claude -p \"/scan <crate> $BATCH_SIZE\")" >&2
+  exit 1
+fi
+# The sessions are non-interactive, so the AETHER MCP server must already be registered
+# for this project: `.mcp.json` with an "aether" entry (the stdio aether-mcp binary,
+# which opens the store itself; no daemon is required).
+if [ ! -f .mcp.json ] || ! grep -q '"aether"' .mcp.json; then
+  echo "error: no project-scoped AETHER MCP registration (.mcp.json with an \"aether\" server)." >&2
+  echo "  Register it with: aetherd --workspace . init-agent --platform claude" >&2
+  echo "  or: claude mcp add --transport stdio --scope project aether -- aether-mcp --workspace ." >&2
+  exit 1
+fi
+
+# Prints "name<TAB>scope[<TAB>scope...]" per scan unit, scopes relative to the workspace
+# root. Cargo workspaces: one unit per package, parsed structurally from the metadata
+# JSON (packages[].name / manifest_path / targets; never the dependency or target names
+# that also carry a "name" key). A package whose manifest sits at the workspace root owns
+# only its own targets: the top-level directory of each target's src_path (src/, tests/,
+# benches/, ...) or, for a target file stored at the root itself (e.g. `path = "lib.rs"`),
+# that file. Never the whole workspace. Without Cargo (or python3), one unit per top-level
+# directory (or root-level file) that holds indexed symbols, straight from the index.
 discover_packages() {
   if command -v cargo >/dev/null 2>&1 && [ -f Cargo.toml ] && command -v python3 >/dev/null 2>&1; then
     cargo metadata --no-deps --format-version 1 2>/dev/null | python3 -c '
@@ -73,11 +101,9 @@ for pkg in meta["packages"]:
     if dirs:
         print(pkg["name"] + "\t" + "\t".join(dirs))
 '
-  elif [ -d crates ]; then
-    for dir in crates/*/; do
-      name="$(basename "$dir")"
-      printf '%s\t%s\n' "$name" "crates/$name"
-    done
+  else
+    sqlite3 "$DB" "SELECT DISTINCT CASE WHEN instr(file_path, '/') > 0 THEN substr(file_path, 1, instr(file_path, '/') - 1) ELSE file_path END FROM symbols ORDER BY 1;" \
+      | awk 'NF { printf "%s\t%s\n", $0, $0 }'
   fi
 }
 
@@ -86,45 +112,38 @@ PACKAGE_TABLE="$(discover_packages)"
 
 CRATES=()
 if [ "$#" -gt 0 ]; then
-  CRATES=("$@")
+  for name in "$@"; do CRATES+=("${name%/}"); done
 else
   while IFS= read -r name; do
     [ -n "$name" ] && CRATES+=("$name")
   done < <(printf '%s\n' "$PACKAGE_TABLE" | cut -f1 | sort)
   if [ "${#CRATES[@]}" -eq 0 ]; then
-    echo "error: no crates discovered (no Cargo workspace or crates/ directory); pass crate names explicitly" >&2
+    echo "error: nothing to scan: no Cargo packages and no indexed symbols in $DB" >&2
     exit 1
   fi
 fi
 
-# Tab-separated scopes (directories or root-level target files) for one crate; unknown
-# names fall back to crates/<name>.
+# Tab-separated scopes (directories or root-level target files) for one unit. Names that
+# are not discovered units are taken as paths relative to the workspace root when they
+# exist, else as crates/<name>.
 crate_scopes() {
   local found
   found="$(printf '%s\n' "$PACKAGE_TABLE" | awk -F '\t' -v crate="$1" '$1 == crate { sub(/^[^\t]*\t/, ""); print; exit }')"
-  if [ -n "$found" ]; then printf '%s' "$found"; else printf 'crates/%s' "$1"; fi
+  if [ -n "$found" ]; then
+    printf '%s' "$found"
+  elif [ -e "$1" ]; then
+    printf '%s' "${1%/}"
+  else
+    printf 'crates/%s' "$1"
+  fi
 }
 crate_scopes_display() { crate_scopes "$1" | tr '\t' ','; }
 
-if [ ! -f "$DB" ]; then
-  echo "error: $DB not found. Index first with:" >&2
-  echo "  aetherd --workspace . --index-once --full --inference-provider mock" >&2
-  exit 1
-fi
-if ! command -v sqlite3 >/dev/null 2>&1; then
-  echo "error: sqlite3 is required to count scan targets" >&2
-  exit 1
-fi
-if ! command -v claude >/dev/null 2>&1; then
-  echo "error: the claude CLI is required (each crate runs as: claude -p \"/scan <crate> $BATCH_SIZE\")" >&2
-  exit 1
-fi
-
-# SQL scope: only symbols under the selected crates' own directories (or equal to a
-# root-level target file).
+# SQL scope for the given units: only symbols under their own directories (or equal to
+# a root-level target file).
 scope_clause() {
   local clauses=() crate scope scopes
-  for crate in "${CRATES[@]}"; do
+  for crate in "$@"; do
     IFS=$'\t' read -ra scopes <<< "$(crate_scopes "$crate")"
     for scope in "${scopes[@]}"; do
       [ -z "$scope" ] && continue
@@ -136,16 +155,18 @@ scope_clause() {
     done
   done
   if [ "${#clauses[@]}" -eq 0 ]; then
-    echo "error: no source directories resolved for: ${CRATES[*]}" >&2
+    echo "error: no source directories resolved for: $*" >&2
     exit 1
   fi
   local IFS=' '
   printf '(%s)' "$(printf '%s OR ' "${clauses[@]}" | sed 's/ OR $//')"
 }
-SCOPE="$(scope_clause)"
+SCOPE="$(scope_clause "${CRATES[@]}")"
 
+# Number of [MOCK] / low-confidence SIRs inside a scope clause (default: all selected units).
 count_targets() {
-  sqlite3 "$DB" "SELECT COUNT(*) FROM sir JOIN symbols s ON s.id = sir.id WHERE $SCOPE AND (sir.sir_json LIKE '%\"intent\":\"[MOCK]%' OR json_extract(sir.sir_json, '\$.confidence') < 0.2);"
+  local scope="${1:-$SCOPE}"
+  sqlite3 "$DB" "SELECT COUNT(*) FROM sir JOIN symbols s ON s.id = sir.id WHERE $scope AND (sir.sir_json LIKE '%\"intent\":\"[MOCK]%' OR json_extract(sir.sir_json, '\$.confidence') < 0.2);"
 }
 
 NEXT_STEP="deepen the results with: aetherd --workspace . regenerate --deep --below-confidence 0.85 (or /refactor-deep on the files that matter most)"
@@ -161,7 +182,11 @@ log "scanning ${#CRATES[@]} crate(s), batch size $BATCH_SIZE, up to $MAX_PARALLE
 # Bash 3.2 cannot wait for "any one job": poll the running job count instead.
 running_jobs() { jobs -rp | wc -l | tr -d ' '; }
 for crate in "${CRATES[@]}"; do
-  crate_log="$LOG_DIR/${crate}_${STAMP}.log"
+  if [ "$(count_targets "$(scope_clause "$crate")")" = "0" ]; then
+    log "skip $crate ($(crate_scopes_display "$crate")): no scan targets"
+    continue
+  fi
+  crate_log="$LOG_DIR/$(printf '%s' "$crate" | tr '/' '_')_${STAMP}.log"
   log "start $crate ($(crate_scopes_display "$crate")) -> $crate_log"
   ( claude -p "/scan $crate $BATCH_SIZE" > "$crate_log" 2>&1 \
       && echo "done $crate" || echo "FAILED $crate (see $crate_log)" ) | tee -a "$MASTER_LOG" &

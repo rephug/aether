@@ -341,6 +341,8 @@ mod tests {
         assert!(!script.contains("mapfile"));
         assert!(!script.contains("wait -n"));
         assert!(!script.contains("git rev-parse"));
+        assert!(script.contains(".mcp.json"));
+        assert!(script.contains("FROM symbols"));
         assert!(script.contains("--inference-provider mock"));
         assert!(!script.contains("enrich_all.sh"));
     }

@@ -194,6 +194,14 @@ fn files_for_platform(platform: AgentPlatform, context: &TemplateContext) -> Vec
             "AGENTS.md",
             OmpAgentsTemplate::render(context),
         ));
+    }
+
+    // Claude Code and Oh My Pi both read a project-root `.mcp.json`; the non-interactive
+    // `claude -p "/scan ..."` sessions started by scripts/scan_all.sh depend on it.
+    if matches!(
+        platform,
+        AgentPlatform::Claude | AgentPlatform::Omp | AgentPlatform::All
+    ) {
         files.push(GeneratedFile::new(
             ".mcp.json",
             McpJsonTemplate::render(context),
@@ -320,6 +328,11 @@ mod tests {
         let command = fs::read_to_string(workspace.join(".claude/commands/scan.md"))
             .expect("read scan command");
         assert!(command.contains("aether_sir_inject"));
+        let mcp = fs::read_to_string(workspace.join(".mcp.json")).expect("read .mcp.json");
+        assert!(
+            mcp.contains("\"aether\""),
+            "claude platform must register the MCP server"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

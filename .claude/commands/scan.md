@@ -13,10 +13,12 @@ symbols this session processes before stopping.
 
 ## Procedure
 
-1. Resolve the crate's directories. Run
+1. Resolve the crate's directories. In a Cargo workspace run
    `cargo metadata --no-deps --format-version 1` and take the directory of the
    `manifest_path` for the package named `<crate>`, relative to the workspace root
-   (for example `crates/<crate>` or `packages/<crate>`). Call it `<dir>`. If the
+   (for example `crates/<crate>` or `packages/<crate>`). Call it `<dir>`. Without
+   Cargo (TypeScript, Python, ...), or when `<crate>` names no package, `<crate>` is a
+   directory (or a single file) relative to the workspace root. If the
    manifest sits at the workspace root, the package owns only its own targets: use
    the top-level directory of each target's `src_path` (typically `src`, `tests`,
    `benches`, `examples`) as the `<dir>` set, and match a target file stored at the
