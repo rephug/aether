@@ -8,7 +8,7 @@ If the file does not exist, `aetherd` creates it on startup with defaults.
 
 ```toml
 [inference]
-provider = "auto" # auto | tiered | gemini | qwen3_local | openai_compat | omp
+provider = "auto" # auto | tiered | gemini | qwen3_local | openai_compat | omp | mock
 # model = "..."
 # endpoint = "..."
 api_key_env = "GEMINI_API_KEY"
@@ -22,6 +22,7 @@ concurrency = 2
   - `qwen3_local`: always Ollama-compatible local inference.
   - `openai_compat`: always OpenAI-compatible chat completions.
   - `omp`: the Oh My Pi auth gateway (see [Oh My Pi models and batch pricing](#oh-my-pi-models-and-batch-pricing)).
+  - `mock`: no model at all. Every symbol gets a `[MOCK]` placeholder SIR at confidence 0.1 from tree-sitter facts, so `aether_audit_candidates` ranks it first for `/scan` (zero-Gemini onboarding, Decision #121).
 - `model`
   - Optional provider-specific override.
   - Gemini default: `gemini-3.1-flash-lite-preview`
@@ -215,7 +216,7 @@ No API key is required for `qwen3_local`.
 `aetherd` can override config values at runtime:
 
 ```bash
---inference-provider <auto|tiered|gemini|qwen3_local|openai_compat|omp>
+--inference-provider <auto|tiered|gemini|qwen3_local|openai_compat|omp|mock>
 --inference-model <name>
 --inference-endpoint <url>
 --inference-api-key-env <ENV_VAR_NAME>

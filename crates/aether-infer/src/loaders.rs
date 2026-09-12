@@ -16,7 +16,9 @@ use crate::embedding::openai_compat::OpenAiCompatEmbeddingProvider;
 use crate::http::{is_ollama_reachable, is_ollama_reachable_blocking};
 use crate::providers::gemini::{request_gemini_summary, resolve_gemini_model};
 use crate::providers::qwen_local::request_qwen_summary;
-use crate::providers::{GeminiProvider, OpenAiCompatProvider, Qwen3LocalProvider, TieredProvider};
+use crate::providers::{
+    GeminiProvider, MockInferenceProvider, OpenAiCompatProvider, Qwen3LocalProvider, TieredProvider,
+};
 use crate::reranker::candle::CandleRerankerProvider;
 use crate::reranker::cohere::CohereRerankerProvider;
 use crate::types::{
@@ -151,6 +153,17 @@ pub fn load_inference_provider_from_config(
                 model_name: provider.model_name(),
                 provider: Box::new(provider),
                 provider_name: InferenceProviderKind::Omp.as_str().to_owned(),
+            })
+        }
+        InferenceProviderKind::Mock => {
+            let provider = MockInferenceProvider::new();
+            tracing::info!(
+                "mock provider selected: placeholder [MOCK] SIRs at confidence 0.1, no API key needed"
+            );
+            Ok(LoadedProvider {
+                model_name: provider.model_name(),
+                provider_name: provider.provider_name(),
+                provider: Box::new(provider),
             })
         }
     }
@@ -360,6 +373,8 @@ pub async fn summarize_text_with_config(
             let summary = provider.request_summary(system_prompt, user_prompt).await?;
             Ok(clean_summary(summary))
         }
+        // The mock provider has no model to summarize with.
+        InferenceProviderKind::Mock => Ok(None),
         InferenceProviderKind::Omp => {
             if resolve_omp_gateway_token(selected_api_key_env.as_str()).is_err() {
                 return Ok(None);
@@ -1298,6 +1313,22 @@ dimensions = 3072
             Err(InferError::MissingApiKey(name)) => assert_eq!(name, env_name),
             _ => panic!("expected missing api key"),
         }
+    }
+
+    #[test]
+    fn load_provider_mock_needs_no_key_or_model() {
+        let temp = tempdir().expect("tempdir");
+        ensure_workspace_config(temp.path()).expect("ensure config");
+        let loaded = load_provider_from_env_or_mock(
+            temp.path(),
+            ProviderOverrides {
+                provider: Some(InferenceProviderKind::Mock),
+                ..ProviderOverrides::default()
+            },
+        )
+        .expect("mock provider always loads");
+        assert_eq!(loaded.provider_name, "mock");
+        assert_eq!(loaded.model_name, "tree-sitter");
     }
 
     #[test]
