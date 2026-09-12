@@ -1,4 +1,11 @@
----
+use super::TemplateContext;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScanCommandTemplate;
+
+impl ScanCommandTemplate {
+    pub fn render(_context: &TemplateContext) -> String {
+        r#"---
 description: Fast baseline SIR coverage for a crate — replaces [MOCK] and low-confidence SIRs, coverage over depth
 ---
 
@@ -56,3 +63,7 @@ symbols this session processes before stopping.
 7. Group by file. When multiple symbols share a source file, read the
    file once and analyze all its symbols together. This is the single
    biggest throughput win.
+"#
+        .to_owned()
+    }
+}
