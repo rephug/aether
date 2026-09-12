@@ -17,3 +17,7 @@ tests/stress/reports/*.json
 tests/stress/repos/
 .mcp.json
 .claude/
+
+# Run-series state and session scaffolding (never committed; see docs/runs/AETHER_RUN_SESSION_CONTEXT.md)
+RUN_STATUS.md
+/docs/runs/
