@@ -82,21 +82,29 @@ fi
 # directory (or root-level file) that holds indexed symbols, straight from the index.
 discover_packages() {
   if command -v cargo >/dev/null 2>&1 && [ -f Cargo.toml ] && command -v python3 >/dev/null 2>&1; then
-    cargo metadata --no-deps --format-version 1 2>/dev/null | python3 -c '
+    AETHER_WORKSPACE="$WORKSPACE" cargo metadata --no-deps --format-version 1 2>/dev/null | python3 -c '
 import json, os, sys
 meta = json.load(sys.stdin)
-root = os.path.realpath(meta["workspace_root"])
+# Scopes are relative to the AETHER workspace (where the index lives), which may be a
+# single package inside a larger Cargo workspace; packages outside it are ignored.
+root = os.path.realpath(os.environ["AETHER_WORKSPACE"])
+def inside(path):
+    rel = os.path.relpath(os.path.realpath(path), root)
+    return None if rel == ".." or rel.startswith(".." + os.sep) else rel
 for pkg in meta["packages"]:
-    manifest_dir = os.path.dirname(os.path.realpath(pkg["manifest_path"]))
-    rel = os.path.relpath(manifest_dir, root)
+    rel = inside(os.path.dirname(pkg["manifest_path"]))
+    if rel is None:
+        continue
     if rel != ".":
         dirs = [rel]
     else:
         dirs = []
         for target in pkg.get("targets", []):
-            src = os.path.relpath(os.path.realpath(target["src_path"]), root)
+            src = inside(target["src_path"])
+            if src is None:
+                continue
             scope = src.split(os.sep)[0]
-            if scope and scope != "." and not scope.startswith("..") and scope not in dirs:
+            if scope and scope != "." and scope not in dirs:
                 dirs.append(scope)
     if dirs:
         print(pkg["name"] + "\t" + "\t".join(dirs))
@@ -179,26 +187,40 @@ if [ "$BEFORE" = "0" ]; then
 fi
 
 log "scanning ${#CRATES[@]} crate(s), batch size $BATCH_SIZE, up to $MAX_PARALLEL parallel sessions"
-# Bash 3.2 cannot wait for "any one job": poll the running job count instead.
+# Bash 3.2 cannot wait for "any one job": poll the running job count instead. Failed
+# sessions leave a marker so the exit status reflects them after the final wait.
 running_jobs() { jobs -rp | wc -l | tr -d ' '; }
+FAIL_DIR="$LOG_DIR/failed_${STAMP}"
+mkdir -p "$FAIL_DIR"
 for crate in "${CRATES[@]}"; do
   if [ "$(count_targets "$(scope_clause "$crate")")" = "0" ]; then
     log "skip $crate ($(crate_scopes_display "$crate")): no scan targets"
     continue
   fi
-  crate_log="$LOG_DIR/$(printf '%s' "$crate" | tr '/' '_')_${STAMP}.log"
+  safe_name="$(printf '%s' "$crate" | tr '/' '_')"
+  crate_log="$LOG_DIR/${safe_name}_${STAMP}.log"
   log "start $crate ($(crate_scopes_display "$crate")) -> $crate_log"
-  ( claude -p "/scan $crate $BATCH_SIZE" > "$crate_log" 2>&1 \
-      && echo "done $crate" || echo "FAILED $crate (see $crate_log)" ) | tee -a "$MASTER_LOG" &
+  ( if claude -p "/scan $crate $BATCH_SIZE" > "$crate_log" 2>&1; then
+      echo "done $crate"
+    else
+      touch "$FAIL_DIR/$safe_name"
+      echo "FAILED $crate (see $crate_log)"
+    fi ) | tee -a "$MASTER_LOG" &
   while [ "$(running_jobs)" -ge "$MAX_PARALLEL" ]; do
     sleep 2
   done
 done
 wait
+FAILED="$(ls "$FAIL_DIR" | wc -l | tr -d ' ')"
+rm -rf "$FAIL_DIR"
 
 AFTER="$(count_targets)"
 log "scan targets after: $AFTER (was $BEFORE)"
 log "complete: $((BEFORE - AFTER)) symbol(s) scanned; logs in $LOG_DIR"
+if [ "$FAILED" != "0" ]; then
+  log "error: $FAILED scan session(s) failed; see the FAILED lines above"
+  exit 1
+fi
 if [ "$AFTER" != "0" ]; then
   log "rerun scripts/scan_all.sh to continue, then $NEXT_STEP"
 else

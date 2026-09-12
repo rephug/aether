@@ -58,7 +58,7 @@ pub fn run_init_agent(workspace: &Path, options: InitAgentOptions) -> Result<Ini
         )
     })?;
 
-    let context = build_template_context(&config);
+    let context = build_template_context(workspace, &config);
     let files = files_for_platform(options.platform, &context);
 
     let mut written_files = Vec::new();
@@ -211,19 +211,48 @@ fn files_for_platform(platform: AgentPlatform, context: &TemplateContext) -> Vec
     files
 }
 
-fn build_template_context(config: &AetherConfig) -> TemplateContext {
+fn build_template_context(workspace: &Path, config: &AetherConfig) -> TemplateContext {
     TemplateContext {
         languages: detected_languages(),
         verify_commands: config.verify.commands.clone(),
         embeddings_enabled: config.embeddings.enabled,
         inference_provider: config.inference.provider.as_str().to_owned(),
         agent_schema_version: AETHER_AGENT_SCHEMA_VERSION,
-        mcp_binary_hint: default_mcp_binary_hint(),
+        mcp_binary_hint: resolve_mcp_binary_hint(workspace),
     }
 }
 
-fn default_mcp_binary_hint() -> String {
-    "./target/debug/aether-mcp".to_owned()
+const SOURCE_TREE_MCP_BINARY: &str = "./target/debug/aether-mcp";
+const MCP_BINARY_NAME: &str = "aether-mcp";
+
+/// The command `.mcp.json` and the agent docs use to start the AETHER MCP server.
+///
+/// The source-tree debug binary is used only when it exists in this workspace (the
+/// AETHER checkout dogfooding its own assets). Otherwise prefer the `aether-mcp` that
+/// was installed next to the running `aetherd`, and fall back to the bare name so the
+/// PATH resolves it. A downstream project never gets a path into a build tree it
+/// does not have.
+fn resolve_mcp_binary_hint(workspace: &Path) -> String {
+    if workspace.join(SOURCE_TREE_MCP_BINARY).is_file() {
+        return SOURCE_TREE_MCP_BINARY.to_owned();
+    }
+    let installed_sibling = std::env::current_exe()
+        .ok()
+        .and_then(|current| current.parent().map(Path::to_path_buf))
+        .map(|dir| dir.join(binary_file_name(MCP_BINARY_NAME)))
+        .filter(|candidate| candidate.is_file());
+    match installed_sibling {
+        Some(sibling) => sibling.to_string_lossy().into_owned(),
+        None => MCP_BINARY_NAME.to_owned(),
+    }
+}
+
+fn binary_file_name(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    }
 }
 
 fn detected_languages() -> Vec<String> {
@@ -329,9 +358,17 @@ mod tests {
             .expect("read scan command");
         assert!(command.contains("aether_sir_inject"));
         let mcp = fs::read_to_string(workspace.join(".mcp.json")).expect("read .mcp.json");
+        let parsed: serde_json::Value = serde_json::from_str(&mcp).expect("valid json");
+        let command = parsed["mcpServers"]["aether"]["command"]
+            .as_str()
+            .expect("claude platform must register the MCP server");
         assert!(
-            mcp.contains("\"aether\""),
-            "claude platform must register the MCP server"
+            !command.starts_with("./target/"),
+            "a workspace without a build tree must not be pointed at one: {command}"
+        );
+        assert!(
+            command.ends_with("aether-mcp") || command.ends_with("aether-mcp.exe"),
+            "unexpected MCP command: {command}"
         );
         #[cfg(unix)]
         {
