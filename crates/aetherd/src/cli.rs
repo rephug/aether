@@ -582,7 +582,7 @@ pub struct BatchBuildArgs {
     #[arg(long, help = "Batch JSONL output directory override")]
     pub batch_dir: Option<String>,
 
-    #[arg(long, help = "Batch provider (gemini, openai)")]
+    #[arg(long, help = "Batch provider (gemini, openai, anthropic, auto)")]
     pub provider: Option<String>,
 }
 
@@ -597,7 +597,7 @@ pub struct BatchIngestArgs {
     #[arg(help = "Path to the batch result JSONL file")]
     pub results_jsonl: PathBuf,
 
-    #[arg(long, help = "Batch provider (gemini, openai)")]
+    #[arg(long, help = "Batch provider (gemini, openai, anthropic, auto)")]
     pub provider: Option<String>,
 }
 
@@ -664,7 +664,10 @@ pub struct BatchRunArgs {
     )]
     pub max_concurrent_jobs: Option<usize>,
 
-    #[arg(long, help = "Batch provider (gemini, openai, anthropic)")]
+    #[arg(
+        long,
+        help = "Batch provider (gemini, openai, anthropic, or auto to follow the omp route in inference.model)"
+    )]
     pub provider: Option<String>,
 }
 

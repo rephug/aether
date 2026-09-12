@@ -201,6 +201,7 @@ pub(crate) fn build_openai_chat_completion_body(
     system_prompt: &str,
     user_prompt: &str,
     include_response_format: bool,
+    reasoning_effort: Option<&str>,
 ) -> Value {
     let mut body = json!({
         "model": model,
@@ -211,8 +212,13 @@ pub(crate) fn build_openai_chat_completion_body(
         "temperature": 0.0
     });
 
-    if include_response_format && let Some(body_obj) = body.as_object_mut() {
-        body_obj.insert("response_format".to_owned(), json!({"type": "json_object"}));
+    if let Some(body_obj) = body.as_object_mut() {
+        if include_response_format {
+            body_obj.insert("response_format".to_owned(), json!({"type": "json_object"}));
+        }
+        if let Some(effort) = reasoning_effort.map(str::trim).filter(|e| !e.is_empty()) {
+            body_obj.insert("reasoning_effort".to_owned(), json!(effort));
+        }
     }
 
     body
@@ -496,5 +502,16 @@ mod tests {
 
         let text = extract_gemini_text_part(&response).expect("gemini text");
         assert_eq!(text, r#"{"intent":"ok"}"#);
+    }
+
+    #[test]
+    fn chat_completion_body_includes_reasoning_effort_only_when_set() {
+        let body = build_openai_chat_completion_body("m", "sys", "usr", true, Some("high"));
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["response_format"]["type"], "json_object");
+
+        let body = build_openai_chat_completion_body("m", "sys", "usr", false, Some("  "));
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("response_format").is_none());
     }
 }

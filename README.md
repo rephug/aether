@@ -795,6 +795,7 @@ dimensions = 3072
 vector_backend = "lancedb"
 
 [batch]
+provider = "gemini"               # gemini | openai | anthropic | auto (follow the omp route in [inference].model)
 scan_model = "gemini-3.1-flash-lite-preview"
 triage_model = "gemini-3.1-flash-lite-preview"
 deep_model = "gemini-3.1-pro"

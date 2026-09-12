@@ -8,7 +8,7 @@ If the file does not exist, `aetherd` creates it on startup with defaults.
 
 ```toml
 [inference]
-provider = "auto" # auto | tiered | gemini | qwen3_local | openai_compat
+provider = "auto" # auto | tiered | gemini | qwen3_local | openai_compat | omp
 # model = "..."
 # endpoint = "..."
 api_key_env = "GEMINI_API_KEY"
@@ -21,6 +21,7 @@ concurrency = 2
   - `gemini`: always Gemini.
   - `qwen3_local`: always Ollama-compatible local inference.
   - `openai_compat`: always OpenAI-compatible chat completions.
+  - `omp`: the Oh My Pi auth gateway (see [Oh My Pi models and batch pricing](#oh-my-pi-models-and-batch-pricing)).
 - `model`
   - Optional provider-specific override.
   - Gemini default: `gemini-3.1-flash-lite-preview`
@@ -35,6 +36,87 @@ concurrency = 2
   - When `provider = "gemini"` and concurrency is left at the default value, AETHER normalizes it to `16`.
   - For `gemini-3.1-flash-lite-preview`, `concurrency = 16` is safe under the 4000 RPM limit.
   - For local Ollama on consumer hardware, `concurrency = 2` is appropriate.
+
+## Oh My Pi models and batch pricing
+
+AETHER can address models the way an Oh My Pi (omp) project does: as routes of the form
+`provider/model` (`anthropic/claude-fable-5`, `openai-codex/gpt-5.6-sol`,
+`opencode-go/deepseek-v4-flash`), billed on whatever credential omp holds for that provider.
+Two mechanisms cover the two ways you may want to pay:
+
+| Path | What it bills | When to use it |
+| --- | --- | --- |
+| `[inference] provider = "omp"` | The omp credential for the route, normally a subscription login (Claude, Codex, opencode) | Online SIR generation: `aetherd index`, watcher reindexing, triage and deep passes |
+| `[batch]` with `provider = "auto"` | The provider's own API key at **batch pricing** (50% off for Anthropic Message Batches, OpenAI Batch, Gemini Batch Mode) | `aetherd batch run` and the continuous monitor, for routes whose provider offers a batch API |
+
+The omp gateway has no batch endpoint, so batch pricing is never available on a subscription
+route: it always needs the provider's API key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`GEMINI_API_KEY`, or the `[batch.<provider>].api_key_env` override).
+
+### 1. Start the gateway
+
+```bash
+omp auth-broker serve            # serves the credentials in ~/.omp/agent (OAuth logins, keys)
+export OMP_AUTH_BROKER_URL=http://127.0.0.1:<broker-port>
+omp auth-gateway token           # prints/creates ~/.omp/auth-gateway.token
+omp auth-gateway serve           # OpenAI-compatible endpoint on http://127.0.0.1:4000
+```
+
+`omp auth-gateway status` shows the bind address and token file. The gateway lists the routes
+it can serve at `GET /v1/models`.
+
+### 2. Point AETHER at it
+
+```toml
+[inference]
+provider = "omp"
+model = "anthropic/claude-fable-5"          # any omp route the gateway can serve
+# endpoint = "http://127.0.0.1:4000/v1"     # default; change if you bind elsewhere
+# api_key_env = "OMP_GATEWAY_TOKEN"         # default; falls back to ~/.omp/auth-gateway.token
+thinking = "medium"                         # forwarded as reasoning_effort (minimal|low|medium|high|xhigh|max)
+concurrency = 4
+
+[sir_quality]
+triage_provider = "omp"
+triage_model = "openai-codex/gpt-5.6-sol"
+deep_provider = "omp"
+deep_model = "anthropic/claude-fable-5"
+```
+
+- The bearer token is read from `OMP_GATEWAY_TOKEN`, then from `$HOME/.omp/auth-gateway.token`
+  (or the path in `OMP_GATEWAY_TOKEN_FILE`). Missing both is a configuration error naming the
+  command that creates one.
+- `model` must be a route (`provider/model`); a bare model name is a validation warning and a
+  load error, because the gateway needs the provider namespace to pick a credential.
+- `omp` is also accepted as `[inference.tiered].primary`.
+
+### 3. Opt into batch pricing where the provider offers it
+
+```toml
+[batch]
+provider = "auto"                           # follow the omp route in [inference].model
+passes = ["scan", "triage"]
+# Models may be written as omp routes; the provider prefix is stripped on submit.
+# When a pass has no batch model, the bare model of [inference].model is used.
+deep_model = "anthropic/claude-fable-5"
+```
+
+With `provider = "auto"`:
+
+- `anthropic/...` submits to the Anthropic Message Batches API,
+- `openai/...` to the OpenAI Batch API,
+- `google/...` (or `gemini/...`) to Gemini Batch Mode,
+- any other route (`openai-codex/...`, `opencode-go/...`, `nanogpt/...`, `ollama/...`) fails
+  with an explicit error listing the providers that do offer batch pricing. `aetherd status`
+  reports the same as a `batch_provider_auto_no_batch_pricing` warning.
+
+`openai-codex` deliberately does **not** map to the OpenAI batch API: the Codex route is a
+ChatGPT subscription login, while the batch API bills an API key, so they are different routes
+even when the model name matches. Set `provider = "openai"` explicitly (and `OPENAI_API_KEY`)
+to batch those models on API pricing.
+
+`--provider` on `aetherd batch build|ingest|run` overrides the config, and `auto` is valid there
+too.
 
 ## Three-Pass SIR Quality Pipeline
 
@@ -107,6 +189,8 @@ vector_backend = "lancedb" # lancedb | sqlite
 
 - `GEMINI_API_KEY` for Gemini, unless `api_key_env` overrides it.
 - `OPENAI_COMPAT_API_KEY` or your configured `api_key_env` for `openai_compat`.
+- `OMP_GATEWAY_TOKEN` (or `~/.omp/auth-gateway.token`) for `omp`.
+- `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` for batch pricing on the matching batch provider.
 
 No API key is required for `qwen3_local`.
 
@@ -115,7 +199,7 @@ No API key is required for `qwen3_local`.
 `aetherd` can override config values at runtime:
 
 ```bash
---inference-provider <auto|tiered|gemini|qwen3_local|openai_compat>
+--inference-provider <auto|tiered|gemini|qwen3_local|openai_compat|omp>
 --inference-model <name>
 --inference-endpoint <url>
 --inference-api-key-env <ENV_VAR_NAME>

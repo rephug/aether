@@ -14,6 +14,9 @@ pub enum InferenceProviderKind {
     Qwen3Local,
     #[serde(rename = "openai_compat")]
     OpenAiCompat,
+    /// Oh My Pi auth gateway (`omp auth-gateway serve`): OpenAI-compatible transport,
+    /// models addressed as OMP routes (`provider/model`), billed on the OMP credential.
+    Omp,
 }
 
 impl InferenceProviderKind {
@@ -24,6 +27,7 @@ impl InferenceProviderKind {
             Self::Gemini => "gemini",
             Self::Qwen3Local => "qwen3_local",
             Self::OpenAiCompat => "openai_compat",
+            Self::Omp => "omp",
         }
     }
 }
@@ -38,8 +42,9 @@ impl std::str::FromStr for InferenceProviderKind {
             "gemini" => Ok(Self::Gemini),
             "qwen3_local" => Ok(Self::Qwen3Local),
             "openai_compat" => Ok(Self::OpenAiCompat),
+            "omp" => Ok(Self::Omp),
             other => Err(format!(
-                "invalid provider '{other}', expected one of: auto, tiered, gemini, qwen3_local, openai_compat"
+                "invalid provider '{other}', expected one of: auto, tiered, gemini, qwen3_local, openai_compat, omp"
             )),
         }
     }
@@ -214,6 +219,21 @@ mod tests {
             InferenceProviderKind::OpenAiCompat.as_str(),
             "openai_compat"
         );
+    }
+
+    #[test]
+    fn inference_provider_kind_round_trips_omp() {
+        let parsed: InferenceProviderKind = "omp".parse().expect("omp should parse");
+        assert_eq!(parsed, InferenceProviderKind::Omp);
+        assert_eq!(InferenceProviderKind::Omp.as_str(), "omp");
+        let toml_value: InferenceProviderKind = toml::from_str::<toml::Value>("kind = \"omp\"")
+            .expect("toml")
+            .get("kind")
+            .cloned()
+            .expect("kind")
+            .try_into()
+            .expect("deserialize omp");
+        assert_eq!(toml_value, InferenceProviderKind::Omp);
     }
 
     #[test]

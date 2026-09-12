@@ -4,6 +4,7 @@ pub mod audit_report_cmd;
 pub mod claude_md;
 pub mod codex_instructions;
 pub mod cursor_rules;
+pub mod omp;
 pub mod refactor_cmd;
 pub mod refactor_deep_cmd;
 pub mod skill_md;
@@ -14,6 +15,7 @@ pub use audit_report_cmd::AuditReportCommandTemplate;
 pub use claude_md::ClaudeTemplate;
 pub use codex_instructions::CodexInstructionsTemplate;
 pub use cursor_rules::CursorRulesTemplate;
+pub use omp::{McpJsonTemplate, OmpAgentsTemplate};
 pub use refactor_cmd::RefactorCommandTemplate;
 pub use refactor_deep_cmd::RefactorDeepCommandTemplate;
 pub use skill_md::SkillTemplate;
@@ -262,8 +264,8 @@ pub(crate) fn plain_tool_list() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaudeTemplate, CodexInstructionsTemplate, CursorRulesTemplate, SkillTemplate,
-        TOOL_DESCRIPTIONS, TemplateContext,
+        ClaudeTemplate, CodexInstructionsTemplate, CursorRulesTemplate, McpJsonTemplate,
+        OmpAgentsTemplate, SkillTemplate, TOOL_DESCRIPTIONS, TemplateContext,
     };
 
     fn sample_context() -> TemplateContext {
@@ -314,6 +316,27 @@ mod tests {
         assert!(rendered.contains("1. Before editing or refactoring"));
         assert!(rendered.contains("Agent schema version: 7"));
         assert!(rendered.contains("aether_verify"));
+    }
+
+    #[test]
+    fn omp_agents_template_matches_claude_guidance() {
+        let context = sample_context();
+        assert_eq!(
+            OmpAgentsTemplate::render(&context),
+            ClaudeTemplate::render(&context)
+        );
+    }
+
+    #[test]
+    fn mcp_json_template_registers_aether_server() {
+        let rendered = McpJsonTemplate::render(&sample_context());
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("valid json");
+        assert_eq!(
+            parsed["mcpServers"]["aether"]["command"],
+            "./target/debug/aether-mcp"
+        );
+        assert_eq!(parsed["mcpServers"]["aether"]["args"][0], "--workspace");
+        assert!(rendered.ends_with('\n'));
     }
 
     #[test]

@@ -33,6 +33,7 @@ pub(crate) fn render(config: &AetherConfig, params: &HashMap<String, String>) ->
                     ("gemini", "Gemini"),
                     ("qwen3_local", "Qwen3 Local"),
                     ("openai_compat", "OpenAI Compatible"),
+                    ("omp", "Oh My Pi Gateway"),
                 ],
                 "Inference provider backend",
                 "inference",
@@ -45,7 +46,7 @@ pub(crate) fn render(config: &AetherConfig, params: &HashMap<String, String>) ->
                 "Model name for inference requests",
             ))
 
-            @if provider_str == "openai_compat" || provider_str == "qwen3_local" {
+            @if provider_str == "openai_compat" || provider_str == "qwen3_local" || provider_str == "omp" {
                 (helpers::text_input(
                     "endpoint",
                     "Endpoint",

@@ -10,7 +10,7 @@ mod run;
 
 use std::path::{Path, PathBuf};
 
-use aether_config::{AetherConfig, BatchConfig};
+use aether_config::{AetherConfig, BatchConfig, strip_omp_route_prefix};
 use anyhow::{Result, anyhow};
 
 use crate::cli::{BatchBuildArgs, BatchPass, BatchRunArgs};
@@ -90,28 +90,44 @@ pub(crate) trait BatchProvider: Send + Sync {
     fn name(&self) -> &str;
 }
 
+/// Resolve the effective batch provider name from CLI override, `[batch].provider`, and
+/// (for `provider = "auto"`) the omp route in `[inference].model`.
+pub(crate) fn resolve_batch_provider_name(
+    config: &AetherConfig,
+    provider_override: Option<&str>,
+) -> Result<String> {
+    let batch_config = config.batch.clone().unwrap_or_default();
+    batch_config
+        .resolve_provider(provider_override, config.inference.model.as_deref())
+        .map_err(|message| anyhow!(message))
+}
+
 /// Create a batch provider from config with optional CLI override.
+///
+/// Batch pricing always bills the provider's own API key (`ANTHROPIC_API_KEY`,
+/// `OPENAI_API_KEY`, `GEMINI_API_KEY` unless overridden): the omp gateway has no batch
+/// endpoint, so a subscription route cannot be used here.
 pub(crate) fn create_batch_provider(
-    config: &BatchConfig,
+    config: &AetherConfig,
     provider_override: Option<&str>,
 ) -> Result<Box<dyn BatchProvider>> {
-    let provider_name = provider_override
-        .filter(|s| !s.is_empty())
-        .unwrap_or(config.provider.as_str());
-    let api_key_env = config.resolve_api_key_env(provider_name);
+    let batch_config = config.batch.clone().unwrap_or_default();
+    let provider_name = resolve_batch_provider_name(config, provider_override)?;
+    let api_key_env = batch_config.resolve_api_key_env(&provider_name);
     let api_key = std::env::var(&api_key_env).map_err(|_| {
         anyhow!(
-            "batch provider '{}' requires env var {} to be set",
+            "batch provider '{}' requires env var {} to be set (batch pricing bills the \
+             provider API key directly; the omp gateway cannot submit batches)",
             provider_name,
             api_key_env
         )
     })?;
-    match provider_name {
+    match provider_name.as_str() {
         "gemini" => Ok(Box::new(gemini::GeminiBatchProvider::new(api_key))),
         "openai" => Ok(Box::new(openai::OpenAiBatchProvider::new(api_key))),
         "anthropic" => Ok(Box::new(anthropic::AnthropicBatchProvider::new(api_key))),
         other => anyhow::bail!(
-            "unknown batch provider '{}'; supported: gemini, openai, anthropic",
+            "unknown batch provider '{}'; supported: gemini, openai, anthropic, auto",
             other
         ),
     }
@@ -168,19 +184,18 @@ pub(crate) fn resolve_batch_runtime_config(
     workspace: &Path,
     config: &AetherConfig,
     run_args: Option<&BatchRunArgs>,
-) -> BatchRuntimeConfig {
+) -> Result<BatchRuntimeConfig> {
     let batch_config = config.batch.as_ref();
     let batch_dir = resolve_batch_dir(
         workspace,
         batch_config,
         run_args.and_then(|args| args.batch_dir.as_deref()),
     );
-    let provider_name = run_args
-        .and_then(|args| args.provider.as_deref())
-        .filter(|s| !s.is_empty())
-        .or_else(|| batch_config.map(|c| c.provider.as_str()))
-        .unwrap_or("gemini");
-    BatchRuntimeConfig {
+    let provider_name =
+        resolve_batch_provider_name(config, run_args.and_then(|args| args.provider.as_deref()))?;
+    let provider_name = provider_name.as_str();
+    let inference_route = config.inference.model.as_deref();
+    Ok(BatchRuntimeConfig {
         batch_dir,
         jsonl_chunk_size: run_args
             .and_then(|args| args.jsonl_chunk_size)
@@ -205,10 +220,28 @@ pub(crate) fn resolve_batch_runtime_config(
             .or_else(|| batch_config.map(|c| c.max_concurrent_jobs))
             .unwrap_or(4)
             .max(1),
-        scan: resolve_pass_config(batch_config, run_args, BatchPass::Scan, provider_name),
-        triage: resolve_pass_config(batch_config, run_args, BatchPass::Triage, provider_name),
-        deep: resolve_pass_config(batch_config, run_args, BatchPass::Deep, provider_name),
-    }
+        scan: resolve_pass_config(
+            batch_config,
+            run_args,
+            BatchPass::Scan,
+            provider_name,
+            inference_route,
+        ),
+        triage: resolve_pass_config(
+            batch_config,
+            run_args,
+            BatchPass::Triage,
+            provider_name,
+            inference_route,
+        ),
+        deep: resolve_pass_config(
+            batch_config,
+            run_args,
+            BatchPass::Deep,
+            provider_name,
+            inference_route,
+        ),
+    })
 }
 
 pub(crate) fn resolve_build_pass_config(
@@ -281,6 +314,7 @@ fn resolve_pass_config(
     run_args: Option<&BatchRunArgs>,
     pass: BatchPass,
     provider: &str,
+    inference_route: Option<&str>,
 ) -> PassConfig {
     let (model, thinking, neighbor_depth, max_chars) = match pass {
         BatchPass::Scan => (
@@ -303,11 +337,15 @@ fn resolve_pass_config(
         ),
     };
 
+    // CLI overrides may be written as omp routes too (`--scan-model anthropic/claude-x`).
+    let model = model.map(|value| strip_omp_route_prefix(&value, provider).to_owned());
     let config = batch_config.cloned().unwrap_or_default();
     match pass {
         BatchPass::Scan => PassConfig {
             pass,
-            model: model.unwrap_or_else(|| config.resolve_model("scan", provider).to_owned()),
+            model: model.unwrap_or_else(|| {
+                config.resolve_model_for_route("scan", provider, inference_route)
+            }),
             thinking: thinking
                 .unwrap_or_else(|| config.resolve_thinking("scan", provider).to_owned()),
             neighbor_depth: 0,
@@ -316,7 +354,9 @@ fn resolve_pass_config(
         },
         BatchPass::Triage => PassConfig {
             pass,
-            model: model.unwrap_or_else(|| config.resolve_model("triage", provider).to_owned()),
+            model: model.unwrap_or_else(|| {
+                config.resolve_model_for_route("triage", provider, inference_route)
+            }),
             thinking: thinking
                 .unwrap_or_else(|| config.resolve_thinking("triage", provider).to_owned()),
             neighbor_depth: neighbor_depth.unwrap_or(config.triage_neighbor_depth),
@@ -325,7 +365,9 @@ fn resolve_pass_config(
         },
         BatchPass::Deep => PassConfig {
             pass,
-            model: model.unwrap_or_else(|| config.resolve_model("deep", provider).to_owned()),
+            model: model.unwrap_or_else(|| {
+                config.resolve_model_for_route("deep", provider, inference_route)
+            }),
             thinking: thinking
                 .unwrap_or_else(|| config.resolve_thinking("deep", provider).to_owned()),
             neighbor_depth: neighbor_depth.unwrap_or(config.deep_neighbor_depth),

@@ -1,7 +1,9 @@
 use crate::{
+    batch::BATCH_PROVIDER_AUTO,
     constants::{DEFAULT_COHERE_API_KEY_ENV, DEFAULT_GEMINI_API_KEY_ENV},
     embeddings::EmbeddingProviderKind,
     inference::{InferenceProviderKind, TieredConfig},
+    omp::{batch_pricing_providers_list, batch_target_for_omp_route, split_omp_route},
     root::AetherConfig,
     search::SearchRerankerKind,
     storage::GraphBackend,
@@ -20,6 +22,8 @@ fn provider_ignores_gemini_thinking(
 ) -> bool {
     match provider {
         InferenceProviderKind::Gemini | InferenceProviderKind::Auto => false,
+        // The omp gateway forwards `reasoning_effort`, so thinking is honoured there too.
+        InferenceProviderKind::Omp => false,
         InferenceProviderKind::Qwen3Local | InferenceProviderKind::OpenAiCompat => true,
         InferenceProviderKind::Tiered => tiered.is_some_and(|tiered| {
             !tiered
@@ -210,6 +214,50 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
             }
         }
         InferenceProviderKind::OpenAiCompat => {}
+        InferenceProviderKind::Omp => match config.inference.model.as_deref() {
+            None => warnings.push(ConfigWarning {
+                code: "inference_omp_model_missing",
+                message: "inference.provider=omp requires inference.model as an omp route \
+                          (provider/model, e.g. anthropic/claude-fable-5)"
+                    .to_owned(),
+            }),
+            Some(model) if split_omp_route(model).is_none() => warnings.push(ConfigWarning {
+                code: "inference_omp_model_not_a_route",
+                message: format!(
+                    "inference.model '{model}' is not an omp route; expected provider/model \
+                     (e.g. anthropic/claude-fable-5)"
+                ),
+            }),
+            Some(_) => {}
+        },
+    }
+
+    if let Some(batch) = config.batch.as_ref()
+        && batch
+            .provider
+            .trim()
+            .eq_ignore_ascii_case(BATCH_PROVIDER_AUTO)
+    {
+        match config.inference.model.as_deref() {
+            Some(route) if batch_target_for_omp_route(route).is_some() => {}
+            Some(route) => warnings.push(ConfigWarning {
+                code: "batch_provider_auto_no_batch_pricing",
+                message: format!(
+                    "batch.provider=auto cannot follow inference.model '{route}': that provider \
+                     offers no batch pricing (only {} do); batch commands will fail until \
+                     batch.provider names one of them",
+                    batch_pricing_providers_list()
+                ),
+            }),
+            None => warnings.push(ConfigWarning {
+                code: "batch_provider_auto_without_route",
+                message: format!(
+                    "batch.provider=auto needs an omp route in inference.model; set one or \
+                     choose a batch provider explicitly ({})",
+                    batch_pricing_providers_list()
+                ),
+            }),
+        }
     }
 
     if config.inference.thinking.is_some()
@@ -365,6 +413,87 @@ mod tests {
 
     fn warning_codes(warnings: &[ConfigWarning]) -> Vec<&'static str> {
         warnings.iter().map(|warning| warning.code).collect()
+    }
+
+    fn omp_config(model: Option<&str>, batch_provider: Option<&str>) -> AetherConfig {
+        let mut config = AetherConfig::default();
+        config.inference.provider = InferenceProviderKind::Omp;
+        config.inference.model = model.map(str::to_owned);
+        config.verify.commands = vec!["cargo test".to_owned()];
+        config.batch = batch_provider.map(|provider| crate::BatchConfig {
+            provider: provider.to_owned(),
+            ..crate::BatchConfig::default()
+        });
+        config
+    }
+
+    #[test]
+    fn validate_config_omp_requires_a_route_model() {
+        let codes = warning_codes(&validate_config(&omp_config(None, None)));
+        assert!(codes.contains(&"inference_omp_model_missing"), "{codes:?}");
+
+        let codes = warning_codes(&validate_config(&omp_config(Some("claude-fable-5"), None)));
+        assert!(
+            codes.contains(&"inference_omp_model_not_a_route"),
+            "{codes:?}"
+        );
+
+        let codes = warning_codes(&validate_config(&omp_config(
+            Some("anthropic/claude-fable-5"),
+            None,
+        )));
+        assert!(
+            !codes.iter().any(|code| code.starts_with("inference_omp")),
+            "{codes:?}"
+        );
+    }
+
+    #[test]
+    fn validate_config_omp_honours_thinking() {
+        let mut config = omp_config(Some("anthropic/claude-fable-5"), None);
+        config.inference.thinking = Some("high".to_owned());
+        let codes = warning_codes(&validate_config(&config));
+        assert!(
+            !codes.contains(&"inference_thinking_ignored_for_provider"),
+            "{codes:?}"
+        );
+    }
+
+    #[test]
+    fn validate_config_batch_auto_reports_routes_without_batch_pricing() {
+        let codes = warning_codes(&validate_config(&omp_config(
+            Some("anthropic/claude-fable-5"),
+            Some("auto"),
+        )));
+        assert!(
+            !codes
+                .iter()
+                .any(|code| code.starts_with("batch_provider_auto")),
+            "{codes:?}"
+        );
+
+        let codes = warning_codes(&validate_config(&omp_config(
+            Some("openai-codex/gpt-5.6-sol"),
+            Some("auto"),
+        )));
+        assert!(
+            codes.contains(&"batch_provider_auto_no_batch_pricing"),
+            "{codes:?}"
+        );
+
+        let codes = warning_codes(&validate_config(&omp_config(None, Some("auto"))));
+        assert!(
+            codes.contains(&"batch_provider_auto_without_route"),
+            "{codes:?}"
+        );
+
+        let codes = warning_codes(&validate_config(&omp_config(None, Some("gemini"))));
+        assert!(
+            !codes
+                .iter()
+                .any(|code| code.starts_with("batch_provider_auto")),
+            "{codes:?}"
+        );
     }
 
     #[test]
