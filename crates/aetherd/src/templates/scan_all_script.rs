@@ -73,7 +73,8 @@ if [ ! -f .mcp.json ] || ! grep -q '"aether"' .mcp.json; then
 fi
 
 # Prints "name<TAB>scope[<TAB>scope...]" per scan unit, scopes relative to the workspace
-# root. Cargo workspaces: one unit per package, parsed structurally from the metadata
+# root; a scope prefixed with "-" is an exclusion (a nested member's directory carved out
+# of its parent's scope, so no two units overlap). Cargo workspaces: one unit per package, parsed structurally from the metadata
 # JSON (packages[].name / manifest_path / targets; never the dependency or target names
 # that also carry a "name" key). A package owns its manifest directory (unless that is
 # the workspace root) plus, for every target whose src_path lies outside that directory,
@@ -97,6 +98,7 @@ def inside(path):
     return None if rel == ".." or rel.startswith(".." + os.sep) else rel
 def covered(scope, scopes):
     return any(scope == s or scope.startswith(s + os.sep) for s in scopes)
+units = []
 for pkg in meta["packages"]:
     manifest_dir = os.path.dirname(pkg["manifest_path"])
     rel = inside(manifest_dir)
@@ -117,7 +119,18 @@ for pkg in meta["packages"]:
             scopes = [s for s in scopes if not (s == scope or s.startswith(scope + os.sep))]
             scopes.append(scope)
     if scopes:
-        print(pkg["name"] + "\t" + "\t".join(scopes))
+        units.append((pkg["name"], scopes))
+# A member nested below another member (crates/parent, crates/parent/child) is carved
+# out of the parent so the two units never scan the same symbols.
+for name, scopes in units:
+    excluded = []
+    for other_name, other_scopes in units:
+        if other_name == name:
+            continue
+        for other in other_scopes:
+            if any(other != s and other.startswith(s + os.sep) for s in scopes) and other not in excluded:
+                excluded.append(other)
+    print(name + "\t" + "\t".join(scopes + ["-" + e for e in excluded]))
 ' 2>/dev/null || true)"
   fi
   if [ -n "$table" ]; then
@@ -169,27 +182,42 @@ sql_prefix_pattern() {
   p="${p//\\/\\\\}"; p="${p//%/\\%}"; p="${p//_/\\_}"
   sql_str "$p/%"
 }
+# One SQL predicate for a scope: equality for a file, escaped prefix match for a directory.
+scope_predicate() {
+  if [ -f "$1" ]; then
+    printf "s.file_path = '%s'" "$(sql_str "$1")"
+  else
+    printf "s.file_path LIKE '%s' ESCAPE '\\\\'" "$(sql_prefix_pattern "$1")"
+  fi
+}
 # SQL scope for the given units: only symbols under their own directories (or equal to
-# a root-level target file).
+# a root-level target file), minus any nested member carved out with a "-" scope.
 scope_clause() {
-  local clauses=() crate scope scopes
+  local units=() crate scope scopes includes excludes
   for crate in "$@"; do
+    includes=(); excludes=()
     IFS=$'\t' read -ra scopes <<< "$(crate_scopes "$crate")"
     for scope in "${scopes[@]}"; do
       [ -z "$scope" ] && continue
-      if [ -f "$scope" ]; then
-        clauses+=("s.file_path = '$(sql_str "$scope")'")
-      else
-        clauses+=("s.file_path LIKE '$(sql_prefix_pattern "$scope")' ESCAPE '\\'")
-      fi
+      case "$scope" in
+        -*) excludes+=("$(scope_predicate "${scope#-}")") ;;
+        *) includes+=("$(scope_predicate "$scope")") ;;
+      esac
     done
+    [ "${#includes[@]}" -eq 0 ] && continue
+    local IFS=' '
+    local unit="($(printf '%s OR ' "${includes[@]}" | sed 's/ OR $//'))"
+    if [ "${#excludes[@]}" -gt 0 ]; then
+      unit="($unit AND NOT ($(printf '%s OR ' "${excludes[@]}" | sed 's/ OR $//')))"
+    fi
+    units+=("$unit")
   done
-  if [ "${#clauses[@]}" -eq 0 ]; then
+  if [ "${#units[@]}" -eq 0 ]; then
     echo "error: no source directories resolved for: $*" >&2
     exit 1
   fi
   local IFS=' '
-  printf '(%s)' "$(printf '%s OR ' "${clauses[@]}" | sed 's/ OR $//')"
+  printf '(%s)' "$(printf '%s OR ' "${units[@]}" | sed 's/ OR $//')"
 }
 SCOPE="$(scope_clause "${CRATES[@]}")"
 

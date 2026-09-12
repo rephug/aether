@@ -35,8 +35,10 @@ symbols this session processes before stopping.
    each target's `src_path` (typically `src`, `tests`, `benches`, `examples`) as the
    `<dir>` set, and match a target file stored at the root itself (for example
    `path = "lib.rs"`) by exact `file_path`. Never treat a root package as "the whole
-   workspace": other members live beside it. If `cargo metadata` fails, fall back to
-   the directory rule above.
+   workspace": other members live beside it. If another package's directory lies
+   inside `<dir>` (`crates/parent` and `crates/parent/child`), exclude it
+   (`AND NOT s.file_path LIKE '<nested>/%' ESCAPE '\'`) so no two crates scan the
+   same symbols. If `cargo metadata` fails, fall back to the directory rule above.
 2. Build the target list from the low-confidence set, not from a ranked window.
    Query `.aether/meta.sqlite` directly, so symbols that were already scanned can never
    crowd the remaining placeholders out of a truncated result:

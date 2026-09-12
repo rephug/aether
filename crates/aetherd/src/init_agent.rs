@@ -66,14 +66,25 @@ pub fn run_init_agent(workspace: &Path, options: InitAgentOptions) -> Result<Ini
 
     for file in files {
         let absolute_path = workspace.join(&file.relative_path);
-        if absolute_path.exists() && !options.force {
-            if file.relative_path == Path::new(MCP_CONFIG_FILE)
-                && merge_mcp_server(&absolute_path, &file.content)?
-            {
-                written_files.push(file.relative_path);
-            } else {
-                skipped_existing_files.push(file.relative_path);
+        if absolute_path.exists() && file.relative_path == Path::new(MCP_CONFIG_FILE) {
+            // Shared with other MCP servers: never replaced wholesale, even with --force.
+            match merge_mcp_server(&absolute_path, &file.content, options.force)? {
+                McpMerge::Updated => {
+                    written_files.push(file.relative_path);
+                    continue;
+                }
+                McpMerge::Unchanged => {
+                    skipped_existing_files.push(file.relative_path);
+                    continue;
+                }
+                McpMerge::NotJson if !options.force => {
+                    skipped_existing_files.push(file.relative_path);
+                    continue;
+                }
+                McpMerge::NotJson => {}
             }
+        } else if absolute_path.exists() && !options.force {
+            skipped_existing_files.push(file.relative_path);
             continue;
         }
 
@@ -232,29 +243,35 @@ const SOURCE_TREE_MCP_BINARY: &str = "./target/debug/aether-mcp";
 const MCP_CONFIG_FILE: &str = ".mcp.json";
 const MCP_SERVER_KEY: &str = "aether";
 
+#[derive(Debug, PartialEq, Eq)]
+enum McpMerge {
+    /// The `aether` entry was added (or, with `force`, refreshed) and the file rewritten.
+    Updated,
+    /// The file already registers `aether` as rendered; nothing written.
+    Unchanged,
+    /// Not a JSON object we can extend; left untouched.
+    NotJson,
+}
+
 /// `.mcp.json` is shared with every other MCP server the project registers, so an
-/// existing file is never treated as an all-or-nothing template: the `aether` entry is
-/// merged into it when missing. Returns `true` when the file was updated, `false` when
-/// it already registers `aether` or is not a JSON object we can extend safely (left
-/// untouched and reported as skipped).
-fn merge_mcp_server(existing_path: &Path, rendered: &str) -> Result<bool> {
+/// existing file is never treated as an all-or-nothing template: only the `aether`
+/// entry is added when missing, and `force` refreshes that one entry while leaving
+/// every other registration in place.
+fn merge_mcp_server(existing_path: &Path, rendered: &str, force: bool) -> Result<McpMerge> {
     let current = fs::read_to_string(existing_path)
         .with_context(|| format!("failed to read {}", existing_path.display()))?;
     let Ok(mut current_json) = serde_json::from_str::<serde_json::Value>(&current) else {
-        return Ok(false);
+        return Ok(McpMerge::NotJson);
     };
     let Some(root) = current_json.as_object_mut() else {
-        return Ok(false);
+        return Ok(McpMerge::NotJson);
     };
     let servers = root
         .entry("mcpServers")
         .or_insert_with(|| serde_json::Value::Object(Default::default()));
     let Some(servers) = servers.as_object_mut() else {
-        return Ok(false);
+        return Ok(McpMerge::NotJson);
     };
-    if servers.contains_key(MCP_SERVER_KEY) {
-        return Ok(false);
-    }
     let rendered_json: serde_json::Value =
         serde_json::from_str(rendered).context("rendered .mcp.json template is valid JSON")?;
     let Some(aether) = rendered_json
@@ -262,15 +279,19 @@ fn merge_mcp_server(existing_path: &Path, rendered: &str) -> Result<bool> {
         .and_then(|value| value.get(MCP_SERVER_KEY))
         .cloned()
     else {
-        return Ok(false);
+        return Ok(McpMerge::NotJson);
     };
+    match servers.get(MCP_SERVER_KEY) {
+        Some(existing) if !force || *existing == aether => return Ok(McpMerge::Unchanged),
+        _ => {}
+    }
     servers.insert(MCP_SERVER_KEY.to_owned(), aether);
     let mut merged =
         serde_json::to_string_pretty(&current_json).context("merged .mcp.json serializes")?;
     merged.push('\n');
     fs::write(existing_path, merged)
         .with_context(|| format!("failed to write {}", existing_path.display()))?;
-    Ok(true)
+    Ok(McpMerge::Updated)
 }
 const MCP_BINARY_NAME: &str = "aether-mcp";
 
@@ -487,6 +508,31 @@ mod tests {
                 .skipped_existing_files
                 .contains(&std::path::PathBuf::from(".mcp.json"))
         );
+
+        // --force refreshes the aether entry only; other registrations survive.
+        fs::write(
+            workspace.join(".mcp.json"),
+            "{\n  \"mcpServers\": {\n    \"other\": { \"command\": \"other-mcp\" },\n    \"aether\": { \"command\": \"stale\" }\n  }\n}\n",
+        )
+        .expect("seed stale .mcp.json");
+        let forced = run_init_agent(
+            workspace,
+            InitAgentOptions {
+                platform: AgentPlatform::Claude,
+                force: true,
+            },
+        )
+        .expect("forced init-agent should succeed");
+        assert!(
+            forced
+                .written_files
+                .contains(&std::path::PathBuf::from(".mcp.json"))
+        );
+        let refreshed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(workspace.join(".mcp.json")).unwrap())
+                .expect("valid json");
+        assert_eq!(refreshed["mcpServers"]["other"]["command"], "other-mcp");
+        assert_ne!(refreshed["mcpServers"]["aether"]["command"], "stale");
     }
 
     #[test]

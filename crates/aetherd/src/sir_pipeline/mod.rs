@@ -298,11 +298,18 @@ impl SirPipeline {
         let contracts_config = load_workspace_config(&workspace_root)
             .ok()
             .and_then(|c| c.contracts);
+        let provider_name: String = provider_name.into();
+        // The mock provider's 0.1 placeholders are intentional: no quality-floor warning.
+        let quality_monitor = if provider_name == InferenceProviderKind::Mock.as_str() {
+            SirQualityMonitor::disabled()
+        } else {
+            SirQualityMonitor::new(SIR_QUALITY_FLOOR_WINDOW, SIR_QUALITY_FLOOR_CONFIDENCE)
+        };
 
         Ok(Self {
             workspace_root,
             provider,
-            provider_name: provider_name.into(),
+            provider_name,
             model_name: model_name.into(),
             embedding_provider,
             embedding_provider_name,
@@ -311,10 +318,7 @@ impl SirPipeline {
             runtime,
             sir_concurrency: concurrency,
             inference_timeout_secs: INFERENCE_ATTEMPT_TIMEOUT_SECS,
-            quality_monitor: Mutex::new(SirQualityMonitor::new(
-                SIR_QUALITY_FLOOR_WINDOW,
-                SIR_QUALITY_FLOOR_CONFIDENCE,
-            )),
+            quality_monitor: Mutex::new(quality_monitor),
             tiered_parse_fallback_provider,
             tiered_parse_fallback_model,
             skip_surreal_sync: false,
