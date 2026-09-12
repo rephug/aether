@@ -59,7 +59,7 @@ if ! command -v sqlite3 >/dev/null 2>&1; then
   exit 1
 fi
 if ! command -v claude >/dev/null 2>&1; then
-  echo "error: the claude CLI is required (each scope runs as: claude -p \"/scan <crate> $BATCH_SIZE\")" >&2
+  echo "error: the claude CLI is required (each scope runs as: claude -p \"/scan <crate> $BATCH_SIZE\" --allowedTools \"mcp__aether*\")" >&2
   exit 1
 fi
 # The sessions are non-interactive, so the AETHER MCP server must already be registered
@@ -71,6 +71,13 @@ if [ ! -f .mcp.json ] || ! grep -q '"aether"' .mcp.json; then
   echo "  or: claude mcp add --transport stdio --scope project aether -- aether-mcp --workspace ." >&2
   exit 1
 fi
+
+# Top-level directories (or root-level files) that hold indexed symbols, straight from
+# the index: the units of a project without Cargo, and the extra units of a mixed project
+# (TypeScript/Python sources beside Rust packages).
+index_top_level_scopes() {
+  sqlite3 "$DB" "SELECT DISTINCT CASE WHEN instr(file_path, '/') > 0 THEN substr(file_path, 1, instr(file_path, '/') - 1) ELSE file_path END FROM symbols ORDER BY 1;" | awk 'NF'
+}
 
 # Prints "name<TAB>scope[<TAB>scope...]" per scan unit, scopes relative to the workspace
 # root; a scope prefixed with "-" is an exclusion (a nested member's directory carved out
@@ -88,9 +95,10 @@ fi
 # python3), one unit per top-level directory (or root-level file) that holds indexed
 # symbols, straight from the index.
 discover_packages() {
-  local table=""
+  local table="" index_tops
+  index_tops="$(index_top_level_scopes)"
   if command -v cargo >/dev/null 2>&1 && [ -f Cargo.toml ] && command -v python3 >/dev/null 2>&1; then
-    table="$(cargo metadata --no-deps --format-version 1 2>/dev/null | AETHER_WORKSPACE="$WORKSPACE" python3 -c '
+    table="$(cargo metadata --no-deps --format-version 1 2>/dev/null | AETHER_WORKSPACE="$WORKSPACE" AETHER_INDEX_TOPS="$index_tops" python3 -c '
 import json, os, sys
 meta = json.load(sys.stdin)
 # Scopes are relative to the AETHER workspace (where the index lives), which may be a
@@ -135,13 +143,25 @@ for name, scopes in units:
             if any(other != s and other.startswith(s + os.sep) for s in scopes) and other not in excluded:
                 excluded.append(other)
     print(name + "\t" + "\t".join(scopes + ["-" + e for e in excluded]))
+# Mixed project: an indexed top-level directory (or root-level file) that no package owns
+# becomes its own unit; one that merely contains packages becomes a unit minus them, so
+# TypeScript/Python sources beside the Rust packages are scanned too.
+package_scopes = [s for _, scopes in units for s in scopes]
+unit_names = {name for name, _ in units}
+for top in os.environ.get("AETHER_INDEX_TOPS", "").split("\n"):
+    top = top.strip()
+    if not top or top in unit_names:
+        continue
+    if any(top == s or top.startswith(s + os.sep) for s in package_scopes):
+        continue
+    inside = [s for s in package_scopes if s.startswith(top + os.sep)]
+    print(top + "\t" + "\t".join([top] + ["-" + s for s in inside]))
 ' 2>/dev/null || true)"
   fi
   if [ -n "$table" ]; then
     printf '%s\n' "$table"
   else
-    sqlite3 "$DB" "SELECT DISTINCT CASE WHEN instr(file_path, '/') > 0 THEN substr(file_path, 1, instr(file_path, '/') - 1) ELSE file_path END FROM symbols ORDER BY 1;" \
-      | awk 'NF { printf "%s\t%s\n", $0, $0 }'
+    printf '%s\n' "$index_tops" | awk 'NF { printf "%s\t%s\n", $0, $0 }'
   fi
 }
 
@@ -202,13 +222,10 @@ sql_prefix_pattern() {
   p="${p//\\/\\\\}"; p="${p//%/\\%}"; p="${p//_/\\_}"
   sql_str "$p/%"
 }
-# One SQL predicate for a scope: equality for a file, escaped prefix match for a directory.
+# One SQL predicate for a scope: the path itself (a root-level file) or anything below it
+# (a directory), decided by the index rather than by what exists on disk right now.
 scope_predicate() {
-  if [ -f "$1" ]; then
-    printf "s.file_path = '%s'" "$(sql_str "$1")"
-  else
-    printf "s.file_path LIKE '%s' ESCAPE '\\\\'" "$(sql_prefix_pattern "$1")"
-  fi
+  printf "(s.file_path = '%s' OR s.file_path LIKE '%s' ESCAPE '\\\\')" "$(sql_str "$1")" "$(sql_prefix_pattern "$1")"
 }
 # SQL scope for the given units: only symbols under their own directories (or equal to
 # a root-level target file), minus any nested member carved out with a "-" scope.
@@ -270,7 +287,7 @@ for crate in "${CRATES[@]}"; do
   safe_name="$(printf '%s' "$crate" | tr '/' '_')"
   crate_log="$LOG_DIR/${safe_name}_${STAMP}.log"
   log "start $crate ($(crate_scopes_display "$crate")) -> $crate_log"
-  ( if claude -p "/scan $crate $BATCH_SIZE" > "$crate_log" 2>&1; then
+  ( if claude -p "/scan $crate $BATCH_SIZE" --allowedTools "mcp__aether*" > "$crate_log" 2>&1; then
       echo "done $crate"
     else
       touch "$FAIL_DIR/$safe_name"
@@ -289,6 +306,10 @@ log "scan targets after: $AFTER (was $BEFORE)"
 log "complete: $((BEFORE - AFTER)) symbol(s) scanned; logs in $LOG_DIR"
 if [ "$FAILED" != "0" ]; then
   log "error: $FAILED scan session(s) failed; see the FAILED lines above"
+  exit 1
+fi
+if [ "$AFTER" = "$BEFORE" ]; then
+  log "error: no placeholder was replaced; the sessions could not use aether_sir_inject (check $LOG_DIR for tool denials or MCP failures)"
   exit 1
 fi
 if [ "$AFTER" != "0" ]; then
