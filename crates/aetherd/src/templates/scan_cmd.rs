@@ -53,7 +53,8 @@ label (it may read `dir:web` or `shared` for a synthetic unit).
    crowd the remaining placeholders out of a truncated result:
    `SELECT s.id, s.qualified_name, s.file_path FROM symbols s JOIN sir ON sir.id = s.id
    WHERE s.file_path LIKE '<dir>/%' ESCAPE '\'
-     AND (json_extract(sir.sir_json, '$.confidence') < 0.2 OR sir.sir_json LIKE '%"intent":"[MOCK]%')
+     AND (json_extract(sir.sir_json, '$.confidence') < 0.2 OR sir.sir_json LIKE '%"intent":"[MOCK]%'
+          OR sir.sir_status = 'rollup_failed')
    ORDER BY s.file_path, s.qualified_name`
    (for several `<dir>`s, OR one `LIKE` clause per directory; a root-level file is
    matched with `s.file_path = '<file>'`, so use `(s.file_path = '<p>' OR s.file_path
@@ -76,7 +77,10 @@ label (it may read `dir:web` or `shared` for a synthetic unit).
    side_effects, dependencies, error_modes, complexity, confidence, and
    `generation_pass: "scan"`, `provider: "claude-code"`, `model: "<your model>"`).
 5. Target confidence 0.7–0.8 for scan-level SIRs. Use `force: true` only when replacing a
-   `[MOCK]` placeholder that somehow carries a higher confidence.
+   `[MOCK]` placeholder that somehow carries a higher confidence. If an inject call
+   returns an error saying the SIR was written but the file rollup could not be rebuilt,
+   rerun that same call once: the symbol is marked `rollup_failed`, the confidence guard
+   is lifted for it, and the target query above keeps selecting it until the rerun succeeds.
 6. Stop after `batch-size` symbols and print how many targets remain (rerun `/scan` or let
    `scripts/scan_all.sh` loop).
 

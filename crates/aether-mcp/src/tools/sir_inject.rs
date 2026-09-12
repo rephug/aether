@@ -5,8 +5,9 @@ use aether_sir::{
 use aether_store::{
     SirHistoryStore, SirMetaRecord, SirStateStore, SymbolCatalogStore, SymbolRecord,
 };
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use aether_parse::language_for_path;
 use aetherd::sir_pipeline::{SirPipeline, refresh_local_file_rollup};
@@ -64,6 +65,24 @@ pub struct AetherSirInjectRequest {
 /// Serializes the leaf-SIR write and the file-rollup rebuild across concurrent
 /// `aether_sir_inject` calls in this process.
 static INJECT_WRITE_LOCK: Mutex<()> = Mutex::new(());
+/// One lock per symbol for the embedding refresh, so two injections into the same symbol
+/// embed in order (the later SIR wins) while unrelated symbols stay concurrent.
+static EMBED_LOCKS: Mutex<Option<HashMap<String, Arc<Mutex<()>>>>> = Mutex::new(None);
+/// `sir_status` recorded when a leaf was written but its file rollup could not be
+/// rebuilt: the confidence guard lets such a symbol be re-injected without `force`, and
+/// the scan queries keep selecting it, so the retry is never blocked.
+pub const SIR_STATUS_ROLLUP_FAILED: &str = "rollup_failed";
+
+fn embed_lock_for(symbol_id: &str) -> Arc<Mutex<()>> {
+    let mut locks = EMBED_LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks
+        .get_or_insert_with(HashMap::new)
+        .entry(symbol_id.to_owned())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherSirInjectResponse {
@@ -266,8 +285,12 @@ impl AetherMcpServer {
         let previous_confidence = previous_sir.as_ref().map(|sir| sir.confidence);
         let new_confidence = request.confidence.unwrap_or(DEFAULT_INJECT_CONFIDENCE);
 
+        let previous_rollup_failed = previous_meta
+            .as_ref()
+            .is_some_and(|meta| meta.sir_status == SIR_STATUS_ROLLUP_FAILED);
         if previous_confidence.is_some_and(|confidence| confidence > FORCE_CONFIDENCE_THRESHOLD)
             && !request.force.unwrap_or(false)
+            && !previous_rollup_failed
         {
             let note = previous_confidence.map(|confidence| {
                 format!(
@@ -355,7 +378,7 @@ impl AetherMcpServer {
         )?;
 
         store.write_sir_blob(symbol_id.as_str(), canonical_json.as_str())?;
-        store.upsert_sir_meta(SirMetaRecord {
+        let meta_record = SirMetaRecord {
             id: symbol_id.clone(),
             sir_hash: hash.clone(),
             sir_version: version_write.version,
@@ -369,7 +392,8 @@ impl AetherMcpServer {
             sir_status: "fresh".to_owned(),
             last_error: None,
             last_attempt_at: version_write.updated_at,
-        })?;
+        };
+        store.upsert_sir_meta(meta_record.clone())?;
 
         // Aggregate reads (file and module level) are served from the file rollup, so
         // rebuild it from the leaves now rather than leaving the indexing-time rollup
@@ -382,10 +406,18 @@ impl AetherMcpServer {
                 &rollup_identity.2,
             )
             .map_err(|err| {
-                AetherMcpError::Message(format!(
-                    "SIR for {qualified_name} was written but the file rollup for {} could not be rebuilt: {err:#}; rerun the injection so aggregate reads stay consistent",
+                let message = format!(
+                    "SIR for {qualified_name} was written but the file rollup for {} could not be rebuilt: {err:#}; rerun the injection (the confidence guard is lifted for it) so aggregate reads stay consistent",
                     symbol.file_path
-                ))
+                );
+                // Leave a retry marker: the leaf keeps its scan-level confidence, but the
+                // guard and the scan queries treat this status as "still a target".
+                let _ = store.upsert_sir_meta(SirMetaRecord {
+                    sir_status: SIR_STATUS_ROLLUP_FAILED.to_owned(),
+                    last_error: Some(message.clone()),
+                    ..meta_record.clone()
+                });
+                AetherMcpError::Message(message)
             })?;
         // The embedding refresh may call a local or remote model: release the lock first
         // so concurrent injections into other files are not serialized behind it.
@@ -454,6 +486,20 @@ impl AetherMcpServer {
     ) -> String {
         if !self.state.config.embeddings.enabled {
             return "skipped: embeddings disabled".to_owned();
+        }
+        // Per-symbol ordering: a slower embedding for an older SIR must never overwrite
+        // the embedding of a newer one, so embed under the symbol's lock and only when
+        // the store still holds the SIR this call wrote.
+        let symbol_lock = embed_lock_for(symbol_id);
+        let _symbol_guard = symbol_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match self.state.store.get_sir_meta(symbol_id) {
+            Ok(Some(meta)) if meta.sir_hash != sir_hash => {
+                return "superseded: a newer SIR was injected".to_owned();
+            }
+            Err(err) => return format!("failed: {err:#}"),
+            _ => {}
         }
         let pipeline = match SirPipeline::new_embeddings_only(self.state.workspace.clone()) {
             Ok(pipeline) => pipeline,
