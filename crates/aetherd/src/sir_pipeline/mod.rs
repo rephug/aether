@@ -2992,11 +2992,11 @@ pub fn refresh_local_file_rollup(
             None,
         )
         .with_context(|| format!("failed to record file rollup history for {file_path}"))?;
-    if version_write.changed {
-        store
-            .write_sir_blob(&rollup_id, &canonical_json)
-            .with_context(|| format!("failed to write file rollup for {file_path}"))?;
-    }
+    // Always rewrite the (cheap, deterministic) blob: a retry after a failed write must
+    // repair the live rollup even though the history already carries this hash.
+    store
+        .write_sir_blob(&rollup_id, &canonical_json)
+        .with_context(|| format!("failed to write file rollup for {file_path}"))?;
     store
         .upsert_sir_meta(SirMetaRecord {
             id: rollup_id,
