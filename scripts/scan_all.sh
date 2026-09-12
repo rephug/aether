@@ -4,10 +4,11 @@
 #
 # Usage: scripts/scan_all.sh [BATCH_SIZE=100] [MAX_PARALLEL=4] [crate ...]
 #
-# With no crate arguments every workspace member from `cargo metadata` is scanned
-# (falling back to the directories under crates/). Preflight stops any running
-# aetherd / aether-mcp (the graph store holds an exclusive lock), checks the index
-# exists, and counts [MOCK] / low-confidence SIRs before and after.
+# With no crate arguments every workspace package from `cargo metadata` is scanned
+# (falling back to the directories under crates/). Preflight stops the aetherd /
+# aether-mcp processes that belong to THIS workspace (the graph store holds an
+# exclusive lock), checks the index exists, and counts [MOCK] / low-confidence SIRs
+# in the selected crates before and after.
 set -euo pipefail
 
 BATCH_SIZE="${1:-100}"
@@ -24,29 +25,61 @@ mkdir -p "$LOG_DIR"
 
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$MASTER_LOG"; }
 
-discover_crates() {
-  if command -v cargo >/dev/null 2>&1 && [ -f Cargo.toml ]; then
-    # Every workspace member, by package name (jq-free: one "name" per member line).
-    cargo metadata --no-deps --format-version 1 2>/dev/null \
-      | tr ',' '\n' | sed -n 's/^.*"name":"\([^"]*\)".*$/\1/p' | sort -u
+# Prints "name<TAB>dir" per workspace package, dir relative to the workspace root.
+# Parses the metadata JSON structurally (packages[].name / manifest_path); never the
+# dependency or target names that also carry a "name" key.
+discover_packages() {
+  if command -v cargo >/dev/null 2>&1 && [ -f Cargo.toml ] && command -v python3 >/dev/null 2>&1; then
+    cargo metadata --no-deps --format-version 1 2>/dev/null | python3 -c '
+import json, os, sys
+meta = json.load(sys.stdin)
+root = os.path.realpath(meta["workspace_root"])
+for pkg in meta["packages"]:
+    manifest_dir = os.path.dirname(os.path.realpath(pkg["manifest_path"]))
+    rel = os.path.relpath(manifest_dir, root)
+    print(pkg["name"] + "\t" + ("" if rel == "." else rel))
+'
   elif [ -d crates ]; then
-    for dir in crates/*/; do basename "$dir"; done
+    for dir in crates/*/; do
+      name="$(basename "$dir")"
+      printf '%s\t%s\n' "$name" "crates/$name"
+    done
   fi
 }
+
+declare -A CRATE_DIRS=()
+while IFS=$'\t' read -r name dir; do
+  [ -n "$name" ] && CRATE_DIRS["$name"]="$dir"
+done < <(discover_packages)
 
 if [ "$#" -gt 0 ]; then
   CRATES=("$@")
 else
-  mapfile -t CRATES < <(discover_crates)
+  mapfile -t CRATES < <(printf '%s\n' "${!CRATE_DIRS[@]}" | sort)
   if [ "${#CRATES[@]}" -eq 0 ]; then
     echo "error: no crates discovered (no Cargo workspace or crates/ directory); pass crate names explicitly" >&2
     exit 1
   fi
 fi
 
-# The daemon and MCP server hold the graph store lock; scanning runs through claude -p.
-pkill -f aetherd 2>/dev/null || true
-pkill -f aether-mcp 2>/dev/null || true
+# Directory prefix per selected crate; unknown names fall back to crates/<name>.
+crate_dir() {
+  if [ -n "${CRATE_DIRS[$1]+x}" ]; then printf '%s' "${CRATE_DIRS[$1]}"; else printf 'crates/%s' "$1"; fi
+}
+
+# Stop only the aetherd / aether-mcp processes that belong to this workspace: by cwd on
+# Linux (/proc), otherwise by a --workspace argument naming this path.
+stop_workspace_processes() {
+  local pid cwd
+  for pid in $(pgrep -f 'aetherd|aether-mcp' 2>/dev/null || true); do
+    [ "$pid" = "$$" ] && continue
+    cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null || true)"
+    if [ "$cwd" = "$WORKSPACE" ] || tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF -- "$WORKSPACE"; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+}
+stop_workspace_processes
 
 if [ ! -f "$DB" ]; then
   echo "error: $DB not found. Index first with:" >&2
@@ -62,16 +95,30 @@ if ! command -v claude >/dev/null 2>&1; then
   exit 1
 fi
 
+# SQL scope: only symbols under the selected crates' directories (a root package with an
+# empty dir means the whole workspace).
+scope_clause() {
+  local clauses=() crate dir
+  for crate in "${CRATES[@]}"; do
+    dir="$(crate_dir "$crate")"
+    if [ -z "$dir" ]; then printf '1=1'; return; fi
+    clauses+=("s.file_path LIKE '${dir//\'/\'\'}/%'")
+  done
+  local IFS=' '
+  printf '(%s)' "$(printf '%s OR ' "${clauses[@]}" | sed 's/ OR $//')"
+}
+SCOPE="$(scope_clause)"
+
 count_targets() {
-  sqlite3 "$DB" "SELECT COUNT(*) FROM sir WHERE sir_json LIKE '%\"intent\":\"[MOCK]%' OR json_extract(sir_json, '\$.confidence') < 0.2;"
+  sqlite3 "$DB" "SELECT COUNT(*) FROM sir JOIN symbols s ON s.id = sir.id WHERE $SCOPE AND (sir.sir_json LIKE '%\"intent\":\"[MOCK]%' OR json_extract(sir.sir_json, '\$.confidence') < 0.2);"
 }
 
 NEXT_STEP="deepen the results with: aetherd --workspace . regenerate --deep --below-confidence 0.85 (or /refactor-deep on the files that matter most)"
 
 BEFORE="$(count_targets)"
-log "scan targets before: $BEFORE ([MOCK] or confidence < 0.2)"
+log "scan targets before: $BEFORE ([MOCK] or confidence < 0.2 in: ${CRATES[*]})"
 if [ "$BEFORE" = "0" ]; then
-  log "nothing to scan; $NEXT_STEP"
+  log "nothing to scan in the selected crates; $NEXT_STEP"
   exit 0
 fi
 
@@ -79,7 +126,7 @@ log "scanning ${#CRATES[@]} crate(s), batch size $BATCH_SIZE, up to $MAX_PARALLE
 running=0
 for crate in "${CRATES[@]}"; do
   crate_log="$LOG_DIR/${crate}_${STAMP}.log"
-  log "start $crate -> $crate_log"
+  log "start $crate ($(crate_dir "$crate")) -> $crate_log"
   ( claude -p "/scan $crate $BATCH_SIZE" > "$crate_log" 2>&1 \
       && echo "done $crate" || echo "FAILED $crate (see $crate_log)" ) | tee -a "$MASTER_LOG" &
   running=$((running + 1))

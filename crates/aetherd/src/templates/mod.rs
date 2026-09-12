@@ -336,6 +336,8 @@ mod tests {
         let script = ScanAllScriptTemplate::render(&context);
         assert!(script.starts_with("#!/usr/bin/env bash"));
         assert!(script.contains("cargo metadata --no-deps"));
+        assert!(script.contains("stop_workspace_processes"));
+        assert!(!script.contains("pkill -f aetherd"));
         assert!(script.contains("--inference-provider mock"));
         assert!(!script.contains("enrich_all.sh"));
     }

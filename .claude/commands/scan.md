@@ -13,27 +13,34 @@ symbols this session processes before stopping.
 
 ## Procedure
 
-1. Build the target list from the low-confidence set, not from a ranked window.
+1. Resolve the crate's directory. Run
+   `cargo metadata --no-deps --format-version 1` and take the directory of the
+   `manifest_path` for the package named `<crate>`, relative to the workspace root
+   (for example `crates/<crate>`, `packages/<crate>`, or the root itself). Call it
+   `<dir>`; a root package means "the whole workspace".
+2. Build the target list from the low-confidence set, not from a ranked window.
    Query `.aether/meta.sqlite` directly, so symbols that were already scanned can never
    crowd the remaining placeholders out of a truncated result:
    `SELECT s.id, s.qualified_name, s.file_path FROM symbols s JOIN sir ON sir.id = s.id
-   WHERE s.file_path LIKE 'crates/<crate>/%'
+   WHERE s.file_path LIKE '<dir>/%'
      AND (json_extract(sir.sir_json, '$.confidence') < 0.2 OR sir.sir_json LIKE '%"intent":"[MOCK]%')
    ORDER BY s.file_path, s.qualified_name`
-   If SQL is not available to you, call `aether_audit_candidates` with
-   `crate_filter: "<crate>"` and a `top_n` well above the crate's symbol count
-   (for example 1000), then keep only candidates whose `current_confidence` is below
-   0.2 or whose SIR intent starts with `[MOCK]`. Never pass `batch-size` as `top_n`:
-   the tool ranks by a composite score in which confidence is only one factor.
-2. Take the first `batch-size` targets and group them by source file.
-3. Work in batches of 10 symbols per reasoning turn: read each source file ONCE,
+   (drop the `file_path` condition for a root package). If SQL is not available to
+   you, call `aether_audit_candidates` with a `top_n` well above the crate's symbol
+   count (for example 1000), then keep only candidates under `<dir>` whose
+   `current_confidence` is below 0.2 or whose SIR intent starts with `[MOCK]`; note
+   the tool's `crate_filter` assumes a `crates/<crate>/` layout, so filter on
+   `file_path` yourself when the crate lives elsewhere. Never pass `batch-size` as
+   `top_n`: the tool ranks by a composite score in which confidence is only one factor.
+3. Take the first `batch-size` targets and group them by source file.
+4. Work in batches of 10 symbols per reasoning turn: read each source file ONCE,
    produce the SIRs for all of its symbols together, then fire every
    `aether_sir_inject` call for the batch (intent, behavior, inputs, outputs,
    side_effects, dependencies, error_modes, complexity, confidence, and
    `generation_pass: "scan"`, `provider: "claude-code"`, `model: "<your model>"`).
-4. Target confidence 0.7–0.8 for scan-level SIRs. Use `force: true` only when replacing a
+5. Target confidence 0.7–0.8 for scan-level SIRs. Use `force: true` only when replacing a
    `[MOCK]` placeholder that somehow carries a higher confidence.
-5. Stop after `batch-size` symbols and print how many targets remain (rerun `/scan` or let
+6. Stop after `batch-size` symbols and print how many targets remain (rerun `/scan` or let
    `scripts/scan_all.sh` loop).
 
 ## Quality guidelines
