@@ -18,9 +18,20 @@ impl ScanAllScriptTemplate {
 # in the selected crates before and after.
 set -euo pipefail
 
-BATCH_SIZE="${1:-100}"
-MAX_PARALLEL="${2:-4}"
-shift $(( $# >= 2 ? 2 : $# )) || true
+# Leading numeric arguments are BATCH_SIZE then MAX_PARALLEL; everything else is a crate
+# name, so `scripts/scan_all.sh aether-core` and `scripts/scan_all.sh 50 aether-core` both work.
+BATCH_SIZE=100
+MAX_PARALLEL=4
+if [ "$#" -gt 0 ] && [[ "$1" =~ ^[0-9]+$ ]]; then
+  BATCH_SIZE="$1"; shift
+  if [ "$#" -gt 0 ] && [[ "$1" =~ ^[0-9]+$ ]]; then
+    MAX_PARALLEL="$1"; shift
+  fi
+fi
+if [ "$BATCH_SIZE" -lt 1 ] || [ "$MAX_PARALLEL" -lt 1 ]; then
+  echo "error: BATCH_SIZE and MAX_PARALLEL must be positive integers (got $BATCH_SIZE, $MAX_PARALLEL)" >&2
+  exit 1
+fi
 
 WORKSPACE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$WORKSPACE"
@@ -32,9 +43,11 @@ mkdir -p "$LOG_DIR"
 
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$MASTER_LOG"; }
 
-# Prints "name<TAB>dir" per workspace package, dir relative to the workspace root.
-# Parses the metadata JSON structurally (packages[].name / manifest_path); never the
-# dependency or target names that also carry a "name" key.
+# Prints "name<TAB>dir[<TAB>dir...]" per workspace package, dirs relative to the workspace
+# root. Parses the metadata JSON structurally (packages[].name / manifest_path / targets);
+# never the dependency or target names that also carry a "name" key. A package whose
+# manifest sits at the workspace root owns only the top-level directories of its own
+# targets (src/, tests/, benches/, ...), never the whole workspace.
 discover_packages() {
   if command -v cargo >/dev/null 2>&1 && [ -f Cargo.toml ] && command -v python3 >/dev/null 2>&1; then
     cargo metadata --no-deps --format-version 1 2>/dev/null | python3 -c '
@@ -44,7 +57,17 @@ root = os.path.realpath(meta["workspace_root"])
 for pkg in meta["packages"]:
     manifest_dir = os.path.dirname(os.path.realpath(pkg["manifest_path"]))
     rel = os.path.relpath(manifest_dir, root)
-    print(pkg["name"] + "\t" + ("" if rel == "." else rel))
+    if rel != ".":
+        dirs = [rel]
+    else:
+        dirs = []
+        for target in pkg.get("targets", []):
+            src = os.path.relpath(os.path.realpath(target["src_path"]), root)
+            top = src.split(os.sep)[0]
+            if top and top != "." and not top.startswith("..") and top not in dirs and os.sep in src:
+                dirs.append(top)
+    if dirs:
+        print(pkg["name"] + "\t" + "\t".join(dirs))
 '
   elif [ -d crates ]; then
     for dir in crates/*/; do
@@ -55,8 +78,8 @@ for pkg in meta["packages"]:
 }
 
 declare -A CRATE_DIRS=()
-while IFS=$'\t' read -r name dir; do
-  [ -n "$name" ] && CRATE_DIRS["$name"]="$dir"
+while IFS=$'\t' read -r name dirs; do
+  [ -n "$name" ] && CRATE_DIRS["$name"]="$dirs"
 done < <(discover_packages)
 
 if [ "$#" -gt 0 ]; then
@@ -69,10 +92,11 @@ else
   fi
 fi
 
-# Directory prefix per selected crate; unknown names fall back to crates/<name>.
-crate_dir() {
+# Tab-separated directory prefixes per selected crate; unknown names fall back to crates/<name>.
+crate_dirs() {
   if [ -n "${CRATE_DIRS[$1]+x}" ]; then printf '%s' "${CRATE_DIRS[$1]}"; else printf 'crates/%s' "$1"; fi
 }
+crate_dirs_display() { crate_dirs "$1" | tr '\t' ','; }
 
 # Stop only the aetherd / aether-mcp processes that belong to this workspace: by cwd on
 # Linux (/proc), otherwise by a --workspace argument naming this path.
@@ -90,7 +114,7 @@ stop_workspace_processes
 
 if [ ! -f "$DB" ]; then
   echo "error: $DB not found. Index first with:" >&2
-  echo "  aetherd --workspace . --index-once --inference-provider mock" >&2
+  echo "  aetherd --workspace . --index-once --full --inference-provider mock" >&2
   exit 1
 fi
 if ! command -v sqlite3 >/dev/null 2>&1; then
@@ -102,15 +126,19 @@ if ! command -v claude >/dev/null 2>&1; then
   exit 1
 fi
 
-# SQL scope: only symbols under the selected crates' directories (a root package with an
-# empty dir means the whole workspace).
+# SQL scope: only symbols under the selected crates' own directories.
 scope_clause() {
-  local clauses=() crate dir
+  local clauses=() crate dir dirs
   for crate in "${CRATES[@]}"; do
-    dir="$(crate_dir "$crate")"
-    if [ -z "$dir" ]; then printf '1=1'; return; fi
-    clauses+=("s.file_path LIKE '${dir//\'/\'\'}/%'")
+    IFS=$'\t' read -ra dirs <<< "$(crate_dirs "$crate")"
+    for dir in "${dirs[@]}"; do
+      [ -n "$dir" ] && clauses+=("s.file_path LIKE '${dir//\'/\'\'}/%'")
+    done
   done
+  if [ "${#clauses[@]}" -eq 0 ]; then
+    echo "error: no source directories resolved for: ${CRATES[*]}" >&2
+    exit 1
+  fi
   local IFS=' '
   printf '(%s)' "$(printf '%s OR ' "${clauses[@]}" | sed 's/ OR $//')"
 }
@@ -133,7 +161,7 @@ log "scanning ${#CRATES[@]} crate(s), batch size $BATCH_SIZE, up to $MAX_PARALLE
 running=0
 for crate in "${CRATES[@]}"; do
   crate_log="$LOG_DIR/${crate}_${STAMP}.log"
-  log "start $crate ($(crate_dir "$crate")) -> $crate_log"
+  log "start $crate ($(crate_dirs_display "$crate")) -> $crate_log"
   ( claude -p "/scan $crate $BATCH_SIZE" > "$crate_log" 2>&1 \
       && echo "done $crate" || echo "FAILED $crate (see $crate_log)" ) | tee -a "$MASTER_LOG" &
   running=$((running + 1))

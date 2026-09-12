@@ -13,11 +13,14 @@ symbols this session processes before stopping.
 
 ## Procedure
 
-1. Resolve the crate's directory. Run
+1. Resolve the crate's directories. Run
    `cargo metadata --no-deps --format-version 1` and take the directory of the
    `manifest_path` for the package named `<crate>`, relative to the workspace root
-   (for example `crates/<crate>`, `packages/<crate>`, or the root itself). Call it
-   `<dir>`; a root package means "the whole workspace".
+   (for example `crates/<crate>` or `packages/<crate>`). Call it `<dir>`. If the
+   manifest sits at the workspace root, the package owns only its own targets: use
+   the top-level directory of each target's `src_path` (typically `src`, `tests`,
+   `benches`, `examples`) as the `<dir>` set. Never treat a root package as "the
+   whole workspace": other members live beside it.
 2. Build the target list from the low-confidence set, not from a ranked window.
    Query `.aether/meta.sqlite` directly, so symbols that were already scanned can never
    crowd the remaining placeholders out of a truncated result:
@@ -25,7 +28,7 @@ symbols this session processes before stopping.
    WHERE s.file_path LIKE '<dir>/%'
      AND (json_extract(sir.sir_json, '$.confidence') < 0.2 OR sir.sir_json LIKE '%"intent":"[MOCK]%')
    ORDER BY s.file_path, s.qualified_name`
-   (drop the `file_path` condition for a root package). If SQL is not available to
+   (for several `<dir>`s, OR one `LIKE` clause per directory). If SQL is not available to
    you, call `aether_audit_candidates` with a `top_n` well above the crate's symbol
    count (for example 1000), then keep only candidates under `<dir>` whose
    `current_confidence` is below 0.2 or whose SIR intent starts with `[MOCK]`; note

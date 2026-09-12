@@ -12,7 +12,7 @@ before writing code and verify its changes afterward.
 
 Zero-API-key path (Claude Code Max subscribers):
 
-    aetherd --workspace . --index-once --inference-provider mock
+    aetherd --workspace . --index-once --full --inference-provider mock
 
 This builds the symbol table and dependency graph with tree-sitter only.
 Every symbol gets a `[MOCK]` placeholder SIR at confidence 0.1 — the
