@@ -508,6 +508,7 @@ mod tests {
                 concurrency: default_sir_concurrency(),
                 thinking: None,
                 tiered: None,
+                omp: crate::OmpConfig::default(),
             },
             sir_quality: SirQualityConfig::default(),
             storage: StorageConfig {

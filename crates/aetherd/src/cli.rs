@@ -672,6 +672,22 @@ pub struct BatchRunArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct OmpArgs {
+    #[command(subcommand)]
+    pub command: OmpCommand,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+pub enum OmpCommand {
+    /// Start `omp auth-broker serve` and `omp auth-gateway serve` (detached) if not already healthy
+    Up,
+    /// Stop the broker and gateway processes started by `aetherd omp up`
+    Down,
+    /// Report broker/gateway health, token presence, and served routes (exit 1 if the gateway is down)
+    Status,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct ContinuousArgs {
     #[command(subcommand)]
     pub command: ContinuousCommand,
@@ -1091,6 +1107,8 @@ pub enum Commands {
     TaskRelevance(TaskRelevanceArgs),
     /// Enhance a prompt with AETHER codebase intelligence
     Enhance(EnhanceArgs),
+    /// Start, stop, or inspect the Oh My Pi broker + gateway used by inference.provider=omp
+    Omp(OmpArgs),
     /// Assemble semantic context for a symbol
     SirContext(SirContextArgs),
     /// Inject or update a symbol's SIR annotation

@@ -756,6 +756,7 @@ MAINTENANCE
   fsck                   Cross-store consistency check
   setup-local            Configure local Ollama inference
   init-agent             Generate agent config files
+  omp up|down|status     Start/stop/inspect the Oh My Pi broker + gateway (inference.provider=omp)
   remember / recall      Project memory management
 ```
 

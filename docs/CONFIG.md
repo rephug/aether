@@ -53,17 +53,33 @@ The omp gateway has no batch endpoint, so batch pricing is never available on a 
 route: it always needs the provider's API key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
 `GEMINI_API_KEY`, or the `[batch.<provider>].api_key_env` override).
 
-### 1. Start the gateway
+### 1. Log in, then let AETHER start the gateway
 
 ```bash
-omp auth-broker serve            # serves the credentials in ~/.omp/agent (OAuth logins, keys)
-export OMP_AUTH_BROKER_URL=http://127.0.0.1:<broker-port>
-omp auth-gateway token           # prints/creates ~/.omp/auth-gateway.token
-omp auth-gateway serve           # OpenAI-compatible endpoint on http://127.0.0.1:4000
+omp auth-broker login anthropic       # once per provider; opens the OAuth flow
+aetherd --workspace . omp up          # starts the broker + gateway, detached
+aetherd --workspace . omp status      # health, token, number of routes served
+aetherd --workspace . omp down        # stops what `up` started
 ```
 
-`omp auth-gateway status` shows the bind address and token file. The gateway lists the routes
-it can serve at `GET /v1/models`.
+`up` spawns `omp auth-broker serve` (serving the credentials in `~/.omp/agent`) and
+`omp auth-gateway serve` (OpenAI-compatible endpoint on `http://127.0.0.1:4000`, bearer token
+in `~/.omp/auth-gateway.token`), logs them under `.aether/omp/`, and records their pids there.
+With `autostart = true` (the default) every `aetherd` run that uses the `omp` provider does
+the same on demand, so after login nothing else needs to be running.
+
+```toml
+[inference.omp]
+autostart = true                   # spawn broker + gateway when the gateway is unreachable
+# command = "omp"                  # the omp binary (absolute path allowed)
+# broker_bind = "127.0.0.1:8765"
+# gateway_bind = "127.0.0.1:4000"  # must agree with inference.endpoint when that is set
+# startup_timeout_secs = 20
+```
+
+Starting them by hand works too (`omp auth-broker serve`, then `omp auth-gateway serve` with
+`OMP_AUTH_BROKER_URL` pointing at the broker); `omp up` notices a healthy gateway and leaves
+it alone. The gateway lists the routes it can serve at `GET /v1/models`.
 
 ### 2. Point AETHER at it
 

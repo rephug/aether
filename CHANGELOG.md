@@ -22,6 +22,9 @@ and this project follows [Semantic Versioning](https://semver.org/).
   model of `inference.model`.
 - `aetherd init-agent --platform omp` writes `AGENTS.md` and a project-root `.mcp.json`
   for Oh My Pi projects.
+- `aetherd omp up|down|status` and `[inference.omp] autostart` (default on): AETHER
+  spawns `omp auth-broker serve` and `omp auth-gateway serve` itself when the gateway is
+  unreachable, so an `omp` login is all that is needed before `aetherd index`.
 
 - GitHub Release packaging now publishes `aetherd` and `aether-mcp` binaries for
   x64 and arm64 across Linux, macOS, and Windows targets.
