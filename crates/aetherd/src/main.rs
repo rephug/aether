@@ -100,6 +100,8 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     let selected_provider = cli.inference_provider.unwrap_or(config.inference.provider);
+    aetherd::omp_gateway::autostart_if_needed(&workspace, &config, selected_provider)
+        .context("omp gateway autostart failed (set [inference.omp] autostart = false to skip)")?;
     let run_triage = config.sir_quality.triage_pass || cli.deep;
     let run_deep = config.sir_quality.deep_pass || cli.deep;
     if run_triage
@@ -333,6 +335,7 @@ fn run_subcommand(workspace: &Path, config: &AetherConfig, command: Commands) ->
         Commands::TaskHistory(args) => run_task_history_subcommand(workspace, args),
         Commands::TaskRelevance(args) => run_task_relevance_subcommand(workspace, args),
         Commands::Enhance(args) => run_enhance_subcommand(workspace, args),
+        Commands::Omp(args) => aetherd::omp_gateway::run_omp_command(workspace, config, args),
         Commands::SirContext(args) => run_sir_context_subcommand(workspace, args),
         Commands::SirInject(args) => run_sir_inject_subcommand(workspace, args),
         Commands::SirDiff(args) => run_sir_diff_subcommand(workspace, args),

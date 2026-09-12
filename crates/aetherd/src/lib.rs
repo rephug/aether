@@ -21,6 +21,7 @@ pub mod indexer;
 pub mod init_agent;
 pub mod memory;
 pub mod observer;
+pub mod omp_gateway;
 pub mod priority_queue;
 pub mod quality;
 pub mod refactor_prep;

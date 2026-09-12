@@ -350,7 +350,7 @@ fn scan_workspace_files(workspace: &Path) -> (Vec<LanguageCount>, usize) {
             extensions,
         })
         .collect();
-    result.sort_by(|a, b| b.count.cmp(&a.count));
+    result.sort_by_key(|entry| std::cmp::Reverse(entry.count));
 
     (result, total)
 }

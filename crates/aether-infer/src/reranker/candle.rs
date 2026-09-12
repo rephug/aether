@@ -313,7 +313,7 @@ impl CandleRerankerProvider {
                 .map(|candidate| candidate.text.as_str())
                 .collect::<Vec<_>>();
             let scores = Self::score_chunk(loaded, query, &docs)?;
-            for (candidate, score) in batch.iter().zip(scores.into_iter()) {
+            for (candidate, score) in batch.iter().zip(scores) {
                 scored.push((candidate.id.clone(), score));
             }
         }

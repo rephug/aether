@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 
 use aether_config::{
     AETHER_DIR_NAME, DEFAULT_COHERE_API_KEY_ENV, DEFAULT_GEMINI_API_KEY_ENV,
-    DEFAULT_OPENAI_COMPAT_API_KEY_ENV, DEFAULT_QWEN_ENDPOINT, DEFAULT_QWEN_MODEL,
-    EmbeddingProviderKind, InferenceProviderKind, SearchRerankerKind, TieredConfig,
-    ensure_workspace_config,
+    DEFAULT_OMP_GATEWAY_ENDPOINT, DEFAULT_OMP_GATEWAY_TOKEN_ENV, DEFAULT_OPENAI_COMPAT_API_KEY_ENV,
+    DEFAULT_QWEN_ENDPOINT, DEFAULT_QWEN_MODEL, EmbeddingProviderKind, InferenceProviderKind,
+    OMP_GATEWAY_TOKEN_FILE, SearchRerankerKind, TieredConfig, ensure_workspace_config,
 };
 use aether_core::Secret;
 
@@ -140,7 +140,109 @@ pub fn load_inference_provider_from_config(
                 provider_name: InferenceProviderKind::OpenAiCompat.as_str().to_owned(),
             })
         }
+        InferenceProviderKind::Omp => {
+            let provider = build_omp_provider(
+                &selected_api_key_env,
+                selected_endpoint,
+                selected_model,
+                selected_thinking,
+            )?;
+            Ok(LoadedProvider {
+                model_name: provider.model_name(),
+                provider: Box::new(provider),
+                provider_name: InferenceProviderKind::Omp.as_str().to_owned(),
+            })
+        }
     }
+}
+
+/// Build the omp gateway provider: OpenAI-compatible transport against
+/// `omp auth-gateway serve`, model addressed as an omp route (`provider/model`).
+fn build_omp_provider(
+    api_key_env: &str,
+    endpoint: Option<String>,
+    model: Option<String>,
+    thinking: Option<String>,
+) -> Result<OpenAiCompatProvider, InferError> {
+    let token = resolve_omp_gateway_token(api_key_env)?;
+    let api_base =
+        normalize_optional(endpoint).unwrap_or_else(|| DEFAULT_OMP_GATEWAY_ENDPOINT.to_owned());
+    let model = normalize_optional(model).ok_or_else(|| {
+        InferError::InvalidConfig(
+            "inference.provider=omp requires inference.model as an omp route (provider/model, \
+             e.g. anthropic/claude-fable-5)"
+                .to_owned(),
+        )
+    })?;
+    if aether_config::split_omp_route(&model).is_none() {
+        return Err(InferError::InvalidConfig(format!(
+            "inference.model '{model}' is not an omp route; expected provider/model \
+             (e.g. anthropic/claude-fable-5)"
+        )));
+    }
+    tracing::info!(
+        endpoint = %api_base,
+        model = %model,
+        reasoning_effort = ?omp_reasoning_effort(thinking.as_deref()),
+        "omp provider selected (Oh My Pi auth gateway)"
+    );
+    Ok(
+        OpenAiCompatProvider::new(Secret::new(token), api_base, model)
+            .with_provider_name(InferenceProviderKind::Omp.as_str())
+            .with_reasoning_effort(omp_reasoning_effort(thinking.as_deref())),
+    )
+}
+
+/// Map `[inference].thinking` onto the gateway's `reasoning_effort` vocabulary.
+///
+/// Unknown values (including `dynamic`, `off`, `none`) omit the field so the gateway applies
+/// the model's own default.
+fn omp_reasoning_effort(thinking: Option<&str>) -> Option<String> {
+    let value = thinking?.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => Some(value),
+        _ => None,
+    }
+}
+
+/// Locate the gateway bearer token: the configured env var first, then the token file that
+/// `omp auth-gateway token` writes under `$HOME`.
+fn resolve_omp_gateway_token(api_key_env: &str) -> Result<String, InferError> {
+    resolve_omp_gateway_token_from(api_key_env, omp_gateway_token_path())
+}
+
+fn resolve_omp_gateway_token_from(
+    api_key_env: &str,
+    token_file: Option<PathBuf>,
+) -> Result<String, InferError> {
+    if let Some(token) = read_env_non_empty(api_key_env) {
+        return Ok(token);
+    }
+    if let Some(path) = token_file.as_ref()
+        && let Ok(contents) = std::fs::read_to_string(path)
+    {
+        let token = contents.trim();
+        if !token.is_empty() {
+            return Ok(token.to_owned());
+        }
+    }
+    Err(InferError::InvalidConfig(format!(
+        "no omp gateway token: set {} or run `omp auth-gateway token` (looked for {})",
+        api_key_env,
+        token_file
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| format!("$HOME/{OMP_GATEWAY_TOKEN_FILE}"))
+    )))
+}
+
+fn omp_gateway_token_path() -> Option<PathBuf> {
+    // `OMP_GATEWAY_TOKEN_FILE` lets a container or CI point at a mounted token without
+    // pretending to have a home directory.
+    if let Some(explicit) = read_env_non_empty("OMP_GATEWAY_TOKEN_FILE") {
+        return Some(PathBuf::from(explicit));
+    }
+    let home = read_env_non_empty("HOME").or_else(|| read_env_non_empty("USERPROFILE"))?;
+    Some(Path::new(&home).join(OMP_GATEWAY_TOKEN_FILE))
 }
 
 pub fn load_provider_from_env_or_mock(
@@ -255,6 +357,19 @@ pub async fn summarize_text_with_config(
             let api_base = selected_endpoint.ok_or(InferError::MissingEndpoint)?;
             let model = selected_model.ok_or(InferError::MissingModel)?;
             let provider = OpenAiCompatProvider::new(Secret::new(api_key), api_base, model);
+            let summary = provider.request_summary(system_prompt, user_prompt).await?;
+            Ok(clean_summary(summary))
+        }
+        InferenceProviderKind::Omp => {
+            if resolve_omp_gateway_token(selected_api_key_env.as_str()).is_err() {
+                return Ok(None);
+            }
+            let provider = build_omp_provider(
+                selected_api_key_env.as_str(),
+                selected_endpoint,
+                selected_model,
+                config.inference.thinking,
+            )?;
             let summary = provider.request_summary(system_prompt, user_prompt).await?;
             Ok(clean_summary(summary))
         }
@@ -476,9 +591,28 @@ fn load_tiered_provider(
                 model,
             )
         }
+        "omp" => {
+            let api_key_env = if primary_api_key_env == DEFAULT_GEMINI_API_KEY_ENV {
+                DEFAULT_OMP_GATEWAY_TOKEN_ENV.to_owned()
+            } else {
+                primary_api_key_env
+            };
+            let provider = build_omp_provider(
+                &api_key_env,
+                primary_endpoint,
+                primary_model,
+                selected_thinking,
+            )?;
+            let model_name = provider.model_name();
+            (
+                Box::new(provider),
+                InferenceProviderKind::Omp.as_str().to_owned(),
+                model_name,
+            )
+        }
         other => {
             return Err(InferError::InvalidConfig(format!(
-                "inference.tiered.primary must be 'gemini' or 'openai_compat' (found '{other}')"
+                "inference.tiered.primary must be 'gemini', 'openai_compat' or 'omp' (found '{other}')"
             )));
         }
     };
@@ -616,6 +750,7 @@ fn no_provider_available_message(endpoint: &str, api_key_env: &str) -> String {
 fn default_api_key_env_for_provider(provider: InferenceProviderKind) -> &'static str {
     match provider {
         InferenceProviderKind::OpenAiCompat => DEFAULT_OPENAI_COMPAT_API_KEY_ENV,
+        InferenceProviderKind::Omp => DEFAULT_OMP_GATEWAY_TOKEN_ENV,
         _ => DEFAULT_GEMINI_API_KEY_ENV,
     }
 }
@@ -632,6 +767,13 @@ fn resolve_inference_api_key_env(
                 && value == DEFAULT_GEMINI_API_KEY_ENV =>
         {
             DEFAULT_OPENAI_COMPAT_API_KEY_ENV.to_owned()
+        }
+        // The serde default for `api_key_env` is the Gemini variable; for omp that means
+        // "unset", so fall through to the gateway token variable.
+        Some(value)
+            if provider == InferenceProviderKind::Omp && value == DEFAULT_GEMINI_API_KEY_ENV =>
+        {
+            DEFAULT_OMP_GATEWAY_TOKEN_ENV.to_owned()
         }
         Some(value) => value,
         None => default_api_key_env_for_provider(provider).to_owned(),
@@ -1156,6 +1298,143 @@ dimensions = 3072
             Err(InferError::MissingApiKey(name)) => assert_eq!(name, env_name),
             _ => panic!("expected missing api key"),
         }
+    }
+
+    #[test]
+    fn load_provider_omp_requires_route_model() {
+        let temp = tempdir().expect("tempdir");
+        ensure_workspace_config(temp.path()).expect("ensure config");
+        let env_name = "AETHER_TEST_OMP_TOKEN_ROUTE_ZZZZZ";
+        unsafe {
+            env::set_var(env_name, "gateway-token");
+        }
+
+        let missing = load_provider_from_env_or_mock(
+            temp.path(),
+            ProviderOverrides {
+                provider: Some(InferenceProviderKind::Omp),
+                api_key_env: Some(env_name.to_owned()),
+                ..ProviderOverrides::default()
+            },
+        );
+        match missing {
+            Err(InferError::InvalidConfig(message)) => {
+                assert!(message.contains("requires inference.model"), "{message}")
+            }
+            Ok(_) => panic!("expected invalid config, got a provider"),
+            Err(other) => panic!("expected invalid config, got {other}"),
+        }
+
+        let bare = load_provider_from_env_or_mock(
+            temp.path(),
+            ProviderOverrides {
+                provider: Some(InferenceProviderKind::Omp),
+                model: Some("claude-fable-5".to_owned()),
+                api_key_env: Some(env_name.to_owned()),
+                ..ProviderOverrides::default()
+            },
+        );
+        match bare {
+            Err(InferError::InvalidConfig(message)) => {
+                assert!(message.contains("not an omp route"), "{message}")
+            }
+            Ok(_) => panic!("expected invalid config, got a provider"),
+            Err(other) => panic!("expected invalid config, got {other}"),
+        }
+
+        unsafe {
+            env::remove_var(env_name);
+        }
+    }
+
+    #[test]
+    fn load_provider_omp_constructs_gateway_provider_from_env_token() {
+        let temp = tempdir().expect("tempdir");
+        ensure_workspace_config(temp.path()).expect("ensure config");
+        let env_name = "AETHER_TEST_OMP_TOKEN_OK_ZZZZZ";
+        unsafe {
+            env::set_var(env_name, "gateway-token");
+        }
+
+        let loaded = load_provider_from_env_or_mock(
+            temp.path(),
+            ProviderOverrides {
+                provider: Some(InferenceProviderKind::Omp),
+                model: Some("anthropic/claude-fable-5".to_owned()),
+                api_key_env: Some(env_name.to_owned()),
+                thinking: Some("high".to_owned()),
+                ..ProviderOverrides::default()
+            },
+        )
+        .expect("omp provider should load with a token and a route");
+
+        assert_eq!(loaded.provider_name, InferenceProviderKind::Omp.as_str());
+        assert_eq!(loaded.model_name, "anthropic/claude-fable-5");
+        assert_eq!(loaded.provider.provider_name(), "omp");
+
+        unsafe {
+            env::remove_var(env_name);
+        }
+    }
+
+    #[test]
+    fn omp_gateway_token_falls_back_to_token_file() {
+        let temp = tempdir().expect("tempdir");
+        let token_path = temp.path().join("auth-gateway.token");
+        std::fs::write(&token_path, "file-token\n").expect("write token");
+        let env_name = "AETHER_TEST_OMP_TOKEN_UNSET_ZZZZZ";
+
+        let token = resolve_omp_gateway_token_from(env_name, Some(token_path.clone()))
+            .expect("token file should be used");
+        assert_eq!(token, "file-token");
+
+        let missing = resolve_omp_gateway_token_from(env_name, Some(temp.path().join("absent")));
+        match missing {
+            Err(InferError::InvalidConfig(message)) => {
+                assert!(message.contains("omp auth-gateway token"), "{message}");
+                assert!(message.contains(env_name), "{message}");
+            }
+            other => panic!("expected invalid config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn omp_reasoning_effort_maps_known_levels_only() {
+        assert_eq!(
+            omp_reasoning_effort(Some(" High ")),
+            Some("high".to_owned())
+        );
+        assert_eq!(
+            omp_reasoning_effort(Some("xhigh")),
+            Some("xhigh".to_owned())
+        );
+        assert_eq!(omp_reasoning_effort(Some("dynamic")), None);
+        assert_eq!(omp_reasoning_effort(Some("off")), None);
+        assert_eq!(omp_reasoning_effort(None), None);
+    }
+
+    #[test]
+    fn resolve_inference_api_key_env_defaults_omp_to_gateway_token() {
+        assert_eq!(
+            resolve_inference_api_key_env(InferenceProviderKind::Omp, None, None),
+            DEFAULT_OMP_GATEWAY_TOKEN_ENV
+        );
+        assert_eq!(
+            resolve_inference_api_key_env(
+                InferenceProviderKind::Omp,
+                None,
+                Some(DEFAULT_GEMINI_API_KEY_ENV.to_owned())
+            ),
+            DEFAULT_OMP_GATEWAY_TOKEN_ENV
+        );
+        assert_eq!(
+            resolve_inference_api_key_env(
+                InferenceProviderKind::Omp,
+                Some("MY_TOKEN".to_owned()),
+                None
+            ),
+            "MY_TOKEN"
+        );
     }
 
     #[test]

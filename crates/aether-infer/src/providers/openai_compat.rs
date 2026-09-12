@@ -24,6 +24,11 @@ pub struct OpenAiCompatProvider {
     api_base: String,
     api_key: Secret,
     model: String,
+    /// Name reported by `provider_name()`; `openai_compat` unless a wrapper (the omp
+    /// gateway) rebrands it so fingerprints and logs say which transport was used.
+    provider_name: String,
+    /// OpenAI `reasoning_effort` to send (`low`, `medium`, `high`, ...). `None` omits it.
+    reasoning_effort: Option<String>,
     json_mode_supported: AtomicBool,
 }
 
@@ -34,6 +39,8 @@ impl std::fmt::Debug for OpenAiCompatProvider {
             .field("api_base", &self.api_base)
             .field("api_key", &"[REDACTED]")
             .field("model", &self.model)
+            .field("provider_name", &self.provider_name)
+            .field("reasoning_effort", &self.reasoning_effort)
             .field(
                 "json_mode_supported",
                 &self.json_mode_supported.load(Ordering::Relaxed),
@@ -49,6 +56,8 @@ impl Clone for OpenAiCompatProvider {
             api_base: self.api_base.clone(),
             api_key: self.api_key.clone(),
             model: self.model.clone(),
+            provider_name: self.provider_name.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
             json_mode_supported: AtomicBool::new(self.json_mode_supported.load(Ordering::Relaxed)),
         }
     }
@@ -61,8 +70,24 @@ impl OpenAiCompatProvider {
             api_base: normalize_openai_api_base(&api_base),
             api_key,
             model,
+            provider_name: InferenceProviderKind::OpenAiCompat.as_str().to_owned(),
+            reasoning_effort: None,
             json_mode_supported: AtomicBool::new(true),
         }
+    }
+
+    /// Report a different provider name (used by the omp gateway wrapper).
+    pub fn with_provider_name(mut self, provider_name: impl Into<String>) -> Self {
+        self.provider_name = provider_name.into();
+        self
+    }
+
+    /// Send `reasoning_effort` with every chat completion request.
+    pub fn with_reasoning_effort(mut self, reasoning_effort: Option<String>) -> Self {
+        self.reasoning_effort = reasoning_effort
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        self
     }
 
     fn endpoint_url(&self) -> String {
@@ -80,6 +105,7 @@ impl OpenAiCompatProvider {
             system_prompt,
             user_prompt,
             include_response_format,
+            self.reasoning_effort.as_deref(),
         );
         let response = self
             .client
@@ -171,7 +197,7 @@ impl OpenAiCompatProvider {
 #[async_trait]
 impl InferenceProvider for OpenAiCompatProvider {
     fn provider_name(&self) -> String {
-        InferenceProviderKind::OpenAiCompat.as_str().to_owned()
+        self.provider_name.clone()
     }
 
     fn model_name(&self) -> String {
@@ -218,5 +244,26 @@ mod tests {
         let debug = format!("{provider:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("super-secret-value"));
+    }
+
+    #[test]
+    fn openai_compat_provider_can_be_rebranded_with_reasoning() {
+        let provider = OpenAiCompatProvider::new(
+            Secret::new("token".to_owned()),
+            "http://127.0.0.1:4000/v1".to_owned(),
+            "anthropic/claude-fable-5".to_owned(),
+        )
+        .with_provider_name("omp")
+        .with_reasoning_effort(Some(" high ".to_owned()));
+        assert_eq!(provider.provider_name(), "omp");
+        assert_eq!(provider.model_name(), "anthropic/claude-fable-5");
+        assert_eq!(provider.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            provider
+                .clone()
+                .with_reasoning_effort(Some(String::new()))
+                .reasoning_effort,
+            None
+        );
     }
 }

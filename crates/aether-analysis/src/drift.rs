@@ -385,7 +385,7 @@ impl DriftAnalyzer {
         });
         structural_anomalies
             .new_cycles
-            .sort_by(|left, right| left.symbols.join(",").cmp(&right.symbols.join(",")));
+            .sort_by_key(|cycle| cycle.symbols.join(","));
         structural_anomalies
             .orphaned_subgraphs
             .sort_by(|left, right| {

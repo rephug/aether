@@ -9,8 +9,8 @@ use clap::ValueEnum;
 
 use crate::templates::{
     AuditChangesCommandTemplate, AuditCommandTemplate, AuditReportCommandTemplate, ClaudeTemplate,
-    CodexInstructionsTemplate, CursorRulesTemplate, RefactorCommandTemplate,
-    RefactorDeepCommandTemplate, SkillTemplate, TemplateContext,
+    CodexInstructionsTemplate, CursorRulesTemplate, McpJsonTemplate, OmpAgentsTemplate,
+    RefactorCommandTemplate, RefactorDeepCommandTemplate, SkillTemplate, TemplateContext,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -19,6 +19,8 @@ pub enum AgentPlatform {
     Claude,
     Codex,
     Cursor,
+    /// Oh My Pi: `AGENTS.md` plus a project-root `.mcp.json` for the AETHER MCP server.
+    Omp,
     All,
 }
 
@@ -139,6 +141,17 @@ fn files_for_platform(platform: AgentPlatform, context: &TemplateContext) -> Vec
         });
     }
 
+    if matches!(platform, AgentPlatform::Omp | AgentPlatform::All) {
+        files.push(GeneratedFile {
+            relative_path: PathBuf::from("AGENTS.md"),
+            content: OmpAgentsTemplate::render(context),
+        });
+        files.push(GeneratedFile {
+            relative_path: PathBuf::from(".mcp.json"),
+            content: McpJsonTemplate::render(context),
+        });
+    }
+
     files
 }
 
@@ -216,6 +229,8 @@ mod tests {
         assert!(workspace.join("CLAUDE.md").exists());
         assert!(workspace.join(".codex-instructions").exists());
         assert!(workspace.join(".cursor/rules").exists());
+        assert!(workspace.join("AGENTS.md").exists());
+        assert!(workspace.join(".mcp.json").exists());
         assert!(workspace.join(".claude/commands/audit.md").exists());
         assert!(workspace.join(".claude/commands/refactor.md").exists());
         assert!(workspace.join(".claude/commands/refactor-deep.md").exists());
@@ -226,6 +241,39 @@ mod tests {
                 .join(".agents/skills/aether-context/SKILL.md")
                 .exists()
         );
+    }
+
+    #[test]
+    fn init_agent_omp_platform_writes_agents_md_and_mcp_json_only() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+
+        write_config_with_embeddings(workspace, false);
+
+        let outcome = run_init_agent(
+            workspace,
+            InitAgentOptions {
+                platform: AgentPlatform::Omp,
+                force: false,
+            },
+        )
+        .expect("init-agent omp should succeed");
+
+        assert_eq!(outcome.exit_code(), 0);
+        assert_eq!(
+            outcome.written_files,
+            vec![
+                std::path::PathBuf::from("AGENTS.md"),
+                std::path::PathBuf::from(".mcp.json")
+            ]
+        );
+        assert!(!workspace.join("CLAUDE.md").exists());
+        let agents = fs::read_to_string(workspace.join("AGENTS.md")).expect("read agents");
+        assert!(agents.contains("AETHER Code Intelligence"));
+        assert!(agents.contains("aether_verify"));
+        let mcp = fs::read_to_string(workspace.join(".mcp.json")).expect("read mcp");
+        let parsed: serde_json::Value = serde_json::from_str(&mcp).expect("valid json");
+        assert!(parsed["mcpServers"]["aether"]["command"].is_string());
     }
 
     #[test]
