@@ -6,6 +6,8 @@ use aether_store::{
     SirHistoryStore, SirMetaRecord, SirStateStore, SymbolCatalogStore, SymbolRecord,
 };
 use std::collections::HashMap;
+
+use anyhow::Context as _;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -63,8 +65,28 @@ pub struct AetherSirInjectRequest {
 }
 
 /// Serializes the leaf-SIR write and the file-rollup rebuild across concurrent
-/// `aether_sir_inject` calls in this process.
+/// `aether_sir_inject` calls in this process; `acquire_inject_write_lock` adds the
+/// cross-process half (an exclusive lock on `.aether/inject.lock`), since every MCP
+/// client runs its own stdio `aether-mcp` process against the same store.
 static INJECT_WRITE_LOCK: Mutex<()> = Mutex::new(());
+const INJECT_LOCK_FILE: &str = "inject.lock";
+
+/// Exclusive, cross-process lock held while a leaf SIR and its file rollup are written.
+/// Released when the returned handle is dropped.
+fn acquire_inject_write_lock(workspace: &Path) -> anyhow::Result<std::fs::File> {
+    let dir = workspace.join(".aether");
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let path = dir.join(INJECT_LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.lock()
+        .with_context(|| format!("failed to lock {}", path.display()))?;
+    Ok(file)
+}
 /// One lock per symbol for the embedding refresh, so two injections into the same symbol
 /// embed in order (the later SIR wins) while unrelated symbols stay concurrent.
 static EMBED_LOCKS: Mutex<Option<HashMap<String, Arc<Mutex<()>>>>> = Mutex::new(None);
@@ -367,6 +389,8 @@ impl AetherMcpServer {
         let _inject_guard = INJECT_WRITE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _inject_file_guard = acquire_inject_write_lock(&self.state.workspace)
+            .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
         let version_write = store.record_sir_version_if_changed(
             symbol_id.as_str(),
             hash.as_str(),
@@ -411,16 +435,24 @@ impl AetherMcpServer {
                     symbol.file_path
                 );
                 // Leave a retry marker: the leaf keeps its scan-level confidence, but the
-                // guard and the scan queries treat this status as "still a target".
-                let _ = store.upsert_sir_meta(SirMetaRecord {
+                // guard and the scan queries treat this status as "still a target". If even
+                // the marker cannot be written, say so: the symbol must then be re-injected
+                // with force=true, because nothing in the store records the failure.
+                let message = match store.upsert_sir_meta(SirMetaRecord {
                     sir_status: SIR_STATUS_ROLLUP_FAILED.to_owned(),
                     last_error: Some(message.clone()),
                     ..meta_record.clone()
-                });
+                }) {
+                    Ok(()) => message,
+                    Err(marker_err) => format!(
+                        "{message}; the rollup_failed retry marker could not be written either ({marker_err}), so rerun this injection with force=true once the store accepts writes"
+                    ),
+                };
                 AetherMcpError::Message(message)
             })?;
-        // The embedding refresh may call a local or remote model: release the lock first
+        // The embedding refresh may call a local or remote model: release both locks first
         // so concurrent injections into other files are not serialized behind it.
+        drop(_inject_file_guard);
         drop(_inject_guard);
         let embedding_status =
             self.refresh_embedding_after_inject(symbol_id.as_str(), hash.as_str(), &canonical_json);
