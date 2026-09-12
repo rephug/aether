@@ -38,7 +38,7 @@ pub(crate) fn snapshot_workspace_symbols(workspace: &Path) -> Result<HashMap<Str
 
     let mut symbols_by_id = HashMap::new();
     for event in observer.initial_symbol_events() {
-        for symbol in event.added.into_iter().chain(event.updated.into_iter()) {
+        for symbol in event.added.into_iter().chain(event.updated) {
             symbols_by_id.insert(symbol.id.clone(), symbol);
         }
     }
