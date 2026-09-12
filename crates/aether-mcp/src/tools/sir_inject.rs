@@ -6,6 +6,7 @@ use aether_store::{
     SirHistoryStore, SirMetaRecord, SirStateStore, SymbolCatalogStore, SymbolRecord,
 };
 use std::path::Path;
+use std::sync::Mutex;
 
 use aether_parse::language_for_path;
 use aetherd::sir_pipeline::{SirPipeline, refresh_local_file_rollup};
@@ -59,6 +60,10 @@ pub struct AetherSirInjectRequest {
     /// Force overwrite even if existing SIR has higher confidence
     pub force: Option<bool>,
 }
+
+/// Serializes the leaf-SIR write and the file-rollup rebuild across concurrent
+/// `aether_sir_inject` calls in this process.
+static INJECT_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherSirInjectResponse {
@@ -332,6 +337,13 @@ impl AetherMcpServer {
         let generation_pass = normalize_optional_text_with_default(request.generation_pass, "deep");
         let rollup_identity = (provider.clone(), model.clone(), generation_pass.clone());
         let now = current_unix_timestamp();
+        // The leaf write and the file-rollup rebuild below must not interleave with a
+        // concurrent injection into the same file (the MCP router runs each call on its
+        // own blocking task): an older leaf snapshot persisted last would put stale
+        // rollup content back. One process-wide lock keeps write + rebuild atomic.
+        let _inject_guard = INJECT_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let version_write = store.record_sir_version_if_changed(
             symbol_id.as_str(),
             hash.as_str(),
@@ -452,6 +464,7 @@ impl AetherMcpServer {
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::sync::Mutex;
 
     use aether_sir::SirAnnotation;
     use aether_store::{SirHistoryStore, SirStateStore, SymbolCatalogStore, SymbolRecord};

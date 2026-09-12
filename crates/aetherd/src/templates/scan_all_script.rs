@@ -11,6 +11,10 @@ impl ScanAllScriptTemplate {
 #
 # Usage: scripts/scan_all.sh [BATCH_SIZE=100] [MAX_PARALLEL=4] [crate ...]
 #
+# Each /scan session handles at most BATCH_SIZE symbols, so the script runs rounds of
+# sessions over the units that still have targets until none remain (MAX_ROUNDS, default
+# 50, caps that); a round that replaces nothing is reported as a failure.
+#
 # With no arguments every workspace package from `cargo metadata` is scanned; in a
 # workspace without Cargo (TypeScript, Python, ...) every top-level directory that holds
 # indexed symbols is scanned instead. Arguments may be package names or directories
@@ -36,6 +40,7 @@ if [ "$BATCH_SIZE" -lt 1 ] || [ "$MAX_PARALLEL" -lt 1 ]; then
   echo "error: BATCH_SIZE and MAX_PARALLEL must be positive integers (got $BATCH_SIZE, $MAX_PARALLEL)" >&2
   exit 1
 fi
+MAX_ROUNDS="${MAX_ROUNDS:-50}"
 
 # The workspace is the directory this script was generated into (its parent), not the
 # Git root: an AETHER workspace may sit inside a larger repository.
@@ -309,19 +314,24 @@ if [ "$BEFORE" = "0" ]; then
   exit 0
 fi
 
-log "scanning ${#CRATES[@]} crate(s), batch size $BATCH_SIZE, up to $MAX_PARALLEL parallel sessions"
+log "scanning ${#CRATES[@]} crate(s), batch size $BATCH_SIZE, up to $MAX_PARALLEL parallel sessions, up to $MAX_ROUNDS round(s)"
 # Bash 3.2 cannot wait for "any one job": poll the running job count instead. Failed
-# sessions leave a marker so the exit status reflects them after the final wait.
+# sessions leave a marker so the exit status reflects them after each round's wait.
 running_jobs() { jobs -rp | wc -l | tr -d ' '; }
 FAIL_DIR="$LOG_DIR/failed_${STAMP}"
 mkdir -p "$FAIL_DIR"
+ROUND=0
+ROUND_BEFORE="$BEFORE"
+while :; do
+ROUND=$((ROUND + 1))
+log "round $ROUND: $ROUND_BEFORE target(s) remaining"
 for crate in "${CRATES[@]}"; do
   if [ "$(count_targets "$(scope_clause "$crate")")" = "0" ]; then
     log "skip $crate ($(crate_scopes_display "$crate")): no scan targets"
     continue
   fi
   safe_name="$(printf '%s' "$crate" | tr '/:' '__')"
-  crate_log="$LOG_DIR/${safe_name}_${STAMP}.log"
+  crate_log="$LOG_DIR/${safe_name}_${STAMP}_r${ROUND}.log"
   # The session receives the exact include/exclude scopes computed here (comma-separated,
   # exclusions prefixed with "-"), so /scan never has to re-derive them and synthetic
   # units (dir:<name>, directory remainders) carry their carve-outs.
@@ -339,24 +349,31 @@ for crate in "${CRATES[@]}"; do
 done
 wait
 FAILED="$(ls "$FAIL_DIR" | wc -l | tr -d ' ')"
+rm -f "$FAIL_DIR"/* 2>/dev/null || true
+AFTER="$(count_targets)"
+log "round $ROUND done: $AFTER target(s) remaining (was $ROUND_BEFORE)"
+if [ "$FAILED" != "0" ]; then
+  rm -rf "$FAIL_DIR"
+  log "error: $FAILED scan session(s) failed in round $ROUND; see the FAILED lines above"
+  exit 1
+fi
+if [ "$AFTER" -ge "$ROUND_BEFORE" ]; then
+  rm -rf "$FAIL_DIR"
+  log "error: round $ROUND replaced no placeholder; the sessions could not use aether_sir_inject (check $LOG_DIR for tool denials or MCP failures)"
+  exit 1
+fi
+[ "$AFTER" = "0" ] && break
+if [ "$ROUND" -ge "$MAX_ROUNDS" ]; then
+  rm -rf "$FAIL_DIR"
+  log "error: $AFTER target(s) still remain after $MAX_ROUNDS round(s); rerun scripts/scan_all.sh (or raise MAX_ROUNDS) to continue"
+  exit 1
+fi
+ROUND_BEFORE="$AFTER"
+done
 rm -rf "$FAIL_DIR"
 
-AFTER="$(count_targets)"
-log "scan targets after: $AFTER (was $BEFORE)"
-log "complete: $((BEFORE - AFTER)) symbol(s) scanned; logs in $LOG_DIR"
-if [ "$FAILED" != "0" ]; then
-  log "error: $FAILED scan session(s) failed; see the FAILED lines above"
-  exit 1
-fi
-if [ "$AFTER" = "$BEFORE" ]; then
-  log "error: no placeholder was replaced; the sessions could not use aether_sir_inject (check $LOG_DIR for tool denials or MCP failures)"
-  exit 1
-fi
-if [ "$AFTER" != "0" ]; then
-  log "rerun scripts/scan_all.sh to continue, then $NEXT_STEP"
-else
-  log "$NEXT_STEP"
-fi
+log "complete: $((BEFORE - AFTER)) symbol(s) scanned in $ROUND round(s); logs in $LOG_DIR"
+log "$NEXT_STEP"
 "##
         .to_owned()
     }
