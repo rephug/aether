@@ -312,6 +312,10 @@ pub struct AetherAuditCandidatesRequest {
     pub min_risk: Option<f64>,
     /// Include reasoning_trace excerpts in output (default true)
     pub include_reasoning_hints: Option<bool>,
+    /// Include symbols whose SIR already comes from the deep pass (default false).
+    /// Deep SIRs are the finished product of the enrichment pipeline, so by default
+    /// they are not offered as audit candidates again.
+    pub include_deep: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -417,6 +421,13 @@ fn normalize_optional_path(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(normalize_path)
+}
+
+/// True when a SIR's generation pass is the deep pass (case-insensitive).
+fn is_deep_pass(generation_pass: Option<&str>) -> bool {
+    generation_pass
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("deep"))
 }
 
 fn normalize_generation_pass(value: Option<&str>) -> Option<String> {
@@ -842,6 +853,7 @@ impl AetherMcpServer {
         let file_filter = normalize_optional_path(request.file_filter.as_deref());
         let min_risk = request.min_risk.unwrap_or(0.0).clamp(0.0, 1.0);
         let include_reasoning_hints = request.include_reasoning_hints.unwrap_or(true);
+        let include_deep = request.include_deep.unwrap_or(false);
         let scope_description = scope_description(
             request
                 .crate_filter
@@ -968,6 +980,12 @@ impl AetherMcpServer {
                     file_filter.as_deref(),
                     min_risk,
                 )
+            })
+            .filter(|row| {
+                include_deep
+                    || !sir_metadata_by_symbol
+                        .get(row.symbol_id.as_str())
+                        .is_some_and(|metadata| is_deep_pass(metadata.generation_pass.as_deref()))
             })
             .map(|row| {
                 let metadata = sir_metadata_by_symbol.get(row.symbol_id.as_str());
@@ -1424,6 +1442,8 @@ vector_backend = "sqlite"
                 file_filter: None,
                 min_risk: Some(0.0),
                 include_reasoning_hints: Some(true),
+                // the fixture seeds sym-a at the deep pass; these tests cover ordering and scope
+                include_deep: Some(true),
             })
             .expect("audit candidates");
 
@@ -1455,6 +1475,8 @@ vector_backend = "sqlite"
                 file_filter: None,
                 min_risk: Some(0.0),
                 include_reasoning_hints: Some(true),
+                // the fixture seeds sym-a at the deep pass; these tests cover ordering and scope
+                include_deep: Some(true),
             })
             .expect("audit candidates");
 
@@ -1478,6 +1500,7 @@ vector_backend = "sqlite"
                 file_filter: None,
                 min_risk: Some(0.0),
                 include_reasoning_hints: Some(true),
+                include_deep: None,
             })
             .expect("baseline candidates");
         let threshold = (baseline.candidates[1].risk_score + 0.01).clamp(0.0, 1.0);
@@ -1489,6 +1512,7 @@ vector_backend = "sqlite"
                 file_filter: None,
                 min_risk: Some(threshold),
                 include_reasoning_hints: Some(true),
+                include_deep: None,
             })
             .expect("filtered candidates");
 
@@ -1534,6 +1558,7 @@ vector_backend = "sqlite"
                 file_filter: Some("crates/missing/src/lib.rs".to_owned()),
                 min_risk: Some(0.0),
                 include_reasoning_hints: Some(true),
+                include_deep: None,
             })
             .expect("empty candidates");
 

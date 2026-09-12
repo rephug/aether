@@ -141,6 +141,50 @@ fn looks_like_sir_shape(value: &Value) -> bool {
     .all(|key| obj.contains_key(*key))
 }
 
+/// Split an Ollama deep-mode response into its `<think>...</think>` reasoning and the
+/// remainder that carries the SIR JSON.
+///
+/// Every think block is collected (joined by blank lines) and removed from the
+/// remainder; an unterminated `<think>` swallows the rest of the text as reasoning so a
+/// truncated trace never leaks into the JSON parser. Returns `None` reasoning when the
+/// response has no think block or only an empty one.
+pub(crate) fn split_think_block(raw: &str) -> (Option<String>, String) {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+
+    let mut reasoning_parts = Vec::new();
+    let mut remainder = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find(OPEN) {
+        remainder.push_str(&rest[..start]);
+        let after_open = &rest[start + OPEN.len()..];
+        match after_open.find(CLOSE) {
+            Some(end) => {
+                let thought = after_open[..end].trim();
+                if !thought.is_empty() {
+                    reasoning_parts.push(thought.to_owned());
+                }
+                rest = &after_open[end + CLOSE.len()..];
+            }
+            None => {
+                let thought = after_open.trim();
+                if !thought.is_empty() {
+                    reasoning_parts.push(thought.to_owned());
+                }
+                rest = "";
+            }
+        }
+    }
+    remainder.push_str(rest);
+
+    let reasoning = if reasoning_parts.is_empty() {
+        None
+    } else {
+        Some(reasoning_parts.join("\n\n"))
+    };
+    (reasoning, remainder)
+}
+
 pub(crate) fn parse_and_validate_sir(candidate_json: &str) -> Result<SirAnnotation, String> {
     let normalized = normalize_candidate_json(candidate_json);
 
@@ -348,5 +392,46 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].0, "not json");
         assert!(captured[0].1.contains("json parse error"));
+    }
+}
+
+#[cfg(test)]
+mod think_block_tests {
+    use super::{parse_and_validate_sir, split_think_block};
+
+    const SIR_JSON: &str = r#"{"intent":"Parses config","inputs":["path"],"outputs":["Config"],"side_effects":[],"dependencies":[],"error_modes":["io error"],"confidence":0.8}"#;
+
+    #[test]
+    fn split_think_block_extracts_reasoning_and_leaves_json() {
+        let raw = format!(
+            "<think>\nFirst I look at the signature.\nThen the body.\n</think>\n{SIR_JSON}"
+        );
+        let (reasoning, remainder) = split_think_block(&raw);
+        assert_eq!(
+            reasoning.as_deref(),
+            Some("First I look at the signature.\nThen the body.")
+        );
+        assert_eq!(remainder.trim(), SIR_JSON);
+        assert!(parse_and_validate_sir(&remainder).is_ok());
+    }
+
+    #[test]
+    fn split_think_block_without_block_is_passthrough() {
+        let (reasoning, remainder) = split_think_block(SIR_JSON);
+        assert_eq!(reasoning, None);
+        assert_eq!(remainder, SIR_JSON);
+        let (reasoning, remainder) = split_think_block("<think></think>  {}");
+        assert_eq!(reasoning, None);
+        assert_eq!(remainder.trim(), "{}");
+    }
+
+    #[test]
+    fn split_think_block_handles_multiple_and_unterminated_blocks() {
+        let (reasoning, remainder) = split_think_block("<think>a</think>x<think>b</think>y");
+        assert_eq!(reasoning.as_deref(), Some("a\n\nb"));
+        assert_eq!(remainder, "xy");
+        let (reasoning, remainder) = split_think_block("{}<think>never closed");
+        assert_eq!(reasoning.as_deref(), Some("never closed"));
+        assert_eq!(remainder, "{}");
     }
 }

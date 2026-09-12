@@ -12,16 +12,16 @@ use aether_core::{
     SearchMode, SymbolEdge,
 };
 use aether_mcp::{
-    AetherAuditReportRequest, AetherAuditResolveRequest, AetherAuditSubmitRequest,
-    AetherBlastRadiusRequest, AetherCallChainRequest, AetherDependenciesRequest,
-    AetherExplainRequest, AetherGetSirRequest, AetherHealthExplainRequest,
-    AetherHealthHotspotsRequest, AetherHealthRequest, AetherMcpServer, AetherRecallRequest,
-    AetherRefactorPrepRequest, AetherRememberRequest, AetherSearchRequest, AetherSirInjectRequest,
-    AetherSuggestTraitSplitRequest, AetherSymbolLookupRequest, AetherSymbolTimelineRequest,
-    AetherTestIntentsRequest, AetherTraitSplitResolutionMode, AetherUsageMatrixRequest,
-    AetherVerifyIntentRequest, AetherWhyChangedReason, AetherWhyChangedRequest,
-    AetherWhySelectorMode, AuditCategory, AuditCertainty, AuditSeverity, AuditStatus,
-    MCP_SCHEMA_VERSION, MEMORY_SCHEMA_VERSION, SharedState, SirLevelRequest,
+    AetherAuditCandidatesRequest, AetherAuditReportRequest, AetherAuditResolveRequest,
+    AetherAuditSubmitRequest, AetherBlastRadiusRequest, AetherCallChainRequest,
+    AetherDependenciesRequest, AetherExplainRequest, AetherGetSirRequest,
+    AetherHealthExplainRequest, AetherHealthHotspotsRequest, AetherHealthRequest, AetherMcpServer,
+    AetherRecallRequest, AetherRefactorPrepRequest, AetherRememberRequest, AetherSearchRequest,
+    AetherSirInjectRequest, AetherSuggestTraitSplitRequest, AetherSymbolLookupRequest,
+    AetherSymbolTimelineRequest, AetherTestIntentsRequest, AetherTraitSplitResolutionMode,
+    AetherUsageMatrixRequest, AetherVerifyIntentRequest, AetherWhyChangedReason,
+    AetherWhyChangedRequest, AetherWhySelectorMode, AuditCategory, AuditCertainty, AuditSeverity,
+    AuditStatus, MCP_SCHEMA_VERSION, MEMORY_SCHEMA_VERSION, SharedState, SirLevelRequest,
 };
 #[cfg(feature = "verification")]
 use aether_mcp::{AetherVerifyMode, AetherVerifyRequest};
@@ -3151,11 +3151,12 @@ fn mcp_sir_inject_tool_injects_blocks_and_forces_overwrites() -> Result<()> {
         .0;
     assert_eq!(first.status, "injected");
     assert_eq!(first.sir_version, 1);
+    assert_eq!(first.embedding_status, "skipped: embeddings disabled");
     assert!(
         first
             .note
             .as_deref()
-            .is_some_and(|note| note.contains("Embeddings not refreshed"))
+            .is_some_and(|note| note.contains("embeddings disabled"))
     );
 
     let blocked = rt
@@ -3211,6 +3212,248 @@ fn mcp_sir_inject_tool_injects_blocks_and_forces_overwrites() -> Result<()> {
         .expect("injected sir meta exists");
     assert_eq!(meta.sir_hash, forced.sir_hash);
     assert_eq!(meta.sir_version, forced.sir_version);
+
+    Ok(())
+}
+
+/// Minimal Ollama-style embedding endpoint: answers every POST with a fixed vector.
+fn spawn_stub_embedding_server() -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+    let port = listener.local_addr().expect("addr").port();
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buffer = [0u8; 8192];
+            let _ = stream.read(&mut buffer);
+            let body = r#"{"embedding":[0.1,0.2,0.3,0.4]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (format!("http://127.0.0.1:{port}/api/embeddings"), handle)
+}
+
+#[test]
+fn mcp_sir_inject_refreshes_embedding_when_embeddings_are_enabled() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    let (endpoint, _server_thread) = spawn_stub_embedding_server();
+    fs::create_dir_all(workspace.join(".aether"))?;
+    fs::write(
+        workspace.join(".aether/config.toml"),
+        format!(
+            r#"[inference]
+provider = "qwen3_local"
+api_key_env = "GEMINI_API_KEY"
+
+[storage]
+mirror_sir_files = true
+graph_backend = "sqlite"
+
+[embeddings]
+enabled = true
+provider = "qwen3_local"
+vector_backend = "sqlite"
+endpoint = "{endpoint}"
+model = "stub-embed"
+"#
+        ),
+    )?;
+
+    let store = SqliteStore::open(workspace)?;
+    store.upsert_symbol(custom_symbol_record(
+        "sym-embed",
+        "crate::inject::embed",
+        "src/lib.rs",
+        "function",
+    ))?;
+    drop(store);
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+    let injected = rt
+        .block_on(server.aether_sir_inject(Parameters(AetherSirInjectRequest {
+            symbol: "sym-embed".to_owned(),
+            intent: "Injected intent that must reach the vector store".to_owned(),
+            behavior: None,
+            edge_cases: None,
+            side_effects: None,
+            dependencies: None,
+            error_modes: None,
+            confidence: Some(0.97),
+            inputs: None,
+            outputs: None,
+            complexity: None,
+            generation_pass: None,
+            model: None,
+            provider: None,
+            force: None,
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert_eq!(injected.status, "injected");
+    assert_eq!(injected.embedding_status, "refreshed");
+    assert_eq!(injected.note, None);
+
+    // The vector store row now carries the injected SIR's hash.
+    let pipeline =
+        aetherd::sir_pipeline::SirPipeline::new_embeddings_only(workspace.to_path_buf())?;
+    let record = pipeline
+        .load_symbol_embedding("sym-embed")?
+        .expect("embedding row written by inject");
+    assert_eq!(record.sir_hash, injected.sir_hash);
+    // The provider L2-normalizes what the endpoint returned; the direction is the stub's.
+    assert_eq!(record.embedding.len(), 4);
+    let norm = record
+        .embedding
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    assert!(
+        (norm - 1.0).abs() < 1e-4,
+        "embedding should be unit length: {norm}"
+    );
+    let expected = [0.1f32, 0.2, 0.3, 0.4];
+    let expected_norm = expected.iter().map(|v| v * v).sum::<f32>().sqrt();
+    for (actual, raw) in record.embedding.iter().zip(expected) {
+        assert!(
+            (actual - raw / expected_norm).abs() < 1e-4,
+            "{actual} vs {raw}"
+        );
+    }
+
+    // A second inject with the same content leaves the row alone.
+    let again = rt
+        .block_on(server.aether_sir_inject(Parameters(AetherSirInjectRequest {
+            symbol: "sym-embed".to_owned(),
+            intent: "Injected intent that must reach the vector store".to_owned(),
+            behavior: None,
+            edge_cases: None,
+            side_effects: None,
+            dependencies: None,
+            error_modes: None,
+            confidence: Some(0.97),
+            inputs: None,
+            outputs: None,
+            complexity: None,
+            generation_pass: None,
+            model: None,
+            provider: None,
+            force: Some(true),
+        })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    assert_eq!(again.embedding_status, "unchanged");
+
+    Ok(())
+}
+
+fn seed_sir_with_pass(store: &SqliteStore, symbol_id: &str, generation_pass: &str) -> Result<()> {
+    let sir_json = r#"{"intent":"seeded intent","inputs":[],"outputs":[],"side_effects":[],"dependencies":[],"error_modes":[],"confidence":0.6}"#;
+    let hash = format!("hash-{symbol_id}");
+    let history = store.record_sir_version_if_changed(
+        symbol_id,
+        hash.as_str(),
+        "seed",
+        "seed",
+        sir_json,
+        1_700_000_100,
+        None,
+    )?;
+    store.write_sir_blob(symbol_id, sir_json)?;
+    store.upsert_sir_meta(SirMetaRecord {
+        id: symbol_id.to_owned(),
+        sir_hash: hash,
+        sir_version: history.version,
+        provider: "seed".to_owned(),
+        model: "seed".to_owned(),
+        generation_pass: generation_pass.to_owned(),
+        reasoning_trace: None,
+        prompt_hash: None,
+        staleness_score: None,
+        updated_at: 1_700_000_100,
+        sir_status: "fresh".to_owned(),
+        last_error: None,
+        last_attempt_at: 1_700_000_100,
+    })?;
+    Ok(())
+}
+
+#[test]
+fn mcp_audit_candidates_excludes_deep_sirs_unless_requested() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    write_test_config(workspace);
+
+    let store = SqliteStore::open(workspace)?;
+    store.upsert_symbol(custom_symbol_record(
+        "sym-scan",
+        "crate::audit::scan_level",
+        "src/scan.rs",
+        "function",
+    ))?;
+    store.upsert_symbol(custom_symbol_record(
+        "sym-deep",
+        "crate::audit::deep_level",
+        "src/deep.rs",
+        "function",
+    ))?;
+    seed_sir_with_pass(&store, "sym-scan", "scan")?;
+    seed_sir_with_pass(&store, "sym-deep", "deep")?;
+    drop(store);
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+
+    let default_response = rt
+        .block_on(
+            server.aether_audit_candidates(Parameters(AetherAuditCandidatesRequest {
+                top_n: Some(10),
+                crate_filter: None,
+                file_filter: None,
+                min_risk: None,
+                include_reasoning_hints: None,
+                include_deep: None,
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    let default_ids = default_response
+        .candidates
+        .iter()
+        .map(|candidate| candidate.symbol_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(default_ids, vec!["sym-scan"]);
+    assert_eq!(default_response.total_in_scope, 1);
+
+    let with_deep = rt
+        .block_on(
+            server.aether_audit_candidates(Parameters(AetherAuditCandidatesRequest {
+                top_n: Some(10),
+                crate_filter: None,
+                file_filter: None,
+                min_risk: None,
+                include_reasoning_hints: None,
+                include_deep: Some(true),
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+    let mut with_deep_ids = with_deep
+        .candidates
+        .iter()
+        .map(|candidate| candidate.symbol_id.as_str())
+        .collect::<Vec<_>>();
+    with_deep_ids.sort_unstable();
+    assert_eq!(with_deep_ids, vec!["sym-deep", "sym-scan"]);
+    assert_eq!(with_deep.total_in_scope, 2);
 
     Ok(())
 }
