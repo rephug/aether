@@ -74,7 +74,10 @@ fi
 
 # Prints "name<TAB>scope[<TAB>scope...]" per scan unit, scopes relative to the workspace
 # root; a scope prefixed with "-" is an exclusion (a nested member's directory carved out
-# of its parent's scope, so no two units overlap). Cargo workspaces: one unit per package, parsed structurally from the metadata
+# of its parent's scope, so no two units overlap). A target declared outside its package
+# directory contributes the target file itself plus its `<stem>/` module directory (the
+# Rust module-tree convention), never the whole shared directory, so two packages with
+# targets in the same external directory stay disjoint. Cargo workspaces: one unit per package, parsed structurally from the metadata
 # JSON (packages[].name / manifest_path / targets; never the dependency or target names
 # that also carry a "name" key). A package owns its manifest directory (unless that is
 # the workspace root) plus, for every target whose src_path lies outside that directory,
@@ -110,14 +113,15 @@ for pkg in meta["packages"]:
         if src is None:
             continue
         if rel == ".":
-            scope = src.split(os.sep)[0]
+            candidates = [src.split(os.sep)[0]]
         elif src == rel or src.startswith(rel + os.sep):
             continue
         else:
-            scope = os.path.dirname(src) or src
-        if scope and scope != "." and not covered(scope, scopes):
-            scopes = [s for s in scopes if not (s == scope or s.startswith(scope + os.sep))]
-            scopes.append(scope)
+            candidates = [src, os.path.splitext(src)[0]]
+        for scope in candidates:
+            if scope and scope != "." and not covered(scope, scopes):
+                scopes = [s for s in scopes if not (s == scope or s.startswith(scope + os.sep))]
+                scopes.append(scope)
     if scopes:
         units.append((pkg["name"], scopes))
 # A member nested below another member (crates/parent, crates/parent/child) is carved
@@ -144,9 +148,25 @@ for name, scopes in units:
 # One "name<TAB>scopes" line per package (no associative arrays: Bash 3.2 lacks them).
 PACKAGE_TABLE="$(discover_packages)"
 
+# Explicit names are package names or project-relative paths; normalize the common
+# spellings (`./src`, `src/`) to the form the index stores. `.` is not a unit: run with no
+# arguments to scan everything.
+normalize_unit() {
+  local u="$1"
+  while [ "${u#./}" != "$u" ]; do u="${u#./}"; done
+  u="${u%/}"
+  printf '%s' "$u"
+}
 CRATES=()
 if [ "$#" -gt 0 ]; then
-  for name in "$@"; do CRATES+=("${name%/}"); done
+  for name in "$@"; do
+    unit="$(normalize_unit "$name")"
+    if [ -z "$unit" ] || [ "$unit" = "." ]; then
+      echo "error: '$name' is not a scan unit; run scripts/scan_all.sh with no names to scan everything" >&2
+      exit 1
+    fi
+    CRATES+=("$unit")
+  done
 else
   while IFS= read -r name; do
     [ -n "$name" ] && CRATES+=("$name")
