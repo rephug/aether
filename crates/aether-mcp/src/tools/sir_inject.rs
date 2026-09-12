@@ -374,12 +374,19 @@ impl AetherMcpServer {
         // Aggregate reads (file and module level) are served from the file rollup, so
         // rebuild it from the leaves now rather than leaving the indexing-time rollup
         // (a [MOCK] concatenation after a mock index) in place.
-        let file_rollup_status = self.refresh_file_rollup_after_inject(
-            symbol.file_path.as_str(),
-            &rollup_identity.0,
-            &rollup_identity.1,
-            &rollup_identity.2,
-        );
+        let file_rollup_status = self
+            .refresh_file_rollup_after_inject(
+                symbol.file_path.as_str(),
+                &rollup_identity.0,
+                &rollup_identity.1,
+                &rollup_identity.2,
+            )
+            .map_err(|err| {
+                AetherMcpError::Message(format!(
+                    "SIR for {qualified_name} was written but the file rollup for {} could not be rebuilt: {err:#}; rerun the injection so aggregate reads stay consistent",
+                    symbol.file_path
+                ))
+            })?;
         // The embedding refresh may call a local or remote model: release the lock first
         // so concurrent injections into other files are not serialized behind it.
         drop(_inject_guard);
@@ -407,28 +414,32 @@ impl AetherMcpServer {
         })
     }
 
+    /// Rebuild the file rollup for `file_path`. A failure is returned, not swallowed:
+    /// the leaf is already persisted, but reporting the injection as a success while
+    /// the aggregate is stale would let a scan claim completion with inconsistent data.
     fn refresh_file_rollup_after_inject(
         &self,
         file_path: &str,
         provider: &str,
         model: &str,
         generation_pass: &str,
-    ) -> String {
+    ) -> anyhow::Result<String> {
         let Some(language) = language_for_path(Path::new(file_path)) else {
-            return "skipped: unknown language".to_owned();
+            return Ok("skipped: unknown language".to_owned());
         };
-        match refresh_local_file_rollup(
+        let written = refresh_local_file_rollup(
             self.state.store.as_ref(),
             file_path,
             language,
             provider,
             model,
             generation_pass,
-        ) {
-            Ok(true) => "refreshed".to_owned(),
-            Ok(false) => "removed: no leaf SIRs".to_owned(),
-            Err(err) => format!("failed: {err:#}"),
-        }
+        )?;
+        Ok(if written {
+            "refreshed".to_owned()
+        } else {
+            "removed: no leaf SIRs".to_owned()
+        })
     }
 
     /// Refresh the symbol's embedding right after an inject so semantic search sees the

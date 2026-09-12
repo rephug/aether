@@ -73,6 +73,12 @@ pub fn run_init_agent(workspace: &Path, options: InitAgentOptions) -> Result<Ini
                     written_files.push(file.relative_path);
                     continue;
                 }
+                // Without --force an existing registration is an untouched file; with
+                // --force an identical entry means the forced refresh is already satisfied.
+                McpMerge::Unchanged if options.force => {
+                    written_files.push(file.relative_path);
+                    continue;
+                }
                 McpMerge::Unchanged => {
                     skipped_existing_files.push(file.relative_path);
                     continue;
@@ -533,6 +539,23 @@ mod tests {
                 .expect("valid json");
         assert_eq!(refreshed["mcpServers"]["other"]["command"], "other-mcp");
         assert_ne!(refreshed["mcpServers"]["aether"]["command"], "stale");
+
+        // A repeated --force with an already-current entry is a success, not a skip.
+        let repeated = run_init_agent(
+            workspace,
+            InitAgentOptions {
+                platform: AgentPlatform::Claude,
+                force: true,
+            },
+        )
+        .expect("repeated forced init-agent should succeed");
+        assert!(
+            !repeated
+                .skipped_existing_files
+                .contains(&std::path::PathBuf::from(".mcp.json")),
+            "an up-to-date .mcp.json must not fail a forced regeneration"
+        );
+        assert_eq!(repeated.exit_code(), 0);
     }
 
     #[test]
