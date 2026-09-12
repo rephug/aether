@@ -8,11 +8,30 @@ use crate::http::{
 };
 use crate::providers::PARSE_VALIDATION_RETRIES;
 use crate::sir_parsing::{
-    build_retry_prompt, extract_local_text_part, normalize_candidate_json,
+    build_retry_prompt, extract_local_text_part, normalize_candidate_json, parse_and_validate_sir,
     run_sir_parse_validation_retries, run_sir_parse_validation_retries_with_feedback,
+    split_think_block,
 };
 use crate::sir_prompt;
-use crate::types::{InferError, InferenceProvider, SirContext, normalize_optional};
+use crate::types::{InferError, InferSirResult, InferenceProvider, SirContext, normalize_optional};
+
+/// A deep-mode Ollama reply split into the SIR JSON candidate and the model's
+/// `<think>` reasoning, when the model produced one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeepCandidate {
+    pub candidate_json: String,
+    pub reasoning_trace: Option<String>,
+}
+
+/// Separate the `<think>...</think>` block from a raw deep-mode reply before the bracket
+/// parser sees it, so the reasoning is kept as a trace instead of being discarded.
+pub(crate) fn parse_deep_response(raw: &str) -> DeepCandidate {
+    let (reasoning_trace, remainder) = split_think_block(raw);
+    DeepCandidate {
+        candidate_json: normalize_candidate_json(remainder.as_str()),
+        reasoning_trace: normalize_optional(reasoning_trace),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Qwen3LocalProvider {
@@ -47,11 +66,11 @@ impl Qwen3LocalProvider {
         extract_local_text_part(&response_value)
     }
 
-    async fn request_deep_candidate_json_with_prompt(
+    async fn request_deep_candidate_with_prompt(
         &self,
-        prompt: String,
-    ) -> Result<String, InferError> {
-        let body = build_ollama_deep_generate_body(&self.model, &prompt, 8192);
+        prompt: &str,
+    ) -> Result<DeepCandidate, InferError> {
+        let body = build_ollama_deep_generate_body(&self.model, prompt, 8192);
 
         let response_value: Value = self
             .client
@@ -64,7 +83,49 @@ impl Qwen3LocalProvider {
             .await?;
 
         let raw = extract_local_text_part(&response_value)?;
-        Ok(normalize_candidate_json(raw.as_str()))
+        Ok(parse_deep_response(raw.as_str()))
+    }
+
+    async fn request_deep_candidate_json_with_prompt(
+        &self,
+        prompt: String,
+    ) -> Result<String, InferError> {
+        Ok(self
+            .request_deep_candidate_with_prompt(prompt.as_str())
+            .await?
+            .candidate_json)
+    }
+
+    /// Deep-mode generation that keeps the `<think>` reasoning as `reasoning_trace`,
+    /// mirroring the Gemini provider's thinking capture. Parse/validation failures retry
+    /// the same way the fast path does.
+    async fn generate_deep_sir_result_from_prompt(
+        &self,
+        prompt: &str,
+    ) -> Result<InferSirResult, InferError> {
+        let mut last_error = String::from("unknown parse/validation failure");
+
+        for attempt in 0..=PARSE_VALIDATION_RETRIES {
+            let candidate = self.request_deep_candidate_with_prompt(prompt).await?;
+            match parse_and_validate_sir(candidate.candidate_json.as_str()) {
+                Ok(sir) => {
+                    return Ok(InferSirResult {
+                        sir,
+                        provider: self.provider_name(),
+                        model: self.model_name(),
+                        reasoning_trace: candidate.reasoning_trace,
+                    });
+                }
+                Err(message) => {
+                    last_error = message;
+                    if attempt == PARSE_VALIDATION_RETRIES {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Err(InferError::ParseValidationExhausted(last_error))
     }
 
     async fn request_candidate_json(
@@ -126,6 +187,61 @@ impl InferenceProvider for Qwen3LocalProvider {
             })
             .await
         }
+    }
+
+    async fn generate_sir_from_prompt_with_meta(
+        &self,
+        prompt: &str,
+        context: &SirContext,
+        deep_mode: bool,
+    ) -> Result<InferSirResult, InferError> {
+        if deep_mode {
+            // Deep mode is where Ollama emits its <think> block; keep it as the trace.
+            return self.generate_deep_sir_result_from_prompt(prompt).await;
+        }
+        // Fast mode is unchanged: no reasoning trace.
+        let sir = self
+            .generate_sir_from_prompt(prompt, context, false)
+            .await?;
+        Ok(InferSirResult {
+            sir,
+            provider: self.provider_name(),
+            model: self.model_name(),
+            reasoning_trace: None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod deep_response_tests {
+    use super::parse_deep_response;
+    use crate::sir_parsing::parse_and_validate_sir;
+
+    const CANNED_DEEP_RESPONSE: &str = "<think>\nThe function opens the file, so io errors are the main failure mode.\nConfidence should be moderate.\n</think>\n```json\n{\"intent\":\"Loads the configuration file\",\"inputs\":[\"path\"],\"outputs\":[\"Config\"],\"side_effects\":[],\"dependencies\":[\"std::fs\"],\"error_modes\":[\"io error\"],\"confidence\":0.7,}\n```";
+
+    #[test]
+    fn deep_response_keeps_think_block_as_reasoning_and_json_still_parses() {
+        let candidate = parse_deep_response(CANNED_DEEP_RESPONSE);
+        let reasoning = candidate
+            .reasoning_trace
+            .as_deref()
+            .expect("think block must be captured");
+        assert!(reasoning.starts_with("The function opens the file"));
+        assert!(reasoning.contains("Confidence should be moderate."));
+        assert!(!candidate.candidate_json.contains("<think>"));
+        let sir = parse_and_validate_sir(candidate.candidate_json.as_str())
+            .expect("SIR JSON must still parse after the think block is removed");
+        assert_eq!(sir.intent, "Loads the configuration file");
+        assert!((sir.confidence - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn deep_response_without_think_block_has_no_reasoning() {
+        let candidate = parse_deep_response(
+            r#"{"intent":"x","inputs":[],"outputs":[],"side_effects":[],"dependencies":[],"error_modes":[],"confidence":0.5}"#,
+        );
+        assert_eq!(candidate.reasoning_trace, None);
+        assert!(parse_and_validate_sir(candidate.candidate_json.as_str()).is_ok());
     }
 }
 

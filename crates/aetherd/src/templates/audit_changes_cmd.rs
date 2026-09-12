@@ -35,8 +35,9 @@ For each changed file:
    and `limit` set to 100 to enumerate symbols in that file.
 2. Keep only matches whose `file_path` exactly matches the changed file.
 3. Call `aether_health` scoped to the file for structural risk scores.
-4. If `aether_audit_candidates` is available, call it with a file filter
-   for a pre-ranked target list.
+4. If `aether_audit_candidates` is available, call it with a file filter and
+   `include_deep: true` for a pre-ranked target list (changed symbols with a
+   deep SIR still need review).
 5. Prioritize symbols with high betweenness (bottlenecks), low test coverage,
    or symbols that callers depend on heavily.
 

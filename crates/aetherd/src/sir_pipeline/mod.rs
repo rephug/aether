@@ -1911,10 +1911,7 @@ impl SirPipeline {
         Some((provider_name, model_name))
     }
 
-    pub(crate) fn load_symbol_embedding(
-        &self,
-        symbol_id: &str,
-    ) -> Result<Option<SymbolEmbeddingRecord>> {
+    pub fn load_symbol_embedding(&self, symbol_id: &str) -> Result<Option<SymbolEmbeddingRecord>> {
         let symbol_id = symbol_id.trim();
         if symbol_id.is_empty() {
             return Ok(None);
@@ -2536,7 +2533,7 @@ impl SirPipeline {
             .collect()
     }
 
-    pub(crate) fn refresh_embedding_if_needed(
+    pub fn refresh_embedding_if_needed(
         &self,
         symbol_id: &str,
         sir_hash_value: &str,

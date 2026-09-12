@@ -16,8 +16,9 @@ Audit $ARGUMENTS for bugs using AETHER's MCP tools to guide analysis.
 1. Call `aether_health` scoped to $ARGUMENTS to get structural risk scores.
 2. Symbols with high risk_score, high betweenness centrality, or low test coverage
    are priority targets.
-3. If `aether_audit_candidates` is available, call it with the scope for a
-   pre-ranked target list with reasoning hints.
+3. If `aether_audit_candidates` is available, call it with the scope and
+   `include_deep: true` for a pre-ranked target list with reasoning hints
+   (a general audit must not skip symbols that already have a deep SIR).
 4. If neither tool returns results, fall back to `aether_symbol_lookup` for
    the target file/crate and prioritize large, complex symbols.
 
