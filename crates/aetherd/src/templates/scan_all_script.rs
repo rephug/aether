@@ -54,8 +54,20 @@ if [ ! -f "$DB" ]; then
   echo "  aetherd --workspace . --index-once --full --inference-provider mock" >&2
   exit 1
 fi
-if ! command -v sqlite3 >/dev/null 2>&1; then
-  echo "error: sqlite3 is required to count scan targets" >&2
+# Index queries go through the sqlite3 CLI when it works, else Python's built-in sqlite3
+# module (python3 is required for package discovery anyway); one of the two must exist.
+if command -v sqlite3 >/dev/null 2>&1 && sqlite3 -version >/dev/null 2>&1; then
+  run_sql() { sqlite3 "$DB" "$1"; }
+elif command -v python3 >/dev/null 2>&1; then
+  run_sql() {
+    AETHER_DB="$DB" AETHER_SQL="$1" python3 -c '
+import os, sqlite3
+for row in sqlite3.connect(os.environ["AETHER_DB"]).execute(os.environ["AETHER_SQL"]):
+    print("|".join("" if v is None else str(v) for v in row))
+'
+  }
+else
+  echo "error: the sqlite3 CLI or python3 is required to query $DB" >&2
   exit 1
 fi
 if ! command -v claude >/dev/null 2>&1; then
@@ -76,7 +88,7 @@ fi
 # the index: the units of a project without Cargo, and the extra units of a mixed project
 # (TypeScript/Python sources beside Rust packages).
 index_top_level_scopes() {
-  sqlite3 "$DB" "SELECT DISTINCT CASE WHEN instr(file_path, '/') > 0 THEN substr(file_path, 1, instr(file_path, '/') - 1) ELSE file_path END FROM symbols ORDER BY 1;" | awk 'NF'
+  run_sql "SELECT DISTINCT CASE WHEN instr(file_path, '/') > 0 THEN substr(file_path, 1, instr(file_path, '/') - 1) ELSE file_path END FROM symbols ORDER BY 1;" | awk 'NF'
 }
 
 # Prints "name<TAB>scope[<TAB>scope...]" per scan unit, scopes relative to the workspace
@@ -112,15 +124,17 @@ def inside(path):
     return None if rel == ".." or rel.startswith(".." + os.sep) else rel
 def covered(scope, scopes):
     return any(scope == s or scope.startswith(s + os.sep) for s in scopes)
-# Which packages declare targets in each external directory (outside their manifest dir).
+# Which packages declare targets in each directory outside their manifest dir. A root
+# package counts as an owner of every directory its targets live in (src/, tests/, ...),
+# so a member pointing a target into one of those never becomes its sole owner.
 external_owners = {}
 for pkg in meta["packages"]:
     rel = inside(os.path.dirname(pkg["manifest_path"]))
-    if rel is None or rel == ".":
+    if rel is None:
         continue
     for target in pkg.get("targets", []):
         src = inside(target["src_path"])
-        if src is None or src == rel or src.startswith(rel + os.sep):
+        if src is None or (rel != "." and (src == rel or src.startswith(rel + os.sep))):
             continue
         external_owners.setdefault(os.path.dirname(src) or ".", set()).add(pkg["name"])
 units = []
@@ -283,7 +297,7 @@ SCOPE="$(scope_clause "${CRATES[@]}")"
 # Number of [MOCK] / low-confidence SIRs inside a scope clause (default: all selected units).
 count_targets() {
   local scope="${1:-$SCOPE}"
-  sqlite3 "$DB" "SELECT COUNT(*) FROM sir JOIN symbols s ON s.id = sir.id WHERE $scope AND (sir.sir_json LIKE '%\"intent\":\"[MOCK]%' OR json_extract(sir.sir_json, '\$.confidence') < 0.2);"
+  run_sql "SELECT COUNT(*) FROM sir JOIN symbols s ON s.id = sir.id WHERE $scope AND (sir.sir_json LIKE '%\"intent\":\"[MOCK]%' OR json_extract(sir.sir_json, '\$.confidence') < 0.2);"
 }
 
 NEXT_STEP="deepen the results with: aetherd --workspace . regenerate --deep --below-confidence 0.85 (or /refactor-deep on the files that matter most)"
