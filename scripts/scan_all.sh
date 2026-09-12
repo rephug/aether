@@ -52,7 +52,7 @@ if ! command -v sqlite3 >/dev/null 2>&1; then
   exit 1
 fi
 if ! command -v claude >/dev/null 2>&1; then
-  echo "error: the claude CLI is required (each scope runs as: claude -p \"/scan <crate> $BATCH_SIZE\" --allowedTools \"mcp__aether*\")" >&2
+  echo "error: the claude CLI is required (each unit runs as: claude -p \"/scan <unit> $BATCH_SIZE scopes=<paths>\" --allowedTools \"mcp__aether*\")" >&2
   exit 1
 fi
 # The sessions are non-interactive, so the AETHER MCP server must already be registered
@@ -299,10 +299,14 @@ for crate in "${CRATES[@]}"; do
     log "skip $crate ($(crate_scopes_display "$crate")): no scan targets"
     continue
   fi
-  safe_name="$(printf '%s' "$crate" | tr '/' '_')"
+  safe_name="$(printf '%s' "$crate" | tr '/:' '__')"
   crate_log="$LOG_DIR/${safe_name}_${STAMP}.log"
-  log "start $crate ($(crate_scopes_display "$crate")) -> $crate_log"
-  ( if claude -p "/scan $crate $BATCH_SIZE" --allowedTools "mcp__aether*" > "$crate_log" 2>&1; then
+  # The session receives the exact include/exclude scopes computed here (comma-separated,
+  # exclusions prefixed with "-"), so /scan never has to re-derive them and synthetic
+  # units (dir:<name>, directory remainders) carry their carve-outs.
+  scopes="$(crate_scopes_display "$crate")"
+  log "start $crate ($scopes) -> $crate_log"
+  ( if claude -p "/scan $crate $BATCH_SIZE scopes=$scopes" --allowedTools "mcp__aether*" > "$crate_log" 2>&1; then
       echo "done $crate"
     else
       touch "$FAIL_DIR/$safe_name"

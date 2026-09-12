@@ -4,16 +4,20 @@ description: Fast baseline SIR coverage for a crate — replaces [MOCK] and low-
 
 # /scan — zero-key baseline coverage
 
-Usage: `/scan <crate> [batch-size]`
+Usage: `/scan <crate> [batch-size] [scopes=<paths>]`
 
 Purpose: give every symbol in `<crate>` that only has a `[MOCK]` placeholder or a
 low-confidence (< 0.2) SIR a real, scan-level SIR. This is about COVERAGE, not
 perfection: deeper enrichment comes later. `batch-size` (default 100) caps how many
-symbols this session processes before stopping.
+symbols this session processes before stopping. `scopes=` (what `scripts/scan_all.sh`
+passes) is a comma-separated list of project-relative paths, each an include or, with a
+leading `-`, an exclude: use exactly those and skip step 1; `<crate>` is then only a
+label (it may read `dir:web` or `shared` for a synthetic unit).
 
 ## Procedure
 
-1. Resolve the crate's directories. All paths below are relative to THIS project's
+1. Resolve the crate's directories (skip this step when `scopes=` was given: its
+   includes are the `<dir>` set and its `-` entries the exclusions). All paths below are relative to THIS project's
    root (the directory holding `.aether/`, the same root the indexed `file_path`s use),
    never to an enclosing Cargo workspace root when the two differ. In a Cargo project
    run `cargo metadata --no-deps --format-version 1` and take the directory of the
@@ -45,7 +49,9 @@ symbols this session processes before stopping.
      AND (json_extract(sir.sir_json, '$.confidence') < 0.2 OR sir.sir_json LIKE '%"intent":"[MOCK]%')
    ORDER BY s.file_path, s.qualified_name`
    (for several `<dir>`s, OR one `LIKE` clause per directory; a root-level file is
-   matched with `s.file_path = '<file>'`; escape `_`, `%` and `\` in `<dir>` with a
+   matched with `s.file_path = '<file>'`, so use `(s.file_path = '<p>' OR s.file_path
+   LIKE '<p>/%' ESCAPE '\')` per include when unsure; every exclusion becomes
+   `AND NOT (<same predicate>)`; escape `_`, `%` and `\` in paths with a
    backslash so they match literally). Run it with the `sqlite3` CLI, or, when that is
    not installed, with Python's built-in module:
    `python3 -c "import sqlite3; [print(*r) for r in sqlite3.connect('.aether/meta.sqlite').execute(\"<query>\")]"`.
