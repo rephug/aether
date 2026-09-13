@@ -8,6 +8,9 @@ pub struct SirQualityMonitor {
     window_size: usize,
     floor: f32,
     warned_for_current_dip: bool,
+    /// False for providers whose low confidence is intentional (the mock provider's
+    /// placeholders), so the floor warning never fires for them.
+    enabled: bool,
 }
 
 impl SirQualityMonitor {
@@ -17,10 +20,22 @@ impl SirQualityMonitor {
             window_size: window_size.max(1),
             floor,
             warned_for_current_dip: false,
+            enabled: true,
+        }
+    }
+
+    /// A monitor that records nothing and never warns.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::new(1, 0.0)
         }
     }
 
     pub fn record(&mut self, confidence: f32) -> bool {
+        if !self.enabled {
+            return false;
+        }
         self.recent_confidences.push_back(confidence);
         if self.recent_confidences.len() > self.window_size {
             self.recent_confidences.pop_front();
@@ -40,7 +55,7 @@ impl SirQualityMonitor {
                 avg_confidence = avg_confidence,
                 floor = self.floor,
                 window_size = self.window_size,
-                "SIR quality is low (avg confidence {:.2}). Consider using a larger model or switching to Gemini.",
+                "SIR quality is low (avg confidence {:.2}); the configured [inference] provider or model may be too weak for this codebase.",
                 avg_confidence
             );
             return true;
@@ -66,6 +81,14 @@ impl SirQualityMonitor {
 #[cfg(test)]
 mod tests {
     use super::SirQualityMonitor;
+
+    #[test]
+    fn disabled_monitor_never_warns() {
+        let mut monitor = SirQualityMonitor::disabled();
+        for _ in 0..20 {
+            assert!(!monitor.record(0.1));
+        }
+    }
 
     #[test]
     fn warns_after_window_of_low_confidence_results() {

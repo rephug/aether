@@ -213,6 +213,7 @@ dependencies = [
  "aether-store",
  "aetherd",
  "anyhow",
+ "blake3",
  "clap",
  "rmcp",
  "rusqlite",

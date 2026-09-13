@@ -19,6 +19,9 @@ pub enum InferenceProviderKind {
     /// Oh My Pi auth gateway (`omp auth-gateway serve`): OpenAI-compatible transport,
     /// models addressed as OMP routes (`provider/model`), billed on the OMP credential.
     Omp,
+    /// Key-free placeholder provider: every symbol gets a `[MOCK]` SIR at confidence 0.1
+    /// from tree-sitter facts alone, so `aether_audit_candidates` surfaces it for `/scan`.
+    Mock,
 }
 
 impl InferenceProviderKind {
@@ -30,6 +33,7 @@ impl InferenceProviderKind {
             Self::Qwen3Local => "qwen3_local",
             Self::OpenAiCompat => "openai_compat",
             Self::Omp => "omp",
+            Self::Mock => "mock",
         }
     }
 }
@@ -45,8 +49,9 @@ impl std::str::FromStr for InferenceProviderKind {
             "qwen3_local" => Ok(Self::Qwen3Local),
             "openai_compat" => Ok(Self::OpenAiCompat),
             "omp" => Ok(Self::Omp),
+            "mock" => Ok(Self::Mock),
             other => Err(format!(
-                "invalid provider '{other}', expected one of: auto, tiered, gemini, qwen3_local, openai_compat, omp"
+                "invalid provider '{other}', expected one of: auto, tiered, gemini, qwen3_local, openai_compat, omp, mock"
             )),
         }
     }
@@ -310,6 +315,13 @@ mod tests {
             .try_into()
             .expect("deserialize omp");
         assert_eq!(toml_value, InferenceProviderKind::Omp);
+    }
+
+    #[test]
+    fn inference_provider_kind_round_trips_mock() {
+        let parsed: InferenceProviderKind = "mock".parse().expect("mock should parse");
+        assert_eq!(parsed, InferenceProviderKind::Mock);
+        assert_eq!(InferenceProviderKind::Mock.as_str(), "mock");
     }
 
     #[test]

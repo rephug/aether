@@ -12,7 +12,7 @@ before writing code and verify its changes afterward.
 
 Zero-API-key path (Claude Code Max subscribers):
 
-    aetherd --workspace . --index-once --inference-provider mock
+    aetherd --workspace . --index-once --full --inference-provider mock
 
 This builds the symbol table and dependency graph with tree-sitter only.
 Every symbol gets a `[MOCK]` placeholder SIR at confidence 0.1 — the
@@ -27,10 +27,12 @@ Gemini path (faster for 10K+ symbol codebases, ~$2):
     aetherd --workspace . init-agent --platform claude   # or gemini | codex | cursor | all
 
 This generates CLAUDE.md (behavioral guidance + required actions), a
-skill file, and the AETHER slash commands under `.claude/commands/`.
-Then connect Claude Code to AETHER's MCP server:
+skill file, the AETHER slash commands under `.claude/commands/`,
+`scripts/scan_all.sh`, and a project-scoped `.mcp.json` that registers the
+AETHER MCP server (the stdio `aether-mcp` binary; no daemon needs to be
+running). To register it by hand instead:
 
-    claude mcp add aether --url http://localhost:9720/mcp
+    claude mcp add --transport stdio --scope project aether -- aether-mcp --workspace .
 
 ## 3. Get baseline coverage
 

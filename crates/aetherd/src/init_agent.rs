@@ -10,7 +10,8 @@ use clap::ValueEnum;
 use crate::templates::{
     AuditChangesCommandTemplate, AuditCommandTemplate, AuditReportCommandTemplate, ClaudeTemplate,
     CodexInstructionsTemplate, CursorRulesTemplate, McpJsonTemplate, OmpAgentsTemplate,
-    RefactorCommandTemplate, RefactorDeepCommandTemplate, SkillTemplate, TemplateContext,
+    RefactorCommandTemplate, RefactorDeepCommandTemplate, ScanAllScriptTemplate,
+    ScanCommandTemplate, SkillTemplate, TemplateContext,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -57,7 +58,7 @@ pub fn run_init_agent(workspace: &Path, options: InitAgentOptions) -> Result<Ini
         )
     })?;
 
-    let context = build_template_context(&config);
+    let context = build_template_context(workspace, &config);
     let files = files_for_platform(options.platform, &context);
 
     let mut written_files = Vec::new();
@@ -65,7 +66,30 @@ pub fn run_init_agent(workspace: &Path, options: InitAgentOptions) -> Result<Ini
 
     for file in files {
         let absolute_path = workspace.join(&file.relative_path);
-        if absolute_path.exists() && !options.force {
+        if absolute_path.exists() && file.relative_path == Path::new(MCP_CONFIG_FILE) {
+            // Shared with other MCP servers: never replaced wholesale, even with --force.
+            match merge_mcp_server(&absolute_path, &file.content, options.force)? {
+                McpMerge::Updated => {
+                    written_files.push(file.relative_path);
+                    continue;
+                }
+                // Without --force an existing registration is an untouched file; with
+                // --force an identical entry means the forced refresh is already satisfied.
+                McpMerge::Unchanged if options.force => {
+                    written_files.push(file.relative_path);
+                    continue;
+                }
+                McpMerge::Unchanged => {
+                    skipped_existing_files.push(file.relative_path);
+                    continue;
+                }
+                McpMerge::NotJson if !options.force => {
+                    skipped_existing_files.push(file.relative_path);
+                    continue;
+                }
+                McpMerge::NotJson => {}
+            }
+        } else if absolute_path.exists() && !options.force {
             skipped_existing_files.push(file.relative_path);
             continue;
         }
@@ -78,6 +102,9 @@ pub fn run_init_agent(workspace: &Path, options: InitAgentOptions) -> Result<Ini
 
         fs::write(&absolute_path, file.content)
             .with_context(|| format!("failed to write {}", absolute_path.display()))?;
+        if file.executable {
+            mark_executable(&absolute_path)?;
+        }
         written_files.push(file.relative_path);
     }
 
@@ -91,83 +118,217 @@ pub fn run_init_agent(workspace: &Path, options: InitAgentOptions) -> Result<Ini
 struct GeneratedFile {
     relative_path: PathBuf,
     content: String,
+    /// Mark the written file executable (shell scripts).
+    executable: bool,
+}
+
+impl GeneratedFile {
+    fn new(relative_path: impl Into<PathBuf>, content: String) -> Self {
+        Self {
+            relative_path: relative_path.into(),
+            content,
+            executable: false,
+        }
+    }
+
+    fn script(relative_path: impl Into<PathBuf>, content: String) -> Self {
+        Self {
+            relative_path: relative_path.into(),
+            content,
+            executable: true,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn mark_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path)
+        .with_context(|| format!("failed to stat {}", path.display()))?
+        .permissions();
+    permissions.set_mode(permissions.mode() | 0o755);
+    fs::set_permissions(path, permissions)
+        .with_context(|| format!("failed to chmod {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn mark_executable(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn files_for_platform(platform: AgentPlatform, context: &TemplateContext) -> Vec<GeneratedFile> {
     let mut files = Vec::new();
 
     if matches!(platform, AgentPlatform::Claude | AgentPlatform::All) {
-        files.push(GeneratedFile {
-            relative_path: PathBuf::from("CLAUDE.md"),
-            content: ClaudeTemplate::render(context),
-        });
-        files.push(GeneratedFile {
-            relative_path: PathBuf::from(".agents/skills/aether-context/SKILL.md"),
-            content: SkillTemplate::render(context),
-        });
-        files.push(GeneratedFile {
-            relative_path: PathBuf::from(".claude/commands/audit.md"),
-            content: AuditCommandTemplate::render(context),
-        });
-        files.push(GeneratedFile {
-            relative_path: PathBuf::from(".claude/commands/refactor.md"),
-            content: RefactorCommandTemplate::render(context),
-        });
-        files.push(GeneratedFile {
-            relative_path: PathBuf::from(".claude/commands/refactor-deep.md"),
-            content: RefactorDeepCommandTemplate::render(context),
-        });
-        files.push(GeneratedFile {
-            relative_path: PathBuf::from(".claude/commands/audit-report.md"),
-            content: AuditReportCommandTemplate::render(context),
-        });
-        files.push(GeneratedFile {
-            relative_path: PathBuf::from(".claude/commands/audit-changes.md"),
-            content: AuditChangesCommandTemplate::render(context),
-        });
+        files.push(GeneratedFile::new(
+            "CLAUDE.md",
+            ClaudeTemplate::render(context),
+        ));
+        files.push(GeneratedFile::new(
+            ".agents/skills/aether-context/SKILL.md",
+            SkillTemplate::render(context),
+        ));
+        files.push(GeneratedFile::new(
+            ".claude/commands/audit.md",
+            AuditCommandTemplate::render(context),
+        ));
+        files.push(GeneratedFile::new(
+            ".claude/commands/refactor.md",
+            RefactorCommandTemplate::render(context),
+        ));
+        files.push(GeneratedFile::new(
+            ".claude/commands/refactor-deep.md",
+            RefactorDeepCommandTemplate::render(context),
+        ));
+        files.push(GeneratedFile::new(
+            ".claude/commands/audit-report.md",
+            AuditReportCommandTemplate::render(context),
+        ));
+        files.push(GeneratedFile::new(
+            ".claude/commands/audit-changes.md",
+            AuditChangesCommandTemplate::render(context),
+        ));
+        files.push(GeneratedFile::new(
+            ".claude/commands/scan.md",
+            ScanCommandTemplate::render(context),
+        ));
+        files.push(GeneratedFile::script(
+            "scripts/scan_all.sh",
+            ScanAllScriptTemplate::render(context),
+        ));
     }
 
     if matches!(platform, AgentPlatform::Codex | AgentPlatform::All) {
-        files.push(GeneratedFile {
-            relative_path: PathBuf::from(".codex-instructions"),
-            content: CodexInstructionsTemplate::render(context),
-        });
+        files.push(GeneratedFile::new(
+            ".codex-instructions",
+            CodexInstructionsTemplate::render(context),
+        ));
     }
 
     if matches!(platform, AgentPlatform::Cursor | AgentPlatform::All) {
-        files.push(GeneratedFile {
-            relative_path: PathBuf::from(".cursor/rules"),
-            content: CursorRulesTemplate::render(context),
-        });
+        files.push(GeneratedFile::new(
+            ".cursor/rules",
+            CursorRulesTemplate::render(context),
+        ));
     }
 
     if matches!(platform, AgentPlatform::Omp | AgentPlatform::All) {
-        files.push(GeneratedFile {
-            relative_path: PathBuf::from("AGENTS.md"),
-            content: OmpAgentsTemplate::render(context),
-        });
-        files.push(GeneratedFile {
-            relative_path: PathBuf::from(".mcp.json"),
-            content: McpJsonTemplate::render(context),
-        });
+        files.push(GeneratedFile::new(
+            "AGENTS.md",
+            OmpAgentsTemplate::render(context),
+        ));
+    }
+
+    // Claude Code and Oh My Pi both read a project-root `.mcp.json`; the non-interactive
+    // `claude -p "/scan ..."` sessions started by scripts/scan_all.sh depend on it.
+    if matches!(
+        platform,
+        AgentPlatform::Claude | AgentPlatform::Omp | AgentPlatform::All
+    ) {
+        files.push(GeneratedFile::new(
+            ".mcp.json",
+            McpJsonTemplate::render(context),
+        ));
     }
 
     files
 }
 
-fn build_template_context(config: &AetherConfig) -> TemplateContext {
+fn build_template_context(workspace: &Path, config: &AetherConfig) -> TemplateContext {
     TemplateContext {
         languages: detected_languages(),
         verify_commands: config.verify.commands.clone(),
         embeddings_enabled: config.embeddings.enabled,
         inference_provider: config.inference.provider.as_str().to_owned(),
         agent_schema_version: AETHER_AGENT_SCHEMA_VERSION,
-        mcp_binary_hint: default_mcp_binary_hint(),
+        mcp_binary_hint: resolve_mcp_binary_hint(workspace),
     }
 }
 
-fn default_mcp_binary_hint() -> String {
-    "./target/debug/aether-mcp".to_owned()
+const SOURCE_TREE_MCP_BINARY: &str = "./target/debug/aether-mcp";
+const MCP_CONFIG_FILE: &str = ".mcp.json";
+const MCP_SERVER_KEY: &str = "aether";
+
+#[derive(Debug, PartialEq, Eq)]
+enum McpMerge {
+    /// The `aether` entry was added (or, with `force`, refreshed) and the file rewritten.
+    Updated,
+    /// The file already registers `aether` as rendered; nothing written.
+    Unchanged,
+    /// Not a JSON object we can extend; left untouched.
+    NotJson,
+}
+
+/// `.mcp.json` is shared with every other MCP server the project registers, so an
+/// existing file is never treated as an all-or-nothing template: only the `aether`
+/// entry is added when missing, and `force` refreshes that one entry while leaving
+/// every other registration in place.
+fn merge_mcp_server(existing_path: &Path, rendered: &str, force: bool) -> Result<McpMerge> {
+    let current = fs::read_to_string(existing_path)
+        .with_context(|| format!("failed to read {}", existing_path.display()))?;
+    let Ok(mut current_json) = serde_json::from_str::<serde_json::Value>(&current) else {
+        return Ok(McpMerge::NotJson);
+    };
+    let Some(root) = current_json.as_object_mut() else {
+        return Ok(McpMerge::NotJson);
+    };
+    let servers = root
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+    let Some(servers) = servers.as_object_mut() else {
+        return Ok(McpMerge::NotJson);
+    };
+    let rendered_json: serde_json::Value =
+        serde_json::from_str(rendered).context("rendered .mcp.json template is valid JSON")?;
+    let Some(aether) = rendered_json
+        .get("mcpServers")
+        .and_then(|value| value.get(MCP_SERVER_KEY))
+        .cloned()
+    else {
+        return Ok(McpMerge::NotJson);
+    };
+    match servers.get(MCP_SERVER_KEY) {
+        Some(existing) if !force || *existing == aether => return Ok(McpMerge::Unchanged),
+        _ => {}
+    }
+    servers.insert(MCP_SERVER_KEY.to_owned(), aether);
+    let mut merged =
+        serde_json::to_string_pretty(&current_json).context("merged .mcp.json serializes")?;
+    merged.push('\n');
+    fs::write(existing_path, merged)
+        .with_context(|| format!("failed to write {}", existing_path.display()))?;
+    Ok(McpMerge::Updated)
+}
+const MCP_BINARY_NAME: &str = "aether-mcp";
+
+/// The command `.mcp.json` and the agent docs use to start the AETHER MCP server.
+///
+/// The source-tree debug binary is used only when it exists in this workspace (the
+/// AETHER checkout dogfooding its own assets). Otherwise prefer the `aether-mcp` that
+/// was installed next to the running `aetherd`, and fall back to the bare name so the
+/// PATH resolves it. A downstream project never gets a path into a build tree it
+/// does not have.
+fn resolve_mcp_binary_hint(workspace: &Path) -> String {
+    if workspace.join(SOURCE_TREE_MCP_BINARY).is_file() {
+        return SOURCE_TREE_MCP_BINARY.to_owned();
+    }
+    let installed_sibling = std::env::current_exe()
+        .ok()
+        .and_then(|current| current.parent().map(Path::to_path_buf))
+        .map(|dir| dir.join(binary_file_name(MCP_BINARY_NAME)))
+        .filter(|candidate| candidate.is_file());
+    match installed_sibling {
+        Some(sibling) => sibling.to_string_lossy().into_owned(),
+        None => MCP_BINARY_NAME.to_owned(),
+    }
+}
+
+fn binary_file_name(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    }
 }
 
 fn detected_languages() -> Vec<String> {
@@ -236,11 +397,165 @@ mod tests {
         assert!(workspace.join(".claude/commands/refactor-deep.md").exists());
         assert!(workspace.join(".claude/commands/audit-report.md").exists());
         assert!(workspace.join(".claude/commands/audit-changes.md").exists());
+        assert!(workspace.join(".claude/commands/scan.md").exists());
+        assert!(workspace.join("scripts/scan_all.sh").exists());
         assert!(
             workspace
                 .join(".agents/skills/aether-context/SKILL.md")
                 .exists()
         );
+    }
+
+    #[test]
+    fn init_agent_claude_platform_ships_scan_assets_and_marks_script_executable() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_config_with_embeddings(workspace, false);
+
+        let outcome = run_init_agent(
+            workspace,
+            InitAgentOptions {
+                platform: AgentPlatform::Claude,
+                force: false,
+            },
+        )
+        .expect("init-agent claude should succeed");
+        assert!(
+            outcome
+                .written_files
+                .contains(&std::path::PathBuf::from(".claude/commands/scan.md"))
+        );
+        assert!(
+            outcome
+                .written_files
+                .contains(&std::path::PathBuf::from("scripts/scan_all.sh"))
+        );
+        let command = fs::read_to_string(workspace.join(".claude/commands/scan.md"))
+            .expect("read scan command");
+        assert!(command.contains("aether_sir_inject"));
+        let mcp = fs::read_to_string(workspace.join(".mcp.json")).expect("read .mcp.json");
+        let parsed: serde_json::Value = serde_json::from_str(&mcp).expect("valid json");
+        let command = parsed["mcpServers"]["aether"]["command"]
+            .as_str()
+            .expect("claude platform must register the MCP server");
+        assert!(
+            !command.starts_with("./target/"),
+            "a workspace without a build tree must not be pointed at one: {command}"
+        );
+        assert!(
+            command.ends_with("aether-mcp") || command.ends_with("aether-mcp.exe"),
+            "unexpected MCP command: {command}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(workspace.join("scripts/scan_all.sh"))
+                .expect("stat script")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o111, "scan_all.sh should be executable");
+        }
+
+        // Codex/Cursor platforms never write the Claude command set.
+        let temp = tempdir().expect("tempdir");
+        write_config_with_embeddings(temp.path(), false);
+        run_init_agent(
+            temp.path(),
+            InitAgentOptions {
+                platform: AgentPlatform::Codex,
+                force: false,
+            },
+        )
+        .expect("init-agent codex should succeed");
+        assert!(!temp.path().join(".claude/commands/scan.md").exists());
+        assert!(!temp.path().join("scripts/scan_all.sh").exists());
+    }
+
+    #[test]
+    fn init_agent_merges_aether_into_an_existing_mcp_json() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::write(
+            workspace.join(".mcp.json"),
+            "{\n  \"mcpServers\": {\n    \"other\": { \"command\": \"other-mcp\" }\n  }\n}\n",
+        )
+        .expect("seed .mcp.json");
+        let outcome = run_init_agent(
+            workspace,
+            InitAgentOptions {
+                platform: AgentPlatform::Claude,
+                force: false,
+            },
+        )
+        .expect("init-agent should succeed");
+        assert!(
+            outcome
+                .written_files
+                .contains(&std::path::PathBuf::from(".mcp.json")),
+            "an existing .mcp.json without aether must be updated, not skipped"
+        );
+        let merged: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(workspace.join(".mcp.json")).unwrap())
+                .expect("valid json");
+        assert!(merged["mcpServers"]["other"]["command"].is_string());
+        assert!(merged["mcpServers"]["aether"]["command"].is_string());
+
+        // A second run leaves the file alone and reports it as existing.
+        let again = run_init_agent(
+            workspace,
+            InitAgentOptions {
+                platform: AgentPlatform::Claude,
+                force: false,
+            },
+        )
+        .expect("second init-agent should succeed");
+        assert!(
+            again
+                .skipped_existing_files
+                .contains(&std::path::PathBuf::from(".mcp.json"))
+        );
+
+        // --force refreshes the aether entry only; other registrations survive.
+        fs::write(
+            workspace.join(".mcp.json"),
+            "{\n  \"mcpServers\": {\n    \"other\": { \"command\": \"other-mcp\" },\n    \"aether\": { \"command\": \"stale\" }\n  }\n}\n",
+        )
+        .expect("seed stale .mcp.json");
+        let forced = run_init_agent(
+            workspace,
+            InitAgentOptions {
+                platform: AgentPlatform::Claude,
+                force: true,
+            },
+        )
+        .expect("forced init-agent should succeed");
+        assert!(
+            forced
+                .written_files
+                .contains(&std::path::PathBuf::from(".mcp.json"))
+        );
+        let refreshed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(workspace.join(".mcp.json")).unwrap())
+                .expect("valid json");
+        assert_eq!(refreshed["mcpServers"]["other"]["command"], "other-mcp");
+        assert_ne!(refreshed["mcpServers"]["aether"]["command"], "stale");
+
+        // A repeated --force with an already-current entry is a success, not a skip.
+        let repeated = run_init_agent(
+            workspace,
+            InitAgentOptions {
+                platform: AgentPlatform::Claude,
+                force: true,
+            },
+        )
+        .expect("repeated forced init-agent should succeed");
+        assert!(
+            !repeated
+                .skipped_existing_files
+                .contains(&std::path::PathBuf::from(".mcp.json")),
+            "an up-to-date .mcp.json must not fail a forced regeneration"
+        );
+        assert_eq!(repeated.exit_code(), 0);
     }
 
     #[test]

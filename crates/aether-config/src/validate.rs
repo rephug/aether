@@ -24,7 +24,9 @@ fn provider_ignores_gemini_thinking(
         InferenceProviderKind::Gemini | InferenceProviderKind::Auto => false,
         // The omp gateway forwards `reasoning_effort`, so thinking is honoured there too.
         InferenceProviderKind::Omp => false,
-        InferenceProviderKind::Qwen3Local | InferenceProviderKind::OpenAiCompat => true,
+        InferenceProviderKind::Qwen3Local
+        | InferenceProviderKind::OpenAiCompat
+        | InferenceProviderKind::Mock => true,
         InferenceProviderKind::Tiered => tiered.is_some_and(|tiered| {
             !tiered
                 .primary
@@ -214,6 +216,16 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
             }
         }
         InferenceProviderKind::OpenAiCompat => {}
+        InferenceProviderKind::Mock => {
+            if config.inference.model.is_some() || config.inference.endpoint.is_some() {
+                warnings.push(ConfigWarning {
+                    code: "inference_model_endpoint_ignored_for_mock",
+                    message:
+                        "inference.provider=mock ignores inference.model and inference.endpoint"
+                            .to_owned(),
+                });
+            }
+        }
         InferenceProviderKind::Omp => match config.inference.model.as_deref() {
             None => warnings.push(ConfigWarning {
                 code: "inference_omp_model_missing",

@@ -34,6 +34,7 @@ pub(crate) fn render(config: &AetherConfig, params: &HashMap<String, String>) ->
                     ("qwen3_local", "Qwen3 Local"),
                     ("openai_compat", "OpenAI Compatible"),
                     ("omp", "Oh My Pi Gateway"),
+                    ("mock", "Mock (no key, [MOCK] placeholders)"),
                 ],
                 "Inference provider backend",
                 "inference",

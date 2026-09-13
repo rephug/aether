@@ -5,7 +5,14 @@ use aether_sir::{
 use aether_store::{
     SirHistoryStore, SirMetaRecord, SirStateStore, SymbolCatalogStore, SymbolRecord,
 };
-use aetherd::sir_pipeline::SirPipeline;
+use std::collections::HashMap;
+
+use anyhow::Context as _;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use aether_parse::language_for_path;
+use aetherd::sir_pipeline::{SirPipeline, refresh_local_file_rollup};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +64,74 @@ pub struct AetherSirInjectRequest {
     pub force: Option<bool>,
 }
 
+/// Serializes the leaf-SIR write and the file-rollup rebuild across concurrent
+/// `aether_sir_inject` calls in this process; `acquire_inject_write_lock` adds the
+/// cross-process half (an exclusive lock on `.aether/inject.lock`), since every MCP
+/// client runs its own stdio `aether-mcp` process against the same store.
+static INJECT_WRITE_LOCK: Mutex<()> = Mutex::new(());
+const INJECT_LOCK_FILE: &str = "inject.lock";
+
+/// Exclusive, cross-process lock held while a leaf SIR and its file rollup are written.
+/// Released when the returned handle is dropped.
+fn acquire_inject_write_lock(workspace: &Path) -> anyhow::Result<std::fs::File> {
+    let dir = workspace.join(".aether");
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let path = dir.join(INJECT_LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.lock()
+        .with_context(|| format!("failed to lock {}", path.display()))?;
+    Ok(file)
+}
+/// One lock per symbol for the embedding refresh, so two injections into the same symbol
+/// embed in order (the later SIR wins) while unrelated symbols stay concurrent. This is
+/// the in-process half; `acquire_embed_lock` adds the cross-process half, since every
+/// MCP client runs its own stdio `aether-mcp` process against the same store.
+static EMBED_LOCKS: Mutex<Option<HashMap<String, Arc<Mutex<()>>>>> = Mutex::new(None);
+/// Directory under `.aether/` holding one lock file per symbol (named by the BLAKE3 hash
+/// of the symbol id, so arbitrary ids map to safe, bounded file names).
+const EMBED_LOCK_DIR: &str = "embed-locks";
+/// `sir_status` recorded when a leaf was written but its file rollup could not be
+/// rebuilt: the confidence guard lets such a symbol be re-injected without `force`, and
+/// the scan queries keep selecting it, so the retry is never blocked.
+pub const SIR_STATUS_ROLLUP_FAILED: &str = "rollup_failed";
+
+/// Exclusive, cross-process lock for one symbol's embedding refresh, so a slower embedding
+/// computed by another `aether-mcp` process for an older SIR cannot overwrite the vector
+/// of a newer one. Released when the returned handle is dropped.
+fn acquire_embed_lock(workspace: &Path, symbol_id: &str) -> anyhow::Result<std::fs::File> {
+    let dir = workspace.join(".aether").join(EMBED_LOCK_DIR);
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let path = dir.join(format!(
+        "{}.lock",
+        blake3::hash(symbol_id.as_bytes()).to_hex()
+    ));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.lock()
+        .with_context(|| format!("failed to lock {}", path.display()))?;
+    Ok(file)
+}
+
+fn embed_lock_for(symbol_id: &str) -> Arc<Mutex<()>> {
+    let mut locks = EMBED_LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks
+        .get_or_insert_with(HashMap::new)
+        .entry(symbol_id.to_owned())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherSirInjectResponse {
     pub symbol_id: String,
@@ -74,6 +149,8 @@ pub struct AetherSirInjectResponse {
     /// What happened to the symbol's embedding: `refreshed`, `unchanged`,
     /// `skipped: <reason>` or `failed: <error>`.
     pub embedding_status: String,
+    /// Whether the file rollup (and therefore module reads) was rebuilt from the leaves.
+    pub file_rollup_status: String,
 }
 
 /// Round an f32 confidence to 4 decimal places as f64, so the JSON response reads
@@ -256,8 +333,12 @@ impl AetherMcpServer {
         let previous_confidence = previous_sir.as_ref().map(|sir| sir.confidence);
         let new_confidence = request.confidence.unwrap_or(DEFAULT_INJECT_CONFIDENCE);
 
+        let previous_rollup_failed = previous_meta
+            .as_ref()
+            .is_some_and(|meta| meta.sir_status == SIR_STATUS_ROLLUP_FAILED);
         if previous_confidence.is_some_and(|confidence| confidence > FORCE_CONFIDENCE_THRESHOLD)
             && !request.force.unwrap_or(false)
+            && !previous_rollup_failed
         {
             let note = previous_confidence.map(|confidence| {
                 format!(
@@ -280,6 +361,7 @@ impl AetherMcpServer {
                 status: "blocked".to_owned(),
                 note,
                 embedding_status: "skipped: inject blocked".to_owned(),
+                file_rollup_status: "skipped: inject blocked".to_owned(),
             });
         }
 
@@ -324,7 +406,17 @@ impl AetherMcpServer {
         let provider = normalize_optional_text_with_default(request.provider, "manual");
         let model = normalize_optional_text_with_default(request.model, "manual");
         let generation_pass = normalize_optional_text_with_default(request.generation_pass, "deep");
+        let rollup_identity = (provider.clone(), model.clone(), generation_pass.clone());
         let now = current_unix_timestamp();
+        // The leaf write and the file-rollup rebuild below must not interleave with a
+        // concurrent injection into the same file (the MCP router runs each call on its
+        // own blocking task): an older leaf snapshot persisted last would put stale
+        // rollup content back. One process-wide lock keeps write + rebuild atomic.
+        let _inject_guard = INJECT_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _inject_file_guard = acquire_inject_write_lock(&self.state.workspace)
+            .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
         let version_write = store.record_sir_version_if_changed(
             symbol_id.as_str(),
             hash.as_str(),
@@ -336,7 +428,7 @@ impl AetherMcpServer {
         )?;
 
         store.write_sir_blob(symbol_id.as_str(), canonical_json.as_str())?;
-        store.upsert_sir_meta(SirMetaRecord {
+        let meta_record = SirMetaRecord {
             id: symbol_id.clone(),
             sir_hash: hash.clone(),
             sir_version: version_write.version,
@@ -350,8 +442,44 @@ impl AetherMcpServer {
             sir_status: "fresh".to_owned(),
             last_error: None,
             last_attempt_at: version_write.updated_at,
-        })?;
+        };
+        store.upsert_sir_meta(meta_record.clone())?;
 
+        // Aggregate reads (file and module level) are served from the file rollup, so
+        // rebuild it from the leaves now rather than leaving the indexing-time rollup
+        // (a [MOCK] concatenation after a mock index) in place.
+        let file_rollup_status = self
+            .refresh_file_rollup_after_inject(
+                symbol.file_path.as_str(),
+                &rollup_identity.0,
+                &rollup_identity.1,
+                &rollup_identity.2,
+            )
+            .map_err(|err| {
+                let message = format!(
+                    "SIR for {qualified_name} was written but the file rollup for {} could not be rebuilt: {err:#}; rerun the injection (the confidence guard is lifted for it) so aggregate reads stay consistent",
+                    symbol.file_path
+                );
+                // Leave a retry marker: the leaf keeps its scan-level confidence, but the
+                // guard and the scan queries treat this status as "still a target". If even
+                // the marker cannot be written, say so: the symbol must then be re-injected
+                // with force=true, because nothing in the store records the failure.
+                let message = match store.upsert_sir_meta(SirMetaRecord {
+                    sir_status: SIR_STATUS_ROLLUP_FAILED.to_owned(),
+                    last_error: Some(message.clone()),
+                    ..meta_record.clone()
+                }) {
+                    Ok(()) => message,
+                    Err(marker_err) => format!(
+                        "{message}; the rollup_failed retry marker could not be written either ({marker_err}), so rerun this injection with force=true once the store accepts writes"
+                    ),
+                };
+                AetherMcpError::Message(message)
+            })?;
+        // The embedding refresh may call a local or remote model: release both locks first
+        // so concurrent injections into other files are not serialized behind it.
+        drop(_inject_file_guard);
+        drop(_inject_guard);
         let embedding_status =
             self.refresh_embedding_after_inject(symbol_id.as_str(), hash.as_str(), &canonical_json);
         let note = match embedding_status.as_str() {
@@ -372,6 +500,35 @@ impl AetherMcpServer {
             status: "injected".to_owned(),
             note,
             embedding_status,
+            file_rollup_status,
+        })
+    }
+
+    /// Rebuild the file rollup for `file_path`. A failure is returned, not swallowed:
+    /// the leaf is already persisted, but reporting the injection as a success while
+    /// the aggregate is stale would let a scan claim completion with inconsistent data.
+    fn refresh_file_rollup_after_inject(
+        &self,
+        file_path: &str,
+        provider: &str,
+        model: &str,
+        generation_pass: &str,
+    ) -> anyhow::Result<String> {
+        let Some(language) = language_for_path(Path::new(file_path)) else {
+            return Ok("skipped: unknown language".to_owned());
+        };
+        let written = refresh_local_file_rollup(
+            self.state.store.as_ref(),
+            file_path,
+            language,
+            provider,
+            model,
+            generation_pass,
+        )?;
+        Ok(if written {
+            "refreshed".to_owned()
+        } else {
+            "removed: no leaf SIRs".to_owned()
         })
     }
 
@@ -387,6 +544,26 @@ impl AetherMcpServer {
     ) -> String {
         if !self.state.config.embeddings.enabled {
             return "skipped: embeddings disabled".to_owned();
+        }
+        // Per-symbol ordering: a slower embedding for an older SIR must never overwrite
+        // the embedding of a newer one, so embed under the symbol's in-process and
+        // cross-process locks, and only when the store still holds the SIR this call
+        // wrote (the check happens after both locks are held, so no other injector can
+        // be mid-embedding for this symbol while it runs).
+        let symbol_lock = embed_lock_for(symbol_id);
+        let _symbol_guard = symbol_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _cross_process_guard = match acquire_embed_lock(&self.state.workspace, symbol_id) {
+            Ok(guard) => guard,
+            Err(err) => return format!("failed: {err:#}"),
+        };
+        match self.state.store.get_sir_meta(symbol_id) {
+            Ok(Some(meta)) if meta.sir_hash != sir_hash => {
+                return "superseded: a newer SIR was injected".to_owned();
+            }
+            Err(err) => return format!("failed: {err:#}"),
+            _ => {}
         }
         let pipeline = match SirPipeline::new_embeddings_only(self.state.workspace.clone()) {
             Ok(pipeline) => pipeline,
@@ -411,6 +588,7 @@ impl AetherMcpServer {
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::sync::Mutex;
 
     use aether_sir::SirAnnotation;
     use aether_store::{SirHistoryStore, SirStateStore, SymbolCatalogStore, SymbolRecord};
@@ -547,8 +725,18 @@ vector_backend = "sqlite"
         assert_eq!(response.previous_confidence, None);
         assert_eq!(response.new_confidence, 0.6);
         assert!(!response.sir_hash.is_empty());
+        assert_eq!(response.file_rollup_status, "refreshed");
 
         let store = aether_store::SqliteStore::open(temp.path()).expect("open store");
+        let rollup_id = aether_sir::synthetic_file_sir_id("rust", "src/lib.rs");
+        let rollup = store
+            .read_sir_blob(&rollup_id)
+            .expect("read file rollup")
+            .expect("file rollup rebuilt from the injected leaf");
+        assert!(
+            rollup.contains("Persist a new SIR annotation"),
+            "file rollup must reflect the injected leaf: {rollup}"
+        );
         let history = store.list_sir_history("sym-new").expect("list sir history");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].version, 1);
@@ -703,6 +891,7 @@ vector_backend = "sqlite"
             status: "injected".to_owned(),
             note: None,
             embedding_status: "skipped: embeddings disabled".to_owned(),
+            file_rollup_status: "refreshed".to_owned(),
         };
         let rendered = serde_json::to_string(&response).expect("serialize");
         assert!(rendered.contains("\"new_confidence\":0.97"), "{rendered}");
