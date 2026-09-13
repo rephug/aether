@@ -31,8 +31,9 @@ label (it may read `dir:web` or `shared` for a synthetic unit).
    modules such as `mod util;` → `shared/util.rs` are covered); when several packages
    target the same directory, add only that file (exact `file_path`) and its `<stem>/`
    module directory (`shared/foo`), so `shared/bar.rs` of another package stays out and
-   the directory's remainder is scanned as its own unit by `scripts/scan_all.sh`. Paths
-   never start with `./`. If the manifest sits at the
+   the directory's remainder is scanned as its own unit by `scripts/scan_all.sh`; when
+   several packages declare the very same target file, only the first package name in
+   sorted order owns it. Paths never start with `./`. If the manifest sits at the
    project root, the package owns only its own targets: use the top-level directory of
    each target's `src_path` (typically `src`, `tests`, `benches`, `examples`) as the
    `<dir>` set, and match a target file stored at the root itself (for example

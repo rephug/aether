@@ -95,7 +95,9 @@ index_top_level_scopes() {
 # directory brings that directory in when this package is the only one targeting it (so
 # sibling modules such as `mod util;` → shared/util.rs are covered); when several
 # packages target the same external directory each gets only its target file plus its
-# `<stem>/` module directory, and the directory's remainder becomes its own unit.
+# `<stem>/` module directory, and the directory's remainder becomes its own unit. When
+# several packages declare the very same target file, the first package name in sorted
+# order owns it, so no two units ever carry equal scopes.
 # An indexed top-level directory whose name collides with a package is emitted as
 # `dir:<name>`; explicit arguments may use that form too. Cargo workspaces: one unit per package, parsed structurally from the metadata
 # JSON (packages[].name / manifest_path / targets; never the dependency or target names
@@ -127,6 +129,7 @@ def covered(scope, scopes):
 # and a non-root package owns everything under its manifest dir, so a member pointing a
 # target into either never becomes the sole owner of that directory.
 external_owners = {}
+file_owners = {}
 manifest_dirs = {}
 for pkg in meta["packages"]:
     rel = inside(os.path.dirname(pkg["manifest_path"]))
@@ -139,6 +142,7 @@ for pkg in meta["packages"]:
         if src is None or (rel != "." and (src == rel or src.startswith(rel + os.sep))):
             continue
         external_owners.setdefault(os.path.dirname(src) or ".", set()).add(pkg["name"])
+        file_owners.setdefault(src, set()).add(pkg["name"])
 def owners_of(directory):
     owners = set(external_owners.get(directory, set()))
     for name, mdir in manifest_dirs.items():
@@ -159,6 +163,9 @@ for pkg in meta["packages"]:
         if rel == ".":
             candidates = [src.split(os.sep)[0]]
         elif src == rel or src.startswith(rel + os.sep):
+            continue
+        elif pkg["name"] != min(file_owners[src]):
+            # Several packages declare this very file; the first by name owns it.
             continue
         else:
             ext_dir = os.path.dirname(src) or "."
