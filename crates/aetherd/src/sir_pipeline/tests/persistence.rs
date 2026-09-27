@@ -970,6 +970,58 @@ fn a_job_for_newer_text_replaces_a_sir_bound_to_older_text() {
 }
 
 #[test]
+fn a_source_that_cannot_be_read_fails_the_persist_instead_of_superseding_it() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    write_embeddings_only_config(workspace);
+
+    let store = SqliteStore::open(workspace).expect("open store");
+    let pipeline = build_write_pipeline(workspace, Arc::new(PanicInferenceProvider));
+    let (symbol, record) = parsed_symbol(workspace, "src/lib.rs", "fn unreadable() {}\n");
+    store.upsert_symbol(record).expect("upsert symbol");
+    let generated = infer::GeneratedSir {
+        symbol: symbol.clone(),
+        sir: demo_sir(),
+        provider_name: "test_provider".to_owned(),
+        model_name: "test_model".to_owned(),
+        reasoning_trace: None,
+        prior_sir: None,
+        source_hash: symbol.content_hash.clone(),
+    };
+
+    // The file exists but cannot be read (a directory stands in its place). That says
+    // nothing about the symbol's text, so the result is neither dropped as superseded
+    // nor written: the persist fails naming the file, and the job stays to be retried.
+    fs::remove_file(workspace.join("src/lib.rs")).expect("remove file");
+    fs::create_dir(workspace.join("src/lib.rs")).expect("directory in the file's place");
+    let err = match pipeline.persist_successful_generation_sqlite(
+        &store,
+        &generated,
+        SIR_GENERATION_PASS_SCAN,
+        None,
+    ) {
+        Err(err) => err,
+        Ok(_) => panic!("an unreadable source must fail the persist"),
+    };
+    assert!(
+        format!("{err:#}").contains("failed to read src/lib.rs"),
+        "unexpected error: {err:#}"
+    );
+    assert!(
+        store.get_sir_meta(&symbol.id).expect("meta").is_none(),
+        "the failed persist wrote nothing"
+    );
+
+    // A file that is gone is the one case that means the symbol is gone with it: the
+    // result is superseded, as for any other body the symbol no longer has.
+    fs::remove_dir(workspace.join("src/lib.rs")).expect("remove directory");
+    let persisted = pipeline
+        .persist_successful_generation_sqlite(&store, &generated, SIR_GENERATION_PASS_SCAN, None)
+        .expect("persist");
+    assert!(matches!(persisted, GenerationPersist::Superseded));
+}
+
+#[test]
 fn a_failed_generation_for_a_removed_symbol_writes_no_marker() {
     let temp = tempdir().expect("tempdir");
     let workspace = temp.path();

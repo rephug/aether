@@ -151,26 +151,46 @@ fn infer_symbol_text_is_public(symbol_text: &str) -> bool {
 /// as `SirJob::source_hash` was: the file is re-read and re-parsed and the symbol found
 /// by its id, never by the range an earlier snapshot recorded, so an edit elsewhere in
 /// the file that moved the symbol does not read as a change to it, and a change to its
-/// body is never hidden by other text that happens to fill the old range. `None`: the
-/// file is gone, cannot be parsed, or no longer declares the symbol. A writer that
-/// generated from an earlier read compares the two under the inject lock: a mismatch
-/// means the result describes a body the symbol no longer has.
-pub fn current_source_hash(workspace_root: &Path, symbol: &Symbol) -> Option<String> {
-    let source = fs::read_to_string(workspace_root.join(&symbol.file_path)).ok()?;
-    let symbols = LIVE_PARSER.with(|parser| {
+/// body is never hidden by other text that happens to fill the old range. `Ok(None)`:
+/// the file is gone or no longer declares the symbol, so the result describes a body
+/// the symbol no longer has. `Err`: the file exists but could not be read or parsed;
+/// that says nothing about the symbol's text, so a caller must fail (and leave its
+/// result to be retried) rather than read it as an edit and drop a valid result. A
+/// writer that generated from an earlier read compares the two under the inject lock:
+/// a mismatch means the result describes a body the symbol no longer has.
+pub fn current_source_hash(workspace_root: &Path, symbol: &Symbol) -> Result<Option<String>> {
+    let source = match fs::read_to_string(workspace_root.join(&symbol.file_path)) {
+        Ok(source) => source,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(anyhow!(
+                "failed to read {} for the current source of {}: {err}",
+                symbol.file_path,
+                symbol.qualified_name
+            ));
+        }
+    };
+    let symbols = LIVE_PARSER.with(|parser| -> Result<Vec<Symbol>> {
         let mut parser = parser.borrow_mut();
         if parser.is_none() {
-            *parser = SymbolExtractor::new().ok();
+            *parser =
+                Some(SymbolExtractor::new().context("failed to initialize the source parser")?);
         }
         parser
-            .as_mut()?
+            .as_mut()
+            .ok_or_else(|| anyhow!("the source parser is unavailable after initialization"))?
             .extract_from_path(Path::new(&symbol.file_path), &source)
-            .ok()
+            .with_context(|| {
+                format!(
+                    "failed to parse {} for the current source of {}",
+                    symbol.file_path, symbol.qualified_name
+                )
+            })
     })?;
-    symbols
+    Ok(symbols
         .into_iter()
         .find(|current| current.id == symbol.id)
-        .map(|current| current.content_hash)
+        .map(|current| current.content_hash))
 }
 
 thread_local! {

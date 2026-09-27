@@ -477,7 +477,9 @@ impl AetherMcpServer {
             // An edit while the model ran leaves the stored SIR as it was until the
             // daemon's job for that edit lands; a result generated from the old body
             // must not land first and pre-empt it.
-            if current_source_hash(self.workspace(), &candidate.symbol).as_deref()
+            if current_source_hash(self.workspace(), &candidate.symbol)
+                .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?
+                .as_deref()
                 != Some(source_hash.as_str())
             {
                 tracing::info!(

@@ -299,7 +299,9 @@ impl SirPipeline {
         // lands, and both jobs started from it. Persist only while the source still
         // hashes to what this job read; otherwise the newer job's result is the one to
         // keep and this one would only pre-empt it.
-        if current_source_hash(&self.workspace_root, &generated.symbol).as_deref()
+        // A file that cannot be read or parsed is an error, not an edit: the result is
+        // kept for a retry instead of being dropped as superseded.
+        if current_source_hash(&self.workspace_root, &generated.symbol)?.as_deref()
             != Some(generated.source_hash.as_str())
         {
             tracing::info!(

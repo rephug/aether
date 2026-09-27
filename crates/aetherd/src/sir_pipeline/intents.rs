@@ -145,7 +145,9 @@ impl SirPipeline {
             // symbol from the new source, and this older description would only
             // pre-empt that job and record itself as fresh.
             if let Some(planned_source) = payload.source_hash.as_deref()
-                && current_source_hash(&self.workspace_root, &payload.symbol).as_deref()
+                && current_source_hash(&self.workspace_root, &payload.symbol)
+                    .with_context(|| format!("failed to check the source for intent {intent_id}"))?
+                    .as_deref()
                     != Some(planned_source)
             {
                 tracing::info!(

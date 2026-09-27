@@ -545,8 +545,11 @@ fn prepare_symbol(
             // unchanged body would read as changed while a changed one could hide behind
             // whatever text now fills that range. A file that is gone or no longer
             // declares the symbol, or a body that no longer hashes to what the prompt
-            // was built from, all count as changed.
-            if current_source_hash(pipeline.workspace_root(), &payload.symbol).as_deref()
+            // was built from, all count as changed; a file that exists but cannot be
+            // read or parsed fails the ingest instead, so the result stays to be retried.
+            if current_source_hash(pipeline.workspace_root(), &payload.symbol)
+                .with_context(|| format!("failed to check the source for {symbol_id}"))?
+                .as_deref()
                 != Some(origin.source_hash.as_str())
             {
                 tracing::info!(
