@@ -22,8 +22,8 @@ use tokio::runtime::Runtime;
 use tokio::time::{sleep, timeout};
 
 use aetherd::sir_pipeline::{
-    SirPipeline, acquire_embed_write_lock, acquire_inject_write_lock, current_sir_identity,
-    current_source_hash,
+    EmbeddingRefresh, SirPipeline, acquire_embed_write_lock, acquire_inject_write_lock,
+    current_sir_identity, current_source_hash,
 };
 
 use super::{
@@ -143,7 +143,10 @@ enum DeepSirPersist {
     /// follows the commit failed: the SIR stands (it is fresh and current), only its
     /// vector is stale until the next embeddings pass, so this is not a failed scan.
     Persisted { embedding_error: Option<String> },
-    /// The stored SIR changed while this one was being generated; nothing was written.
+    /// The stored SIR changed while this one was being generated (nothing was written),
+    /// or replaced this one's leaf while its embedding was being generated (the leaf
+    /// committed but stands no more): either way the symbol was not deep-scanned by this
+    /// call and its current SIR is another writer's.
     Superseded,
 }
 
@@ -519,7 +522,17 @@ impl AetherMcpServer {
             sir_hash_value.as_str(),
             canonical_json.as_str(),
         ) {
-            Ok(()) => None,
+            // The leaf was replaced by another writer while its vector was being
+            // generated: that writer's SIR stands and is not this call's deep scan, so
+            // the candidate is neither reported as completed nor snapshotted as deep-scanned.
+            Ok(Some(EmbeddingRefresh::Superseded)) => {
+                tracing::info!(
+                    symbol_id = %candidate.symbol.id,
+                    "deep SIR committed but was replaced before its embedding was stored"
+                );
+                return Ok(DeepSirPersist::Superseded);
+            }
+            Ok(_) => None,
             Err(err) => {
                 tracing::warn!(
                     symbol_id = %candidate.symbol.id,
@@ -596,9 +609,9 @@ impl AetherMcpServer {
         symbol_id: &str,
         sir_hash_value: &str,
         canonical_json: &str,
-    ) -> Result<(), AetherMcpError> {
+    ) -> Result<Option<EmbeddingRefresh>, AetherMcpError> {
         let Some(pipeline) = embedding_pipeline else {
-            return Ok(());
+            return Ok(None);
         };
         let _embed_guard = acquire_embed_write_lock(&self.state.workspace, symbol_id)
             .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
@@ -616,8 +629,8 @@ impl AetherMcpServer {
                 None,
                 &mut still_current,
             )
-            .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
-        Ok(())
+            .map(Some)
+            .map_err(|err| AetherMcpError::Message(format!("{err:#}")))
     }
 }
 

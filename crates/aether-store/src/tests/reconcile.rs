@@ -1,6 +1,76 @@
 use super::*;
 
 #[test]
+fn reconcile_moves_the_source_hash_with_the_migrated_sir() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+
+    let mut old_symbol = symbol_record();
+    old_symbol.id = "sym-old".to_owned();
+    old_symbol.signature_fingerprint = "sig-old".to_owned();
+    let mut new_symbol = old_symbol.clone();
+    new_symbol.id = "sym-new".to_owned();
+    new_symbol.signature_fingerprint = "sig-new".to_owned();
+    store.upsert_symbol(old_symbol.clone()).expect("upsert old");
+    store.upsert_symbol(new_symbol.clone()).expect("upsert new");
+    let leaf = |id: &str, hash: &str, updated_at: i64| SirMetaRecord {
+        id: id.to_owned(),
+        sir_hash: hash.to_owned(),
+        sir_version: 1,
+        provider: "mock".to_owned(),
+        model: "mock-model".to_owned(),
+        generation_pass: "scan".to_owned(),
+        reasoning_trace: None,
+        prompt_hash: None,
+        staleness_score: None,
+        updated_at,
+        sir_status: "fresh".to_owned(),
+        last_error: None,
+        last_attempt_at: updated_at,
+    };
+    // The target already holds an older SIR of its own text; the stale id holds a newer
+    // SIR bound to other text. The migration replaces the target's SIR and must carry
+    // the source it describes along, or a job for the target's text would read the
+    // migrated SIR as describing that text and yield to it.
+    store
+        .persist_sir_state_atomically_with_source(
+            leaf("sym-new", "hash-target", 1_700_000_100),
+            r#"{"intent":"target"}"#,
+            None,
+            None,
+            Some("source-target"),
+        )
+        .expect("persist target SIR");
+    store
+        .persist_sir_state_atomically_with_source(
+            leaf("sym-old", "hash-migrated", 1_700_000_200),
+            r#"{"intent":"migrated"}"#,
+            None,
+            None,
+            Some("source-migrated"),
+        )
+        .expect("persist stale-id SIR");
+
+    let (migrated, pruned) = store
+        .reconcile_and_prune(&[("sym-old".to_owned(), "sym-new".to_owned())], &[])
+        .expect("reconcile old -> new");
+    assert_eq!((migrated, pruned), (1, 0));
+    assert_eq!(
+        store
+            .get_sir_meta("sym-new")
+            .expect("meta")
+            .expect("meta exists")
+            .sir_hash,
+        "hash-migrated"
+    );
+    assert_eq!(
+        store.get_sir_source_hash("sym-new").expect("source hash"),
+        Some("source-migrated".to_owned()),
+        "the migrated SIR keeps the source it describes"
+    );
+}
+
+#[test]
 fn reconcile_migrates_sir_to_new_id() {
     let temp = tempdir().expect("tempdir");
     let store = SqliteStore::open(temp.path()).expect("open store");

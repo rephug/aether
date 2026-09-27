@@ -59,6 +59,9 @@ pub(crate) struct SirRowState {
     pub(crate) sir_status: String,
     pub(crate) last_error: Option<String>,
     pub(crate) last_attempt_at: i64,
+    /// The content hash of the text the SIR describes, when its writer recorded it;
+    /// it moves with the SIR when reconciliation migrates it to another id.
+    pub(crate) source_hash: Option<String>,
     pub(crate) sir_json: Option<String>,
 }
 pub(crate) fn load_sir_row_state(
@@ -80,7 +83,8 @@ pub(crate) fn load_sir_row_state(
             sir_status,
             last_error,
             last_attempt_at,
-            sir_json
+            sir_json,
+            source_hash
         FROM sir
         WHERE id = ?1
         "#,
@@ -110,6 +114,7 @@ pub(crate) fn load_sir_row_state(
                 sir_json: row
                     .get::<_, Option<String>>(12)?
                     .filter(|value| !value.trim().is_empty()),
+                source_hash: row.get(13)?,
             })
         },
     )
@@ -127,9 +132,9 @@ pub(crate) fn upsert_sir_row_state(
         INSERT INTO sir (
             id, sir_hash, sir_version, provider, model, generation_pass, reasoning_trace,
             prompt_hash, staleness_score, updated_at, sir_status, last_error, last_attempt_at,
-            sir_json
+            sir_json, source_hash
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
         ON CONFLICT(id) DO UPDATE SET
             sir_hash = excluded.sir_hash,
             sir_version = excluded.sir_version,
@@ -143,7 +148,8 @@ pub(crate) fn upsert_sir_row_state(
             sir_status = excluded.sir_status,
             last_error = excluded.last_error,
             last_attempt_at = excluded.last_attempt_at,
-            sir_json = excluded.sir_json
+            sir_json = excluded.sir_json,
+            source_hash = excluded.source_hash
         "#,
         params![
             symbol_id,
@@ -160,6 +166,7 @@ pub(crate) fn upsert_sir_row_state(
             &row.last_error,
             row.last_attempt_at,
             &row.sir_json,
+            &row.source_hash,
         ],
     )?;
     Ok(())

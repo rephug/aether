@@ -86,7 +86,9 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
             record.id
         ));
     }
-    let fresh = load_fresh_symbol_source(workspace, &record)?;
+    // The file must still declare the symbol (a dry run reports that too); the text
+    // the leaf is bound to is re-read right before the write below.
+    load_fresh_symbol_source(workspace, &record)?;
     let existing_blob = store
         .read_sir_blob(record.id.as_str())
         .with_context(|| format!("failed to read existing SIR for {}", record.id))?;
@@ -179,6 +181,17 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
             "internal error: no persistence pipeline was prepared for the write"
         ));
     };
+    // Editors take no lock: re-parse the file once more right before the write, so the
+    // leaf is bound to the text on disk at the commit and an edit that landed since the
+    // first read refuses the injection rather than describing text the symbol no longer has.
+    let fresh = load_fresh_symbol_source(workspace, &record)?;
+    if fresh.symbol.id != record.id {
+        return Err(anyhow!(
+            "source for {} ({}) no longer declares the symbol as indexed; nothing was injected: wait for re-indexing and retry",
+            record.qualified_name,
+            record.file_path
+        ));
+    }
     let payload = UpsertSirIntentPayload {
         symbol: symbol_from_record(&record)?,
         sir: updated.clone(),
@@ -188,10 +201,9 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
         reasoning_trace: None,
         commit_hash: None,
         prompt_hash: None,
-        // The leaf records the text this SIR describes (the file was re-parsed under the
-        // lock), so a daemon job for a later edit can tell it describes older text. When
-        // the parse matched the symbol by name rather than id, the hash is not this id's.
-        source_hash: (fresh.symbol.id == record.id).then(|| fresh.symbol.content_hash.clone()),
+        // The leaf records the text this SIR describes (re-parsed under the lock just
+        // above), so a daemon job for a later edit can tell it describes older text.
+        source_hash: Some(fresh.symbol.content_hash.clone()),
         prior_sir: crate::sir_pipeline::PriorSir::Unrecorded,
     };
     let (canonical_json, sir_hash) = persist_pipeline
