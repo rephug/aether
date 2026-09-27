@@ -24,10 +24,10 @@ pub(crate) fn keymap_sidecar_name(pass: &str) -> String {
     format!("{pass}.keymap.json")
 }
 
-/// The sidecar beside a pass's JSONL files holding each request's SIR identity at
-/// build time (see `BuildSummary::prior_sirs`).
-pub(crate) fn prior_sir_sidecar_name(pass: &str) -> String {
-    format!("{pass}.prior_sir.json")
+/// The sidecar beside a pass's JSONL files holding what each request was built from
+/// (see `BuildSummary::origins`).
+pub(crate) fn origin_sidecar_name(pass: &str) -> String {
+    format!("{pass}.origin.json")
 }
 
 /// A short identifier unique to one build of a pass, carried in its request keys.
@@ -86,10 +86,21 @@ pub(crate) struct BuildSummary {
     /// and so in every result, so a result is matched to the sidecar entries of the
     /// build that produced it and never to a later build's for the same pass.
     pub build_id: String,
-    /// The SIR each symbol held when its request was built (`None`: no SIR), keyed by
-    /// the full request key, so ingest can tell a result whose symbol was written
-    /// meanwhile (an injection, say) and leave that newer SIR alone.
-    pub prior_sirs: HashMap<String, Option<SirIdentity>>,
+    /// What each request was built from, keyed by the full request key, so ingest can
+    /// tell a result whose symbol was written or edited meanwhile and leave the newer
+    /// state alone (see [`BatchRequestOrigin`]).
+    pub origins: HashMap<String, BatchRequestOrigin>,
+}
+
+/// What one batch request was built from: the SIR the symbol held (`None`: no SIR)
+/// and the content hash of the symbol source the prompt was built from. Ingest applies
+/// a result only while the symbol still holds exactly that SIR and that source; a
+/// symbol injected or edited meanwhile keeps its newer state (and, for an edit, the
+/// daemon's regeneration from the new source is not pre-empted by a stale result).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BatchRequestOrigin {
+    pub prior_sir: Option<SirIdentity>,
+    pub source_hash: String,
 }
 
 pub(crate) fn snapshot_workspace_symbols(workspace: &Path) -> Result<HashMap<String, Symbol>> {
@@ -171,7 +182,7 @@ pub(crate) fn build_pass_jsonl_for_ids(
         unresolved_symbols: 0,
         keymap: HashMap::new(),
         build_id: new_build_id(pass_config.pass.as_str()),
-        prior_sirs: HashMap::new(),
+        origins: HashMap::new(),
     };
     let symbol_ids = match candidate_ids {
         Some(ids) => ids.to_vec(),
@@ -338,9 +349,12 @@ pub(crate) fn build_pass_jsonl_for_ids(
         if writer.is_none() || current_lines >= runtime.jsonl_chunk_size {
             chunk_index += 1;
             current_lines = 0;
+            // Named per build: a second build of the same pass in this directory must
+            // not truncate a chunk an earlier run has yet to submit.
             let file_path = runtime.batch_dir.join(format!(
-                "{}-{:04}.jsonl",
+                "{}-{}-{:04}.jsonl",
                 pass_config.pass.as_str(),
+                summary.build_id,
                 chunk_index
             ));
             let file = File::create(&file_path).with_context(|| {
@@ -354,9 +368,13 @@ pub(crate) fn build_pass_jsonl_for_ids(
         summary
             .keymap
             .insert(provider.request_key(&key_str), key_str.clone());
-        summary
-            .prior_sirs
-            .insert(key_str.clone(), existing_meta.as_ref().map(SirIdentity::of));
+        summary.origins.insert(
+            key_str.clone(),
+            BatchRequestOrigin {
+                prior_sir: existing_meta.as_ref().map(SirIdentity::of),
+                source_hash: symbol.content_hash.clone(),
+            },
+        );
         let line = provider.format_request(
             &key_str,
             &system_prompt,
@@ -382,10 +400,10 @@ pub(crate) fn build_pass_jsonl_for_ids(
     }
 
     // Write the keymap sidecar so ingest can recover full keys from providers that
-    // truncate custom_id (e.g. Anthropic's 64-char limit), and the prior-SIR sidecar:
-    // the identity (hash and history version) each symbol's SIR had when its request
-    // was built, which ingest compares under the inject lock right before persisting a
-    // result, skipping results for symbols whose SIR moved on in the meantime. Both are
+    // truncate custom_id (e.g. Anthropic's 64-char limit), and the origin sidecar: the
+    // SIR identity (hash and history version) and symbol source hash each request was
+    // built from, which ingest compares under the inject lock right before persisting a
+    // result, skipping results for symbols written or edited in the meantime. Both are
     // keyed per build (the build id is part of every key) and merged into whatever an
     // earlier build of the same pass left in the directory, so a result from that
     // earlier build, ingested later, still finds its own entries.
@@ -395,11 +413,11 @@ pub(crate) fn build_pass_jsonl_for_ids(
             .join(keymap_sidecar_name(pass_config.pass.as_str()));
         merge_sidecar(&keymap_path, &summary.keymap, "batch keymap")?;
     }
-    if !summary.prior_sirs.is_empty() {
-        let prior_path = runtime
+    if !summary.origins.is_empty() {
+        let origin_path = runtime
             .batch_dir
-            .join(prior_sir_sidecar_name(pass_config.pass.as_str()));
-        merge_sidecar(&prior_path, &summary.prior_sirs, "batch prior-SIR sidecar")?;
+            .join(origin_sidecar_name(pass_config.pass.as_str()));
+        merge_sidecar(&origin_path, &summary.origins, "batch origin sidecar")?;
     }
 
     Ok(summary)

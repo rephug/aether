@@ -115,6 +115,7 @@ fn run_ingest_command(
         config,
         provider.as_ref(),
         provider.name(),
+        None,
     )?;
     println!(
         "Ingested {} result(s), skipped {}, superseded {}, wrote {} fingerprint row(s)",
@@ -198,6 +199,7 @@ fn run_full_batch_command(
                     config,
                     provider.as_ref(),
                     provider.name(),
+                    Some(&extract_summary.symbols_by_id),
                 )?;
                 println!(
                     "Ingested {} chunk {}: processed {}, skipped {}, superseded {}, fingerprint rows {}",

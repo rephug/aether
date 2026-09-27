@@ -11,13 +11,14 @@ use aether_store::{
 };
 use anyhow::{Context, Result, anyhow};
 
-use crate::batch::build::{keymap_sidecar_name, prior_sir_sidecar_name};
+use crate::batch::build::{
+    BatchRequestOrigin, keymap_sidecar_name, origin_sidecar_name, snapshot_workspace_symbols,
+};
 use crate::batch::hash::diff_prompt_hashes;
 use crate::batch::{BatchProvider, BatchResultLine, PassConfig};
 use crate::continuous::cosine_distance_from_embeddings;
 use crate::sir_pipeline::{
-    EmbeddingInput, PriorSir, SirIdentity, SirPipeline, UpsertSirIntentPayload,
-    current_sir_identity,
+    EmbeddingInput, PriorSir, SirPipeline, UpsertSirIntentPayload, current_sir_identity,
 };
 
 /// Number of embedding records to buffer before flushing to the vector store.
@@ -34,7 +35,8 @@ pub(crate) struct IngestSummary {
     pub processed: usize,
     pub skipped: usize,
     /// Results left unapplied because the symbol's SIR was written (by an injection,
-    /// say) after the batch request was built; the newer SIR stands.
+    /// say) or its source edited after the batch request was built; the newer state
+    /// stands.
     pub superseded: usize,
     pub fingerprint_rows: usize,
 }
@@ -70,6 +72,7 @@ pub(crate) fn ingest_results(
     config: &AetherConfig,
     provider: &dyn BatchProvider,
     provider_name: &str,
+    symbols_by_id: Option<&HashMap<String, Symbol>>,
 ) -> Result<IngestSummary> {
     let keymap = load_keymap(results_path, pass_config.pass.as_str());
     if !keymap.is_empty() {
@@ -78,7 +81,22 @@ pub(crate) fn ingest_results(
             "loaded batch keymap for prompt-hash recovery"
         );
     }
-    let prior_sirs = load_prior_sirs(results_path, pass_config.pass.as_str());
+    let origins = load_origins(results_path, pass_config.pass.as_str());
+    // Results carrying an origin are checked against the symbol source as it is now,
+    // so the workspace is snapshotted once here unless the caller already has one.
+    let snapshot;
+    let current_symbols = if origins.is_empty() {
+        symbols_by_id
+    } else {
+        match symbols_by_id {
+            Some(symbols) => Some(symbols),
+            None => {
+                snapshot = snapshot_workspace_symbols(workspace)
+                    .context("failed to snapshot workspace symbols for batch ingest")?;
+                Some(&snapshot)
+            }
+        }
+    };
 
     let file = std::fs::File::open(results_path)
         .with_context(|| format!("failed to open batch results {}", results_path.display()))?;
@@ -119,7 +137,8 @@ pub(crate) fn ingest_results(
                 provider,
                 provider_name,
                 &keymap,
-                &prior_sirs,
+                &origins,
+                current_symbols,
                 &line_chunk,
                 &mut summary,
                 &mut embedding_buffer,
@@ -138,7 +157,8 @@ pub(crate) fn ingest_results(
             provider,
             provider_name,
             &keymap,
-            &prior_sirs,
+            &origins,
+            current_symbols,
             &line_chunk,
             &mut summary,
             &mut embedding_buffer,
@@ -169,7 +189,8 @@ fn process_chunk(
     provider: &dyn BatchProvider,
     provider_name: &str,
     keymap: &HashMap<String, String>,
-    prior_sirs: &HashMap<String, Option<SirIdentity>>,
+    origins: &HashMap<String, BatchRequestOrigin>,
+    current_symbols: Option<&HashMap<String, Symbol>>,
     lines: &[String],
     summary: &mut IngestSummary,
     embedding_buffer: &mut Vec<SymbolEmbeddingRecord>,
@@ -188,7 +209,8 @@ fn process_chunk(
             provider,
             provider_name,
             keymap,
-            prior_sirs,
+            origins,
+            current_symbols,
         ) {
             Ok(None) => {
                 summary.superseded += 1;
@@ -310,7 +332,8 @@ fn prepare_symbol(
     provider: &dyn BatchProvider,
     provider_name: &str,
     keymap: &HashMap<String, String>,
-    prior_sirs: &HashMap<String, Option<SirIdentity>>,
+    origins: &HashMap<String, BatchRequestOrigin>,
+    current_symbols: Option<&HashMap<String, Symbol>>,
 ) -> Result<Option<PreparedSymbol>> {
     let (symbol_id, prompt_hash, request_key, sir_json, reasoning_trace) =
         match provider.parse_result_line(raw_line)? {
@@ -398,6 +421,7 @@ fn prepare_symbol(
     // embedding is only used for delta_sem in fingerprint rows.
     let previous_embedding: Option<SymbolEmbeddingRecord> = None;
 
+    let origin = origins.get(&request_key);
     let provider_kind = provider_kind_from_name(provider_name);
     let payload = UpsertSirIntentPayload {
         symbol: symbol_from_record(&symbol_record)?,
@@ -407,16 +431,17 @@ fn prepare_symbol(
         generation_pass: pass_config.pass.as_str().to_owned(),
         reasoning_trace,
         commit_hash: None,
-        prior_sir: prior_sirs
-            .get(&request_key)
-            .map_or(PriorSir::Unrecorded, |identity| {
-                PriorSir::recorded(identity.clone())
-            }),
+        prior_sir: origin.map_or(PriorSir::Unrecorded, |origin| {
+            PriorSir::recorded(origin.prior_sir.clone())
+        }),
     };
-    // The result was generated from the SIR the symbol held at build time, possibly
-    // hours ago. Under the inject lock every leaf writer shares, persist it only while
-    // the store still holds exactly that SIR (hash and history version); a symbol
-    // written since (an `aether_sir_inject` from `/scan`, say) keeps its newer SIR. The
+    // The result was generated from the SIR and the symbol source the request was built
+    // from, possibly hours ago. Under the inject lock every leaf writer shares, persist
+    // it only while the store still holds exactly that SIR (hash and history version)
+    // and the symbol's source still hashes the same; a symbol written since (an
+    // `aether_sir_inject` from `/scan`, say) keeps its newer SIR, and a symbol edited
+    // since keeps waiting for the daemon's regeneration from the new source rather than
+    // taking a SIR of the old one (which would also pre-empt that regeneration). The
     // prompt-hash promotion is a read-modify-write of the same row, so it stays under
     // the lock too: it must neither clobber a later injection's provenance nor restore
     // this result's hash over a SIR that replaced it.
@@ -430,6 +455,18 @@ fn prepare_symbol(
                 "skipping batch result: the stored SIR changed since the request was built"
             );
             return Ok(None);
+        }
+        if let Some(origin) = origin {
+            let current_source_hash = current_symbols
+                .and_then(|symbols| symbols.get(&symbol_id))
+                .map(|symbol| symbol.content_hash.as_str());
+            if current_source_hash != Some(origin.source_hash.as_str()) {
+                tracing::info!(
+                    symbol_id = %symbol_id,
+                    "skipping batch result: the symbol source changed since the request was built"
+                );
+                return Ok(None);
+            }
         }
         let persisted = pipeline
             .persist_sir_payload_into_sqlite(store, &payload, None)
@@ -524,19 +561,19 @@ fn prompt_hash_meta_record(
     }
 }
 
-/// Try to load the prior-SIR sidecar written during JSONL build (see
-/// `BuildSummary::prior_sirs`). A batch built without one is ingested unchecked.
-fn load_prior_sirs(results_path: &Path, pass: &str) -> HashMap<String, Option<SirIdentity>> {
+/// Try to load the origin sidecar written during JSONL build (see
+/// `BuildSummary::origins`). A batch built without one is ingested unchecked.
+fn load_origins(results_path: &Path, pass: &str) -> HashMap<String, BatchRequestOrigin> {
     let Some(batch_dir) = results_path.parent() else {
         return HashMap::new();
     };
-    let prior_path = batch_dir.join(prior_sir_sidecar_name(pass));
-    match std::fs::read_to_string(&prior_path) {
+    let origin_path = batch_dir.join(origin_sidecar_name(pass));
+    match std::fs::read_to_string(&origin_path) {
         Ok(content) => serde_json::from_str(&content).unwrap_or_else(|err| {
             tracing::warn!(
-                path = %prior_path.display(),
+                path = %origin_path.display(),
                 error = %err,
-                "failed to parse batch prior-SIR sidecar, results are ingested unchecked"
+                "failed to parse batch origin sidecar, results are ingested unchecked"
             );
             HashMap::new()
         }),
@@ -630,7 +667,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use aether_store::{SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord};
+    use aether_store::{SirIdentity, SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord};
     use async_trait::async_trait;
     use tempfile::tempdir;
 
@@ -822,7 +859,15 @@ vector_backend = "sqlite"
         persist(&demo_sir(), "scan");
         let built_against = current_sir_identity(&store, "sym-late").expect("identity");
         let key = "sym-late|prompt-late|build-1".to_owned();
-        let prior_sirs = HashMap::from([(key.clone(), built_against)]);
+        let source_hash = symbol.content_hash.clone();
+        let origins = HashMap::from([(
+            key.clone(),
+            BatchRequestOrigin {
+                prior_sir: built_against,
+                source_hash: source_hash.clone(),
+            },
+        )]);
+        let current_symbols = HashMap::from([("sym-late".to_owned(), symbol.clone())]);
 
         // ...and an injection replaced it before the result came back.
         let reviewed = SirAnnotation {
@@ -850,7 +895,8 @@ vector_backend = "sqlite"
             &provider,
             "gemini",
             &HashMap::new(),
-            &prior_sirs,
+            &origins,
+            Some(&current_symbols),
         )
         .expect("prepare symbol");
         assert!(
@@ -872,8 +918,23 @@ vector_backend = "sqlite"
             "no provenance from the skipped result"
         );
 
-        // Built against the SIR the store still holds, the result is applied.
-        let prior_sirs = HashMap::from([(key, reviewed_identity)]);
+        // Built against the SIR the store still holds but a source since edited (same
+        // id, different body), the result is not applied either: the daemon's
+        // regeneration from the new source must not be pre-empted by a SIR of the old.
+        let origins = HashMap::from([(
+            key.clone(),
+            BatchRequestOrigin {
+                prior_sir: reviewed_identity.clone(),
+                source_hash: source_hash.clone(),
+            },
+        )]);
+        let edited_symbols = HashMap::from([(
+            "sym-late".to_owned(),
+            Symbol {
+                content_hash: aether_core::content_hash("fn late() { edited }"),
+                ..symbol.clone()
+            },
+        )]);
         let outcome = prepare_symbol(
             &pipeline,
             &store,
@@ -882,7 +943,35 @@ vector_backend = "sqlite"
             &provider,
             "gemini",
             &HashMap::new(),
-            &prior_sirs,
+            &origins,
+            Some(&edited_symbols),
+        )
+        .expect("prepare symbol");
+        assert!(
+            outcome.is_none(),
+            "a result for an edited source is not applied"
+        );
+        assert_eq!(
+            store
+                .get_sir_meta("sym-late")
+                .expect("load sir meta")
+                .expect("sir meta exists")
+                .generation_pass,
+            "injected"
+        );
+
+        // Built against the SIR and source the workspace still holds, the result is
+        // applied.
+        let outcome = prepare_symbol(
+            &pipeline,
+            &store,
+            &triage_pass_config(),
+            "ignored",
+            &provider,
+            "gemini",
+            &HashMap::new(),
+            &origins,
+            Some(&current_symbols),
         )
         .expect("prepare symbol");
         assert!(outcome.is_some());
@@ -941,6 +1030,7 @@ vector_backend = "sqlite"
             "gemini",
             &HashMap::new(),
             &HashMap::new(),
+            None,
         )
         .expect("prepare symbol")
         .expect("result applied");

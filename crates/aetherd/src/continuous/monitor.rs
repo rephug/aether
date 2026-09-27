@@ -229,6 +229,7 @@ fn run_monitor_once_inner(
                     config,
                     provider.as_ref(),
                     provider.name(),
+                    Some(&current_symbols),
                 )?;
                 ingested_results += ingest_summary.processed;
                 fingerprint_rows += ingest_summary.fingerprint_rows;

@@ -632,6 +632,11 @@ impl VectorStore for LanceVectorStore {
             return Ok(false);
         }
         let connection = self.connect().await?;
+        let destination = table_name_for(
+            record.provider.as_str(),
+            record.model.as_str(),
+            record.embedding.len() as i32,
+        );
         let guard = expected.map(|observed| {
             format!(
                 "target.sir_hash = '{}' AND target.provider = '{}' AND target.model = '{}' AND target.updated_at = {}",
@@ -641,8 +646,23 @@ impl VectorStore for LanceVectorStore {
                 observed.updated_at
             )
         });
-        let matched = match guard.as_deref() {
-            Some(condition) => MatchedArm::OnlyWhen(condition),
+        let matched = match expected {
+            Some(observed)
+                if table_name_for(
+                    observed.provider.as_str(),
+                    observed.model.as_str(),
+                    observed.embedding_dim as i32,
+                ) == destination =>
+            {
+                MatchedArm::OnlyWhen(guard.as_deref().unwrap_or_default())
+            }
+            // The observed vector lives in another table: the symbol is returning to an
+            // identity it used before (embedding configuration A → B → A). The cross-table
+            // check above already holds, and any row the destination table still holds
+            // for the symbol is a leftover from before that identity was left, never the
+            // observed vector, so it is replaced outright rather than guarded by the
+            // observed vector's identity, which no row in this table can carry.
+            Some(_) => MatchedArm::Always,
             None => MatchedArm::Skip,
         };
         self.upsert_embedding_with_connection_when(&connection, &record, matched, true)
