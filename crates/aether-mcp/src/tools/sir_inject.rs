@@ -571,11 +571,14 @@ impl AetherMcpServer {
             Ok(pipeline) => pipeline,
             Err(err) => return format!("failed: {err:#}"),
         };
+        // Missing metadata counts as superseded too: the indexer deletes a removed
+        // symbol's SIR and embedding without taking these locks, and a vector written
+        // for it afterwards would be an orphan nothing ever cleans up.
         let store = self.state.store.as_ref();
         let mut still_current = || -> anyhow::Result<bool> {
             Ok(store
                 .get_sir_meta(symbol_id)?
-                .is_none_or(|meta| meta.sir_hash == sir_hash))
+                .is_some_and(|meta| meta.sir_hash == sir_hash))
         };
         match pipeline.refresh_embedding_if_current(
             symbol_id,

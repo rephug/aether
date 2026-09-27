@@ -87,7 +87,18 @@ pub fn run_init_agent(workspace: &Path, options: InitAgentOptions) -> Result<Ini
                     skipped_existing_files.push(file.relative_path);
                     continue;
                 }
-                McpMerge::NotJson => {}
+                // Not something we can extend (invalid JSON, JSON with comments, a
+                // non-object root): even --force must not replace it with the AETHER
+                // entry alone, since that would silently drop every other server the
+                // project registered there. Report it and leave the file as it is.
+                McpMerge::NotJson => {
+                    anyhow::bail!(
+                        "{} exists but is not a JSON object with a \"mcpServers\" object, so the \"{}\" entry cannot be merged into it and the file was left untouched; fix the file or add this entry by hand:\n{}",
+                        absolute_path.display(),
+                        MCP_SERVER_KEY,
+                        file.content.trim_end()
+                    );
+                }
             }
         } else if absolute_path.exists() && !options.force {
             skipped_existing_files.push(file.relative_path);
@@ -556,6 +567,56 @@ mod tests {
             "an up-to-date .mcp.json must not fail a forced regeneration"
         );
         assert_eq!(repeated.exit_code(), 0);
+    }
+
+    #[test]
+    fn init_agent_force_leaves_an_unparseable_mcp_json_untouched() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        // JSON with comments: a real editor setting, but not something serde_json reads.
+        let original = "{\n  // registered by hand\n  \"mcpServers\": { \"other\": { \"command\": \"other-mcp\" } }\n}\n";
+        fs::write(workspace.join(".mcp.json"), original).expect("seed .mcp.json");
+
+        // Without --force the file is simply reported as existing.
+        let outcome = run_init_agent(
+            workspace,
+            InitAgentOptions {
+                platform: AgentPlatform::Claude,
+                force: false,
+            },
+        )
+        .expect("init-agent should succeed");
+        assert!(
+            outcome
+                .skipped_existing_files
+                .contains(&std::path::PathBuf::from(".mcp.json"))
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join(".mcp.json")).unwrap(),
+            original
+        );
+
+        // With --force the merge cannot be done safely: an error names the file and
+        // carries the entry to add by hand, and the other registrations survive.
+        let err = run_init_agent(
+            workspace,
+            InitAgentOptions {
+                platform: AgentPlatform::Claude,
+                force: true,
+            },
+        )
+        .expect_err("forced init-agent must not clobber an unparseable .mcp.json");
+        let message = format!("{err:#}");
+        assert!(message.contains(".mcp.json"), "{message}");
+        assert!(message.contains("left untouched"), "{message}");
+        assert!(message.contains("\"aether\""), "{message}");
+        assert_eq!(
+            fs::read_to_string(workspace.join(".mcp.json")).unwrap(),
+            original,
+            "the shared MCP configuration must survive a forced regeneration"
+        );
+        // The other generated assets were still refreshed before the error.
+        assert!(workspace.join("CLAUDE.md").exists());
     }
 
     #[test]
