@@ -584,26 +584,118 @@ fn build_job_records_the_hash_of_the_text_it_read_for_the_prompt() {
         SymbolKind::Function,
         snapshot_source,
     );
-    // The file was edited after the snapshot the symbol came from: the job must carry
-    // the hash of what it read, not the snapshot's hash, and of the full text even when
-    // the prompt text is truncated.
+    // The file was edited after the snapshot the symbol came from: the recorded range
+    // now covers other text, so the job is refused rather than prompting on that text.
     let edited_source = "fn late() { edited }\n";
     fs::create_dir_all(workspace.join("src")).expect("create src");
     fs::write(workspace.join("src/lib.rs"), edited_source).expect("write source");
     let mut edited_symbol = symbol.clone();
     edited_symbol.range.end_byte = Some(edited_source.len());
     edited_symbol.range.end.column = edited_source.trim_end().len() + 1;
+    let err = build_job(workspace, edited_symbol, None, Some(8))
+        .err()
+        .expect("a symbol whose text changed since indexing must be refused");
+    assert!(
+        format!("{err:#}").contains("changed since it was indexed"),
+        "unexpected error: {err:#}"
+    );
 
-    let job = build_job(workspace, edited_symbol.clone(), None, Some(8)).expect("build job");
-    assert_eq!(job.symbol_text, "fn late(");
-    assert_eq!(job.source_hash, content_hash(edited_source));
-    assert_ne!(job.source_hash, symbol.content_hash);
-
-    // With the file as the snapshot saw it, the two agree.
+    // With the file as the snapshot saw it, the job carries the hash of the full text
+    // it read (the parser's hash), even when the prompt text is truncated.
     fs::write(workspace.join("src/lib.rs"), snapshot_source).expect("restore source");
-    let job = build_job(workspace, symbol.clone(), None, None).expect("build job");
+    let job = build_job(workspace, symbol.clone(), None, Some(8)).expect("build job");
+    assert_eq!(job.symbol_text, "fn late(");
     assert_eq!(job.source_hash, content_hash(snapshot_source));
     assert_eq!(job.source_hash, symbol.content_hash);
+}
+
+#[test]
+fn a_failed_generation_marks_only_the_sir_it_started_from_stale() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    write_embeddings_only_config(workspace);
+
+    let store = SqliteStore::open(workspace).expect("open store");
+    let pipeline = build_write_pipeline(workspace, Arc::new(PanicInferenceProvider));
+    let symbol_id = "sym-failed";
+    store
+        .upsert_symbol(demo_symbol(symbol_id, "demo::failed"))
+        .expect("upsert symbol");
+    let symbol = demo_type_symbol(
+        symbol_id,
+        "failed",
+        "demo::failed",
+        "src/lib.rs",
+        SymbolKind::Function,
+        "fn failed() {}\n",
+    );
+    let placeholder = demo_sir();
+    pipeline
+        .persist_sir_payload_into_sqlite(
+            &store,
+            &payload_for(&symbol, &placeholder, SIR_GENERATION_PASS_SCAN),
+            None,
+        )
+        .expect("persist placeholder");
+    let started_from = current_sir_identity(&store, symbol_id).expect("identity");
+
+    // While the job ran, an injection replaced the placeholder with a reviewed SIR.
+    let reviewed = SirAnnotation {
+        intent: "Reviewed by hand".to_owned(),
+        confidence: 0.97,
+        ..demo_sir()
+    };
+    pipeline
+        .persist_sir_payload_into_sqlite(&store, &payload_for(&symbol, &reviewed, "injected"), None)
+        .expect("inject");
+
+    // The job's failure must not mark the reviewed SIR stale or rewrite its provenance.
+    pipeline
+        .handle_failed_generation(
+            &store,
+            infer::FailedSirGeneration {
+                symbol: symbol.clone(),
+                error_message: "provider timed out".to_owned(),
+                prior_sir: started_from,
+            },
+            SIR_GENERATION_PASS_SCAN,
+            false,
+            &mut std::io::sink(),
+        )
+        .expect("handle failure");
+    let meta = store
+        .get_sir_meta(symbol_id)
+        .expect("meta")
+        .expect("meta exists");
+    assert_eq!(meta.sir_status, SIR_STATUS_FRESH);
+    assert_eq!(meta.generation_pass, "injected");
+    assert_eq!(meta.last_error, None);
+
+    // A failure against the SIR the store still holds is recorded on it.
+    pipeline
+        .handle_failed_generation(
+            &store,
+            infer::FailedSirGeneration {
+                symbol,
+                error_message: "provider timed out".to_owned(),
+                prior_sir: current_sir_identity(&store, symbol_id).expect("identity"),
+            },
+            SIR_GENERATION_PASS_SCAN,
+            false,
+            &mut std::io::sink(),
+        )
+        .expect("handle failure");
+    let meta = store
+        .get_sir_meta(symbol_id)
+        .expect("meta")
+        .expect("meta exists");
+    assert_eq!(meta.sir_status, SIR_STATUS_STALE);
+    assert_eq!(meta.last_error.as_deref(), Some("provider timed out"));
+    assert_eq!(
+        meta.sir_hash,
+        sir_hash(&reviewed),
+        "the reviewed SIR itself stays"
+    );
 }
 
 #[test]

@@ -54,6 +54,9 @@ pub(super) struct GeneratedSir {
 pub(super) struct FailedSirGeneration {
     pub(super) symbol: Symbol,
     pub(super) error_message: String,
+    /// See `SirJob::prior_sir`: the failure is recorded on the symbol's metadata only
+    /// while the store still holds this SIR, never on one written since.
+    pub(super) prior_sir: Option<SirIdentity>,
 }
 
 #[derive(Debug)]
@@ -82,6 +85,17 @@ pub(crate) fn build_job(
             )
         })?;
     let source_hash = content_hash(&symbol_text);
+    // The symbol's range came from the parser's view of the file. If the file changed
+    // since, the range may now cover other bytes: hashing and prompting on those would
+    // describe the wrong slice, and the persist-time source check, using the same stale
+    // range, could not tell. Refuse the job until the symbol is re-indexed.
+    if source_hash != symbol.content_hash {
+        return Err(anyhow!(
+            "source for {} in {} changed since it was indexed (the recorded range no longer covers the text it was recorded for); skipping until the symbol is re-indexed",
+            symbol.qualified_name,
+            symbol.file_path,
+        ));
+    }
     let effective_limit = match max_chars {
         Some(0) | None => MAX_SYMBOL_TEXT_CHARS,
         Some(value) => value,
@@ -224,6 +238,7 @@ pub(super) async fn generate_sir_jobs(
                     return SirGenerationOutcome::Failure(Box::new(FailedSirGeneration {
                         symbol,
                         error_message: "inference semaphore closed".to_owned(),
+                        prior_sir,
                     }));
                 }
             };
@@ -315,8 +330,9 @@ pub(super) async fn generate_sir_jobs(
                         })),
                         Err(fallback_err) => {
                             SirGenerationOutcome::Failure(Box::new(FailedSirGeneration {
-                            symbol,
-                            error_message: format!("{fallback_err:#}"),
+                                symbol,
+                                error_message: format!("{fallback_err:#}"),
+                                prior_sir,
                             }))
                         }
                     }
@@ -324,6 +340,7 @@ pub(super) async fn generate_sir_jobs(
                 Err(err) => SirGenerationOutcome::Failure(Box::new(FailedSirGeneration {
                     symbol,
                     error_message: format!("{err:#}"),
+                    prior_sir,
                 })),
             }
         });

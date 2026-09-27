@@ -673,6 +673,15 @@ fn extract_symbol_text(
             ))
         })?;
     let source_hash = aether_core::content_hash(&symbol_text);
+    // The range came from the parser's view of the file; if the text it now covers is
+    // not what the symbol was recorded for, the file changed since indexing and the
+    // prompt would describe the wrong slice.
+    if source_hash != symbol.content_hash {
+        return Err(AetherMcpError::Message(format!(
+            "source for {} ({}) changed since it was indexed; re-index before a deep scan",
+            symbol.qualified_name, symbol.file_path
+        )));
+    }
     if symbol_text.len() > MAX_SYMBOL_TEXT_CHARS {
         let truncated = symbol_text
             .char_indices()

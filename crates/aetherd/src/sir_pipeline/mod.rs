@@ -1485,9 +1485,21 @@ impl SirPipeline {
         out: &mut dyn Write,
     ) -> Result<()> {
         let last_attempt_at = unix_timestamp_secs();
+        // The failure belongs to the SIR the job started from. Under the inject lock,
+        // mark only that SIR stale: a SIR another writer stored meanwhile (an injection
+        // from `/scan`, say) is not stale for having outlived an unrelated model error.
+        let _inject_guard = acquire_inject_write_lock(&self.workspace_root)?;
         let previous_meta = store
             .get_sir_meta(&failed.symbol.id)
             .with_context(|| format!("failed to load SIR metadata for {}", failed.symbol.id))?;
+        if previous_meta.as_ref().map(SirIdentity::of) != failed.prior_sir {
+            tracing::info!(
+                symbol_id = %failed.symbol.id,
+                error = %failed.error_message,
+                "SIR generation failed, but the stored SIR changed meanwhile; leaving it as written"
+            );
+            return Ok(());
+        }
 
         let stale_meta = previous_meta.map_or_else(
             || SirMetaRecord {
