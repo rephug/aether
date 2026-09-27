@@ -13,7 +13,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use super::{AetherMcpServer, LiveSourceHashes, current_unix_timestamp};
+use super::{AetherMcpServer, LiveSymbolSources, current_unix_timestamp};
 use crate::AetherMcpError;
 
 const FORCE_CONFIDENCE_THRESHOLD: f32 = 0.5;
@@ -296,7 +296,7 @@ impl AetherMcpServer {
             .map(str::trim)
             .filter(|hash| !hash.is_empty())
         {
-            let mut live = LiveSourceHashes::new(&self.state.workspace);
+            let mut live = LiveSymbolSources::new(&self.state.workspace);
             match live.hash_for(symbol.file_path.as_str(), symbol_id.as_str())? {
                 Some(current) if current == expected => {}
                 Some(_) => {
@@ -1097,22 +1097,26 @@ vector_backend = "sqlite"
         }
         let server = AetherMcpServer::new(workspace, false).expect("server");
 
-        // The lookup reports the hash of the text as the file holds it now.
+        // The lookup reports the hash of the text as the file holds it now, and, by id
+        // with `include_source`, the very text that hash was computed from.
         let lookup = server
             .aether_symbol_lookup_logic(crate::AetherSymbolLookupRequest {
-                query: symbol.qualified_name.clone(),
-                limit: Some(5),
+                query: String::new(),
+                limit: None,
+                symbol_ids: Some(vec![symbol.id.clone(), "no-such-symbol".to_owned()]),
+                include_source: Some(true),
             })
             .expect("lookup");
-        let found = lookup
-            .matches
-            .iter()
-            .find(|entry| entry.symbol_id == symbol.id)
-            .expect("lookup match");
+        assert_eq!(lookup.matches.len(), 1, "unknown ids are left out");
+        let found = &lookup.matches[0];
+        assert_eq!(found.symbol_id, symbol.id);
         assert_eq!(
             found.source_hash.as_deref(),
             Some(symbol.content_hash.as_str())
         );
+        let text = found.source_text.as_deref().expect("source text");
+        assert!(text.contains("fn target()"), "text: {text}");
+        assert_eq!(aether_core::content_hash(text), symbol.content_hash);
 
         let request = |source_hash: Option<String>| AetherSirInjectRequest {
             symbol: symbol.id.clone(),
@@ -1165,6 +1169,8 @@ vector_backend = "sqlite"
             .aether_symbol_lookup_logic(crate::AetherSymbolLookupRequest {
                 query: symbol.qualified_name.clone(),
                 limit: Some(5),
+                symbol_ids: None,
+                include_source: None,
             })
             .expect("lookup");
         let current = lookup

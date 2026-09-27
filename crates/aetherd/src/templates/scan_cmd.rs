@@ -76,16 +76,20 @@ label (it may read `dir:web` or `shared` for a synthetic unit).
    assumes a `crates/<crate>/` layout, so filter on `file_path` yourself. Never pass
    `batch-size` as `top_n`.
 3. Take the first `batch-size` targets and group them by source file.
-4. Work in batches of 10 symbols per reasoning turn: for each source file call
-   `aether_symbol_lookup` once with the file path (`limit: 100`) to get every target's
-   current `source_hash`, read the file ONCE, produce the SIRs for all of its symbols
-   together, then fire every `aether_sir_inject` call for the batch (intent, behavior,
-   inputs, outputs, side_effects, dependencies, error_modes, complexity, confidence,
-   the symbol's `source_hash`, and `generation_pass: "scan"`, `provider: "claude-code"`,
-   `model: "<your model>"`). The `source_hash` binds the SIR to the text you read: the
-   inject is refused if the file changed in between (the error says the source changed
-   since it was read, or that the file no longer declares the symbol); skip such a
-   symbol for this round, the daemon regenerates it from the new source.
+4. Work in batches of 10 symbols per reasoning turn: for each source file in the batch
+   call `aether_symbol_lookup` ONCE with `symbol_ids` set to the batch's target ids in
+   that file (from step 2; exact ids, so a file with hundreds of symbols hides none) and
+   `include_source: true`. Each match returns `source_text` and `source_hash` from one
+   read of the file: reason over that `source_text` (do not read the file separately,
+   the hash must describe the text you reasoned about), produce the SIRs for all of the
+   file's symbols together, then fire every `aether_sir_inject` call for the batch
+   (intent, behavior, inputs, outputs, side_effects, dependencies, error_modes,
+   complexity, confidence, the symbol's `source_hash`, and `generation_pass: "scan"`,
+   `provider: "claude-code"`, `model: "<your model>"`). The `source_hash` binds the SIR
+   to that text: the inject is refused if the file changed in between (the error says
+   the source changed since it was read, or that the file no longer declares the
+   symbol); skip such a symbol for this round, the daemon regenerates it from the new
+   source. A target the lookup does not return was removed from the index: skip it.
 5. Target confidence 0.7–0.8 for scan-level SIRs. Use `force: true` only when replacing a
    `[MOCK]` placeholder that somehow carries a higher confidence. If an inject call
    returns an error saying the SIR was written but the file rollup could not be rebuilt,
@@ -104,17 +108,17 @@ label (it may read `dir:web` or `shared` for a synthetic unit).
 2. Don't skip symbols. Every symbol deserves at least a basic SIR.
    Even trivial getters get a scan-level annotation.
 3. Don't call aether_sir_context. That's the expensive cross-symbol
-   lookup. Save it for /enrich. Just read the source file.
+   lookup. Save it for /enrich. The `source_text` from step 4 is all you need.
 4. Don't write reasoning traces. They're valuable but eat context.
    Save them for /enrich deep passes.
 5. DO flag anything suspicious. If you spot a potential bug while
    scanning, note it in error_modes but don't deep-dive.
-6. Batch aggressively. Read 10 source files at once, produce all 10
+6. Batch aggressively. Fetch the batch's sources at once, produce all 10
    SIRs in a single reasoning step, then fire off all 10 inject
    calls. Per-turn overhead is the bottleneck — minimize turns, not
    tokens.
-7. Group by file. When multiple symbols share a source file, read the
-   file once and analyze all its symbols together. This is the single
+7. Group by file. When multiple symbols share a source file, fetch them
+   in one lookup and analyze all its symbols together. This is the single
    biggest throughput win.
 "#
         .to_owned()

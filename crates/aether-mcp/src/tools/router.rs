@@ -53,7 +53,7 @@ impl AetherMcpServer {
 
     #[tool(
         name = "aether_symbol_lookup",
-        description = "Lookup symbols by qualified name or file path. Each match carries source_hash, the content hash of the symbol's source as the file holds it now; pass it to aether_sir_inject to bind the injection to the text you read."
+        description = "Lookup symbols by qualified name or file path, or fetch exact symbol_ids (up to 200, not subject to limit). Each match carries source_hash, the content hash of the symbol's source as the file holds it now; with include_source it also carries source_text, the text that hash was computed from. Reason over source_text and pass source_hash to aether_sir_inject to bind the injection to exactly that text."
     )]
     pub async fn aether_symbol_lookup(
         &self,

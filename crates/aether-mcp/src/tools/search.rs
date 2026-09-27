@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    AetherMcpServer, LiveSourceHashes, child_method_symbols, effective_limit, is_type_symbol_kind,
+    AetherMcpServer, LiveSymbolSources, child_method_symbols, effective_limit, is_type_symbol_kind,
     symbol_leaf_name,
 };
 use crate::state::semantic_search_unavailability;
@@ -28,9 +28,24 @@ use crate::{AetherMcpError, SearchMode};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherSymbolLookupRequest {
+    /// Lexical query over symbol ids, qualified names, file paths, languages and kinds.
+    /// Ignored when `symbol_ids` is given.
     pub query: String,
     pub limit: Option<u32>,
+    /// Exact symbol ids to return instead of a query's matches (up to 200), in the order
+    /// given and without the lexical `limit`: a `/scan` batch fetches its targets' current
+    /// source this way, so a file with more indexed symbols than the limit cannot hide any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol_ids: Option<Vec<String>>,
+    /// Also return each match's `source_text`, the exact text its `source_hash` was
+    /// computed from (one read of the file), so a SIR reasoned from that text can be
+    /// injected with that hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_source: Option<bool>,
 }
+
+/// Upper bound on `symbol_ids` per lookup call.
+pub const SYMBOL_LOOKUP_MAX_IDS: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherSymbolLookupMatch {
@@ -46,6 +61,9 @@ pub struct AetherSymbolLookupMatch {
     /// SIR written for the text you read is refused if that text has since changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_hash: Option<String>,
+    /// The text `source_hash` was computed from, when `include_source` was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -195,6 +213,7 @@ impl From<SymbolSearchResult> for AetherSymbolLookupMatch {
             kind: value.kind,
             semantic_score: None,
             source_hash: None,
+            source_text: None,
         }
     }
 }
@@ -209,6 +228,7 @@ impl From<SymbolRecord> for AetherSymbolLookupMatch {
             kind: value.kind,
             semantic_score: None,
             source_hash: None,
+            source_text: None,
         }
     }
 }
@@ -247,12 +267,23 @@ impl AetherMcpServer {
         request: AetherSymbolLookupRequest,
     ) -> Result<AetherSymbolLookupResponse, AetherMcpError> {
         let limit = effective_limit(request.limit);
-        let mut matches = self.lexical_search_matches(&request.query, limit)?;
-        // The hashes come from the files as they are now, not from the index, so a
-        // caller can bind a later `aether_sir_inject` to the exact text it read.
-        let mut live = LiveSourceHashes::new(&self.state.workspace);
+        let mut matches = match request.symbol_ids.as_deref() {
+            Some(ids) => self.symbol_matches_by_id(ids)?,
+            None => self.lexical_search_matches(&request.query, limit)?,
+        };
+        // The hashes (and texts) come from the files as they are now, not from the
+        // index, and both from one read per file, so a caller can reason over
+        // `source_text` and bind the resulting `aether_sir_inject` to exactly that text.
+        let include_source = request.include_source.unwrap_or(false);
+        let mut live = LiveSymbolSources::new(&self.state.workspace);
         for entry in &mut matches {
-            entry.source_hash = live.hash_for(&entry.file_path, &entry.symbol_id)?;
+            let Some(source) = live.source_for(&entry.file_path, &entry.symbol_id)? else {
+                continue;
+            };
+            entry.source_hash = Some(source.source_hash.clone());
+            if include_source {
+                entry.source_text = Some(source.source_text.clone());
+            }
         }
         let envelope = SearchEnvelope {
             mode_requested: SearchMode::Lexical,
@@ -617,6 +648,35 @@ impl AetherMcpServer {
         ))
     }
 
+    /// The indexed symbols with exactly these ids, in the order given; ids the index does
+    /// not hold are left out. Not subject to the lexical `limit`.
+    fn symbol_matches_by_id(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<AetherSymbolLookupMatch>, AetherMcpError> {
+        if ids.len() > SYMBOL_LOOKUP_MAX_IDS {
+            return Err(AetherMcpError::Message(format!(
+                "symbol_ids holds {} ids; at most {SYMBOL_LOOKUP_MAX_IDS} per call",
+                ids.len()
+            )));
+        }
+        if !self.sqlite_path().exists() {
+            return Ok(Vec::new());
+        }
+        let store = self.state.store.as_ref();
+        let mut matches = Vec::with_capacity(ids.len());
+        for id in ids {
+            let id = id.trim();
+            if id.is_empty() {
+                continue;
+            }
+            if let Some(record) = store.get_symbol_record(id)? {
+                matches.push(AetherSymbolLookupMatch::from(record));
+            }
+        }
+        Ok(matches)
+    }
+
     fn lexical_search_matches(
         &self,
         query: &str,
@@ -721,6 +781,7 @@ impl AetherMcpServer {
                 kind: symbol.kind,
                 semantic_score: Some(candidate.semantic_score),
                 source_hash: None,
+                source_text: None,
             });
         }
         if matches.is_empty() {

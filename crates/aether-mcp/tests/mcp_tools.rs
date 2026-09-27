@@ -402,6 +402,8 @@ vector_backend = "sqlite"
             server.aether_symbol_lookup(Parameters(AetherSymbolLookupRequest {
                 query: "alpha".to_owned(),
                 limit: None,
+                symbol_ids: None,
+                include_source: None,
             })),
         )
         .map_err(|err| anyhow::anyhow!(err.to_string()))?

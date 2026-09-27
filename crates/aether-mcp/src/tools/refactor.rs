@@ -9,7 +9,7 @@ use aether_analysis::{
     prepare_refactor_prep, verify_intent_snapshot,
 };
 use aether_config::InferenceProviderKind;
-use aether_core::{Position, SourceRange, normalize_path};
+use aether_core::normalize_path;
 use aether_infer::{
     InferenceProvider, ProviderOverrides, SirContext, load_provider_from_env_or_mock, sir_prompt,
 };
@@ -26,7 +26,9 @@ use aetherd::sir_pipeline::{
     current_source_hash,
 };
 
-use super::{AetherMcpServer, MCP_SCHEMA_VERSION, current_unix_timestamp};
+use super::{
+    AetherMcpServer, MCP_SCHEMA_VERSION, current_unix_timestamp, extract_symbol_source_text,
+};
 use crate::AetherMcpError;
 
 const INFERENCE_MAX_RETRIES: usize = 2;
@@ -692,45 +694,6 @@ fn extract_symbol_text(
         symbol_text.truncate(truncated);
     }
     Ok((symbol_text, source_hash))
-}
-
-fn extract_symbol_source_text(source: &str, range: SourceRange) -> Option<String> {
-    let start = range
-        .start_byte
-        .or_else(|| byte_offset_for_position(source, range.start))?;
-    let end = range
-        .end_byte
-        .or_else(|| byte_offset_for_position(source, range.end))?;
-    if start > end || end > source.len() {
-        return None;
-    }
-    source.get(start..end).map(str::to_owned)
-}
-
-fn byte_offset_for_position(source: &str, position: Position) -> Option<usize> {
-    let mut line = 1usize;
-    let mut column = 1usize;
-    if position.line == 1 && position.column == 1 {
-        return Some(0);
-    }
-
-    for (index, ch) in source.char_indices() {
-        if line == position.line && column == position.column {
-            return Some(index);
-        }
-        if ch == '\n' {
-            line += 1;
-            column = 1;
-        } else {
-            column += ch.len_utf8();
-        }
-    }
-
-    if line == position.line && column == position.column {
-        Some(source.len())
-    } else {
-        None
-    }
 }
 
 async fn generate_sir_from_prompt_with_retries(
