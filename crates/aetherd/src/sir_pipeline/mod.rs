@@ -2923,12 +2923,24 @@ impl SirPipeline {
         load_file_leaf_sirs(store, file_path)
     }
 
+    /// Retire a file's rollup because the file has no leaf SIRs left. Runs under the
+    /// workspace inject lock and re-checks the leaves there: an `aether_sir_inject` call
+    /// may have written a leaf and rebuilt the rollup since the file was snapshotted as
+    /// empty, and that rollup must stay.
     fn remove_file_rollup(
         &self,
         store: &SqliteStore,
         file_path: &str,
         language: Language,
     ) -> Result<()> {
+        let _inject_guard = acquire_inject_write_lock(&self.workspace_root)?;
+        if !load_file_leaf_sirs(store, file_path)?.is_empty() {
+            tracing::info!(
+                file_path = %file_path,
+                "keeping file rollup: leaves were written since the file was seen empty"
+            );
+            return Ok(());
+        }
         let rollup_id = synthetic_file_sir_id(language.as_str(), file_path);
         store
             .mark_removed(&rollup_id)

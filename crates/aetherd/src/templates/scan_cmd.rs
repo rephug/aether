@@ -21,7 +21,7 @@ passes) is a comma-separated list of project-relative paths, each marked with a 
 `+` (an include) or `-` (an exclude), so a path that itself starts with `-` is still an
 include when written `+-src`. Split the list on commas first, then percent-decode each
 entry and the `<crate>` label (`%2C` is a comma inside a path, `%20` a space, `%09` a
-tab, `%5C` a backslash, `%25` a percent sign): `+packages/foo%2Cbar` is the single directory
+tab, `%0A` a newline, `%5C` a backslash, `%25` a percent sign): `+packages/foo%2Cbar` is the single directory
 `packages/foo,bar`. Use exactly those scopes and skip step 1; `<crate>` is then only a
 label (it may read `dir:web` or `shared` for a synthetic unit).
 

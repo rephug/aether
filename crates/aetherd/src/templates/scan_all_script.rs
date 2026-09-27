@@ -56,12 +56,21 @@ mkdir -p "$LOG_DIR"
 
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$MASTER_LOG"; }
 
-# Unit names and scopes travel through a tab-separated table, a comma-separated list and
-# a whitespace-tokenized /scan prompt, so each is percent-encoded the moment it is
-# produced (`%` first, then `\`, tab, `,` and space) and decoded only where a real path
-# is needed (existence checks, SQL, human-readable log lines); /scan decodes its copy.
+# Unit names and scopes travel through a line- and tab-separated table, a comma-separated
+# list and a whitespace-tokenized /scan prompt, so each is percent-encoded the moment it
+# is produced (`%` first, then `\`, tab, newline, `,` and space) and decoded only where a
+# real path is needed (existence checks, SQL, human-readable log lines); /scan decodes
+# its copy. Index rows are encoded inside the SQL query itself, before they are read
+# line by line.
 pct_encode() {
-  printf '%s' "$1" | sed -e 's/%/%25/g' -e 's/\\/%5C/g' -e "s/$(printf '\t')/%09/g" -e 's/,/%2C/g' -e 's/ /%20/g'
+  local s="$1"
+  s="${s//%/%25}"
+  s="${s//\\/%5C}"
+  s="${s//$'\t'/%09}"
+  s="${s//$'\n'/%0A}"
+  s="${s//,/%2C}"
+  s="${s// /%20}"
+  printf '%s' "$s"
 }
 pct_decode() {
   local s="$1"
@@ -132,10 +141,11 @@ if ! mcp_registered; then
 fi
 
 # Top-level directories (or root-level files) that hold indexed symbols, straight from
-# the index: the units of a project without Cargo, and the extra units of a mixed project
-# (TypeScript/Python sources beside Rust packages).
+# the index, one percent-encoded value per line (encoded by the query, so a newline
+# inside a path cannot split its row): the units of a project without Cargo, and the
+# extra units of a mixed project (TypeScript/Python sources beside Rust packages).
 index_top_level_scopes() {
-  run_sql "SELECT DISTINCT CASE WHEN instr(file_path, '/') > 0 THEN substr(file_path, 1, instr(file_path, '/') - 1) ELSE file_path END FROM symbols ORDER BY 1;" | awk 'length($0) > 0'
+  run_sql "SELECT DISTINCT replace(replace(replace(replace(replace(replace(top, '%', '%25'), '\\', '%5C'), char(9), '%09'), char(10), '%0A'), ',', '%2C'), ' ', '%20') FROM (SELECT CASE WHEN instr(file_path, '/') > 0 THEN substr(file_path, 1, instr(file_path, '/') - 1) ELSE file_path END AS top FROM symbols) ORDER BY 1;" | awk 'length($0) > 0'
 }
 
 # Prints "name<TAB>scope[<TAB>scope...]" per scan unit, name and scopes percent-encoded
@@ -167,7 +177,15 @@ discover_packages() {
     table="$(cargo metadata --no-deps --format-version 1 2>/dev/null | AETHER_WORKSPACE="$WORKSPACE" AETHER_INDEX_TOPS="$index_tops" python3 -c '
 import json, os, sys
 def enc(s):
-    return s.replace("%", "%25").replace("\\", "%5C").replace("\t", "%09").replace(",", "%2C").replace(" ", "%20")
+    return s.replace("%", "%25").replace("\\", "%5C").replace("\t", "%09").replace("\n", "%0A").replace(",", "%2C").replace(" ", "%20")
+def dec(s):
+    out, i = [], 0
+    while i < len(s):
+        if s[i] == "%" and len(s) >= i + 3:
+            out.append(chr(int(s[i + 1:i + 3], 16))); i += 3
+        else:
+            out.append(s[i]); i += 1
+    return "".join(out)
 meta = json.load(sys.stdin)
 # Scopes are relative to the AETHER workspace (where the index lives), which may be a
 # single package inside a larger Cargo workspace; packages outside it are ignored.
@@ -251,6 +269,7 @@ unit_names = {name for name, _ in units}
 for top in os.environ.get("AETHER_INDEX_TOPS", "").split("\n"):
     if not top:
         continue
+    top = dec(top)
     if any(top == s or top.startswith(s + os.sep) for s in package_scopes):
         continue
     carved = [s for s in package_scopes if s.startswith(top + os.sep)]
@@ -263,7 +282,6 @@ for top in os.environ.get("AETHER_INDEX_TOPS", "").split("\n"):
   else
     while IFS= read -r top || [ -n "$top" ]; do
       [ -z "$top" ] && continue
-      top="$(pct_encode "$top")"
       printf '%s\t+%s\n' "$top" "$top"
     done <<< "$index_tops"
   fi

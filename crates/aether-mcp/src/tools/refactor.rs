@@ -11,19 +11,18 @@ use aether_analysis::{
 use aether_config::InferenceProviderKind;
 use aether_core::{Position, SourceRange, normalize_path};
 use aether_infer::{
-    EmbeddingProvider, EmbeddingProviderOverrides, EmbeddingPurpose, InferenceProvider,
-    ProviderOverrides, SirContext, load_embedding_provider_from_config,
-    load_provider_from_env_or_mock, sir_prompt,
+    EmbeddingProvider, EmbeddingProviderOverrides, InferenceProvider, ProviderOverrides,
+    SirContext, load_embedding_provider_from_config, load_provider_from_env_or_mock, sir_prompt,
 };
 use aether_sir::{canonicalize_sir_json, sir_hash, validate_sir};
-use aether_store::{SirMetaRecord, SirStateStore, SnapshotStore, SymbolEmbeddingRecord};
+use aether_store::{SirMetaRecord, SirStateStore, SnapshotStore};
 use anyhow::{Result as AnyResult, anyhow};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 use tokio::time::{sleep, timeout};
 
-use aetherd::sir_pipeline::{acquire_embed_write_lock, acquire_inject_write_lock};
+use aetherd::sir_pipeline::{SirPipeline, acquire_embed_write_lock, acquire_inject_write_lock};
 
 use super::{AetherMcpServer, MCP_SCHEMA_VERSION, current_unix_timestamp};
 use crate::AetherMcpError;
@@ -438,7 +437,6 @@ impl AetherMcpServer {
             )?;
         }
         self.refresh_embedding_if_needed(
-            runtime,
             embedding_provider,
             candidate.symbol.id.as_str(),
             sir_hash_value.as_str(),
@@ -483,68 +481,41 @@ impl AetherMcpServer {
         Ok(())
     }
 
-    /// Embed the deep SIR under the symbol's embedding lock, which every vector writer
-    /// shares, and store the vector only while the SIR is still the one just written and
-    /// the stored vector is still the one observed, so a slow embedding here can never
-    /// overwrite the vector a concurrent injection stored for a newer SIR.
+    /// Embed the deep SIR through the pipeline's guarded refresh, under the symbol's
+    /// embedding lock that every vector writer shares: the SIR's currency is re-read
+    /// before the provider call, before the vector is stored and after it is stored (and
+    /// once when a vector for this hash already exists), the write is conditional on the
+    /// vector observed beforehand, and a vector for a SIR that was replaced meanwhile is
+    /// never left behind. Exactly the path `aether_sir_inject` uses.
     fn refresh_embedding_if_needed(
         &self,
-        runtime: &Runtime,
         embedding_provider: Option<&(Arc<dyn EmbeddingProvider>, String, String)>,
         symbol_id: &str,
         sir_hash_value: &str,
         canonical_json: &str,
     ) -> Result<(), AetherMcpError> {
-        let Some(vector_store) = self.state.vector_store.as_ref() else {
-            return Ok(());
-        };
-        let Some((provider, provider_name, model_name)) = embedding_provider else {
-            return Ok(());
-        };
-        let _embed_guard = acquire_embed_write_lock(&self.state.workspace, symbol_id)
-            .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
-        let observed = runtime.block_on(vector_store.get_embedding_meta(symbol_id))?;
-        if observed.as_ref().is_some_and(|meta| {
-            meta.sir_hash == sir_hash_value
-                && meta.provider == *provider_name
-                && meta.model == *model_name
-        }) {
+        if self.state.vector_store.is_none() || embedding_provider.is_none() {
             return Ok(());
         }
-        let sir_is_current = || -> Result<bool, AetherMcpError> {
-            Ok(self
-                .state
-                .store
+        let _embed_guard = acquire_embed_write_lock(&self.state.workspace, symbol_id)
+            .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
+        let pipeline = SirPipeline::new_embeddings_only(self.state.workspace.clone())
+            .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
+        let store = self.state.store.as_ref();
+        let mut still_current = || -> anyhow::Result<bool> {
+            Ok(store
                 .get_sir_meta(symbol_id)?
                 .is_some_and(|meta| meta.sir_hash == sir_hash_value))
         };
-        if !sir_is_current()? {
-            return Ok(());
-        }
-
-        let embedding = runtime.block_on(async {
-            provider
-                .embed_text_with_purpose(canonical_json, EmbeddingPurpose::Document)
-                .await
-        })?;
-        if embedding.is_empty() || !sir_is_current()? {
-            return Ok(());
-        }
-
-        // Conditional on the vector observed above: a writer that reached the store
-        // first keeps its vector (the lock rules that out for vector writers, the check
-        // covers any path that does not take it).
-        runtime.block_on(vector_store.upsert_embedding_if_matches(
-            SymbolEmbeddingRecord {
-                symbol_id: symbol_id.to_owned(),
-                sir_hash: sir_hash_value.to_owned(),
-                provider: provider_name.clone(),
-                model: model_name.clone(),
-                embedding,
-                updated_at: current_unix_timestamp(),
-            },
-            observed.as_ref(),
-        ))?;
+        pipeline
+            .refresh_embedding_if_current(
+                symbol_id,
+                sir_hash_value,
+                canonical_json,
+                None,
+                &mut still_current,
+            )
+            .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
         Ok(())
     }
 }
