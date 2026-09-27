@@ -508,7 +508,7 @@ impl AetherMcpServer {
         let _inject_guard = acquire_inject_write_lock(&self.state.workspace)
             .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
         let current = self.state.store.get_sir_meta(symbol_id)?;
-        if current.as_ref().map(SirIdentity::of).as_ref() != attempted_against {
+        if self.state.store.get_sir_identity(symbol_id)?.as_ref() != attempted_against {
             tracing::info!(
                 symbol_id = %symbol_id,
                 "not marking the SIR stale: it was replaced while the deep scan attempt ran"

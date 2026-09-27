@@ -82,7 +82,7 @@ pub use sir_history::{
     SirHistoryBaselineSelector, SirHistoryRecord, SirHistoryResolvedPair, SirHistorySelector,
     SirVersionWriteResult,
 };
-pub use sir_meta::{SirIdentity, SirMetaRecord};
+pub use sir_meta::{SirIdentity, SirMetaRecord, SirRowSnapshot};
 pub use snapshots::{IntentSnapshot, IntentSnapshotSummary, SnapshotEntry};
 pub use symbols::{SymbolMetadata, SymbolRecord, SymbolSearchResult};
 pub use task_context_history::TaskContextHistoryRecord;

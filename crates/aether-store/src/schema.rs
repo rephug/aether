@@ -676,6 +676,15 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         conn.execute("PRAGMA user_version = 18", [])?;
     }
 
+    if version < 19 {
+        // A per-row write counter that advances on every accepted SIR write, even one
+        // that stores the same canonical content again (a forced injection, say), so a
+        // writer that planned against the SIR it observed can tell that write from a
+        // later one with the same hash and history version.
+        ensure_sir_column(conn, "write_generation", "INTEGER NOT NULL DEFAULT 0")?;
+        conn.execute("PRAGMA user_version = 19", [])?;
+    }
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_version (

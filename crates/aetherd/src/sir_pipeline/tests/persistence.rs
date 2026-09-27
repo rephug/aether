@@ -228,6 +228,7 @@ fn intent_payload_round_trips_the_prior_sir_record() {
     assert!(parsed.prior_sir.still_holds(Some(&SirIdentity {
         sir_hash: "h".to_owned(),
         sir_version: 7,
+        write_generation: 7,
     })));
 
     // Absent: null, and only a store without a SIR still holds it.
@@ -240,12 +241,14 @@ fn intent_payload_round_trips_the_prior_sir_record() {
     assert!(!parsed.prior_sir.still_holds(Some(&SirIdentity {
         sir_hash: "h".to_owned(),
         sir_version: 1,
+        write_generation: 1,
     })));
 
     // Present: hash and version both have to match.
     let identity = SirIdentity {
         sir_hash: "h1".to_owned(),
         sir_version: 2,
+        write_generation: 2,
     };
     payload.prior_sir = PriorSir::Present(identity.clone());
     let json = payload.to_json_string().expect("serialize");
@@ -256,16 +259,21 @@ fn intent_payload_round_trips_the_prior_sir_record() {
     assert!(!parsed.prior_sir.still_holds(Some(&SirIdentity {
         sir_hash: "h1".to_owned(),
         sir_version: 3,
+        write_generation: 3,
     })));
     assert!(!parsed.prior_sir.still_holds(Some(&SirIdentity {
         sir_hash: "h2".to_owned(),
         sir_version: 2,
+        write_generation: 2,
     })));
 
     // Intents written before the record existed carry no key at all.
     let legacy = UpsertSirIntentPayload::from_json_str(
-        json.replace(",\"prior_sir\":{\"sir_hash\":\"h1\",\"sir_version\":2}", "")
-            .as_str(),
+        json.replace(
+            ",\"prior_sir\":{\"sir_hash\":\"h1\",\"sir_version\":2,\"write_generation\":2}",
+            "",
+        )
+        .as_str(),
     )
     .expect("parse legacy payload");
     assert_eq!(legacy.prior_sir, PriorSir::Unrecorded);
@@ -314,7 +322,8 @@ fn persist_successful_generation_sqlite_skips_a_sir_whose_content_cycled_back() 
         prior_sir,
         Some(SirIdentity {
             sir_hash: sir_hash(&first),
-            sir_version: 1
+            sir_version: 1,
+            write_generation: 1,
         })
     );
 
@@ -329,7 +338,8 @@ fn persist_successful_generation_sqlite_skips_a_sir_whose_content_cycled_back() 
         current,
         Some(SirIdentity {
             sir_hash: sir_hash(&first),
-            sir_version: 3
+            sir_version: 3,
+            write_generation: 3,
         }),
         "the same content written again is a new write generation"
     );
@@ -751,4 +761,90 @@ fn persist_successful_generation_sqlite_skips_a_sir_whose_source_changed() {
         .expect("persist");
     assert!(matches!(persisted, GenerationPersist::Persisted(_)));
     assert!(store.read_sir_blob(symbol_id).expect("read blob").is_some());
+}
+
+#[test]
+fn rewriting_the_same_sir_content_is_a_new_write_generation() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    write_embeddings_only_config(workspace);
+
+    let store = SqliteStore::open(workspace).expect("open store");
+    let pipeline = build_write_pipeline(workspace, Arc::new(PanicInferenceProvider));
+    let symbol_id = "sym-forced";
+    store
+        .upsert_symbol(demo_symbol(symbol_id, "demo::forced"))
+        .expect("upsert symbol");
+    let source = "fn forced() {}\n";
+    let symbol = demo_type_symbol(
+        symbol_id,
+        "forced",
+        "demo::forced",
+        "src/lib.rs",
+        SymbolKind::Function,
+        source,
+    );
+    fs::create_dir_all(workspace.join("src")).expect("create src");
+    fs::write(workspace.join("src/lib.rs"), source).expect("write source");
+    let sir = demo_sir();
+
+    // The job is queued against the first write of this content...
+    pipeline
+        .persist_sir_payload_into_sqlite(
+            &store,
+            &payload_for(&symbol, &sir, SIR_GENERATION_PASS_SCAN),
+            None,
+        )
+        .expect("persist");
+    let observed = current_sir_identity(&store, symbol_id).expect("identity");
+    assert_eq!(
+        observed,
+        Some(SirIdentity {
+            sir_hash: sir_hash(&sir),
+            sir_version: 1,
+            write_generation: 1,
+        })
+    );
+
+    // ...then a forced injection writes the same canonical content again: same hash,
+    // same history version, but a write of its own with its own provenance.
+    pipeline
+        .persist_sir_payload_into_sqlite(&store, &payload_for(&symbol, &sir, "injected"), None)
+        .expect("forced injection");
+    let current = current_sir_identity(&store, symbol_id).expect("identity");
+    assert_eq!(
+        current,
+        Some(SirIdentity {
+            sir_hash: sir_hash(&sir),
+            sir_version: 1,
+            write_generation: 2,
+        })
+    );
+    assert_ne!(current, observed);
+
+    // The job planned against the first write is superseded by the second.
+    let generated = infer::GeneratedSir {
+        symbol: symbol.clone(),
+        sir: SirAnnotation {
+            intent: "Generated from the older state".to_owned(),
+            ..demo_sir()
+        },
+        provider_name: "test_provider".to_owned(),
+        model_name: "test_model".to_owned(),
+        reasoning_trace: None,
+        prior_sir: observed,
+        source_hash: content_hash(source),
+    };
+    let persisted = pipeline
+        .persist_successful_generation_sqlite(&store, &generated, SIR_GENERATION_PASS_SCAN, None)
+        .expect("persist");
+    assert!(matches!(persisted, GenerationPersist::Superseded));
+    let meta = store
+        .get_sir_meta(symbol_id)
+        .expect("meta")
+        .expect("meta exists");
+    assert_eq!(
+        meta.generation_pass, "injected",
+        "the forced injection's provenance stands"
+    );
 }

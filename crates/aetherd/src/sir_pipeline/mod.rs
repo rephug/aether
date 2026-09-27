@@ -1492,7 +1492,7 @@ impl SirPipeline {
         let previous_meta = store
             .get_sir_meta(&failed.symbol.id)
             .with_context(|| format!("failed to load SIR metadata for {}", failed.symbol.id))?;
-        if previous_meta.as_ref().map(SirIdentity::of) != failed.prior_sir {
+        if current_sir_identity(store, &failed.symbol.id)? != failed.prior_sir {
             tracing::info!(
                 symbol_id = %failed.symbol.id,
                 error = %failed.error_message,

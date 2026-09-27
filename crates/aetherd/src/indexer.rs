@@ -949,9 +949,10 @@ where
         };
         // Metadata and blob from one row, so the identity recorded with the baseline
         // is the identity of the SIR the enrichment will be built from.
-        let Some((meta, blob)) = store.get_sir_meta_with_blob(symbol.id.as_str())? else {
+        let Some(row) = store.get_sir_meta_with_blob(symbol.id.as_str())? else {
             continue;
         };
+        let (meta, identity, blob) = (row.meta, row.identity, row.blob);
         let pass = meta.generation_pass.to_ascii_lowercase();
         if should_skip_pass(pass.as_str()) {
             continue;
@@ -978,7 +979,7 @@ where
                 .copied()
                 .unwrap_or(0.0),
             baseline_sir,
-            baseline_sir_identity: SirIdentity::of(&meta),
+            baseline_sir_identity: identity,
         });
     }
 

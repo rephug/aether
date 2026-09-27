@@ -1,7 +1,7 @@
 use aether_core::{Symbol, content_hash};
 use aether_parse::TestIntent;
 use aether_sir::SirAnnotation;
-use aether_store::{SirStateStore, SqliteStore, SymbolRecord, TestIntentRecord};
+use aether_store::{SqliteStore, SymbolRecord, TestIntentRecord};
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 
@@ -11,11 +11,9 @@ pub use aether_store::SirIdentity;
 
 /// The identity of the SIR a symbol holds right now (`None`: no SIR stored).
 pub fn current_sir_identity(store: &SqliteStore, symbol_id: &str) -> Result<Option<SirIdentity>> {
-    Ok(store
-        .get_sir_meta(symbol_id)
-        .with_context(|| format!("failed to read SIR metadata for {symbol_id}"))?
-        .as_ref()
-        .map(SirIdentity::of))
+    store
+        .get_sir_identity(symbol_id)
+        .with_context(|| format!("failed to read SIR identity for {symbol_id}"))
 }
 
 /// What the store held for a symbol when a write was planned, as recorded on a write

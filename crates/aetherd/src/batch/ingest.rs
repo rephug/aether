@@ -714,7 +714,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use aether_store::{SirIdentity, SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord};
+    use aether_store::{SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord};
     use async_trait::async_trait;
     use tempfile::tempdir;
 
@@ -975,7 +975,7 @@ vector_backend = "sqlite"
             .expect("load sir meta")
             .expect("sir meta exists");
         assert_eq!(
-            Some(SirIdentity::of(&meta)),
+            current_sir_identity(&store, "sym-late").expect("identity"),
             reviewed_identity,
             "the injected SIR must stand"
         );

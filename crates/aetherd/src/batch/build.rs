@@ -296,12 +296,12 @@ pub(crate) fn build_pass_jsonl_for_ids(
         // The symbol's current SIR and its identity come from one row read before the
         // prompt is built: the prompt (for triage and deep passes) describes this SIR,
         // and ingest applies the result only while the symbol still holds exactly it.
-        let (existing_meta, baseline_blob) = match store
+        let (existing_meta, existing_identity, baseline_blob) = match store
             .get_sir_meta_with_blob(symbol_id.as_str())
             .with_context(|| format!("failed to read SIR state for {symbol_id}"))?
         {
-            Some((meta, blob)) => (Some(meta), blob),
-            None => (None, None),
+            Some(row) => (Some(row.meta), Some(row.identity), row.blob),
+            None => (None, None, None),
         };
 
         // Build per-symbol user prompt and collect neighbor entries for hash.
@@ -396,7 +396,7 @@ pub(crate) fn build_pass_jsonl_for_ids(
         summary.origins.insert(
             key_str.clone(),
             BatchRequestOrigin {
-                prior_sir: existing_meta.as_ref().map(SirIdentity::of),
+                prior_sir: existing_identity,
                 source_hash: job.source_hash.clone(),
             },
         );
@@ -646,6 +646,7 @@ mod tests {
             Some(SirIdentity {
                 sir_hash: "h1".to_owned(),
                 sir_version: 1,
+                write_generation: 1,
             }),
         )]);
         let second = HashMap::from([(
@@ -653,6 +654,7 @@ mod tests {
             Some(SirIdentity {
                 sir_hash: "h2".to_owned(),
                 sir_version: 2,
+                write_generation: 2,
             }),
         )]);
         let first_path = dir.join(origin_sidecar_name("triage", "build-1"));

@@ -460,15 +460,14 @@ fn collect_scope_metrics(
             .len() as u32;
         // Blob and metadata come from the one row that holds both, so the identity
         // recorded here is the identity of the SIR the enrichment is built from.
-        let (current_meta, baseline_blob) =
+        let (current_meta, baseline_sir_identity, baseline_blob) =
             match store.get_sir_meta_with_blob(symbol.id.as_str())? {
-                Some((meta, blob)) => (Some(meta), blob),
-                None => (None, None),
+                Some(row) => (Some(row.meta), Some(row.identity), row.blob),
+                None => (None, None, None),
             };
         let baseline_sir = baseline_blob
             .map(|blob| parse_valid_sir(symbol.id.as_str(), blob.as_str()))
             .transpose()?;
-        let baseline_sir_identity = current_meta.as_ref().map(SirIdentity::of);
         let current_generation_pass = current_meta
             .as_ref()
             .map(|meta| normalize_generation_pass(meta.generation_pass.as_str()));

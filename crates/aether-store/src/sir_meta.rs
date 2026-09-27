@@ -2,25 +2,31 @@ use super::*;
 use crate::sir_history::record_sir_version_if_changed_tx;
 use crate::write_intents::update_intent_status_tx;
 
-/// The identity of one stored SIR write: its content hash together with the history
-/// version the store assigned to it. A hash alone does not identify a write, because a
-/// symbol's SIR can cycle back to an earlier content (`H1 → H2 → H1`) through two
-/// injections; the history version only ever grows, so the pair tells those apart.
-/// Writers that plan a write against the SIR they observed compare this pair, under
-/// the inject lock, right before they write.
+/// The identity of one stored SIR write: its content hash, the history version the
+/// store assigned to it, and the row's write generation. A hash alone does not identify
+/// a write, because a symbol's SIR can cycle back to an earlier content (`H1 → H2 → H1`)
+/// through two injections; the history version only ever grows, but it is reused when
+/// the same canonical content is written again (a forced injection, a metadata
+/// promotion), so the write generation, which advances on every accepted write, tells
+/// those apart too. Writers that plan a write against the SIR they observed compare
+/// the whole triple, under the inject lock, right before they write.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SirIdentity {
     pub sir_hash: String,
     pub sir_version: i64,
+    #[serde(default)]
+    pub write_generation: i64,
 }
 
-impl SirIdentity {
-    pub fn of(meta: &SirMetaRecord) -> Self {
-        Self {
-            sir_hash: meta.sir_hash.clone(),
-            sir_version: meta.sir_version,
-        }
-    }
+/// A symbol's SIR row read in one query: metadata, write identity and stored JSON, so
+/// a caller that builds a prompt or an enrichment from the blob and records the
+/// identity for a later compare-and-set cannot pair one write's JSON with another
+/// write's identity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SirRowSnapshot {
+    pub meta: SirMetaRecord,
+    pub identity: SirIdentity,
+    pub blob: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -493,6 +499,13 @@ impl SqliteStore {
         record.sir_version = write_result.version;
         record.updated_at = write_result.updated_at;
         upsert_sir_meta_tx(&tx, &record)?;
+        // Every accepted leaf write advances the row's write generation, so a writer
+        // that observed the row before this write can tell, even when the content
+        // hash and history version are unchanged.
+        tx.execute(
+            "UPDATE sir SET write_generation = write_generation + 1 WHERE id = ?1",
+            params![record.id.as_str()],
+        )?;
         if let Some(intent_id) = write_intent_id {
             update_intent_status_tx(&tx, intent_id, WriteIntentStatus::SqliteDone)?;
         }
@@ -544,29 +557,49 @@ impl SqliteStore {
         Ok(record)
     }
 
-    /// A symbol's SIR metadata together with its stored SIR JSON, read from the one
-    /// row that holds both, so the pair is consistent: a caller that builds a prompt or
-    /// an enrichment from the blob and records the metadata's identity for a later
-    /// compare-and-set cannot pair one write's JSON with another write's identity.
+    /// A symbol's SIR row in one query (see [`SirRowSnapshot`]). A row migrated from
+    /// the file-mirror era may hold its JSON only on disk; that blob is read from the
+    /// mirror without writing it back, so this read never races a concurrent SIR writer.
     pub fn get_sir_meta_with_blob(
         &self,
         symbol_id: &str,
-    ) -> Result<Option<(SirMetaRecord, Option<String>)>, StoreError> {
-        let Some((record, blob)) = self.read_sir_row(symbol_id)? else {
+    ) -> Result<Option<SirRowSnapshot>, StoreError> {
+        let Some(mut snapshot) = self.read_sir_row(symbol_id)? else {
             return Ok(None);
         };
-        // A row migrated from the file-mirror era may hold its JSON only on disk.
-        let blob = match blob {
-            Some(blob) => Some(blob),
-            None => self.store_read_sir_blob(symbol_id)?,
-        };
-        Ok(Some((record, blob)))
+        if snapshot.blob.is_none() {
+            let path = self.sir_blob_path(symbol_id);
+            if path.exists() {
+                snapshot.blob =
+                    Some(fs::read_to_string(path)?).filter(|value| !value.trim().is_empty());
+            }
+        }
+        Ok(Some(snapshot))
     }
 
-    fn read_sir_row(
-        &self,
-        symbol_id: &str,
-    ) -> Result<Option<(SirMetaRecord, Option<String>)>, StoreError> {
+    /// The identity of the SIR a symbol holds right now (`None`: no SIR stored).
+    pub fn get_sir_identity(&self, symbol_id: &str) -> Result<Option<SirIdentity>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT sir_hash, sir_version, write_generation
+            FROM sir
+            WHERE id = ?1
+            "#,
+        )?;
+        let identity = stmt
+            .query_row(params![symbol_id], |row| {
+                Ok(SirIdentity {
+                    sir_hash: row.get(0)?,
+                    sir_version: row.get::<_, i64>(1)?.max(1),
+                    write_generation: row.get(2)?,
+                })
+            })
+            .optional()?;
+        Ok(identity)
+    }
+
+    fn read_sir_row(&self, symbol_id: &str) -> Result<Option<SirRowSnapshot>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"
@@ -584,23 +617,32 @@ impl SqliteStore {
                 sir_status,
                 last_error,
                 last_attempt_at,
-                sir_json
+                sir_json,
+                write_generation
             FROM sir
             WHERE id = ?1
             "#,
         )?;
 
-        let record = stmt
+        let snapshot = stmt
             .query_row(params![symbol_id], |row| {
-                Ok((
-                    sir_meta_from_row(row, 0)?,
-                    row.get::<_, Option<String>>(13)?
+                let meta = sir_meta_from_row(row, 0)?;
+                let identity = SirIdentity {
+                    sir_hash: meta.sir_hash.clone(),
+                    sir_version: meta.sir_version.max(1),
+                    write_generation: row.get(14)?,
+                };
+                Ok(SirRowSnapshot {
+                    meta,
+                    identity,
+                    blob: row
+                        .get::<_, Option<String>>(13)?
                         .filter(|value| !value.trim().is_empty()),
-                ))
+                })
             })
             .optional()?;
 
-        Ok(record)
+        Ok(snapshot)
     }
 }
 
