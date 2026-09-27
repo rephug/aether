@@ -44,6 +44,10 @@ pub(super) struct GeneratedSir {
     pub(super) reasoning_trace: Option<String>,
     /// See `SirJob::prior_sir`.
     pub(super) prior_sir: Option<SirIdentity>,
+    /// See `SirJob::source_hash`: the result is persisted only while the symbol's source
+    /// still hashes to this, so a job that read an older body cannot land after (and
+    /// pre-empt) the job the edit queued.
+    pub(super) source_hash: String,
 }
 
 #[derive(Debug)]
@@ -127,6 +131,18 @@ fn infer_symbol_text_is_public(symbol_text: &str) -> bool {
         || trimmed.starts_with("export default ")
 }
 
+/// The content hash of the symbol's source as it is on disk right now (`None`: the file
+/// is gone or the symbol's range no longer yields text), computed exactly as
+/// `SirJob::source_hash` was. A writer that generated from an earlier read compares the
+/// two under the inject lock: a mismatch means the symbol was edited meanwhile and the
+/// result describes a body the symbol no longer has.
+pub fn current_source_hash(workspace_root: &Path, symbol: &Symbol) -> Option<String> {
+    let source = fs::read_to_string(workspace_root.join(&symbol.file_path)).ok()?;
+    extract_symbol_source_text(&source, symbol.range)
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| content_hash(&text))
+}
+
 /// The text a symbol's range covers in `source`, as the SIR prompt sees it.
 pub(crate) fn extract_symbol_source_text(source: &str, range: SourceRange) -> Option<String> {
     let start = range
@@ -197,7 +213,7 @@ pub(super) async fn generate_sir_jobs(
                 custom_prompt,
                 deep_mode,
                 prior_sir,
-                source_hash: _,
+                source_hash,
             } = job;
             let qualified_name = symbol.qualified_name.clone();
 
@@ -242,6 +258,7 @@ pub(super) async fn generate_sir_jobs(
                     model_name: result.model,
                     reasoning_trace: result.reasoning_trace,
                     prior_sir,
+                    source_hash,
                 })),
                 Err(err)
                     if is_parse_validation_exhausted_error(&err)
@@ -294,6 +311,7 @@ pub(super) async fn generate_sir_jobs(
                             model_name: result.model,
                             reasoning_trace: result.reasoning_trace,
                             prior_sir,
+                            source_hash,
                         })),
                         Err(fallback_err) => {
                             SirGenerationOutcome::Failure(Box::new(FailedSirGeneration {

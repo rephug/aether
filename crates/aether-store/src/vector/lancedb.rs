@@ -33,6 +33,14 @@ fn build_in_predicate(ids: &[&str]) -> String {
 pub struct LanceVectorStore {
     workspace_root: PathBuf,
     vectors_dir: PathBuf,
+    /// Serializes the compare-and-set operations (`upsert_embedding_if_matches`,
+    /// `delete_embedding_if_matches`) within this process. A symbol's vectors live in
+    /// one table per provider/model/dimension, so the precondition is read across
+    /// tables and the write lands in one of them: without this, two writers that both
+    /// observed the same vector but target different tables could each pass the read
+    /// before either merge runs. Writers in other processes hold the per-symbol embed
+    /// lock, which serializes them with this process's writers as well.
+    cas_serial: tokio::sync::Mutex<()>,
 }
 
 impl LanceVectorStore {
@@ -47,6 +55,7 @@ impl LanceVectorStore {
         let store = Self {
             workspace_root,
             vectors_dir,
+            cas_serial: tokio::sync::Mutex::new(()),
         };
         store.migrate_from_sqlite_if_needed().await?;
         store.migrate_project_notes_from_sqlite_if_needed().await?;
@@ -619,6 +628,7 @@ impl VectorStore for LanceVectorStore {
         if record.embedding.is_empty() {
             return Ok(false);
         }
+        let _serial = self.cas_serial.lock().await;
         // Vectors are keyed by symbol inside one table per provider/model/dimension, so
         // the precondition is checked across all tables first (the stored vector must be
         // exactly the one observed: hash, provider, model, dimension and write time, or
@@ -683,6 +693,7 @@ impl VectorStore for LanceVectorStore {
         updated_at: i64,
     ) -> Result<(), StoreError> {
         self.migrate_from_sqlite_if_needed().await?;
+        let _serial = self.cas_serial.lock().await;
         let connection = self.connect().await?;
         let predicate = format!(
             "symbol_id = '{}' AND sir_hash = '{}' AND updated_at = {updated_at}",

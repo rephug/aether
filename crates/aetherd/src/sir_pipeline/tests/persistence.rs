@@ -47,13 +47,16 @@ fn commit_successful_generation_injects_method_dependencies_from_symbol_edges_ac
         .expect("upsert edges");
 
     let pipeline = build_write_pipeline(workspace, Arc::new(PanicInferenceProvider));
+    let parent_source = "pub trait Store {\n    fn load(&self) -> Record;\n    fn save(&self, record: Record);\n}\n";
+    fs::create_dir_all(workspace.join("src")).expect("create src");
+    fs::write(workspace.join("src/store.rs"), parent_source).expect("write parent source");
     let parent_symbol = demo_type_symbol(
         "sym-store",
         "Store",
         "Store",
         "src/store.rs",
         SymbolKind::Trait,
-        "pub trait Store {\n    fn load(&self) -> Record;\n    fn save(&self, record: Record);\n}\n",
+        parent_source,
     );
     let generated = infer::GeneratedSir {
         symbol: parent_symbol.clone(),
@@ -77,6 +80,7 @@ fn commit_successful_generation_injects_method_dependencies_from_symbol_edges_ac
         model_name: "test_model".to_owned(),
         reasoning_trace: None,
         prior_sir: None,
+        source_hash: content_hash(parent_source),
     };
 
     let mut out = Vec::new();
@@ -294,6 +298,9 @@ fn persist_successful_generation_sqlite_skips_a_sir_whose_content_cycled_back() 
         ..demo_sir()
     };
 
+    fs::create_dir_all(workspace.join("src")).expect("create src");
+    fs::write(workspace.join("src/lib.rs"), "fn cycle() {}\n").expect("write source");
+
     // The job is queued while the store holds H1 (version 1)...
     pipeline
         .persist_sir_payload_into_sqlite(
@@ -337,6 +344,7 @@ fn persist_successful_generation_sqlite_skips_a_sir_whose_content_cycled_back() 
         model_name: "test_model".to_owned(),
         reasoning_trace: None,
         prior_sir,
+        source_hash: content_hash("fn cycle() {}\n"),
     };
     let persisted = pipeline
         .persist_successful_generation_sqlite(&store, &generated, SIR_GENERATION_PASS_SCAN, None)
@@ -522,6 +530,8 @@ fn persist_successful_generation_sqlite_rolls_back_when_sqlite_done_fails() {
         .upsert_symbol(demo_symbol(symbol_id, "demo::rollback"))
         .expect("upsert symbol");
     install_sqlite_done_failure_trigger(workspace, symbol_id);
+    fs::create_dir_all(workspace.join("src")).expect("create src");
+    fs::write(workspace.join("src/lib.rs"), "fn rollback() {}\n").expect("write source");
 
     let generated = infer::GeneratedSir {
         symbol: demo_type_symbol(
@@ -537,6 +547,7 @@ fn persist_successful_generation_sqlite_rolls_back_when_sqlite_done_fails() {
         model_name: "test_model".to_owned(),
         reasoning_trace: None,
         prior_sir: None,
+        source_hash: content_hash("fn rollback() {}\n"),
     };
 
     let persisted = pipeline
@@ -593,4 +604,59 @@ fn build_job_records_the_hash_of_the_text_it_read_for_the_prompt() {
     let job = build_job(workspace, symbol.clone(), None, None).expect("build job");
     assert_eq!(job.source_hash, content_hash(snapshot_source));
     assert_eq!(job.source_hash, symbol.content_hash);
+}
+
+#[test]
+fn persist_successful_generation_sqlite_skips_a_sir_whose_source_changed() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    write_embeddings_only_config(workspace);
+
+    let store = SqliteStore::open(workspace).expect("open store");
+    let pipeline = build_write_pipeline(workspace, Arc::new(PanicInferenceProvider));
+    let symbol_id = "sym-edited";
+    store
+        .upsert_symbol(demo_symbol(symbol_id, "demo::edited"))
+        .expect("upsert symbol");
+    let original = "fn edited() {}\n";
+    let symbol = demo_type_symbol(
+        symbol_id,
+        "edited",
+        "demo::edited",
+        "src/lib.rs",
+        SymbolKind::Function,
+        original,
+    );
+    fs::create_dir_all(workspace.join("src")).expect("create src");
+    fs::write(workspace.join("src/lib.rs"), original).expect("write source");
+
+    // The job read the original body; while it ran, the body was edited (same
+    // signature, so the same symbol id) and the stored SIR did not change.
+    let generated = infer::GeneratedSir {
+        symbol: symbol.clone(),
+        sir: demo_sir(),
+        provider_name: "test_provider".to_owned(),
+        model_name: "test_model".to_owned(),
+        reasoning_trace: None,
+        prior_sir: None,
+        source_hash: content_hash(original),
+    };
+    fs::write(workspace.join("src/lib.rs"), "fn edited() { changed }\n").expect("edit source");
+    let persisted = pipeline
+        .persist_successful_generation_sqlite(&store, &generated, SIR_GENERATION_PASS_SCAN, None)
+        .expect("persist");
+    assert!(
+        matches!(persisted, GenerationPersist::Superseded),
+        "a result generated from a body the symbol no longer has must not land"
+    );
+    assert_eq!(store.read_sir_blob(symbol_id).expect("read blob"), None);
+    assert_eq!(count_table_rows(workspace, "write_intents"), 0);
+
+    // With the source as the job read it, the result lands.
+    fs::write(workspace.join("src/lib.rs"), original).expect("restore source");
+    let persisted = pipeline
+        .persist_successful_generation_sqlite(&store, &generated, SIR_GENERATION_PASS_SCAN, None)
+        .expect("persist");
+    assert!(matches!(persisted, GenerationPersist::Persisted(_)));
+    assert!(store.read_sir_blob(symbol_id).expect("read blob").is_some());
 }

@@ -23,6 +23,7 @@ use tokio::time::{sleep, timeout};
 
 use aetherd::sir_pipeline::{
     SirPipeline, acquire_embed_write_lock, acquire_inject_write_lock, current_sir_identity,
+    current_source_hash,
 };
 
 use super::{AetherMcpServer, MCP_SCHEMA_VERSION, current_unix_timestamp};
@@ -396,6 +397,9 @@ impl AetherMcpServer {
         // still holds exactly this write; a SIR another writer stored meanwhile (even
         // one landing between the enrichment build and this call) wins.
         let prior_sir = candidate.baseline_sir_identity.clone();
+        // The hash of the symbol source the prompt is built from, so the persist below
+        // can tell whether the symbol was edited while the model ran.
+        let source_hash = current_source_hash(self.workspace(), &candidate.symbol);
         let symbol_text = extract_symbol_text(self.workspace(), &candidate.symbol)?;
         let context = build_sir_context(
             &candidate.symbol,
@@ -442,6 +446,18 @@ impl AetherMcpServer {
                 tracing::info!(
                     symbol_id = %candidate.symbol.id,
                     "skipping deep SIR: the stored SIR changed while it was being generated"
+                );
+                return Ok(DeepSirPersist::Superseded);
+            }
+            // An edit while the model ran leaves the stored SIR as it was until the
+            // daemon's job for that edit lands; a result generated from the old body
+            // must not land first and pre-empt it.
+            if source_hash.is_none()
+                || current_source_hash(self.workspace(), &candidate.symbol) != source_hash
+            {
+                tracing::info!(
+                    symbol_id = %candidate.symbol.id,
+                    "skipping deep SIR: the symbol source changed while it was being generated"
                 );
                 return Ok(DeepSirPersist::Superseded);
             }

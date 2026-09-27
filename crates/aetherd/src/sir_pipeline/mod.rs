@@ -37,6 +37,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
+pub use self::infer::current_source_hash;
 use self::infer::{GeneratedSir, SirGenerationOutcome, SirJob, generate_sir_jobs};
 pub(crate) use self::infer::{build_job, extract_symbol_source_text};
 pub(crate) use self::persist::{PriorSir, UpsertSirIntentPayload};
@@ -1341,6 +1342,20 @@ impl SirPipeline {
             tracing::info!(
                 symbol_id = %generated.symbol.id,
                 "skipping generated SIR: the stored SIR changed while it was being generated"
+            );
+            return Ok(GenerationPersist::Superseded);
+        }
+        // The stored SIR alone does not say the result is current: a symbol edited
+        // while this job ran still holds the same SIR until the job that edit queued
+        // lands, and both jobs started from it. Persist only while the source still
+        // hashes to what this job read; otherwise the newer job's result is the one to
+        // keep and this one would only pre-empt it.
+        if current_source_hash(&self.workspace_root, &generated.symbol).as_deref()
+            != Some(generated.source_hash.as_str())
+        {
+            tracing::info!(
+                symbol_id = %generated.symbol.id,
+                "skipping generated SIR: the symbol source changed while it was being generated"
             );
             return Ok(GenerationPersist::Superseded);
         }
