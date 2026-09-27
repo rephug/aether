@@ -11,7 +11,9 @@
 # With no arguments every workspace package from `cargo metadata` is scanned; in a
 # workspace without Cargo (TypeScript, Python, ...) every top-level directory that holds
 # indexed symbols is scanned instead. Arguments may be package names or directories
-# relative to the workspace root. Preflight checks the index and the project-scoped
+# relative to the workspace root; a unit named twice (also as a path spelling of a
+# package name) is scanned once, and units whose scopes overlap are rejected, so no two
+# sessions ever cover the same symbols. Preflight checks the index and the project-scoped
 # AETHER MCP registration (.mcp.json, written by `aetherd init-agent`) that the Claude
 # sessions need for `aether_sir_inject`, then counts [MOCK] / low-confidence SIRs in the
 # selected scopes before and after. A running aetherd is left alone: the MCP server
@@ -263,6 +265,61 @@ crate_scopes() {
   fi
 }
 crate_scopes_display() { crate_scopes "$1" | tr '\t' ','; }
+
+# Explicit units must not overlap: two sessions over the same symbols duplicate model work
+# and race `aether_sir_inject` (its confidence guard runs before the injection lock).
+# Does PATH fall inside UNIT's scopes (under an include and not carved out by an exclude)?
+unit_contains() {
+  local unit="$1" path="$2" scope scopes
+  IFS=$'\t' read -ra scopes <<< "$(crate_scopes "$unit")"
+  for scope in "${scopes[@]}"; do
+    case "$scope" in
+      -*) scope="${scope#-}"
+          if [ "$path" = "$scope" ] || [ "${path#"$scope"/}" != "$path" ]; then return 1; fi ;;
+    esac
+  done
+  for scope in "${scopes[@]}"; do
+    case "$scope" in
+      -*|'') ;;
+      *) if [ "$path" = "$scope" ] || [ "${path#"$scope"/}" != "$path" ]; then return 0; fi ;;
+    esac
+  done
+  return 1
+}
+# Do two units share symbols, i.e. does an include scope of either lie inside the other?
+units_overlap() {
+  local a="$1" b="$2" scope scopes
+  IFS=$'\t' read -ra scopes <<< "$(crate_scopes "$b")"
+  for scope in "${scopes[@]}"; do
+    case "$scope" in -*|'') ;; *) if unit_contains "$a" "$scope"; then return 0; fi ;; esac
+  done
+  IFS=$'\t' read -ra scopes <<< "$(crate_scopes "$a")"
+  for scope in "${scopes[@]}"; do
+    case "$scope" in -*|'') ;; *) if unit_contains "$b" "$scope"; then return 0; fi ;; esac
+  done
+  return 1
+}
+if [ "$#" -gt 0 ]; then
+  UNIQUE=()
+  for crate in "${CRATES[@]}"; do
+    dup=""
+    for kept in ${UNIQUE[@]+"${UNIQUE[@]}"}; do
+      if [ "$kept" = "$crate" ] || [ "$(crate_scopes "$kept")" = "$(crate_scopes "$crate")" ]; then
+        dup="$kept"; break
+      fi
+      if units_overlap "$kept" "$crate"; then
+        echo "error: scan units '$kept' ($(crate_scopes_display "$kept")) and '$crate' ($(crate_scopes_display "$crate")) overlap; name only one of them" >&2
+        exit 1
+      fi
+    done
+    if [ -n "$dup" ]; then
+      [ "$dup" != "$crate" ] && log "skipping '$crate': same scopes as '$dup'"
+      continue
+    fi
+    UNIQUE+=("$crate")
+  done
+  CRATES=("${UNIQUE[@]}")
+fi
 
 # SQL string literal: single quotes doubled.
 sql_str() { printf '%s' "${1//\'/\'\'}"; }
