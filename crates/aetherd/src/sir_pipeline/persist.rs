@@ -58,6 +58,11 @@ pub(crate) struct UpsertSirIntentPayload {
     pub(crate) commit_hash: Option<String>,
     /// The SIR the symbol held when this write was planned (see [`PriorSir`]).
     pub(crate) prior_sir: PriorSir,
+    /// The hash of the prompt this SIR answers, when it came from a batch request.
+    /// Written into the `sir` row with the leaf itself, so it is part of the same
+    /// transaction as the write it describes (batch ingest reads it back as proof that
+    /// a row is its own earlier write).
+    pub(crate) prompt_hash: Option<String>,
 }
 
 impl UpsertSirIntentPayload {
@@ -70,6 +75,7 @@ impl UpsertSirIntentPayload {
             "generation_pass": self.generation_pass,
             "reasoning_trace": self.reasoning_trace,
             "commit_hash": self.commit_hash,
+            "prompt_hash": self.prompt_hash,
         });
         match &self.prior_sir {
             PriorSir::Unrecorded => {}
@@ -119,6 +125,15 @@ impl UpsertSirIntentPayload {
                 ));
             }
         };
+        let prompt_hash = match object.get("prompt_hash") {
+            Some(Value::String(value)) if !value.trim().is_empty() => Some(value.clone()),
+            Some(Value::String(_)) | Some(Value::Null) | None => None,
+            Some(_) => {
+                return Err(anyhow!(
+                    "payload field 'prompt_hash' must be a string or null"
+                ));
+            }
+        };
         let prior_sir = match object.get("prior_sir") {
             None => PriorSir::Unrecorded,
             Some(Value::Null) => PriorSir::Absent,
@@ -142,6 +157,7 @@ impl UpsertSirIntentPayload {
             reasoning_trace,
             commit_hash,
             prior_sir,
+            prompt_hash,
         })
     }
 }

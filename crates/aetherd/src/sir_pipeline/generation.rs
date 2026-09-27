@@ -298,6 +298,7 @@ impl SirPipeline {
             reasoning_trace: generated.reasoning_trace.clone(),
             commit_hash: commit_hash.map(str::to_owned),
             prior_sir: PriorSir::recorded(generated.prior_sir.clone()),
+            prompt_hash: None,
         };
         let payload_json = match payload.to_json_string() {
             Ok(json) => json,
@@ -578,7 +579,7 @@ impl SirPipeline {
                 model: payload.model_name.clone(),
                 generation_pass: payload.generation_pass.clone(),
                 reasoning_trace: payload.reasoning_trace.clone(),
-                prompt_hash: None,
+                prompt_hash: payload.prompt_hash.clone(),
                 staleness_score: None,
                 updated_at: attempted_at,
                 sir_status: SIR_STATUS_FRESH.to_owned(),

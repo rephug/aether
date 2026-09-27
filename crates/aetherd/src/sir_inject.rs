@@ -174,6 +174,7 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
         generation_pass: "injected".to_owned(),
         reasoning_trace: None,
         commit_hash: None,
+        prompt_hash: None,
         prior_sir: crate::sir_pipeline::PriorSir::Unrecorded,
     };
     let (canonical_json, sir_hash) = persist_pipeline

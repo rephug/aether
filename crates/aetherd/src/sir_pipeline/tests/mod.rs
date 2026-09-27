@@ -449,6 +449,7 @@ fn payload_for(symbol: &Symbol, sir: &SirAnnotation, pass: &str) -> UpsertSirInt
         generation_pass: pass.to_owned(),
         reasoning_trace: None,
         commit_hash: None,
+        prompt_hash: None,
         prior_sir: PriorSir::Unrecorded,
     }
 }
