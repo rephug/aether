@@ -553,6 +553,7 @@ fn print_reconciliation_dry_run(plan: &ReconciliationPlan, out: &mut dyn Write) 
 }
 
 fn execute_symbol_reconciliation<GraphCleanup, VectorCleanup>(
+    workspace: &Path,
     store: &SqliteStore,
     plan: &ReconciliationPlan,
     graph_cleanup: GraphCleanup,
@@ -562,6 +563,11 @@ where
     GraphCleanup: FnOnce(&[String]) -> Result<()>,
     VectorCleanup: FnOnce(&[String]) -> Result<()>,
 {
+    // Reconciliation migrates and deletes symbol rows with their SIRs. Like the other
+    // symbol-removal paths it runs under the inject lock: an injection that found the
+    // symbol under that lock must not have it pruned before its leaf write lands, or
+    // the write would recreate an orphan SIR row for an id the index no longer holds.
+    let _inject_guard = acquire_inject_write_lock(workspace)?;
     let migrations = plan
         .migrations
         .iter()
@@ -640,6 +646,7 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
 
     let reconciliation_plan = plan_symbol_reconciliation(&store, &symbols_by_id)?;
     let _ = execute_symbol_reconciliation(
+        &config.workspace,
         &store,
         &reconciliation_plan,
         |symbol_ids| structural.delete_symbols_batch(symbol_ids),
@@ -2895,7 +2902,7 @@ vector_backend = "sqlite"
         let symbols_by_id = HashMap::from_iter([(new_symbol.id.clone(), new_symbol.clone())]);
         let plan = plan_symbol_reconciliation(&store, &symbols_by_id).expect("plan reconcile");
         let (migrated, pruned) =
-            execute_symbol_reconciliation(&store, &plan, |_| Ok(()), |_| Ok(()))
+            execute_symbol_reconciliation(temp.path(), &store, &plan, |_| Ok(()), |_| Ok(()))
                 .expect("execute reconcile");
         assert_eq!((migrated, pruned), (1, 0));
 
@@ -2926,14 +2933,19 @@ vector_backend = "sqlite"
 
         let symbols_by_id = HashMap::from_iter([(new_symbol.id.clone(), new_symbol.clone())]);
         let first_plan = plan_symbol_reconciliation(&store, &symbols_by_id).expect("first plan");
-        execute_symbol_reconciliation(&store, &first_plan, |_| Ok(()), |_| Ok(()))
+        execute_symbol_reconciliation(temp.path(), &store, &first_plan, |_| Ok(()), |_| Ok(()))
             .expect("first reconcile");
 
         let second_plan = plan_symbol_reconciliation(&store, &symbols_by_id).expect("second plan");
         assert!(second_plan.is_empty());
-        let (migrated, pruned) =
-            execute_symbol_reconciliation(&store, &second_plan, |_| Ok(()), |_| Ok(()))
-                .expect("second reconcile");
+        let (migrated, pruned) = execute_symbol_reconciliation(
+            temp.path(),
+            &store,
+            &second_plan,
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .expect("second reconcile");
         assert_eq!((migrated, pruned), (0, 0));
 
         let (total_symbols, symbols_with_sir) = store

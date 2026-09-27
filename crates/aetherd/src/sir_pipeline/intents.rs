@@ -90,6 +90,11 @@ impl SirPipeline {
         payload: &UpsertSirIntentPayload,
         verbose: bool,
     ) -> Result<()> {
+        // Only an intent whose write never landed is `failed`: a stage that failed after
+        // the SQLite stage committed left the intent at that stage (the store keeps the
+        // last completed stage when recording the error), so it resumes below from the
+        // stage after it, against its own committed SIR, rather than being re-planned
+        // against a store that already holds that write and retired as superseded.
         let mut status = match intent.status {
             WriteIntentStatus::Failed => WriteIntentStatus::Pending,
             ref current => current.clone(),

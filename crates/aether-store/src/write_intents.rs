@@ -181,18 +181,24 @@ impl SqliteStore {
         tx.commit()?;
         Ok(())
     }
+    /// Record a failed stage on an intent. An intent whose write never landed
+    /// (`pending`) becomes `failed`; one whose SQLite stage already committed keeps the
+    /// last stage it completed (`sqlite_done`, `vector_done`, `graph_done`) and only
+    /// records the error, so a replay resumes the remaining stages from there instead of
+    /// re-planning the write against a store that already holds it.
     pub fn mark_intent_failed(&self, intent_id: &str, error: &str) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             r#"
             UPDATE write_intents
-            SET status = ?2,
-                error_message = ?3,
+            SET status = CASE WHEN status = ?2 THEN ?3 ELSE status END,
+                error_message = ?4,
                 completed_at = NULL
             WHERE intent_id = ?1
             "#,
             params![
                 intent_id,
+                WriteIntentStatus::Pending.to_string(),
                 WriteIntentStatus::Failed.to_string(),
                 error.trim().to_owned(),
             ],

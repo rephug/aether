@@ -509,6 +509,54 @@ fn replay_retires_an_intent_whose_sir_moved_on() {
         store.read_sir_blob(symbol_id).expect("blob").as_deref(),
         Some(canonicalize_sir_json(&payload.sir).as_str())
     );
+
+    // An intent whose sqlite stage committed and whose embedding stage then failed
+    // keeps its stage when the failure is recorded: the replay resumes from it against
+    // the intent's own committed SIR and completes, instead of re-planning the write
+    // against a store that now holds it and retiring the intent as superseded.
+    let mut payload = payload_for(
+        &symbol,
+        &SirAnnotation {
+            intent: "Committed, then the embedding failed".to_owned(),
+            ..demo_sir()
+        },
+        SIR_GENERATION_PASS_SCAN,
+    );
+    payload.prior_sir =
+        PriorSir::recorded(current_sir_identity(&store, symbol_id).expect("identity"));
+    let resumed = intent_for(
+        "intent-resumed",
+        WriteIntentStatus::Pending,
+        payload.to_json_string().expect("payload json"),
+    );
+    store.create_write_intent(&resumed).expect("create intent");
+    pipeline
+        .persist_sir_payload_into_sqlite(&store, &payload, Some("intent-resumed"))
+        .expect("sqlite stage");
+    store
+        .mark_intent_failed("intent-resumed", "embedding provider unavailable")
+        .expect("record the failed stage");
+    let resumed = store
+        .get_intent("intent-resumed")
+        .expect("intent")
+        .expect("intent exists");
+    assert_eq!(resumed.status, WriteIntentStatus::SqliteDone);
+    pipeline
+        .replay_upsert_sir_intent(&store, &resumed, &payload, false)
+        .expect("replay the interrupted intent");
+    assert_eq!(
+        store
+            .get_intent("intent-resumed")
+            .expect("intent")
+            .expect("intent exists")
+            .status,
+        WriteIntentStatus::Complete
+    );
+    assert_eq!(
+        store.read_sir_blob(symbol_id).expect("blob").as_deref(),
+        Some(canonicalize_sir_json(&payload.sir).as_str()),
+        "the intent's own committed SIR stands"
+    );
 }
 
 #[test]
