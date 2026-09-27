@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,9 +25,7 @@ use aetherd::sir_pipeline::{
     current_sir_identity, current_source_hash,
 };
 
-use super::{
-    AetherMcpServer, MCP_SCHEMA_VERSION, current_unix_timestamp, extract_symbol_source_text,
-};
+use super::{AetherMcpServer, LiveSymbolSources, MCP_SCHEMA_VERSION, current_unix_timestamp};
 use crate::AetherMcpError;
 
 const INFERENCE_MAX_RETRIES: usize = 2;
@@ -561,6 +558,17 @@ impl AetherMcpServer {
         // the row's current hash and version, not a snapshot another writer replaced.
         let _inject_guard = acquire_inject_write_lock(&self.state.workspace)
             .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
+        // A symbol removed meanwhile (row and SIR deleted under this lock) has nothing
+        // to mark: for a candidate that started without a SIR, "no SIR" before and after
+        // would otherwise read as unchanged and the marker would recreate an orphan
+        // `sir` row for an id the index no longer holds.
+        if self.state.store.get_symbol_record(symbol_id)?.is_none() {
+            tracing::info!(
+                symbol_id = %symbol_id,
+                "not marking the SIR stale: the symbol was removed while the deep scan attempt ran"
+            );
+            return Ok(());
+        }
         let current = self.state.store.get_sir_meta(symbol_id)?;
         if self.state.store.get_sir_identity(symbol_id)?.as_ref() != attempted_against {
             tracing::info!(
@@ -709,27 +717,31 @@ fn infer_symbol_text_is_public(symbol_text: &str) -> bool {
 }
 
 /// The symbol's text for the prompt (truncated to the prompt budget) together with the
-/// content hash of the full text, both from one read of the file, so the hash is of
-/// the body the prompt describes (and equals what `current_source_hash` computes for
-/// an unchanged file).
+/// content hash of the full text, both from one read and parse of the file in which the
+/// symbol is found by id (never by the range the candidate snapshot recorded, which an
+/// edit elsewhere in the file may have moved), so the hash is of the body the prompt
+/// describes and equals what `current_source_hash` computes for an unchanged file.
 fn extract_symbol_text(
     workspace: &Path,
     symbol: &aether_core::Symbol,
 ) -> Result<(String, String), AetherMcpError> {
-    let full_path = workspace.join(&symbol.file_path);
-    let source = fs::read_to_string(&full_path)?;
-    let mut symbol_text = extract_symbol_source_text(&source, symbol.range)
-        .filter(|text| !text.trim().is_empty())
-        .ok_or_else(|| {
-            AetherMcpError::Message(format!(
-                "failed to extract symbol source for {} ({})",
-                symbol.qualified_name, symbol.file_path
-            ))
-        })?;
-    let source_hash = aether_core::content_hash(&symbol_text);
-    // The range came from the parser's view of the file; if the text it now covers is
-    // not what the symbol was recorded for, the file changed since indexing and the
-    // prompt would describe the wrong slice.
+    let mut live = LiveSymbolSources::new(workspace);
+    let Some(current) = live.source_for(symbol.file_path.as_str(), symbol.id.as_str())? else {
+        return Err(AetherMcpError::Message(format!(
+            "{} no longer declares {} as indexed (or cannot be read); re-index before a deep scan",
+            symbol.file_path, symbol.qualified_name
+        )));
+    };
+    let mut symbol_text = current.source_text.clone();
+    let source_hash = current.source_hash.clone();
+    if symbol_text.trim().is_empty() {
+        return Err(AetherMcpError::Message(format!(
+            "failed to extract symbol source for {} ({})",
+            symbol.qualified_name, symbol.file_path
+        )));
+    }
+    // The candidate was collected from the index; if the symbol's body no longer hashes
+    // to what was indexed, the file changed since and the daemon regenerates it first.
     if source_hash != symbol.content_hash {
         return Err(AetherMcpError::Message(format!(
             "source for {} ({}) changed since it was indexed; re-index before a deep scan",

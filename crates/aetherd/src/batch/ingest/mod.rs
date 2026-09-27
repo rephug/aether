@@ -83,14 +83,14 @@ pub(crate) fn ingest_results(
     provider: &dyn BatchProvider,
     provider_name: &str,
 ) -> Result<IngestSummary> {
-    let keymap = load_keymap(results_path, pass_config.pass.as_str());
+    let keymap = load_keymap(results_path, pass_config.pass.as_str())?;
     if !keymap.is_empty() {
         tracing::debug!(
             keys = keymap.len(),
             "loaded batch keymap for prompt-hash recovery"
         );
     }
-    let origins = load_origins(results_path, pass_config.pass.as_str());
+    let origins = load_origins(results_path, pass_config.pass.as_str())?;
 
     let file = std::fs::File::open(results_path)
         .with_context(|| format!("failed to open batch results {}", results_path.display()))?;
@@ -651,7 +651,7 @@ fn parse_key(key: &str) -> Result<(&str, &str)> {
 /// one per build of the pass still present in the directory. A result whose build has
 /// none is refused (see `prepare_symbol`); a legacy result without a build id is
 /// ingested unchecked.
-fn load_origins(results_path: &Path, pass: &str) -> HashMap<String, BatchRequestOrigin> {
+fn load_origins(results_path: &Path, pass: &str) -> Result<HashMap<String, BatchRequestOrigin>> {
     load_sidecars(results_path, pass, ORIGIN_SIDECAR_KIND)
 }
 
@@ -661,25 +661,30 @@ fn load_origins(results_path: &Path, pass: &str) -> HashMap<String, BatchRequest
 /// A keymap maps each provider request key to its full `symbol_id|prompt_hash|build_id`
 /// key, allowing ingest to recover full batch keys from providers that truncate
 /// custom_id (e.g. Anthropic's 64-char limit).
-fn load_keymap(results_path: &Path, pass: &str) -> HashMap<String, String> {
+fn load_keymap(results_path: &Path, pass: &str) -> Result<HashMap<String, String>> {
     load_sidecars(results_path, pass, KEYMAP_SIDECAR_KIND)
 }
 
 /// The union of every `<pass>.<build_id>.<kind>.json` beside the results (each build
 /// writes its own, and keys carry the build id, so entries never collide) plus the
-/// pre-build-id `<pass>.<kind>.json` when one is present. An unparsable sidecar is
-/// skipped with a warning.
+/// pre-build-id `<pass>.<kind>.json` when one is present. A sidecar that exists but
+/// cannot be read fails the ingest naming the file (every result of that build would
+/// otherwise be refused as origin-less with nothing to say why); an unparsable one is
+/// skipped with a warning naming the file.
 fn load_sidecars<V: serde::de::DeserializeOwned>(
     results_path: &Path,
     pass: &str,
     kind: &str,
-) -> HashMap<String, V> {
+) -> Result<HashMap<String, V>> {
     let Some(batch_dir) = results_path.parent() else {
-        return HashMap::new();
+        return Ok(HashMap::new());
     };
-    let Ok(entries) = std::fs::read_dir(batch_dir) else {
-        return HashMap::new();
-    };
+    let entries = std::fs::read_dir(batch_dir).with_context(|| {
+        format!(
+            "failed to list the batch directory {} for {kind} sidecars",
+            batch_dir.display()
+        )
+    })?;
     let prefix = format!("{pass}.");
     let suffix = format!(".{kind}.json");
     let legacy = format!("{pass}.{kind}.json");
@@ -696,9 +701,9 @@ fn load_sidecars<V: serde::de::DeserializeOwned>(
         .collect::<Vec<_>>();
     paths.sort();
     for path in paths {
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
+        let content = std::fs::read_to_string(&path).with_context(|| {
+            format!("failed to read the batch {kind} sidecar {}", path.display())
+        })?;
         match serde_json::from_str::<HashMap<String, V>>(&content) {
             Ok(entries) => merged.extend(entries),
             Err(err) => tracing::warn!(
@@ -708,7 +713,7 @@ fn load_sidecars<V: serde::de::DeserializeOwned>(
             ),
         }
     }
-    merged
+    Ok(merged)
 }
 
 fn symbol_from_record(record: &aether_store::SymbolRecord) -> Result<Symbol> {

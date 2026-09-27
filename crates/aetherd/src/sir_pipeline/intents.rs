@@ -2,6 +2,19 @@
 
 use super::*;
 
+/// Whether `stored` is the write `prepared` describes, ignoring the fields that
+/// `prepare_sir_for_persistence` derives from the dependency edges current at the time
+/// (`method_dependencies` and the merged `dependencies`): those move with the graph,
+/// the rest of the SIR only with a writer.
+pub(crate) fn is_own_committed_write(stored: &SirAnnotation, prepared: &SirAnnotation) -> bool {
+    let mask = |sir: &SirAnnotation| SirAnnotation {
+        method_dependencies: None,
+        dependencies: Vec::new(),
+        ..sir.clone()
+    };
+    sir_hash(&mask(stored)) == sir_hash(&mask(prepared))
+}
+
 impl SirPipeline {
     pub fn replay_incomplete_intents(
         &self,
@@ -104,8 +117,10 @@ impl SirPipeline {
         let (prepared_sir, _, _) = self
             .prepare_sir_for_persistence(store, &payload.symbol, &payload.sir)
             .with_context(|| format!("failed to prepare SIR for intent {intent_id}"))?;
-        let mut canonical_json = canonicalize_sir_json(&prepared_sir);
-        let mut sir_hash_value = sir_hash(&prepared_sir);
+        // Set by whichever branch runs: the write this replay performs, or the one it
+        // finds committed.
+        let canonical_json;
+        let sir_hash_value;
 
         if status == WriteIntentStatus::Pending {
             // The intent's write never landed. It is still wanted only while the store
@@ -159,7 +174,16 @@ impl SirPipeline {
                 .with_context(|| {
                     format!("failed to read sqlite SIR blob for intent {intent_id}")
                 })?;
-            if stored_blob.as_deref() != Some(canonical_json.as_str()) {
+            // The comparison sets aside what `prepare_sir_for_persistence` derives from
+            // the current dependency edges (`method_dependencies`, the merged
+            // `dependencies`): edges recorded since the commit change today's
+            // recomputation, not the SIR this intent wrote, and must not retire it
+            // before its embedding and graph stages ran.
+            let Some(stored_sir) = stored_blob
+                .as_deref()
+                .and_then(|blob| serde_json::from_str::<SirAnnotation>(blob).ok())
+                .filter(|stored| is_own_committed_write(stored, &prepared_sir))
+            else {
                 tracing::info!(
                     intent_id = %intent_id,
                     symbol_id = %payload.symbol.id,
@@ -169,7 +193,10 @@ impl SirPipeline {
                     .mark_intent_complete(intent_id)
                     .with_context(|| format!("failed to retire superseded intent {intent_id}"))?;
                 return Ok(());
-            }
+            };
+            // The remaining stages describe the blob as committed, not the recomputation.
+            canonical_json = canonicalize_sir_json(&stored_sir);
+            sir_hash_value = sir_hash(&stored_sir);
         }
 
         if status == WriteIntentStatus::SqliteDone {

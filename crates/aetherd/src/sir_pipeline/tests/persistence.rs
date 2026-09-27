@@ -382,6 +382,44 @@ fn persist_successful_generation_sqlite_skips_a_sir_whose_content_cycled_back() 
 }
 
 #[test]
+fn a_committed_write_is_recognized_across_edge_derived_fields() {
+    use super::super::intents::is_own_committed_write;
+
+    let committed = SirAnnotation {
+        dependencies: vec!["Helper".to_owned(), "Record".to_owned()],
+        method_dependencies: Some(HashMap::from([(
+            "load".to_owned(),
+            vec!["Helper".to_owned()],
+        )])),
+        ..demo_sir()
+    };
+    // Edges recorded since the commit change today's recomputation of the derived
+    // fields, not the write itself.
+    let recomputed = SirAnnotation {
+        dependencies: vec![
+            "Helper".to_owned(),
+            "Record".to_owned(),
+            "StoreError".to_owned(),
+        ],
+        method_dependencies: Some(HashMap::from([
+            (
+                "load".to_owned(),
+                vec!["Helper".to_owned(), "StoreError".to_owned()],
+            ),
+            ("save".to_owned(), vec!["Record".to_owned()]),
+        ])),
+        ..demo_sir()
+    };
+    assert!(is_own_committed_write(&committed, &recomputed));
+    // Any other difference is another writer's SIR.
+    let replaced = SirAnnotation {
+        intent: "Reviewed by hand".to_owned(),
+        ..recomputed.clone()
+    };
+    assert!(!is_own_committed_write(&committed, &replaced));
+}
+
+#[test]
 fn replay_retires_an_intent_whose_sir_moved_on() {
     let temp = tempdir().expect("tempdir");
     let workspace = temp.path();
