@@ -297,6 +297,7 @@ mod tests {
 
     use tempfile::tempdir;
 
+    use super::super::structural::to_symbol_record;
     use super::super::tests::{test_symbol, write_default_config};
     use super::*;
 
