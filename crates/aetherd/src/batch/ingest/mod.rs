@@ -16,9 +16,20 @@ use crate::batch::hash::diff_prompt_hashes;
 use crate::batch::{BatchProvider, BatchResultLine, PassConfig};
 use crate::continuous::cosine_distance_from_embeddings;
 use crate::sir_pipeline::{
-    EmbeddingInput, PriorSir, SirPipeline, UpsertSirIntentPayload, current_sir_identity,
-    current_source_hash,
+    EmbeddingInput, PriorSir, SirIdentity, SirPipeline, UpsertSirIntentPayload,
+    current_sir_identity, current_source_hash,
 };
+
+/// Log the symbols whose vectors a flush dropped because their SIR was replaced
+/// while the batch was being embedded. The newer writer owns the vector now.
+fn note_superseded_vectors(symbol_ids: &[String]) {
+    for symbol_id in symbol_ids {
+        tracing::info!(
+            symbol_id = %symbol_id,
+            "vector dropped: SIR replaced while the batch was embedded"
+        );
+    }
+}
 
 /// Number of embedding records to buffer before flushing to the vector store.
 /// Keeps memory modest (~600KB for 3072-dim f32 vectors) while reducing LanceDB
@@ -61,6 +72,9 @@ struct PreparedSymbol {
     /// just made, or, for a resumed result, its own earlier write. Downstream rows
     /// carry it, which tells them from rows an older ingest of the same prompt left.
     write_generation: i64,
+    /// The full identity of that leaf write; the vector flush stores this result's
+    /// vector only while the store still holds exactly it.
+    identity: SirIdentity,
 }
 
 /// Map batch provider name to the closest `InferenceProviderKind`.
@@ -101,7 +115,7 @@ pub(crate) fn ingest_results(
         .context("failed to initialize batch ingest pipeline")?;
 
     let mut summary = IngestSummary::default();
-    let mut embedding_buffer: Vec<SymbolEmbeddingRecord> =
+    let mut embedding_buffer: Vec<(SymbolEmbeddingRecord, SirIdentity)> =
         Vec::with_capacity(INGEST_VECTOR_BATCH_SIZE);
 
     // Collect raw lines into a buffer so we can process them in chunks.
@@ -159,9 +173,10 @@ pub(crate) fn ingest_results(
 
     // Flush any remaining buffered embeddings to vector store.
     if !embedding_buffer.is_empty() {
-        pipeline
+        let superseded = pipeline
             .flush_embedding_batch(store, embedding_buffer)
             .context("failed to flush final embedding batch during ingest")?;
+        note_superseded_vectors(&superseded);
     }
 
     Ok(summary)
@@ -184,7 +199,7 @@ fn process_chunk(
     origins: &HashMap<String, BatchRequestOrigin>,
     lines: &[String],
     summary: &mut IngestSummary,
-    embedding_buffer: &mut Vec<SymbolEmbeddingRecord>,
+    embedding_buffer: &mut Vec<(SymbolEmbeddingRecord, SirIdentity)>,
 ) -> Result<()> {
     let mut prepared: Vec<PreparedSymbol> = Vec::with_capacity(lines.len());
     let mut embed_inputs: Vec<EmbeddingInput> = Vec::new();
@@ -333,17 +348,26 @@ fn process_chunk(
         }
     }
 
-    // Buffer new embedding records for vector store flush.
+    // Buffer new embedding records for vector store flush, each with the identity of
+    // the leaf write it embeds.
     for record in embedding_records {
-        embedding_buffer.push(record);
+        let Some(identity) = prepared
+            .iter()
+            .find(|prep| prep.symbol_id == record.symbol_id)
+            .map(|prep| prep.identity.clone())
+        else {
+            continue;
+        };
+        embedding_buffer.push((record, identity));
     }
 
     // Flush to vector store if buffer exceeds threshold.
     if embedding_buffer.len() >= INGEST_VECTOR_BATCH_SIZE {
         let batch = std::mem::take(embedding_buffer);
-        pipeline
+        let superseded = pipeline
             .flush_embedding_batch(store, batch)
             .context("failed to flush embedding batch during ingest")?;
+        note_superseded_vectors(&superseded);
     }
 
     Ok(())
@@ -498,7 +522,7 @@ fn prepare_symbol(
     // regeneration never writes a prompt hash, so a same-content SIR written
     // independently since supersedes the result like any other, and a different SIR
     // trivially does.
-    let (canonical_json, sir_hash_value, resumed, write_generation) = {
+    let (canonical_json, sir_hash_value, resumed, write_generation, identity) = {
         let _inject_guard =
             crate::sir_pipeline::acquire_inject_write_lock(pipeline.workspace_root())?;
         let current = current_sir_identity(store, &symbol_id)?;
@@ -559,19 +583,24 @@ fn prepare_symbol(
                 return Ok(None);
             }
         }
-        let write_generation = match resumed_write {
-            Some(write_generation) => write_generation,
-            None => {
-                // Leaf, history, metadata and this request's provenance in one transaction.
-                pipeline
-                    .persist_sir_payload_into_sqlite(store, &payload, None)
-                    .with_context(|| format!("failed to persist SIR payload for {symbol_id}"))?;
-                current_sir_identity(store, &symbol_id)?
-                    .ok_or_else(|| anyhow!("missing persisted SIR identity for {symbol_id}"))?
-                    .write_generation
-            }
-        };
-        (canonical_json, sir_hash_value, resumed, write_generation)
+        if resumed_write.is_none() {
+            // Leaf, history, metadata and this request's provenance in one transaction.
+            pipeline
+                .persist_sir_payload_into_sqlite(store, &payload, None)
+                .with_context(|| format!("failed to persist SIR payload for {symbol_id}"))?;
+        }
+        // The identity of the leaf this result stands on (the write just made, or, for
+        // a resumed result, its own earlier write), read under the same lock.
+        let identity = current_sir_identity(store, &symbol_id)?
+            .ok_or_else(|| anyhow!("missing persisted SIR identity for {symbol_id}"))?;
+        let write_generation = resumed_write.unwrap_or(identity.write_generation);
+        (
+            canonical_json,
+            sir_hash_value,
+            resumed,
+            write_generation,
+            identity,
+        )
     };
 
     Ok(Some(PreparedSymbol {
@@ -584,6 +613,7 @@ fn prepare_symbol(
         embedding_slot: None,
         resumed,
         write_generation,
+        identity,
     }))
 }
 

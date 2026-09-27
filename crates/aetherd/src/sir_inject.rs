@@ -14,7 +14,9 @@ use crate::batch::write_fingerprint_row;
 use crate::cli::SirInjectArgs;
 use crate::continuous::cosine_distance_from_embeddings;
 use crate::sir_agent_support::{load_fresh_symbol_source, resolve_symbol, symbol_from_record};
-use crate::sir_pipeline::{EmbeddingRefresh, SirPipeline, UpsertSirIntentPayload};
+use crate::sir_pipeline::{
+    EmbeddingRefresh, SirPipeline, UpsertSirIntentPayload, current_sir_identity,
+};
 
 const FORCE_CONFIDENCE_THRESHOLD: f32 = 0.5;
 const DEFAULT_INJECT_CONFIDENCE: f32 = 0.95;
@@ -206,7 +208,7 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
         source_hash: Some(fresh.symbol.content_hash.clone()),
         prior_sir: crate::sir_pipeline::PriorSir::Unrecorded,
     };
-    let (canonical_json, sir_hash) = persist_pipeline
+    let (canonical_json, _sir_hash) = persist_pipeline
         .persist_sir_payload_into_sqlite(&store, &payload, None)
         .with_context(|| format!("failed to persist injected SIR for {}", record.id))?;
 
@@ -222,6 +224,11 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
             ..persisted_meta
         })
         .with_context(|| format!("failed to persist prompt hash for {}", record.id))?;
+    // The identity of the leaf this command wrote, read under the same lock: the
+    // embedding below belongs to exactly this write.
+    let committed = current_sir_identity(&store, record.id.as_str())
+        .with_context(|| format!("failed to read the SIR identity for {}", record.id))?
+        .ok_or_else(|| anyhow!("missing persisted SIR identity for {}", record.id))?;
 
     drop(inject_guard);
     let delta_sem = if let Some(pipeline) = embedding_pipeline.as_mut() {
@@ -229,7 +236,7 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
             .refresh_embedding_if_needed(
                 &store,
                 record.id.as_str(),
-                sir_hash.as_str(),
+                &committed,
                 canonical_json.as_str(),
                 false,
                 &mut std::io::sink(),

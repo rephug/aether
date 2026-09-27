@@ -198,6 +198,10 @@ struct PersistedSuccessfulGeneration {
     sir_hash: String,
     canonical_json: String,
     provider_name: String,
+    /// The identity the leaf write produced, read under the inject lock that made it:
+    /// the embedding stage compares the store against exactly this write, so a leaf
+    /// replaced and restored with the same content meanwhile is not taken for it.
+    identity: SirIdentity,
     embedding_needed: Option<EmbeddingNeeded>,
 }
 

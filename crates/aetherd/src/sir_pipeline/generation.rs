@@ -191,7 +191,7 @@ impl SirPipeline {
         match self.refresh_embedding_if_needed(
             store,
             &generated.symbol.id,
-            &persisted.sir_hash,
+            &persisted.identity,
             &persisted.canonical_json,
             print_sir,
             out,
@@ -421,6 +421,31 @@ impl SirPipeline {
             return Ok(GenerationPersist::Failed);
         }
 
+        // Read under the same lock as the write: the identity the embedding stage must
+        // still find for its vector to belong to this write.
+        let identity = match current_sir_identity(store, &generated.symbol.id) {
+            Ok(Some(identity)) => identity,
+            Ok(None) => {
+                let message = "the persisted SIR identity is missing".to_owned();
+                self.mark_intent_failed_safely(store, intent.intent_id.as_str(), message.as_str());
+                tracing::error!(
+                    symbol_id = %generated.symbol.id,
+                    "missing persisted SIR identity after the sqlite write"
+                );
+                return Ok(GenerationPersist::Failed);
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                self.mark_intent_failed_safely(store, intent.intent_id.as_str(), message.as_str());
+                tracing::error!(
+                    symbol_id = %generated.symbol.id,
+                    error = %err,
+                    "failed to read the persisted SIR identity"
+                );
+                return Ok(GenerationPersist::Failed);
+            }
+        };
+
         let embedding_needed =
             match self.check_embedding_needed(&generated.symbol.id, &sir_hash_value, None) {
                 Ok(needed) => needed,
@@ -448,6 +473,7 @@ impl SirPipeline {
                 sir_hash: sir_hash_value,
                 canonical_json,
                 provider_name: generated.provider_name.clone(),
+                identity,
                 embedding_needed,
             },
         )))

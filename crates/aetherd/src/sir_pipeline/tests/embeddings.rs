@@ -401,6 +401,93 @@ fn refresh_embedding_if_current_never_leaves_a_vector_for_a_replaced_sir() {
 }
 
 #[test]
+fn flush_embedding_batch_reports_the_records_it_drops_for_replaced_sirs() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    write_embeddings_only_config(workspace);
+    let store = SqliteStore::open(workspace).expect("open store");
+    let pipeline = build_write_pipeline_with_embeddings(
+        workspace,
+        Arc::new(PanicInferenceProvider),
+        Some(Arc::new(counting_embedding_provider().0)),
+    );
+    let sir = demo_sir();
+    let mut identities = Vec::new();
+    for (symbol_id, name) in [("sym-kept", "demo::kept"), ("sym-stale", "demo::stale")] {
+        store
+            .upsert_symbol(demo_symbol(symbol_id, name))
+            .expect("upsert symbol");
+        let symbol = demo_type_symbol(
+            symbol_id,
+            name,
+            name,
+            "src/lib.rs",
+            SymbolKind::Function,
+            "fn f() {}\n",
+        );
+        pipeline
+            .persist_sir_payload_into_sqlite(
+                &store,
+                &payload_for(&symbol, &sir, SIR_GENERATION_PASS_SCAN),
+                None,
+            )
+            .expect("persist");
+        let identity = current_sir_identity(&store, symbol_id)
+            .expect("identity")
+            .expect("persisted");
+        identities.push((symbol_id, symbol, identity));
+    }
+    // The stale symbol is rewritten with the same content before the flush: same hash,
+    // another write generation. Its record embeds a write that is no longer current.
+    let (_, stale_symbol, stale_identity) = &identities[1];
+    pipeline
+        .persist_sir_payload_into_sqlite(
+            &store,
+            &payload_for(stale_symbol, &sir, SIR_GENERATION_PASS_SCAN),
+            None,
+        )
+        .expect("rewrite");
+    let record = |symbol_id: &str| SymbolEmbeddingRecord {
+        symbol_id: symbol_id.to_owned(),
+        sir_hash: sir_hash(&sir),
+        provider: "test_embedding".to_owned(),
+        model: "test-model".to_owned(),
+        embedding: vec![1.0, 0.0],
+        updated_at: 1_700_000_400,
+    };
+
+    let superseded = pipeline
+        .flush_embedding_batch(
+            &store,
+            vec![
+                (record("sym-kept"), identities[0].2.clone()),
+                (record("sym-stale"), stale_identity.clone()),
+            ],
+        )
+        .expect("flush");
+
+    assert_eq!(
+        superseded,
+        vec!["sym-stale".to_owned()],
+        "the dropped record is reported, not counted as stored"
+    );
+    assert!(
+        pipeline
+            .load_symbol_embedding("sym-kept")
+            .expect("load embedding")
+            .is_some(),
+        "the current record is stored"
+    );
+    assert!(
+        pipeline
+            .load_symbol_embedding("sym-stale")
+            .expect("load embedding")
+            .is_none(),
+        "no vector is stored for the write that was replaced"
+    );
+}
+
+#[test]
 fn a_prefetched_vector_identity_is_re_read_under_the_lock_before_it_counts_as_current() {
     let temp = tempdir().expect("tempdir");
     let workspace = temp.path();

@@ -776,27 +776,55 @@ impl SirPipeline {
         let pending = std::mem::take(buffer);
         let records = pending
             .iter()
-            .map(|item| item.record.clone())
+            .map(|item| (item.record.clone(), item.persisted.identity.clone()))
             .collect::<Vec<_>>();
-        if let Err(err) = self.flush_embedding_batch(store, records) {
-            let message = format!("{err:#}");
-            tracing::error!(
-                error = %err,
-                record_count = pending.len(),
-                "failed to flush embedding batch"
-            );
-            for item in pending {
-                self.mark_intent_failed_safely(
-                    store,
-                    item.persisted.intent_id.as_str(),
-                    message.as_str(),
+        let superseded = match self.flush_embedding_batch(store, records) {
+            Ok(superseded) => superseded,
+            Err(err) => {
+                let message = format!("{err:#}");
+                tracing::error!(
+                    error = %err,
+                    record_count = pending.len(),
+                    "failed to flush embedding batch"
                 );
-                stats.failure_count += 1;
+                for item in pending {
+                    self.mark_intent_failed_safely(
+                        store,
+                        item.persisted.intent_id.as_str(),
+                        message.as_str(),
+                    );
+                    stats.failure_count += 1;
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
+        };
 
         for item in pending {
+            // Another writer replaced this leaf while the batch was embedded: its vector
+            // was dropped (or taken back), that writer embeds its own SIR, and this
+            // write is retired rather than advanced to `vector_done` and counted as a
+            // success for a vector that was never stored.
+            if superseded.contains(&item.persisted.symbol_id) {
+                tracing::info!(
+                    symbol_id = %item.persisted.symbol_id,
+                    "generated SIR was replaced before its embedding was stored; retiring its intent"
+                );
+                if let Err(err) = store.mark_intent_complete(&item.persisted.intent_id) {
+                    let message = format!("{err:#}");
+                    self.mark_intent_failed_safely(
+                        store,
+                        item.persisted.intent_id.as_str(),
+                        message.as_str(),
+                    );
+                    tracing::error!(
+                        symbol_id = %item.persisted.symbol_id,
+                        error = %err,
+                        "failed to retire the superseded write intent"
+                    );
+                }
+                stats.failure_count += 1;
+                continue;
+            }
             let _ = self.finish_bulk_scan_success(
                 store,
                 item.persisted,

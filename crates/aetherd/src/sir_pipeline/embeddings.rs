@@ -250,11 +250,24 @@ impl SirPipeline {
             };
 
             let canonical = canonicalize_sir_json(&sir);
-            let hash = sir_hash(&sir);
+            // The identity of the write whose blob was just read; the refresh holds the
+            // vector to that write, not to any later one with the same hash.
+            let committed = match current_sir_identity(store, symbol_id) {
+                Ok(Some(identity)) => identity,
+                Ok(None) => {
+                    skipped_no_sir += 1;
+                    continue;
+                }
+                Err(err) => {
+                    errors += 1;
+                    tracing::warn!(symbol_id = %symbol_id, error = %err, "failed to read SIR identity");
+                    continue;
+                }
+            };
             match self.refresh_embedding_if_needed(
                 store,
                 symbol_id,
-                &hash,
+                &committed,
                 &canonical,
                 print_sir,
                 out,
@@ -297,43 +310,53 @@ impl SirPipeline {
     /// wrote a newer leaf and its own vector) is dropped rather than written over the
     /// newer vector, and a record whose SIR moves on between that check and the write
     /// is taken back afterwards, exactly as the single-symbol refresh does.
+    ///
+    /// Each record comes with the identity of the leaf write it embeds (hash, history
+    /// version, write generation), and currency is that whole identity: a leaf replaced
+    /// and then restored with the same content while the batch was embedded is another
+    /// write, not this one. The symbols whose vectors were dropped or taken back are
+    /// returned, so the caller retires their writes instead of reporting them stored.
     pub(crate) fn flush_embedding_batch(
         &self,
         store: &SqliteStore,
-        records: Vec<SymbolEmbeddingRecord>,
-    ) -> Result<()> {
+        records: Vec<(SymbolEmbeddingRecord, SirIdentity)>,
+    ) -> Result<Vec<String>> {
         if records.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let _embed_guards = acquire_embed_write_locks(
             &self.workspace_root,
-            records.iter().map(|record| record.symbol_id.as_str()),
+            records.iter().map(|(record, _)| record.symbol_id.as_str()),
         )?;
-        let sir_is_current = |record: &SymbolEmbeddingRecord| -> Result<bool> {
-            Ok(store
-                .get_sir_meta(record.symbol_id.as_str())
-                .with_context(|| format!("failed to read SIR metadata for {}", record.symbol_id))?
-                .is_some_and(|meta| meta.sir_hash == record.sir_hash))
+        let sir_is_current = |record: &SymbolEmbeddingRecord, identity: &SirIdentity| {
+            current_sir_identity(store, record.symbol_id.as_str())
+                .map(|current| current.as_ref() == Some(identity))
         };
+        let mut superseded = Vec::new();
         let mut current = Vec::with_capacity(records.len());
-        for record in records {
-            if sir_is_current(&record)? {
-                current.push(record);
+        for (record, identity) in records {
+            if sir_is_current(&record, &identity)? {
+                current.push((record, identity));
             } else {
                 tracing::debug!(
                     symbol_id = %record.symbol_id,
                     "dropping embedding for a SIR replaced while the batch was being embedded"
                 );
+                superseded.push(record.symbol_id);
             }
         }
         if current.is_empty() {
-            return Ok(());
+            return Ok(superseded);
         }
         self.runtime
-            .block_on(self.vector_store.upsert_embedding_batch(current.clone()))
+            .block_on(
+                self.vector_store.upsert_embedding_batch(
+                    current.iter().map(|(record, _)| record.clone()).collect(),
+                ),
+            )
             .context("failed to flush embedding batch to vector store")?;
-        for record in &current {
-            if !sir_is_current(record)? {
+        for (record, identity) in &current {
+            if !sir_is_current(record, identity)? {
                 self.runtime
                     .block_on(self.vector_store.delete_embedding_if_matches(
                         record.symbol_id.as_str(),
@@ -346,9 +369,10 @@ impl SirPipeline {
                             record.symbol_id
                         )
                     })?;
+                superseded.push(record.symbol_id.clone());
             }
         }
-        Ok(())
+        Ok(superseded)
     }
 
     /// Check whether a symbol needs a new embedding without generating one.
@@ -444,12 +468,16 @@ impl SirPipeline {
     /// The outcome is returned as is: `Superseded` tells the caller that the SIR it
     /// wrote is no longer the stored one, so its write is not to be recorded as
     /// completed (that SIR's own writer embeds it); it must not be read as "unchanged".
+    /// `committed` is the identity of that write (hash, history version and write
+    /// generation), read under the inject lock that made it; the vector belongs to the
+    /// caller's write only while the store holds exactly that identity, so a leaf
+    /// replaced and then restored with the same content meanwhile counts as superseded.
     #[allow(clippy::too_many_arguments)]
     pub fn refresh_embedding_if_needed(
         &self,
         store: &SqliteStore,
         symbol_id: &str,
-        sir_hash_value: &str,
+        committed: &SirIdentity,
         canonical_json: &str,
         print_sir: bool,
         out: &mut dyn Write,
@@ -457,14 +485,11 @@ impl SirPipeline {
     ) -> Result<EmbeddingRefresh> {
         let _embed_guard = acquire_embed_write_lock(&self.workspace_root, symbol_id)?;
         let mut still_current = || -> Result<bool> {
-            Ok(store
-                .get_sir_meta(symbol_id)
-                .with_context(|| format!("failed to read SIR metadata for {symbol_id}"))?
-                .is_some_and(|meta| meta.sir_hash == sir_hash_value))
+            Ok(current_sir_identity(store, symbol_id)?.as_ref() == Some(committed))
         };
         let outcome = self.refresh_embedding_if_current(
             symbol_id,
-            sir_hash_value,
+            committed.sir_hash.as_str(),
             canonical_json,
             prefetched_meta,
             &mut still_current,

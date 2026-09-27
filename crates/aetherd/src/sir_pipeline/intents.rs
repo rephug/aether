@@ -120,7 +120,9 @@ impl SirPipeline {
         // Set by whichever branch runs: the write this replay performs, or the one it
         // finds committed.
         let canonical_json;
-        let sir_hash_value;
+        // The identity of the committed leaf the embedding stage embeds: the write this
+        // replay makes, or the one it finds committed.
+        let committed: SirIdentity;
 
         if status == WriteIntentStatus::Pending {
             // The intent's write never landed. It is still wanted only while the store
@@ -183,7 +185,10 @@ impl SirPipeline {
                 .persist_sir_payload_into_sqlite(store, payload, Some(intent_id))
                 .with_context(|| format!("failed sqlite write stage for intent {intent_id}"))?;
             canonical_json = persisted.0;
-            sir_hash_value = persisted.1;
+            committed =
+                current_sir_identity(store, payload.symbol.id.as_str())?.ok_or_else(|| {
+                    anyhow::anyhow!("missing persisted SIR identity for intent {intent_id}")
+                })?;
             status = WriteIntentStatus::SqliteDone;
         } else {
             // The intent's SQLite write landed (the status is set in that transaction).
@@ -230,7 +235,10 @@ impl SirPipeline {
             };
             // The remaining stages describe the blob as committed, not the recomputation.
             canonical_json = canonicalize_sir_json(&stored_sir);
-            sir_hash_value = sir_hash(&stored_sir);
+            committed =
+                current_sir_identity(store, payload.symbol.id.as_str())?.ok_or_else(|| {
+                    anyhow::anyhow!("missing committed SIR identity for intent {intent_id}")
+                })?;
         }
 
         if status == WriteIntentStatus::SqliteDone {
@@ -238,7 +246,7 @@ impl SirPipeline {
                 .refresh_embedding_if_needed(
                     store,
                     payload.symbol.id.as_str(),
-                    sir_hash_value.as_str(),
+                    &committed,
                     canonical_json.as_str(),
                     false,
                     &mut std::io::sink(),
