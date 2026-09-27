@@ -650,15 +650,16 @@ impl VectorStore for LanceVectorStore {
         }))
     }
 
-    async fn delete_embedding_if_sir_hash(
+    async fn delete_embedding_if_matches(
         &self,
         symbol_id: &str,
         sir_hash: &str,
+        updated_at: i64,
     ) -> Result<(), StoreError> {
         self.migrate_from_sqlite_if_needed().await?;
         let connection = self.connect().await?;
         let predicate = format!(
-            "symbol_id = '{}' AND sir_hash = '{}'",
+            "symbol_id = '{}' AND sir_hash = '{}' AND updated_at = {updated_at}",
             escape_sql_string(symbol_id),
             escape_sql_string(sir_hash)
         );

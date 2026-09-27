@@ -72,13 +72,15 @@ pub trait VectorStore: Send + Sync {
         symbol_ids: &[String],
     ) -> Result<HashMap<String, VectorEmbeddingMetaRecord>, StoreError>;
     async fn delete_embedding(&self, symbol_id: &str) -> Result<(), StoreError>;
-    /// Delete the symbol's embedding only while it still describes the SIR with
-    /// `sir_hash`, so a writer taking back its own vector never removes one a newer
-    /// writer has stored since.
-    async fn delete_embedding_if_sir_hash(
+    /// Delete the symbol's embedding only while it is still the exact vector the caller
+    /// observed or wrote (same `sir_hash` and same `updated_at`), so a writer taking
+    /// back its own vector never removes one a newer writer has stored since, even when
+    /// that newer vector describes an earlier SIR again (`H1 → H2 → H1`).
+    async fn delete_embedding_if_matches(
         &self,
         symbol_id: &str,
         sir_hash: &str,
+        updated_at: i64,
     ) -> Result<(), StoreError>;
     async fn delete_embeddings(&self, symbol_ids: &[String]) -> Result<(), StoreError>;
     async fn search_nearest(

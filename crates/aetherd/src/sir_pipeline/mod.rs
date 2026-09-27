@@ -2610,16 +2610,32 @@ impl SirPipeline {
             // It is only right while the SIR is still this one: an injection that
             // repeats an earlier hash can reach here after a concurrent injection
             // installed a newer SIR, and if that injector's own refresh then fails the
-            // old vector would keep serving the new annotation. Take it back out.
+            // old vector would keep serving the new annotation. Take it back out, but
+            // only the exact vector observed (hash and write time), never one another
+            // writer stored since.
             if !still_current()? {
-                self.runtime
-                    .block_on(
-                        self.vector_store
-                            .delete_embedding_if_sir_hash(symbol_id, sir_hash_value),
-                    )
-                    .with_context(|| {
-                        format!("failed to delete the superseded embedding for {symbol_id}")
-                    })?;
+                let observed = match prefetched_meta {
+                    Some(meta) => Some(meta.clone()),
+                    None => self
+                        .runtime
+                        .block_on(self.vector_store.get_embedding_meta(symbol_id))
+                        .with_context(|| {
+                            format!("failed to read embedding metadata for {symbol_id}")
+                        })?,
+                };
+                if let Some(observed) = observed
+                    && observed.sir_hash == sir_hash_value
+                {
+                    self.runtime
+                        .block_on(self.vector_store.delete_embedding_if_matches(
+                            symbol_id,
+                            sir_hash_value,
+                            observed.updated_at,
+                        ))
+                        .with_context(|| {
+                            format!("failed to delete the superseded embedding for {symbol_id}")
+                        })?;
+                }
                 return Ok(EmbeddingRefresh::Superseded);
             }
             return Ok(EmbeddingRefresh::Unchanged);
@@ -2686,14 +2702,16 @@ impl SirPipeline {
             // The SIR changed between the last check and the write: the vector just
             // stored describes the old SIR, so take it back out rather than let the new
             // SIR read as semantically identical to the old one. Only this call's own
-            // vector is removed (the delete is keyed on the SIR hash): a writer that
-            // does not take the embedding locks (the daemon's index or regenerate pass)
-            // may already have stored the newer SIR's vector, and that one must stay.
+            // vector is removed (the delete is keyed on the SIR hash and this write's
+            // timestamp): a writer that does not take the embedding locks (the daemon's
+            // index or regenerate pass) may already have stored the newer SIR's vector,
+            // even one for this same hash again (`H1 → H2 → H1`), and that one must stay.
             self.runtime
-                .block_on(
-                    self.vector_store
-                        .delete_embedding_if_sir_hash(symbol_id, sir_hash_value),
-                )
+                .block_on(self.vector_store.delete_embedding_if_matches(
+                    symbol_id,
+                    sir_hash_value,
+                    updated_at,
+                ))
                 .with_context(|| {
                     format!("failed to delete the superseded embedding for {symbol_id}")
                 })?;

@@ -242,12 +242,14 @@ impl SqliteStore {
         tx.commit()?;
         Ok(true)
     }
-    /// Delete the symbol's embedding only while it still carries `sir_hash` (one
-    /// statement, so no newer vector can slip in between a check and the delete).
-    pub fn delete_symbol_embedding_if_sir_hash(
+    /// Delete the symbol's embedding only while it is still the row that carries
+    /// `sir_hash` and `updated_at` (one statement, so no newer vector can slip in
+    /// between a check and the delete, and a newer vector for the same hash survives).
+    pub fn delete_symbol_embedding_if_matches(
         &self,
         symbol_id: &str,
         sir_hash: &str,
+        updated_at: i64,
     ) -> Result<(), StoreError> {
         // A panic elsewhere while holding the connection poisons the mutex, but the
         // connection itself is still usable: recover it rather than panic in turn.
@@ -256,8 +258,8 @@ impl SqliteStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.execute(
-            "DELETE FROM sir_embeddings WHERE symbol_id = ?1 AND sir_hash = ?2",
-            params![symbol_id, sir_hash],
+            "DELETE FROM sir_embeddings WHERE symbol_id = ?1 AND sir_hash = ?2 AND updated_at = ?3",
+            params![symbol_id, sir_hash, updated_at],
         )?;
         Ok(())
     }
@@ -408,9 +410,9 @@ mod tests {
             .expect("row");
         assert_eq!(meta.sir_hash, "h2");
 
-        // The hash-conditional delete is the mirror image.
+        // The conditional delete is the mirror image: hash and write time must match.
         store
-            .delete_symbol_embedding_if_sir_hash("s", "h1")
+            .delete_symbol_embedding_if_matches("s", "h1", 1)
             .expect("delete");
         assert!(
             store
@@ -419,7 +421,17 @@ mod tests {
                 .is_some()
         );
         store
-            .delete_symbol_embedding_if_sir_hash("s", "h2")
+            .delete_symbol_embedding_if_matches("s", "h2", 2)
+            .expect("delete");
+        assert!(
+            store
+                .get_symbol_embedding_meta("s")
+                .expect("meta")
+                .is_some(),
+            "a vector for the same hash written at another time is not this writer's"
+        );
+        store
+            .delete_symbol_embedding_if_matches("s", "h2", 1)
             .expect("delete");
         assert!(
             store

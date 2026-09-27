@@ -83,8 +83,14 @@ else
   echo "error: the sqlite3 CLI or python3 is required to query $DB" >&2
   exit 1
 fi
+# Print-mode sessions have nobody to approve a tool, so everything /scan needs is
+# pre-approved: the AETHER MCP tools, and Bash only for the two query programs the
+# command text uses to enumerate targets from .aether/meta.sqlite (the sqlite3 CLI and
+# Python's built-in sqlite3 module). Nothing else is allowed.
+SCAN_ALLOWED_TOOLS=("mcp__aether*" "Bash(sqlite3:*)" "Bash(python3:*)")
+SCAN_ALLOWED_TOOLS_DISPLAY='"mcp__aether*" "Bash(sqlite3:*)" "Bash(python3:*)"'
 if ! command -v claude >/dev/null 2>&1; then
-  echo "error: the claude CLI is required (each unit runs as: claude -p \"/scan <unit> $BATCH_SIZE scopes=<paths>\" --allowedTools \"mcp__aether*\")" >&2
+  echo "error: the claude CLI is required (each unit runs as: claude -p \"/scan <unit> $BATCH_SIZE scopes=<paths>\" --allowedTools $SCAN_ALLOWED_TOOLS_DISPLAY)" >&2
   exit 1
 fi
 # The sessions are non-interactive, so the AETHER MCP server must already be registered
@@ -468,7 +474,7 @@ for crate in "${CRATES[@]}"; do
   # their carve-outs.
   scopes="$(scan_scopes_arg "$crate")"
   log "start $(unit_display "$crate") ($(crate_scopes_display "$crate")) -> $crate_log"
-  ( if claude -p "/scan $crate $BATCH_SIZE scopes=$scopes" --allowedTools "mcp__aether*" > "$crate_log" 2>&1; then
+  ( if claude -p "/scan $crate $BATCH_SIZE scopes=$scopes" --allowedTools "${SCAN_ALLOWED_TOOLS[@]}" > "$crate_log" 2>&1; then
       echo "done $(unit_display "$crate")"
     else
       touch "$FAIL_DIR/$safe_name"
