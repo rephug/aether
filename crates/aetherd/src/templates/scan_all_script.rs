@@ -82,9 +82,30 @@ if ! command -v claude >/dev/null 2>&1; then
   exit 1
 fi
 # The sessions are non-interactive, so the AETHER MCP server must already be registered
-# for this project: `.mcp.json` with an "aether" entry (the stdio aether-mcp binary,
-# which opens the store itself; no daemon is required).
-if [ ! -f .mcp.json ] || ! grep -q '"aether"' .mcp.json; then
+# for this project: `.mcp.json` whose `mcpServers.aether` entry names a command (stdio
+# aether-mcp, which opens the store itself; no daemon is required) or a URL. The entry
+# is checked structurally: the word "aether" elsewhere in the file (another server's
+# arguments, say) registers nothing, and would only launch sessions without tools.
+mcp_registered() {
+  [ -f .mcp.json ] || return 1
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<'PY' 2>/dev/null
+import json, sys
+try:
+    with open(".mcp.json") as f:
+        entry = json.load(f).get("mcpServers", {}).get("aether")
+except (OSError, ValueError, AttributeError):
+    sys.exit(1)
+ok = isinstance(entry, dict) and any(
+    isinstance(entry.get(key), str) and entry[key].strip() for key in ("command", "url")
+)
+sys.exit(0 if ok else 1)
+PY
+  else
+    grep -q '"aether"' .mcp.json
+  fi
+}
+if ! mcp_registered; then
   echo "error: no project-scoped AETHER MCP registration (.mcp.json with an \"aether\" server)." >&2
   echo "  Register it with: aetherd --workspace . init-agent --platform claude" >&2
   echo "  or: claude mcp add --transport stdio --scope project aether -- aether-mcp --workspace ." >&2

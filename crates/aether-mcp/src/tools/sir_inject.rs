@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use aether_parse::language_for_path;
-use aetherd::sir_pipeline::{SirPipeline, refresh_local_file_rollup};
+use aetherd::sir_pipeline::{EmbeddingRefresh, SirPipeline, refresh_local_file_rollup};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -552,9 +552,13 @@ impl AetherMcpServer {
         }
         // Per-symbol ordering: a slower embedding for an older SIR must never overwrite
         // the embedding of a newer one, so embed under the symbol's in-process and
-        // cross-process locks, and only when the store still holds the SIR this call
-        // wrote (the check happens after both locks are held, so no other injector can
-        // be mid-embedding for this symbol while it runs).
+        // cross-process locks (no other injector can be mid-embedding for this symbol
+        // while it runs), and only while the store still holds the SIR this call wrote.
+        // Injections do not wait on these locks, so a newer SIR can land at any point
+        // during the provider call: the pipeline re-asks `still_current` right before
+        // and right after the vector is stored, and removes a vector the newer SIR
+        // would otherwise inherit. That injector's own refresh, queued behind these
+        // locks, then embeds the newer SIR.
         let symbol_lock = embed_lock_for(symbol_id);
         let _symbol_guard = symbol_lock
             .lock()
@@ -563,27 +567,26 @@ impl AetherMcpServer {
             Ok(guard) => guard,
             Err(err) => return format!("failed: {err:#}"),
         };
-        match self.state.store.get_sir_meta(symbol_id) {
-            Ok(Some(meta)) if meta.sir_hash != sir_hash => {
-                return "superseded: a newer SIR was injected".to_owned();
-            }
-            Err(err) => return format!("failed: {err:#}"),
-            _ => {}
-        }
         let pipeline = match SirPipeline::new_embeddings_only(self.state.workspace.clone()) {
             Ok(pipeline) => pipeline,
             Err(err) => return format!("failed: {err:#}"),
         };
-        match pipeline.refresh_embedding_if_needed(
+        let store = self.state.store.as_ref();
+        let mut still_current = || -> anyhow::Result<bool> {
+            Ok(store
+                .get_sir_meta(symbol_id)?
+                .is_none_or(|meta| meta.sir_hash == sir_hash))
+        };
+        match pipeline.refresh_embedding_if_current(
             symbol_id,
             sir_hash,
             canonical_json,
-            false,
-            &mut std::io::sink(),
             None,
+            &mut still_current,
         ) {
-            Ok(true) => "refreshed".to_owned(),
-            Ok(false) => "unchanged".to_owned(),
+            Ok(EmbeddingRefresh::Refreshed { .. }) => "refreshed".to_owned(),
+            Ok(EmbeddingRefresh::Unchanged) => "unchanged".to_owned(),
+            Ok(EmbeddingRefresh::Superseded) => "superseded: a newer SIR was injected".to_owned(),
             Err(err) => format!("failed: {err:#}"),
         }
     }

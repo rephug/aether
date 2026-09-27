@@ -101,6 +101,18 @@ pub(crate) struct EmbeddingNeeded {
     pub model: String,
 }
 
+/// Outcome of `SirPipeline::refresh_embedding_if_current`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmbeddingRefresh {
+    /// A vector for `sir_hash_value` was stored under this provider and model.
+    Refreshed { provider: String, model: String },
+    /// The store already held that vector (or no provider is configured).
+    Unchanged,
+    /// The SIR was replaced while the vector was being generated or stored; nothing
+    /// for the old SIR is left in the vector store.
+    Superseded,
+}
+
 /// Input data for batch embedding record construction.
 #[derive(Debug, Clone)]
 pub(crate) struct EmbeddingInput {
@@ -2546,16 +2558,56 @@ impl SirPipeline {
         out: &mut dyn Write,
         prefetched_meta: Option<&VectorEmbeddingMetaRecord>,
     ) -> Result<bool> {
+        match self.refresh_embedding_if_current(
+            symbol_id,
+            sir_hash_value,
+            canonical_json,
+            prefetched_meta,
+            &mut || Ok(true),
+        )? {
+            EmbeddingRefresh::Refreshed { provider, model } => {
+                if print_sir {
+                    writeln!(
+                        out,
+                        "EMBEDDING_STORED symbol_id={symbol_id} provider={provider} model={model}"
+                    )
+                    .context("failed to write embedding print line")?;
+                }
+                Ok(true)
+            }
+            EmbeddingRefresh::Unchanged | EmbeddingRefresh::Superseded => Ok(false),
+        }
+    }
+
+    /// Like `refresh_embedding_if_needed`, but for callers that cannot hold the SIR
+    /// fixed while the provider runs: `still_current` (typically "the store's SIR hash
+    /// for this symbol is still `sir_hash_value`") is consulted before the provider
+    /// call, again right before the vector is stored, and once more after it is stored.
+    /// A vector for a SIR that was replaced in the meantime is never left in the store:
+    /// the write is skipped, or undone when the replacement landed between the last
+    /// check and the write, so the symbol carries the newer SIR's vector once that
+    /// injector's own refresh runs, or none at all rather than a stale one.
+    pub fn refresh_embedding_if_current(
+        &self,
+        symbol_id: &str,
+        sir_hash_value: &str,
+        canonical_json: &str,
+        prefetched_meta: Option<&VectorEmbeddingMetaRecord>,
+        still_current: &mut dyn FnMut() -> Result<bool>,
+    ) -> Result<EmbeddingRefresh> {
         let Some(needed) =
             self.check_embedding_needed(symbol_id, sir_hash_value, prefetched_meta)?
         else {
-            return Ok(false);
+            return Ok(EmbeddingRefresh::Unchanged);
         };
 
         let Some(embedding_provider) = self.embedding_provider.as_ref() else {
-            return Ok(false);
+            return Ok(EmbeddingRefresh::Unchanged);
         };
 
+        if !still_current()? {
+            return Ok(EmbeddingRefresh::Superseded);
+        }
         let embedding = self
             .runtime
             .block_on(
@@ -2565,7 +2617,10 @@ impl SirPipeline {
             .with_context(|| format!("failed to generate embedding for {symbol_id}"))?;
 
         if embedding.is_empty() {
-            return Ok(false);
+            return Ok(EmbeddingRefresh::Unchanged);
+        }
+        if !still_current()? {
+            return Ok(EmbeddingRefresh::Superseded);
         }
 
         let updated_at = unix_timestamp_secs();
@@ -2580,16 +2635,22 @@ impl SirPipeline {
             }))
             .with_context(|| format!("failed to store embedding for {symbol_id}"))?;
 
-        if print_sir {
-            writeln!(
-                out,
-                "EMBEDDING_STORED symbol_id={symbol_id} provider={} model={}",
-                needed.provider, needed.model
-            )
-            .context("failed to write embedding print line")?;
+        if !still_current()? {
+            // The SIR changed between the last check and the write: the vector just
+            // stored describes the old SIR, so take it back out rather than let the new
+            // SIR read as semantically identical to the old one.
+            self.runtime
+                .block_on(self.vector_store.delete_embedding(symbol_id))
+                .with_context(|| {
+                    format!("failed to delete the superseded embedding for {symbol_id}")
+                })?;
+            return Ok(EmbeddingRefresh::Superseded);
         }
 
-        Ok(true)
+        Ok(EmbeddingRefresh::Refreshed {
+            provider: needed.provider,
+            model: needed.model,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]

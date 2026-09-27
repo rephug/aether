@@ -638,6 +638,114 @@ enabled = false
         assert_eq!(history[0].sir_hash, sir_hash_value);
     }
 
+    fn counting_embedding_provider() -> (CountingEmbeddingProvider, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingEmbeddingProvider {
+            calls: Arc::clone(&calls),
+            batch_calls: Arc::new(AtomicUsize::new(0)),
+            batch_sizes: Arc::new(Mutex::new(Vec::new())),
+            purposes: Arc::new(Mutex::new(Vec::new())),
+        };
+        (provider, calls)
+    }
+
+    /// `still_current` answers from a script (one entry per call, `true` once the script
+    /// runs out) and records how often it was asked.
+    fn scripted_check(script: Vec<bool>) -> (Arc<Mutex<Vec<bool>>>, Arc<AtomicUsize>) {
+        (Arc::new(Mutex::new(script)), Arc::new(AtomicUsize::new(0)))
+    }
+
+    #[test]
+    fn refresh_embedding_if_current_never_leaves_a_vector_for_a_replaced_sir() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_only_config(workspace);
+        let store = SqliteStore::open(workspace).expect("open store");
+        store
+            .upsert_symbol(demo_symbol("sym-guard", "demo::guard"))
+            .expect("upsert symbol");
+        let (provider, calls) = counting_embedding_provider();
+        let pipeline = build_write_pipeline_with_embeddings(
+            workspace,
+            Arc::new(PanicInferenceProvider),
+            Some(Arc::new(provider)),
+        );
+
+        // Replaced while the provider ran: the vector is never stored.
+        let (script, asked) = scripted_check(vec![true, false]);
+        let outcome = pipeline
+            .refresh_embedding_if_current("sym-guard", "hash-1", "{}", None, &mut || {
+                asked.fetch_add(1, Ordering::SeqCst);
+                let mut script = script.lock().expect("script");
+                Ok(if script.is_empty() {
+                    true
+                } else {
+                    script.remove(0)
+                })
+            })
+            .expect("guarded refresh");
+        assert_eq!(outcome, EmbeddingRefresh::Superseded);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "provider ran once");
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+        assert!(
+            pipeline
+                .load_symbol_embedding("sym-guard")
+                .expect("load embedding")
+                .is_none(),
+            "no vector for the replaced SIR"
+        );
+
+        // Replaced between the last check and the write: the stored vector is removed.
+        let (script, asked) = scripted_check(vec![true, true, false]);
+        let outcome = pipeline
+            .refresh_embedding_if_current("sym-guard", "hash-2", "{}", None, &mut || {
+                asked.fetch_add(1, Ordering::SeqCst);
+                let mut script = script.lock().expect("script");
+                Ok(if script.is_empty() {
+                    true
+                } else {
+                    script.remove(0)
+                })
+            })
+            .expect("guarded refresh");
+        assert_eq!(outcome, EmbeddingRefresh::Superseded);
+        assert_eq!(asked.load(Ordering::SeqCst), 3);
+        assert!(
+            pipeline
+                .load_symbol_embedding("sym-guard")
+                .expect("load embedding")
+                .is_none(),
+            "the vector written for the replaced SIR was deleted"
+        );
+
+        // Still current throughout: the vector lands and carries the SIR hash.
+        let outcome = pipeline
+            .refresh_embedding_if_current("sym-guard", "hash-3", "{}", None, &mut || Ok(true))
+            .expect("guarded refresh");
+        assert_eq!(
+            outcome,
+            EmbeddingRefresh::Refreshed {
+                provider: "test_embedding".to_owned(),
+                model: "test-model".to_owned(),
+            }
+        );
+        let record = pipeline
+            .load_symbol_embedding("sym-guard")
+            .expect("load embedding")
+            .expect("vector stored");
+        assert_eq!(record.sir_hash, "hash-3");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // Already embedded for this hash: no provider call, no check needed.
+        let outcome = pipeline
+            .refresh_embedding_if_current("sym-guard", "hash-3", "{}", None, &mut || {
+                panic!("still_current must not be consulted when nothing is written")
+            })
+            .expect("guarded refresh");
+        assert_eq!(outcome, EmbeddingRefresh::Unchanged);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
     #[test]
     fn persist_successful_generation_sqlite_rolls_back_when_sqlite_done_fails() {
         let temp = tempdir().expect("tempdir");
