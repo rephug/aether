@@ -195,7 +195,13 @@ impl SqliteStore {
         symbol_id: &str,
         sir_hash: &str,
     ) -> Result<(), StoreError> {
-        self.conn.lock().unwrap().execute(
+        // A panic elsewhere while holding the connection poisons the mutex, but the
+        // connection itself is still usable: recover it rather than panic in turn.
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
             "DELETE FROM sir_embeddings WHERE symbol_id = ?1 AND sir_hash = ?2",
             params![symbol_id, sir_hash],
         )?;

@@ -10,14 +10,15 @@ Purpose: give every symbol in `<crate>` that only has a `[MOCK]` placeholder or 
 low-confidence (< 0.2) SIR a real, scan-level SIR. This is about COVERAGE, not
 perfection: deeper enrichment comes later. `batch-size` (default 100) caps how many
 symbols this session processes before stopping. `scopes=` (what `scripts/scan_all.sh`
-passes) is a comma-separated list of project-relative paths, each an include or, with a
-leading `-`, an exclude: use exactly those and skip step 1; `<crate>` is then only a
-label (it may read `dir:web` or `shared` for a synthetic unit).
+passes) is a comma-separated list of project-relative paths, each marked with a leading
+`+` (an include) or `-` (an exclude), so a path that itself starts with `-` is still an
+include when written `+-src`: use exactly those and skip step 1; `<crate>` is then only
+a label (it may read `dir:web` or `shared` for a synthetic unit).
 
 ## Procedure
 
-1. Resolve the crate's directories (skip this step when `scopes=` was given: its
-   includes are the `<dir>` set and its `-` entries the exclusions). All paths below are relative to THIS project's
+1. Resolve the crate's directories (skip this step when `scopes=` was given: its `+`
+   entries are the `<dir>` set and its `-` entries the exclusions). All paths below are relative to THIS project's
    root (the directory holding `.aether/`, the same root the indexed `file_path`s use),
    never to an enclosing Cargo workspace root when the two differ. In a Cargo project
    run `cargo metadata --no-deps --format-version 1` and take the directory of the

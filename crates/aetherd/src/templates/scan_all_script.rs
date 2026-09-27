@@ -120,8 +120,9 @@ index_top_level_scopes() {
 }
 
 # Prints "name<TAB>scope[<TAB>scope...]" per scan unit, scopes relative to the workspace
-# root; a scope prefixed with "-" is an exclusion (a nested member's directory carved out
-# of its parent's scope, so no two units overlap). A target declared outside its package
+# root; every scope carries a marker, "+" for an include and "-" for an exclusion (a
+# nested member's directory carved out of its parent's scope, so no two units overlap),
+# so a path that itself begins with "-" is never mistaken for an exclusion. A target declared outside its package
 # directory brings that directory in when this package is the only one targeting it (so
 # sibling modules such as `mod util;` → shared/util.rs are covered); when several
 # packages target the same external directory each gets only its target file plus its
@@ -219,7 +220,7 @@ for name, scopes in units:
         for other in other_scopes:
             if any(other != s and other.startswith(s + os.sep) for s in scopes) and other not in excluded:
                 excluded.append(other)
-    print(name + "\t" + "\t".join(scopes + ["-" + e for e in excluded]))
+    print(name + "\t" + "\t".join(["+" + s for s in scopes] + ["-" + e for e in excluded]))
 # Mixed project: an indexed top-level directory (or root-level file) that no package owns
 # becomes its own unit; one that merely contains packages becomes a unit minus them, so
 # TypeScript/Python sources beside the Rust packages are scanned too.
@@ -233,13 +234,13 @@ for top in os.environ.get("AETHER_INDEX_TOPS", "").split("\n"):
         continue
     carved = [s for s in package_scopes if s.startswith(top + os.sep)]
     name = "dir:" + top if top in unit_names else top
-    print(name + "\t" + "\t".join([top] + ["-" + s for s in carved]))
+    print(name + "\t" + "\t".join(["+" + top] + ["-" + s for s in carved]))
 ' 2>/dev/null || true)"
   fi
   if [ -n "$table" ]; then
     printf '%s\n' "$table"
   else
-    printf '%s\n' "$index_tops" | awk 'NF { printf "%s\t%s\n", $0, $0 }'
+    printf '%s\n' "$index_tops" | awk 'NF { printf "%s\t+%s\n", $0, $0 }'
   fi
 }
 
@@ -276,20 +277,21 @@ else
   fi
 fi
 
-# Tab-separated scopes (directories or root-level target files) for one unit. `dir:<path>`
-# always means that path; other names that are not discovered units are taken as paths
-# relative to the workspace root when they exist, else as crates/<name>.
+# Tab-separated scopes (directories or root-level target files, each marked "+" include
+# or "-" exclude) for one unit. `dir:<path>` always means that path; other names that are
+# not discovered units are taken as paths relative to the workspace root when they
+# exist, else as crates/<name>.
 crate_scopes() {
   local found
   found="$(printf '%s\n' "$PACKAGE_TABLE" | awk -F '\t' -v crate="$1" '$1 == crate { sub(/^[^\t]*\t/, ""); print; exit }')"
   if [ -n "$found" ]; then
     printf '%s' "$found"
   elif [ "${1#dir:}" != "$1" ]; then
-    printf '%s' "${1#dir:}"
+    printf '+%s' "${1#dir:}"
   elif [ -e "$1" ]; then
-    printf '%s' "${1%/}"
+    printf '+%s' "${1%/}"
   else
-    printf 'crates/%s' "$1"
+    printf '+crates/%s' "$1"
   fi
 }
 crate_scopes_display() { crate_scopes "$1" | tr '\t' ','; }
@@ -308,8 +310,8 @@ unit_contains() {
   done
   for scope in "${scopes[@]}"; do
     case "$scope" in
-      -*|'') ;;
-      *) if [ "$path" = "$scope" ] || [ "${path#"$scope"/}" != "$path" ]; then return 0; fi ;;
+      +*) scope="${scope#+}"
+          if [ "$path" = "$scope" ] || [ "${path#"$scope"/}" != "$path" ]; then return 0; fi ;;
     esac
   done
   return 1
@@ -319,11 +321,11 @@ units_overlap() {
   local a="$1" b="$2" scope scopes
   IFS=$'\t' read -ra scopes <<< "$(crate_scopes "$b")"
   for scope in "${scopes[@]}"; do
-    case "$scope" in -*|'') ;; *) if unit_contains "$a" "$scope"; then return 0; fi ;; esac
+    case "$scope" in +*) if unit_contains "$a" "${scope#+}"; then return 0; fi ;; esac
   done
   IFS=$'\t' read -ra scopes <<< "$(crate_scopes "$a")"
   for scope in "${scopes[@]}"; do
-    case "$scope" in -*|'') ;; *) if unit_contains "$b" "$scope"; then return 0; fi ;; esac
+    case "$scope" in +*) if unit_contains "$b" "${scope#+}"; then return 0; fi ;; esac
   done
   return 1
 }
@@ -363,8 +365,8 @@ sql_prefix_pattern() {
 scope_predicate() {
   printf "(s.file_path = '%s' OR s.file_path LIKE '%s' ESCAPE '\\\\')" "$(sql_str "$1")" "$(sql_prefix_pattern "$1")"
 }
-# SQL scope for the given units: only symbols under their own directories (or equal to
-# a root-level target file), minus any nested member carved out with a "-" scope.
+# SQL scope for the given units: only symbols under their own "+" directories (or equal
+# to a root-level target file), minus any nested member carved out with a "-" scope.
 scope_clause() {
   local units=() crate scope scopes includes excludes
   for crate in "$@"; do
@@ -374,6 +376,7 @@ scope_clause() {
       [ -z "$scope" ] && continue
       case "$scope" in
         -*) excludes+=("$(scope_predicate "${scope#-}")") ;;
+        +*) includes+=("$(scope_predicate "${scope#+}")") ;;
         *) includes+=("$(scope_predicate "$scope")") ;;
       esac
     done
