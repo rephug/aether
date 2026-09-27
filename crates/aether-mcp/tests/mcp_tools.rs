@@ -3146,6 +3146,7 @@ fn mcp_sir_inject_tool_injects_blocks_and_forces_overwrites() -> Result<()> {
             model: None,
             provider: None,
             force: None,
+            source_hash: None,
         })))
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
@@ -3176,6 +3177,7 @@ fn mcp_sir_inject_tool_injects_blocks_and_forces_overwrites() -> Result<()> {
             model: None,
             provider: None,
             force: Some(false),
+            source_hash: None,
         })))
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
@@ -3199,6 +3201,7 @@ fn mcp_sir_inject_tool_injects_blocks_and_forces_overwrites() -> Result<()> {
             model: Some("claude-opus-4-6".to_owned()),
             provider: Some("manual".to_owned()),
             force: Some(true),
+            source_hash: None,
         })))
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
@@ -3294,6 +3297,7 @@ model = "stub-embed"
             model: None,
             provider: None,
             force: None,
+            source_hash: None,
         })))
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
@@ -3347,6 +3351,7 @@ model = "stub-embed"
             model: None,
             provider: None,
             force: Some(true),
+            source_hash: None,
         })))
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;

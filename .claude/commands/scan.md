@@ -69,16 +69,23 @@ label (it may read `dir:web` or `shared` for a synthetic unit).
    assumes a `crates/<crate>/` layout, so filter on `file_path` yourself. Never pass
    `batch-size` as `top_n`.
 3. Take the first `batch-size` targets and group them by source file.
-4. Work in batches of 10 symbols per reasoning turn: read each source file ONCE,
-   produce the SIRs for all of its symbols together, then fire every
-   `aether_sir_inject` call for the batch (intent, behavior, inputs, outputs,
-   side_effects, dependencies, error_modes, complexity, confidence, and
-   `generation_pass: "scan"`, `provider: "claude-code"`, `model: "<your model>"`).
+4. Work in batches of 10 symbols per reasoning turn: for each source file call
+   `aether_symbol_lookup` once with the file path (`limit: 100`) to get every target's
+   current `source_hash`, read the file ONCE, produce the SIRs for all of its symbols
+   together, then fire every `aether_sir_inject` call for the batch (intent, behavior,
+   inputs, outputs, side_effects, dependencies, error_modes, complexity, confidence,
+   the symbol's `source_hash`, and `generation_pass: "scan"`, `provider: "claude-code"`,
+   `model: "<your model>"`). The `source_hash` binds the SIR to the text you read: the
+   inject is refused if the file changed in between (the error says the source changed
+   since it was read, or that the file no longer declares the symbol); skip such a
+   symbol for this round, the daemon regenerates it from the new source.
 5. Target confidence 0.7–0.8 for scan-level SIRs. Use `force: true` only when replacing a
    `[MOCK]` placeholder that somehow carries a higher confidence. If an inject call
    returns an error saying the SIR was written but the file rollup could not be rebuilt,
-   rerun that same call once: the symbol is marked `rollup_failed`, the confidence guard
-   is lifted for it, and the target query above keeps selecting it until the rerun succeeds.
+   rerun that same call once, unchanged: the symbol is marked `rollup_failed`, the
+   confidence guard is lifted for exactly that injection (one reproducing the stored
+   SIR; any other request needs `force`), and the target query above keeps selecting it
+   until the rerun succeeds.
 6. Stop after `batch-size` symbols and print how many targets remain (rerun `/scan` or let
    `scripts/scan_all.sh` loop).
 

@@ -13,7 +13,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use super::{AetherMcpServer, current_unix_timestamp};
+use super::{AetherMcpServer, LiveSourceHashes, current_unix_timestamp};
 use crate::AetherMcpError;
 
 const FORCE_CONFIDENCE_THRESHOLD: f32 = 0.5;
@@ -59,11 +59,19 @@ pub struct AetherSirInjectRequest {
     pub provider: Option<String>,
     /// Force overwrite even if existing SIR has higher confidence
     pub force: Option<bool>,
+    /// The content hash of the symbol's source as read for this SIR (`source_hash` from
+    /// `aether_symbol_lookup`). When given, the injection is refused, under the inject
+    /// lock, if the file no longer declares the symbol or its body no longer hashes to
+    /// this value: the SIR would describe text that has changed since it was read, and
+    /// writing it would pre-empt the daemon's regeneration from the new source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_hash: Option<String>,
 }
 
 /// `sir_status` recorded when a leaf was written but its file rollup could not be
-/// rebuilt: the confidence guard lets such a symbol be re-injected without `force`, and
-/// the scan queries keep selecting it, so the retry is never blocked.
+/// rebuilt: the confidence guard lets the same injection be rerun without `force` (a
+/// request that reconstructs the stored SIR; any other still needs `force`), and the
+/// scan queries keep selecting the symbol, so the retry is never blocked.
 pub const SIR_STATUS_ROLLUP_FAILED: &str = "rollup_failed";
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -276,6 +284,35 @@ impl AetherMcpServer {
                 "symbol '{qualified_name}' ({symbol_id}) was removed from the index while the request was being resolved; nothing was injected"
             )));
         }
+        // The SIR describes the text the caller read. When the caller says which text
+        // that was (`source_hash`), require, under the lock, that the file still declares
+        // the symbol with exactly that body: after an edit the daemon re-indexes the
+        // symbol and regenerates its SIR from the new source, and a leaf written now for
+        // the old text would advance the identity that regeneration was planned against
+        // and leave a SIR of the old implementation standing.
+        if let Some(expected) = request
+            .source_hash
+            .as_deref()
+            .map(str::trim)
+            .filter(|hash| !hash.is_empty())
+        {
+            let mut live = LiveSourceHashes::new(&self.state.workspace);
+            match live.hash_for(symbol.file_path.as_str(), symbol_id.as_str())? {
+                Some(current) if current == expected => {}
+                Some(_) => {
+                    return Err(AetherMcpError::Message(format!(
+                        "source for {qualified_name} ({}) changed since it was read; nothing was injected: re-read the symbol (aether_symbol_lookup reports its current source_hash) and describe the new text, or leave it to the daemon's regeneration",
+                        symbol.file_path
+                    )));
+                }
+                None => {
+                    return Err(AetherMcpError::Message(format!(
+                        "{} no longer declares {qualified_name} as indexed (or cannot be read); nothing was injected: wait for re-indexing and look the symbol up again",
+                        symbol.file_path
+                    )));
+                }
+            }
+        }
         let previous_meta = store.get_sir_meta(symbol_id.as_str())?;
         let previous_blob = store.read_sir_blob(symbol_id.as_str())?;
         let previous_sir = previous_blob
@@ -285,38 +322,6 @@ impl AetherMcpServer {
         let previous_confidence = previous_sir.as_ref().map(|sir| sir.confidence);
         let new_confidence = request.confidence.unwrap_or(DEFAULT_INJECT_CONFIDENCE);
 
-        let previous_rollup_failed = previous_meta
-            .as_ref()
-            .is_some_and(|meta| meta.sir_status == SIR_STATUS_ROLLUP_FAILED);
-        if previous_confidence.is_some_and(|confidence| confidence > FORCE_CONFIDENCE_THRESHOLD)
-            && !request.force.unwrap_or(false)
-            && !previous_rollup_failed
-        {
-            let note = previous_confidence.map(|confidence| {
-                format!(
-                    "existing SIR confidence {confidence:.2} exceeds {FORCE_CONFIDENCE_THRESHOLD:.2} threshold; rerun with force=true to override"
-                )
-            });
-            return Ok(AetherSirInjectResponse {
-                symbol_id,
-                qualified_name,
-                sir_hash: previous_meta
-                    .as_ref()
-                    .map(|meta| meta.sir_hash.clone())
-                    .unwrap_or_default(),
-                sir_version: previous_meta
-                    .as_ref()
-                    .map(|meta| meta.sir_version)
-                    .unwrap_or(0),
-                previous_confidence,
-                new_confidence,
-                status: "blocked".to_owned(),
-                note,
-                embedding_status: "skipped: inject blocked".to_owned(),
-                file_rollup_status: "skipped: inject blocked".to_owned(),
-            });
-        }
-
         let intent = request.intent.trim();
         if intent.is_empty() {
             return Err(AetherMcpError::Message(
@@ -324,7 +329,9 @@ impl AetherMcpServer {
             ));
         }
 
-        let mut updated = previous_sir.unwrap_or_else(|| empty_sir_annotation(new_confidence));
+        let mut updated = previous_sir
+            .clone()
+            .unwrap_or_else(|| empty_sir_annotation(new_confidence));
         updated.intent = intent.to_owned();
         if let Some(behavior) = normalize_optional_note(request.behavior) {
             updated.behavior = behavior;
@@ -355,6 +362,52 @@ impl AetherMcpServer {
 
         let canonical_json = canonicalize_sir_json(&updated);
         let hash = sir_hash(&updated);
+        let previous_rollup_failed = previous_meta
+            .as_ref()
+            .is_some_and(|meta| meta.sir_status == SIR_STATUS_ROLLUP_FAILED);
+        // A `rollup_failed` marker lifts the guard only for the retry of the injection
+        // that left it: the request that reconstructs the stored SIR exactly. Any other
+        // request queued against the earlier placeholder still needs `force`, or it
+        // would overwrite the reviewed SIR merely because its rollup once failed.
+        let retries_failed_rollup = previous_rollup_failed
+            && previous_sir
+                .as_ref()
+                .is_some_and(|previous| sir_hash(previous) == hash);
+        if previous_confidence.is_some_and(|confidence| confidence > FORCE_CONFIDENCE_THRESHOLD)
+            && !request.force.unwrap_or(false)
+            && !retries_failed_rollup
+        {
+            let note = previous_confidence.map(|confidence| {
+                if previous_rollup_failed {
+                    format!(
+                        "existing SIR confidence {confidence:.2} exceeds {FORCE_CONFIDENCE_THRESHOLD:.2} threshold; its rollup_failed marker only admits a rerun of the same injection (one that reproduces the stored SIR), so rerun that call, or rerun with force=true to override"
+                    )
+                } else {
+                    format!(
+                        "existing SIR confidence {confidence:.2} exceeds {FORCE_CONFIDENCE_THRESHOLD:.2} threshold; rerun with force=true to override"
+                    )
+                }
+            });
+            return Ok(AetherSirInjectResponse {
+                symbol_id,
+                qualified_name,
+                sir_hash: previous_meta
+                    .as_ref()
+                    .map(|meta| meta.sir_hash.clone())
+                    .unwrap_or_default(),
+                sir_version: previous_meta
+                    .as_ref()
+                    .map(|meta| meta.sir_version)
+                    .unwrap_or(0),
+                previous_confidence,
+                new_confidence,
+                status: "blocked".to_owned(),
+                note,
+                embedding_status: "skipped: inject blocked".to_owned(),
+                file_rollup_status: "skipped: inject blocked".to_owned(),
+            });
+        }
+
         let provider = normalize_optional_text_with_default(request.provider, "manual");
         let model = normalize_optional_text_with_default(request.model, "manual");
         let generation_pass = normalize_optional_text_with_default(request.generation_pass, "deep");
@@ -665,6 +718,7 @@ vector_backend = "sqlite"
                 model: None,
                 provider: None,
                 force: None,
+                source_hash: None,
             })
             .expect("inject sir");
 
@@ -722,6 +776,7 @@ vector_backend = "sqlite"
                 model: None,
                 provider: None,
                 force: Some(false),
+                source_hash: None,
             })
             .expect("inject sir");
 
@@ -771,6 +826,7 @@ vector_backend = "sqlite"
                             model: None,
                             provider: None,
                             force: Some(false),
+                            source_hash: None,
                         })
                         .expect("inject")
                 })
@@ -838,6 +894,7 @@ vector_backend = "sqlite"
                 model: Some("claude-opus-4-6".to_owned()),
                 provider: Some("manual".to_owned()),
                 force: Some(true),
+                source_hash: None,
             })
             .expect("inject sir");
 
@@ -888,6 +945,7 @@ vector_backend = "sqlite"
                 model: None,
                 provider: None,
                 force: Some(false),
+                source_hash: None,
             })
             .expect("inject sir");
 
@@ -929,5 +987,206 @@ vector_backend = "sqlite"
         // serde_json::Value goes through f64 too, which is where the artifact used to appear.
         let value = serde_json::to_value(&response).expect("to_value");
         assert_eq!(value["new_confidence"].to_string(), "0.97");
+    }
+
+    #[test]
+    fn sir_inject_rollup_failed_marker_only_admits_a_rerun_of_the_same_injection() {
+        let temp = tempdir().expect("tempdir");
+        write_test_config(temp.path());
+        seed_symbol(temp.path(), "sym-rollup", "crate::rollup_retry");
+        seed_existing_sir(temp.path(), "sym-rollup", 0.9);
+        {
+            let store = aether_store::SqliteStore::open(temp.path()).expect("open store");
+            let meta = store
+                .get_sir_meta("sym-rollup")
+                .expect("get sir meta")
+                .expect("seeded meta");
+            store
+                .upsert_sir_meta(aether_store::SirMetaRecord {
+                    sir_status: super::SIR_STATUS_ROLLUP_FAILED.to_owned(),
+                    ..meta
+                })
+                .expect("mark rollup failed");
+        }
+        let server = AetherMcpServer::new(temp.path(), false).expect("server");
+        let request = |intent: &str, confidence: f32| AetherSirInjectRequest {
+            symbol: "sym-rollup".to_owned(),
+            intent: intent.to_owned(),
+            behavior: None,
+            edge_cases: None,
+            side_effects: None,
+            dependencies: None,
+            error_modes: None,
+            confidence: Some(confidence),
+            inputs: None,
+            outputs: None,
+            complexity: None,
+            generation_pass: None,
+            model: None,
+            provider: None,
+            force: Some(false),
+            source_hash: None,
+        };
+
+        // A different request that was queued against the old placeholder does not get
+        // to overwrite the reviewed SIR just because its rollup once failed.
+        let other = server
+            .aether_sir_inject_logic(request("A different request's intent", 0.8))
+            .expect("inject sir");
+        assert_eq!(other.status, "blocked");
+        assert!(
+            other
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("rerun of the same injection")),
+            "note: {:?}",
+            other.note
+        );
+        let store = aether_store::SqliteStore::open(temp.path()).expect("open store");
+        let stored: SirAnnotation = serde_json::from_str(
+            &store
+                .read_sir_blob("sym-rollup")
+                .expect("read blob")
+                .expect("blob"),
+        )
+        .expect("parse blob");
+        assert_eq!(stored.intent, "existing intent");
+
+        // The rerun of the failed injection reconstructs the stored SIR and passes.
+        let retry = server
+            .aether_sir_inject_logic(request("existing intent", 0.9))
+            .expect("inject sir");
+        assert_eq!(retry.status, "injected");
+        assert_eq!(retry.file_rollup_status, "refreshed");
+        let meta = store
+            .get_sir_meta("sym-rollup")
+            .expect("get sir meta")
+            .expect("meta");
+        assert_eq!(meta.sir_status, "fresh");
+    }
+
+    #[test]
+    fn sir_inject_refuses_a_source_that_changed_since_it_was_read() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_test_config(workspace);
+        let source = "pub fn target() -> u32 {\n    1\n}\n";
+        fs::create_dir_all(workspace.join("src")).expect("create src");
+        fs::write(workspace.join("src/lib.rs"), source).expect("write source");
+        let symbols = aether_parse::SymbolExtractor::new()
+            .expect("parser")
+            .extract_from_path(Path::new("src/lib.rs"), source)
+            .expect("extract");
+        let symbol = symbols
+            .iter()
+            .find(|symbol| symbol.name == "target")
+            .expect("target symbol");
+        {
+            let store = aether_store::SqliteStore::open(workspace).expect("open store");
+            store
+                .upsert_symbol(SymbolRecord {
+                    id: symbol.id.clone(),
+                    file_path: symbol.file_path.clone(),
+                    language: symbol.language.as_str().to_owned(),
+                    kind: symbol.kind.as_str().to_owned(),
+                    qualified_name: symbol.qualified_name.clone(),
+                    signature_fingerprint: symbol.signature_fingerprint.clone(),
+                    last_seen_at: 1_700_000_000,
+                })
+                .expect("upsert symbol");
+        }
+        let server = AetherMcpServer::new(workspace, false).expect("server");
+
+        // The lookup reports the hash of the text as the file holds it now.
+        let lookup = server
+            .aether_symbol_lookup_logic(crate::AetherSymbolLookupRequest {
+                query: symbol.qualified_name.clone(),
+                limit: Some(5),
+            })
+            .expect("lookup");
+        let found = lookup
+            .matches
+            .iter()
+            .find(|entry| entry.symbol_id == symbol.id)
+            .expect("lookup match");
+        assert_eq!(
+            found.source_hash.as_deref(),
+            Some(symbol.content_hash.as_str())
+        );
+
+        let request = |source_hash: Option<String>| AetherSirInjectRequest {
+            symbol: symbol.id.clone(),
+            intent: "Returns the answer".to_owned(),
+            behavior: None,
+            edge_cases: None,
+            side_effects: None,
+            dependencies: None,
+            error_modes: None,
+            confidence: Some(0.75),
+            inputs: None,
+            outputs: None,
+            complexity: None,
+            generation_pass: Some("scan".to_owned()),
+            model: None,
+            provider: None,
+            force: Some(true),
+            source_hash,
+        };
+        let injected = server
+            .aether_sir_inject_logic(request(Some(symbol.content_hash.clone())))
+            .expect("inject against the text that was read");
+        assert_eq!(injected.status, "injected");
+
+        // The body changes under the same symbol id: a SIR for the old text is refused.
+        fs::write(
+            workspace.join("src/lib.rs"),
+            "pub fn target() -> u32 {\n    2\n}\n",
+        )
+        .expect("edit source");
+        let err = server
+            .aether_sir_inject_logic(request(Some(symbol.content_hash.clone())))
+            .expect_err("a changed source must refuse the injection");
+        assert!(
+            err.to_string().contains("changed since it was read"),
+            "unexpected error: {err}"
+        );
+        let store = aether_store::SqliteStore::open(workspace).expect("open store");
+        let meta = store
+            .get_sir_meta(&symbol.id)
+            .expect("get sir meta")
+            .expect("meta");
+        assert_eq!(
+            meta.sir_hash, injected.sir_hash,
+            "the refused call wrote nothing"
+        );
+
+        // The lookup now reports the new text's hash, and an injection bound to it lands.
+        let lookup = server
+            .aether_symbol_lookup_logic(crate::AetherSymbolLookupRequest {
+                query: symbol.qualified_name.clone(),
+                limit: Some(5),
+            })
+            .expect("lookup");
+        let current = lookup
+            .matches
+            .iter()
+            .find(|entry| entry.symbol_id == symbol.id)
+            .and_then(|entry| entry.source_hash.clone())
+            .expect("current source hash");
+        assert_ne!(current, symbol.content_hash);
+        let rebound = server
+            .aether_sir_inject_logic(request(Some(current)))
+            .expect("inject against the new text");
+        assert_eq!(rebound.status, "injected");
+
+        // A symbol the file no longer declares is refused too.
+        fs::write(workspace.join("src/lib.rs"), "pub fn other() {}\n").expect("remove symbol");
+        let err = server
+            .aether_sir_inject_logic(request(Some(symbol.content_hash.clone())))
+            .expect_err("a vanished symbol must refuse the injection");
+        assert!(
+            err.to_string().contains("no longer declares"),
+            "unexpected error: {err}"
+        );
     }
 }

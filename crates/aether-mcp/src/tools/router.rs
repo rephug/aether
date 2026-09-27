@@ -53,7 +53,7 @@ impl AetherMcpServer {
 
     #[tool(
         name = "aether_symbol_lookup",
-        description = "Lookup symbols by qualified name or file path"
+        description = "Lookup symbols by qualified name or file path. Each match carries source_hash, the content hash of the symbol's source as the file holds it now; pass it to aether_sir_inject to bind the injection to the text you read."
     )]
     pub async fn aether_symbol_lookup(
         &self,
@@ -419,7 +419,7 @@ impl AetherMcpServer {
 
     #[tool(
         name = "aether_sir_inject",
-        description = "Inject or update a symbol's complete SIR annotation. Accepts intent, behavior, edge_cases, side_effects, dependencies, error_modes, inputs, outputs, complexity, confidence, and model provenance."
+        description = "Inject or update a symbol's complete SIR annotation. Accepts intent, behavior, edge_cases, side_effects, dependencies, error_modes, inputs, outputs, complexity, confidence, model provenance, and source_hash (from aether_symbol_lookup): when given, the injection is refused if the symbol's source on disk no longer hashes to it."
     )]
     pub async fn aether_sir_inject(
         &self,

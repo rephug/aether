@@ -20,7 +20,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    AetherMcpServer, child_method_symbols, effective_limit, is_type_symbol_kind, symbol_leaf_name,
+    AetherMcpServer, LiveSourceHashes, child_method_symbols, effective_limit, is_type_symbol_kind,
+    symbol_leaf_name,
 };
 use crate::state::semantic_search_unavailability;
 use crate::{AetherMcpError, SearchMode};
@@ -39,6 +40,12 @@ pub struct AetherSymbolLookupMatch {
     pub language: String,
     pub kind: String,
     pub semantic_score: Option<f32>,
+    /// The content hash of the symbol's source as the workspace file holds it now
+    /// (`aether_symbol_lookup` only); `None` when the file cannot be read or parsed or no
+    /// longer declares the symbol. Pass it as `source_hash` to `aether_sir_inject` so a
+    /// SIR written for the text you read is refused if that text has since changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -187,6 +194,7 @@ impl From<SymbolSearchResult> for AetherSymbolLookupMatch {
             language: value.language,
             kind: value.kind,
             semantic_score: None,
+            source_hash: None,
         }
     }
 }
@@ -200,6 +208,7 @@ impl From<SymbolRecord> for AetherSymbolLookupMatch {
             language: value.language,
             kind: value.kind,
             semantic_score: None,
+            source_hash: None,
         }
     }
 }
@@ -238,7 +247,13 @@ impl AetherMcpServer {
         request: AetherSymbolLookupRequest,
     ) -> Result<AetherSymbolLookupResponse, AetherMcpError> {
         let limit = effective_limit(request.limit);
-        let matches = self.lexical_search_matches(&request.query, limit)?;
+        let mut matches = self.lexical_search_matches(&request.query, limit)?;
+        // The hashes come from the files as they are now, not from the index, so a
+        // caller can bind a later `aether_sir_inject` to the exact text it read.
+        let mut live = LiveSourceHashes::new(&self.state.workspace);
+        for entry in &mut matches {
+            entry.source_hash = live.hash_for(&entry.file_path, &entry.symbol_id)?;
+        }
         let envelope = SearchEnvelope {
             mode_requested: SearchMode::Lexical,
             mode_used: SearchMode::Lexical,
@@ -705,6 +720,7 @@ impl AetherMcpServer {
                 language: symbol.language,
                 kind: symbol.kind,
                 semantic_score: Some(candidate.semantic_score),
+                source_hash: None,
             });
         }
         if matches.is_empty() {
