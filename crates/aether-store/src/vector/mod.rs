@@ -289,6 +289,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lance_conditional_write_removes_the_row_the_previous_identity_left() {
+        let temp = tempdir().expect("tempdir");
+        let store = LanceVectorStore::open(temp.path())
+            .await
+            .expect("open LanceDB vector store");
+
+        // The vector moves from identity A to identity B within the same second: the
+        // guarded write lands in B's table and A's row goes, so the cross-table lookups
+        // cannot keep answering with A on the timestamp tie.
+        store
+            .upsert_embedding(vector_record_with_meta(
+                "sym-move",
+                "hash-1",
+                "mock",
+                "model-2d",
+                vec![1.0, 0.0],
+                100,
+            ))
+            .await
+            .expect("upsert under identity A");
+        let observed_a = store
+            .get_embedding_meta("sym-move")
+            .await
+            .expect("meta")
+            .expect("vector under A");
+        assert_eq!(
+            (observed_a.provider.as_str(), observed_a.embedding_dim),
+            ("mock", 2)
+        );
+        let written = store
+            .upsert_embedding_if_matches(
+                vector_record_with_meta(
+                    "sym-move",
+                    "hash-1",
+                    "mock-alt",
+                    "model-3d",
+                    vec![1.0, 0.0, 0.0],
+                    100,
+                ),
+                Some(&observed_a),
+            )
+            .await
+            .expect("guarded write under identity B");
+        assert!(written);
+        let observed_b = store
+            .get_embedding_meta("sym-move")
+            .await
+            .expect("meta")
+            .expect("vector under B");
+        assert_eq!(
+            (
+                observed_b.provider.as_str(),
+                observed_b.model.as_str(),
+                observed_b.embedding_dim,
+                observed_b.updated_at
+            ),
+            ("mock-alt", "model-3d", 3, 100)
+        );
+        assert_eq!(
+            store
+                .get_embedding_metas_batch(&["sym-move".to_owned()])
+                .await
+                .expect("batch lookup")
+                .get("sym-move")
+                .map(|meta| meta.provider.as_str()),
+            Some("mock-alt")
+        );
+        assert!(
+            store
+                .search_nearest(&[1.0, 0.0], "mock", "model-2d", 5)
+                .await
+                .expect("search identity A")
+                .is_empty(),
+            "the row identity A held is removed once the move is verified"
+        );
+
+        // Returning to A in the same second replaces A's table row and removes B's.
+        let written = store
+            .upsert_embedding_if_matches(
+                vector_record_with_meta(
+                    "sym-move",
+                    "hash-1",
+                    "mock",
+                    "model-2d",
+                    vec![0.0, 1.0],
+                    100,
+                ),
+                Some(&observed_b),
+            )
+            .await
+            .expect("guarded write back under identity A");
+        assert!(written);
+        assert_eq!(
+            store
+                .get_embedding_meta("sym-move")
+                .await
+                .expect("meta")
+                .map(|meta| (meta.provider, meta.embedding_dim)),
+            Some(("mock".to_owned(), 2))
+        );
+        assert!(
+            store
+                .search_nearest(&[1.0, 0.0, 0.0], "mock-alt", "model-3d", 5)
+                .await
+                .expect("search identity B")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn lance_vector_store_gets_latest_embedding_metas_in_batch() {
         let temp = tempdir().expect("tempdir");
         let store = LanceVectorStore::open(temp.path())

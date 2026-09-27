@@ -697,12 +697,42 @@ impl VectorStore for LanceVectorStore {
         let stored = self
             .meta_in_table(&connection, &destination, record.symbol_id.as_str())
             .await?;
-        Ok(stored.is_some_and(|meta| {
+        let written = stored.is_some_and(|meta| {
             meta.sir_hash == record.sir_hash
                 && meta.provider == record.provider
                 && meta.model == record.model
                 && meta.updated_at == record.updated_at
-        }))
+        });
+        // A vector that moved to another identity leaves its observed row behind in the
+        // previous table. Take exactly that row out (keyed by its hash and write time)
+        // once the new row is verified: the cross-table "latest" lookups break equal
+        // second-resolution timestamps arbitrarily, so a leftover written in the same
+        // second could otherwise keep reading as the symbol's current vector and make
+        // every embeddings-only pass regenerate a vector it already has.
+        if written && let Some(observed) = expected {
+            let source = table_name_for(
+                observed.provider.as_str(),
+                observed.model.as_str(),
+                observed.embedding_dim as i32,
+            );
+            if source != destination
+                && let Ok(table) = connection.open_table(&source).execute().await
+            {
+                table
+                    .delete(
+                        format!(
+                            "symbol_id = '{}' AND sir_hash = '{}' AND updated_at = {}",
+                            escape_sql_string(record.symbol_id.as_str()),
+                            escape_sql_string(observed.sir_hash.as_str()),
+                            observed.updated_at
+                        )
+                        .as_str(),
+                    )
+                    .await
+                    .map_err(map_lancedb_err)?;
+            }
+        }
+        Ok(written)
     }
 
     async fn delete_embedding_if_matches(
