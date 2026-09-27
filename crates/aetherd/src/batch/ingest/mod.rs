@@ -11,15 +11,13 @@ use aether_store::{
 };
 use anyhow::{Context, Result, anyhow};
 
-use crate::batch::build::{
-    BatchRequestOrigin, KEYMAP_SIDECAR_KIND, ORIGIN_SIDECAR_KIND, snapshot_workspace_symbols,
-};
+use crate::batch::build::{BatchRequestOrigin, KEYMAP_SIDECAR_KIND, ORIGIN_SIDECAR_KIND};
 use crate::batch::hash::diff_prompt_hashes;
 use crate::batch::{BatchProvider, BatchResultLine, PassConfig};
 use crate::continuous::cosine_distance_from_embeddings;
 use crate::sir_pipeline::{
     EmbeddingInput, PriorSir, SirPipeline, UpsertSirIntentPayload, current_sir_identity,
-    extract_symbol_source_text,
+    current_source_hash,
 };
 
 /// Number of embedding records to buffer before flushing to the vector store.
@@ -84,7 +82,6 @@ pub(crate) fn ingest_results(
     config: &AetherConfig,
     provider: &dyn BatchProvider,
     provider_name: &str,
-    symbols_by_id: Option<&HashMap<String, Symbol>>,
 ) -> Result<IngestSummary> {
     let keymap = load_keymap(results_path, pass_config.pass.as_str());
     if !keymap.is_empty() {
@@ -94,21 +91,6 @@ pub(crate) fn ingest_results(
         );
     }
     let origins = load_origins(results_path, pass_config.pass.as_str());
-    // Results carrying an origin are checked against the symbol source as it is now,
-    // so the workspace is snapshotted once here unless the caller already has one.
-    let snapshot;
-    let current_symbols = if origins.is_empty() {
-        symbols_by_id
-    } else {
-        match symbols_by_id {
-            Some(symbols) => Some(symbols),
-            None => {
-                snapshot = snapshot_workspace_symbols(workspace)
-                    .context("failed to snapshot workspace symbols for batch ingest")?;
-                Some(&snapshot)
-            }
-        }
-    };
 
     let file = std::fs::File::open(results_path)
         .with_context(|| format!("failed to open batch results {}", results_path.display()))?;
@@ -150,7 +132,6 @@ pub(crate) fn ingest_results(
                 provider_name,
                 &keymap,
                 &origins,
-                current_symbols,
                 &line_chunk,
                 &mut summary,
                 &mut embedding_buffer,
@@ -170,7 +151,6 @@ pub(crate) fn ingest_results(
             provider_name,
             &keymap,
             &origins,
-            current_symbols,
             &line_chunk,
             &mut summary,
             &mut embedding_buffer,
@@ -202,7 +182,6 @@ fn process_chunk(
     provider_name: &str,
     keymap: &HashMap<String, String>,
     origins: &HashMap<String, BatchRequestOrigin>,
-    current_symbols: Option<&HashMap<String, Symbol>>,
     lines: &[String],
     summary: &mut IngestSummary,
     embedding_buffer: &mut Vec<SymbolEmbeddingRecord>,
@@ -222,7 +201,6 @@ fn process_chunk(
             provider_name,
             keymap,
             origins,
-            current_symbols,
         ) {
             Ok(None) => {
                 summary.superseded += 1;
@@ -386,7 +364,6 @@ fn prepare_symbol(
     provider_name: &str,
     keymap: &HashMap<String, String>,
     origins: &HashMap<String, BatchRequestOrigin>,
-    current_symbols: Option<&HashMap<String, Symbol>>,
 ) -> Result<Option<PreparedSymbol>> {
     let (symbol_id, prompt_hash, request_key, sir_json, reasoning_trace) =
         match provider.parse_result_line(raw_line)? {
@@ -558,21 +535,17 @@ fn prepare_symbol(
         if let Some(origin) = origin
             && !resumed
         {
-            // Re-read the symbol's source here, under the lock, rather than trusting
-            // the snapshot's hash: an edit landing after the snapshot would otherwise
-            // slip through. The snapshot only says where the symbol is; a symbol it
-            // does not know, a file that is gone, or text at that range that no longer
-            // hashes to what the prompt was built from all count as changed.
-            let current_source_hash = current_symbols
-                .and_then(|symbols| symbols.get(&symbol_id))
-                .and_then(|symbol| {
-                    let source =
-                        std::fs::read_to_string(pipeline.workspace_root().join(&symbol.file_path))
-                            .ok()?;
-                    extract_symbol_source_text(&source, symbol.range)
-                })
-                .map(|text| aether_core::content_hash(&text));
-            if current_source_hash.as_deref() != Some(origin.source_hash.as_str()) {
+            // Re-read and re-parse the symbol's file here, under the lock, and find the
+            // symbol by id, rather than trusting a snapshot's hash or its recorded range:
+            // an edit landing after a snapshot would otherwise slip through, and one
+            // elsewhere in the file would move the symbol out of the old range, so an
+            // unchanged body would read as changed while a changed one could hide behind
+            // whatever text now fills that range. A file that is gone or no longer
+            // declares the symbol, or a body that no longer hashes to what the prompt
+            // was built from, all count as changed.
+            if current_source_hash(pipeline.workspace_root(), &payload.symbol).as_deref()
+                != Some(origin.source_hash.as_str())
+            {
                 tracing::info!(
                     symbol_id = %symbol_id,
                     "skipping batch result: the symbol source changed since the request was built"

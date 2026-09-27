@@ -115,7 +115,6 @@ fn run_ingest_command(
         config,
         provider.as_ref(),
         provider.name(),
-        None,
     )?;
     println!(
         "Ingested {} result(s) ({} resumed), skipped {}, superseded {}, wrote {} fingerprint row(s)",
@@ -194,11 +193,6 @@ fn run_full_batch_command(
         ))?;
 
         completed.sort_by_key(|job| job.chunk_index);
-        // The remote job took a while: the source may have moved on since the build
-        // snapshot the requests (and their origin entries) were made from, so ingest
-        // checks results against the workspace as it is now, not that snapshot.
-        let current_symbols = snapshot_workspace_symbols(workspace)
-            .context("failed to snapshot workspace symbols for batch ingest")?;
         let mut skipped_results = 0usize;
         for job in completed {
             for result_path in job.result_paths {
@@ -210,7 +204,6 @@ fn run_full_batch_command(
                     config,
                     provider.as_ref(),
                     provider.name(),
-                    Some(&current_symbols),
                 )?;
                 println!(
                     "Ingested {} chunk {}: processed {} ({} resumed), skipped {}, superseded {}, fingerprint rows {}",

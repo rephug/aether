@@ -37,9 +37,9 @@ use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
+pub(crate) use self::infer::build_job;
 pub use self::infer::current_source_hash;
 use self::infer::{GeneratedSir, SirGenerationOutcome, SirJob, generate_sir_jobs};
-pub(crate) use self::infer::{build_job, extract_symbol_source_text};
 pub(crate) use self::persist::{PriorSir, UpsertSirIntentPayload};
 pub use self::persist::{SirIdentity, current_sir_identity};
 use self::persist::{flatten_error_line, to_symbol_record, to_test_intent_record};

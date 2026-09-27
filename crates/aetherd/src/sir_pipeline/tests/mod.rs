@@ -191,6 +191,39 @@ fn demo_symbol(symbol_id: &str, qualified_name: &str) -> SymbolRecord {
     }
 }
 
+/// Writes `source` to `file_path` in the workspace, parses it and returns its one symbol
+/// with the catalog record the store keeps for it. The ids are the parser's, so a writer
+/// re-parsing the file under the inject lock finds the symbol by id.
+fn parsed_symbols(workspace: &Path, file_path: &str, source: &str) -> Vec<Symbol> {
+    let path = workspace.join(file_path);
+    fs::create_dir_all(path.parent().expect("file has a parent")).expect("create parent");
+    fs::write(&path, source).expect("write source");
+    let mut extractor = aether_parse::SymbolExtractor::new().expect("initialize parser");
+    extractor
+        .extract_from_path(Path::new(file_path), source)
+        .expect("parse source")
+}
+
+fn parsed_symbol(
+    workspace: &Path,
+    file_path: &str,
+    source: &str,
+) -> (Symbol, aether_store::SymbolRecord) {
+    let mut symbols = parsed_symbols(workspace, file_path, source);
+    assert_eq!(symbols.len(), 1, "the source declares one symbol");
+    let symbol = symbols.remove(0);
+    let record = aether_store::SymbolRecord {
+        id: symbol.id.clone(),
+        file_path: symbol.file_path.clone(),
+        language: "rust".to_owned(),
+        kind: "function".to_owned(),
+        qualified_name: symbol.qualified_name.clone(),
+        signature_fingerprint: symbol.signature_fingerprint.clone(),
+        last_seen_at: 1_700_000_000,
+    };
+    (symbol, record)
+}
+
 fn demo_symbol_record_with_kind(
     symbol_id: &str,
     qualified_name: &str,

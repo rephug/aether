@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -5,6 +6,7 @@ use std::time::Duration;
 
 use aether_core::{Position, SourceRange, Symbol, content_hash};
 use aether_infer::{InferError, InferSirResult, InferenceProvider, SirContext};
+use aether_parse::SymbolExtractor;
 use aether_sir::SirAnnotation;
 use anyhow::{Context, Result, anyhow};
 use tokio::sync::Semaphore;
@@ -145,16 +147,35 @@ fn infer_symbol_text_is_public(symbol_text: &str) -> bool {
         || trimmed.starts_with("export default ")
 }
 
-/// The content hash of the symbol's source as it is on disk right now (`None`: the file
-/// is gone or the symbol's range no longer yields text), computed exactly as
-/// `SirJob::source_hash` was. A writer that generated from an earlier read compares the
-/// two under the inject lock: a mismatch means the symbol was edited meanwhile and the
-/// result describes a body the symbol no longer has.
+/// The content hash of the symbol's source as it is on disk right now, computed exactly
+/// as `SirJob::source_hash` was: the file is re-read and re-parsed and the symbol found
+/// by its id, never by the range an earlier snapshot recorded, so an edit elsewhere in
+/// the file that moved the symbol does not read as a change to it, and a change to its
+/// body is never hidden by other text that happens to fill the old range. `None`: the
+/// file is gone, cannot be parsed, or no longer declares the symbol. A writer that
+/// generated from an earlier read compares the two under the inject lock: a mismatch
+/// means the result describes a body the symbol no longer has.
 pub fn current_source_hash(workspace_root: &Path, symbol: &Symbol) -> Option<String> {
     let source = fs::read_to_string(workspace_root.join(&symbol.file_path)).ok()?;
-    extract_symbol_source_text(&source, symbol.range)
-        .filter(|text| !text.trim().is_empty())
-        .map(|text| content_hash(&text))
+    let symbols = LIVE_PARSER.with(|parser| {
+        let mut parser = parser.borrow_mut();
+        if parser.is_none() {
+            *parser = SymbolExtractor::new().ok();
+        }
+        parser
+            .as_mut()?
+            .extract_from_path(Path::new(&symbol.file_path), &source)
+            .ok()
+    })?;
+    symbols
+        .into_iter()
+        .find(|current| current.id == symbol.id)
+        .map(|current| current.content_hash)
+}
+
+thread_local! {
+    /// One parser per thread for the source re-reads under the inject lock.
+    static LIVE_PARSER: RefCell<Option<SymbolExtractor>> = const { RefCell::new(None) };
 }
 
 /// The text a symbol's range covers in `source`, as the SIR prompt sees it.
