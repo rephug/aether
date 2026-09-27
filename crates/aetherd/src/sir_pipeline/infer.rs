@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aether_core::{Position, SourceRange, Symbol};
+use aether_core::{Position, SourceRange, Symbol, content_hash};
 use aether_infer::{InferError, InferSirResult, InferenceProvider, SirContext};
 use aether_sir::SirAnnotation;
 use anyhow::{Context, Result, anyhow};
@@ -28,6 +28,11 @@ pub(crate) struct SirJob {
     /// only while the store still holds exactly this write; a SIR another writer stored
     /// in the meantime wins, even one that brought the same content back.
     pub(crate) prior_sir: Option<SirIdentity>,
+    /// The content hash of the symbol text actually read from disk for this job, before
+    /// any truncation: the same hash the parser stores as `Symbol::content_hash`, but of
+    /// the text the prompt was built from rather than of an earlier snapshot, so a
+    /// caller recording what a prompt described records exactly that.
+    pub(crate) source_hash: String,
 }
 
 #[derive(Debug)]
@@ -72,6 +77,7 @@ pub(crate) fn build_job(
                 symbol.file_path,
             )
         })?;
+    let source_hash = content_hash(&symbol_text);
     let effective_limit = match max_chars {
         Some(0) | None => MAX_SYMBOL_TEXT_CHARS,
         Some(value) => value,
@@ -109,6 +115,7 @@ pub(crate) fn build_job(
         custom_prompt: None,
         deep_mode: false,
         prior_sir: None,
+        source_hash,
     })
 }
 
@@ -190,6 +197,7 @@ pub(super) async fn generate_sir_jobs(
                 custom_prompt,
                 deep_mode,
                 prior_sir,
+                source_hash: _,
             } = job;
             let qualified_name = symbol.qualified_name.clone();
 

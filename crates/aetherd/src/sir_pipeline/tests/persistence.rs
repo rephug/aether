@@ -559,3 +559,38 @@ fn persist_successful_generation_sqlite_rolls_back_when_sqlite_done_fails() {
             .is_some_and(|message| message.contains("sqlite_done blocked for test"))
     );
 }
+
+#[test]
+fn build_job_records_the_hash_of_the_text_it_read_for_the_prompt() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    let snapshot_source = "fn late() {}\n";
+    let symbol = demo_type_symbol(
+        "sym-late",
+        "late",
+        "demo::late",
+        "src/lib.rs",
+        SymbolKind::Function,
+        snapshot_source,
+    );
+    // The file was edited after the snapshot the symbol came from: the job must carry
+    // the hash of what it read, not the snapshot's hash, and of the full text even when
+    // the prompt text is truncated.
+    let edited_source = "fn late() { edited }\n";
+    fs::create_dir_all(workspace.join("src")).expect("create src");
+    fs::write(workspace.join("src/lib.rs"), edited_source).expect("write source");
+    let mut edited_symbol = symbol.clone();
+    edited_symbol.range.end_byte = Some(edited_source.len());
+    edited_symbol.range.end.column = edited_source.trim_end().len() + 1;
+
+    let job = build_job(workspace, edited_symbol.clone(), None, Some(8)).expect("build job");
+    assert_eq!(job.symbol_text, "fn late(");
+    assert_eq!(job.source_hash, content_hash(edited_source));
+    assert_ne!(job.source_hash, symbol.content_hash);
+
+    // With the file as the snapshot saw it, the two agree.
+    fs::write(workspace.join("src/lib.rs"), snapshot_source).expect("restore source");
+    let job = build_job(workspace, symbol.clone(), None, None).expect("build job");
+    assert_eq!(job.source_hash, content_hash(snapshot_source));
+    assert_eq!(job.source_hash, symbol.content_hash);
+}

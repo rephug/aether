@@ -388,11 +388,16 @@ pub(crate) fn build_pass_jsonl_for_ids(
         summary
             .keymap
             .insert(provider.request_key(&key_str), key_str.clone());
+        // The origin's source hash is of the text `build_job` actually read for the
+        // prompt, not of the snapshot the symbol came from: an edit between the two is
+        // then reflected in what ingest demands the file to hold, and a source that
+        // returns to the snapshot's contents cannot make a prompt of the intermediate
+        // body look current.
         summary.origins.insert(
             key_str.clone(),
             BatchRequestOrigin {
                 prior_sir: existing_meta.as_ref().map(SirIdentity::of),
-                source_hash: symbol.content_hash.clone(),
+                source_hash: job.source_hash.clone(),
             },
         );
         let line = provider.format_request(
