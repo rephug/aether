@@ -38,9 +38,40 @@ pub fn run_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<(
 fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<InjectExecution> {
     let store = SqliteStore::open(workspace).context("failed to open local store")?;
     let record = resolve_symbol(&store, args.selector.as_str())?;
+    // The pipelines and the unrelated vector read come first, outside the inject lock:
+    // opening the vector store can run the SQLite-to-LanceDB migration, and one manual
+    // injection must not hold every daemon generation and MCP injection for that long.
+    // A dry run writes nothing and needs neither.
+    let mut embedding_warning = None;
+    let mut previous_embedding = None;
+    let (persist_pipeline, mut embedding_pipeline) = if args.dry_run {
+        (None, None)
+    } else {
+        let persist_pipeline = build_persist_pipeline(workspace)?;
+        let embedding_pipeline = if args.no_embed {
+            None
+        } else {
+            match SirPipeline::new_embeddings_only(workspace.to_path_buf()) {
+                Ok(pipeline) => Some(pipeline),
+                Err(err) => {
+                    embedding_warning = Some(format!(
+                        "warning: embeddings unavailable; persisted SIR without refresh: {err}"
+                    ));
+                    None
+                }
+            }
+        };
+        if let Some(pipeline) = embedding_pipeline.as_ref() {
+            previous_embedding = pipeline
+                .load_symbol_embedding(record.id.as_str())
+                .with_context(|| format!("failed to load existing embedding for {}", record.id))?;
+        }
+        (Some(persist_pipeline), embedding_pipeline)
+    };
     // Read the prior SIR, apply the confidence guard, merge and persist under the inject
     // lock every leaf writer shares, so a concurrent injection or indexer pass cannot
-    // slip in between; released before the embedding refresh, which has its own lock.
+    // slip in between; the lock covers only the symbol/SIR re-check, the guard and the
+    // leaf write, and is released before the embedding refresh, which has its own lock.
     let inject_guard = crate::sir_pipeline::acquire_inject_write_lock(workspace)?;
     // The selector was resolved before the lock: the running daemon may have removed
     // the symbol (and its SIR) in between, and a leaf written now would be an orphan.
@@ -143,29 +174,11 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
     let generation_model =
         normalize_optional_text(args.model.as_deref()).unwrap_or_else(|| "manual".to_owned());
 
-    let persist_pipeline = build_persist_pipeline(workspace)?;
-    let mut embedding_warning = None;
-    let mut previous_embedding = None;
-    let mut embedding_pipeline = if args.no_embed {
-        None
-    } else {
-        match SirPipeline::new_embeddings_only(workspace.to_path_buf()) {
-            Ok(pipeline) => Some(pipeline),
-            Err(err) => {
-                embedding_warning = Some(format!(
-                    "warning: embeddings unavailable; persisted SIR without refresh: {err}"
-                ));
-                None
-            }
-        }
+    let Some(persist_pipeline) = persist_pipeline else {
+        return Err(anyhow!(
+            "internal error: no persistence pipeline was prepared for the write"
+        ));
     };
-
-    if let Some(pipeline) = embedding_pipeline.as_ref() {
-        previous_embedding = pipeline
-            .load_symbol_embedding(record.id.as_str())
-            .with_context(|| format!("failed to load existing embedding for {}", record.id))?;
-    }
-
     let payload = UpsertSirIntentPayload {
         symbol: symbol_from_record(&record)?,
         sir: updated.clone(),
@@ -175,7 +188,10 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
         reasoning_trace: None,
         commit_hash: None,
         prompt_hash: None,
-        source_hash: None,
+        // The leaf records the text this SIR describes (the file was re-parsed under the
+        // lock), so a daemon job for a later edit can tell it describes older text. When
+        // the parse matched the symbol by name rather than id, the hash is not this id's.
+        source_hash: (fresh.symbol.id == record.id).then(|| fresh.symbol.content_hash.clone()),
         prior_sir: crate::sir_pipeline::PriorSir::Unrecorded,
     };
     let (canonical_json, sir_hash) = persist_pipeline
@@ -598,6 +614,14 @@ vector_backend = "sqlite"
             .expect("list history");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].trigger, "inject");
+        let fresh = super::load_fresh_symbol_source(temp.path(), &record).expect("fresh source");
+        assert_eq!(
+            store
+                .get_sir_source_hash(record.id.as_str())
+                .expect("source hash"),
+            Some(fresh.symbol.content_hash),
+            "the leaf records the text the injection describes"
+        );
     }
 
     #[test]
