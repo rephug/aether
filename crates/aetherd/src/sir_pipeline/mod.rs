@@ -99,6 +99,11 @@ pub struct QualityBatchItem {
     pub priority_score: f64,
     pub enrichment: SirEnrichmentContext,
     pub use_cot: bool,
+    /// The identity of the SIR the enrichment was built from (`None`: the symbol had no
+    /// SIR), read from the same row as that SIR. The generated result is persisted only
+    /// while the symbol still holds exactly it; a SIR injected after the enrichment was
+    /// built, even before the job is queued, makes the result superseded.
+    pub baseline_sir_identity: Option<SirIdentity>,
 }
 
 /// Returned by `check_embedding_needed` when a symbol requires a new embedding.
@@ -626,7 +631,9 @@ impl SirPipeline {
                 None,
             ) {
                 Ok(mut job) => {
-                    job.prior_sir = current_sir_identity(store, &job.symbol.id)?;
+                    // Not re-read here: the enrichment in the prompt describes the SIR
+                    // the item was built from, so that is the write the guard compares.
+                    job.prior_sir = item.baseline_sir_identity;
                     let prompt = if item.use_cot {
                         sir_prompt::build_enriched_sir_prompt_with_cot(
                             &job.symbol_text,

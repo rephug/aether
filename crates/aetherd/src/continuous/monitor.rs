@@ -185,6 +185,7 @@ fn run_monitor_once_inner(
 
     let mut submitted_chunks = 0usize;
     let mut ingested_results = 0usize;
+    let mut skipped_results = 0usize;
     let mut fingerprint_rows = 0usize;
     if continuous.auto_submit && !build_summary.files.is_empty() {
         let tokio_rt = tokio::runtime::Builder::new_current_thread()
@@ -236,15 +237,26 @@ fn run_monitor_once_inner(
                     Some(&symbols_now),
                 )?;
                 ingested_results += ingest_summary.processed;
+                skipped_results += ingest_summary.skipped;
                 fingerprint_rows += ingest_summary.fingerprint_rows;
             }
         }
-        // Every chunk of this build is ingested: its sidecars have served.
-        remove_build_sidecars(
-            &runtime.batch_dir,
-            pass_config.pass.as_str(),
-            build_summary.build_id.as_str(),
-        )?;
+        if skipped_results == 0 {
+            // Every result of this build is applied or superseded: its sidecars have
+            // served. A skipped result may be re-ingested by hand and needs its origin
+            // entry, so the sidecars stay otherwise.
+            remove_build_sidecars(
+                &runtime.batch_dir,
+                pass_config.pass.as_str(),
+                build_summary.build_id.as_str(),
+            )?;
+        } else {
+            tracing::warn!(
+                build_id = %build_summary.build_id,
+                skipped = skipped_results,
+                "kept the build's batch sidecars: skipped results may be re-ingested"
+            );
+        }
     }
 
     let completed_at = unix_timestamp_secs();

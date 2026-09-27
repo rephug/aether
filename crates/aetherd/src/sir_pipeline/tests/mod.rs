@@ -351,6 +351,7 @@ fn make_quality_batch_items(symbols: &[Symbol]) -> Vec<QualityBatchItem> {
                 caller_contract_clauses: Vec::new(),
             },
             use_cot: false,
+            baseline_sir_identity: None,
         })
         .collect()
 }

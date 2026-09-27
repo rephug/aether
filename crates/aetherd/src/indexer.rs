@@ -18,7 +18,7 @@ use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
 #[cfg(test)]
 use aether_store::SirHistoryStore;
 use aether_store::{
-    SirMetaRecord, SirStateStore, SqliteStore, SurrealGraphStore, SymbolCatalogStore,
+    SirIdentity, SirMetaRecord, SirStateStore, SqliteStore, SurrealGraphStore, SymbolCatalogStore,
     SymbolEmbeddingRecord, SymbolRecord, SymbolRelationStore, TestIntentRecord, TestIntentStore,
     open_graph_store, open_surreal_graph_store_sync,
 };
@@ -787,6 +787,8 @@ struct QualityPassCandidate {
     symbol: Symbol,
     priority_score: f64,
     baseline_sir: SirAnnotation,
+    /// The identity of `baseline_sir`'s stored write, read from the same row.
+    baseline_sir_identity: SirIdentity,
 }
 
 fn run_triage_pass(
@@ -945,7 +947,9 @@ where
             );
             continue;
         };
-        let Some(meta) = store.get_sir_meta(symbol.id.as_str())? else {
+        // Metadata and blob from one row, so the identity recorded with the baseline
+        // is the identity of the SIR the enrichment will be built from.
+        let Some((meta, blob)) = store.get_sir_meta_with_blob(symbol.id.as_str())? else {
             continue;
         };
         let pass = meta.generation_pass.to_ascii_lowercase();
@@ -953,7 +957,7 @@ where
             continue;
         }
 
-        let Some(blob) = store.read_sir_blob(symbol.id.as_str())? else {
+        let Some(blob) = blob else {
             continue;
         };
         let baseline_sir = match serde_json::from_str::<SirAnnotation>(&blob) {
@@ -974,6 +978,7 @@ where
                 .copied()
                 .unwrap_or(0.0),
             baseline_sir,
+            baseline_sir_identity: SirIdentity::of(&meta),
         });
     }
 
@@ -1070,6 +1075,7 @@ fn run_quality_pass(
             priority_score: candidate.priority_score,
             enrichment,
             use_cot,
+            baseline_sir_identity: Some(candidate.baseline_sir_identity),
         });
     }
 

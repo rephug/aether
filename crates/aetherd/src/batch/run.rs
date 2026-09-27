@@ -195,6 +195,7 @@ fn run_full_batch_command(
         // checks results against the workspace as it is now, not that snapshot.
         let current_symbols = snapshot_workspace_symbols(workspace)
             .context("failed to snapshot workspace symbols for batch ingest")?;
+        let mut skipped_results = 0usize;
         for job in completed {
             for result_path in job.result_paths {
                 let ingest_summary = ingest_results(
@@ -216,12 +217,22 @@ fn run_full_batch_command(
                     ingest_summary.superseded,
                     ingest_summary.fingerprint_rows
                 );
+                skipped_results += ingest_summary.skipped;
             }
         }
 
-        if failed.is_empty() {
-            // Every result of this build is ingested: its sidecars have served.
+        if failed.is_empty() && skipped_results == 0 {
+            // Every result of this build is applied or superseded: its sidecars have
+            // served. A skipped result (unparsable line, persist error) may be
+            // re-ingested by hand and needs its origin entry, so the sidecars stay.
             remove_build_sidecars(&runtime.batch_dir, pass.as_str(), build_id.as_str())?;
+        } else if skipped_results > 0 && failed.is_empty() {
+            println!(
+                "Kept the {} build {} sidecars: {} result(s) were skipped and may be re-ingested",
+                pass.as_str(),
+                build_id,
+                skipped_results
+            );
         } else {
             failed.sort_by_key(|job| job.chunk_index);
             let failed_count = failed.len();
