@@ -120,7 +120,8 @@ fn infer_symbol_text_is_public(symbol_text: &str) -> bool {
         || trimmed.starts_with("export default ")
 }
 
-fn extract_symbol_source_text(source: &str, range: SourceRange) -> Option<String> {
+/// The text a symbol's range covers in `source`, as the SIR prompt sees it.
+pub(crate) fn extract_symbol_source_text(source: &str, range: SourceRange) -> Option<String> {
     let start = range
         .start_byte
         .or_else(|| byte_offset_for_position(source, range.start))?;

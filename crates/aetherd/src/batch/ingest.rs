@@ -12,13 +12,14 @@ use aether_store::{
 use anyhow::{Context, Result, anyhow};
 
 use crate::batch::build::{
-    BatchRequestOrigin, keymap_sidecar_name, origin_sidecar_name, snapshot_workspace_symbols,
+    BatchRequestOrigin, KEYMAP_SIDECAR_KIND, ORIGIN_SIDECAR_KIND, snapshot_workspace_symbols,
 };
 use crate::batch::hash::diff_prompt_hashes;
 use crate::batch::{BatchProvider, BatchResultLine, PassConfig};
 use crate::continuous::cosine_distance_from_embeddings;
 use crate::sir_pipeline::{
     EmbeddingInput, PriorSir, SirPipeline, UpsertSirIntentPayload, current_sir_identity,
+    extract_symbol_source_text,
 };
 
 /// Number of embedding records to buffer before flushing to the vector store.
@@ -428,8 +429,7 @@ fn prepare_symbol(
     let origin = origins.get(&request_key);
     if origin.is_none() && key_has_build_id(&request_key) {
         return Err(anyhow!(
-            "batch result '{request_key}' has no origin entry in the {} sidecar; refusing to ingest it unchecked",
-            origin_sidecar_name(pass_config.pass.as_str())
+            "batch result '{request_key}' has no entry in its build's origin sidecar; refusing to ingest it unchecked"
         ));
     }
     let provider_kind = provider_kind_from_name(provider_name);
@@ -467,10 +467,21 @@ fn prepare_symbol(
             return Ok(None);
         }
         if let Some(origin) = origin {
+            // Re-read the symbol's source here, under the lock, rather than trusting
+            // the snapshot's hash: an edit landing after the snapshot would otherwise
+            // slip through. The snapshot only says where the symbol is; a symbol it
+            // does not know, a file that is gone, or text at that range that no longer
+            // hashes to what the prompt was built from all count as changed.
             let current_source_hash = current_symbols
                 .and_then(|symbols| symbols.get(&symbol_id))
-                .map(|symbol| symbol.content_hash.as_str());
-            if current_source_hash != Some(origin.source_hash.as_str()) {
+                .and_then(|symbol| {
+                    let source =
+                        std::fs::read_to_string(pipeline.workspace_root().join(&symbol.file_path))
+                            .ok()?;
+                    extract_symbol_source_text(&source, symbol.range)
+                })
+                .map(|text| aether_core::content_hash(&text));
+            if current_source_hash.as_deref() != Some(origin.source_hash.as_str()) {
                 tracing::info!(
                     symbol_id = %symbol_id,
                     "skipping batch result: the symbol source changed since the request was built"
@@ -577,48 +588,68 @@ fn prompt_hash_meta_record(
     }
 }
 
-/// Try to load the origin sidecar written during JSONL build (see
-/// `BuildSummary::origins`). A batch built without one is ingested unchecked.
+/// Load the origin sidecars written during JSONL build (see `BuildSummary::origins`),
+/// one per build of the pass still present in the directory. A result whose build has
+/// none is refused (see `prepare_symbol`); a legacy result without a build id is
+/// ingested unchecked.
 fn load_origins(results_path: &Path, pass: &str) -> HashMap<String, BatchRequestOrigin> {
-    let Some(batch_dir) = results_path.parent() else {
-        return HashMap::new();
-    };
-    let origin_path = batch_dir.join(origin_sidecar_name(pass));
-    match std::fs::read_to_string(&origin_path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|err| {
-            tracing::warn!(
-                path = %origin_path.display(),
-                error = %err,
-                "failed to parse batch origin sidecar, results are ingested unchecked"
-            );
-            HashMap::new()
-        }),
-        Err(_) => HashMap::new(),
-    }
+    load_sidecars(results_path, pass, ORIGIN_SIDECAR_KIND)
 }
 
-/// Try to load a keymap sidecar written during JSONL build.
+/// Load the keymap sidecars written during JSONL build, one per build of the pass
+/// still present in the directory.
 ///
-/// The keymap maps each provider request key to its full `symbol_id|prompt_hash|build_id`
+/// A keymap maps each provider request key to its full `symbol_id|prompt_hash|build_id`
 /// key, allowing ingest to recover full batch keys from providers that truncate
 /// custom_id (e.g. Anthropic's 64-char limit).
 fn load_keymap(results_path: &Path, pass: &str) -> HashMap<String, String> {
-    let batch_dir = match results_path.parent() {
-        Some(dir) => dir,
-        None => return HashMap::new(),
+    load_sidecars(results_path, pass, KEYMAP_SIDECAR_KIND)
+}
+
+/// The union of every `<pass>.<build_id>.<kind>.json` beside the results (each build
+/// writes its own, and keys carry the build id, so entries never collide) plus the
+/// pre-build-id `<pass>.<kind>.json` when one is present. An unparsable sidecar is
+/// skipped with a warning.
+fn load_sidecars<V: serde::de::DeserializeOwned>(
+    results_path: &Path,
+    pass: &str,
+    kind: &str,
+) -> HashMap<String, V> {
+    let Some(batch_dir) = results_path.parent() else {
+        return HashMap::new();
     };
-    let keymap_path = batch_dir.join(keymap_sidecar_name(pass));
-    match std::fs::read_to_string(&keymap_path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|err| {
-            tracing::warn!(
-                path = %keymap_path.display(),
+    let Ok(entries) = std::fs::read_dir(batch_dir) else {
+        return HashMap::new();
+    };
+    let prefix = format!("{pass}.");
+    let suffix = format!(".{kind}.json");
+    let legacy = format!("{pass}.{kind}.json");
+    let mut merged = HashMap::new();
+    let mut paths = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name == legacy || (name.starts_with(&prefix) && name.ends_with(&suffix))
+                })
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        match serde_json::from_str::<HashMap<String, V>>(&content) {
+            Ok(entries) => merged.extend(entries),
+            Err(err) => tracing::warn!(
+                path = %path.display(),
                 error = %err,
-                "failed to parse batch keymap, prompt hashes may be unavailable"
-            );
-            HashMap::new()
-        }),
-        Err(_) => HashMap::new(),
+                "failed to parse batch {kind} sidecar, its entries are unavailable"
+            ),
+        }
     }
+    merged
 }
 
 fn symbol_from_record(record: &aether_store::SymbolRecord) -> Result<Symbol> {
@@ -855,7 +886,23 @@ vector_backend = "sqlite"
         let pipeline = SirPipeline::new_embeddings_only(workspace.to_path_buf())
             .map(|pipeline| pipeline.with_skip_surreal_sync(true))
             .expect("build embeddings-only pipeline");
-        let symbol = symbol_from_record(&record).expect("build symbol");
+        // The symbol's source on disk, as the build snapshot saw it.
+        let source = "fn late() {}\n";
+        fs::create_dir_all(workspace.join("src")).expect("create src");
+        fs::write(workspace.join("src/lib.rs"), source).expect("write source");
+        let symbol = Symbol {
+            content_hash: aether_core::content_hash(source),
+            range: SourceRange {
+                start: Position { line: 1, column: 1 },
+                end: Position {
+                    line: 1,
+                    column: source.trim_end().len() + 1,
+                },
+                start_byte: Some(0),
+                end_byte: Some(source.len()),
+            },
+            ..symbol_from_record(&record).expect("build symbol")
+        };
         let persist = |sir: &SirAnnotation, pass: &str| {
             pipeline
                 .persist_sir_payload_into_sqlite(
@@ -938,9 +985,10 @@ vector_backend = "sqlite"
             "no provenance from the skipped result"
         );
 
-        // Built against the SIR the store still holds but a source since edited (same
-        // id, different body), the result is not applied either: the daemon's
-        // regeneration from the new source must not be pre-empted by a SIR of the old.
+        // Built against the SIR the store still holds but a source since edited on
+        // disk (same id, different body; the snapshot still says the old hash), the
+        // result is not applied either: the daemon's regeneration from the new source
+        // must not be pre-empted by a SIR of the old.
         let origins = HashMap::from([(
             key.clone(),
             BatchRequestOrigin {
@@ -948,13 +996,7 @@ vector_backend = "sqlite"
                 source_hash: source_hash.clone(),
             },
         )]);
-        let edited_symbols = HashMap::from([(
-            "sym-late".to_owned(),
-            Symbol {
-                content_hash: aether_core::content_hash("fn late() { edited }"),
-                ..symbol.clone()
-            },
-        )]);
+        fs::write(workspace.join("src/lib.rs"), "fn late() { edited }\n").expect("edit source");
         let outcome = prepare_symbol(
             &pipeline,
             &store,
@@ -964,7 +1006,7 @@ vector_backend = "sqlite"
             "gemini",
             &HashMap::new(),
             &origins,
-            Some(&edited_symbols),
+            Some(&current_symbols),
         )
         .expect("prepare symbol");
         assert!(
@@ -979,6 +1021,8 @@ vector_backend = "sqlite"
                 .generation_pass,
             "injected"
         );
+
+        fs::write(workspace.join("src/lib.rs"), source).expect("restore source");
 
         // A result carrying a build id but no origin entry is refused, not ingested
         // unchecked.
@@ -997,7 +1041,8 @@ vector_backend = "sqlite"
             Ok(_) => panic!("a modern key without an origin must be refused"),
         };
         assert!(
-            err.to_string().contains("no origin entry"),
+            err.to_string()
+                .contains("has no entry in its build's origin sidecar"),
             "unexpected error: {err:#}"
         );
         assert_eq!(

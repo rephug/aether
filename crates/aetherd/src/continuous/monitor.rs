@@ -23,7 +23,7 @@ use super::{ensure_supported_schedule, parse_requeue_pass, resolve_continuous_co
 use crate::batch::hash::{compute_source_hash_segment, decompose_prompt_hash};
 use crate::batch::{
     BatchPollStatus, build_pass_jsonl_for_ids, create_batch_provider, ingest_results,
-    resolve_batch_runtime_config, snapshot_workspace_symbols,
+    remove_build_sidecars, resolve_batch_runtime_config, snapshot_workspace_symbols,
 };
 use crate::indexer::run_structural_index_once;
 use crate::sir_pipeline::build_job;
@@ -239,6 +239,12 @@ fn run_monitor_once_inner(
                 fingerprint_rows += ingest_summary.fingerprint_rows;
             }
         }
+        // Every chunk of this build is ingested: its sidecars have served.
+        remove_build_sidecars(
+            &runtime.batch_dir,
+            pass_config.pass.as_str(),
+            build_summary.build_id.as_str(),
+        )?;
     }
 
     let completed_at = unix_timestamp_secs();

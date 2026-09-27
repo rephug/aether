@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::batch::build::{build_pass_jsonl, snapshot_workspace_symbols};
+use crate::batch::build::{build_pass_jsonl, remove_build_sidecars, snapshot_workspace_symbols};
 use crate::batch::extract::run_extract;
 use crate::batch::ingest::ingest_results;
 use crate::batch::{
@@ -178,6 +178,7 @@ fn run_full_batch_command(
             "starting batch submission"
         );
 
+        let build_id = build_summary.build_id.clone();
         let BatchPollOutcome {
             mut completed,
             mut failed,
@@ -218,7 +219,10 @@ fn run_full_batch_command(
             }
         }
 
-        if !failed.is_empty() {
+        if failed.is_empty() {
+            // Every result of this build is ingested: its sidecars have served.
+            remove_build_sidecars(&runtime.batch_dir, pass.as_str(), build_id.as_str())?;
+        } else {
             failed.sort_by_key(|job| job.chunk_index);
             let failed_count = failed.len();
             let failure_summary = failed
