@@ -289,6 +289,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lance_guarded_delete_fails_on_a_table_it_cannot_open() {
+        let temp = tempdir().expect("tempdir");
+        let store = LanceVectorStore::open(temp.path())
+            .await
+            .expect("open LanceDB vector store");
+        store
+            .upsert_embedding(vector_record("sym-a", "hash-a"))
+            .await
+            .expect("upsert sym-a");
+
+        // A vector table that exists but cannot be opened (a corrupt manifest): taking
+        // back a superseded vector must fail naming the table, not skip it and report
+        // the vector gone while its row may still stand there.
+        let broken = temp
+            .path()
+            .join(".aether/vectors")
+            .join(format!("{VECTOR_TABLE_PREFIX}broken.lance"));
+        std::fs::create_dir_all(broken.join("_versions")).expect("create broken table");
+        std::fs::write(broken.join("_versions/1.manifest"), b"not a manifest")
+            .expect("write corrupt manifest");
+        let err = store
+            .delete_embedding_if_matches("sym-a", "hash-a", 1_700_000_000)
+            .await
+            .expect_err("an unopenable table fails the guarded delete");
+        assert!(
+            err.to_string()
+                .contains(&format!("{VECTOR_TABLE_PREFIX}broken")),
+            "unexpected error: {err}"
+        );
+        let err = store
+            .delete_embeddings(&["sym-a".to_owned()])
+            .await
+            .expect_err("an unopenable table fails the batch delete");
+        assert!(
+            err.to_string()
+                .contains(&format!("{VECTOR_TABLE_PREFIX}broken")),
+            "unexpected error: {err}"
+        );
+
+        // Once the broken table is gone, the same deletes succeed.
+        std::fs::remove_dir_all(&broken).expect("remove broken table");
+        store
+            .delete_embeddings(&["sym-a".to_owned()])
+            .await
+            .expect("delete sym-a");
+        assert!(
+            store
+                .get_embedding_meta("sym-a")
+                .await
+                .expect("lookup sym-a")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn lance_conditional_write_removes_the_row_the_previous_identity_left() {
         let temp = tempdir().expect("tempdir");
         let store = LanceVectorStore::open(temp.path())

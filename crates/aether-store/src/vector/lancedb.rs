@@ -6,7 +6,7 @@ use arrow_array::{Array, StringArray};
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
-use lancedb::{Connection as LanceConnection, DistanceType, Error as LanceError, connect};
+use lancedb::{Connection as LanceConnection, DistanceType, Error as LanceError, Table, connect};
 
 use crate::{SqliteStore, StoreError};
 
@@ -84,7 +84,7 @@ impl LanceVectorStore {
         table_name: &str,
         symbol_id: &str,
     ) -> Result<Option<VectorEmbeddingMetaRecord>, StoreError> {
-        let Ok(table) = connection.open_table(table_name).execute().await else {
+        let Some(table) = open_listed_table(connection, table_name).await? else {
             return Ok(None);
         };
         let schema = table.schema().await.map_err(map_lancedb_err)?;
@@ -157,7 +157,7 @@ impl LanceVectorStore {
             .into_iter()
             .filter(|name| name.starts_with(VECTOR_TABLE_PREFIX))
         {
-            let Ok(table) = connection.open_table(&name).execute().await else {
+            let Some(table) = open_listed_table(&connection, &name).await? else {
                 continue;
             };
             let batches = table
@@ -215,7 +215,7 @@ impl LanceVectorStore {
             .into_iter()
             .filter(|name| name.starts_with(VECTOR_TABLE_PREFIX))
         {
-            let Ok(table) = connection.open_table(&name).execute().await else {
+            let Some(table) = open_listed_table(&connection, &name).await? else {
                 continue;
             };
             for chunk in requested.chunks(PUSHDOWN_CHUNK_SIZE) {
@@ -555,7 +555,7 @@ impl VectorStore for LanceVectorStore {
             .into_iter()
             .filter(|name| name.starts_with(VECTOR_TABLE_PREFIX))
         {
-            let Ok(table) = connection.open_table(&name).execute().await else {
+            let Some(table) = open_listed_table(&connection, &name).await? else {
                 continue;
             };
             let schema = table.schema().await.map_err(map_lancedb_err)?;
@@ -620,7 +620,7 @@ impl VectorStore for LanceVectorStore {
             .into_iter()
             .filter(|name| name.starts_with(VECTOR_TABLE_PREFIX))
         {
-            let Ok(table) = connection.open_table(&name).execute().await else {
+            let Some(table) = open_listed_table(&connection, &name).await? else {
                 continue;
             };
             table
@@ -705,7 +705,7 @@ impl VectorStore for LanceVectorStore {
                 observed.embedding_dim as i32,
             );
             if source != destination
-                && let Ok(table) = connection.open_table(&source).execute().await
+                && let Some(table) = open_listed_table(&connection, &source).await?
             {
                 table
                     .delete(
@@ -761,7 +761,7 @@ impl VectorStore for LanceVectorStore {
             .into_iter()
             .filter(|name| name.starts_with(VECTOR_TABLE_PREFIX))
         {
-            let Ok(table) = connection.open_table(&name).execute().await else {
+            let Some(table) = open_listed_table(&connection, &name).await? else {
                 continue;
             };
             table
@@ -795,7 +795,7 @@ impl VectorStore for LanceVectorStore {
             .into_iter()
             .filter(|name| name.starts_with(VECTOR_TABLE_PREFIX))
         {
-            let Ok(table) = connection.open_table(&name).execute().await else {
+            let Some(table) = open_listed_table(&connection, &name).await? else {
                 continue;
             };
             for chunk in requested.chunks(PUSHDOWN_CHUNK_SIZE) {
@@ -926,7 +926,7 @@ impl VectorStore for LanceVectorStore {
             .into_iter()
             .filter(|name| name.starts_with(VECTOR_TABLE_PREFIX) && name.ends_with(&suffix))
         {
-            let Ok(table) = connection.open_table(&table_name).execute().await else {
+            let Some(table) = open_listed_table(&connection, &table_name).await? else {
                 continue;
             };
 
@@ -1006,7 +1006,7 @@ impl VectorStore for LanceVectorStore {
             .into_iter()
             .filter(|name| name.starts_with(PROJECT_NOTES_VECTOR_TABLE_PREFIX))
         {
-            let Ok(table) = connection.open_table(&name).execute().await else {
+            let Some(table) = open_listed_table(&connection, &name).await? else {
                 continue;
             };
             table
@@ -1099,6 +1099,25 @@ impl VectorStore for LanceVectorStore {
 
 pub(super) fn map_lancedb_err(err: LanceError) -> StoreError {
     StoreError::LanceDb(err.to_string())
+}
+
+/// Open a table the connection listed (or a table name derived from an identity).
+/// `Ok(None)` only when the table does not exist (listed a moment ago and dropped since,
+/// or never created for that identity); any other failure to open it, an I/O error or a
+/// corrupt table, is an error naming the table. Reading such a failure as "no table"
+/// would let a delete report success while the rows it was to remove stand, or a lookup
+/// report a vector absent that is merely unreadable right now.
+async fn open_listed_table(
+    connection: &LanceConnection,
+    name: &str,
+) -> Result<Option<Table>, StoreError> {
+    match connection.open_table(name).execute().await {
+        Ok(table) => Ok(Some(table)),
+        Err(LanceError::TableNotFound { .. }) => Ok(None),
+        Err(err) => Err(StoreError::LanceDb(format!(
+            "failed to open vector table {name}: {err}"
+        ))),
+    }
 }
 
 fn is_table_already_exists_error(err: &LanceError) -> bool {
