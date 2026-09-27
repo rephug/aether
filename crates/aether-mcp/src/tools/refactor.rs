@@ -462,7 +462,11 @@ impl AetherMcpServer {
         // one transaction under the workspace inject lock every SIR writer shares, so it
         // cannot interleave with an `aether_sir_inject` call or a daemon rollup persist,
         // and it lands only while the store still holds the SIR generation started from.
-        {
+        // The identity the leaf write produced, read under the same lock: the embedding
+        // refresh below compares the store against exactly this write, so a leaf
+        // replaced and then restored with the same content (`H1 → H2 → H1`) is not
+        // taken for this one.
+        let committed = {
             let _inject_guard = acquire_inject_write_lock(&self.state.workspace)
                 .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
             let current_sir = current_sir_identity(self.state.store.as_ref(), &candidate.symbol.id)
@@ -509,7 +513,15 @@ impl AetherMcpServer {
                 None,
                 Some(source_hash.as_str()),
             )?;
-        }
+            current_sir_identity(self.state.store.as_ref(), &candidate.symbol.id)
+                .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?
+                .ok_or_else(|| {
+                    AetherMcpError::Message(format!(
+                        "missing persisted SIR identity for {}",
+                        candidate.symbol.id
+                    ))
+                })?
+        };
         // The leaf is committed: a provider or vector-store failure here must not
         // report the candidate as failed (the failure handler would then find a SIR
         // whose identity no longer matches the baseline and leave it as is, and later
@@ -518,7 +530,7 @@ impl AetherMcpServer {
         let embedding_error = match self.refresh_embedding_if_needed(
             embedding_pipeline,
             candidate.symbol.id.as_str(),
-            sir_hash_value.as_str(),
+            &committed,
             canonical_json.as_str(),
         ) {
             // The leaf was replaced by another writer while its vector was being
@@ -611,13 +623,17 @@ impl AetherMcpServer {
     /// before the provider call, before the vector is stored and after it is stored (and
     /// once when a vector for this hash already exists), the write is conditional on the
     /// vector observed beforehand, and a vector for a SIR that was replaced meanwhile is
-    /// never left behind. Exactly the path `aether_sir_inject` uses, through the same
-    /// shared pipeline (`None` when embeddings are not configured: nothing to refresh).
+    /// never left behind. Currency is the full identity of the write this call made
+    /// (`committed`: hash, history version and write generation), not the hash alone,
+    /// so a leaf replaced and then restored with the same content while the provider ran
+    /// counts as superseded rather than as this deep scan. The same path as
+    /// `aether_sir_inject`, through the same shared pipeline (`None` when embeddings are
+    /// not configured: nothing to refresh).
     fn refresh_embedding_if_needed(
         &self,
         embedding_pipeline: Option<&SirPipeline>,
         symbol_id: &str,
-        sir_hash_value: &str,
+        committed: &SirIdentity,
         canonical_json: &str,
     ) -> Result<Option<EmbeddingRefresh>, AetherMcpError> {
         let Some(pipeline) = embedding_pipeline else {
@@ -627,14 +643,12 @@ impl AetherMcpServer {
             .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
         let store = self.state.store.as_ref();
         let mut still_current = || -> anyhow::Result<bool> {
-            Ok(store
-                .get_sir_meta(symbol_id)?
-                .is_some_and(|meta| meta.sir_hash == sir_hash_value))
+            Ok(current_sir_identity(store, symbol_id)?.as_ref() == Some(committed))
         };
         pipeline
             .refresh_embedding_if_current(
                 symbol_id,
-                sir_hash_value,
+                committed.sir_hash.as_str(),
                 canonical_json,
                 None,
                 &mut still_current,
