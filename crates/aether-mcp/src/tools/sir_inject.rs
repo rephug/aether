@@ -73,6 +73,17 @@ pub struct AetherSirInjectRequest {
 /// request that reconstructs the stored SIR; any other still needs `force`), and the
 /// scan queries keep selecting the symbol, so the retry is never blocked.
 pub const SIR_STATUS_ROLLUP_FAILED: &str = "rollup_failed";
+/// `sir_status` a leaf is written with, in the same transaction as the leaf itself,
+/// until its file rollup has been rebuilt; it is cleared to `fresh` only after the
+/// rebuild succeeds. A process that exits between the two leaves this marker behind,
+/// and the guard and the scan queries treat it exactly like `rollup_failed`, so the
+/// documented unchanged rerun repairs the rollup instead of the leaf passing as done.
+pub const SIR_STATUS_ROLLUP_PENDING: &str = "rollup_pending";
+
+/// Whether a leaf's status says its file rollup still has to be rebuilt.
+pub(crate) fn rollup_outstanding(status: &str) -> bool {
+    status == SIR_STATUS_ROLLUP_FAILED || status == SIR_STATUS_ROLLUP_PENDING
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherSirInjectResponse {
@@ -364,8 +375,8 @@ impl AetherMcpServer {
         let hash = sir_hash(&updated);
         let previous_rollup_failed = previous_meta
             .as_ref()
-            .is_some_and(|meta| meta.sir_status == SIR_STATUS_ROLLUP_FAILED);
-        // A `rollup_failed` marker lifts the guard only for the retry of the injection
+            .is_some_and(|meta| rollup_outstanding(&meta.sir_status));
+        // A `rollup_failed` or `rollup_pending` marker lifts the guard only for the retry of the injection
         // that left it: the request that reconstructs the stored SIR exactly. Any other
         // request queued against the earlier placeholder still needs `force`, or it
         // would overwrite the reviewed SIR merely because its rollup once failed.
@@ -380,7 +391,7 @@ impl AetherMcpServer {
             let note = previous_confidence.map(|confidence| {
                 if previous_rollup_failed {
                     format!(
-                        "existing SIR confidence {confidence:.2} exceeds {FORCE_CONFIDENCE_THRESHOLD:.2} threshold; its rollup_failed marker only admits a rerun of the same injection (one that reproduces the stored SIR), so rerun that call, or rerun with force=true to override"
+                        "existing SIR confidence {confidence:.2} exceeds {FORCE_CONFIDENCE_THRESHOLD:.2} threshold; its outstanding-rollup marker only admits a rerun of the same injection (one that reproduces the stored SIR), so rerun that call, or rerun with force=true to override"
                     )
                 } else {
                     format!(
@@ -417,7 +428,11 @@ impl AetherMcpServer {
         // same path the daemon's SIR pipeline uses): a failure between separate writes
         // would leave the new JSON under the old hash and a `fresh` status, a leaf that
         // the scan queries no longer select (its confidence is now high) and that the
-        // guard blocks from an ordinary retry, so it could never be repaired.
+        // guard blocks from an ordinary retry, so it could never be repaired. The leaf
+        // is written as `rollup_pending` in that same transaction and becomes `fresh`
+        // only once the rollup below has been rebuilt: a process that exits in between
+        // leaves a marker the scan queries select and the guard admits a rerun for,
+        // rather than a high-confidence leaf over a stale rollup that reads as done.
         let mut meta_record = SirMetaRecord {
             id: symbol_id.clone(),
             sir_hash: hash.clone(),
@@ -429,7 +444,7 @@ impl AetherMcpServer {
             prompt_hash: None,
             staleness_score: None,
             updated_at: now,
-            sir_status: "fresh".to_owned(),
+            sir_status: SIR_STATUS_ROLLUP_PENDING.to_owned(),
             last_error: None,
             last_attempt_at: now,
         };
@@ -473,6 +488,19 @@ impl AetherMcpServer {
                     ),
                 };
                 AetherMcpError::Message(message)
+            })?;
+        // The rollup is rebuilt: the leaf is complete. Clearing the marker is the last
+        // write under the lock; if it fails, the leaf stays `rollup_pending` and the
+        // documented unchanged rerun (admitted by the guard) rebuilds and clears it.
+        store
+            .upsert_sir_meta(SirMetaRecord {
+                sir_status: "fresh".to_owned(),
+                ..meta_record.clone()
+            })
+            .map_err(|err| {
+                AetherMcpError::Message(format!(
+                    "SIR for {qualified_name} and its file rollup were written but the leaf's rollup_pending marker could not be cleared: {err}; rerun the same injection"
+                ))
             })?;
         // The embedding refresh may call a local or remote model: release the inject lock
         // first so concurrent injections into other files are not serialized behind it.
@@ -1063,6 +1091,31 @@ vector_backend = "sqlite"
             .expect("get sir meta")
             .expect("meta");
         assert_eq!(meta.sir_status, "fresh");
+
+        // A leaf whose process exited between its transaction and the rollup rebuild is
+        // left `rollup_pending`: the same rules apply, and the rerun clears it.
+        store
+            .upsert_sir_meta(aether_store::SirMetaRecord {
+                sir_status: super::SIR_STATUS_ROLLUP_PENDING.to_owned(),
+                ..meta
+            })
+            .expect("mark rollup pending");
+        let other = server
+            .aether_sir_inject_logic(request("A different request's intent", 0.8))
+            .expect("inject sir");
+        assert_eq!(other.status, "blocked");
+        let retry = server
+            .aether_sir_inject_logic(request("existing intent", 0.9))
+            .expect("inject sir");
+        assert_eq!(retry.status, "injected");
+        assert_eq!(
+            store
+                .get_sir_meta("sym-rollup")
+                .expect("get sir meta")
+                .expect("meta")
+                .sir_status,
+            "fresh"
+        );
     }
 
     #[test]

@@ -467,10 +467,10 @@ SCOPE="$(scope_clause "${CRATES[@]}")"
 
 # Number of scan targets inside a scope clause (default: all selected units): [MOCK] or
 # low-confidence SIRs, plus leaves whose file rollup could not be rebuilt after injection
-# (sir_status = 'rollup_failed'), which /scan re-injects.
+# (sir_status 'rollup_failed', or 'rollup_pending' left by an exited process), which /scan re-injects.
 count_targets() {
   local scope="${1:-$SCOPE}"
-  run_sql "SELECT COUNT(*) FROM sir JOIN symbols s ON s.id = sir.id WHERE $scope AND (sir.sir_json LIKE '%\"intent\":\"[MOCK]%' OR json_extract(sir.sir_json, '\$.confidence') < 0.2 OR sir.sir_status = 'rollup_failed');"
+  run_sql "SELECT COUNT(*) FROM sir JOIN symbols s ON s.id = sir.id WHERE $scope AND (sir.sir_json LIKE '%\"intent\":\"[MOCK]%' OR json_extract(sir.sir_json, '\$.confidence') < 0.2 OR sir.sir_status IN ('rollup_failed', 'rollup_pending'));"
 }
 
 NEXT_STEP="deepen the results with: aetherd --workspace . regenerate --deep --below-confidence 0.85 (or /refactor-deep on the files that matter most)"

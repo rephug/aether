@@ -52,7 +52,7 @@ label (it may read `dir:web` or `shared` for a synthetic unit).
    `SELECT s.id, s.qualified_name, s.file_path FROM symbols s JOIN sir ON sir.id = s.id
    WHERE s.file_path LIKE '<dir>/%' ESCAPE '\'
      AND (json_extract(sir.sir_json, '$.confidence') < 0.2 OR sir.sir_json LIKE '%"intent":"[MOCK]%'
-          OR sir.sir_status = 'rollup_failed')
+          OR sir.sir_status IN ('rollup_failed', 'rollup_pending'))
    ORDER BY s.file_path, s.qualified_name`
    (for several `<dir>`s, OR one `LIKE` clause per directory; a root-level file is
    matched with `s.file_path = '<file>'`, so use `(s.file_path = '<p>' OR s.file_path
@@ -89,7 +89,8 @@ label (it may read `dir:web` or `shared` for a synthetic unit).
    rerun that same call once, unchanged: the symbol is marked `rollup_failed`, the
    confidence guard is lifted for exactly that injection (one reproducing the stored
    SIR; any other request needs `force`), and the target query above keeps selecting it
-   until the rerun succeeds.
+   until the rerun succeeds. A leaf still marked `rollup_pending` (its session exited
+   before the rollup was rebuilt) is selected and repaired the same way.
 6. Stop after `batch-size` symbols and print how many targets remain (rerun `/scan` or let
    `scripts/scan_all.sh` loop).
 

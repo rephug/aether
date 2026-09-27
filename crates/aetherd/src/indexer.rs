@@ -38,7 +38,7 @@ use crate::priority_queue::{
 use crate::sir_pipeline::{
     MAX_SYMBOL_TEXT_CHARS, QualityBatchItem, SIR_GENERATION_PASS_DEEP, SIR_GENERATION_PASS_PREMIUM,
     SIR_GENERATION_PASS_REGENERATED, SIR_GENERATION_PASS_SCAN, SIR_GENERATION_PASS_TRIAGE,
-    SirPipeline, build_job,
+    SirPipeline, acquire_inject_write_lock, build_job,
 };
 
 const REQUEST_POLL_BATCH: usize = 128;
@@ -2445,6 +2445,12 @@ impl StructuralIndexer {
 
     fn process_event(&mut self, store: &SqliteStore, event: &SymbolChangeEvent) -> Result<()> {
         for symbol in &event.removed {
+            // Removal deletes the symbol row and its SIR, so it takes the inject lock the
+            // leaf writers hold (as the SIR pipeline's removal does): an `aether_sir_inject`
+            // call re-checks the symbol under that lock and cannot persist a leaf for a
+            // symbol removed underneath it, which the `sir` table has no foreign key to
+            // reject.
+            let _inject_guard = acquire_inject_write_lock(&self.workspace_root)?;
             store
                 .mark_removed(&symbol.id)
                 .with_context(|| format!("failed to mark symbol removed: {}", symbol.id))?;
