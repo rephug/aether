@@ -112,7 +112,8 @@ fi
 # The sessions are non-interactive, so the AETHER MCP server must already be registered
 # for this project: `.mcp.json` whose `mcpServers.aether` entry names a command (stdio
 # aether-mcp, which opens the store itself; no daemon is required) or a URL. The entry
-# is checked structurally: the word "aether" elsewhere in the file (another server's
+# is checked structurally, by python3 or else the sqlite3 CLI's JSON functions, never by
+# a substring match: the word "aether" elsewhere in the file (another server's
 # arguments, say) registers nothing, and would only launch sessions without tools.
 mcp_registered() {
   [ -f .mcp.json ] || return 1
@@ -129,8 +130,15 @@ ok = isinstance(entry, dict) and any(
 )
 sys.exit(0 if ok else 1)
 PY
+  elif command -v sqlite3 >/dev/null 2>&1 && sqlite3 -version >/dev/null 2>&1; then
+    # Without python3, the sqlite3 CLI parses the file (readfile + JSON1): the check
+    # prints 1 only for a valid JSON document whose mcpServers.aether object carries a
+    # non-blank string command or url; unparseable JSON, a missing entry or a build
+    # without JSON1 prints nothing or fails, so the preflight fails closed.
+    [ "$(sqlite3 -batch -noheader :memory: "WITH doc(j) AS (SELECT CAST(readfile('.mcp.json') AS TEXT)) SELECT 1 FROM doc WHERE json_valid(j) AND json_type(j, '\$.mcpServers.aether') = 'object' AND ((json_type(j, '\$.mcpServers.aether.command') = 'text' AND trim(json_extract(j, '\$.mcpServers.aether.command'), ' ' || char(9) || char(10) || char(13)) <> '') OR (json_type(j, '\$.mcpServers.aether.url') = 'text' AND trim(json_extract(j, '\$.mcpServers.aether.url'), ' ' || char(9) || char(10) || char(13)) <> ''));" 2>/dev/null)" = "1" ]
   else
-    grep -q '"aether"' .mcp.json
+    # No JSON parser at all: never guess from a substring match.
+    return 1
   fi
 }
 if ! mcp_registered; then
