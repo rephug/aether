@@ -419,7 +419,7 @@ impl AetherMcpServer {
 
     #[tool(
         name = "aether_sir_inject",
-        description = "Inject or update a symbol's complete SIR annotation. Accepts intent, behavior, edge_cases, side_effects, dependencies, error_modes, inputs, outputs, complexity, confidence, model provenance, and source_hash (from aether_symbol_lookup): when given, the injection is refused if the symbol's source on disk no longer hashes to it."
+        description = "Inject or update a symbol's complete SIR annotation. Accepts intent, behavior, edge_cases, side_effects, dependencies, error_modes, inputs, outputs, complexity, confidence, model provenance, and source_hash (from aether_symbol_lookup): when given, the injection is refused if the symbol's source on disk no longer hashes to it. Status is injected, blocked (existing high-confidence SIR, use force), or rollup_repaired (the existing SIR was kept and its outstanding file rollup rebuilt)."
     )]
     pub async fn aether_sir_inject(
         &self,

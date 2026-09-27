@@ -88,9 +88,11 @@ label (it may read `dir:web` or `shared` for a synthetic unit).
    returns an error saying the SIR was written but the file rollup could not be rebuilt,
    rerun that same call once, unchanged: the symbol is marked `rollup_failed`, the
    confidence guard is lifted for exactly that injection (one reproducing the stored
-   SIR; any other request needs `force`), and the target query above keeps selecting it
-   until the rerun succeeds. A leaf still marked `rollup_pending` (its session exited
-   before the rollup was rebuilt) is selected and repaired the same way.
+   SIR), and the target query above keeps selecting it until the rerun succeeds. A leaf
+   still marked `rollup_failed` or `rollup_pending` from an earlier session (it exited
+   before the rollup was rebuilt) is selected too; injecting your new annotation for it
+   returns `status: "rollup_repaired"`: the stored high-confidence SIR was kept, its
+   rollup rebuilt and the marker cleared. Count that symbol as done and move on.
 6. Stop after `batch-size` symbols and print how many targets remain (rerun `/scan` or let
    `scripts/scan_all.sh` loop).
 

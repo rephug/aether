@@ -376,10 +376,14 @@ impl AetherMcpServer {
         let previous_rollup_failed = previous_meta
             .as_ref()
             .is_some_and(|meta| rollup_outstanding(&meta.sir_status));
-        // A `rollup_failed` or `rollup_pending` marker lifts the guard only for the retry of the injection
-        // that left it: the request that reconstructs the stored SIR exactly. Any other
-        // request queued against the earlier placeholder still needs `force`, or it
-        // would overwrite the reviewed SIR merely because its rollup once failed.
+        // A `rollup_failed` or `rollup_pending` marker lifts the guard only for the
+        // retry of the injection that left it: the request that reconstructs the stored
+        // SIR exactly. Any other request queued against the earlier placeholder still
+        // needs `force` to replace the reviewed SIR; instead of merely being blocked,
+        // though, it repairs what the marker records as outstanding (below): the stored
+        // SIR is kept, its file rollup rebuilt and the marker cleared, so a fresh scan
+        // session that cannot reproduce the earlier annotation still completes the
+        // symbol rather than leaving it pending round after round.
         let retries_failed_rollup = previous_rollup_failed
             && previous_sir
                 .as_ref()
@@ -388,16 +392,22 @@ impl AetherMcpServer {
             && !request.force.unwrap_or(false)
             && !retries_failed_rollup
         {
+            if let Some(previous_meta) = previous_meta
+                .as_ref()
+                .filter(|meta| rollup_outstanding(&meta.sir_status))
+            {
+                return self.repair_outstanding_rollup(
+                    store,
+                    &symbol,
+                    previous_meta,
+                    previous_confidence,
+                    new_confidence,
+                );
+            }
             let note = previous_confidence.map(|confidence| {
-                if previous_rollup_failed {
-                    format!(
-                        "existing SIR confidence {confidence:.2} exceeds {FORCE_CONFIDENCE_THRESHOLD:.2} threshold; its outstanding-rollup marker only admits a rerun of the same injection (one that reproduces the stored SIR), so rerun that call, or rerun with force=true to override"
-                    )
-                } else {
-                    format!(
-                        "existing SIR confidence {confidence:.2} exceeds {FORCE_CONFIDENCE_THRESHOLD:.2} threshold; rerun with force=true to override"
-                    )
-                }
+                format!(
+                    "existing SIR confidence {confidence:.2} exceeds {FORCE_CONFIDENCE_THRESHOLD:.2} threshold; rerun with force=true to override"
+                )
             });
             return Ok(AetherSirInjectResponse {
                 symbol_id,
@@ -525,6 +535,65 @@ impl AetherMcpServer {
             status: "injected".to_owned(),
             note,
             embedding_status,
+            file_rollup_status,
+        })
+    }
+
+    /// Rollup-only repair of a leaf whose earlier injection left its file rollup
+    /// outstanding (`rollup_pending` or `rollup_failed`): the stored, high-confidence SIR
+    /// is kept as it is, the file rollup is rebuilt from the current leaves under the
+    /// inject lock the caller holds, and the marker is cleared to `fresh`. Nothing about
+    /// the leaf itself changes, so the request's own annotation is not written; the
+    /// response says so (`status: "rollup_repaired"`).
+    fn repair_outstanding_rollup(
+        &self,
+        store: &aether_store::SqliteStore,
+        symbol: &SymbolRecord,
+        previous_meta: &SirMetaRecord,
+        previous_confidence: Option<f32>,
+        new_confidence: f32,
+    ) -> Result<AetherSirInjectResponse, AetherMcpError> {
+        let file_rollup_status = self
+            .refresh_file_rollup_after_inject(
+                symbol.file_path.as_str(),
+                previous_meta.provider.as_str(),
+                previous_meta.model.as_str(),
+                previous_meta.generation_pass.as_str(),
+            )
+            .map_err(|err| {
+                AetherMcpError::Message(format!(
+                    "the stored SIR for {} was kept but its outstanding file rollup for {} could not be rebuilt: {err:#}; rerun the injection",
+                    symbol.qualified_name, symbol.file_path
+                ))
+            })?;
+        store
+            .upsert_sir_meta(SirMetaRecord {
+                sir_status: "fresh".to_owned(),
+                last_error: None,
+                ..previous_meta.clone()
+            })
+            .map_err(|err| {
+                AetherMcpError::Message(format!(
+                    "the file rollup for {} was rebuilt but the {} marker on {} could not be cleared: {err}; rerun the injection",
+                    symbol.file_path, previous_meta.sir_status, symbol.qualified_name
+                ))
+            })?;
+        let note = previous_confidence.map(|confidence| {
+            format!(
+                "existing SIR confidence {confidence:.2} exceeds {FORCE_CONFIDENCE_THRESHOLD:.2} threshold and was kept; its file rollup, left {} by an earlier injection, was rebuilt and the marker cleared. Rerun with force=true to replace the SIR itself",
+                previous_meta.sir_status
+            )
+        });
+        Ok(AetherSirInjectResponse {
+            symbol_id: symbol.id.clone(),
+            qualified_name: symbol.qualified_name.clone(),
+            sir_hash: previous_meta.sir_hash.clone(),
+            sir_version: previous_meta.sir_version,
+            previous_confidence,
+            new_confidence,
+            status: "rollup_repaired".to_owned(),
+            note,
+            embedding_status: "skipped: stored SIR kept".to_owned(),
             file_rollup_status,
         })
     }
@@ -1058,15 +1127,19 @@ vector_backend = "sqlite"
 
         // A different request that was queued against the old placeholder does not get
         // to overwrite the reviewed SIR just because its rollup once failed.
+        // A different request queued against the old placeholder must not overwrite the
+        // reviewed SIR; it repairs the outstanding rollup instead, so the symbol stops
+        // being a scan target without anyone having to reproduce the stored annotation.
         let other = server
             .aether_sir_inject_logic(request("A different request's intent", 0.8))
             .expect("inject sir");
-        assert_eq!(other.status, "blocked");
+        assert_eq!(other.status, "rollup_repaired");
+        assert_eq!(other.file_rollup_status, "refreshed");
         assert!(
             other
                 .note
                 .as_deref()
-                .is_some_and(|note| note.contains("rerun of the same injection")),
+                .is_some_and(|note| note.contains("was kept") && note.contains("rollup_failed")),
             "note: {:?}",
             other.note
         );
@@ -1079,8 +1152,21 @@ vector_backend = "sqlite"
         )
         .expect("parse blob");
         assert_eq!(stored.intent, "existing intent");
+        let meta = store
+            .get_sir_meta("sym-rollup")
+            .expect("get sir meta")
+            .expect("meta");
+        assert_eq!(meta.sir_status, "fresh");
+        assert_eq!(meta.sir_hash, "seed-hash", "the leaf was not rewritten");
 
-        // The rerun of the failed injection reconstructs the stored SIR and passes.
+        // The rerun of the failed injection itself reconstructs the stored SIR and is
+        // admitted while the marker is outstanding.
+        store
+            .upsert_sir_meta(aether_store::SirMetaRecord {
+                sir_status: super::SIR_STATUS_ROLLUP_FAILED.to_owned(),
+                ..meta
+            })
+            .expect("mark rollup failed again");
         let retry = server
             .aether_sir_inject_logic(request("existing intent", 0.9))
             .expect("inject sir");
@@ -1093,7 +1179,7 @@ vector_backend = "sqlite"
         assert_eq!(meta.sir_status, "fresh");
 
         // A leaf whose process exited between its transaction and the rollup rebuild is
-        // left `rollup_pending`: the same rules apply, and the rerun clears it.
+        // left `rollup_pending`: a fresh session's different annotation repairs it too.
         store
             .upsert_sir_meta(aether_store::SirMetaRecord {
                 sir_status: super::SIR_STATUS_ROLLUP_PENDING.to_owned(),
@@ -1103,11 +1189,7 @@ vector_backend = "sqlite"
         let other = server
             .aether_sir_inject_logic(request("A different request's intent", 0.8))
             .expect("inject sir");
-        assert_eq!(other.status, "blocked");
-        let retry = server
-            .aether_sir_inject_logic(request("existing intent", 0.9))
-            .expect("inject sir");
-        assert_eq!(retry.status, "injected");
+        assert_eq!(other.status, "rollup_repaired");
         assert_eq!(
             store
                 .get_sir_meta("sym-rollup")
@@ -1115,6 +1197,20 @@ vector_backend = "sqlite"
                 .expect("meta")
                 .sir_status,
             "fresh"
+        );
+
+        // With nothing outstanding, the guard blocks as before.
+        let blocked = server
+            .aether_sir_inject_logic(request("A different request's intent", 0.8))
+            .expect("inject sir");
+        assert_eq!(blocked.status, "blocked");
+        assert!(
+            blocked
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("force=true")),
+            "note: {:?}",
+            blocked.note
         );
     }
 
