@@ -567,19 +567,40 @@ impl SqliteStore {
         let Some(mut snapshot) = self.read_sir_row(symbol_id)? else {
             return Ok(None);
         };
-        if snapshot.blob.is_none() {
+        // The mirror file is written after the row's transaction commits, so a writer
+        // landing between the row read and the file read would pair the older identity
+        // with the newer JSON. The row is read again after the file: only when its
+        // identity is unchanged do the two belong together; otherwise the newer row is
+        // taken (and, once it holds its JSON itself, returned as is).
+        for _ in 0..3 {
+            if snapshot.blob.is_some() {
+                return Ok(Some(snapshot));
+            }
             let path = self.sir_blob_path(symbol_id);
-            if path.exists() {
-                snapshot.blob =
-                    Some(fs::read_to_string(path)?).filter(|value| !value.trim().is_empty());
+            if !path.exists() {
+                return Ok(Some(snapshot));
+            }
+            let mirrored = fs::read_to_string(path)?;
+            match self.read_sir_row(symbol_id)? {
+                None => return Ok(None),
+                Some(again) if again.identity == snapshot.identity => {
+                    snapshot.blob = Some(mirrored).filter(|value| !value.trim().is_empty());
+                    return Ok(Some(snapshot));
+                }
+                Some(again) => snapshot = again,
             }
         }
-        Ok(Some(snapshot))
+        Err(StoreError::Compatibility(format!(
+            "SIR row for {symbol_id} kept changing while its legacy mirror was read"
+        )))
     }
 
     /// The identity of the SIR a symbol holds right now (`None`: no SIR stored).
     pub fn get_sir_identity(&self, symbol_id: &str) -> Result<Option<SirIdentity>, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut stmt = conn.prepare(
             r#"
             SELECT sir_hash, sir_version, write_generation
@@ -600,7 +621,10 @@ impl SqliteStore {
     }
 
     fn read_sir_row(&self, symbol_id: &str) -> Result<Option<SirRowSnapshot>, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut stmt = conn.prepare(
             r#"
             SELECT
