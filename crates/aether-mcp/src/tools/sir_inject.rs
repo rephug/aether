@@ -64,14 +64,16 @@ pub struct AetherSirInjectRequest {
     pub force: Option<bool>,
 }
 
-/// Serializes the leaf-SIR write and the file-rollup rebuild across concurrent
-/// `aether_sir_inject` calls in this process; `acquire_inject_write_lock` adds the
+/// Serializes each `aether_sir_inject` call, from reading the prior SIR through the
+/// confidence guard, the leaf write and the file-rollup rebuild, against concurrent
+/// calls in this process; `acquire_inject_write_lock` adds the
 /// cross-process half (an exclusive lock on `.aether/inject.lock`), since every MCP
 /// client runs its own stdio `aether-mcp` process against the same store.
 static INJECT_WRITE_LOCK: Mutex<()> = Mutex::new(());
 const INJECT_LOCK_FILE: &str = "inject.lock";
 
-/// Exclusive, cross-process lock held while a leaf SIR and its file rollup are written.
+/// Exclusive, cross-process lock held from reading the prior SIR until the leaf SIR and
+/// its file rollup are written.
 /// Released when the returned handle is dropped.
 fn acquire_inject_write_lock(workspace: &Path) -> anyhow::Result<std::fs::File> {
     let dir = workspace.join(".aether");
@@ -324,6 +326,18 @@ impl AetherMcpServer {
         let symbol = resolve_symbol_selector(store, request.symbol.as_str())?;
         let symbol_id = symbol.id.clone();
         let qualified_name = symbol.qualified_name.clone();
+        // Read the prior state, apply the confidence guard, merge, write the leaf and
+        // rebuild the file rollup under one lock: a concurrent injection into the same
+        // symbol (or the same file) must observe this call's write, not the snapshot it
+        // started from. Otherwise two injectors of a low-confidence symbol both pass the
+        // guard, and the slower one overwrites the faster one's result with fields merged
+        // from the stale SIR. The MCP router runs each call on its own blocking task, so
+        // one process-wide lock plus the cross-process file lock covers both cases.
+        let _inject_guard = INJECT_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _inject_file_guard = acquire_inject_write_lock(&self.state.workspace)
+            .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
         let previous_meta = store.get_sir_meta(symbol_id.as_str())?;
         let previous_blob = store.read_sir_blob(symbol_id.as_str())?;
         let previous_sir = previous_blob
@@ -408,15 +422,6 @@ impl AetherMcpServer {
         let generation_pass = normalize_optional_text_with_default(request.generation_pass, "deep");
         let rollup_identity = (provider.clone(), model.clone(), generation_pass.clone());
         let now = current_unix_timestamp();
-        // The leaf write and the file-rollup rebuild below must not interleave with a
-        // concurrent injection into the same file (the MCP router runs each call on its
-        // own blocking task): an older leaf snapshot persisted last would put stale
-        // rollup content back. One process-wide lock keeps write + rebuild atomic.
-        let _inject_guard = INJECT_WRITE_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _inject_file_guard = acquire_inject_write_lock(&self.state.workspace)
-            .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
         let version_write = store.record_sir_version_if_changed(
             symbol_id.as_str(),
             hash.as_str(),
@@ -588,7 +593,6 @@ impl AetherMcpServer {
 mod tests {
     use std::fs;
     use std::path::Path;
-    use std::sync::Mutex;
 
     use aether_sir::SirAnnotation;
     use aether_store::{SirHistoryStore, SirStateStore, SymbolCatalogStore, SymbolRecord};
@@ -785,6 +789,84 @@ vector_backend = "sqlite"
             .list_sir_history("sym-block")
             .expect("list sir history");
         assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn sir_inject_concurrent_injections_of_one_symbol_serialize_through_the_guard() {
+        // Two injectors (separate servers over one workspace, as two MCP processes
+        // would be) race to replace a low-confidence SIR without force: the one that
+        // takes the lock second must see the first's high-confidence write and be
+        // blocked by the guard instead of overwriting it.
+        let temp = tempdir().expect("tempdir");
+        write_test_config(temp.path());
+        seed_symbol(temp.path(), "sym-race", "crate::raced");
+        seed_existing_sir(temp.path(), "sym-race", 0.1);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|label| {
+                let workspace = temp.path().to_path_buf();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let server = AetherMcpServer::new(&workspace, false).expect("server");
+                    barrier.wait();
+                    server
+                        .aether_sir_inject_logic(AetherSirInjectRequest {
+                            symbol: "sym-race".to_owned(),
+                            intent: format!("{label} injector"),
+                            behavior: None,
+                            edge_cases: None,
+                            side_effects: None,
+                            dependencies: None,
+                            error_modes: None,
+                            confidence: Some(0.9),
+                            inputs: None,
+                            outputs: None,
+                            complexity: None,
+                            generation_pass: None,
+                            model: None,
+                            provider: None,
+                            force: Some(false),
+                        })
+                        .expect("inject")
+                })
+            })
+            .collect();
+        let responses: Vec<AetherSirInjectResponse> = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("join"))
+            .collect();
+
+        let injected: Vec<_> = responses
+            .iter()
+            .filter(|response| response.status == "injected")
+            .collect();
+        let blocked: Vec<_> = responses
+            .iter()
+            .filter(|response| response.status == "blocked")
+            .collect();
+        assert_eq!(injected.len(), 1, "{responses:?}");
+        assert_eq!(blocked.len(), 1, "{responses:?}");
+        assert_eq!(injected[0].previous_confidence, Some(0.1));
+        assert_eq!(blocked[0].previous_confidence, Some(0.9));
+
+        let store = aether_store::SqliteStore::open(temp.path()).expect("open store");
+        let blob = store
+            .read_sir_blob("sym-race")
+            .expect("read blob")
+            .expect("blob exists");
+        let sir: SirAnnotation = serde_json::from_str(&blob).expect("parse sir");
+        assert_eq!(sir.confidence, 0.9);
+        assert!(
+            sir.intent.ends_with(" injector"),
+            "winner's intent kept: {}",
+            sir.intent
+        );
+        assert_eq!(
+            store.list_sir_history("sym-race").expect("history").len(),
+            2,
+            "seed plus exactly one injection"
+        );
     }
 
     #[test]
