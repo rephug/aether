@@ -1,11 +1,51 @@
 use aether_core::{Symbol, content_hash};
 use aether_parse::TestIntent;
 use aether_sir::SirAnnotation;
-use aether_store::{SymbolRecord, TestIntentRecord};
+use aether_store::{SqliteStore, SymbolRecord, TestIntentRecord};
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 
 use super::SIR_GENERATION_PASS_SCAN;
+
+pub use aether_store::SirIdentity;
+
+/// The identity of the SIR a symbol holds right now (`None`: no SIR stored).
+pub fn current_sir_identity(store: &SqliteStore, symbol_id: &str) -> Result<Option<SirIdentity>> {
+    store
+        .get_sir_identity(symbol_id)
+        .with_context(|| format!("failed to read SIR identity for {symbol_id}"))
+}
+
+/// What the store held for a symbol when a write was planned, as recorded on a write
+/// intent: nothing known (intents written before this was recorded), no SIR, or one
+/// specific SIR write. A replay persists the intent only while the store still holds
+/// exactly that; otherwise a newer writer got there first and the intent is retired.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum PriorSir {
+    #[default]
+    Unrecorded,
+    Absent,
+    Present(SirIdentity),
+}
+
+impl PriorSir {
+    pub(crate) fn recorded(identity: Option<SirIdentity>) -> Self {
+        match identity {
+            Some(identity) => Self::Present(identity),
+            None => Self::Absent,
+        }
+    }
+
+    /// Whether the store's current SIR is still the one this record was planned
+    /// against (always true when nothing was recorded).
+    pub(crate) fn still_holds(&self, current: Option<&SirIdentity>) -> bool {
+        match self {
+            Self::Unrecorded => true,
+            Self::Absent => current.is_none(),
+            Self::Present(identity) => current == Some(identity),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct UpsertSirIntentPayload {
@@ -16,11 +56,23 @@ pub(crate) struct UpsertSirIntentPayload {
     pub(crate) generation_pass: String,
     pub(crate) reasoning_trace: Option<String>,
     pub(crate) commit_hash: Option<String>,
+    /// The SIR the symbol held when this write was planned (see [`PriorSir`]).
+    pub(crate) prior_sir: PriorSir,
+    /// The hash of the prompt this SIR answers, when it came from a batch request.
+    /// Written into the `sir` row with the leaf itself, so it is part of the same
+    /// transaction as the write it describes (batch ingest reads it back as proof that
+    /// a row is its own earlier write).
+    pub(crate) prompt_hash: Option<String>,
+    /// The content hash of the symbol text this SIR describes, when the writer knows it
+    /// (the daemon's jobs, batch results with an origin). Written into the `sir` row
+    /// with the leaf, so a later job for edited text can tell that the stored SIR is of
+    /// older text; a pending replay re-checks it against the file before writing.
+    pub(crate) source_hash: Option<String>,
 }
 
 impl UpsertSirIntentPayload {
     pub(crate) fn to_json_string(&self) -> Result<String> {
-        serde_json::to_string(&json!({
+        let mut value = json!({
             "symbol": self.symbol,
             "sir": self.sir,
             "provider_name": self.provider_name,
@@ -28,8 +80,20 @@ impl UpsertSirIntentPayload {
             "generation_pass": self.generation_pass,
             "reasoning_trace": self.reasoning_trace,
             "commit_hash": self.commit_hash,
-        }))
-        .context("failed to serialize upsert intent payload")
+            "prompt_hash": self.prompt_hash,
+            "source_hash": self.source_hash,
+        });
+        match &self.prior_sir {
+            PriorSir::Unrecorded => {}
+            PriorSir::Absent => {
+                value["prior_sir"] = Value::Null;
+            }
+            PriorSir::Present(identity) => {
+                value["prior_sir"] = serde_json::to_value(identity)
+                    .context("failed to serialize the prior SIR identity")?;
+            }
+        }
+        serde_json::to_string(&value).context("failed to serialize upsert intent payload")
     }
 
     pub(crate) fn from_json_str(raw: &str) -> Result<Self> {
@@ -67,6 +131,37 @@ impl UpsertSirIntentPayload {
                 ));
             }
         };
+        let prompt_hash = match object.get("prompt_hash") {
+            Some(Value::String(value)) if !value.trim().is_empty() => Some(value.clone()),
+            Some(Value::String(_)) | Some(Value::Null) | None => None,
+            Some(_) => {
+                return Err(anyhow!(
+                    "payload field 'prompt_hash' must be a string or null"
+                ));
+            }
+        };
+        let source_hash = match object.get("source_hash") {
+            Some(Value::String(value)) if !value.trim().is_empty() => Some(value.clone()),
+            Some(Value::String(_)) | Some(Value::Null) | None => None,
+            Some(_) => {
+                return Err(anyhow!(
+                    "payload field 'source_hash' must be a string or null"
+                ));
+            }
+        };
+        let prior_sir = match object.get("prior_sir") {
+            None => PriorSir::Unrecorded,
+            Some(Value::Null) => PriorSir::Absent,
+            Some(value @ Value::Object(_)) => PriorSir::Present(
+                serde_json::from_value(value.clone())
+                    .context("payload field 'prior_sir' is not a SIR identity")?,
+            ),
+            Some(_) => {
+                return Err(anyhow!(
+                    "payload field 'prior_sir' must be an object or null"
+                ));
+            }
+        };
 
         Ok(Self {
             symbol: serde_json::from_value(symbol_value).context("invalid payload symbol")?,
@@ -76,6 +171,9 @@ impl UpsertSirIntentPayload {
             generation_pass,
             reasoning_trace,
             commit_hash,
+            prior_sir,
+            prompt_hash,
+            source_hash,
         })
     }
 }

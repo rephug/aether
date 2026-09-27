@@ -1,10 +1,12 @@
+use std::cell::RefCell;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aether_core::{Position, SourceRange, Symbol};
+use aether_core::{Position, SourceRange, Symbol, content_hash};
 use aether_infer::{InferError, InferSirResult, InferenceProvider, SirContext};
+use aether_parse::SymbolExtractor;
 use aether_sir::SirAnnotation;
 use anyhow::{Context, Result, anyhow};
 use tokio::sync::Semaphore;
@@ -13,7 +15,7 @@ use tokio::time::{sleep, timeout};
 
 use super::{
     INFERENCE_BACKOFF_BASE_MS, INFERENCE_BACKOFF_MAX_MS, INFERENCE_MAX_RETRIES,
-    MAX_SYMBOL_TEXT_CHARS,
+    MAX_SYMBOL_TEXT_CHARS, SirIdentity,
 };
 
 #[derive(Debug)]
@@ -23,21 +25,40 @@ pub(crate) struct SirJob {
     pub(crate) context: SirContext,
     pub(crate) custom_prompt: Option<String>,
     pub(crate) deep_mode: bool,
+    /// The SIR stored for the symbol when the job was queued (`None`: no SIR yet), by
+    /// hash and history version. Generation runs unlocked, so the result is persisted
+    /// only while the store still holds exactly this write; a SIR another writer stored
+    /// in the meantime wins, even one that brought the same content back.
+    pub(crate) prior_sir: Option<SirIdentity>,
+    /// The content hash of the symbol text actually read from disk for this job, before
+    /// any truncation: the same hash the parser stores as `Symbol::content_hash`, but of
+    /// the text the prompt was built from rather than of an earlier snapshot, so a
+    /// caller recording what a prompt described records exactly that.
+    pub(crate) source_hash: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct GeneratedSir {
     pub(super) symbol: Symbol,
     pub(super) sir: SirAnnotation,
     pub(super) provider_name: String,
     pub(super) model_name: String,
     pub(super) reasoning_trace: Option<String>,
+    /// See `SirJob::prior_sir`.
+    pub(super) prior_sir: Option<SirIdentity>,
+    /// See `SirJob::source_hash`: the result is persisted only while the symbol's source
+    /// still hashes to this, so a job that read an older body cannot land after (and
+    /// pre-empt) the job the edit queued.
+    pub(super) source_hash: String,
 }
 
 #[derive(Debug)]
 pub(super) struct FailedSirGeneration {
     pub(super) symbol: Symbol,
     pub(super) error_message: String,
+    /// See `SirJob::prior_sir`: the failure is recorded on the symbol's metadata only
+    /// while the store still holds this SIR, never on one written since.
+    pub(super) prior_sir: Option<SirIdentity>,
 }
 
 #[derive(Debug)]
@@ -65,6 +86,18 @@ pub(crate) fn build_job(
                 symbol.file_path,
             )
         })?;
+    let source_hash = content_hash(&symbol_text);
+    // The symbol's range came from the parser's view of the file. If the file changed
+    // since, the range may now cover other bytes: hashing and prompting on those would
+    // describe the wrong slice, and the persist-time source check, using the same stale
+    // range, could not tell. Refuse the job until the symbol is re-indexed.
+    if source_hash != symbol.content_hash {
+        return Err(anyhow!(
+            "source for {} in {} changed since it was indexed (the recorded range no longer covers the text it was recorded for); skipping until the symbol is re-indexed",
+            symbol.qualified_name,
+            symbol.file_path,
+        ));
+    }
     let effective_limit = match max_chars {
         Some(0) | None => MAX_SYMBOL_TEXT_CHARS,
         Some(value) => value,
@@ -101,6 +134,8 @@ pub(crate) fn build_job(
         context,
         custom_prompt: None,
         deep_mode: false,
+        prior_sir: None,
+        source_hash,
     })
 }
 
@@ -112,7 +147,59 @@ fn infer_symbol_text_is_public(symbol_text: &str) -> bool {
         || trimmed.starts_with("export default ")
 }
 
-fn extract_symbol_source_text(source: &str, range: SourceRange) -> Option<String> {
+/// The content hash of the symbol's source as it is on disk right now, computed exactly
+/// as `SirJob::source_hash` was: the file is re-read and re-parsed and the symbol found
+/// by its id, never by the range an earlier snapshot recorded, so an edit elsewhere in
+/// the file that moved the symbol does not read as a change to it, and a change to its
+/// body is never hidden by other text that happens to fill the old range. `Ok(None)`:
+/// the file is gone or no longer declares the symbol, so the result describes a body
+/// the symbol no longer has. `Err`: the file exists but could not be read or parsed;
+/// that says nothing about the symbol's text, so a caller must fail (and leave its
+/// result to be retried) rather than read it as an edit and drop a valid result. A
+/// writer that generated from an earlier read compares the two under the inject lock:
+/// a mismatch means the result describes a body the symbol no longer has.
+pub fn current_source_hash(workspace_root: &Path, symbol: &Symbol) -> Result<Option<String>> {
+    let source = match fs::read_to_string(workspace_root.join(&symbol.file_path)) {
+        Ok(source) => source,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(anyhow!(
+                "failed to read {} for the current source of {}: {err}",
+                symbol.file_path,
+                symbol.qualified_name
+            ));
+        }
+    };
+    let symbols = LIVE_PARSER.with(|parser| -> Result<Vec<Symbol>> {
+        let mut parser = parser.borrow_mut();
+        if parser.is_none() {
+            *parser =
+                Some(SymbolExtractor::new().context("failed to initialize the source parser")?);
+        }
+        parser
+            .as_mut()
+            .ok_or_else(|| anyhow!("the source parser is unavailable after initialization"))?
+            .extract_from_path(Path::new(&symbol.file_path), &source)
+            .with_context(|| {
+                format!(
+                    "failed to parse {} for the current source of {}",
+                    symbol.file_path, symbol.qualified_name
+                )
+            })
+    })?;
+    Ok(symbols
+        .into_iter()
+        .find(|current| current.id == symbol.id)
+        .map(|current| current.content_hash))
+}
+
+thread_local! {
+    /// One parser per thread for the source re-reads under the inject lock.
+    static LIVE_PARSER: RefCell<Option<SymbolExtractor>> = const { RefCell::new(None) };
+}
+
+/// The text a symbol's range covers in `source`, as the SIR prompt sees it.
+pub(crate) fn extract_symbol_source_text(source: &str, range: SourceRange) -> Option<String> {
     let start = range
         .start_byte
         .or_else(|| byte_offset_for_position(source, range.start))?;
@@ -180,6 +267,8 @@ pub(super) async fn generate_sir_jobs(
                 context,
                 custom_prompt,
                 deep_mode,
+                prior_sir,
+                source_hash,
             } = job;
             let qualified_name = symbol.qualified_name.clone();
 
@@ -190,6 +279,7 @@ pub(super) async fn generate_sir_jobs(
                     return SirGenerationOutcome::Failure(Box::new(FailedSirGeneration {
                         symbol,
                         error_message: "inference semaphore closed".to_owned(),
+                        prior_sir,
                     }));
                 }
             };
@@ -223,6 +313,8 @@ pub(super) async fn generate_sir_jobs(
                     provider_name: result.provider,
                     model_name: result.model,
                     reasoning_trace: result.reasoning_trace,
+                    prior_sir,
+                    source_hash,
                 })),
                 Err(err)
                     if is_parse_validation_exhausted_error(&err)
@@ -274,11 +366,14 @@ pub(super) async fn generate_sir_jobs(
                             provider_name: result.provider,
                             model_name: result.model,
                             reasoning_trace: result.reasoning_trace,
+                            prior_sir,
+                            source_hash,
                         })),
                         Err(fallback_err) => {
                             SirGenerationOutcome::Failure(Box::new(FailedSirGeneration {
-                            symbol,
-                            error_message: format!("{fallback_err:#}"),
+                                symbol,
+                                error_message: format!("{fallback_err:#}"),
+                                prior_sir,
                             }))
                         }
                     }
@@ -286,6 +381,7 @@ pub(super) async fn generate_sir_jobs(
                 Err(err) => SirGenerationOutcome::Failure(Box::new(FailedSirGeneration {
                     symbol,
                     error_message: format!("{err:#}"),
+                    prior_sir,
                 })),
             }
         });

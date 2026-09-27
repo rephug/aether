@@ -9,6 +9,8 @@ const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com/v1";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const ANTHROPIC_BETA_EXTENDED_CACHE_TTL: &str = "extended-cache-ttl-2025-04-11";
 const ANTHROPIC_CACHE_TTL: &str = "1h";
+/// The `custom_id` length Anthropic's batch API accepts.
+const ANTHROPIC_CUSTOM_ID_MAX_LEN: usize = 64;
 
 /// Maximum requests per Anthropic batch job.
 const MAX_REQUESTS_PER_BATCH: usize = 10_000;
@@ -52,6 +54,29 @@ impl AnthropicBatchProvider {
 
 #[async_trait::async_trait]
 impl BatchProvider for AnthropicBatchProvider {
+    /// Anthropic limits `custom_id` to 64 chars matching `^[a-zA-Z0-9_-]{1,64}$`, and a
+    /// compound key `symbol_id|prompt_hash|build_id` exceeds that. The id keeps the
+    /// build id (so a result identifies the build it answers, and the keymap entry for
+    /// it cannot be crossed with another build's) after as much of the symbol id as
+    /// fits; a key without a build id sends the symbol id alone, as before.
+    fn request_key(&self, key: &str) -> String {
+        let mut parts = key.splitn(3, '|');
+        let symbol_id = parts.next().unwrap_or(key);
+        let build_id = parts.nth(1).filter(|value| !value.is_empty());
+        let custom_id = match build_id {
+            Some(build_id) => {
+                let symbol_budget = ANTHROPIC_CUSTOM_ID_MAX_LEN.saturating_sub(build_id.len() + 1);
+                let prefix: String = symbol_id.chars().take(symbol_budget).collect();
+                format!("{prefix}-{build_id}")
+            }
+            None => symbol_id.to_owned(),
+        };
+        custom_id
+            .chars()
+            .take(ANTHROPIC_CUSTOM_ID_MAX_LEN)
+            .collect()
+    }
+
     fn format_request(
         &self,
         key: &str,
@@ -94,21 +119,8 @@ impl BatchProvider for AnthropicBatchProvider {
             });
         }
 
-        // Anthropic limits custom_id to 64 chars matching ^[a-zA-Z0-9_-]{1,64}$.
-        // Compound key is symbol_id|hashes... which exceeds 64 chars.
-        // Use just the symbol_id (64 hex chars) which fits exactly.
-        let truncated_key: String = match key.find('|') {
-            Some(pos) => key[..pos].to_string(),
-            None => {
-                if key.len() > 64 {
-                    key[..64].to_string()
-                } else {
-                    key.to_string()
-                }
-            }
-        };
         let line = json!({
-            "custom_id": truncated_key,
+            "custom_id": self.request_key(key),
             "params": params
         });
 
@@ -436,6 +448,40 @@ mod tests {
 
         // custom_id is truncated to the symbol_id portion (before first '|')
         assert_eq!(json["custom_id"], "sym1");
+        assert_eq!(p.request_key("sym1|hash1"), "sym1");
+
+        // A key carrying a build id keeps it, after as much of the symbol id as fits,
+        // so results identify the build they answer.
+        let symbol_id = "f".repeat(64);
+        let custom_id = p.request_key(&format!("{symbol_id}|hash1|0123456789ab"));
+        assert_eq!(custom_id.len(), 64);
+        assert_eq!(custom_id, format!("{}-0123456789ab", "f".repeat(51)));
+        assert_eq!(
+            p.request_key("sym1|hash1|0123456789ab"),
+            "sym1-0123456789ab"
+        );
+        let line = p
+            .format_request(
+                "sym1|hash1|0123456789ab",
+                "System instructions.",
+                "User content.",
+                "claude-haiku-4-5-20251001",
+                "off",
+            )
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(json["custom_id"], "sym1-0123456789ab");
+        let json: serde_json::Value = serde_json::from_str(
+            &p.format_request(
+                "sym1|hash1",
+                "System instructions.",
+                "User content.",
+                "claude-haiku-4-5-20251001",
+                "off",
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(json["params"]["model"], "claude-haiku-4-5-20251001");
         assert_eq!(json["params"]["max_tokens"], 4096);
 

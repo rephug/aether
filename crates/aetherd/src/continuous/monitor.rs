@@ -23,7 +23,7 @@ use super::{ensure_supported_schedule, parse_requeue_pass, resolve_continuous_co
 use crate::batch::hash::{compute_source_hash_segment, decompose_prompt_hash};
 use crate::batch::{
     BatchPollStatus, build_pass_jsonl_for_ids, create_batch_provider, ingest_results,
-    resolve_batch_runtime_config,
+    remove_build_sidecars, resolve_batch_runtime_config, unaccounted_requests,
 };
 use crate::indexer::run_structural_index_once;
 use crate::sir_pipeline::build_job;
@@ -185,6 +185,8 @@ fn run_monitor_once_inner(
 
     let mut submitted_chunks = 0usize;
     let mut ingested_results = 0usize;
+    let mut skipped_results = 0usize;
+    let mut superseded_results = 0usize;
     let mut fingerprint_rows = 0usize;
     if continuous.auto_submit && !build_summary.files.is_empty() {
         let tokio_rt = tokio::runtime::Builder::new_current_thread()
@@ -231,8 +233,43 @@ fn run_monitor_once_inner(
                     provider.name(),
                 )?;
                 ingested_results += ingest_summary.processed;
+                skipped_results += ingest_summary.skipped;
+                superseded_results += ingest_summary.superseded;
                 fingerprint_rows += ingest_summary.fingerprint_rows;
             }
+        }
+        let unaccounted = unaccounted_requests(
+            build_summary.written,
+            ingested_results,
+            superseded_results,
+            skipped_results,
+        );
+        if skipped_results == 0 && unaccounted == 0 {
+            // Every result of this build is applied or superseded: its sidecars have
+            // served. A skipped result may be re-ingested by hand and needs its origin
+            // entry, so the sidecars stay otherwise, as they do when fewer results came
+            // back than requests were written.
+            remove_build_sidecars(
+                &runtime.batch_dir,
+                pass_config.pass.as_str(),
+                build_summary.build_id.as_str(),
+            )?;
+        } else if unaccounted > 0 {
+            tracing::warn!(
+                build_id = %build_summary.build_id,
+                written = build_summary.written,
+                processed = ingested_results,
+                superseded = superseded_results,
+                skipped = skipped_results,
+                unaccounted,
+                "kept the build's batch sidecars: fewer results came back than requests were written"
+            );
+        } else {
+            tracing::warn!(
+                build_id = %build_summary.build_id,
+                skipped = skipped_results,
+                "kept the build's batch sidecars: skipped results may be re-ingested"
+            );
         }
     }
 

@@ -249,6 +249,7 @@ fn seed_live_symbol_cleanup_state(store: &SqliteStore, symbol_id: &str) {
             generation_model: Some("mock-model".to_owned()),
             generation_pass: Some("scan".to_owned()),
             delta_sem: Some(0.25),
+            sir_write_generation: None,
         })
         .expect("insert cleanup fingerprint history");
     let contract_id = store

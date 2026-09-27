@@ -6,7 +6,7 @@ use arrow_array::{Array, StringArray};
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
-use lancedb::{Connection as LanceConnection, DistanceType, Error as LanceError, connect};
+use lancedb::{Connection as LanceConnection, DistanceType, Error as LanceError, Table, connect};
 
 use crate::{SqliteStore, StoreError};
 
@@ -33,6 +33,14 @@ fn build_in_predicate(ids: &[&str]) -> String {
 pub struct LanceVectorStore {
     workspace_root: PathBuf,
     vectors_dir: PathBuf,
+    /// Serializes the compare-and-set operations (`upsert_embedding_if_matches`,
+    /// `delete_embedding_if_matches`) within this process. A symbol's vectors live in
+    /// one table per provider/model/dimension, so the precondition is read across
+    /// tables and the write lands in one of them: without this, two writers that both
+    /// observed the same vector but target different tables could each pass the read
+    /// before either merge runs. Writers in other processes hold the per-symbol embed
+    /// lock, which serializes them with this process's writers as well.
+    cas_serial: tokio::sync::Mutex<()>,
 }
 
 impl LanceVectorStore {
@@ -47,6 +55,7 @@ impl LanceVectorStore {
         let store = Self {
             workspace_root,
             vectors_dir,
+            cas_serial: tokio::sync::Mutex::new(()),
         };
         store.migrate_from_sqlite_if_needed().await?;
         store.migrate_project_notes_from_sqlite_if_needed().await?;
@@ -63,6 +72,57 @@ impl LanceVectorStore {
 
     pub(super) fn sqlite_path(&self) -> PathBuf {
         self.workspace_root.join(".aether").join("meta.sqlite")
+    }
+
+    /// The metadata of `symbol_id`'s row in one vector table (`None` when the table is
+    /// missing, has no recognizable dimension or holds no row for the symbol). The
+    /// cross-table "latest" lookup resolves equal second-resolution timestamps
+    /// arbitrarily, so a check that concerns one table reads that table directly.
+    async fn meta_in_table(
+        &self,
+        connection: &LanceConnection,
+        table_name: &str,
+        symbol_id: &str,
+    ) -> Result<Option<VectorEmbeddingMetaRecord>, StoreError> {
+        let Some(table) = open_listed_table(connection, table_name).await? else {
+            return Ok(None);
+        };
+        let schema = table.schema().await.map_err(map_lancedb_err)?;
+        let Some(embedding_dim) = embedding_dim_from_schema(schema.as_ref()) else {
+            return Ok(None);
+        };
+        let predicate = format!("symbol_id = '{}'", escape_sql_string(symbol_id));
+        let batches = table
+            .query()
+            .select(Select::columns(&[
+                "symbol_id",
+                "sir_hash",
+                "provider",
+                "model",
+                "updated_at",
+            ]))
+            .only_if(predicate.as_str())
+            .limit(1)
+            .execute()
+            .await
+            .map_err(map_lancedb_err)?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(map_lancedb_err)?;
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            return Ok(Some(VectorEmbeddingMetaRecord {
+                symbol_id: string_at(&batch, "symbol_id", 0)?,
+                sir_hash: string_at(&batch, "sir_hash", 0)?,
+                provider: string_at(&batch, "provider", 0)?,
+                model: string_at(&batch, "model", 0)?,
+                embedding_dim: i64::from(embedding_dim),
+                updated_at: int64_at(&batch, "updated_at", 0)?,
+            }));
+        }
+        Ok(None)
     }
 
     pub(super) async fn connect(&self) -> Result<LanceConnection, StoreError> {
@@ -97,7 +157,7 @@ impl LanceVectorStore {
             .into_iter()
             .filter(|name| name.starts_with(VECTOR_TABLE_PREFIX))
         {
-            let Ok(table) = connection.open_table(&name).execute().await else {
+            let Some(table) = open_listed_table(&connection, &name).await? else {
                 continue;
             };
             let batches = table
@@ -155,7 +215,7 @@ impl LanceVectorStore {
             .into_iter()
             .filter(|name| name.starts_with(VECTOR_TABLE_PREFIX))
         {
-            let Ok(table) = connection.open_table(&name).execute().await else {
+            let Some(table) = open_listed_table(&connection, &name).await? else {
                 continue;
             };
             for chunk in requested.chunks(PUSHDOWN_CHUNK_SIZE) {
@@ -191,6 +251,20 @@ impl LanceVectorStore {
         &self,
         connection: &LanceConnection,
         record: &VectorRecord,
+    ) -> Result<(), StoreError> {
+        self.upsert_embedding_with_connection_when(connection, record, MatchedArm::Always, true)
+            .await
+    }
+
+    /// `merge_insert` whose update arm is `matched` (never, always, or only while a
+    /// LanceDB predicate over `target.` columns holds) and whose insert arm is enabled
+    /// by `insert_when_missing`; the guard and the write are one operation.
+    async fn upsert_embedding_with_connection_when(
+        &self,
+        connection: &LanceConnection,
+        record: &VectorRecord,
+        matched: MatchedArm<'_>,
+        insert_when_missing: bool,
     ) -> Result<(), StoreError> {
         let embedding_dim = record.embedding.len() as i32;
         if embedding_dim <= 0 {
@@ -234,9 +308,18 @@ impl LanceVectorStore {
         let (schema, batch) = single_record_batch(record)?;
         let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
         let mut merge = table.merge_insert(&["symbol_id"]);
-        merge
-            .when_matched_update_all(None)
-            .when_not_matched_insert_all();
+        match matched {
+            MatchedArm::Skip => {}
+            MatchedArm::Always => {
+                merge.when_matched_update_all(None);
+            }
+            MatchedArm::OnlyWhen(condition) => {
+                merge.when_matched_update_all(Some(condition.to_owned()));
+            }
+        }
+        if insert_when_missing {
+            merge.when_not_matched_insert_all();
+        }
         merge
             .execute(Box::new(reader))
             .await
@@ -423,7 +506,6 @@ impl VectorStore for LanceVectorStore {
     ) -> Result<Option<VectorEmbeddingMetaRecord>, StoreError> {
         self.migrate_from_sqlite_if_needed().await?;
         let connection = self.connect().await?;
-        let predicate = format!("symbol_id = '{}'", escape_sql_string(symbol_id));
 
         let mut latest = None::<VectorEmbeddingMetaRecord>;
         for name in connection
@@ -434,49 +516,12 @@ impl VectorStore for LanceVectorStore {
             .into_iter()
             .filter(|name| name.starts_with(VECTOR_TABLE_PREFIX))
         {
-            let Ok(table) = connection.open_table(&name).execute().await else {
+            let Some(record) = self.meta_in_table(&connection, &name, symbol_id).await? else {
                 continue;
             };
-            let schema = table.schema().await.map_err(map_lancedb_err)?;
-            let Some(embedding_dim) = embedding_dim_from_schema(schema.as_ref()) else {
-                continue;
-            };
-
-            let batches = table
-                .query()
-                .select(Select::columns(&[
-                    "symbol_id",
-                    "sir_hash",
-                    "provider",
-                    "model",
-                    "updated_at",
-                ]))
-                .only_if(predicate.as_str())
-                .limit(1)
-                .execute()
-                .await
-                .map_err(map_lancedb_err)?
-                .try_collect::<Vec<_>>()
-                .await
-                .map_err(map_lancedb_err)?;
-
-            for batch in batches {
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                let record = VectorEmbeddingMetaRecord {
-                    symbol_id: string_at(&batch, "symbol_id", 0)?,
-                    sir_hash: string_at(&batch, "sir_hash", 0)?,
-                    provider: string_at(&batch, "provider", 0)?,
-                    model: string_at(&batch, "model", 0)?,
-                    embedding_dim: i64::from(embedding_dim),
-                    updated_at: int64_at(&batch, "updated_at", 0)?,
-                };
-
-                match latest.as_ref() {
-                    Some(existing) if existing.updated_at >= record.updated_at => {}
-                    _ => latest = Some(record),
-                }
+            match latest.as_ref() {
+                Some(existing) if existing.updated_at >= record.updated_at => {}
+                _ => latest = Some(record),
             }
         }
 
@@ -510,7 +555,7 @@ impl VectorStore for LanceVectorStore {
             .into_iter()
             .filter(|name| name.starts_with(VECTOR_TABLE_PREFIX))
         {
-            let Ok(table) = connection.open_table(&name).execute().await else {
+            let Some(table) = open_listed_table(&connection, &name).await? else {
                 continue;
             };
             let schema = table.schema().await.map_err(map_lancedb_err)?;
@@ -575,7 +620,148 @@ impl VectorStore for LanceVectorStore {
             .into_iter()
             .filter(|name| name.starts_with(VECTOR_TABLE_PREFIX))
         {
-            let Ok(table) = connection.open_table(&name).execute().await else {
+            let Some(table) = open_listed_table(&connection, &name).await? else {
+                continue;
+            };
+            table
+                .delete(predicate.as_str())
+                .await
+                .map_err(map_lancedb_err)?;
+        }
+
+        Ok(())
+    }
+
+    async fn upsert_embedding_if_matches(
+        &self,
+        record: VectorRecord,
+        expected: Option<&VectorEmbeddingMetaRecord>,
+    ) -> Result<bool, StoreError> {
+        self.migrate_from_sqlite_if_needed().await?;
+        if record.embedding.is_empty() {
+            return Ok(false);
+        }
+        let _serial = self.cas_serial.lock().await;
+        // Vectors are keyed by symbol inside one table per provider/model/dimension, so
+        // the precondition is checked across all tables first (the stored vector must be
+        // exactly the one observed: hash, provider, model, dimension and write time, or
+        // none at all), then enforced again inside the merge on the destination table:
+        // with an observed vector the update arm runs only while the row still is that
+        // vector, with none observed there is no update arm at all, and the insert arm
+        // always runs so a symbol whose vector moves to a new identity (an embed-only
+        // regeneration after changing the embedding model) still lands.
+        let current = self.get_embedding_meta(record.symbol_id.as_str()).await?;
+        if current.as_ref() != expected {
+            return Ok(false);
+        }
+        let connection = self.connect().await?;
+        let destination = table_name_for(
+            record.provider.as_str(),
+            record.model.as_str(),
+            record.embedding.len() as i32,
+        );
+        let guard = expected.map(|observed| {
+            format!(
+                "target.sir_hash = '{}' AND target.provider = '{}' AND target.model = '{}' AND target.updated_at = {}",
+                escape_sql_string(observed.sir_hash.as_str()),
+                escape_sql_string(observed.provider.as_str()),
+                escape_sql_string(observed.model.as_str()),
+                observed.updated_at
+            )
+        });
+        let matched = match expected {
+            Some(observed)
+                if table_name_for(
+                    observed.provider.as_str(),
+                    observed.model.as_str(),
+                    observed.embedding_dim as i32,
+                ) == destination =>
+            {
+                MatchedArm::OnlyWhen(guard.as_deref().unwrap_or_default())
+            }
+            // The observed vector lives in another table: the symbol is returning to an
+            // identity it used before (embedding configuration A → B → A). The cross-table
+            // check above already holds, and any row the destination table still holds
+            // for the symbol is a leftover from before that identity was left, never the
+            // observed vector, so it is replaced outright rather than guarded by the
+            // observed vector's identity, which no row in this table can carry.
+            Some(_) => MatchedArm::Always,
+            None => MatchedArm::Skip,
+        };
+        // A vector moving to another identity leaves the observed row behind in the
+        // previous table, and the cross-table "latest" lookups break equal
+        // second-resolution timestamps arbitrarily, so such a leftover written in the
+        // same second could keep reading as the symbol's current vector and make every
+        // embeddings-only pass regenerate a vector it already has. Exactly that row
+        // (symbol, observed hash and write time) is removed first, before the
+        // destination write: a process that exits between the two leaves the symbol
+        // with no vector, which the next pass simply regenerates, never with two rows
+        // of different identities for later reads to pick between. Removing the row
+        // last would leave exactly that pair behind on a crash, with nothing to clean it up.
+        if let Some(observed) = expected {
+            let source = table_name_for(
+                observed.provider.as_str(),
+                observed.model.as_str(),
+                observed.embedding_dim as i32,
+            );
+            if source != destination
+                && let Some(table) = open_listed_table(&connection, &source).await?
+            {
+                table
+                    .delete(
+                        format!(
+                            "symbol_id = '{}' AND sir_hash = '{}' AND updated_at = {}",
+                            escape_sql_string(record.symbol_id.as_str()),
+                            escape_sql_string(observed.sir_hash.as_str()),
+                            observed.updated_at
+                        )
+                        .as_str(),
+                    )
+                    .await
+                    .map_err(map_lancedb_err)?;
+            }
+        }
+        self.upsert_embedding_with_connection_when(&connection, &record, matched, true)
+            .await?;
+        // Verify the destination row itself: the cross-table "latest" lookup breaks
+        // equal second-resolution timestamps arbitrarily, so a row left in another
+        // table by the previous identity, written in the same second, could otherwise
+        // be reported instead of the row this call just wrote.
+        let stored = self
+            .meta_in_table(&connection, &destination, record.symbol_id.as_str())
+            .await?;
+        Ok(stored.is_some_and(|meta| {
+            meta.sir_hash == record.sir_hash
+                && meta.provider == record.provider
+                && meta.model == record.model
+                && meta.updated_at == record.updated_at
+        }))
+    }
+
+    async fn delete_embedding_if_matches(
+        &self,
+        symbol_id: &str,
+        sir_hash: &str,
+        updated_at: i64,
+    ) -> Result<(), StoreError> {
+        self.migrate_from_sqlite_if_needed().await?;
+        let _serial = self.cas_serial.lock().await;
+        let connection = self.connect().await?;
+        let predicate = format!(
+            "symbol_id = '{}' AND sir_hash = '{}' AND updated_at = {updated_at}",
+            escape_sql_string(symbol_id),
+            escape_sql_string(sir_hash)
+        );
+
+        for name in connection
+            .table_names()
+            .execute()
+            .await
+            .map_err(map_lancedb_err)?
+            .into_iter()
+            .filter(|name| name.starts_with(VECTOR_TABLE_PREFIX))
+        {
+            let Some(table) = open_listed_table(&connection, &name).await? else {
                 continue;
             };
             table
@@ -609,7 +795,7 @@ impl VectorStore for LanceVectorStore {
             .into_iter()
             .filter(|name| name.starts_with(VECTOR_TABLE_PREFIX))
         {
-            let Ok(table) = connection.open_table(&name).execute().await else {
+            let Some(table) = open_listed_table(&connection, &name).await? else {
                 continue;
             };
             for chunk in requested.chunks(PUSHDOWN_CHUNK_SIZE) {
@@ -740,7 +926,7 @@ impl VectorStore for LanceVectorStore {
             .into_iter()
             .filter(|name| name.starts_with(VECTOR_TABLE_PREFIX) && name.ends_with(&suffix))
         {
-            let Ok(table) = connection.open_table(&table_name).execute().await else {
+            let Some(table) = open_listed_table(&connection, &table_name).await? else {
                 continue;
             };
 
@@ -820,7 +1006,7 @@ impl VectorStore for LanceVectorStore {
             .into_iter()
             .filter(|name| name.starts_with(PROJECT_NOTES_VECTOR_TABLE_PREFIX))
         {
-            let Ok(table) = connection.open_table(&name).execute().await else {
+            let Some(table) = open_listed_table(&connection, &name).await? else {
                 continue;
             };
             table
@@ -915,6 +1101,25 @@ pub(super) fn map_lancedb_err(err: LanceError) -> StoreError {
     StoreError::LanceDb(err.to_string())
 }
 
+/// Open a table the connection listed (or a table name derived from an identity).
+/// `Ok(None)` only when the table does not exist (listed a moment ago and dropped since,
+/// or never created for that identity); any other failure to open it, an I/O error or a
+/// corrupt table, is an error naming the table. Reading such a failure as "no table"
+/// would let a delete report success while the rows it was to remove stand, or a lookup
+/// report a vector absent that is merely unreadable right now.
+async fn open_listed_table(
+    connection: &LanceConnection,
+    name: &str,
+) -> Result<Option<Table>, StoreError> {
+    match connection.open_table(name).execute().await {
+        Ok(table) => Ok(Some(table)),
+        Err(LanceError::TableNotFound { .. }) => Ok(None),
+        Err(err) => Err(StoreError::LanceDb(format!(
+            "failed to open vector table {name}: {err}"
+        ))),
+    }
+}
+
 fn is_table_already_exists_error(err: &LanceError) -> bool {
     err.to_string()
         .to_ascii_lowercase()
@@ -961,6 +1166,17 @@ pub(crate) fn sanitize_for_table_name(value: &str) -> String {
         .chars()
         .take(48)
         .collect::<String>()
+}
+
+/// The update arm of a `merge_insert` on the vector tables.
+#[derive(Debug, Clone, Copy)]
+enum MatchedArm<'a> {
+    /// Never update a matching row.
+    Skip,
+    /// Always update a matching row.
+    Always,
+    /// Update a matching row only while this LanceDB predicate over `target.` holds.
+    OnlyWhen(&'a str),
 }
 
 fn escape_sql_string(value: &str) -> String {

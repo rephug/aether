@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,23 +8,24 @@ use aether_analysis::{
     prepare_refactor_prep, verify_intent_snapshot,
 };
 use aether_config::InferenceProviderKind;
-use aether_core::{Position, SourceRange, normalize_path};
+use aether_core::normalize_path;
 use aether_infer::{
-    EmbeddingProvider, EmbeddingProviderOverrides, EmbeddingPurpose, InferenceProvider,
-    ProviderOverrides, SirContext, load_embedding_provider_from_config,
-    load_provider_from_env_or_mock, sir_prompt,
+    InferenceProvider, ProviderOverrides, SirContext, load_provider_from_env_or_mock, sir_prompt,
 };
 use aether_sir::{canonicalize_sir_json, sir_hash, validate_sir};
-use aether_store::{
-    SirHistoryStore, SirMetaRecord, SirStateStore, SnapshotStore, SymbolEmbeddingRecord,
-};
+use aether_store::{SirIdentity, SirMetaRecord, SirStateStore, SnapshotStore};
 use anyhow::{Result as AnyResult, anyhow};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 use tokio::time::{sleep, timeout};
 
-use super::{AetherMcpServer, MCP_SCHEMA_VERSION, current_unix_timestamp};
+use aetherd::sir_pipeline::{
+    EmbeddingRefresh, SirPipeline, acquire_embed_write_lock, acquire_inject_write_lock,
+    current_sir_identity, current_source_hash,
+};
+
+use super::{AetherMcpServer, LiveSymbolSources, MCP_SCHEMA_VERSION, current_unix_timestamp};
 use crate::AetherMcpError;
 
 const INFERENCE_MAX_RETRIES: usize = 2;
@@ -66,6 +66,15 @@ pub struct AetherRefactorPrepResponse {
     pub deep_completed: u32,
     pub deep_failed: u32,
     pub deep_failed_symbol_ids: Vec<String>,
+    /// Deep scans whose symbol was written by someone else (an `aether_sir_inject`
+    /// call, say) while the SIR was being generated; that newer SIR was kept.
+    #[serde(default)]
+    pub deep_superseded: u32,
+    /// Deep SIRs that were persisted but whose embedding refresh failed afterwards; the
+    /// SIR stands and counts as completed, the vector is refreshed by the next
+    /// `aetherd --index-once --embeddings-only` pass (see `notes`).
+    #[serde(default)]
+    pub deep_embedding_failed: u32,
     pub forced_cycle_members: u32,
     pub skipped_fresh: u32,
     pub notes: Vec<String>,
@@ -120,6 +129,22 @@ struct McpDeepScanOutcome {
     requested: usize,
     succeeded_ids: HashSet<String>,
     failed_symbol_ids: Vec<String>,
+    superseded_symbol_ids: Vec<String>,
+    /// Persisted deep SIRs whose embedding refresh failed, with the error.
+    embedding_failures: Vec<(String, String)>,
+}
+
+/// What became of one deep-scan candidate's generated SIR.
+enum DeepSirPersist {
+    /// The leaf committed. `embedding_error` is set when the embedding refresh that
+    /// follows the commit failed: the SIR stands (it is fresh and current), only its
+    /// vector is stale until the next embeddings pass, so this is not a failed scan.
+    Persisted { embedding_error: Option<String> },
+    /// The stored SIR changed while this one was being generated (nothing was written),
+    /// or replaced this one's leaf while its embedding was being generated (the leaf
+    /// committed but stands no more): either way the symbol was not deep-scanned by this
+    /// call and its current SIR is another writer's.
+    Superseded,
 }
 
 impl AetherMcpServer {
@@ -156,10 +181,23 @@ impl AetherMcpServer {
         self.state.store.create_snapshot(&snapshot)?;
 
         let mut notes = prep.notes;
+        if !deep_outcome.superseded_symbol_ids.is_empty() {
+            notes.push(format!(
+                "{} deep scans were superseded by SIRs written concurrently and left as written.",
+                deep_outcome.superseded_symbol_ids.len()
+            ));
+        }
         if !deep_outcome.failed_symbol_ids.is_empty() {
             notes.push(format!(
                 "{} deep scans did not complete successfully.",
                 deep_outcome.failed_symbol_ids.len()
+            ));
+        }
+        if !deep_outcome.embedding_failures.is_empty() {
+            let (first_id, first_error) = &deep_outcome.embedding_failures[0];
+            notes.push(format!(
+                "{} deep SIRs were persisted but their embedding refresh failed (e.g. {first_id}: {first_error}); run 'aetherd --index-once --embeddings-only' to refresh their vectors.",
+                deep_outcome.embedding_failures.len()
             ));
         }
         notes.push(
@@ -201,6 +239,8 @@ impl AetherMcpServer {
             deep_completed: deep_outcome.succeeded_ids.len() as u32,
             deep_failed: deep_outcome.failed_symbol_ids.len() as u32,
             deep_failed_symbol_ids: deep_outcome.failed_symbol_ids,
+            deep_superseded: deep_outcome.superseded_symbol_ids.len() as u32,
+            deep_embedding_failed: deep_outcome.embedding_failures.len() as u32,
             forced_cycle_members: prep.forced_cycle_members as u32,
             skipped_fresh: prep.skipped_fresh as u32,
             notes,
@@ -311,21 +351,9 @@ impl AetherMcpServer {
                 AetherMcpError::Message(format!("failed to build tokio runtime: {err}"))
             })?;
 
-        let embedding_loaded = if self.state.vector_store.is_some() {
-            load_embedding_provider_from_config(
-                self.workspace(),
-                EmbeddingProviderOverrides::default(),
-            )?
-        } else {
-            None
-        };
-        let embedding_provider = embedding_loaded.map(|loaded| {
-            (
-                Arc::<dyn EmbeddingProvider>::from(loaded.provider),
-                loaded.provider_name,
-                loaded.model_name,
-            )
-        });
+        // The server's one embedding pipeline serves every candidate: the provider (and
+        // a local provider's model) is loaded once per process, not once per symbol.
+        let embedding_pipeline = self.state.embedding_pipeline()?;
 
         let commit_hash = aether_core::GitContext::open(self.workspace())
             .and_then(|context| context.head_commit_hash());
@@ -340,19 +368,30 @@ impl AetherMcpServer {
                 provider.clone(),
                 provider_name.as_str(),
                 model_name.as_str(),
-                embedding_provider.as_ref(),
+                embedding_pipeline.as_deref(),
                 commit_hash.as_deref(),
                 candidate,
                 use_cot,
                 timeout_secs,
             ) {
-                Ok(()) => {
+                Ok(DeepSirPersist::Persisted { embedding_error }) => {
                     outcome.succeeded_ids.insert(candidate.symbol.id.clone());
+                    if let Some(error) = embedding_error {
+                        outcome
+                            .embedding_failures
+                            .push((candidate.symbol.id.clone(), error));
+                    }
+                }
+                Ok(DeepSirPersist::Superseded) => {
+                    outcome
+                        .superseded_symbol_ids
+                        .push(candidate.symbol.id.clone());
                 }
                 Err(err) => {
                     outcome.failed_symbol_ids.push(candidate.symbol.id.clone());
                     self.record_failed_deep_attempt(
                         candidate.symbol.id.as_str(),
+                        candidate.baseline_sir_identity.as_ref(),
                         provider_name.as_str(),
                         model_name.as_str(),
                         err.to_string().as_str(),
@@ -371,13 +410,22 @@ impl AetherMcpServer {
         provider: Arc<dyn InferenceProvider>,
         provider_name: &str,
         model_name: &str,
-        embedding_provider: Option<&(Arc<dyn EmbeddingProvider>, String, String)>,
+        embedding_pipeline: Option<&SirPipeline>,
         commit_hash: Option<&str>,
         candidate: &PreparedRefactorCandidate,
         use_cot: bool,
         timeout_secs: u64,
-    ) -> Result<(), AetherMcpError> {
-        let symbol_text = extract_symbol_text(self.workspace(), &candidate.symbol)?;
+    ) -> Result<DeepSirPersist, AetherMcpError> {
+        // The SIR write this generation starts from (hash and history version), read
+        // from the same row as the SIR the candidate's enrichment was built from. The
+        // model call runs unlocked, so the result is persisted only while the store
+        // still holds exactly this write; a SIR another writer stored meanwhile (even
+        // one landing between the enrichment build and this call) wins.
+        let prior_sir = candidate.baseline_sir_identity.clone();
+        // Prompt text and source hash come from one read of the file, so the hash is of
+        // exactly the body the prompt describes; the persist below compares it with the
+        // source as it is then and drops the result if the symbol was edited meanwhile.
+        let (symbol_text, source_hash) = extract_symbol_text(self.workspace(), &candidate.symbol)?;
         let context = build_sir_context(
             &candidate.symbol,
             candidate.refactor_risk,
@@ -410,55 +458,139 @@ impl AetherMcpServer {
         let canonical_json = canonicalize_sir_json(&generated.sir);
         let sir_hash_value = sir_hash(&generated.sir);
         let attempted_at = current_unix_timestamp();
-        let version = self.state.store.record_sir_version_if_changed(
+        // The deep SIR is a leaf write like any other: history, JSON and metadata land in
+        // one transaction under the workspace inject lock every SIR writer shares, so it
+        // cannot interleave with an `aether_sir_inject` call or a daemon rollup persist,
+        // and it lands only while the store still holds the SIR generation started from.
+        // The identity the leaf write produced, read under the same lock: the embedding
+        // refresh below compares the store against exactly this write, so a leaf
+        // replaced and then restored with the same content (`H1 → H2 → H1`) is not
+        // taken for this one.
+        let committed = {
+            let _inject_guard = acquire_inject_write_lock(&self.state.workspace)
+                .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
+            let current_sir = current_sir_identity(self.state.store.as_ref(), &candidate.symbol.id)
+                .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
+            if current_sir != prior_sir {
+                tracing::info!(
+                    symbol_id = %candidate.symbol.id,
+                    "skipping deep SIR: the stored SIR changed while it was being generated"
+                );
+                return Ok(DeepSirPersist::Superseded);
+            }
+            // An edit while the model ran leaves the stored SIR as it was until the
+            // daemon's job for that edit lands; a result generated from the old body
+            // must not land first and pre-empt it.
+            if current_source_hash(self.workspace(), &candidate.symbol)
+                .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?
+                .as_deref()
+                != Some(source_hash.as_str())
+            {
+                tracing::info!(
+                    symbol_id = %candidate.symbol.id,
+                    "skipping deep SIR: the symbol source changed while it was being generated"
+                );
+                return Ok(DeepSirPersist::Superseded);
+            }
+            self.state.store.persist_sir_state_atomically_with_source(
+                SirMetaRecord {
+                    id: candidate.symbol.id.clone(),
+                    sir_hash: sir_hash_value.clone(),
+                    sir_version: 1,
+                    provider: provider_name.to_owned(),
+                    model: model_name.to_owned(),
+                    generation_pass: "deep".to_owned(),
+                    reasoning_trace: generated.reasoning_trace.clone(),
+                    prompt_hash: None,
+                    staleness_score: None,
+                    updated_at: attempted_at,
+                    sir_status: "fresh".to_owned(),
+                    last_error: None,
+                    last_attempt_at: attempted_at,
+                },
+                canonical_json.as_str(),
+                commit_hash,
+                None,
+                Some(source_hash.as_str()),
+            )?;
+            current_sir_identity(self.state.store.as_ref(), &candidate.symbol.id)
+                .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?
+                .ok_or_else(|| {
+                    AetherMcpError::Message(format!(
+                        "missing persisted SIR identity for {}",
+                        candidate.symbol.id
+                    ))
+                })?
+        };
+        // The leaf is committed: a provider or vector-store failure here must not
+        // report the candidate as failed (the failure handler would then find a SIR
+        // whose identity no longer matches the baseline and leave it as is, and later
+        // runs would skip the fresh deep SIR with its stale vector for good). The SIR
+        // stands; the embedding is reported for the caller to refresh.
+        let embedding_error = match self.refresh_embedding_if_needed(
+            embedding_pipeline,
             candidate.symbol.id.as_str(),
-            sir_hash_value.as_str(),
-            provider_name,
-            model_name,
+            &committed,
             canonical_json.as_str(),
-            attempted_at,
-            commit_hash,
-        )?;
+        ) {
+            // The leaf was replaced by another writer while its vector was being
+            // generated: that writer's SIR stands and is not this call's deep scan, so
+            // the candidate is neither reported as completed nor snapshotted as deep-scanned.
+            Ok(Some(EmbeddingRefresh::Superseded)) => {
+                tracing::info!(
+                    symbol_id = %candidate.symbol.id,
+                    "deep SIR committed but was replaced before its embedding was stored"
+                );
+                return Ok(DeepSirPersist::Superseded);
+            }
+            Ok(_) => None,
+            Err(err) => {
+                tracing::warn!(
+                    symbol_id = %candidate.symbol.id,
+                    error = %err,
+                    "deep SIR persisted but its embedding refresh failed"
+                );
+                Some(err.to_string())
+            }
+        };
 
-        if version.changed {
-            self.state
-                .store
-                .write_sir_blob(candidate.symbol.id.as_str(), canonical_json.as_str())?;
-        }
-        self.state.store.upsert_sir_meta(SirMetaRecord {
-            id: candidate.symbol.id.clone(),
-            sir_hash: sir_hash_value.clone(),
-            sir_version: version.version,
-            provider: provider_name.to_owned(),
-            model: model_name.to_owned(),
-            generation_pass: "deep".to_owned(),
-            reasoning_trace: generated.reasoning_trace.clone(),
-            prompt_hash: None,
-            staleness_score: None,
-            updated_at: version.updated_at,
-            sir_status: "fresh".to_owned(),
-            last_error: None,
-            last_attempt_at: attempted_at,
-        })?;
-        self.refresh_embedding_if_needed(
-            runtime,
-            embedding_provider,
-            candidate.symbol.id.as_str(),
-            sir_hash_value.as_str(),
-            canonical_json.as_str(),
-        )?;
-
-        Ok(())
+        Ok(DeepSirPersist::Persisted { embedding_error })
     }
 
+    /// Mark the SIR the failed attempt started from as stale with the error, but only
+    /// that SIR: a symbol whose SIR was replaced while the attempt ran (an injection
+    /// landing meanwhile) keeps the newer SIR's status and provenance untouched.
     fn record_failed_deep_attempt(
         &self,
         symbol_id: &str,
+        attempted_against: Option<&SirIdentity>,
         provider_name: &str,
         model_name: &str,
         error_message: &str,
     ) -> Result<(), AetherMcpError> {
+        // A read-modify-write of the metadata row: under the inject lock so it carries
+        // the row's current hash and version, not a snapshot another writer replaced.
+        let _inject_guard = acquire_inject_write_lock(&self.state.workspace)
+            .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
+        // A symbol removed meanwhile (row and SIR deleted under this lock) has nothing
+        // to mark: for a candidate that started without a SIR, "no SIR" before and after
+        // would otherwise read as unchanged and the marker would recreate an orphan
+        // `sir` row for an id the index no longer holds.
+        if self.state.store.get_symbol_record(symbol_id)?.is_none() {
+            tracing::info!(
+                symbol_id = %symbol_id,
+                "not marking the SIR stale: the symbol was removed while the deep scan attempt ran"
+            );
+            return Ok(());
+        }
         let current = self.state.store.get_sir_meta(symbol_id)?;
+        if self.state.store.get_sir_identity(symbol_id)?.as_ref() != attempted_against {
+            tracing::info!(
+                symbol_id = %symbol_id,
+                "not marking the SIR stale: it was replaced while the deep scan attempt ran"
+            );
+            return Ok(());
+        }
         let updated_at = current_unix_timestamp();
         self.state.store.upsert_sir_meta(SirMetaRecord {
             id: symbol_id.to_owned(),
@@ -486,47 +618,43 @@ impl AetherMcpServer {
         Ok(())
     }
 
+    /// Embed the deep SIR through the pipeline's guarded refresh, under the symbol's
+    /// embedding lock that every vector writer shares: the SIR's currency is re-read
+    /// before the provider call, before the vector is stored and after it is stored (and
+    /// once when a vector for this hash already exists), the write is conditional on the
+    /// vector observed beforehand, and a vector for a SIR that was replaced meanwhile is
+    /// never left behind. Currency is the full identity of the write this call made
+    /// (`committed`: hash, history version and write generation), not the hash alone,
+    /// so a leaf replaced and then restored with the same content while the provider ran
+    /// counts as superseded rather than as this deep scan. The same path as
+    /// `aether_sir_inject`, through the same shared pipeline (`None` when embeddings are
+    /// not configured: nothing to refresh).
     fn refresh_embedding_if_needed(
         &self,
-        runtime: &Runtime,
-        embedding_provider: Option<&(Arc<dyn EmbeddingProvider>, String, String)>,
+        embedding_pipeline: Option<&SirPipeline>,
         symbol_id: &str,
-        sir_hash_value: &str,
+        committed: &SirIdentity,
         canonical_json: &str,
-    ) -> Result<(), AetherMcpError> {
-        let Some(vector_store) = self.state.vector_store.as_ref() else {
-            return Ok(());
+    ) -> Result<Option<EmbeddingRefresh>, AetherMcpError> {
+        let Some(pipeline) = embedding_pipeline else {
+            return Ok(None);
         };
-        let Some((provider, provider_name, model_name)) = embedding_provider else {
-            return Ok(());
+        let _embed_guard = acquire_embed_write_lock(&self.state.workspace, symbol_id)
+            .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
+        let store = self.state.store.as_ref();
+        let mut still_current = || -> anyhow::Result<bool> {
+            Ok(current_sir_identity(store, symbol_id)?.as_ref() == Some(committed))
         };
-        let existing = runtime.block_on(vector_store.get_embedding_meta(symbol_id))?;
-        if existing.as_ref().is_some_and(|meta| {
-            meta.sir_hash == sir_hash_value
-                && meta.provider == *provider_name
-                && meta.model == *model_name
-        }) {
-            return Ok(());
-        }
-
-        let embedding = runtime.block_on(async {
-            provider
-                .embed_text_with_purpose(canonical_json, EmbeddingPurpose::Document)
-                .await
-        })?;
-        if embedding.is_empty() {
-            return Ok(());
-        }
-
-        runtime.block_on(vector_store.upsert_embedding(SymbolEmbeddingRecord {
-            symbol_id: symbol_id.to_owned(),
-            sir_hash: sir_hash_value.to_owned(),
-            provider: provider_name.clone(),
-            model: model_name.clone(),
-            embedding,
-            updated_at: current_unix_timestamp(),
-        }))?;
-        Ok(())
+        pipeline
+            .refresh_embedding_if_current(
+                symbol_id,
+                committed.sir_hash.as_str(),
+                canonical_json,
+                None,
+                &mut still_current,
+            )
+            .map(Some)
+            .map_err(|err| AetherMcpError::Message(format!("{err:#}")))
     }
 }
 
@@ -604,18 +732,38 @@ fn infer_symbol_text_is_public(symbol_text: &str) -> bool {
         || trimmed.starts_with("export default ")
 }
 
+/// The symbol's text for the prompt (truncated to the prompt budget) together with the
+/// content hash of the full text, both from one read and parse of the file in which the
+/// symbol is found by id (never by the range the candidate snapshot recorded, which an
+/// edit elsewhere in the file may have moved), so the hash is of the body the prompt
+/// describes and equals what `current_source_hash` computes for an unchanged file.
 fn extract_symbol_text(
     workspace: &Path,
     symbol: &aether_core::Symbol,
-) -> Result<String, AetherMcpError> {
-    let full_path = workspace.join(&symbol.file_path);
-    let source = fs::read_to_string(&full_path)?;
-    let mut symbol_text = extract_symbol_source_text(&source, symbol.range).ok_or_else(|| {
-        AetherMcpError::Message(format!(
+) -> Result<(String, String), AetherMcpError> {
+    let mut live = LiveSymbolSources::new(workspace);
+    let Some(current) = live.source_for(symbol.file_path.as_str(), symbol.id.as_str())? else {
+        return Err(AetherMcpError::Message(format!(
+            "{} no longer declares {} as indexed; re-index before a deep scan",
+            symbol.file_path, symbol.qualified_name
+        )));
+    };
+    let mut symbol_text = current.source_text.clone();
+    let source_hash = current.source_hash.clone();
+    if symbol_text.trim().is_empty() {
+        return Err(AetherMcpError::Message(format!(
             "failed to extract symbol source for {} ({})",
             symbol.qualified_name, symbol.file_path
-        ))
-    })?;
+        )));
+    }
+    // The candidate was collected from the index; if the symbol's body no longer hashes
+    // to what was indexed, the file changed since and the daemon regenerates it first.
+    if source_hash != symbol.content_hash {
+        return Err(AetherMcpError::Message(format!(
+            "source for {} ({}) changed since it was indexed; re-index before a deep scan",
+            symbol.qualified_name, symbol.file_path
+        )));
+    }
     if symbol_text.len() > MAX_SYMBOL_TEXT_CHARS {
         let truncated = symbol_text
             .char_indices()
@@ -625,46 +773,7 @@ fn extract_symbol_text(
             .unwrap_or(0);
         symbol_text.truncate(truncated);
     }
-    Ok(symbol_text)
-}
-
-fn extract_symbol_source_text(source: &str, range: SourceRange) -> Option<String> {
-    let start = range
-        .start_byte
-        .or_else(|| byte_offset_for_position(source, range.start))?;
-    let end = range
-        .end_byte
-        .or_else(|| byte_offset_for_position(source, range.end))?;
-    if start > end || end > source.len() {
-        return None;
-    }
-    source.get(start..end).map(str::to_owned)
-}
-
-fn byte_offset_for_position(source: &str, position: Position) -> Option<usize> {
-    let mut line = 1usize;
-    let mut column = 1usize;
-    if position.line == 1 && position.column == 1 {
-        return Some(0);
-    }
-
-    for (index, ch) in source.char_indices() {
-        if line == position.line && column == position.column {
-            return Some(index);
-        }
-        if ch == '\n' {
-            line += 1;
-            column = 1;
-        } else {
-            column += ch.len_utf8();
-        }
-    }
-
-    if line == position.line && column == position.column {
-        Some(source.len())
-    } else {
-        None
-    }
+    Ok((symbol_text, source_hash))
 }
 
 async fn generate_sir_from_prompt_with_retries(

@@ -31,6 +31,15 @@ impl VectorStore for SqliteVectorStore {
         self.store.upsert_symbol_embedding(record)
     }
 
+    async fn upsert_embedding_if_matches(
+        &self,
+        record: VectorRecord,
+        expected: Option<&VectorEmbeddingMetaRecord>,
+    ) -> Result<bool, StoreError> {
+        self.store
+            .upsert_symbol_embedding_if_matches(record, expected)
+    }
+
     async fn upsert_embedding_batch(&self, records: Vec<VectorRecord>) -> Result<(), StoreError> {
         for record in records {
             self.store.upsert_symbol_embedding(record)?;
@@ -60,6 +69,16 @@ impl VectorStore for SqliteVectorStore {
 
     async fn delete_embedding(&self, symbol_id: &str) -> Result<(), StoreError> {
         self.store.delete_symbol_embedding(symbol_id)
+    }
+
+    async fn delete_embedding_if_matches(
+        &self,
+        symbol_id: &str,
+        sir_hash: &str,
+        updated_at: i64,
+    ) -> Result<(), StoreError> {
+        self.store
+            .delete_symbol_embedding_if_matches(symbol_id, sir_hash, updated_at)
     }
 
     async fn delete_embeddings(&self, symbol_ids: &[String]) -> Result<(), StoreError> {

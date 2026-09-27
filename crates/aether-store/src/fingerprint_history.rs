@@ -13,6 +13,10 @@ pub struct SirFingerprintHistoryRecord {
     pub generation_model: Option<String>,
     pub generation_pass: Option<String>,
     pub delta_sem: Option<f64>,
+    /// The `write_generation` of the leaf write this row records, when the writer knew
+    /// it: a per-write identity (unique per symbol) that lets a retry tell its own row
+    /// from an older row of the same prompt.
+    pub sir_write_generation: Option<i64>,
 }
 
 impl SqliteStore {
@@ -33,9 +37,10 @@ impl SqliteStore {
                 config_changed,
                 generation_model,
                 generation_pass,
-                delta_sem
+                delta_sem,
+                sir_write_generation
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             "#,
             params![
                 record.symbol_id,
@@ -53,6 +58,7 @@ impl SqliteStore {
                 record.generation_model,
                 record.generation_pass,
                 record.delta_sem,
+                record.sir_write_generation,
             ],
         )?;
         Ok(())
@@ -76,7 +82,8 @@ impl SqliteStore {
                 config_changed,
                 generation_model,
                 generation_pass,
-                delta_sem
+                delta_sem,
+                sir_write_generation
             FROM sir_fingerprint_history
             WHERE symbol_id = ?1
             ORDER BY timestamp ASC, id ASC
@@ -95,6 +102,7 @@ impl SqliteStore {
                 generation_model: row.get(8)?,
                 generation_pass: row.get(9)?,
                 delta_sem: row.get(10)?,
+                sir_write_generation: row.get(11)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -120,7 +128,8 @@ impl SqliteStore {
                 config_changed,
                 generation_model,
                 generation_pass,
-                delta_sem
+                delta_sem,
+                sir_write_generation
             FROM sir_fingerprint_history
             ORDER BY timestamp DESC, id DESC
             LIMIT ?1
@@ -139,6 +148,7 @@ impl SqliteStore {
                 generation_model: row.get(8)?,
                 generation_pass: row.get(9)?,
                 delta_sem: row.get(10)?,
+                sir_write_generation: row.get(11)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -155,7 +165,8 @@ impl SqliteStore {
             SELECT
                 symbol_id, timestamp, prompt_hash, prompt_hash_previous,
                 trigger, source_changed, neighbor_changed, config_changed,
-                generation_model, generation_pass, delta_sem
+                generation_model, generation_pass, delta_sem,
+                sir_write_generation
             FROM sir_fingerprint_history
             WHERE timestamp >= ?1
             ORDER BY timestamp ASC, id ASC
@@ -174,6 +185,7 @@ impl SqliteStore {
                 generation_model: row.get(8)?,
                 generation_pass: row.get(9)?,
                 delta_sem: row.get(10)?,
+                sir_write_generation: row.get(11)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -190,7 +202,8 @@ impl SqliteStore {
             SELECT
                 symbol_id, timestamp, prompt_hash, prompt_hash_previous,
                 trigger, source_changed, neighbor_changed, config_changed,
-                generation_model, generation_pass, delta_sem
+                generation_model, generation_pass, delta_sem,
+                sir_write_generation
             FROM sir_fingerprint_history
             WHERE timestamp = ?1
             ORDER BY id ASC
@@ -209,6 +222,7 @@ impl SqliteStore {
                 generation_model: row.get(8)?,
                 generation_pass: row.get(9)?,
                 delta_sem: row.get(10)?,
+                sir_write_generation: row.get(11)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -226,7 +240,8 @@ impl SqliteStore {
             SELECT
                 symbol_id, timestamp, prompt_hash, prompt_hash_previous,
                 trigger, source_changed, neighbor_changed, config_changed,
-                generation_model, generation_pass, delta_sem
+                generation_model, generation_pass, delta_sem,
+                sir_write_generation
             FROM sir_fingerprint_history
             WHERE timestamp >= ?1 AND timestamp <= ?2
             ORDER BY timestamp ASC, id ASC
@@ -245,6 +260,7 @@ impl SqliteStore {
                 generation_model: row.get(8)?,
                 generation_pass: row.get(9)?,
                 delta_sem: row.get(10)?,
+                sir_write_generation: row.get(11)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)

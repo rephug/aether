@@ -307,6 +307,7 @@ fn run_deep_scan_with_pipeline(
             priority_score: candidate.refactor_risk,
             enrichment: candidate.enrichment.clone(),
             use_cot,
+            baseline_sir_identity: candidate.baseline_sir_identity.clone(),
         })
         .collect::<Vec<_>>();
 

@@ -9,14 +9,103 @@ use aether_infer::sir_prompt::{
     sir_enriched_user_prompt, sir_scan_system_prompt, sir_scan_user_prompt,
 };
 use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
-use aether_store::{GraphDependencyEdgeRecord, SirStateStore, SqliteStore};
+use aether_store::{GraphDependencyEdgeRecord, SqliteStore};
 use anyhow::{Context, Result, anyhow};
 
 use crate::batch::hash::compute_prompt_hash;
 use crate::batch::{BatchProvider, BatchRuntimeConfig, PassConfig};
 use crate::cli::BatchPass;
 use crate::observer::ObserverState;
-use crate::sir_pipeline::build_job;
+use crate::sir_pipeline::{SirIdentity, build_job};
+
+/// The keymap sidecar of one build: each request's provider key mapped to its full key
+/// (see `BuildSummary::keymap`).
+pub(crate) fn keymap_sidecar_name(pass: &str, build_id: &str) -> String {
+    format!("{pass}.{build_id}.{KEYMAP_SIDECAR_KIND}.json")
+}
+
+/// The origin sidecar of one build: what each request was built from (see
+/// `BuildSummary::origins`).
+pub(crate) fn origin_sidecar_name(pass: &str, build_id: &str) -> String {
+    format!("{pass}.{build_id}.{ORIGIN_SIDECAR_KIND}.json")
+}
+
+/// The sidecar kinds ingest looks for beside a pass's results: every
+/// `<pass>.<build_id>.<kind>.json` in the directory (one per build, written once and
+/// never modified) plus the pre-build-id `<pass>.<kind>.json` for legacy results.
+pub(crate) const KEYMAP_SIDECAR_KIND: &str = "keymap";
+pub(crate) const ORIGIN_SIDECAR_KIND: &str = "origin";
+
+/// Remove one build's sidecars once every result of that build has been ingested, so
+/// a directory used for repeated builds does not accumulate them. A sidecar that is
+/// already gone is not an error.
+/// How many of a build's `written` requests no result accounted for: a result is
+/// accounted for once it was applied (`processed`), left unapplied as superseded, or
+/// skipped (an error line, an unparsable line, a persist failure). A provider whose
+/// completed batch carries fewer results than requests (failures delivered in another
+/// file, or dropped) must not have the build read as complete: its sidecars are kept so
+/// the missing requests can be rebuilt or re-ingested.
+pub(crate) fn unaccounted_requests(
+    written: usize,
+    processed: usize,
+    superseded: usize,
+    skipped: usize,
+) -> usize {
+    written.saturating_sub(processed + superseded + skipped)
+}
+
+pub(crate) fn remove_build_sidecars(batch_dir: &Path, pass: &str, build_id: &str) -> Result<()> {
+    for name in [
+        keymap_sidecar_name(pass, build_id),
+        origin_sidecar_name(pass, build_id),
+    ] {
+        let path = batch_dir.join(name);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to remove batch sidecar {}", path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A short identifier unique to one build of a pass, carried in its request keys.
+fn new_build_id(pass: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let material = format!("{pass}:{nanos}:{}", std::process::id());
+    aether_core::content_hash(material.as_str())
+        .chars()
+        .take(12)
+        .collect()
+}
+
+/// Write a build's sidecar: serialized to a temporary file beside `path` and renamed
+/// into place, so a reader never sees a partial file. Each build writes its own files
+/// (the build id is in the name), so nothing is read, merged or overwritten.
+fn write_sidecar<V: serde::Serialize>(
+    path: &Path,
+    entries: &HashMap<String, V>,
+    what: &str,
+) -> Result<()> {
+    let json =
+        serde_json::to_string(entries).with_context(|| format!("failed to serialize {what}"))?;
+    let temp_path = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    fs::write(&temp_path, json)
+        .with_context(|| format!("failed to write {what} {}", temp_path.display()))?;
+    fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "failed to publish {what} {} as {}",
+            temp_path.display(),
+            path.display()
+        )
+    })
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct BuildSummary {
@@ -26,7 +115,27 @@ pub(crate) struct BuildSummary {
     pub unresolved_symbols: usize,
     /// Maps symbol_id → full batch key (`symbol_id|prompt_hash`) for providers
     /// that truncate the key in their custom_id field (e.g. Anthropic's 64-char limit).
+    /// Keyed by the provider's request key for each full key (`BatchProvider::request_key`).
     pub keymap: HashMap<String, String>,
+    /// This build's identifier, carried in every request key (`symbol_id|prompt_hash|build_id`)
+    /// and so in every result, so a result is matched to the sidecar entries of the
+    /// build that produced it and never to a later build's for the same pass.
+    pub build_id: String,
+    /// What each request was built from, keyed by the full request key, so ingest can
+    /// tell a result whose symbol was written or edited meanwhile and leave the newer
+    /// state alone (see [`BatchRequestOrigin`]).
+    pub origins: HashMap<String, BatchRequestOrigin>,
+}
+
+/// What one batch request was built from: the SIR the symbol held (`None`: no SIR)
+/// and the content hash of the symbol source the prompt was built from. Ingest applies
+/// a result only while the symbol still holds exactly that SIR and that source; a
+/// symbol injected or edited meanwhile keeps its newer state (and, for an edit, the
+/// daemon's regeneration from the new source is not pre-empted by a stale result).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BatchRequestOrigin {
+    pub prior_sir: Option<SirIdentity>,
+    pub source_hash: String,
 }
 
 pub(crate) fn snapshot_workspace_symbols(workspace: &Path) -> Result<HashMap<String, Symbol>> {
@@ -107,6 +216,8 @@ pub(crate) fn build_pass_jsonl_for_ids(
         skipped: 0,
         unresolved_symbols: 0,
         keymap: HashMap::new(),
+        build_id: new_build_id(pass_config.pass.as_str()),
+        origins: HashMap::new(),
     };
     let symbol_ids = match candidate_ids {
         Some(ids) => ids.to_vec(),
@@ -154,16 +265,6 @@ pub(crate) fn build_pass_jsonl_for_ids(
         );
     }
 
-    let baseline_sirs = if matches!(pass_config.pass, BatchPass::Scan) {
-        HashMap::new()
-    } else {
-        parse_sir_map(
-            &store
-                .list_sir_blobs_for_ids(&candidate_ids)
-                .context("failed to prefetch baseline SIR blobs for batch build")?,
-        )
-    };
-
     let mut file_rollup_ids = HashSet::new();
     let mut neighbor_ids = HashSet::new();
     if !matches!(pass_config.pass, BatchPass::Scan) {
@@ -207,6 +308,17 @@ pub(crate) fn build_pass_jsonl_for_ids(
             }
         };
 
+        // The symbol's current SIR and its identity come from one row read before the
+        // prompt is built: the prompt (for triage and deep passes) describes this SIR,
+        // and ingest applies the result only while the symbol still holds exactly it.
+        let (existing_meta, existing_identity, baseline_blob) = match store
+            .get_sir_meta_with_blob(symbol_id.as_str())
+            .with_context(|| format!("failed to read SIR state for {symbol_id}"))?
+        {
+            Some(row) => (Some(row.meta), Some(row.identity), row.blob),
+            None => (None, None, None),
+        };
+
         // Build per-symbol user prompt and collect neighbor entries for hash.
         let (neighbor_entries, user_prompt) = match pass_config.pass {
             BatchPass::Scan => (
@@ -214,7 +326,16 @@ pub(crate) fn build_pass_jsonl_for_ids(
                 sir_scan_user_prompt(&job.symbol_text, &job.context),
             ),
             BatchPass::Triage | BatchPass::Deep => {
-                let Some(baseline_sir) = baseline_sirs.get(symbol_id.as_str()).cloned() else {
+                let baseline_sir = baseline_blob
+                    .as_deref()
+                    .and_then(|blob| match serde_json::from_str::<SirAnnotation>(blob) {
+                        Ok(sir) => Some(sir),
+                        Err(err) => {
+                            tracing::warn!(symbol_id = %symbol_id, error = %err, "skipping invalid SIR blob during batch build");
+                            None
+                        }
+                    });
+                let Some(baseline_sir) = baseline_sir else {
                     tracing::warn!(
                         symbol_id = %symbol_id,
                         pass = pass_config.pass.as_str(),
@@ -252,11 +373,10 @@ pub(crate) fn build_pass_jsonl_for_ids(
             &neighbor_texts,
             pass_config.config_fingerprint(provider_name).as_str(),
         );
-        let existing_hash = store
-            .get_sir_meta(symbol_id.as_str())
-            .with_context(|| format!("failed to read SIR metadata for {symbol_id}"))?
-            .and_then(|record| record.prompt_hash);
-        if existing_hash.as_deref() == Some(prompt_hash.as_str()) {
+        let existing_hash = existing_meta
+            .as_ref()
+            .and_then(|record| record.prompt_hash.as_deref());
+        if existing_hash == Some(prompt_hash.as_str()) {
             summary.skipped += 1;
             continue;
         }
@@ -264,9 +384,12 @@ pub(crate) fn build_pass_jsonl_for_ids(
         if writer.is_none() || current_lines >= runtime.jsonl_chunk_size {
             chunk_index += 1;
             current_lines = 0;
+            // Named per build: a second build of the same pass in this directory must
+            // not truncate a chunk an earlier run has yet to submit.
             let file_path = runtime.batch_dir.join(format!(
-                "{}-{:04}.jsonl",
+                "{}-{}-{:04}.jsonl",
                 pass_config.pass.as_str(),
+                summary.build_id,
                 chunk_index
             ));
             let file = File::create(&file_path).with_context(|| {
@@ -276,8 +399,22 @@ pub(crate) fn build_pass_jsonl_for_ids(
             summary.files.push(file_path);
         }
 
-        let key_str = format!("{}|{}", symbol_id, prompt_hash);
-        summary.keymap.insert(symbol_id.clone(), key_str.clone());
+        let key_str = format!("{}|{}|{}", symbol_id, prompt_hash, summary.build_id);
+        summary
+            .keymap
+            .insert(provider.request_key(&key_str), key_str.clone());
+        // The origin's source hash is of the text `build_job` actually read for the
+        // prompt, not of the snapshot the symbol came from: an edit between the two is
+        // then reflected in what ingest demands the file to hold, and a source that
+        // returns to the snapshot's contents cannot make a prompt of the intermediate
+        // body look current.
+        summary.origins.insert(
+            key_str.clone(),
+            BatchRequestOrigin {
+                prior_sir: existing_identity,
+                source_hash: job.source_hash.clone(),
+            },
+        );
         let line = provider.format_request(
             &key_str,
             &system_prompt,
@@ -302,16 +439,28 @@ pub(crate) fn build_pass_jsonl_for_ids(
             .context("failed to flush batch JSONL output")?;
     }
 
-    // Write keymap sidecar so ingest can recover full keys from providers that
-    // truncate custom_id (e.g. Anthropic's 64-char limit).
+    // Write the keymap sidecar so ingest can recover full keys from providers that
+    // truncate custom_id (e.g. Anthropic's 64-char limit), and the origin sidecar: the
+    // SIR identity (hash and history version) and symbol source hash each request was
+    // built from, which ingest compares under the inject lock right before persisting a
+    // result, skipping results for symbols written or edited in the meantime. Each
+    // build writes its own two files (named by build id, published atomically, never
+    // modified afterwards), so concurrent builds of one pass cannot lose each other's
+    // entries and a result of an earlier build always finds its own; the full run and
+    // the continuous monitor remove a build's files once its results are ingested.
     if !summary.keymap.is_empty() {
-        let keymap_path = runtime
-            .batch_dir
-            .join(format!("{}.keymap.json", pass_config.pass.as_str()));
-        let keymap_json =
-            serde_json::to_string(&summary.keymap).context("failed to serialize batch keymap")?;
-        fs::write(&keymap_path, keymap_json)
-            .with_context(|| format!("failed to write batch keymap {}", keymap_path.display()))?;
+        let keymap_path = runtime.batch_dir.join(keymap_sidecar_name(
+            pass_config.pass.as_str(),
+            summary.build_id.as_str(),
+        ));
+        write_sidecar(&keymap_path, &summary.keymap, "batch keymap")?;
+    }
+    if !summary.origins.is_empty() {
+        let origin_path = runtime.batch_dir.join(origin_sidecar_name(
+            pass_config.pass.as_str(),
+            summary.build_id.as_str(),
+        ));
+        write_sidecar(&origin_path, &summary.origins, "batch origin sidecar")?;
     }
 
     Ok(summary)
@@ -481,4 +630,97 @@ fn build_caller_contracts_map(
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use aether_store::SirIdentity;
+    use tempfile::tempdir;
+
+    use std::path::Path;
+
+    use super::{new_build_id, origin_sidecar_name, remove_build_sidecars, write_sidecar};
+
+    #[test]
+    fn build_ids_are_short_and_distinct() {
+        let first = new_build_id("triage");
+        let second = new_build_id("triage");
+        assert_eq!(first.len(), 12);
+        assert!(first.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_build_is_accounted_for_only_when_every_written_request_has_a_result() {
+        assert_eq!(super::unaccounted_requests(5, 3, 1, 1), 0);
+        assert_eq!(
+            super::unaccounted_requests(5, 3, 1, 0),
+            1,
+            "a failed request delivered nowhere"
+        );
+        assert_eq!(super::unaccounted_requests(5, 5, 0, 0), 0);
+        assert_eq!(super::unaccounted_requests(0, 0, 0, 0), 0);
+        assert_eq!(
+            super::unaccounted_requests(2, 2, 0, 1),
+            0,
+            "a legacy sidecar may add results beyond this build's requests"
+        );
+    }
+
+    #[test]
+    fn each_build_publishes_its_own_sidecar_and_can_remove_it() {
+        let temp = tempdir().expect("tempdir");
+        let dir = temp.path();
+        let first = HashMap::from([(
+            "sym|p|build-1".to_owned(),
+            Some(SirIdentity {
+                sir_hash: "h1".to_owned(),
+                sir_version: 1,
+                write_generation: 1,
+            }),
+        )]);
+        let second = HashMap::from([(
+            "sym|p|build-2".to_owned(),
+            Some(SirIdentity {
+                sir_hash: "h2".to_owned(),
+                sir_version: 2,
+                write_generation: 2,
+            }),
+        )]);
+        let first_path = dir.join(origin_sidecar_name("triage", "build-1"));
+        let second_path = dir.join(origin_sidecar_name("triage", "build-2"));
+        write_sidecar(&first_path, &first, "batch origin sidecar").expect("first build");
+        write_sidecar(&second_path, &second, "batch origin sidecar").expect("second build");
+
+        // Two builds of one pass leave two files, each holding only its own entries,
+        // and no temporary file behind.
+        let read = |path: &Path| -> HashMap<String, Option<SirIdentity>> {
+            serde_json::from_str(&std::fs::read_to_string(path).expect("read sidecar"))
+                .expect("parse sidecar")
+        };
+        assert_eq!(read(&first_path), first);
+        assert_eq!(read(&second_path), second);
+        let names = std::fs::read_dir(dir)
+            .expect("read dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .into_string()
+                    .expect("utf8")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            names.iter().all(|name| !name.contains(".tmp-")),
+            "temporary files must be renamed away: {names:?}"
+        );
+
+        // Removing one build's sidecars leaves the other's, and is idempotent.
+        remove_build_sidecars(dir, "triage", "build-1").expect("remove first");
+        assert!(!first_path.exists());
+        assert!(second_path.exists());
+        remove_build_sidecars(dir, "triage", "build-1").expect("remove again");
+    }
 }

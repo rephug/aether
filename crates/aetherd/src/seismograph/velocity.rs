@@ -112,6 +112,7 @@ mod tests {
             generation_model: None,
             generation_pass: None,
             delta_sem: Some(delta_sem),
+            sir_write_generation: None,
         }
     }
 

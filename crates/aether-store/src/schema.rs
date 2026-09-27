@@ -427,7 +427,8 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
             config_changed INTEGER NOT NULL DEFAULT 0,
             generation_model TEXT,
             generation_pass TEXT,
-            delta_sem REAL
+            delta_sem REAL,
+            sir_write_generation INTEGER
         );
 
         CREATE INDEX IF NOT EXISTS idx_fingerprint_symbol_time
@@ -676,6 +677,32 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         conn.execute("PRAGMA user_version = 18", [])?;
     }
 
+    if version < 19 {
+        // A per-row write counter that advances on every accepted SIR write, even one
+        // that stores the same canonical content again (a forced injection, say), so a
+        // writer that planned against the SIR it observed can tell that write from a
+        // later one with the same hash and history version.
+        ensure_sir_column(conn, "write_generation", "INTEGER NOT NULL DEFAULT 0")?;
+        conn.execute("PRAGMA user_version = 19", [])?;
+    }
+
+    if version < 20 {
+        // The leaf write a fingerprint row records, by its `write_generation`, so a
+        // retried batch ingest can tell its own row from an older row of the same
+        // prompt (timestamps have second resolution and do not order writes).
+        ensure_fingerprint_history_column(conn, "sir_write_generation", "INTEGER")?;
+        conn.execute("PRAGMA user_version = 20", [])?;
+    }
+
+    if version < 21 {
+        // The content hash of the symbol source a leaf SIR describes, when the writer
+        // knew it (an injection bound to the text its caller read); set with every leaf
+        // write, cleared when the writer did not know it, so a leaf left `rollup_pending`
+        // can be told apart from a request describing newer text.
+        ensure_sir_column(conn, "source_hash", "TEXT")?;
+        conn.execute("PRAGMA user_version = 21", [])?;
+    }
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -763,6 +790,24 @@ fn ensure_sir_column(
     }
 
     let sql = format!("ALTER TABLE sir ADD COLUMN {column_name} {column_definition}");
+    conn.execute(&sql, [])?;
+    Ok(())
+}
+fn ensure_fingerprint_history_column(
+    conn: &Connection,
+    column_name: &str,
+    column_definition: &str,
+) -> Result<(), StoreError> {
+    if !table_exists(conn, "sir_fingerprint_history")? {
+        return Ok(());
+    }
+
+    if table_has_column(conn, "sir_fingerprint_history", column_name)? {
+        return Ok(());
+    }
+
+    let sql =
+        format!("ALTER TABLE sir_fingerprint_history ADD COLUMN {column_name} {column_definition}");
     conn.execute(&sql, [])?;
     Ok(())
 }

@@ -45,7 +45,7 @@ fn migration_v6_renames_legacy_generation_pass_values_to_scan() {
     assert_eq!(single_meta.generation_pass, "scan");
     assert_eq!(
         store.get_schema_version().expect("schema version").version,
-        18
+        21
     );
 }
 
@@ -73,7 +73,7 @@ fn migration_v7_expands_symbol_edge_kinds() {
     let version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("query migrated version");
-    assert_eq!(version, 18);
+    assert_eq!(version, 21);
 
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM symbol_edges", [], |row| row.get(0))
@@ -216,13 +216,13 @@ fn run_migrations_sets_user_version_and_is_idempotent() {
     let first_version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("query first user_version");
-    assert_eq!(first_version, 18);
+    assert_eq!(first_version, 21);
 
     run_migrations(&conn).expect("run migrations twice");
     let second_version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("query second user_version");
-    assert_eq!(second_version, 18);
+    assert_eq!(second_version, 21);
 }
 
 #[test]
@@ -232,7 +232,7 @@ fn schema_version_table_is_populated() {
 
     let schema = store.get_schema_version().expect("get schema version");
     assert_eq!(schema.component, "core");
-    assert_eq!(schema.version, 18);
+    assert_eq!(schema.version, 21);
     assert!(schema.migrated_at > 0);
 }
 
@@ -245,7 +245,7 @@ fn migration_v14_creates_sir_quality_table() {
     let version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("query migrated version");
-    assert_eq!(version, 18);
+    assert_eq!(version, 21);
 
     let columns = conn
         .prepare("PRAGMA table_info(sir_quality)")
@@ -311,7 +311,7 @@ fn migration_v15_creates_and_backfills_symbol_neighbors() {
     let version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("query migrated version");
-    assert_eq!(version, 18);
+    assert_eq!(version, 21);
 
     let neighbors = conn
         .prepare(
@@ -492,6 +492,43 @@ fn write_intent_crud_updates_complete_and_failed() {
         loaded_failed.error_message.as_deref(),
         Some("vector write failed")
     );
+
+    // A failure after the SQLite stage committed keeps the intent at that stage, so a
+    // replay resumes from it instead of re-planning a write the store already holds.
+    let resumable = write_intent_record("intent-3", WriteIntentStatus::Pending);
+    store
+        .create_write_intent(&resumable)
+        .expect("create resumable write intent");
+    store
+        .update_intent_status(&resumable.intent_id, WriteIntentStatus::SqliteDone)
+        .expect("update intent status");
+    store
+        .mark_intent_failed(&resumable.intent_id, "embedding failed")
+        .expect("mark failed after the sqlite stage");
+    let loaded_resumable = store
+        .get_intent(&resumable.intent_id)
+        .expect("get resumable intent")
+        .expect("resumable intent exists");
+    assert_eq!(loaded_resumable.status, WriteIntentStatus::SqliteDone);
+    assert_eq!(
+        loaded_resumable.error_message.as_deref(),
+        Some("embedding failed")
+    );
+    assert!(
+        store
+            .get_incomplete_intents()
+            .expect("incomplete intents")
+            .iter()
+            .any(|intent| intent.intent_id == "intent-3"),
+        "a stage failure after the commit is replayed as incomplete"
+    );
+    assert!(
+        store
+            .get_failed_intents()
+            .expect("failed intents")
+            .iter()
+            .all(|intent| intent.intent_id != "intent-3")
+    );
 }
 
 #[test]
@@ -637,7 +674,7 @@ fn migration_from_v2_to_v3_adds_write_intents_table() {
     let version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("query user_version");
-    assert_eq!(version, 18);
+    assert_eq!(version, 21);
 
     let task_history_exists = conn
         .query_row(

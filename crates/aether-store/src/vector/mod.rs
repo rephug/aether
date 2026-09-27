@@ -52,6 +52,17 @@ pub struct ProjectNoteVectorSearchResult {
 #[async_trait]
 pub trait VectorStore: Send + Sync {
     async fn upsert_embedding(&self, record: VectorRecord) -> Result<(), StoreError>;
+    /// Store `record` only while the symbol's stored vector is still exactly `expected`
+    /// (same SIR hash, provider, model, dimension and write time; `None`: no vector is
+    /// stored yet), as one operation with that check, and report whether the write
+    /// happened. A writer that checked the store before a slow provider call can thus
+    /// never overwrite a vector another writer stored in the meantime, not even one for
+    /// the same SIR under a new embedding identity.
+    async fn upsert_embedding_if_matches(
+        &self,
+        record: VectorRecord,
+        expected: Option<&VectorEmbeddingMetaRecord>,
+    ) -> Result<bool, StoreError>;
     async fn upsert_embedding_batch(&self, records: Vec<VectorRecord>) -> Result<(), StoreError>;
     async fn get_embedding_meta(
         &self,
@@ -62,6 +73,16 @@ pub trait VectorStore: Send + Sync {
         symbol_ids: &[String],
     ) -> Result<HashMap<String, VectorEmbeddingMetaRecord>, StoreError>;
     async fn delete_embedding(&self, symbol_id: &str) -> Result<(), StoreError>;
+    /// Delete the symbol's embedding only while it is still the exact vector the caller
+    /// observed or wrote (same `sir_hash` and same `updated_at`), so a writer taking
+    /// back its own vector never removes one a newer writer has stored since, even when
+    /// that newer vector describes an earlier SIR again (`H1 → H2 → H1`).
+    async fn delete_embedding_if_matches(
+        &self,
+        symbol_id: &str,
+        sir_hash: &str,
+        updated_at: i64,
+    ) -> Result<(), StoreError>;
     async fn delete_embeddings(&self, symbol_ids: &[String]) -> Result<(), StoreError>;
     async fn search_nearest(
         &self,
@@ -264,6 +285,171 @@ mod tests {
                 .await
                 .expect("lookup sym-c")
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn lance_guarded_delete_fails_on_a_table_it_cannot_open() {
+        let temp = tempdir().expect("tempdir");
+        let store = LanceVectorStore::open(temp.path())
+            .await
+            .expect("open LanceDB vector store");
+        store
+            .upsert_embedding(vector_record("sym-a", "hash-a"))
+            .await
+            .expect("upsert sym-a");
+
+        // A vector table that exists but cannot be opened (a corrupt manifest): taking
+        // back a superseded vector must fail naming the table, not skip it and report
+        // the vector gone while its row may still stand there.
+        let broken = temp
+            .path()
+            .join(".aether/vectors")
+            .join(format!("{VECTOR_TABLE_PREFIX}broken.lance"));
+        std::fs::create_dir_all(broken.join("_versions")).expect("create broken table");
+        std::fs::write(broken.join("_versions/1.manifest"), b"not a manifest")
+            .expect("write corrupt manifest");
+        let err = store
+            .delete_embedding_if_matches("sym-a", "hash-a", 1_700_000_000)
+            .await
+            .expect_err("an unopenable table fails the guarded delete");
+        assert!(
+            err.to_string()
+                .contains(&format!("{VECTOR_TABLE_PREFIX}broken")),
+            "unexpected error: {err}"
+        );
+        let err = store
+            .delete_embeddings(&["sym-a".to_owned()])
+            .await
+            .expect_err("an unopenable table fails the batch delete");
+        assert!(
+            err.to_string()
+                .contains(&format!("{VECTOR_TABLE_PREFIX}broken")),
+            "unexpected error: {err}"
+        );
+
+        // Once the broken table is gone, the same deletes succeed.
+        std::fs::remove_dir_all(&broken).expect("remove broken table");
+        store
+            .delete_embeddings(&["sym-a".to_owned()])
+            .await
+            .expect("delete sym-a");
+        assert!(
+            store
+                .get_embedding_meta("sym-a")
+                .await
+                .expect("lookup sym-a")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn lance_conditional_write_removes_the_row_the_previous_identity_left() {
+        let temp = tempdir().expect("tempdir");
+        let store = LanceVectorStore::open(temp.path())
+            .await
+            .expect("open LanceDB vector store");
+
+        // The vector moves from identity A to identity B within the same second: the
+        // guarded write lands in B's table and A's row goes, so the cross-table lookups
+        // cannot keep answering with A on the timestamp tie.
+        store
+            .upsert_embedding(vector_record_with_meta(
+                "sym-move",
+                "hash-1",
+                "mock",
+                "model-2d",
+                vec![1.0, 0.0],
+                100,
+            ))
+            .await
+            .expect("upsert under identity A");
+        let observed_a = store
+            .get_embedding_meta("sym-move")
+            .await
+            .expect("meta")
+            .expect("vector under A");
+        assert_eq!(
+            (observed_a.provider.as_str(), observed_a.embedding_dim),
+            ("mock", 2)
+        );
+        let written = store
+            .upsert_embedding_if_matches(
+                vector_record_with_meta(
+                    "sym-move",
+                    "hash-1",
+                    "mock-alt",
+                    "model-3d",
+                    vec![1.0, 0.0, 0.0],
+                    100,
+                ),
+                Some(&observed_a),
+            )
+            .await
+            .expect("guarded write under identity B");
+        assert!(written);
+        let observed_b = store
+            .get_embedding_meta("sym-move")
+            .await
+            .expect("meta")
+            .expect("vector under B");
+        assert_eq!(
+            (
+                observed_b.provider.as_str(),
+                observed_b.model.as_str(),
+                observed_b.embedding_dim,
+                observed_b.updated_at
+            ),
+            ("mock-alt", "model-3d", 3, 100)
+        );
+        assert_eq!(
+            store
+                .get_embedding_metas_batch(&["sym-move".to_owned()])
+                .await
+                .expect("batch lookup")
+                .get("sym-move")
+                .map(|meta| meta.provider.as_str()),
+            Some("mock-alt")
+        );
+        assert!(
+            store
+                .search_nearest(&[1.0, 0.0], "mock", "model-2d", 5)
+                .await
+                .expect("search identity A")
+                .is_empty(),
+            "the row identity A held is removed once the move is verified"
+        );
+
+        // Returning to A in the same second replaces A's table row and removes B's.
+        let written = store
+            .upsert_embedding_if_matches(
+                vector_record_with_meta(
+                    "sym-move",
+                    "hash-1",
+                    "mock",
+                    "model-2d",
+                    vec![0.0, 1.0],
+                    100,
+                ),
+                Some(&observed_b),
+            )
+            .await
+            .expect("guarded write back under identity A");
+        assert!(written);
+        assert_eq!(
+            store
+                .get_embedding_meta("sym-move")
+                .await
+                .expect("meta")
+                .map(|meta| (meta.provider, meta.embedding_dim)),
+            Some(("mock".to_owned(), 2))
+        );
+        assert!(
+            store
+                .search_nearest(&[1.0, 0.0, 0.0], "mock-alt", "model-3d", 5)
+                .await
+                .expect("search identity B")
+                .is_empty()
         );
     }
 

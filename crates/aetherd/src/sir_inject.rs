@@ -14,7 +14,9 @@ use crate::batch::write_fingerprint_row;
 use crate::cli::SirInjectArgs;
 use crate::continuous::cosine_distance_from_embeddings;
 use crate::sir_agent_support::{load_fresh_symbol_source, resolve_symbol, symbol_from_record};
-use crate::sir_pipeline::{SirPipeline, UpsertSirIntentPayload};
+use crate::sir_pipeline::{
+    EmbeddingRefresh, SirPipeline, UpsertSirIntentPayload, current_sir_identity,
+};
 
 const FORCE_CONFIDENCE_THRESHOLD: f32 = 0.5;
 const DEFAULT_INJECT_CONFIDENCE: f32 = 0.95;
@@ -38,7 +40,57 @@ pub fn run_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<(
 fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<InjectExecution> {
     let store = SqliteStore::open(workspace).context("failed to open local store")?;
     let record = resolve_symbol(&store, args.selector.as_str())?;
-    let fresh = load_fresh_symbol_source(workspace, &record)?;
+    // The pipelines and the unrelated vector read come first, outside the inject lock:
+    // opening the vector store can run the SQLite-to-LanceDB migration, and one manual
+    // injection must not hold every daemon generation and MCP injection for that long.
+    // A dry run writes nothing and needs neither.
+    let mut embedding_warning = None;
+    let mut previous_embedding = None;
+    let (persist_pipeline, mut embedding_pipeline) = if args.dry_run {
+        (None, None)
+    } else {
+        let persist_pipeline = build_persist_pipeline(workspace)?;
+        let embedding_pipeline = if args.no_embed {
+            None
+        } else {
+            match SirPipeline::new_embeddings_only(workspace.to_path_buf()) {
+                Ok(pipeline) => Some(pipeline),
+                Err(err) => {
+                    embedding_warning = Some(format!(
+                        "warning: embeddings unavailable; persisted SIR without refresh: {err}"
+                    ));
+                    None
+                }
+            }
+        };
+        if let Some(pipeline) = embedding_pipeline.as_ref() {
+            previous_embedding = pipeline
+                .load_symbol_embedding(record.id.as_str())
+                .with_context(|| format!("failed to load existing embedding for {}", record.id))?;
+        }
+        (Some(persist_pipeline), embedding_pipeline)
+    };
+    // Read the prior SIR, apply the confidence guard, merge and persist under the inject
+    // lock every leaf writer shares, so a concurrent injection or indexer pass cannot
+    // slip in between; the lock covers only the symbol/SIR re-check, the guard and the
+    // leaf write, and is released before the embedding refresh, which has its own lock.
+    let inject_guard = crate::sir_pipeline::acquire_inject_write_lock(workspace)?;
+    // The selector was resolved before the lock: the running daemon may have removed
+    // the symbol (and its SIR) in between, and a leaf written now would be an orphan.
+    if store
+        .get_symbol_record(record.id.as_str())
+        .with_context(|| format!("failed to re-read symbol record for {}", record.id))?
+        .is_none()
+    {
+        return Err(anyhow!(
+            "symbol '{}' ({}) was removed from the index while the request was being prepared; nothing was injected",
+            record.qualified_name,
+            record.id
+        ));
+    }
+    // The file must still declare the symbol (a dry run reports that too); the text
+    // the leaf is bound to is re-read right before the write below.
+    load_fresh_symbol_source(workspace, &record)?;
     let existing_blob = store
         .read_sir_blob(record.id.as_str())
         .with_context(|| format!("failed to read existing SIR for {}", record.id))?;
@@ -126,29 +178,22 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
     let generation_model =
         normalize_optional_text(args.model.as_deref()).unwrap_or_else(|| "manual".to_owned());
 
-    let persist_pipeline = build_persist_pipeline(workspace)?;
-    let mut embedding_warning = None;
-    let mut previous_embedding = None;
-    let mut embedding_pipeline = if args.no_embed {
-        None
-    } else {
-        match SirPipeline::new_embeddings_only(workspace.to_path_buf()) {
-            Ok(pipeline) => Some(pipeline),
-            Err(err) => {
-                embedding_warning = Some(format!(
-                    "warning: embeddings unavailable; persisted SIR without refresh: {err}"
-                ));
-                None
-            }
-        }
+    let Some(persist_pipeline) = persist_pipeline else {
+        return Err(anyhow!(
+            "internal error: no persistence pipeline was prepared for the write"
+        ));
     };
-
-    if let Some(pipeline) = embedding_pipeline.as_ref() {
-        previous_embedding = pipeline
-            .load_symbol_embedding(record.id.as_str())
-            .with_context(|| format!("failed to load existing embedding for {}", record.id))?;
+    // Editors take no lock: re-parse the file once more right before the write, so the
+    // leaf is bound to the text on disk at the commit and an edit that landed since the
+    // first read refuses the injection rather than describing text the symbol no longer has.
+    let fresh = load_fresh_symbol_source(workspace, &record)?;
+    if fresh.symbol.id != record.id {
+        return Err(anyhow!(
+            "source for {} ({}) no longer declares the symbol as indexed; nothing was injected: wait for re-indexing and retry",
+            record.qualified_name,
+            record.file_path
+        ));
     }
-
     let payload = UpsertSirIntentPayload {
         symbol: symbol_from_record(&record)?,
         sir: updated.clone(),
@@ -157,8 +202,13 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
         generation_pass: "injected".to_owned(),
         reasoning_trace: None,
         commit_hash: None,
+        prompt_hash: None,
+        // The leaf records the text this SIR describes (re-parsed under the lock just
+        // above), so a daemon job for a later edit can tell it describes older text.
+        source_hash: Some(fresh.symbol.content_hash.clone()),
+        prior_sir: crate::sir_pipeline::PriorSir::Unrecorded,
     };
-    let (canonical_json, sir_hash) = persist_pipeline
+    let (canonical_json, _sir_hash) = persist_pipeline
         .persist_sir_payload_into_sqlite(&store, &payload, None)
         .with_context(|| format!("failed to persist injected SIR for {}", record.id))?;
 
@@ -174,18 +224,36 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
             ..persisted_meta
         })
         .with_context(|| format!("failed to persist prompt hash for {}", record.id))?;
+    // The identity of the leaf this command wrote, read under the same lock: the
+    // embedding below belongs to exactly this write.
+    let committed = current_sir_identity(&store, record.id.as_str())
+        .with_context(|| format!("failed to read the SIR identity for {}", record.id))?
+        .ok_or_else(|| anyhow!("missing persisted SIR identity for {}", record.id))?;
 
+    drop(inject_guard);
     let delta_sem = if let Some(pipeline) = embedding_pipeline.as_mut() {
-        pipeline
+        let refresh = pipeline
             .refresh_embedding_if_needed(
+                &store,
                 record.id.as_str(),
-                sir_hash.as_str(),
+                &committed,
                 canonical_json.as_str(),
                 false,
                 &mut std::io::sink(),
                 None,
             )
             .with_context(|| format!("failed to refresh embedding for {}", record.id))?;
+        if refresh == EmbeddingRefresh::Superseded {
+            // Another writer replaced this leaf while its vector was being generated.
+            // The vector in the store (if any) is that writer's, so no semantic delta
+            // may be attributed to this injection, no fingerprint row records it as
+            // applied, and the command does not report the write as standing.
+            let rendered = format!(
+                "SIR for {} was written but replaced by another writer before its embedding was stored; the newer SIR stands and nothing further was recorded for this injection.\n",
+                record.qualified_name
+            );
+            return Ok(InjectExecution { rendered });
+        }
         let current_embedding = pipeline
             .load_symbol_embedding(record.id.as_str())
             .with_context(|| format!("failed to load refreshed embedding for {}", record.id))?;
@@ -203,6 +271,7 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
         generation_model.as_str(),
         "injected",
         delta_sem,
+        None,
     )
     .with_context(|| format!("failed to write fingerprint history for {}", record.id))?;
 
@@ -575,6 +644,14 @@ vector_backend = "sqlite"
             .expect("list history");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].trigger, "inject");
+        let fresh = super::load_fresh_symbol_source(temp.path(), &record).expect("fresh source");
+        assert_eq!(
+            store
+                .get_sir_source_hash(record.id.as_str())
+                .expect("source hash"),
+            Some(fresh.symbol.content_hash),
+            "the leaf records the text the injection describes"
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ use anyhow::{Result, anyhow};
 
 use crate::cli::{BatchBuildArgs, BatchPass, BatchRunArgs};
 
-pub(crate) use build::build_pass_jsonl_for_ids;
+pub(crate) use build::{build_pass_jsonl_for_ids, remove_build_sidecars, unaccounted_requests};
 pub(crate) use ingest::{ingest_results, write_fingerprint_row};
 pub use run::run_batch_command;
 
@@ -51,9 +51,17 @@ pub(crate) enum BatchPollStatus {
 /// Abstraction over provider-specific batch API mechanics.
 #[async_trait::async_trait]
 pub(crate) trait BatchProvider: Send + Sync {
+    /// The identifier this provider sends with a request built for `key` and hands
+    /// back on its result line: the key itself unless the provider limits it (see
+    /// the Anthropic provider). The build-time keymap is keyed by this value so ingest
+    /// can recover the full key from a result.
+    fn request_key(&self, key: &str) -> String {
+        key.to_owned()
+    }
+
     /// Format one batch request line.
     ///
-    /// * `key` — `"symbol_id|prompt_hash"`
+    /// * `key` — `"symbol_id|prompt_hash|build_id"` (see `build::BuildSummary::build_id`)
     /// * `system_prompt` — static SIR instruction (cacheable)
     /// * `user_prompt` — per-symbol content
     /// * `model` — provider-specific model string

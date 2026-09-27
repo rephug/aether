@@ -7,6 +7,8 @@ pub mod cursor_rules;
 pub mod omp;
 pub mod refactor_cmd;
 pub mod refactor_deep_cmd;
+pub mod scan_all_script;
+pub mod scan_cmd;
 pub mod skill_md;
 
 pub use audit_changes_cmd::AuditChangesCommandTemplate;
@@ -18,6 +20,8 @@ pub use cursor_rules::CursorRulesTemplate;
 pub use omp::{McpJsonTemplate, OmpAgentsTemplate};
 pub use refactor_cmd::RefactorCommandTemplate;
 pub use refactor_deep_cmd::RefactorDeepCommandTemplate;
+pub use scan_all_script::ScanAllScriptTemplate;
+pub use scan_cmd::ScanCommandTemplate;
 pub use skill_md::SkillTemplate;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,7 +269,8 @@ pub(crate) fn plain_tool_list() -> String {
 mod tests {
     use super::{
         ClaudeTemplate, CodexInstructionsTemplate, CursorRulesTemplate, McpJsonTemplate,
-        OmpAgentsTemplate, SkillTemplate, TOOL_DESCRIPTIONS, TemplateContext,
+        OmpAgentsTemplate, ScanAllScriptTemplate, ScanCommandTemplate, SkillTemplate,
+        TOOL_DESCRIPTIONS, TemplateContext,
     };
 
     fn sample_context() -> TemplateContext {
@@ -297,6 +302,10 @@ mod tests {
         assert!(rendered.contains("aether_audit_submit"));
         assert!(rendered.contains("aether_sir_inject"));
         assert!(rendered.contains("aether_sir_context"));
+        assert!(rendered.contains("## Zero-Key Onboarding"));
+        assert!(!rendered.contains("recommended path"));
+        assert!(rendered.contains("--inference-provider mock"));
+        assert!(rendered.contains("./scripts/scan_all.sh"));
     }
 
     #[test]
@@ -316,6 +325,44 @@ mod tests {
         assert!(rendered.contains("1. Before editing or refactoring"));
         assert!(rendered.contains("Agent schema version: 7"));
         assert!(rendered.contains("aether_verify"));
+    }
+
+    #[test]
+    fn scan_templates_render_command_and_script() {
+        let context = sample_context();
+        let command = ScanCommandTemplate::render(&context);
+        assert!(command.contains("/scan <crate> [batch-size]"));
+        assert!(command.contains("aether_sir_inject"));
+        assert!(command.contains("`batch-size` as `top_n`"));
+        let script = ScanAllScriptTemplate::render(&context);
+        assert!(script.starts_with("#!/usr/bin/env bash"));
+        assert!(script.contains("cargo metadata --no-deps"));
+        assert!(!script.contains("pkill"));
+        assert!(!script.contains("declare -A"));
+        assert!(!script.contains("mapfile"));
+        assert!(!script.contains("wait -n"));
+        assert!(!script.contains("git rev-parse"));
+        assert!(script.contains(".mcp.json"));
+        assert!(script.contains("FROM symbols"));
+        assert!(script.contains("--inference-provider mock"));
+        assert!(!script.contains("enrich_all.sh"));
+    }
+
+    /// AETHER dogfoods its own generated assets: the checked-in copies must match the
+    /// templates byte for byte.
+    #[test]
+    fn checked_in_scan_assets_match_templates() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repo root");
+        let context = sample_context();
+        let command = std::fs::read_to_string(root.join(".claude/commands/scan.md"))
+            .expect("read .claude/commands/scan.md");
+        assert_eq!(command, ScanCommandTemplate::render(&context));
+        let script = std::fs::read_to_string(root.join("scripts/scan_all.sh"))
+            .expect("read scripts/scan_all.sh");
+        assert_eq!(script, ScanAllScriptTemplate::render(&context));
     }
 
     #[test]

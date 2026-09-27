@@ -8,6 +8,11 @@ pub const DEFAULT_OMP_GATEWAY_ENDPOINT: &str = "http://127.0.0.1:4000/v1";
 pub const DEFAULT_OMP_GATEWAY_TOKEN_ENV: &str = "OMP_GATEWAY_TOKEN";
 /// Token file written by `omp auth-gateway token`, relative to `$HOME`.
 pub const OMP_GATEWAY_TOKEN_FILE: &str = ".omp/auth-gateway.token";
+/// Confidence assigned to placeholder SIRs by the `mock` provider (Decision #121): low
+/// enough that `aether_audit_candidates` ranks unscanned symbols first.
+pub const MOCK_SIR_CONFIDENCE: f32 = 0.1;
+/// Intent prefix that marks a placeholder SIR from the `mock` provider.
+pub const MOCK_INTENT_PREFIX: &str = "[MOCK]";
 /// The omp CLI binary AETHER spawns for `aetherd omp up` / autostart.
 pub const DEFAULT_OMP_COMMAND: &str = "omp";
 /// Default bind of `omp auth-broker serve`.

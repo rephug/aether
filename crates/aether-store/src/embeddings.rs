@@ -188,6 +188,90 @@ impl SqliteStore {
         )?;
         Ok(())
     }
+    /// Store the embedding only while the symbol's stored vector is still exactly
+    /// `expected` (`None`: no row yet); the check and the write share one immediate
+    /// transaction. Returns whether the row was written.
+    pub fn upsert_symbol_embedding_if_matches(
+        &self,
+        record: SymbolEmbeddingRecord,
+        expected: Option<&SymbolEmbeddingMetaRecord>,
+    ) -> Result<bool, StoreError> {
+        use rusqlite::OptionalExtension;
+        let embedding_dim = record.embedding.len() as i64;
+        let embedding_json = serde_json::to_string(&record.embedding)?;
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let current: Option<SymbolEmbeddingMetaRecord> = tx
+            .query_row(
+                "SELECT symbol_id, sir_hash, provider, model, embedding_dim, updated_at FROM sir_embeddings WHERE symbol_id = ?1",
+                params![record.symbol_id],
+                |row| {
+                    Ok(SymbolEmbeddingMetaRecord {
+                        symbol_id: row.get(0)?,
+                        sir_hash: row.get(1)?,
+                        provider: row.get(2)?,
+                        model: row.get(3)?,
+                        embedding_dim: row.get(4)?,
+                        updated_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+        if current.as_ref() != expected {
+            return Ok(false);
+        }
+        tx.execute(
+            r#"
+            INSERT INTO sir_embeddings (
+                symbol_id, sir_hash, provider, model, embedding_dim, embedding_json, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(symbol_id) DO UPDATE SET
+                sir_hash = excluded.sir_hash,
+                provider = excluded.provider,
+                model = excluded.model,
+                embedding_dim = excluded.embedding_dim,
+                embedding_json = excluded.embedding_json,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                record.symbol_id,
+                record.sir_hash,
+                record.provider,
+                record.model,
+                embedding_dim,
+                embedding_json,
+                record.updated_at,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+    /// Delete the symbol's embedding only while it is still the row that carries
+    /// `sir_hash` and `updated_at` (one statement, so no newer vector can slip in
+    /// between a check and the delete, and a newer vector for the same hash survives).
+    pub fn delete_symbol_embedding_if_matches(
+        &self,
+        symbol_id: &str,
+        sir_hash: &str,
+        updated_at: i64,
+    ) -> Result<(), StoreError> {
+        // A panic elsewhere while holding the connection poisons the mutex, but the
+        // connection itself is still usable: recover it rather than panic in turn.
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "DELETE FROM sir_embeddings WHERE symbol_id = ?1 AND sir_hash = ?2 AND updated_at = ?3",
+            params![symbol_id, sir_hash, updated_at],
+        )?;
+        Ok(())
+    }
     pub(crate) fn store_search_symbols_semantic(
         &self,
         query_embedding: &[f32],
@@ -278,5 +362,121 @@ impl SqliteStore {
         }
 
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn record(symbol_id: &str, sir_hash: &str) -> SymbolEmbeddingRecord {
+        SymbolEmbeddingRecord {
+            symbol_id: symbol_id.to_owned(),
+            sir_hash: sir_hash.to_owned(),
+            provider: "p".to_owned(),
+            model: "m".to_owned(),
+            embedding: vec![1.0, 0.0],
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn conditional_embedding_upsert_only_replaces_the_expected_hash() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        let phantom = SymbolEmbeddingMetaRecord {
+            symbol_id: "s".to_owned(),
+            sir_hash: "h0".to_owned(),
+            provider: "p".to_owned(),
+            model: "m".to_owned(),
+            embedding_dim: 2,
+            updated_at: 1,
+        };
+
+        // Nothing stored: a write expecting no row lands, one expecting a row does not.
+        assert!(
+            !store
+                .upsert_symbol_embedding_if_matches(record("s", "h1"), Some(&phantom))
+                .expect("cas")
+        );
+        assert!(
+            store
+                .upsert_symbol_embedding_if_matches(record("s", "h1"), None)
+                .expect("cas")
+        );
+        // A row exists: only a writer that observed exactly it may replace it.
+        let observed = store
+            .get_symbol_embedding_meta("s")
+            .expect("meta")
+            .expect("row");
+        assert!(
+            !store
+                .upsert_symbol_embedding_if_matches(record("s", "h2"), None)
+                .expect("cas")
+        );
+        let same_hash_other_identity = SymbolEmbeddingMetaRecord {
+            provider: "other-provider".to_owned(),
+            ..observed.clone()
+        };
+        assert!(
+            !store
+                .upsert_symbol_embedding_if_matches(
+                    record("s", "h2"),
+                    Some(&same_hash_other_identity)
+                )
+                .expect("cas"),
+            "the same hash under another provider/model is a different vector"
+        );
+        let same_hash_other_time = SymbolEmbeddingMetaRecord {
+            updated_at: observed.updated_at + 1,
+            ..observed.clone()
+        };
+        assert!(
+            !store
+                .upsert_symbol_embedding_if_matches(record("s", "h2"), Some(&same_hash_other_time))
+                .expect("cas"),
+            "the same hash written at another time is a different vector"
+        );
+        assert!(
+            store
+                .upsert_symbol_embedding_if_matches(record("s", "h2"), Some(&observed))
+                .expect("cas")
+        );
+        let meta = store
+            .get_symbol_embedding_meta("s")
+            .expect("meta")
+            .expect("row");
+        assert_eq!(meta.sir_hash, "h2");
+
+        // The conditional delete is the mirror image: hash and write time must match.
+        store
+            .delete_symbol_embedding_if_matches("s", "h1", 1)
+            .expect("delete");
+        assert!(
+            store
+                .get_symbol_embedding_meta("s")
+                .expect("meta")
+                .is_some()
+        );
+        store
+            .delete_symbol_embedding_if_matches("s", "h2", 2)
+            .expect("delete");
+        assert!(
+            store
+                .get_symbol_embedding_meta("s")
+                .expect("meta")
+                .is_some(),
+            "a vector for the same hash written at another time is not this writer's"
+        );
+        store
+            .delete_symbol_embedding_if_matches("s", "h2", 1)
+            .expect("delete");
+        assert!(
+            store
+                .get_symbol_embedding_meta("s")
+                .expect("meta")
+                .is_none()
+        );
     }
 }

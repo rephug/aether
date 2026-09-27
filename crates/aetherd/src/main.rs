@@ -11,7 +11,7 @@ use aether_infer::ProviderOverrides;
 use aether_infer::sir_prompt::SirEnrichmentContext;
 use aether_infer::{download_candle_embedding_model, download_candle_reranker_model};
 use aether_sir::SirAnnotation;
-use aether_store::{AuditFindingFilters, AuditStore, SirStateStore, SqliteStore};
+use aether_store::{AuditFindingFilters, AuditStore, SqliteStore};
 use aetherd::audit_report::render_audit_report;
 use aetherd::batch::run_batch_command;
 use aetherd::calibrate::run_calibration_once;
@@ -535,6 +535,9 @@ struct RegenerateCandidate {
     confidence: f32,
     priority: f64,
     baseline_sir: SirAnnotation,
+    /// Identity of `baseline_sir`'s row, read together with it; the deep job persists
+    /// only while the store still holds exactly that SIR.
+    baseline_sir_identity: aetherd::sir_pipeline::SirIdentity,
 }
 
 fn run_regenerate_command(workspace: &Path, args: RegenerateArgs) -> Result<()> {
@@ -564,16 +567,19 @@ fn run_regenerate_command(workspace: &Path, args: RegenerateArgs) -> Result<()> 
             continue;
         }
 
-        let Some(meta) = store.get_sir_meta(symbol.id.as_str())? else {
+        // Metadata, identity and blob from one row read, so the enrichment built from
+        // this SIR and the identity the deep job is bound to describe the same write.
+        let Some(snapshot) = store.get_sir_meta_with_blob(symbol.id.as_str())? else {
             continue;
         };
+        let meta = snapshot.meta;
         if let Some(provider_filter) = args.from_provider.as_deref()
             && meta.provider != provider_filter
         {
             continue;
         }
 
-        let Some(blob) = store.read_sir_blob(symbol.id.as_str())? else {
+        let Some(blob) = snapshot.blob else {
             continue;
         };
         let Ok(sir) = serde_json::from_str::<SirAnnotation>(&blob) else {
@@ -592,6 +598,7 @@ fn run_regenerate_command(workspace: &Path, args: RegenerateArgs) -> Result<()> 
                 .copied()
                 .unwrap_or(0.0),
             baseline_sir: sir,
+            baseline_sir_identity: snapshot.identity,
         });
     }
 
@@ -705,6 +712,7 @@ fn run_regenerate_command(workspace: &Path, args: RegenerateArgs) -> Result<()> 
                 SirDeepPromptSpec {
                     enrichment,
                     use_cot,
+                    baseline_sir_identity: Some(candidate.baseline_sir_identity.clone()),
                 },
             );
             deep_pipeline.process_event_with_deep_specs(
