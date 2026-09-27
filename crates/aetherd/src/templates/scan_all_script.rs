@@ -135,7 +135,7 @@ fi
 # the index: the units of a project without Cargo, and the extra units of a mixed project
 # (TypeScript/Python sources beside Rust packages).
 index_top_level_scopes() {
-  run_sql "SELECT DISTINCT CASE WHEN instr(file_path, '/') > 0 THEN substr(file_path, 1, instr(file_path, '/') - 1) ELSE file_path END FROM symbols ORDER BY 1;" | awk 'NF'
+  run_sql "SELECT DISTINCT CASE WHEN instr(file_path, '/') > 0 THEN substr(file_path, 1, instr(file_path, '/') - 1) ELSE file_path END FROM symbols ORDER BY 1;" | awk 'length($0) > 0'
 }
 
 # Prints "name<TAB>scope[<TAB>scope...]" per scan unit, name and scopes percent-encoded
@@ -249,7 +249,6 @@ for name, scopes in units:
 package_scopes = [s for _, scopes in units for s in scopes]
 unit_names = {name for name, _ in units}
 for top in os.environ.get("AETHER_INDEX_TOPS", "").split("\n"):
-    top = top.strip()
     if not top:
         continue
     if any(top == s or top.startswith(s + os.sep) for s in package_scopes):

@@ -16,14 +16,14 @@ use aether_infer::{
     load_provider_from_env_or_mock, sir_prompt,
 };
 use aether_sir::{canonicalize_sir_json, sir_hash, validate_sir};
-use aether_store::{
-    SirHistoryStore, SirMetaRecord, SirStateStore, SnapshotStore, SymbolEmbeddingRecord,
-};
+use aether_store::{SirMetaRecord, SirStateStore, SnapshotStore, SymbolEmbeddingRecord};
 use anyhow::{Result as AnyResult, anyhow};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 use tokio::time::{sleep, timeout};
+
+use aetherd::sir_pipeline::{acquire_embed_write_lock, acquire_inject_write_lock};
 
 use super::{AetherMcpServer, MCP_SCHEMA_VERSION, current_unix_timestamp};
 use crate::AetherMcpError;
@@ -410,36 +410,33 @@ impl AetherMcpServer {
         let canonical_json = canonicalize_sir_json(&generated.sir);
         let sir_hash_value = sir_hash(&generated.sir);
         let attempted_at = current_unix_timestamp();
-        let version = self.state.store.record_sir_version_if_changed(
-            candidate.symbol.id.as_str(),
-            sir_hash_value.as_str(),
-            provider_name,
-            model_name,
-            canonical_json.as_str(),
-            attempted_at,
-            commit_hash,
-        )?;
-
-        if version.changed {
-            self.state
-                .store
-                .write_sir_blob(candidate.symbol.id.as_str(), canonical_json.as_str())?;
+        // The deep SIR is a leaf write like any other: history, JSON and metadata land in
+        // one transaction under the workspace inject lock every SIR writer shares, so it
+        // cannot interleave with an `aether_sir_inject` call or a daemon rollup persist.
+        {
+            let _inject_guard = acquire_inject_write_lock(&self.state.workspace)
+                .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
+            self.state.store.persist_sir_state_atomically(
+                SirMetaRecord {
+                    id: candidate.symbol.id.clone(),
+                    sir_hash: sir_hash_value.clone(),
+                    sir_version: 1,
+                    provider: provider_name.to_owned(),
+                    model: model_name.to_owned(),
+                    generation_pass: "deep".to_owned(),
+                    reasoning_trace: generated.reasoning_trace.clone(),
+                    prompt_hash: None,
+                    staleness_score: None,
+                    updated_at: attempted_at,
+                    sir_status: "fresh".to_owned(),
+                    last_error: None,
+                    last_attempt_at: attempted_at,
+                },
+                canonical_json.as_str(),
+                commit_hash,
+                None,
+            )?;
         }
-        self.state.store.upsert_sir_meta(SirMetaRecord {
-            id: candidate.symbol.id.clone(),
-            sir_hash: sir_hash_value.clone(),
-            sir_version: version.version,
-            provider: provider_name.to_owned(),
-            model: model_name.to_owned(),
-            generation_pass: "deep".to_owned(),
-            reasoning_trace: generated.reasoning_trace.clone(),
-            prompt_hash: None,
-            staleness_score: None,
-            updated_at: version.updated_at,
-            sir_status: "fresh".to_owned(),
-            last_error: None,
-            last_attempt_at: attempted_at,
-        })?;
         self.refresh_embedding_if_needed(
             runtime,
             embedding_provider,
@@ -486,6 +483,10 @@ impl AetherMcpServer {
         Ok(())
     }
 
+    /// Embed the deep SIR under the symbol's embedding lock, which every vector writer
+    /// shares, and store the vector only while the SIR is still the one just written and
+    /// the stored vector is still the one observed, so a slow embedding here can never
+    /// overwrite the vector a concurrent injection stored for a newer SIR.
     fn refresh_embedding_if_needed(
         &self,
         runtime: &Runtime,
@@ -500,12 +501,24 @@ impl AetherMcpServer {
         let Some((provider, provider_name, model_name)) = embedding_provider else {
             return Ok(());
         };
-        let existing = runtime.block_on(vector_store.get_embedding_meta(symbol_id))?;
-        if existing.as_ref().is_some_and(|meta| {
+        let _embed_guard = acquire_embed_write_lock(&self.state.workspace, symbol_id)
+            .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
+        let observed = runtime.block_on(vector_store.get_embedding_meta(symbol_id))?;
+        if observed.as_ref().is_some_and(|meta| {
             meta.sir_hash == sir_hash_value
                 && meta.provider == *provider_name
                 && meta.model == *model_name
         }) {
+            return Ok(());
+        }
+        let sir_is_current = || -> Result<bool, AetherMcpError> {
+            Ok(self
+                .state
+                .store
+                .get_sir_meta(symbol_id)?
+                .is_some_and(|meta| meta.sir_hash == sir_hash_value))
+        };
+        if !sir_is_current()? {
             return Ok(());
         }
 
@@ -514,18 +527,24 @@ impl AetherMcpServer {
                 .embed_text_with_purpose(canonical_json, EmbeddingPurpose::Document)
                 .await
         })?;
-        if embedding.is_empty() {
+        if embedding.is_empty() || !sir_is_current()? {
             return Ok(());
         }
 
-        runtime.block_on(vector_store.upsert_embedding(SymbolEmbeddingRecord {
-            symbol_id: symbol_id.to_owned(),
-            sir_hash: sir_hash_value.to_owned(),
-            provider: provider_name.clone(),
-            model: model_name.clone(),
-            embedding,
-            updated_at: current_unix_timestamp(),
-        }))?;
+        // Conditional on the vector observed above: a writer that reached the store
+        // first keeps its vector (the lock rules that out for vector writers, the check
+        // covers any path that does not take it).
+        runtime.block_on(vector_store.upsert_embedding_if_matches(
+            SymbolEmbeddingRecord {
+                symbol_id: symbol_id.to_owned(),
+                sir_hash: sir_hash_value.to_owned(),
+                provider: provider_name.clone(),
+                model: model_name.clone(),
+                embedding,
+                updated_at: current_unix_timestamp(),
+            },
+            observed.as_ref(),
+        ))?;
         Ok(())
     }
 }
