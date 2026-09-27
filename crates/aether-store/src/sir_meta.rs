@@ -2,6 +2,27 @@ use super::*;
 use crate::sir_history::record_sir_version_if_changed_tx;
 use crate::write_intents::update_intent_status_tx;
 
+/// The identity of one stored SIR write: its content hash together with the history
+/// version the store assigned to it. A hash alone does not identify a write, because a
+/// symbol's SIR can cycle back to an earlier content (`H1 → H2 → H1`) through two
+/// injections; the history version only ever grows, so the pair tells those apart.
+/// Writers that plan a write against the SIR they observed compare this pair, under
+/// the inject lock, right before they write.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SirIdentity {
+    pub sir_hash: String,
+    pub sir_version: i64,
+}
+
+impl SirIdentity {
+    pub fn of(meta: &SirMetaRecord) -> Self {
+        Self {
+            sir_hash: meta.sir_hash.clone(),
+            sir_version: meta.sir_version,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SirMetaRecord {
     pub id: String,
@@ -517,29 +538,91 @@ impl SqliteStore {
         )?;
 
         let record = stmt
+            .query_row(params![symbol_id], |row| sir_meta_from_row(row, 0))
+            .optional()?;
+
+        Ok(record)
+    }
+
+    /// A symbol's SIR metadata together with its stored SIR JSON, read from the one
+    /// row that holds both, so the pair is consistent: a caller that builds a prompt or
+    /// an enrichment from the blob and records the metadata's identity for a later
+    /// compare-and-set cannot pair one write's JSON with another write's identity.
+    pub fn get_sir_meta_with_blob(
+        &self,
+        symbol_id: &str,
+    ) -> Result<Option<(SirMetaRecord, Option<String>)>, StoreError> {
+        let Some((record, blob)) = self.read_sir_row(symbol_id)? else {
+            return Ok(None);
+        };
+        // A row migrated from the file-mirror era may hold its JSON only on disk.
+        let blob = match blob {
+            Some(blob) => Some(blob),
+            None => self.store_read_sir_blob(symbol_id)?,
+        };
+        Ok(Some((record, blob)))
+    }
+
+    fn read_sir_row(
+        &self,
+        symbol_id: &str,
+    ) -> Result<Option<(SirMetaRecord, Option<String>)>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                id,
+                sir_hash,
+                sir_version,
+                provider,
+                model,
+                generation_pass,
+                reasoning_trace,
+                prompt_hash,
+                staleness_score,
+                updated_at,
+                sir_status,
+                last_error,
+                last_attempt_at,
+                sir_json
+            FROM sir
+            WHERE id = ?1
+            "#,
+        )?;
+
+        let record = stmt
             .query_row(params![symbol_id], |row| {
-                Ok(SirMetaRecord {
-                    id: row.get(0)?,
-                    sir_hash: row.get(1)?,
-                    sir_version: row.get(2)?,
-                    provider: row.get(3)?,
-                    model: row.get(4)?,
-                    generation_pass: row
-                        .get::<_, Option<String>>(5)?
-                        .map(|value| value.trim().to_owned())
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or_else(|| "scan".to_owned()),
-                    reasoning_trace: row.get(6)?,
-                    prompt_hash: row.get(7)?,
-                    staleness_score: row.get(8)?,
-                    updated_at: row.get(9)?,
-                    sir_status: row.get(10)?,
-                    last_error: row.get(11)?,
-                    last_attempt_at: row.get(12)?,
-                })
+                Ok((
+                    sir_meta_from_row(row, 0)?,
+                    row.get::<_, Option<String>>(13)?
+                        .filter(|value| !value.trim().is_empty()),
+                ))
             })
             .optional()?;
 
         Ok(record)
     }
+}
+
+/// Read a `SirMetaRecord` from the thirteen metadata columns starting at `offset`.
+fn sir_meta_from_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<SirMetaRecord> {
+    Ok(SirMetaRecord {
+        id: row.get(offset)?,
+        sir_hash: row.get(offset + 1)?,
+        sir_version: row.get(offset + 2)?,
+        provider: row.get(offset + 3)?,
+        model: row.get(offset + 4)?,
+        generation_pass: row
+            .get::<_, Option<String>>(offset + 5)?
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "scan".to_owned()),
+        reasoning_trace: row.get(offset + 6)?,
+        prompt_hash: row.get(offset + 7)?,
+        staleness_score: row.get(offset + 8)?,
+        updated_at: row.get(offset + 9)?,
+        sir_status: row.get(offset + 10)?,
+        last_error: row.get(offset + 11)?,
+        last_attempt_at: row.get(offset + 12)?,
+    })
 }

@@ -16,7 +16,8 @@ use aether_sir::{
     FileSir, SirAnnotation, canonicalize_sir_json, synthetic_file_sir_id, validate_sir,
 };
 use aether_store::{
-    IntentSnapshot, SirStateStore, SnapshotEntry, SnapshotStore, SqliteStore, TestIntentStore,
+    IntentSnapshot, SirIdentity, SirStateStore, SnapshotEntry, SnapshotStore, SqliteStore,
+    TestIntentStore,
 };
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +65,11 @@ pub struct PreparedRefactorCandidate {
     pub in_cycle: bool,
     pub enrichment: SirEnrichmentContext,
     pub current_generation_pass: Option<String>,
+    /// The identity (hash and history version) of the SIR the enrichment was built
+    /// from, read from the same row as that SIR (`None`: the symbol had no SIR). A deep
+    /// scan generated from this enrichment is persisted only while the symbol still
+    /// holds exactly this SIR.
+    pub baseline_sir_identity: Option<SirIdentity>,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +137,7 @@ struct ScopeSymbolMetrics {
     in_cycle: bool,
     has_fresh_deep_sir: bool,
     baseline_sir: Option<SirAnnotation>,
+    baseline_sir_identity: Option<SirIdentity>,
     current_generation_pass: Option<String>,
 }
 
@@ -216,6 +223,7 @@ pub fn prepare_refactor_prep_with_health_report(
             in_cycle: selected.in_cycle,
             enrichment,
             current_generation_pass: metric.current_generation_pass.clone(),
+            baseline_sir_identity: metric.baseline_sir_identity.clone(),
         });
     }
 
@@ -450,11 +458,17 @@ fn collect_scope_metrics(
         let test_count = store
             .list_test_intents_for_symbol(symbol.id.as_str())?
             .len() as u32;
-        let baseline_sir = store
-            .read_sir_blob(symbol.id.as_str())?
+        // Blob and metadata come from the one row that holds both, so the identity
+        // recorded here is the identity of the SIR the enrichment is built from.
+        let (current_meta, baseline_blob) =
+            match store.get_sir_meta_with_blob(symbol.id.as_str())? {
+                Some((meta, blob)) => (Some(meta), blob),
+                None => (None, None),
+            };
+        let baseline_sir = baseline_blob
             .map(|blob| parse_valid_sir(symbol.id.as_str(), blob.as_str()))
             .transpose()?;
-        let current_meta = store.get_sir_meta(symbol.id.as_str())?;
+        let baseline_sir_identity = current_meta.as_ref().map(SirIdentity::of);
         let current_generation_pass = current_meta
             .as_ref()
             .map(|meta| normalize_generation_pass(meta.generation_pass.as_str()));
@@ -517,6 +531,7 @@ fn collect_scope_metrics(
             in_cycle,
             has_fresh_deep_sir,
             baseline_sir,
+            baseline_sir_identity,
             current_generation_pass,
         });
     }

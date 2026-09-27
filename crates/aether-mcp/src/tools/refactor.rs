@@ -14,7 +14,7 @@ use aether_infer::{
     InferenceProvider, ProviderOverrides, SirContext, load_provider_from_env_or_mock, sir_prompt,
 };
 use aether_sir::{canonicalize_sir_json, sir_hash, validate_sir};
-use aether_store::{SirMetaRecord, SirStateStore, SnapshotStore};
+use aether_store::{SirIdentity, SirMetaRecord, SirStateStore, SnapshotStore};
 use anyhow::{Result as AnyResult, anyhow};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -365,6 +365,7 @@ impl AetherMcpServer {
                     outcome.failed_symbol_ids.push(candidate.symbol.id.clone());
                     self.record_failed_deep_attempt(
                         candidate.symbol.id.as_str(),
+                        candidate.baseline_sir_identity.as_ref(),
                         provider_name.as_str(),
                         model_name.as_str(),
                         err.to_string().as_str(),
@@ -389,11 +390,12 @@ impl AetherMcpServer {
         use_cot: bool,
         timeout_secs: u64,
     ) -> Result<DeepSirPersist, AetherMcpError> {
-        // The SIR write this generation starts from (hash and history version). The
+        // The SIR write this generation starts from (hash and history version), read
+        // from the same row as the SIR the candidate's enrichment was built from. The
         // model call runs unlocked, so the result is persisted only while the store
-        // still holds exactly this write; a SIR another writer stored meanwhile wins.
-        let prior_sir = current_sir_identity(self.state.store.as_ref(), &candidate.symbol.id)
-            .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
+        // still holds exactly this write; a SIR another writer stored meanwhile (even
+        // one landing between the enrichment build and this call) wins.
+        let prior_sir = candidate.baseline_sir_identity.clone();
         let symbol_text = extract_symbol_text(self.workspace(), &candidate.symbol)?;
         let context = build_sir_context(
             &candidate.symbol,
@@ -474,9 +476,13 @@ impl AetherMcpServer {
         Ok(DeepSirPersist::Persisted)
     }
 
+    /// Mark the SIR the failed attempt started from as stale with the error, but only
+    /// that SIR: a symbol whose SIR was replaced while the attempt ran (an injection
+    /// landing meanwhile) keeps the newer SIR's status and provenance untouched.
     fn record_failed_deep_attempt(
         &self,
         symbol_id: &str,
+        attempted_against: Option<&SirIdentity>,
         provider_name: &str,
         model_name: &str,
         error_message: &str,
@@ -486,6 +492,13 @@ impl AetherMcpServer {
         let _inject_guard = acquire_inject_write_lock(&self.state.workspace)
             .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
         let current = self.state.store.get_sir_meta(symbol_id)?;
+        if current.as_ref().map(SirIdentity::of).as_ref() != attempted_against {
+            tracing::info!(
+                symbol_id = %symbol_id,
+                "not marking the SIR stale: it was replaced while the deep scan attempt ran"
+            );
+            return Ok(());
+        }
         let updated_at = current_unix_timestamp();
         self.state.store.upsert_sir_meta(SirMetaRecord {
             id: symbol_id.to_owned(),

@@ -9,7 +9,7 @@ use aether_infer::sir_prompt::{
     sir_enriched_user_prompt, sir_scan_system_prompt, sir_scan_user_prompt,
 };
 use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
-use aether_store::{GraphDependencyEdgeRecord, SirStateStore, SqliteStore};
+use aether_store::{GraphDependencyEdgeRecord, SqliteStore};
 use anyhow::{Context, Result, anyhow};
 
 use crate::batch::hash::compute_prompt_hash;
@@ -18,10 +18,58 @@ use crate::cli::BatchPass;
 use crate::observer::ObserverState;
 use crate::sir_pipeline::{SirIdentity, build_job};
 
-/// The sidecar beside a pass's JSONL files holding each symbol's SIR identity at build
-/// time (see `BuildSummary::prior_sirs`).
+/// The sidecar beside a pass's JSONL files mapping each request's provider key to its
+/// full key (see `BuildSummary::keymap`).
+pub(crate) fn keymap_sidecar_name(pass: &str) -> String {
+    format!("{pass}.keymap.json")
+}
+
+/// The sidecar beside a pass's JSONL files holding each request's SIR identity at
+/// build time (see `BuildSummary::prior_sirs`).
 pub(crate) fn prior_sir_sidecar_name(pass: &str) -> String {
     format!("{pass}.prior_sir.json")
+}
+
+/// A short identifier unique to one build of a pass, carried in its request keys.
+fn new_build_id(pass: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let material = format!("{pass}:{nanos}:{}", std::process::id());
+    aether_core::content_hash(material.as_str())
+        .chars()
+        .take(12)
+        .collect()
+}
+
+/// Write `entries` into the JSON-object sidecar at `path`, keeping entries an earlier
+/// build left there (an unreadable existing file is replaced, with a warning).
+fn merge_sidecar<V: serde::Serialize + serde::de::DeserializeOwned>(
+    path: &Path,
+    entries: &HashMap<String, V>,
+    what: &str,
+) -> Result<()> {
+    let mut merged: HashMap<String, V> = match fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|err| {
+            tracing::warn!(path = %path.display(), error = %err, "replacing unreadable {what}");
+            HashMap::new()
+        }),
+        Err(_) => HashMap::new(),
+    };
+    for (key, value) in entries {
+        merged.insert(
+            key.clone(),
+            serde_json::from_value(
+                serde_json::to_value(value)
+                    .with_context(|| format!("failed to serialize {what}"))?,
+            )
+            .with_context(|| format!("failed to serialize {what}"))?,
+        );
+    }
+    let json =
+        serde_json::to_string(&merged).with_context(|| format!("failed to serialize {what}"))?;
+    fs::write(path, json).with_context(|| format!("failed to write {what} {}", path.display()))
 }
 
 #[derive(Debug, Clone)]
@@ -32,10 +80,15 @@ pub(crate) struct BuildSummary {
     pub unresolved_symbols: usize,
     /// Maps symbol_id → full batch key (`symbol_id|prompt_hash`) for providers
     /// that truncate the key in their custom_id field (e.g. Anthropic's 64-char limit).
+    /// Keyed by the provider's request key for each full key (`BatchProvider::request_key`).
     pub keymap: HashMap<String, String>,
-    /// The SIR each symbol held when its request was built (`None`: no SIR), so ingest
-    /// can tell a result whose symbol was written meanwhile (an injection, say) and
-    /// leave that newer SIR alone.
+    /// This build's identifier, carried in every request key (`symbol_id|prompt_hash|build_id`)
+    /// and so in every result, so a result is matched to the sidecar entries of the
+    /// build that produced it and never to a later build's for the same pass.
+    pub build_id: String,
+    /// The SIR each symbol held when its request was built (`None`: no SIR), keyed by
+    /// the full request key, so ingest can tell a result whose symbol was written
+    /// meanwhile (an injection, say) and leave that newer SIR alone.
     pub prior_sirs: HashMap<String, Option<SirIdentity>>,
 }
 
@@ -117,6 +170,7 @@ pub(crate) fn build_pass_jsonl_for_ids(
         skipped: 0,
         unresolved_symbols: 0,
         keymap: HashMap::new(),
+        build_id: new_build_id(pass_config.pass.as_str()),
         prior_sirs: HashMap::new(),
     };
     let symbol_ids = match candidate_ids {
@@ -165,16 +219,6 @@ pub(crate) fn build_pass_jsonl_for_ids(
         );
     }
 
-    let baseline_sirs = if matches!(pass_config.pass, BatchPass::Scan) {
-        HashMap::new()
-    } else {
-        parse_sir_map(
-            &store
-                .list_sir_blobs_for_ids(&candidate_ids)
-                .context("failed to prefetch baseline SIR blobs for batch build")?,
-        )
-    };
-
     let mut file_rollup_ids = HashSet::new();
     let mut neighbor_ids = HashSet::new();
     if !matches!(pass_config.pass, BatchPass::Scan) {
@@ -218,6 +262,17 @@ pub(crate) fn build_pass_jsonl_for_ids(
             }
         };
 
+        // The symbol's current SIR and its identity come from one row read before the
+        // prompt is built: the prompt (for triage and deep passes) describes this SIR,
+        // and ingest applies the result only while the symbol still holds exactly it.
+        let (existing_meta, baseline_blob) = match store
+            .get_sir_meta_with_blob(symbol_id.as_str())
+            .with_context(|| format!("failed to read SIR state for {symbol_id}"))?
+        {
+            Some((meta, blob)) => (Some(meta), blob),
+            None => (None, None),
+        };
+
         // Build per-symbol user prompt and collect neighbor entries for hash.
         let (neighbor_entries, user_prompt) = match pass_config.pass {
             BatchPass::Scan => (
@@ -225,7 +280,16 @@ pub(crate) fn build_pass_jsonl_for_ids(
                 sir_scan_user_prompt(&job.symbol_text, &job.context),
             ),
             BatchPass::Triage | BatchPass::Deep => {
-                let Some(baseline_sir) = baseline_sirs.get(symbol_id.as_str()).cloned() else {
+                let baseline_sir = baseline_blob
+                    .as_deref()
+                    .and_then(|blob| match serde_json::from_str::<SirAnnotation>(blob) {
+                        Ok(sir) => Some(sir),
+                        Err(err) => {
+                            tracing::warn!(symbol_id = %symbol_id, error = %err, "skipping invalid SIR blob during batch build");
+                            None
+                        }
+                    });
+                let Some(baseline_sir) = baseline_sir else {
                     tracing::warn!(
                         symbol_id = %symbol_id,
                         pass = pass_config.pass.as_str(),
@@ -263,9 +327,6 @@ pub(crate) fn build_pass_jsonl_for_ids(
             &neighbor_texts,
             pass_config.config_fingerprint(provider_name).as_str(),
         );
-        let existing_meta = store
-            .get_sir_meta(symbol_id.as_str())
-            .with_context(|| format!("failed to read SIR metadata for {symbol_id}"))?;
         let existing_hash = existing_meta
             .as_ref()
             .and_then(|record| record.prompt_hash.as_deref());
@@ -273,10 +334,6 @@ pub(crate) fn build_pass_jsonl_for_ids(
             summary.skipped += 1;
             continue;
         }
-        summary.prior_sirs.insert(
-            symbol_id.clone(),
-            existing_meta.as_ref().map(SirIdentity::of),
-        );
 
         if writer.is_none() || current_lines >= runtime.jsonl_chunk_size {
             chunk_index += 1;
@@ -293,8 +350,13 @@ pub(crate) fn build_pass_jsonl_for_ids(
             summary.files.push(file_path);
         }
 
-        let key_str = format!("{}|{}", symbol_id, prompt_hash);
-        summary.keymap.insert(symbol_id.clone(), key_str.clone());
+        let key_str = format!("{}|{}|{}", symbol_id, prompt_hash, summary.build_id);
+        summary
+            .keymap
+            .insert(provider.request_key(&key_str), key_str.clone());
+        summary
+            .prior_sirs
+            .insert(key_str.clone(), existing_meta.as_ref().map(SirIdentity::of));
         let line = provider.format_request(
             &key_str,
             &system_prompt,
@@ -319,33 +381,25 @@ pub(crate) fn build_pass_jsonl_for_ids(
             .context("failed to flush batch JSONL output")?;
     }
 
-    // Write keymap sidecar so ingest can recover full keys from providers that
-    // truncate custom_id (e.g. Anthropic's 64-char limit).
+    // Write the keymap sidecar so ingest can recover full keys from providers that
+    // truncate custom_id (e.g. Anthropic's 64-char limit), and the prior-SIR sidecar:
+    // the identity (hash and history version) each symbol's SIR had when its request
+    // was built, which ingest compares under the inject lock right before persisting a
+    // result, skipping results for symbols whose SIR moved on in the meantime. Both are
+    // keyed per build (the build id is part of every key) and merged into whatever an
+    // earlier build of the same pass left in the directory, so a result from that
+    // earlier build, ingested later, still finds its own entries.
     if !summary.keymap.is_empty() {
         let keymap_path = runtime
             .batch_dir
-            .join(format!("{}.keymap.json", pass_config.pass.as_str()));
-        let keymap_json =
-            serde_json::to_string(&summary.keymap).context("failed to serialize batch keymap")?;
-        fs::write(&keymap_path, keymap_json)
-            .with_context(|| format!("failed to write batch keymap {}", keymap_path.display()))?;
+            .join(keymap_sidecar_name(pass_config.pass.as_str()));
+        merge_sidecar(&keymap_path, &summary.keymap, "batch keymap")?;
     }
-    // Write the prior-SIR sidecar: the identity (hash and history version) each
-    // symbol's SIR had when the request was built. Ingest compares it, under the inject
-    // lock, right before persisting a result and skips results for symbols whose SIR
-    // moved on in the meantime.
     if !summary.prior_sirs.is_empty() {
         let prior_path = runtime
             .batch_dir
             .join(prior_sir_sidecar_name(pass_config.pass.as_str()));
-        let prior_json = serde_json::to_string(&summary.prior_sirs)
-            .context("failed to serialize batch prior-SIR sidecar")?;
-        fs::write(&prior_path, prior_json).with_context(|| {
-            format!(
-                "failed to write batch prior-SIR sidecar {}",
-                prior_path.display()
-            )
-        })?;
+        merge_sidecar(&prior_path, &summary.prior_sirs, "batch prior-SIR sidecar")?;
     }
 
     Ok(summary)
@@ -515,4 +569,78 @@ fn build_caller_contracts_map(
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use aether_store::SirIdentity;
+    use tempfile::tempdir;
+
+    use super::{merge_sidecar, new_build_id};
+
+    #[test]
+    fn build_ids_are_short_and_distinct() {
+        let first = new_build_id("triage");
+        let second = new_build_id("triage");
+        assert_eq!(first.len(), 12);
+        assert!(first.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn merging_a_sidecar_keeps_an_earlier_builds_entries() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("triage.prior_sir.json");
+        let first_identity = Some(SirIdentity {
+            sir_hash: "h1".to_owned(),
+            sir_version: 1,
+        });
+        merge_sidecar(
+            &path,
+            &HashMap::from([("sym|p|build-1".to_owned(), first_identity.clone())]),
+            "batch prior-SIR sidecar",
+        )
+        .expect("first build");
+        // A later build of the same pass, after the symbol's SIR moved on.
+        merge_sidecar(
+            &path,
+            &HashMap::from([(
+                "sym|p|build-2".to_owned(),
+                Some(SirIdentity {
+                    sir_hash: "h2".to_owned(),
+                    sir_version: 2,
+                }),
+            )]),
+            "batch prior-SIR sidecar",
+        )
+        .expect("second build");
+
+        let merged: HashMap<String, Option<SirIdentity>> =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read sidecar"))
+                .expect("parse sidecar");
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged["sym|p|build-1"], first_identity);
+        assert_eq!(
+            merged["sym|p|build-2"],
+            Some(SirIdentity {
+                sir_hash: "h2".to_owned(),
+                sir_version: 2,
+            })
+        );
+
+        // An unreadable sidecar is replaced rather than failing the build.
+        std::fs::write(&path, "not json").expect("corrupt sidecar");
+        merge_sidecar(
+            &path,
+            &HashMap::from([("sym|p|build-3".to_owned(), None::<SirIdentity>)]),
+            "batch prior-SIR sidecar",
+        )
+        .expect("third build");
+        let merged: HashMap<String, Option<SirIdentity>> =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read sidecar"))
+                .expect("parse sidecar");
+        assert_eq!(merged.len(), 1);
+    }
 }

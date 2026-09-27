@@ -11,7 +11,7 @@ use aether_store::{
 };
 use anyhow::{Context, Result, anyhow};
 
-use crate::batch::build::prior_sir_sidecar_name;
+use crate::batch::build::{keymap_sidecar_name, prior_sir_sidecar_name};
 use crate::batch::hash::diff_prompt_hashes;
 use crate::batch::{BatchProvider, BatchResultLine, PassConfig};
 use crate::continuous::cosine_distance_from_embeddings;
@@ -312,7 +312,7 @@ fn prepare_symbol(
     keymap: &HashMap<String, String>,
     prior_sirs: &HashMap<String, Option<SirIdentity>>,
 ) -> Result<Option<PreparedSymbol>> {
-    let (symbol_id, prompt_hash, sir_json, reasoning_trace) =
+    let (symbol_id, prompt_hash, request_key, sir_json, reasoning_trace) =
         match provider.parse_result_line(raw_line)? {
             BatchResultLine::Success {
                 key,
@@ -327,7 +327,13 @@ fn prepare_symbol(
                     &key
                 };
                 let (sid, phash) = parse_key(resolved_key)?;
-                (sid.to_owned(), phash.to_owned(), text, reasoning_trace)
+                (
+                    sid.to_owned(),
+                    phash.to_owned(),
+                    resolved_key.to_owned(),
+                    text,
+                    reasoning_trace,
+                )
             }
             BatchResultLine::Error { key, message } => {
                 return Err(anyhow!("batch response error (key={:?}): {}", key, message));
@@ -402,7 +408,7 @@ fn prepare_symbol(
         reasoning_trace,
         commit_hash: None,
         prior_sir: prior_sirs
-            .get(&symbol_id)
+            .get(&request_key)
             .map_or(PriorSir::Unrecorded, |identity| {
                 PriorSir::recorded(identity.clone())
             }),
@@ -487,8 +493,13 @@ pub(crate) fn write_fingerprint_row(
         .with_context(|| format!("failed to insert fingerprint history row for {symbol_id}"))
 }
 
+/// Split a request key `symbol_id|prompt_hash[|build_id]` into its symbol id and prompt
+/// hash (the build id only distinguishes sidecar entries, see `BuildSummary::build_id`).
 fn parse_key(key: &str) -> Result<(&str, &str)> {
-    let (symbol_id, prompt_hash) = key.split_once('|').unwrap_or((key, "unknown"));
+    let (symbol_id, rest) = key.split_once('|').unwrap_or((key, "unknown"));
+    let prompt_hash = rest
+        .split_once('|')
+        .map_or(rest, |(prompt_hash, _)| prompt_hash);
     let symbol_id = symbol_id.trim();
     let prompt_hash = prompt_hash.trim();
     if symbol_id.is_empty() || prompt_hash.is_empty() {
@@ -535,15 +546,15 @@ fn load_prior_sirs(results_path: &Path, pass: &str) -> HashMap<String, Option<Si
 
 /// Try to load a keymap sidecar written during JSONL build.
 ///
-/// The keymap maps `symbol_id → symbol_id|prompt_hash`, allowing ingest to
-/// recover full batch keys from providers that truncate custom_id
-/// (e.g. Anthropic's 64-char limit).
+/// The keymap maps each provider request key to its full `symbol_id|prompt_hash|build_id`
+/// key, allowing ingest to recover full batch keys from providers that truncate
+/// custom_id (e.g. Anthropic's 64-char limit).
 fn load_keymap(results_path: &Path, pass: &str) -> HashMap<String, String> {
     let batch_dir = match results_path.parent() {
         Some(dir) => dir,
         None => return HashMap::new(),
     };
-    let keymap_path = batch_dir.join(format!("{pass}.keymap.json"));
+    let keymap_path = batch_dir.join(keymap_sidecar_name(pass));
     match std::fs::read_to_string(&keymap_path) {
         Ok(content) => serde_json::from_str(&content).unwrap_or_else(|err| {
             tracing::warn!(
@@ -765,6 +776,17 @@ vector_backend = "sqlite"
     }
 
     #[test]
+    fn parse_key_reads_two_and_three_part_keys() {
+        assert_eq!(parse_key("sym|hash").expect("two parts"), ("sym", "hash"));
+        assert_eq!(
+            parse_key("sym|hash|0123456789ab").expect("three parts"),
+            ("sym", "hash")
+        );
+        assert!(parse_key("|hash").is_err());
+        assert!(parse_key("sym|").is_err());
+    }
+
+    #[test]
     fn prepare_symbol_skips_a_result_whose_sir_moved_on_since_the_build() {
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();
@@ -799,7 +821,8 @@ vector_backend = "sqlite"
         // The batch was built while the store held the scan SIR...
         persist(&demo_sir(), "scan");
         let built_against = current_sir_identity(&store, "sym-late").expect("identity");
-        let prior_sirs = HashMap::from([("sym-late".to_owned(), built_against)]);
+        let key = "sym-late|prompt-late|build-1".to_owned();
+        let prior_sirs = HashMap::from([(key.clone(), built_against)]);
 
         // ...and an injection replaced it before the result came back.
         let reviewed = SirAnnotation {
@@ -815,7 +838,7 @@ vector_backend = "sqlite"
             ..demo_sir()
         };
         let provider = StubBatchProvider {
-            key: "sym-late|prompt-late".to_owned(),
+            key: key.clone(),
             text: serde_json::to_string(&batch_sir).expect("serialize sir"),
             reasoning_trace: None,
         };
@@ -850,7 +873,7 @@ vector_backend = "sqlite"
         );
 
         // Built against the SIR the store still holds, the result is applied.
-        let prior_sirs = HashMap::from([("sym-late".to_owned(), reviewed_identity)]);
+        let prior_sirs = HashMap::from([(key, reviewed_identity)]);
         let outcome = prepare_symbol(
             &pipeline,
             &store,

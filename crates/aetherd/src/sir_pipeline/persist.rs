@@ -1,33 +1,13 @@
 use aether_core::{Symbol, content_hash};
 use aether_parse::TestIntent;
 use aether_sir::SirAnnotation;
-use aether_store::{SirMetaRecord, SirStateStore, SqliteStore, SymbolRecord, TestIntentRecord};
+use aether_store::{SirStateStore, SqliteStore, SymbolRecord, TestIntentRecord};
 use anyhow::{Context, Result, anyhow};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::SIR_GENERATION_PASS_SCAN;
 
-/// The identity of one stored SIR write: its content hash together with the history
-/// version the store assigned to it. A hash alone does not identify a write, because
-/// the stored SIR can cycle back to an earlier content (`H1 → H2 → H1`) through two
-/// injections; the history version only ever grows, so the pair tells those apart.
-/// Every writer that plans a write against the SIR it observed compares this pair,
-/// under the inject lock, right before it writes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SirIdentity {
-    pub sir_hash: String,
-    pub sir_version: i64,
-}
-
-impl SirIdentity {
-    pub fn of(meta: &SirMetaRecord) -> Self {
-        Self {
-            sir_hash: meta.sir_hash.clone(),
-            sir_version: meta.sir_version,
-        }
-    }
-}
+pub use aether_store::SirIdentity;
 
 /// The identity of the SIR a symbol holds right now (`None`: no SIR stored).
 pub fn current_sir_identity(store: &SqliteStore, symbol_id: &str) -> Result<Option<SirIdentity>> {
