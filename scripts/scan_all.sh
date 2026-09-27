@@ -36,6 +36,12 @@ if [ "$BATCH_SIZE" -lt 1 ] || [ "$MAX_PARALLEL" -lt 1 ]; then
   exit 1
 fi
 MAX_ROUNDS="${MAX_ROUNDS:-50}"
+# A non-numeric cap would make the round test below fail quietly (a failed `[` in an `if`
+# is not an error under `set -e`) and the cap would never apply.
+if ! [[ "$MAX_ROUNDS" =~ ^[0-9]+$ ]] || [ "$MAX_ROUNDS" -lt 1 ]; then
+  echo "error: MAX_ROUNDS must be a positive integer (got $MAX_ROUNDS)" >&2
+  exit 1
+fi
 
 # The workspace is the directory this script was generated into (its parent), not the
 # Git root: an AETHER workspace may sit inside a larger repository.

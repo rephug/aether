@@ -670,10 +670,11 @@ fn load_keymap(results_path: &Path, pass: &str) -> Result<HashMap<String, String
 
 /// The union of every `<pass>.<build_id>.<kind>.json` beside the results (each build
 /// writes its own, and keys carry the build id, so entries never collide) plus the
-/// pre-build-id `<pass>.<kind>.json` when one is present. A sidecar that exists but
-/// cannot be read fails the ingest naming the file (every result of that build would
-/// otherwise be refused as origin-less with nothing to say why); an unparsable one is
-/// skipped with a warning naming the file.
+/// pre-build-id `<pass>.<kind>.json` when one is present. A batch directory that cannot
+/// be listed, an entry the listing fails to yield, and a sidecar that exists but cannot
+/// be read all fail the ingest naming the directory or file (every result of that build
+/// would otherwise be refused as origin-less with nothing to say why); an unparsable
+/// sidecar is skipped with a warning naming the file.
 fn load_sidecars<V: serde::de::DeserializeOwned>(
     results_path: &Path,
     pass: &str,
@@ -692,8 +693,19 @@ fn load_sidecars<V: serde::de::DeserializeOwned>(
     let suffix = format!(".{kind}.json");
     let legacy = format!("{pass}.{kind}.json");
     let mut merged = HashMap::new();
+    // An entry the listing fails to yield is an error too, not a file to leave out: were
+    // it this build's sidecar, every result of the build would be refused as origin-less
+    // with neither the path nor the cause reported.
     let mut paths = entries
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| {
+            format!(
+                "failed to read an entry of the batch directory {} while looking for {kind} sidecars",
+                batch_dir.display()
+            )
+        })?
+        .into_iter()
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
