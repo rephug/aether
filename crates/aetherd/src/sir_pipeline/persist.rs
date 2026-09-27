@@ -63,6 +63,11 @@ pub(crate) struct UpsertSirIntentPayload {
     /// transaction as the write it describes (batch ingest reads it back as proof that
     /// a row is its own earlier write).
     pub(crate) prompt_hash: Option<String>,
+    /// The content hash of the symbol text this SIR describes, when the writer knows it
+    /// (the daemon's jobs, batch results with an origin). Written into the `sir` row
+    /// with the leaf, so a later job for edited text can tell that the stored SIR is of
+    /// older text; a pending replay re-checks it against the file before writing.
+    pub(crate) source_hash: Option<String>,
 }
 
 impl UpsertSirIntentPayload {
@@ -76,6 +81,7 @@ impl UpsertSirIntentPayload {
             "reasoning_trace": self.reasoning_trace,
             "commit_hash": self.commit_hash,
             "prompt_hash": self.prompt_hash,
+            "source_hash": self.source_hash,
         });
         match &self.prior_sir {
             PriorSir::Unrecorded => {}
@@ -134,6 +140,15 @@ impl UpsertSirIntentPayload {
                 ));
             }
         };
+        let source_hash = match object.get("source_hash") {
+            Some(Value::String(value)) if !value.trim().is_empty() => Some(value.clone()),
+            Some(Value::String(_)) | Some(Value::Null) | None => None,
+            Some(_) => {
+                return Err(anyhow!(
+                    "payload field 'source_hash' must be a string or null"
+                ));
+            }
+        };
         let prior_sir = match object.get("prior_sir") {
             None => PriorSir::Unrecorded,
             Some(Value::Null) => PriorSir::Absent,
@@ -158,6 +173,7 @@ impl UpsertSirIntentPayload {
             commit_hash,
             prior_sir,
             prompt_hash,
+            source_hash,
         })
     }
 }

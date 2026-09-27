@@ -319,6 +319,7 @@ impl SirPipeline {
             commit_hash: commit_hash.map(str::to_owned),
             prior_sir: PriorSir::recorded(generated.prior_sir.clone()),
             prompt_hash: None,
+            source_hash: Some(generated.source_hash.clone()),
         };
         let payload_json = match payload.to_json_string() {
             Ok(json) => json,
@@ -606,8 +607,9 @@ impl SirPipeline {
             self.prepare_sir_for_persistence(store, &payload.symbol, &payload.sir)?;
         let attempted_at = unix_timestamp_secs();
         // Higher-quality passes still need to promote metadata even when the
-        // canonical SIR content is identical to an earlier pass.
-        store.persist_sir_state_atomically(
+        // canonical SIR content is identical to an earlier pass. The source hash the
+        // payload carries (if any) is recorded with the leaf, never cleared to unknown.
+        store.persist_sir_state_atomically_with_source(
             SirMetaRecord {
                 id: payload.symbol.id.clone(),
                 sir_hash: sir_hash_value.clone(),
@@ -626,6 +628,7 @@ impl SirPipeline {
             canonical_json.as_str(),
             payload.commit_hash.as_deref(),
             write_intent_id,
+            payload.source_hash.as_deref(),
         )?;
 
         Ok((canonical_json, sir_hash_value))

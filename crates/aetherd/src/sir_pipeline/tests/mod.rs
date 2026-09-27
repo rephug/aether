@@ -483,6 +483,7 @@ fn payload_for(symbol: &Symbol, sir: &SirAnnotation, pass: &str) -> UpsertSirInt
         reasoning_trace: None,
         commit_hash: None,
         prompt_hash: None,
+        source_hash: None,
         prior_sir: PriorSir::Unrecorded,
     }
 }

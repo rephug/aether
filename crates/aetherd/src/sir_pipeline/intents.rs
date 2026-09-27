@@ -125,6 +125,24 @@ impl SirPipeline {
                     .with_context(|| format!("failed to retire superseded intent {intent_id}"))?;
                 return Ok(());
             }
+            // A payload that says which text its SIR describes is replayed only while
+            // the symbol still has that text: after an edit the daemon regenerates the
+            // symbol from the new source, and this older description would only
+            // pre-empt that job and record itself as fresh.
+            if let Some(planned_source) = payload.source_hash.as_deref()
+                && current_source_hash(&self.workspace_root, &payload.symbol).as_deref()
+                    != Some(planned_source)
+            {
+                tracing::info!(
+                    intent_id = %intent_id,
+                    symbol_id = %payload.symbol.id,
+                    "retiring write intent: the symbol source changed since it was planned"
+                );
+                store
+                    .mark_intent_complete(intent_id)
+                    .with_context(|| format!("failed to retire superseded intent {intent_id}"))?;
+                return Ok(());
+            }
             let persisted = self
                 .persist_sir_payload_into_sqlite(store, payload, Some(intent_id))
                 .with_context(|| format!("failed sqlite write stage for intent {intent_id}"))?;

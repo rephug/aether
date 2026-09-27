@@ -198,6 +198,7 @@ fn prepare_symbol_skips_a_result_whose_sir_moved_on_since_the_build() {
                     reasoning_trace: None,
                     commit_hash: None,
                     prompt_hash: None,
+                    source_hash: None,
                     prior_sir: PriorSir::Unrecorded,
                 },
                 None,
@@ -360,6 +361,11 @@ fn prepare_symbol_skips_a_result_whose_sir_moved_on_since_the_build() {
         .expect("sir meta exists");
     assert_eq!(meta.sir_hash, aether_sir::sir_hash(&batch_sir));
     assert_eq!(meta.prompt_hash.as_deref(), Some("prompt-late"));
+    assert_eq!(
+        store.get_sir_source_hash(id).expect("source hash"),
+        Some(symbol.content_hash.clone()),
+        "the origin's source hash is recorded with the leaf"
+    );
 }
 
 #[test]
@@ -389,6 +395,7 @@ fn prepare_symbol_resumes_a_result_an_earlier_attempt_already_persisted() {
                     reasoning_trace: None,
                     commit_hash: None,
                     prompt_hash: None,
+                    source_hash: None,
                     prior_sir: PriorSir::Unrecorded,
                 },
                 None,
@@ -565,6 +572,7 @@ fn a_resumed_result_writes_its_fingerprint_row_once_against_its_true_predecessor
                 reasoning_trace: None,
                 commit_hash: None,
                 prompt_hash: None,
+                source_hash: None,
                 prior_sir: PriorSir::Unrecorded,
             },
             None,
@@ -709,6 +717,7 @@ fn a_resumed_result_writes_its_fingerprint_row_once_against_its_true_predecessor
                 reasoning_trace: None,
                 commit_hash: None,
                 prompt_hash: None,
+                source_hash: None,
                 prior_sir: PriorSir::Unrecorded,
             },
             None,
@@ -807,6 +816,7 @@ fn prepare_symbol_promotes_metadata_when_sir_hash_is_unchanged() {
                 reasoning_trace: None,
                 commit_hash: None,
                 prompt_hash: None,
+                source_hash: None,
                 prior_sir: PriorSir::Unrecorded,
             },
             None,

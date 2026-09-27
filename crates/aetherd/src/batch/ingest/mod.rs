@@ -476,6 +476,9 @@ fn prepare_symbol(
         // Written with the leaf, in its transaction: the row then says which batch
         // request produced it (see the resume check below).
         prompt_hash: Some(prompt_hash.clone()),
+        // The origin's source hash (the text the prompt was built from) is recorded with
+        // the leaf too, so a later job for edited text can tell this SIR is of older text.
+        source_hash: origin.map(|origin| origin.source_hash.clone()),
     };
     // The result was generated from the SIR and the symbol source the request was built
     // from, possibly hours ago. Under the inject lock every leaf writer shares, persist

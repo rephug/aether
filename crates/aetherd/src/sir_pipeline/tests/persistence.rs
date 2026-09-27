@@ -158,6 +158,7 @@ fn persist_sir_payload_updates_metadata_when_hash_is_unchanged() {
                 reasoning_trace: None,
                 commit_hash: None,
                 prompt_hash: None,
+                source_hash: None,
                 prior_sir: PriorSir::Unrecorded,
             },
             None,
@@ -176,6 +177,7 @@ fn persist_sir_payload_updates_metadata_when_hash_is_unchanged() {
                 reasoning_trace: Some("triage reasoning".to_owned()),
                 commit_hash: None,
                 prompt_hash: None,
+                source_hash: None,
                 prior_sir: PriorSir::Unrecorded,
             },
             None,
@@ -250,6 +252,13 @@ fn intent_payload_round_trips_the_prior_sir_record() {
     let json = payload.to_json_string().expect("serialize");
     let parsed = UpsertSirIntentPayload::from_json_str(&json).expect("parse");
     assert_eq!(parsed.prior_sir, PriorSir::Present(identity.clone()));
+
+    // The source hash rides along when known and reads back as unknown otherwise.
+    assert_eq!(parsed.source_hash, None);
+    payload.source_hash = Some("source-1".to_owned());
+    let json = payload.to_json_string().expect("serialize");
+    let parsed = UpsertSirIntentPayload::from_json_str(&json).expect("parse");
+    assert_eq!(parsed.source_hash.as_deref(), Some("source-1"));
     assert!(parsed.prior_sir.still_holds(Some(&identity)));
     assert!(!parsed.prior_sir.still_holds(None));
     assert!(!parsed.prior_sir.still_holds(Some(&SirIdentity {
@@ -710,6 +719,89 @@ fn a_prompt_override_binds_the_job_to_the_baseline_it_was_built_from() {
     assert_eq!(prepare(PriorSir::recorded(baseline.clone())), baseline);
     // ...while an unrecorded one binds to whatever the row holds when queued.
     assert_eq!(prepare(PriorSir::Unrecorded), replacement);
+}
+
+#[test]
+fn a_pending_intent_is_replayed_only_while_the_symbol_still_has_the_text_it_describes() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    write_embeddings_only_config(workspace);
+
+    let store = SqliteStore::open(workspace).expect("open store");
+    let pipeline = build_write_pipeline(workspace, Arc::new(PanicInferenceProvider));
+    let older = "fn replayed() {}\n";
+    let (symbol, record) = parsed_symbol(workspace, "src/lib.rs", older);
+    store.upsert_symbol(record).expect("upsert symbol");
+    let symbol_id = symbol.id.clone();
+    let intent_for = |intent_id: &str, payload: &UpsertSirIntentPayload| WriteIntent {
+        intent_id: intent_id.to_owned(),
+        symbol_id: symbol_id.clone(),
+        file_path: symbol.file_path.clone(),
+        operation: IntentOperation::UpsertSir,
+        status: WriteIntentStatus::Pending,
+        payload_json: Some(payload.to_json_string().expect("payload json")),
+        created_at: 1_700_000_000,
+        completed_at: None,
+        error_message: None,
+    };
+
+    // Planned for the text on disk: the replay writes the leaf and records that text.
+    let mut payload = payload_for(&symbol, &demo_sir(), SIR_GENERATION_PASS_SCAN);
+    payload.prior_sir = PriorSir::Absent;
+    payload.source_hash = Some(symbol.content_hash.clone());
+    let current = intent_for("intent-current-text", &payload);
+    store.create_write_intent(&current).expect("create intent");
+    pipeline
+        .replay_upsert_sir_intent(&store, &current, &payload, false)
+        .expect("replay");
+    assert_eq!(
+        store.read_sir_blob(&symbol_id).expect("blob").as_deref(),
+        Some(canonicalize_sir_json(&payload.sir).as_str())
+    );
+    assert_eq!(
+        store.get_sir_source_hash(&symbol_id).expect("source hash"),
+        Some(symbol.content_hash.clone()),
+        "the payload's source hash is recorded with the leaf"
+    );
+
+    // Planned for that text too, but the body was edited before the replay (same id):
+    // the intent is retired without writing, and the daemon's job for the new text is
+    // left to describe it.
+    let mut stale = payload_for(
+        &symbol,
+        &SirAnnotation {
+            intent: "Describes the older text".to_owned(),
+            ..demo_sir()
+        },
+        SIR_GENERATION_PASS_SCAN,
+    );
+    stale.prior_sir =
+        PriorSir::recorded(current_sir_identity(&store, &symbol_id).expect("identity"));
+    stale.source_hash = Some(symbol.content_hash.clone());
+    let edited = parsed_symbols(workspace, "src/lib.rs", "fn replayed() {\n    2\n}\n")
+        .into_iter()
+        .next()
+        .expect("the edited source declares the symbol");
+    assert_eq!(edited.id, symbol_id);
+    let pending = intent_for("intent-older-text", &stale);
+    store.create_write_intent(&pending).expect("create intent");
+    pipeline
+        .replay_upsert_sir_intent(&store, &pending, &stale, false)
+        .expect("replay");
+    assert_eq!(
+        store
+            .get_intent("intent-older-text")
+            .expect("intent")
+            .expect("intent exists")
+            .status,
+        WriteIntentStatus::Complete,
+        "an intent for text the symbol no longer has is retired"
+    );
+    assert_eq!(
+        store.read_sir_blob(&symbol_id).expect("blob").as_deref(),
+        Some(canonicalize_sir_json(&payload.sir).as_str()),
+        "the older description is not written"
+    );
 }
 
 #[test]
