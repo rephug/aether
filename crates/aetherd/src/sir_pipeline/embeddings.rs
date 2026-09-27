@@ -3,6 +3,10 @@
 
 use super::*;
 
+/// How many times a guarded embedding write is retried against the vector another
+/// writer stored meanwhile for the same SIR under a different provider or model.
+const EMBEDDING_WRITE_ATTEMPTS: usize = 3;
+
 impl SirPipeline {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn process_pending_embeddings(
@@ -552,40 +556,63 @@ impl SirPipeline {
             return Ok(EmbeddingRefresh::Superseded);
         }
 
-        let updated_at = unix_timestamp_secs();
         // The write is conditional on the vector the check observed still being the
         // stored one: a writer that takes no embedding lock (the daemon's index or
         // regenerate pass) may have stored the newer SIR's vector during the provider
         // call, and a plain upsert keyed on the symbol would overwrite it.
-        let written = self
-            .runtime
-            .block_on(self.vector_store.upsert_embedding_if_matches(
-                SymbolEmbeddingRecord {
-                    symbol_id: symbol_id.to_owned(),
-                    sir_hash: sir_hash_value.to_owned(),
-                    provider: needed.provider.clone(),
-                    model: needed.model.clone(),
-                    embedding,
-                    updated_at,
-                },
-                needed.existing.as_ref(),
-            ))
-            .with_context(|| format!("failed to store embedding for {symbol_id}"))?;
-        if !written {
-            // Another writer got there first and its vector stands: for this very SIR
-            // nothing is missing, otherwise this call's SIR has been superseded.
+        let mut expected = needed.existing.clone();
+        let mut attempts = 0usize;
+        let updated_at = loop {
+            let updated_at = unix_timestamp_secs();
+            let written = self
+                .runtime
+                .block_on(self.vector_store.upsert_embedding_if_matches(
+                    SymbolEmbeddingRecord {
+                        symbol_id: symbol_id.to_owned(),
+                        sir_hash: sir_hash_value.to_owned(),
+                        provider: needed.provider.clone(),
+                        model: needed.model.clone(),
+                        embedding: embedding.clone(),
+                        updated_at,
+                    },
+                    expected.as_ref(),
+                ))
+                .with_context(|| format!("failed to store embedding for {symbol_id}"))?;
+            if written {
+                break updated_at;
+            }
+            // Another writer got there first. Its vector stands when it is the one this
+            // call needs: this very SIR under the configured provider and model. A
+            // vector for another SIR means this call's SIR has been superseded. A vector
+            // for this SIR under another provider or model (the embeddings-only pass
+            // prefetches its metadata before taking the symbol's lock, so a writer with
+            // a different identity may have stored since) leaves the configured identity
+            // without a vector, so the write is retried against what is stored now.
             let stored = self
                 .runtime
                 .block_on(self.vector_store.get_embedding_meta(symbol_id))
                 .with_context(|| format!("failed to read embedding metadata for {symbol_id}"))?;
-            return Ok(
-                if stored.is_some_and(|meta| meta.sir_hash == sir_hash_value) {
-                    EmbeddingRefresh::Unchanged
-                } else {
-                    EmbeddingRefresh::Superseded
-                },
-            );
-        }
+            match stored {
+                Some(meta) if meta.sir_hash != sir_hash_value => {
+                    return Ok(EmbeddingRefresh::Superseded);
+                }
+                Some(meta) if meta.provider == needed.provider && meta.model == needed.model => {
+                    return Ok(EmbeddingRefresh::Unchanged);
+                }
+                other => {
+                    attempts += 1;
+                    if attempts >= EMBEDDING_WRITE_ATTEMPTS {
+                        anyhow::bail!(
+                            "failed to store embedding for {symbol_id}: the stored vector changed under {EMBEDDING_WRITE_ATTEMPTS} consecutive writes"
+                        );
+                    }
+                    if !still_current()? {
+                        return Ok(EmbeddingRefresh::Superseded);
+                    }
+                    expected = other;
+                }
+            }
+        };
 
         if !still_current()? {
             // The SIR changed between the last check and the write: the vector just

@@ -91,8 +91,10 @@ label (it may read `dir:web` or `shared` for a synthetic unit).
    SIR), and the target query above keeps selecting it until the rerun succeeds. A leaf
    still marked `rollup_failed` or `rollup_pending` from an earlier session (it exited
    before the rollup was rebuilt) is selected too; injecting your new annotation for it
-   returns `status: "rollup_repaired"`: the stored high-confidence SIR was kept, its
-   rollup rebuilt and the marker cleared. Count that symbol as done and move on.
+   returns `status: "rollup_repaired"` (the stored high-confidence SIR was kept, its
+   rollup rebuilt and the marker cleared) or `status: "injected"` (the stored leaf
+   described older text, or never recorded which text it described, so yours replaced
+   it). Count that symbol as done and move on.
 6. Stop after `batch-size` symbols and print how many targets remain (rerun `/scan` or let
    `scripts/scan_all.sh` loop).
 

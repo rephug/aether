@@ -393,14 +393,19 @@ impl AetherMcpServer {
         // was bound to (recorded with the leaf). When this request is bound to a
         // different, current source, the symbol's body has changed since: the stored
         // leaf is a SIR of the old text and is replaced rather than repaired, or it would
-        // pass as `fresh` while describing code that no longer exists.
+        // pass as `fresh` while describing code that no longer exists. A stored leaf
+        // that never recorded its source (an injection without `source_hash`) offers no
+        // evidence that it describes the current text either, so a request that is
+        // bound to the current text replaces it too; only a request without a hash of
+        // its own cannot tell and repairs.
         let pending_describes_older_source = previous_rollup_failed
             && match (
                 store.get_sir_source_hash(symbol_id.as_str())?,
                 request_source_hash.as_deref(),
             ) {
                 (Some(stored), Some(current)) => stored != current,
-                _ => false,
+                (None, Some(_)) => true,
+                (_, None) => false,
             };
         if previous_confidence.is_some_and(|confidence| confidence > FORCE_CONFIDENCE_THRESHOLD)
             && !request.force.unwrap_or(false)
@@ -1443,7 +1448,7 @@ vector_backend = "sqlite"
         );
         assert_eq!(
             store.get_sir_source_hash(&symbol.id).expect("source hash"),
-            Some(newest)
+            Some(newest.clone())
         );
         let stored: SirAnnotation = serde_json::from_str(
             &store
@@ -1453,6 +1458,43 @@ vector_backend = "sqlite"
         )
         .expect("parse blob");
         assert_eq!(stored.intent, "Describes the newest text");
+
+        // A leaf that never recorded its source (an injection without `source_hash`)
+        // and was left pending offers no evidence about the text it describes: a
+        // request without a hash of its own repairs it, one bound to the current text
+        // replaces it rather than certifying it `fresh`.
+        let unbound = server
+            .aether_sir_inject_logic(AetherSirInjectRequest {
+                force: Some(true),
+                source_hash: None,
+                ..unforced("Injected without a source hash", String::new())
+            })
+            .expect("forced inject without a source hash");
+        assert_eq!(unbound.status, "injected");
+        assert_eq!(
+            store.get_sir_source_hash(&symbol.id).expect("source hash"),
+            None
+        );
+        mark_pending();
+        let unbound_repair = server
+            .aether_sir_inject_logic(AetherSirInjectRequest {
+                source_hash: None,
+                ..unforced("Another unbound annotation", String::new())
+            })
+            .expect("inject");
+        assert_eq!(unbound_repair.status, "rollup_repaired");
+        mark_pending();
+        let bound = server
+            .aether_sir_inject_logic(unforced("Bound to the newest text", newest.clone()))
+            .expect("inject");
+        assert_eq!(
+            bound.status, "injected",
+            "a pending leaf of unknown source is replaced by a request bound to the current text"
+        );
+        assert_eq!(
+            store.get_sir_source_hash(&symbol.id).expect("source hash"),
+            Some(newest)
+        );
 
         // A symbol the file no longer declares is refused too.
         fs::write(workspace.join("src/lib.rs"), "pub fn other() {}\n").expect("remove symbol");

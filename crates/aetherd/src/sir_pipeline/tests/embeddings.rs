@@ -338,6 +338,66 @@ fn refresh_embedding_if_current_never_leaves_a_vector_for_a_replaced_sir() {
             .is_none(),
         "a vector for a superseded SIR must not stay behind"
     );
+
+    // A writer without the embedding locks stores this very SIR's vector under
+    // another provider and model during the provider call (the embeddings-only pass
+    // reads its metadata before the lock): the conditional write misses, but this
+    // SIR is not superseded and the configured identity still has no vector, so the
+    // write is retried against the stored row and lands.
+    let (script, asked) = scripted_check(vec![true, true, true]);
+    let outcome = pipeline
+        .refresh_embedding_if_current("sym-guard", "hash-4", "{}", None, &mut || {
+            let call = asked.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == 2 {
+                pipeline
+                    .runtime
+                    .block_on(
+                        pipeline
+                            .vector_store
+                            .upsert_embedding(SymbolEmbeddingRecord {
+                                symbol_id: "sym-guard".to_owned(),
+                                sir_hash: "hash-4".to_owned(),
+                                provider: "other-provider".to_owned(),
+                                model: "other-model".to_owned(),
+                                embedding: vec![0.0, 1.0],
+                                updated_at: 1_700_000_600,
+                            }),
+                    )
+                    .expect("writer with another identity stores its vector");
+            }
+            let mut script = script.lock().expect("script");
+            Ok(if script.is_empty() {
+                true
+            } else {
+                script.remove(0)
+            })
+        })
+        .expect("guarded refresh");
+    assert_eq!(
+        outcome,
+        EmbeddingRefresh::Refreshed {
+            provider: "test_embedding".to_owned(),
+            model: "test-model".to_owned(),
+        },
+        "a same-SIR vector under another identity is not this pass's vector"
+    );
+    let record = pipeline
+        .load_symbol_embedding("sym-guard")
+        .expect("load embedding")
+        .expect("vector stored");
+    assert_eq!(
+        (
+            record.sir_hash.as_str(),
+            record.provider.as_str(),
+            record.model.as_str()
+        ),
+        ("hash-4", "test_embedding", "test-model")
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        6,
+        "the provider ran once for the retry"
+    );
 }
 
 #[test]
