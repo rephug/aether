@@ -496,9 +496,17 @@ impl SirPipeline {
         prefetched_meta: Option<&VectorEmbeddingMetaRecord>,
         still_current: &mut dyn FnMut() -> Result<bool>,
     ) -> Result<EmbeddingRefresh> {
-        let Some(needed) =
-            self.check_embedding_needed(symbol_id, sir_hash_value, prefetched_meta)?
-        else {
+        let mut needed = self.check_embedding_needed(symbol_id, sir_hash_value, prefetched_meta)?;
+        if needed.is_none() && prefetched_meta.is_some() {
+            // Prefetched metadata was read before the caller took the symbol's lock (the
+            // embeddings-only pass batches one read for every symbol up front), so it
+            // may describe a vector another writer has since moved to a different
+            // provider or model, or removed. It is good enough to say "work is needed",
+            // never to say "nothing is": before declaring the vector current, re-read
+            // the metadata now, under the lock.
+            needed = self.check_embedding_needed(symbol_id, sir_hash_value, None)?;
+        }
+        let Some(needed) = needed else {
             // A vector for this hash is already stored (or no provider is configured).
             // It is only right while the SIR is still this one: an injection that
             // repeats an earlier hash can reach here after a concurrent injection
@@ -507,15 +515,12 @@ impl SirPipeline {
             // only the exact vector observed (hash and write time), never one another
             // writer stored since.
             if !still_current()? {
-                let observed = match prefetched_meta {
-                    Some(meta) => Some(meta.clone()),
-                    None => self
-                        .runtime
-                        .block_on(self.vector_store.get_embedding_meta(symbol_id))
-                        .with_context(|| {
-                            format!("failed to read embedding metadata for {symbol_id}")
-                        })?,
-                };
+                let observed = self
+                    .runtime
+                    .block_on(self.vector_store.get_embedding_meta(symbol_id))
+                    .with_context(|| {
+                        format!("failed to read embedding metadata for {symbol_id}")
+                    })?;
                 if let Some(observed) = observed
                     && observed.sir_hash == sir_hash_value
                 {

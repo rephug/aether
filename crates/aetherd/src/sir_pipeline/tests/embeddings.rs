@@ -401,6 +401,75 @@ fn refresh_embedding_if_current_never_leaves_a_vector_for_a_replaced_sir() {
 }
 
 #[test]
+fn a_prefetched_vector_identity_is_re_read_under_the_lock_before_it_counts_as_current() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    write_embeddings_only_config(workspace);
+    let store = SqliteStore::open(workspace).expect("open store");
+    store
+        .upsert_symbol(demo_symbol("sym-prefetched", "demo::prefetched"))
+        .expect("upsert symbol");
+    let sir_hash_value = seed_sir(&store, "sym-prefetched", &demo_sir());
+    let (provider, calls) = counting_embedding_provider();
+    let pipeline = build_write_pipeline_with_embeddings(
+        workspace,
+        Arc::new(PanicInferenceProvider),
+        Some(Arc::new(provider)),
+    );
+
+    // The embeddings-only pass prefetches every symbol's vector metadata before it takes
+    // any symbol's lock. This prefetched record says the configured identity already
+    // holds a vector for the SIR, but by the time the lock is held the store has none
+    // (another process moved or removed it): the stale record must not make the refresh
+    // report the vector unchanged and leave the configured identity without one.
+    let prefetched = VectorEmbeddingMetaRecord {
+        symbol_id: "sym-prefetched".to_owned(),
+        sir_hash: sir_hash_value.clone(),
+        provider: "test_embedding".to_owned(),
+        model: "test-model".to_owned(),
+        embedding_dim: 2,
+        updated_at: 1_700_000_100,
+    };
+    let outcome = pipeline
+        .refresh_embedding_if_current(
+            "sym-prefetched",
+            &sir_hash_value,
+            "{}",
+            Some(&prefetched),
+            &mut || Ok(true),
+        )
+        .expect("guarded refresh");
+    assert!(
+        matches!(outcome, EmbeddingRefresh::Refreshed { .. }),
+        "the metadata is re-read under the lock: {outcome:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the vector is generated");
+    let stored = pipeline
+        .load_symbol_embedding("sym-prefetched")
+        .expect("load embedding")
+        .expect("a vector for the configured identity");
+    assert_eq!(stored.sir_hash, sir_hash_value);
+    assert_eq!(
+        (stored.provider.as_str(), stored.model.as_str()),
+        ("test_embedding", "test-model")
+    );
+
+    // With the vector in place, the same prefetched record is confirmed by the re-read
+    // and the refresh is a no-op.
+    let outcome = pipeline
+        .refresh_embedding_if_current(
+            "sym-prefetched",
+            &sir_hash_value,
+            "{}",
+            Some(&prefetched),
+            &mut || Ok(true),
+        )
+        .expect("guarded refresh");
+    assert_eq!(outcome, EmbeddingRefresh::Unchanged);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "no second provider call");
+}
+
+#[test]
 fn embeddings_only_calls_embedding_provider_not_inference() {
     let temp = tempdir().expect("tempdir");
     let workspace = temp.path();
