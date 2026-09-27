@@ -39,6 +39,10 @@ pub(crate) struct IngestSummary {
     /// say) or its source edited after the batch request was built; the newer state
     /// stands.
     pub superseded: usize,
+    /// Results whose SIR an earlier, downstream-failed ingest attempt had already
+    /// persisted; counted in `processed` too, with only the embedding, contract and
+    /// fingerprint work redone.
+    pub resumed: usize,
     pub fingerprint_rows: usize,
 }
 
@@ -52,6 +56,9 @@ struct PreparedSymbol {
     previous_embedding: Option<SymbolEmbeddingRecord>,
     /// Index into the batch embedding input vec, or `None` if embedding is disabled.
     embedding_slot: Option<usize>,
+    /// The store already held this SIR from an earlier ingest attempt that failed
+    /// downstream; the leaf was left as is and only the downstream work is redone.
+    resumed: bool,
 }
 
 /// Map batch provider name to the closest `InferenceProviderKind`.
@@ -300,6 +307,9 @@ fn process_chunk(
         .with_context(|| format!("failed to write fingerprint row for {}", prep.symbol_id))?;
 
         summary.processed += 1;
+        if prep.resumed {
+            summary.resumed += 1;
+        }
         summary.fingerprint_rows += 1;
     }
 
@@ -455,18 +465,37 @@ fn prepare_symbol(
     // prompt-hash promotion is a read-modify-write of the same row, so it stays under
     // the lock too: it must neither clobber a later injection's provenance nor restore
     // this result's hash over a SIR that replaced it.
-    let (canonical_json, sir_hash_value) = {
+    //
+    // One newer write is this result's own: an earlier ingest attempt that persisted
+    // the SIR and then failed downstream (embedding, vector flush, fingerprint) leaves
+    // the store holding exactly the SIR this result canonicalizes to, so the retained
+    // sidecars can be re-ingested to finish. Such a result is resumed (the leaf is not
+    // rewritten, so its identity is unchanged) rather than dropped as superseded.
+    let (canonical_json, sir_hash_value, resumed) = {
         let _inject_guard =
             crate::sir_pipeline::acquire_inject_write_lock(pipeline.workspace_root())?;
         let current = current_sir_identity(store, &symbol_id)?;
-        if !payload.prior_sir.still_holds(current.as_ref()) {
+        let (_, canonical_json, sir_hash_value) =
+            pipeline.prepare_sir_for_persistence(store, &payload.symbol, &payload.sir)?;
+        let resumed = !payload.prior_sir.still_holds(current.as_ref())
+            && current
+                .as_ref()
+                .is_some_and(|current| current.sir_hash == sir_hash_value);
+        if resumed {
+            tracing::info!(
+                symbol_id = %symbol_id,
+                "resuming batch result: the store already holds this SIR from an earlier ingest attempt"
+            );
+        } else if !payload.prior_sir.still_holds(current.as_ref()) {
             tracing::info!(
                 symbol_id = %symbol_id,
                 "skipping batch result: the stored SIR changed since the request was built"
             );
             return Ok(None);
         }
-        if let Some(origin) = origin {
+        if let Some(origin) = origin
+            && !resumed
+        {
             // Re-read the symbol's source here, under the lock, rather than trusting
             // the snapshot's hash: an edit landing after the snapshot would otherwise
             // slip through. The snapshot only says where the symbol is; a symbol it
@@ -489,23 +518,35 @@ fn prepare_symbol(
                 return Ok(None);
             }
         }
-        let persisted = pipeline
-            .persist_sir_payload_into_sqlite(store, &payload, None)
-            .with_context(|| format!("failed to persist SIR payload for {symbol_id}"))?;
+        if !resumed {
+            pipeline
+                .persist_sir_payload_into_sqlite(store, &payload, None)
+                .with_context(|| format!("failed to persist SIR payload for {symbol_id}"))?;
+        }
 
         let current_meta = store
             .get_sir_meta(&symbol_id)
             .with_context(|| format!("failed to reload SIR metadata for {symbol_id}"))?
             .ok_or_else(|| anyhow!("missing persisted SIR metadata for {symbol_id}"))?;
-        store
-            .upsert_sir_meta(prompt_hash_meta_record(
-                current_meta,
-                prompt_hash.clone(),
-                payload.generation_pass.clone(),
-                payload.reasoning_trace.clone(),
-            ))
-            .with_context(|| format!("failed to persist prompt_hash for {symbol_id}"))?;
-        persisted
+        // A resumed result promotes its provenance only onto a row that carries none
+        // yet or already carries its own; a same-content SIR another request already
+        // claimed keeps that request's provenance.
+        let claims_provenance = !resumed
+            || current_meta
+                .prompt_hash
+                .as_deref()
+                .is_none_or(|existing| existing == prompt_hash);
+        if claims_provenance {
+            store
+                .upsert_sir_meta(prompt_hash_meta_record(
+                    current_meta,
+                    prompt_hash.clone(),
+                    payload.generation_pass.clone(),
+                    payload.reasoning_trace.clone(),
+                ))
+                .with_context(|| format!("failed to persist prompt_hash for {symbol_id}"))?;
+        }
+        (canonical_json, sir_hash_value, resumed)
     };
 
     Ok(Some(PreparedSymbol {
@@ -516,6 +557,7 @@ fn prepare_symbol(
         previous_meta,
         previous_embedding,
         embedding_slot: None,
+        resumed,
     }))
 }
 
@@ -1075,6 +1117,152 @@ vector_backend = "sqlite"
             .expect("sir meta exists");
         assert_eq!(meta.sir_hash, aether_sir::sir_hash(&batch_sir));
         assert_eq!(meta.prompt_hash.as_deref(), Some("prompt-late"));
+    }
+
+    #[test]
+    fn prepare_symbol_resumes_a_result_an_earlier_attempt_already_persisted() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_only_config(workspace);
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        let record = demo_symbol_record("sym-retry", "demo::retry");
+        store.upsert_symbol(record.clone()).expect("upsert symbol");
+        let pipeline = SirPipeline::new_embeddings_only(workspace.to_path_buf())
+            .map(|pipeline| pipeline.with_skip_surreal_sync(true))
+            .expect("build embeddings-only pipeline");
+        let source = "fn retry() {}\n";
+        fs::create_dir_all(workspace.join("src")).expect("create src");
+        fs::write(workspace.join("src/lib.rs"), source).expect("write source");
+        let symbol = Symbol {
+            content_hash: aether_core::content_hash(source),
+            range: SourceRange {
+                start: Position { line: 1, column: 1 },
+                end: Position {
+                    line: 1,
+                    column: source.trim_end().len() + 1,
+                },
+                start_byte: Some(0),
+                end_byte: Some(source.len()),
+            },
+            ..symbol_from_record(&record).expect("build symbol")
+        };
+        let persist = |sir: &SirAnnotation, pass: &str| {
+            pipeline
+                .persist_sir_payload_into_sqlite(
+                    &store,
+                    &UpsertSirIntentPayload {
+                        symbol: symbol.clone(),
+                        sir: sir.clone(),
+                        provider_name: "gemini".to_owned(),
+                        model_name: "scan-model".to_owned(),
+                        generation_pass: pass.to_owned(),
+                        reasoning_trace: None,
+                        commit_hash: None,
+                        prior_sir: PriorSir::Unrecorded,
+                    },
+                    None,
+                )
+                .expect("persist payload");
+        };
+        persist(&demo_sir(), "scan");
+        let built_against = current_sir_identity(&store, "sym-retry").expect("identity");
+        let key = "sym-retry|prompt-retry|build-1".to_owned();
+        let origins = HashMap::from([(
+            key.clone(),
+            BatchRequestOrigin {
+                prior_sir: built_against,
+                source_hash: symbol.content_hash.clone(),
+            },
+        )]);
+        let current_symbols = HashMap::from([("sym-retry".to_owned(), symbol.clone())]);
+        let batch_sir = SirAnnotation {
+            intent: "Triage result".to_owned(),
+            ..demo_sir()
+        };
+        let provider = StubBatchProvider {
+            key: key.clone(),
+            text: serde_json::to_string(&batch_sir).expect("serialize sir"),
+            reasoning_trace: Some("triage reasoning".to_owned()),
+        };
+        let prepare = |origins: &HashMap<String, BatchRequestOrigin>| {
+            prepare_symbol(
+                &pipeline,
+                &store,
+                &triage_pass_config(),
+                "ignored",
+                &provider,
+                "gemini",
+                &HashMap::new(),
+                origins,
+                Some(&current_symbols),
+            )
+            .expect("prepare symbol")
+        };
+
+        // The first attempt persists the SIR (and, in the real flow, then fails in the
+        // embedding or fingerprint phase, so the sidecars are kept for a retry).
+        let first = prepare(&origins).expect("first attempt applies the result");
+        assert!(!first.resumed);
+        let written = current_sir_identity(&store, "sym-retry")
+            .expect("identity")
+            .expect("sir written");
+        assert_eq!(written.sir_hash, aether_sir::sir_hash(&batch_sir));
+
+        // The retry finds the store holding exactly this result's SIR: it is resumed
+        // for the downstream work, not dropped as superseded, and the leaf is left as
+        // it is (same history version and write generation).
+        let retry = prepare(&origins).expect("retry resumes the result");
+        assert!(retry.resumed, "the retry must resume, not rewrite");
+        assert_eq!(retry.sir_hash, written.sir_hash);
+        assert_eq!(retry.canonical_json, first.canonical_json);
+        assert_eq!(
+            current_sir_identity(&store, "sym-retry").expect("identity"),
+            Some(written.clone()),
+            "resuming must not rewrite the leaf"
+        );
+        let meta = store
+            .get_sir_meta("sym-retry")
+            .expect("load sir meta")
+            .expect("sir meta exists");
+        assert_eq!(meta.prompt_hash.as_deref(), Some("prompt-retry"));
+        assert_eq!(meta.generation_pass, "triage");
+
+        // A same-content SIR another request already claimed keeps that provenance.
+        store
+            .upsert_sir_meta(SirMetaRecord {
+                prompt_hash: Some("prompt-other".to_owned()),
+                generation_pass: "deep".to_owned(),
+                reasoning_trace: None,
+                ..meta
+            })
+            .expect("claim provenance");
+        let retry = prepare(&origins).expect("retry resumes the result");
+        assert!(retry.resumed);
+        let meta = store
+            .get_sir_meta("sym-retry")
+            .expect("load sir meta")
+            .expect("sir meta exists");
+        assert_eq!(meta.prompt_hash.as_deref(), Some("prompt-other"));
+        assert_eq!(meta.generation_pass, "deep");
+
+        // A different SIR written since is not this result's own: superseded as before.
+        persist(
+            &SirAnnotation {
+                intent: "Reviewed by hand".to_owned(),
+                ..demo_sir()
+            },
+            "injected",
+        );
+        let reviewed = current_sir_identity(&store, "sym-retry").expect("identity");
+        assert!(
+            prepare(&origins).is_none(),
+            "a replaced SIR supersedes the result"
+        );
+        assert_eq!(
+            current_sir_identity(&store, "sym-retry").expect("identity"),
+            reviewed
+        );
     }
 
     #[test]

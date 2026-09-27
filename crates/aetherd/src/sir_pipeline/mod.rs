@@ -1083,7 +1083,7 @@ impl SirPipeline {
         }
     }
 
-    fn prepare_sir_for_persistence(
+    pub(crate) fn prepare_sir_for_persistence(
         &self,
         store: &SqliteStore,
         symbol: &Symbol,

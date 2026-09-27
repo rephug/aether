@@ -118,8 +118,12 @@ fn run_ingest_command(
         None,
     )?;
     println!(
-        "Ingested {} result(s), skipped {}, superseded {}, wrote {} fingerprint row(s)",
-        summary.processed, summary.skipped, summary.superseded, summary.fingerprint_rows
+        "Ingested {} result(s) ({} resumed), skipped {}, superseded {}, wrote {} fingerprint row(s)",
+        summary.processed,
+        summary.resumed,
+        summary.skipped,
+        summary.superseded,
+        summary.fingerprint_rows
     );
     Ok(())
 }
@@ -209,10 +213,11 @@ fn run_full_batch_command(
                     Some(&current_symbols),
                 )?;
                 println!(
-                    "Ingested {} chunk {}: processed {}, skipped {}, superseded {}, fingerprint rows {}",
+                    "Ingested {} chunk {}: processed {} ({} resumed), skipped {}, superseded {}, fingerprint rows {}",
                     pass.as_str(),
                     job.chunk_index + 1,
                     ingest_summary.processed,
+                    ingest_summary.resumed,
                     ingest_summary.skipped,
                     ingest_summary.superseded,
                     ingest_summary.fingerprint_rows
