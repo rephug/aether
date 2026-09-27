@@ -487,6 +487,7 @@ vector_backend = "sqlite"
             provider_name: "test_provider".to_owned(),
             model_name: "test_model".to_owned(),
             reasoning_trace: None,
+            prior_sir_hash: None,
         };
 
         let mut out = Vec::new();
@@ -919,6 +920,7 @@ enabled = false
             provider_name: "test_provider".to_owned(),
             model_name: "test_model".to_owned(),
             reasoning_trace: None,
+            prior_sir_hash: None,
         };
 
         let persisted = pipeline
@@ -929,7 +931,7 @@ enabled = false
                 None,
             )
             .expect("sqlite stage should handle failure");
-        assert!(persisted.is_none());
+        assert!(matches!(persisted, GenerationPersist::Failed));
         assert_eq!(count_table_rows(workspace, "sir_history"), 0);
         assert_eq!(count_table_rows(workspace, "sir"), 0);
         assert_eq!(count_table_rows(workspace, "write_intents"), 1);

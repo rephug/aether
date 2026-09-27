@@ -384,9 +384,13 @@ fn prepare_symbol(
         reasoning_trace,
         commit_hash: None,
     };
-    let (canonical_json, sir_hash_value) = pipeline
-        .persist_sir_payload_into_sqlite(store, &payload, None)
-        .with_context(|| format!("failed to persist SIR payload for {symbol_id}"))?;
+    let (canonical_json, sir_hash_value) = {
+        let _inject_guard =
+            crate::sir_pipeline::acquire_inject_write_lock(pipeline.workspace_root())?;
+        pipeline
+            .persist_sir_payload_into_sqlite(store, &payload, None)
+            .with_context(|| format!("failed to persist SIR payload for {symbol_id}"))?
+    };
 
     let current_meta = store
         .get_sir_meta(&symbol_id)

@@ -23,6 +23,10 @@ pub(crate) struct SirJob {
     pub(crate) context: SirContext,
     pub(crate) custom_prompt: Option<String>,
     pub(crate) deep_mode: bool,
+    /// The SIR hash stored for the symbol when the job was queued (`None`: no SIR yet).
+    /// Generation runs unlocked, so the result is persisted only while the store still
+    /// holds this hash; a SIR another writer stored in the meantime wins.
+    pub(crate) prior_sir_hash: Option<String>,
 }
 
 #[derive(Debug)]
@@ -32,6 +36,8 @@ pub(super) struct GeneratedSir {
     pub(super) provider_name: String,
     pub(super) model_name: String,
     pub(super) reasoning_trace: Option<String>,
+    /// See `SirJob::prior_sir_hash`.
+    pub(super) prior_sir_hash: Option<String>,
 }
 
 #[derive(Debug)]
@@ -101,6 +107,7 @@ pub(crate) fn build_job(
         context,
         custom_prompt: None,
         deep_mode: false,
+        prior_sir_hash: None,
     })
 }
 
@@ -180,6 +187,7 @@ pub(super) async fn generate_sir_jobs(
                 context,
                 custom_prompt,
                 deep_mode,
+                prior_sir_hash,
             } = job;
             let qualified_name = symbol.qualified_name.clone();
 
@@ -223,6 +231,7 @@ pub(super) async fn generate_sir_jobs(
                     provider_name: result.provider,
                     model_name: result.model,
                     reasoning_trace: result.reasoning_trace,
+                    prior_sir_hash,
                 })),
                 Err(err)
                     if is_parse_validation_exhausted_error(&err)
@@ -274,6 +283,7 @@ pub(super) async fn generate_sir_jobs(
                             provider_name: result.provider,
                             model_name: result.model,
                             reasoning_trace: result.reasoning_trace,
+                            prior_sir_hash,
                         })),
                         Err(fallback_err) => {
                             SirGenerationOutcome::Failure(Box::new(FailedSirGeneration {

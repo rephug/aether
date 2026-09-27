@@ -156,6 +156,16 @@ struct PreparedCandidateJobs {
     skipped_existing: usize,
 }
 
+/// What became of one generated SIR at persist time.
+enum GenerationPersist {
+    Persisted(Box<PersistedSuccessfulGeneration>),
+    /// Another writer stored a SIR for the symbol while this one was being generated;
+    /// that SIR stands and this result is dropped (not a failure).
+    Superseded,
+    /// The write failed; the reason was logged and the intent, if any, marked failed.
+    Failed,
+}
+
 #[derive(Debug, Clone)]
 struct PersistedSuccessfulGeneration {
     intent_id: String,
@@ -581,6 +591,7 @@ impl SirPipeline {
                 None,
             ) {
                 Ok(mut job) => {
+                    job.prior_sir_hash = self.observe_prior_sir_hash(store, &job.symbol.id)?;
                     let prompt = if item.use_cot {
                         sir_prompt::build_enriched_sir_prompt_with_cot(
                             &job.symbol_text,
@@ -637,7 +648,7 @@ impl SirPipeline {
         for result in results {
             match result {
                 SirGenerationOutcome::Success(generated) => {
-                    let Some(persisted) = self
+                    let persisted = match self
                         .persist_successful_generation_sqlite(
                             store,
                             &generated,
@@ -649,10 +660,13 @@ impl SirPipeline {
                                 "failed to persist quality-batch SIR result for {}",
                                 generated.symbol.id
                             )
-                        })?
-                    else {
-                        stats.failure_count += 1;
-                        continue;
+                        })? {
+                        GenerationPersist::Persisted(persisted) => *persisted,
+                        GenerationPersist::Superseded => continue,
+                        GenerationPersist::Failed => {
+                            stats.failure_count += 1;
+                            continue;
+                        }
                     };
 
                     let symbol_id = persisted.symbol_id.clone();
@@ -769,7 +783,10 @@ impl SirPipeline {
                     .unwrap_or(0.0),
             );
             match build_job(&self.workspace_root, symbol, priority_score, None) {
-                Ok(job) => jobs.push(job),
+                Ok(mut job) => {
+                    job.prior_sir_hash = self.observe_prior_sir_hash(store, &job.symbol.id)?;
+                    jobs.push(job)
+                }
                 Err(err) => {
                     stats.failure_count += 1;
                     tracing::warn!(
@@ -816,7 +833,7 @@ impl SirPipeline {
         for result in results {
             match result {
                 SirGenerationOutcome::Success(generated) => {
-                    let Some(persisted) = self
+                    let persisted = match self
                         .persist_successful_generation_sqlite(
                             store,
                             &generated,
@@ -828,10 +845,13 @@ impl SirPipeline {
                                 "failed to persist bulk-scan SIR result for {}",
                                 generated.symbol.id
                             )
-                        })?
-                    else {
-                        stats.failure_count += 1;
-                        continue;
+                        })? {
+                        GenerationPersist::Persisted(persisted) => *persisted,
+                        GenerationPersist::Superseded => continue,
+                        GenerationPersist::Failed => {
+                            stats.failure_count += 1;
+                            continue;
+                        }
                     };
 
                     let symbol_id = persisted.symbol_id.clone();
@@ -974,6 +994,7 @@ impl SirPipeline {
 
             match build_job(&self.workspace_root, symbol, priority_score, None) {
                 Ok(mut job) => {
+                    job.prior_sir_hash = self.observe_prior_sir_hash(store, &job.symbol.id)?;
                     if let Some(prompt_overrides) = prompt_overrides
                         && let Some(override_spec) = prompt_overrides.get(job.symbol.id.as_str())
                     {
@@ -1187,14 +1208,14 @@ impl SirPipeline {
         print_sir: bool,
         out: &mut dyn Write,
     ) -> Result<Option<String>> {
-        let Some(persisted) = self.persist_successful_generation_sqlite(
+        let persisted = match self.persist_successful_generation_sqlite(
             store,
             &generated,
             generation_pass,
             commit_hash,
-        )?
-        else {
-            return Ok(None);
+        )? {
+            GenerationPersist::Persisted(persisted) => *persisted,
+            GenerationPersist::Superseded | GenerationPersist::Failed => return Ok(None),
         };
 
         if let Err(err) = self.refresh_embedding_if_needed(
@@ -1245,13 +1266,26 @@ impl SirPipeline {
         Ok(Some(persisted.intent_id))
     }
 
+    /// The SIR hash the store holds for a symbol right now, recorded on a job before
+    /// generation so the persist step can tell whether another writer got there first.
+    fn observe_prior_sir_hash(
+        &self,
+        store: &SqliteStore,
+        symbol_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(store
+            .get_sir_meta(symbol_id)
+            .with_context(|| format!("failed to read SIR metadata for {symbol_id}"))?
+            .map(|meta| meta.sir_hash))
+    }
+
     fn persist_successful_generation_sqlite(
         &self,
         store: &SqliteStore,
         generated: &GeneratedSir,
         generation_pass: &str,
         commit_hash: Option<&str>,
-    ) -> Result<Option<PersistedSuccessfulGeneration>> {
+    ) -> Result<GenerationPersist> {
         self.record_generation_quality(generated.sir.confidence);
 
         let (sir, canonical_json, sir_hash_value) =
@@ -1263,9 +1297,23 @@ impl SirPipeline {
                         error = %err,
                         "failed to prepare SIR for persistence"
                     );
-                    return Ok(None);
+                    return Ok(GenerationPersist::Failed);
                 }
             };
+
+        // Generation ran unlocked; under the inject lock every leaf writer shares, persist
+        // only while the store still holds the SIR this job started from. Otherwise
+        // another writer (an `aether_sir_inject` call with a reviewed, high-confidence
+        // SIR, say) landed meanwhile and must not be overwritten by this older result.
+        let _inject_guard = acquire_inject_write_lock(&self.workspace_root)?;
+        let current_sir_hash = self.observe_prior_sir_hash(store, &generated.symbol.id)?;
+        if current_sir_hash != generated.prior_sir_hash {
+            tracing::info!(
+                symbol_id = %generated.symbol.id,
+                "skipping generated SIR: the stored SIR changed while it was being generated"
+            );
+            return Ok(GenerationPersist::Superseded);
+        }
 
         let payload = UpsertSirIntentPayload {
             symbol: generated.symbol.clone(),
@@ -1284,7 +1332,7 @@ impl SirPipeline {
                     error = %err,
                     "failed to serialize write intent payload"
                 );
-                return Ok(None);
+                return Ok(GenerationPersist::Failed);
             }
         };
 
@@ -1307,7 +1355,7 @@ impl SirPipeline {
                 error = %err,
                 "failed to create write intent; skipping symbol write"
             );
-            return Ok(None);
+            return Ok(GenerationPersist::Failed);
         }
 
         let attempted_at = unix_timestamp_secs();
@@ -1339,7 +1387,7 @@ impl SirPipeline {
                 error = %err,
                 "failed to persist sqlite SIR state"
             );
-            return Ok(None);
+            return Ok(GenerationPersist::Failed);
         }
 
         let embedding_needed =
@@ -1357,19 +1405,21 @@ impl SirPipeline {
                         error = %err,
                         "failed to determine whether embedding refresh is needed"
                     );
-                    return Ok(None);
+                    return Ok(GenerationPersist::Failed);
                 }
             };
 
-        Ok(Some(PersistedSuccessfulGeneration {
-            intent_id: intent.intent_id,
-            symbol_id: generated.symbol.id.clone(),
-            file_path: generated.symbol.file_path.clone(),
-            sir_hash: sir_hash_value,
-            canonical_json,
-            provider_name: generated.provider_name.clone(),
-            embedding_needed,
-        }))
+        Ok(GenerationPersist::Persisted(Box::new(
+            PersistedSuccessfulGeneration {
+                intent_id: intent.intent_id,
+                symbol_id: generated.symbol.id.clone(),
+                file_path: generated.symbol.file_path.clone(),
+                sir_hash: sir_hash_value,
+                canonical_json,
+                provider_name: generated.provider_name.clone(),
+                embedding_needed,
+            },
+        )))
     }
 
     fn handle_failed_generation(
@@ -2190,6 +2240,7 @@ impl SirPipeline {
         let mut sir_hash_value = sir_hash(&prepared_sir);
 
         if status == WriteIntentStatus::Pending {
+            let _inject_guard = acquire_inject_write_lock(&self.workspace_root)?;
             let persisted = self
                 .persist_sir_payload_into_sqlite(store, payload, Some(intent_id))
                 .with_context(|| format!("failed sqlite write stage for intent {intent_id}"))?;
@@ -2207,6 +2258,7 @@ impl SirPipeline {
                 None => true,
             };
             if needs_sqlite_refresh {
+                let _inject_guard = acquire_inject_write_lock(&self.workspace_root)?;
                 let persisted = self
                     .persist_sir_payload_into_sqlite(store, payload, Some(intent_id))
                     .with_context(|| {
@@ -2306,6 +2358,9 @@ impl SirPipeline {
         Ok(())
     }
 
+    /// Persist one leaf SIR (history, JSON and metadata in one transaction). The caller
+    /// holds the workspace inject lock (`acquire_inject_write_lock`) around its read of
+    /// the prior state and this write.
     pub(crate) fn persist_sir_payload_into_sqlite(
         &self,
         store: &SqliteStore,

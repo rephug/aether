@@ -38,6 +38,10 @@ pub fn run_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<(
 fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<InjectExecution> {
     let store = SqliteStore::open(workspace).context("failed to open local store")?;
     let record = resolve_symbol(&store, args.selector.as_str())?;
+    // Read the prior SIR, apply the confidence guard, merge and persist under the inject
+    // lock every leaf writer shares, so a concurrent injection or indexer pass cannot
+    // slip in between; released before the embedding refresh, which has its own lock.
+    let inject_guard = crate::sir_pipeline::acquire_inject_write_lock(workspace)?;
     let fresh = load_fresh_symbol_source(workspace, &record)?;
     let existing_blob = store
         .read_sir_blob(record.id.as_str())
@@ -175,6 +179,7 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
         })
         .with_context(|| format!("failed to persist prompt hash for {}", record.id))?;
 
+    drop(inject_guard);
     let delta_sem = if let Some(pipeline) = embedding_pipeline.as_mut() {
         pipeline
             .refresh_embedding_if_needed(
