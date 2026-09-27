@@ -843,6 +843,116 @@ fn a_pending_intent_is_replayed_only_while_the_symbol_still_has_the_text_it_desc
 }
 
 #[test]
+fn a_pending_intent_for_a_removed_symbol_is_retired_without_writing() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    write_embeddings_only_config(workspace);
+    let store = SqliteStore::open(workspace).expect("open store");
+    let pipeline = build_write_pipeline(workspace, Arc::new(PanicInferenceProvider));
+    // The symbol is on disk but no longer in the index (removed since the intent was
+    // planned); the intent is a legacy one: no prior SIR recorded, no source hash.
+    let (symbol, _record) = parsed_symbol(workspace, "src/lib.rs", "fn gone() {}\n");
+    let mut payload = payload_for(&symbol, &demo_sir(), SIR_GENERATION_PASS_SCAN);
+    payload.prior_sir = PriorSir::Unrecorded;
+    payload.source_hash = None;
+    let pending = WriteIntent {
+        intent_id: "intent-removed-symbol".to_owned(),
+        symbol_id: symbol.id.clone(),
+        file_path: symbol.file_path.clone(),
+        operation: IntentOperation::UpsertSir,
+        status: WriteIntentStatus::Pending,
+        payload_json: Some(payload.to_json_string().expect("payload json")),
+        created_at: 1_700_000_000,
+        completed_at: None,
+        error_message: None,
+    };
+    store.create_write_intent(&pending).expect("create intent");
+
+    pipeline
+        .replay_upsert_sir_intent(&store, &pending, &payload, false)
+        .expect("replay");
+    assert_eq!(
+        store
+            .get_intent("intent-removed-symbol")
+            .expect("intent")
+            .expect("intent exists")
+            .status,
+        WriteIntentStatus::Complete,
+        "an intent for a symbol the index no longer holds is retired"
+    );
+    assert!(
+        store.get_sir_meta(&symbol.id).expect("meta").is_none(),
+        "no orphan SIR row is written for the removed symbol"
+    );
+}
+
+#[test]
+fn a_committed_intent_whose_stored_sir_cannot_be_parsed_fails_the_replay_instead_of_retiring_it() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    write_embeddings_only_config(workspace);
+    let store = SqliteStore::open(workspace).expect("open store");
+    let pipeline = build_write_pipeline(workspace, Arc::new(PanicInferenceProvider));
+    let (symbol, record) = parsed_symbol(workspace, "src/lib.rs", "fn damaged() {}\n");
+    store.upsert_symbol(record).expect("upsert symbol");
+    let payload = payload_for(&symbol, &demo_sir(), SIR_GENERATION_PASS_SCAN);
+    // The intent's SQLite stage landed, but the stored blob is damaged.
+    store
+        .persist_sir_state_atomically(
+            aether_store::SirMetaRecord {
+                id: symbol.id.clone(),
+                sir_hash: "hash-damaged".to_owned(),
+                sir_version: 1,
+                provider: "test_provider".to_owned(),
+                model: "test_model".to_owned(),
+                generation_pass: SIR_GENERATION_PASS_SCAN.to_owned(),
+                reasoning_trace: None,
+                prompt_hash: None,
+                staleness_score: None,
+                updated_at: 1_700_000_000,
+                sir_status: SIR_STATUS_FRESH.to_owned(),
+                last_error: None,
+                last_attempt_at: 1_700_000_000,
+            },
+            "{not json",
+            None,
+            None,
+        )
+        .expect("persist damaged blob");
+    let done = WriteIntent {
+        intent_id: "intent-damaged-blob".to_owned(),
+        symbol_id: symbol.id.clone(),
+        file_path: symbol.file_path.clone(),
+        operation: IntentOperation::UpsertSir,
+        status: WriteIntentStatus::SqliteDone,
+        payload_json: Some(payload.to_json_string().expect("payload json")),
+        created_at: 1_700_000_000,
+        completed_at: None,
+        error_message: None,
+    };
+    store.create_write_intent(&done).expect("create intent");
+
+    // Damage is reported by name and the intent stays where it was, not retired as if
+    // a newer writer had replaced its SIR.
+    let err = pipeline
+        .replay_upsert_sir_intent(&store, &done, &payload, false)
+        .expect_err("a stored SIR that cannot be parsed fails the replay");
+    assert!(
+        format!("{err:#}").contains(&format!("failed to parse the stored SIR of {}", symbol.id)),
+        "unexpected error: {err:#}"
+    );
+    assert_eq!(
+        store
+            .get_intent("intent-damaged-blob")
+            .expect("intent")
+            .expect("intent exists")
+            .status,
+        WriteIntentStatus::SqliteDone,
+        "the intent is not retired over a blob nobody wrote as a SIR"
+    );
+}
+
+#[test]
 fn a_job_for_newer_text_replaces_a_sir_bound_to_older_text() {
     let temp = tempdir().expect("tempdir");
     let workspace = temp.path();

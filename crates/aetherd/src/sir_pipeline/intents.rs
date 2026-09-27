@@ -128,6 +128,25 @@ impl SirPipeline {
             // that landed while the daemon was down, say) is not damage to repair but
             // the result that wins, so the intent is retired instead.
             let _inject_guard = acquire_inject_write_lock(&self.workspace_root)?;
+            // A symbol removed since the intent was planned has no row to write a SIR
+            // for: an intent planned against "no SIR" (or one that recorded nothing)
+            // would otherwise pass the identity check below and, lacking a source hash
+            // to fail, recreate an orphan `sir` row for an id the index no longer holds.
+            if store
+                .get_symbol_record(payload.symbol.id.as_str())
+                .with_context(|| format!("failed to read the symbol row for intent {intent_id}"))?
+                .is_none()
+            {
+                tracing::info!(
+                    intent_id = %intent_id,
+                    symbol_id = %payload.symbol.id,
+                    "retiring write intent: the symbol was removed since it was planned"
+                );
+                store
+                    .mark_intent_complete(intent_id)
+                    .with_context(|| format!("failed to retire superseded intent {intent_id}"))?;
+                return Ok(());
+            }
             let current = current_sir_identity(store, payload.symbol.id.as_str())?;
             if !payload.prior_sir.still_holds(current.as_ref()) {
                 tracing::info!(
@@ -181,10 +200,23 @@ impl SirPipeline {
             // `dependencies`): edges recorded since the commit change today's
             // recomputation, not the SIR this intent wrote, and must not retire it
             // before its embedding and graph stages ran.
-            let Some(stored_sir) = stored_blob
-                .as_deref()
-                .and_then(|blob| serde_json::from_str::<SirAnnotation>(blob).ok())
-                .filter(|stored| is_own_committed_write(stored, &prepared_sir))
+            // A stored blob that cannot be parsed is damage to report, not a newer
+            // writer's SIR: retiring the intent over it would abandon its embedding and
+            // graph stages with nothing said, so the replay fails naming the symbol and
+            // the intent stays incomplete.
+            let stored_sir = match stored_blob.as_deref() {
+                Some(blob) => Some(serde_json::from_str::<SirAnnotation>(blob).with_context(
+                    || {
+                        format!(
+                            "failed to parse the stored SIR of {} for intent {intent_id}",
+                            payload.symbol.id
+                        )
+                    },
+                )?),
+                None => None,
+            };
+            let Some(stored_sir) =
+                stored_sir.filter(|stored| is_own_committed_write(stored, &prepared_sir))
             else {
                 tracing::info!(
                     intent_id = %intent_id,
