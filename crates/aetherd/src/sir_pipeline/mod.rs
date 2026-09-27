@@ -1268,6 +1268,7 @@ impl SirPipeline {
         };
 
         if let Err(err) = self.refresh_embedding_if_needed(
+            store,
             &generated.symbol.id,
             &persisted.sir_hash,
             &persisted.canonical_json,
@@ -2160,6 +2161,7 @@ impl SirPipeline {
             let canonical = canonicalize_sir_json(&sir);
             let hash = sir_hash(&sir);
             match self.refresh_embedding_if_needed(
+                store,
                 symbol_id,
                 &hash,
                 &canonical,
@@ -2341,6 +2343,7 @@ impl SirPipeline {
 
         if status == WriteIntentStatus::SqliteDone {
             self.refresh_embedding_if_needed(
+                store,
                 payload.symbol.id.as_str(),
                 sir_hash_value.as_str(),
                 canonical_json.as_str(),
@@ -2738,8 +2741,15 @@ impl SirPipeline {
             .collect()
     }
 
+    /// Refresh a symbol's embedding for the SIR it holds right now, under the per-symbol
+    /// embedding lock. Callers release the inject lock before embedding, so a newer SIR
+    /// can land at any point during the provider call: the refresh re-reads the stored
+    /// SIR hash before and after storing the vector (and once when a vector for the hash
+    /// already exists) and stores or keeps nothing for a SIR the store no longer holds.
+    #[allow(clippy::too_many_arguments)]
     pub fn refresh_embedding_if_needed(
         &self,
+        store: &SqliteStore,
         symbol_id: &str,
         sir_hash_value: &str,
         canonical_json: &str,
@@ -2748,12 +2758,18 @@ impl SirPipeline {
         prefetched_meta: Option<&VectorEmbeddingMetaRecord>,
     ) -> Result<bool> {
         let _embed_guard = acquire_embed_write_lock(&self.workspace_root, symbol_id)?;
+        let mut still_current = || -> Result<bool> {
+            Ok(store
+                .get_sir_meta(symbol_id)
+                .with_context(|| format!("failed to read SIR metadata for {symbol_id}"))?
+                .is_some_and(|meta| meta.sir_hash == sir_hash_value))
+        };
         match self.refresh_embedding_if_current(
             symbol_id,
             sir_hash_value,
             canonical_json,
             prefetched_meta,
-            &mut || Ok(true),
+            &mut still_current,
         )? {
             EmbeddingRefresh::Refreshed { provider, model } => {
                 if print_sir {

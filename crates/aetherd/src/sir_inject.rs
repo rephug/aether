@@ -197,6 +197,7 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
     let delta_sem = if let Some(pipeline) = embedding_pipeline.as_mut() {
         pipeline
             .refresh_embedding_if_needed(
+                &store,
                 record.id.as_str(),
                 sir_hash.as_str(),
                 canonical_json.as_str(),

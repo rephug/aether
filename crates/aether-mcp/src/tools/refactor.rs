@@ -397,10 +397,10 @@ impl AetherMcpServer {
         // still holds exactly this write; a SIR another writer stored meanwhile (even
         // one landing between the enrichment build and this call) wins.
         let prior_sir = candidate.baseline_sir_identity.clone();
-        // The hash of the symbol source the prompt is built from, so the persist below
-        // can tell whether the symbol was edited while the model ran.
-        let source_hash = current_source_hash(self.workspace(), &candidate.symbol);
-        let symbol_text = extract_symbol_text(self.workspace(), &candidate.symbol)?;
+        // Prompt text and source hash come from one read of the file, so the hash is of
+        // exactly the body the prompt describes; the persist below compares it with the
+        // source as it is then and drops the result if the symbol was edited meanwhile.
+        let (symbol_text, source_hash) = extract_symbol_text(self.workspace(), &candidate.symbol)?;
         let context = build_sir_context(
             &candidate.symbol,
             candidate.refactor_risk,
@@ -452,8 +452,8 @@ impl AetherMcpServer {
             // An edit while the model ran leaves the stored SIR as it was until the
             // daemon's job for that edit lands; a result generated from the old body
             // must not land first and pre-empt it.
-            if source_hash.is_none()
-                || current_source_hash(self.workspace(), &candidate.symbol) != source_hash
+            if current_source_hash(self.workspace(), &candidate.symbol).as_deref()
+                != Some(source_hash.as_str())
             {
                 tracing::info!(
                     symbol_id = %candidate.symbol.id,
@@ -654,18 +654,25 @@ fn infer_symbol_text_is_public(symbol_text: &str) -> bool {
         || trimmed.starts_with("export default ")
 }
 
+/// The symbol's text for the prompt (truncated to the prompt budget) together with the
+/// content hash of the full text, both from one read of the file, so the hash is of
+/// the body the prompt describes (and equals what `current_source_hash` computes for
+/// an unchanged file).
 fn extract_symbol_text(
     workspace: &Path,
     symbol: &aether_core::Symbol,
-) -> Result<String, AetherMcpError> {
+) -> Result<(String, String), AetherMcpError> {
     let full_path = workspace.join(&symbol.file_path);
     let source = fs::read_to_string(&full_path)?;
-    let mut symbol_text = extract_symbol_source_text(&source, symbol.range).ok_or_else(|| {
-        AetherMcpError::Message(format!(
-            "failed to extract symbol source for {} ({})",
-            symbol.qualified_name, symbol.file_path
-        ))
-    })?;
+    let mut symbol_text = extract_symbol_source_text(&source, symbol.range)
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| {
+            AetherMcpError::Message(format!(
+                "failed to extract symbol source for {} ({})",
+                symbol.qualified_name, symbol.file_path
+            ))
+        })?;
+    let source_hash = aether_core::content_hash(&symbol_text);
     if symbol_text.len() > MAX_SYMBOL_TEXT_CHARS {
         let truncated = symbol_text
             .char_indices()
@@ -675,7 +682,7 @@ fn extract_symbol_text(
             .unwrap_or(0);
         symbol_text.truncate(truncated);
     }
-    Ok(symbol_text)
+    Ok((symbol_text, source_hash))
 }
 
 fn extract_symbol_source_text(source: &str, range: SourceRange) -> Option<String> {
