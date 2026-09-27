@@ -316,6 +316,8 @@ pub fn run_fsck(workspace: &Path, repair: bool, verbose: bool) -> Result<FsckRep
                 .block_on(open_vector_store(&workspace))
                 .context("failed to open vector store for repairs")?;
             for symbol_id in &orphaned_vector_ids {
+                let _embed_guard =
+                    crate::sir_pipeline::acquire_embed_write_lock(&workspace, symbol_id.as_str())?;
                 runtime
                     .block_on(vector_store.delete_embedding(symbol_id.as_str()))
                     .with_context(|| format!("failed to delete orphaned vector {symbol_id}"))?;

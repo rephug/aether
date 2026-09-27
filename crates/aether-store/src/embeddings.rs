@@ -188,13 +188,13 @@ impl SqliteStore {
         )?;
         Ok(())
     }
-    /// Store the embedding only while the symbol's stored vector still carries
-    /// `expected_sir_hash` (`None`: no row yet); the check and the write share one
-    /// immediate transaction. Returns whether the row was written.
-    pub fn upsert_symbol_embedding_if_sir_hash(
+    /// Store the embedding only while the symbol's stored vector is still exactly
+    /// `expected` (`None`: no row yet); the check and the write share one immediate
+    /// transaction. Returns whether the row was written.
+    pub fn upsert_symbol_embedding_if_matches(
         &self,
         record: SymbolEmbeddingRecord,
-        expected_sir_hash: Option<&str>,
+        expected: Option<&SymbolEmbeddingMetaRecord>,
     ) -> Result<bool, StoreError> {
         use rusqlite::OptionalExtension;
         let embedding_dim = record.embedding.len() as i64;
@@ -205,14 +205,23 @@ impl SqliteStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let tx =
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
-        let current: Option<String> = tx
+        let current: Option<SymbolEmbeddingMetaRecord> = tx
             .query_row(
-                "SELECT sir_hash FROM sir_embeddings WHERE symbol_id = ?1",
+                "SELECT symbol_id, sir_hash, provider, model, embedding_dim, updated_at FROM sir_embeddings WHERE symbol_id = ?1",
                 params![record.symbol_id],
-                |row| row.get(0),
+                |row| {
+                    Ok(SymbolEmbeddingMetaRecord {
+                        symbol_id: row.get(0)?,
+                        sir_hash: row.get(1)?,
+                        provider: row.get(2)?,
+                        model: row.get(3)?,
+                        embedding_dim: row.get(4)?,
+                        updated_at: row.get(5)?,
+                    })
+                },
             )
             .optional()?;
-        if current.as_deref() != expected_sir_hash {
+        if current.as_ref() != expected {
             return Ok(false);
         }
         tx.execute(
@@ -376,32 +385,62 @@ mod tests {
     fn conditional_embedding_upsert_only_replaces_the_expected_hash() {
         let temp = tempdir().expect("tempdir");
         let store = SqliteStore::open(temp.path()).expect("open store");
+        let phantom = SymbolEmbeddingMetaRecord {
+            symbol_id: "s".to_owned(),
+            sir_hash: "h0".to_owned(),
+            provider: "p".to_owned(),
+            model: "m".to_owned(),
+            embedding_dim: 2,
+            updated_at: 1,
+        };
 
         // Nothing stored: a write expecting no row lands, one expecting a row does not.
         assert!(
             !store
-                .upsert_symbol_embedding_if_sir_hash(record("s", "h1"), Some("h0"))
+                .upsert_symbol_embedding_if_matches(record("s", "h1"), Some(&phantom))
                 .expect("cas")
         );
         assert!(
             store
-                .upsert_symbol_embedding_if_sir_hash(record("s", "h1"), None)
+                .upsert_symbol_embedding_if_matches(record("s", "h1"), None)
                 .expect("cas")
         );
-        // A row exists: only a writer that saw h1 may replace it.
+        // A row exists: only a writer that observed exactly it may replace it.
+        let observed = store
+            .get_symbol_embedding_meta("s")
+            .expect("meta")
+            .expect("row");
         assert!(
             !store
-                .upsert_symbol_embedding_if_sir_hash(record("s", "h2"), None)
+                .upsert_symbol_embedding_if_matches(record("s", "h2"), None)
                 .expect("cas")
         );
+        let same_hash_other_identity = SymbolEmbeddingMetaRecord {
+            provider: "other-provider".to_owned(),
+            ..observed.clone()
+        };
         assert!(
             !store
-                .upsert_symbol_embedding_if_sir_hash(record("s", "h2"), Some("stale"))
-                .expect("cas")
+                .upsert_symbol_embedding_if_matches(
+                    record("s", "h2"),
+                    Some(&same_hash_other_identity)
+                )
+                .expect("cas"),
+            "the same hash under another provider/model is a different vector"
+        );
+        let same_hash_other_time = SymbolEmbeddingMetaRecord {
+            updated_at: observed.updated_at + 1,
+            ..observed.clone()
+        };
+        assert!(
+            !store
+                .upsert_symbol_embedding_if_matches(record("s", "h2"), Some(&same_hash_other_time))
+                .expect("cas"),
+            "the same hash written at another time is a different vector"
         );
         assert!(
             store
-                .upsert_symbol_embedding_if_sir_hash(record("s", "h2"), Some("h1"))
+                .upsert_symbol_embedding_if_matches(record("s", "h2"), Some(&observed))
                 .expect("cas")
         );
         let meta = store

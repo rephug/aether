@@ -31,13 +31,13 @@ impl VectorStore for SqliteVectorStore {
         self.store.upsert_symbol_embedding(record)
     }
 
-    async fn upsert_embedding_if_sir_hash(
+    async fn upsert_embedding_if_matches(
         &self,
         record: VectorRecord,
-        expected_sir_hash: Option<&str>,
+        expected: Option<&VectorEmbeddingMetaRecord>,
     ) -> Result<bool, StoreError> {
         self.store
-            .upsert_symbol_embedding_if_sir_hash(record, expected_sir_hash)
+            .upsert_symbol_embedding_if_matches(record, expected)
     }
 
     async fn upsert_embedding_batch(&self, records: Vec<VectorRecord>) -> Result<(), StoreError> {

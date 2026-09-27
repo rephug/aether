@@ -610,32 +610,37 @@ impl VectorStore for LanceVectorStore {
         Ok(())
     }
 
-    async fn upsert_embedding_if_sir_hash(
+    async fn upsert_embedding_if_matches(
         &self,
         record: VectorRecord,
-        expected_sir_hash: Option<&str>,
+        expected: Option<&VectorEmbeddingMetaRecord>,
     ) -> Result<bool, StoreError> {
         self.migrate_from_sqlite_if_needed().await?;
         if record.embedding.is_empty() {
             return Ok(false);
         }
         // Vectors are keyed by symbol inside one table per provider/model/dimension, so
-        // the precondition is checked across all tables first (a vector under another
-        // identity counts as "a vector is stored"), then enforced again inside the merge
-        // on the destination table: with an expected hash the update arm runs only while
-        // the row still carries it, with none expected there is no update arm at all, and
-        // the insert arm always runs so a symbol whose vector moves to a new identity
-        // (an embed-only regeneration after changing the embedding model) still lands.
-        let current = self
-            .get_embedding_meta(record.symbol_id.as_str())
-            .await?
-            .map(|meta| meta.sir_hash);
-        if current.as_deref() != expected_sir_hash {
+        // the precondition is checked across all tables first (the stored vector must be
+        // exactly the one observed: hash, provider, model, dimension and write time, or
+        // none at all), then enforced again inside the merge on the destination table:
+        // with an observed vector the update arm runs only while the row still is that
+        // vector, with none observed there is no update arm at all, and the insert arm
+        // always runs so a symbol whose vector moves to a new identity (an embed-only
+        // regeneration after changing the embedding model) still lands.
+        let current = self.get_embedding_meta(record.symbol_id.as_str()).await?;
+        if current.as_ref() != expected {
             return Ok(false);
         }
         let connection = self.connect().await?;
-        let guard = expected_sir_hash
-            .map(|expected| format!("target.sir_hash = '{}'", escape_sql_string(expected)));
+        let guard = expected.map(|observed| {
+            format!(
+                "target.sir_hash = '{}' AND target.provider = '{}' AND target.model = '{}' AND target.updated_at = {}",
+                escape_sql_string(observed.sir_hash.as_str()),
+                escape_sql_string(observed.provider.as_str()),
+                escape_sql_string(observed.model.as_str()),
+                observed.updated_at
+            )
+        });
         let matched = match guard.as_deref() {
             Some(condition) => MatchedArm::OnlyWhen(condition),
             None => MatchedArm::Skip,
@@ -647,6 +652,7 @@ impl VectorStore for LanceVectorStore {
             meta.sir_hash == record.sir_hash
                 && meta.provider == record.provider
                 && meta.model == record.model
+                && meta.updated_at == record.updated_at
         }))
     }
 

@@ -656,6 +656,49 @@ enabled = false
     }
 
     #[test]
+    fn embed_write_lock_is_exclusive_per_symbol_within_a_process() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path().to_path_buf();
+        let guard = acquire_embed_write_lock(&workspace, "sym-lock").expect("lock");
+        assert!(
+            workspace.join(".aether/embed-locks").is_dir(),
+            "the cross-process lock file lives under .aether/embed-locks"
+        );
+        // Another symbol is independent.
+        let other = acquire_embed_write_lock(&workspace, "sym-other").expect("other lock");
+        drop(other);
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let contender_workspace = workspace.clone();
+        let contender = std::thread::spawn(move || {
+            started_tx.send(()).expect("started");
+            let _guard =
+                acquire_embed_write_lock(&contender_workspace, "sym-lock").expect("contended lock");
+            done_tx.send(()).expect("done");
+        });
+        started_rx.recv().expect("contender started");
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "the contender must wait while the lock is held"
+        );
+        drop(guard);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the contender acquires the lock once it is released");
+        contender.join().expect("join");
+
+        // Batches take their locks in sorted order and release them together.
+        let guards = acquire_embed_write_locks(&workspace, ["b", "a", "b"]).expect("batch locks");
+        assert_eq!(guards.len(), 2);
+        drop(guards);
+        let again = acquire_embed_write_lock(&workspace, "a").expect("released");
+        drop(again);
+    }
+
+    #[test]
     fn refresh_embedding_if_current_never_leaves_a_vector_for_a_replaced_sir() {
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();

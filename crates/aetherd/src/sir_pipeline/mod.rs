@@ -48,8 +48,13 @@ use self::rollup::{
 use crate::quality::SirQualityMonitor;
 
 mod infer;
+mod locks;
 mod persist;
 mod rollup;
+
+pub use locks::{
+    WriteGuard, acquire_embed_write_lock, acquire_embed_write_locks, acquire_inject_write_lock,
+};
 
 pub const DEFAULT_SIR_CONCURRENCY: usize = 2;
 pub(crate) const SIR_STATUS_FRESH: &str = "fresh";
@@ -99,9 +104,9 @@ pub struct QualityBatchItem {
 pub(crate) struct EmbeddingNeeded {
     pub provider: String,
     pub model: String,
-    /// The SIR hash of the vector currently stored for the symbol (`None`: no vector),
-    /// as observed by the check, so the write can be made conditional on it.
-    pub existing_sir_hash: Option<String>,
+    /// The vector currently stored for the symbol as observed by the check (`None`: no
+    /// vector), so the write can be made conditional on exactly that vector.
+    pub existing: Option<VectorEmbeddingMetaRecord>,
 }
 
 /// Outcome of `SirPipeline::refresh_embedding_if_current`.
@@ -900,6 +905,7 @@ impl SirPipeline {
             store
                 .mark_removed(&symbol.id)
                 .with_context(|| format!("failed to mark symbol removed: {}", symbol.id))?;
+            let _embed_guard = acquire_embed_write_lock(&self.workspace_root, &symbol.id)?;
             self.runtime
                 .block_on(self.vector_store.delete_embedding(&symbol.id))
                 .with_context(|| format!("failed to remove vector embedding for {}", symbol.id))?;
@@ -2077,6 +2083,8 @@ impl SirPipeline {
     }
 
     pub fn delete_embeddings(&self, symbol_ids: &[String]) -> Result<()> {
+        let _embed_guards =
+            acquire_embed_write_locks(&self.workspace_root, symbol_ids.iter().map(String::as_str))?;
         self.runtime
             .block_on(self.vector_store.delete_embeddings(symbol_ids))
             .context("failed to delete symbol embeddings")
@@ -2459,11 +2467,17 @@ impl SirPipeline {
         Ok(())
     }
 
-    /// Flush a batch of embedding records to the vector store.
+    /// Flush a batch of embedding records to the vector store, holding every affected
+    /// symbol's embedding lock so the batch never lands over a vector another writer
+    /// (an `aether-mcp` injection, say) is placing at the same time.
     pub(crate) fn flush_embedding_batch(&self, records: Vec<SymbolEmbeddingRecord>) -> Result<()> {
         if records.is_empty() {
             return Ok(());
         }
+        let _embed_guards = acquire_embed_write_locks(
+            &self.workspace_root,
+            records.iter().map(|record| record.symbol_id.as_str()),
+        )?;
         self.runtime
             .block_on(self.vector_store.upsert_embedding_batch(records))
             .context("failed to flush embedding batch to vector store")
@@ -2503,7 +2517,7 @@ impl SirPipeline {
                 .block_on(self.vector_store.get_embedding_meta(symbol_id))
                 .with_context(|| format!("failed to read embedding metadata for {symbol_id}"))?,
         };
-        let existing_sir_hash = existing_meta.as_ref().map(|meta| meta.sir_hash.clone());
+        let existing = existing_meta.clone();
         if let Some(existing_meta) = existing_meta
             && existing_meta.sir_hash == sir_hash_value
             && existing_meta.provider == provider_name
@@ -2515,7 +2529,7 @@ impl SirPipeline {
         Ok(Some(EmbeddingNeeded {
             provider: provider_name.to_owned(),
             model: model_name.to_owned(),
-            existing_sir_hash,
+            existing,
         }))
     }
 
@@ -2563,6 +2577,7 @@ impl SirPipeline {
         out: &mut dyn Write,
         prefetched_meta: Option<&VectorEmbeddingMetaRecord>,
     ) -> Result<bool> {
+        let _embed_guard = acquire_embed_write_lock(&self.workspace_root, symbol_id)?;
         match self.refresh_embedding_if_current(
             symbol_id,
             sir_hash_value,
@@ -2584,7 +2599,8 @@ impl SirPipeline {
         }
     }
 
-    /// Like `refresh_embedding_if_needed`, but for callers that cannot hold the SIR
+    /// Like `refresh_embedding_if_needed`, but for callers that already hold the
+    /// symbol's embedding lock (`acquire_embed_write_lock`) and cannot hold the SIR
     /// fixed while the provider runs: `still_current` (typically "the store's SIR hash
     /// for this symbol is still `sir_hash_value`") is consulted before the provider
     /// call, again right before the vector is stored, and once more after it is stored;
@@ -2670,7 +2686,7 @@ impl SirPipeline {
         // call, and a plain upsert keyed on the symbol would overwrite it.
         let written = self
             .runtime
-            .block_on(self.vector_store.upsert_embedding_if_sir_hash(
+            .block_on(self.vector_store.upsert_embedding_if_matches(
                 SymbolEmbeddingRecord {
                     symbol_id: symbol_id.to_owned(),
                     sir_hash: sir_hash_value.to_owned(),
@@ -2679,7 +2695,7 @@ impl SirPipeline {
                     embedding,
                     updated_at,
                 },
-                needed.existing_sir_hash.as_deref(),
+                needed.existing.as_ref(),
             ))
             .with_context(|| format!("failed to store embedding for {symbol_id}"))?;
         if !written {
@@ -2737,6 +2753,9 @@ impl SirPipeline {
         let mut stale_rollups = Vec::new();
         let mut local_only = Vec::new();
         let mut needs_api = Vec::new();
+        // What each rollup was computed from; `persist_file_rollup` refuses to store a
+        // rollup whose leaves have changed since (an injection may have rebuilt it).
+        let mut fingerprints: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
 
         for (file_path, language) in touched_files {
             let leaf_sirs = self
@@ -2747,6 +2766,7 @@ impl SirPipeline {
                 stale_rollups.push((file_path, language));
                 continue;
             }
+            fingerprints.insert(file_path.clone(), leaf_fingerprint(&leaf_sirs));
 
             let job = RollupJob {
                 file_path,
@@ -2780,6 +2800,7 @@ impl SirPipeline {
                 job.file_path.as_str(),
                 job.language,
                 &file_sir,
+                fingerprints.get(job.file_path.as_str()).map(Vec::as_slice),
                 print_sir,
                 out,
                 commit_hash,
@@ -2799,6 +2820,9 @@ impl SirPipeline {
                 rollup.file_path.as_str(),
                 rollup.language,
                 &rollup.file_sir,
+                fingerprints
+                    .get(rollup.file_path.as_str())
+                    .map(Vec::as_slice),
                 print_sir,
                 out,
                 commit_hash,
@@ -2911,6 +2935,11 @@ impl SirPipeline {
             .with_context(|| format!("failed to remove stale file rollup {rollup_id}"))
     }
 
+    /// Persist a file rollup under the workspace inject lock. With `computed_from`, the
+    /// leaves the rollup was built from, the write is skipped when the file's leaves have
+    /// changed since (another writer, typically an `aether_sir_inject` call, rebuilt the
+    /// rollup from newer leaves while this one was being generated), so a rollup from an
+    /// older snapshot never overwrites a newer one.
     #[allow(clippy::too_many_arguments)]
     fn persist_file_rollup(
         &self,
@@ -2918,11 +2947,23 @@ impl SirPipeline {
         file_path: &str,
         language: Language,
         file_sir: &FileSir,
+        computed_from: Option<&[(String, String)]>,
         print_sir: bool,
         out: &mut dyn Write,
         commit_hash: Option<&str>,
         generation_pass: &str,
     ) -> Result<()> {
+        let _inject_guard = acquire_inject_write_lock(&self.workspace_root)?;
+        if let Some(expected) = computed_from {
+            let current = leaf_fingerprint(&load_file_leaf_sirs(store, file_path)?);
+            if current != expected {
+                tracing::info!(
+                    file_path = %file_path,
+                    "skipping file rollup computed from leaves that have since changed"
+                );
+                return Ok(());
+            }
+        }
         let rollup_id = synthetic_file_sir_id(language.as_str(), file_path);
         let canonical_json = canonicalize_file_sir_json(file_sir);
         let sir_hash_value = file_sir_hash(file_sir);
@@ -2996,6 +3037,7 @@ impl SirPipeline {
             return Ok(());
         }
 
+        let fingerprint = leaf_fingerprint(&leaf_sirs);
         let file_sir = aggregate_file_sir(
             file_path,
             language,
@@ -3011,6 +3053,7 @@ impl SirPipeline {
             file_path,
             language,
             &file_sir,
+            Some(&fingerprint),
             print_sir,
             out,
             commit_hash,
@@ -3046,6 +3089,16 @@ fn resolve_tiered_parse_fallback_provider(
 }
 
 /// Leaf SIRs of every symbol in `file_path` that carries a valid annotation.
+/// The identity of a file's leaves as a rollup input: which symbols, with which SIR.
+fn leaf_fingerprint(leaves: &[FileLeafSir]) -> Vec<(String, String)> {
+    let mut fingerprint: Vec<(String, String)> = leaves
+        .iter()
+        .map(|leaf| (leaf.qualified_name.clone(), aether_sir::sir_hash(&leaf.sir)))
+        .collect();
+    fingerprint.sort();
+    fingerprint
+}
+
 fn load_file_leaf_sirs(store: &SqliteStore, file_path: &str) -> Result<Vec<FileLeafSir>> {
     let symbols = store
         .list_symbols_for_file(file_path)
@@ -3093,6 +3146,9 @@ fn load_file_leaf_sirs(store: &SqliteStore, file_path: &str) -> Result<Vec<FileL
 /// from its current leaf SIRs and persist it under the synthetic file SIR id, so file
 /// and module level reads reflect leaf injections immediately. Removes the rollup when
 /// the file has no valid leaf SIR left. Returns `true` when a rollup was written.
+/// Rebuild a file rollup from its leaves by deterministic concatenation. The caller must
+/// hold the workspace inject lock (`acquire_inject_write_lock`), as `aether_sir_inject`
+/// does around the leaf write and this rebuild.
 pub fn refresh_local_file_rollup(
     store: &SqliteStore,
     file_path: &str,

@@ -3,16 +3,15 @@ use aether_sir::{
     sir_hash, validate_sir,
 };
 use aether_store::{SirMetaRecord, SirStateStore, SymbolCatalogStore, SymbolRecord};
-use std::collections::HashMap;
-
-use anyhow::Context as _;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
 
 use aether_parse::language_for_path;
-use aetherd::sir_pipeline::{EmbeddingRefresh, SirPipeline, refresh_local_file_rollup};
+use aetherd::sir_pipeline::{
+    EmbeddingRefresh, SirPipeline, acquire_embed_write_lock, acquire_inject_write_lock,
+    refresh_local_file_rollup,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 use super::{AetherMcpServer, current_unix_timestamp};
 use crate::AetherMcpError;
@@ -62,75 +61,10 @@ pub struct AetherSirInjectRequest {
     pub force: Option<bool>,
 }
 
-/// Serializes each `aether_sir_inject` call, from reading the prior SIR through the
-/// confidence guard, the leaf write and the file-rollup rebuild, against concurrent
-/// calls in this process; `acquire_inject_write_lock` adds the
-/// cross-process half (an exclusive lock on `.aether/inject.lock`), since every MCP
-/// client runs its own stdio `aether-mcp` process against the same store.
-static INJECT_WRITE_LOCK: Mutex<()> = Mutex::new(());
-const INJECT_LOCK_FILE: &str = "inject.lock";
-
-/// Exclusive, cross-process lock held from reading the prior SIR until the leaf SIR and
-/// its file rollup are written.
-/// Released when the returned handle is dropped.
-fn acquire_inject_write_lock(workspace: &Path) -> anyhow::Result<std::fs::File> {
-    let dir = workspace.join(".aether");
-    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    let path = dir.join(INJECT_LOCK_FILE);
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
-    file.lock()
-        .with_context(|| format!("failed to lock {}", path.display()))?;
-    Ok(file)
-}
-/// One lock per symbol for the embedding refresh, so two injections into the same symbol
-/// embed in order (the later SIR wins) while unrelated symbols stay concurrent. This is
-/// the in-process half; `acquire_embed_lock` adds the cross-process half, since every
-/// MCP client runs its own stdio `aether-mcp` process against the same store.
-static EMBED_LOCKS: Mutex<Option<HashMap<String, Arc<Mutex<()>>>>> = Mutex::new(None);
-/// Directory under `.aether/` holding one lock file per symbol (named by the BLAKE3 hash
-/// of the symbol id, so arbitrary ids map to safe, bounded file names).
-const EMBED_LOCK_DIR: &str = "embed-locks";
 /// `sir_status` recorded when a leaf was written but its file rollup could not be
 /// rebuilt: the confidence guard lets such a symbol be re-injected without `force`, and
 /// the scan queries keep selecting it, so the retry is never blocked.
 pub const SIR_STATUS_ROLLUP_FAILED: &str = "rollup_failed";
-
-/// Exclusive, cross-process lock for one symbol's embedding refresh, so a slower embedding
-/// computed by another `aether-mcp` process for an older SIR cannot overwrite the vector
-/// of a newer one. Released when the returned handle is dropped.
-fn acquire_embed_lock(workspace: &Path, symbol_id: &str) -> anyhow::Result<std::fs::File> {
-    let dir = workspace.join(".aether").join(EMBED_LOCK_DIR);
-    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    let path = dir.join(format!(
-        "{}.lock",
-        blake3::hash(symbol_id.as_bytes()).to_hex()
-    ));
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
-    file.lock()
-        .with_context(|| format!("failed to lock {}", path.display()))?;
-    Ok(file)
-}
-
-fn embed_lock_for(symbol_id: &str) -> Arc<Mutex<()>> {
-    let mut locks = EMBED_LOCKS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    locks
-        .get_or_insert_with(HashMap::new)
-        .entry(symbol_id.to_owned())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherSirInjectResponse {
@@ -329,12 +263,9 @@ impl AetherMcpServer {
         // symbol (or the same file) must observe this call's write, not the snapshot it
         // started from. Otherwise two injectors of a low-confidence symbol both pass the
         // guard, and the slower one overwrites the faster one's result with fields merged
-        // from the stale SIR. The MCP router runs each call on its own blocking task, so
-        // one process-wide lock plus the cross-process file lock covers both cases.
-        let _inject_guard = INJECT_WRITE_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _inject_file_guard = acquire_inject_write_lock(&self.state.workspace)
+        // from the stale SIR. The lock (in-process half plus the cross-process file lock,
+        // shared with the daemon's rollup writer) lives in the pipeline crate.
+        let _inject_guard = acquire_inject_write_lock(&self.state.workspace)
             .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
         let previous_meta = store.get_sir_meta(symbol_id.as_str())?;
         let previous_blob = store.read_sir_blob(symbol_id.as_str())?;
@@ -481,9 +412,8 @@ impl AetherMcpServer {
                 };
                 AetherMcpError::Message(message)
             })?;
-        // The embedding refresh may call a local or remote model: release both locks first
-        // so concurrent injections into other files are not serialized behind it.
-        drop(_inject_file_guard);
+        // The embedding refresh may call a local or remote model: release the inject lock
+        // first so concurrent injections into other files are not serialized behind it.
         drop(_inject_guard);
         let embedding_status =
             self.refresh_embedding_after_inject(symbol_id.as_str(), hash.as_str(), &canonical_json);
@@ -551,19 +481,15 @@ impl AetherMcpServer {
             return "skipped: embeddings disabled".to_owned();
         }
         // Per-symbol ordering: a slower embedding for an older SIR must never overwrite
-        // the embedding of a newer one, so embed under the symbol's in-process and
-        // cross-process locks (no other injector can be mid-embedding for this symbol
-        // while it runs), and only while the store still holds the SIR this call wrote.
-        // Injections do not wait on these locks, so a newer SIR can land at any point
-        // during the provider call: the pipeline re-asks `still_current` right before
-        // and right after the vector is stored, and removes a vector the newer SIR
-        // would otherwise inherit. That injector's own refresh, queued behind these
-        // locks, then embeds the newer SIR.
-        let symbol_lock = embed_lock_for(symbol_id);
-        let _symbol_guard = symbol_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _cross_process_guard = match acquire_embed_lock(&self.state.workspace, symbol_id) {
+        // the embedding of a newer one, so embed under the symbol's embedding lock, which
+        // every vector writer takes (other injectors, the daemon's index and regenerate
+        // passes, symbol removal), and only while the store still holds the SIR this call
+        // wrote. Injections do not wait on this lock, so a newer SIR can land at any point
+        // during the provider call: the pipeline re-asks `still_current` right before and
+        // right after the vector is stored, and removes a vector the newer SIR would
+        // otherwise inherit. That injector's own refresh, queued behind the lock, then
+        // embeds the newer SIR.
+        let _embed_guard = match acquire_embed_write_lock(&self.state.workspace, symbol_id) {
             Ok(guard) => guard,
             Err(err) => return format!("failed: {err:#}"),
         };
@@ -571,9 +497,9 @@ impl AetherMcpServer {
             Ok(pipeline) => pipeline,
             Err(err) => return format!("failed: {err:#}"),
         };
-        // Missing metadata counts as superseded too: the indexer deletes a removed
-        // symbol's SIR and embedding without taking these locks, and a vector written
-        // for it afterwards would be an orphan nothing ever cleans up.
+        // Missing metadata counts as superseded too: the indexer removes a symbol's SIR
+        // without the inject lock, and a vector written for it afterwards would be an
+        // orphan nothing ever cleans up.
         let store = self.state.store.as_ref();
         let mut still_current = || -> anyhow::Result<bool> {
             Ok(store
