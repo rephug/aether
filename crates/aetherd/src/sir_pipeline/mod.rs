@@ -1812,7 +1812,7 @@ impl SirPipeline {
             .iter()
             .map(|item| item.record.clone())
             .collect::<Vec<_>>();
-        if let Err(err) = self.flush_embedding_batch(records) {
+        if let Err(err) = self.flush_embedding_batch(store, records) {
             let message = format!("{err:#}");
             tracing::error!(
                 error = %err,
@@ -2469,8 +2469,17 @@ impl SirPipeline {
 
     /// Flush a batch of embedding records to the vector store, holding every affected
     /// symbol's embedding lock so the batch never lands over a vector another writer
-    /// (an `aether-mcp` injection, say) is placing at the same time.
-    pub(crate) fn flush_embedding_batch(&self, records: Vec<SymbolEmbeddingRecord>) -> Result<()> {
+    /// (an `aether-mcp` injection, say) is placing at the same time. The batch was
+    /// embedded while unlocked, so under the locks each record is checked against the
+    /// symbol's current SIR: a record whose SIR has been replaced since (the injection
+    /// wrote a newer leaf and its own vector) is dropped rather than written over the
+    /// newer vector, and a record whose SIR moves on between that check and the write
+    /// is taken back afterwards, exactly as the single-symbol refresh does.
+    pub(crate) fn flush_embedding_batch(
+        &self,
+        store: &SqliteStore,
+        records: Vec<SymbolEmbeddingRecord>,
+    ) -> Result<()> {
         if records.is_empty() {
             return Ok(());
         }
@@ -2478,9 +2487,46 @@ impl SirPipeline {
             &self.workspace_root,
             records.iter().map(|record| record.symbol_id.as_str()),
         )?;
+        let sir_is_current = |record: &SymbolEmbeddingRecord| -> Result<bool> {
+            Ok(store
+                .get_sir_meta(record.symbol_id.as_str())
+                .with_context(|| format!("failed to read SIR metadata for {}", record.symbol_id))?
+                .is_some_and(|meta| meta.sir_hash == record.sir_hash))
+        };
+        let mut current = Vec::with_capacity(records.len());
+        for record in records {
+            if sir_is_current(&record)? {
+                current.push(record);
+            } else {
+                tracing::debug!(
+                    symbol_id = %record.symbol_id,
+                    "dropping embedding for a SIR replaced while the batch was being embedded"
+                );
+            }
+        }
+        if current.is_empty() {
+            return Ok(());
+        }
         self.runtime
-            .block_on(self.vector_store.upsert_embedding_batch(records))
-            .context("failed to flush embedding batch to vector store")
+            .block_on(self.vector_store.upsert_embedding_batch(current.clone()))
+            .context("failed to flush embedding batch to vector store")?;
+        for record in &current {
+            if !sir_is_current(record)? {
+                self.runtime
+                    .block_on(self.vector_store.delete_embedding_if_matches(
+                        record.symbol_id.as_str(),
+                        record.sir_hash.as_str(),
+                        record.updated_at,
+                    ))
+                    .with_context(|| {
+                        format!(
+                            "failed to delete the superseded embedding for {}",
+                            record.symbol_id
+                        )
+                    })?;
+            }
+        }
+        Ok(())
     }
 
     /// Check whether a symbol needs a new embedding without generating one.

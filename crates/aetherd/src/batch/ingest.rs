@@ -138,7 +138,7 @@ pub(crate) fn ingest_results(
     // Flush any remaining buffered embeddings to vector store.
     if !embedding_buffer.is_empty() {
         pipeline
-            .flush_embedding_batch(embedding_buffer)
+            .flush_embedding_batch(store, embedding_buffer)
             .context("failed to flush final embedding batch during ingest")?;
     }
 
@@ -274,7 +274,7 @@ fn process_chunk(
     if embedding_buffer.len() >= INGEST_VECTOR_BATCH_SIZE {
         let batch = std::mem::take(embedding_buffer);
         pipeline
-            .flush_embedding_batch(batch)
+            .flush_embedding_batch(store, batch)
             .context("failed to flush embedding batch during ingest")?;
     }
 
