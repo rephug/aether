@@ -396,13 +396,27 @@ impl AetherMcpServer {
                 .as_ref()
                 .filter(|meta| rollup_outstanding(&meta.sir_status))
             {
-                return self.repair_outstanding_rollup(
+                let mut repaired = self.repair_outstanding_rollup(
                     store,
                     &symbol,
                     previous_meta,
                     previous_confidence,
                     new_confidence,
-                );
+                )?;
+                // The interrupted injection never reached its embedding refresh (that
+                // runs only after the rollup succeeds), so the stored leaf's vector is
+                // refreshed here, after the inject lock is released, exactly as a
+                // completed injection's would be.
+                drop(_inject_guard);
+                repaired.embedding_status = match previous_blob.as_deref() {
+                    Some(stored_json) => self.refresh_embedding_after_inject(
+                        symbol_id.as_str(),
+                        previous_meta.sir_hash.as_str(),
+                        stored_json,
+                    ),
+                    None => "skipped: no stored SIR text".to_owned(),
+                };
+                return Ok(repaired);
             }
             let note = previous_confidence.map(|confidence| {
                 format!(
@@ -544,7 +558,8 @@ impl AetherMcpServer {
     /// is kept as it is, the file rollup is rebuilt from the current leaves under the
     /// inject lock the caller holds, and the marker is cleared to `fresh`. Nothing about
     /// the leaf itself changes, so the request's own annotation is not written; the
-    /// response says so (`status: "rollup_repaired"`).
+    /// response says so (`status: "rollup_repaired"`). The caller refreshes the stored
+    /// leaf's embedding once the lock is released and fills in `embedding_status`.
     fn repair_outstanding_rollup(
         &self,
         store: &aether_store::SqliteStore,
@@ -593,7 +608,7 @@ impl AetherMcpServer {
             new_confidence,
             status: "rollup_repaired".to_owned(),
             note,
-            embedding_status: "skipped: stored SIR kept".to_owned(),
+            embedding_status: "pending".to_owned(),
             file_rollup_status,
         })
     }
@@ -1135,6 +1150,9 @@ vector_backend = "sqlite"
             .expect("inject sir");
         assert_eq!(other.status, "rollup_repaired");
         assert_eq!(other.file_rollup_status, "refreshed");
+        // The stored leaf's embedding refresh runs after the repair (embeddings are off
+        // in this workspace, so it reports that rather than "pending").
+        assert_eq!(other.embedding_status, "skipped: embeddings disabled");
         assert!(
             other
                 .note

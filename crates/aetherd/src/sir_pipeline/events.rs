@@ -390,6 +390,12 @@ impl SirPipeline {
             let language = symbol.language;
             touched_files.entry(file_path.clone()).or_insert(language);
 
+            // The baseline the job binds to is read before the skip decision and never
+            // again: a SIR injected while the job is being prepared (after a symbol was
+            // selected for having none, say) then differs from the job's prior, so the
+            // scan result is dropped as superseded instead of overwriting the injection
+            // or marking it stale on failure.
+            let baseline_sir = current_sir_identity(store, &symbol.id)?;
             if !force
                 && self
                     .should_skip_sir_generation(store, &symbol)
@@ -417,7 +423,7 @@ impl SirPipeline {
             );
             match build_job(&self.workspace_root, symbol, priority_score, None) {
                 Ok(mut job) => {
-                    job.prior_sir = current_sir_identity(store, &job.symbol.id)?;
+                    job.prior_sir = baseline_sir;
                     jobs.push(job)
                 }
                 Err(err) => {
@@ -613,6 +619,9 @@ impl SirPipeline {
         let mut skipped_existing = 0usize;
 
         for (symbol, allow_existing_skip) in changed_symbols {
+            // Observed once, before the skip decision, and never re-read: a SIR written
+            // while the job is prepared must supersede the job, not become its baseline.
+            let observed_sir = current_sir_identity(store, &symbol.id)?;
             if allow_existing_skip && !force && self.should_skip_sir_generation(store, &symbol)? {
                 skipped_existing += 1;
                 tracing::debug!(
@@ -639,13 +648,12 @@ impl SirPipeline {
                     // A prompt built from a recorded baseline binds the job to that
                     // baseline, not to whatever the row holds now: a SIR written in
                     // between would otherwise be overwritten by a result whose
-                    // enrichment described the older one.
+                    // enrichment described the older one. Without one, the job binds
+                    // to the SIR observed when it was selected.
                     job.prior_sir = match override_spec.map(|spec| &spec.prior_sir) {
                         Some(PriorSir::Present(identity)) => Some(identity.clone()),
                         Some(PriorSir::Absent) => None,
-                        Some(PriorSir::Unrecorded) | None => {
-                            current_sir_identity(store, &job.symbol.id)?
-                        }
+                        Some(PriorSir::Unrecorded) | None => observed_sir,
                     };
                     if let Some(override_spec) = override_spec {
                         job.custom_prompt = Some(override_spec.prompt.clone());
