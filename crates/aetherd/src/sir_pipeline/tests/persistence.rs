@@ -713,6 +713,48 @@ fn a_prompt_override_binds_the_job_to_the_baseline_it_was_built_from() {
 }
 
 #[test]
+fn a_failed_generation_for_a_removed_symbol_writes_no_marker() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    write_embeddings_only_config(workspace);
+
+    let store = SqliteStore::open(workspace).expect("open store");
+    let pipeline = build_write_pipeline(workspace, Arc::new(PanicInferenceProvider));
+    let symbol_id = "sym-removed";
+    store
+        .upsert_symbol(demo_symbol(symbol_id, "demo::removed"))
+        .expect("upsert symbol");
+    let symbol = demo_type_symbol(
+        symbol_id,
+        "removed",
+        "demo::removed",
+        "src/lib.rs",
+        SymbolKind::Function,
+        "fn removed() {}\n",
+    );
+
+    // The job started with no SIR; while it ran, the symbol was removed from the index.
+    // "No SIR" before and after must not read as unchanged: a failure marker would
+    // recreate an orphan SIR row for an id the index no longer holds.
+    store.mark_removed(symbol_id).expect("remove symbol");
+    pipeline
+        .handle_failed_generation(
+            &store,
+            infer::FailedSirGeneration {
+                symbol,
+                error_message: "provider timed out".to_owned(),
+                prior_sir: None,
+            },
+            SIR_GENERATION_PASS_SCAN,
+            false,
+            &mut std::io::sink(),
+        )
+        .expect("handle failure");
+    assert_eq!(store.get_sir_meta(symbol_id).expect("meta"), None);
+    assert_eq!(count_table_rows(workspace, "sir"), 0);
+}
+
+#[test]
 fn a_failed_generation_marks_only_the_sir_it_started_from_stale() {
     let temp = tempdir().expect("tempdir");
     let workspace = temp.path();

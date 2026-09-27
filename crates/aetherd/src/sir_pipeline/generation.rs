@@ -411,6 +411,22 @@ impl SirPipeline {
         // mark only that SIR stale: a SIR another writer stored meanwhile (an injection
         // from `/scan`, say) is not stale for having outlived an unrelated model error.
         let _inject_guard = acquire_inject_write_lock(&self.workspace_root)?;
+        // A symbol removed meanwhile (its row and SIR deleted under this lock) has no
+        // SIR to mark: for a job that started with none, "no SIR" would otherwise read
+        // as unchanged and the marker would recreate an orphan `sir` row for an id the
+        // index no longer holds.
+        if store
+            .get_symbol_record(&failed.symbol.id)
+            .with_context(|| format!("failed to load symbol {}", failed.symbol.id))?
+            .is_none()
+        {
+            tracing::info!(
+                symbol_id = %failed.symbol.id,
+                error = %failed.error_message,
+                "SIR generation failed, but the symbol was removed meanwhile; nothing to mark"
+            );
+            return Ok(());
+        }
         let previous_meta = store
             .get_sir_meta(&failed.symbol.id)
             .with_context(|| format!("failed to load SIR metadata for {}", failed.symbol.id))?;
