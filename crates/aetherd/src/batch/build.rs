@@ -54,7 +54,27 @@ pub(crate) fn remove_build_sidecars(batch_dir: &Path, pass: &str, build_id: &str
             }
         }
     }
+    let receipts = batch_dir.join(receipts_dir_name(pass, build_id));
+    match fs::remove_dir_all(&receipts) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to remove batch ingest receipts {}",
+                    receipts.display()
+                )
+            });
+        }
+    }
     Ok(())
+}
+
+/// The ingest receipts of one build: a directory holding one file per result whose SIR
+/// an ingest attempt has persisted, recording the identity that write produced (see
+/// `ingest::IngestReceipt`). Removed with the build's sidecars.
+pub(crate) fn receipts_dir_name(pass: &str, build_id: &str) -> String {
+    format!("{pass}.{build_id}.receipts")
 }
 
 /// A short identifier unique to one build of a pass, carried in its request keys.
@@ -626,7 +646,9 @@ mod tests {
 
     use std::path::Path;
 
-    use super::{new_build_id, origin_sidecar_name, remove_build_sidecars, write_sidecar};
+    use super::{
+        new_build_id, origin_sidecar_name, receipts_dir_name, remove_build_sidecars, write_sidecar,
+    };
 
     #[test]
     fn build_ids_are_short_and_distinct() {
@@ -685,10 +707,19 @@ mod tests {
             "temporary files must be renamed away: {names:?}"
         );
 
-        // Removing one build's sidecars leaves the other's, and is idempotent.
+        // Removing one build's sidecars (and its ingest receipts) leaves the other's,
+        // and is idempotent.
+        let first_receipts = dir.join(receipts_dir_name("triage", "build-1"));
+        let second_receipts = dir.join(receipts_dir_name("triage", "build-2"));
+        for receipts in [&first_receipts, &second_receipts] {
+            std::fs::create_dir_all(receipts).expect("receipts dir");
+            std::fs::write(receipts.join("r.json"), "{}").expect("receipt");
+        }
         remove_build_sidecars(dir, "triage", "build-1").expect("remove first");
         assert!(!first_path.exists());
+        assert!(!first_receipts.exists());
         assert!(second_path.exists());
+        assert!(second_receipts.join("r.json").exists());
         remove_build_sidecars(dir, "triage", "build-1").expect("remove again");
     }
 }

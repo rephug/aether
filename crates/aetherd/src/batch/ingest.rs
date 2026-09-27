@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aether_config::{AetherConfig, InferenceProviderKind};
 use aether_core::{Language, Position, SourceRange, Symbol, SymbolKind};
@@ -12,14 +12,15 @@ use aether_store::{
 use anyhow::{Context, Result, anyhow};
 
 use crate::batch::build::{
-    BatchRequestOrigin, KEYMAP_SIDECAR_KIND, ORIGIN_SIDECAR_KIND, snapshot_workspace_symbols,
+    BatchRequestOrigin, KEYMAP_SIDECAR_KIND, ORIGIN_SIDECAR_KIND, receipts_dir_name,
+    snapshot_workspace_symbols,
 };
 use crate::batch::hash::diff_prompt_hashes;
 use crate::batch::{BatchProvider, BatchResultLine, PassConfig};
 use crate::continuous::cosine_distance_from_embeddings;
 use crate::sir_pipeline::{
-    EmbeddingInput, PriorSir, SirPipeline, UpsertSirIntentPayload, current_sir_identity,
-    extract_symbol_source_text,
+    EmbeddingInput, PriorSir, SirIdentity, SirPipeline, UpsertSirIntentPayload,
+    current_sir_identity, extract_symbol_source_text,
 };
 
 /// Number of embedding records to buffer before flushing to the vector store.
@@ -40,10 +41,70 @@ pub(crate) struct IngestSummary {
     /// stands.
     pub superseded: usize,
     /// Results whose SIR an earlier, downstream-failed ingest attempt had already
-    /// persisted; counted in `processed` too, with only the embedding, contract and
-    /// fingerprint work redone.
+    /// persisted (its receipt names the store's current SIR); counted in `processed`
+    /// too, with only the embedding, contract and fingerprint work redone.
     pub resumed: usize,
     pub fingerprint_rows: usize,
+}
+
+/// What one ingest attempt wrote for one batch result in phase 1: the identity of the
+/// leaf it persisted. Written beside the build's sidecars (one file per result, under
+/// `<pass>.<build_id>.receipts/`, published by rename) right after the write, under the
+/// inject lock, and read by a retry: a result whose origin identity no longer holds is
+/// resumed only when the store's current SIR is exactly the write this receipt names.
+/// Equal content does not identify the writer, so an independent same-content write
+/// (an injection, say) is still superseding.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct IngestReceipt {
+    pub key: String,
+    pub identity: SirIdentity,
+}
+
+/// The receipt file of one result: keyed by the request key's blake3 so any key spelling
+/// is a valid file name. `None` for a legacy key without a build id (such a result has
+/// no origin either, so it is never checked for resumption).
+fn receipt_path(batch_dir: &Path, pass: &str, key: &str) -> Option<PathBuf> {
+    let build_id = key_build_id(key)?;
+    Some(
+        batch_dir
+            .join(receipts_dir_name(pass, build_id))
+            .join(format!("{}.json", blake3::hash(key.as_bytes()).to_hex())),
+    )
+}
+
+fn load_receipt(path: &Path, key: &str) -> Option<IngestReceipt> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let receipt = match serde_json::from_str::<IngestReceipt>(&content) {
+        Ok(receipt) => receipt,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "failed to parse batch ingest receipt; the result is not resumable"
+            );
+            return None;
+        }
+    };
+    (receipt.key == key).then_some(receipt)
+}
+
+fn write_receipt(path: &Path, receipt: &IngestReceipt) -> Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("receipt path {} has no directory", path.display()))?;
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create receipts directory {}", dir.display()))?;
+    let json = serde_json::to_string(receipt).context("failed to serialize ingest receipt")?;
+    let temp_path = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    std::fs::write(&temp_path, json)
+        .with_context(|| format!("failed to write ingest receipt {}", temp_path.display()))?;
+    std::fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "failed to publish ingest receipt {} as {}",
+            temp_path.display(),
+            path.display()
+        )
+    })
 }
 
 /// Per-symbol state collected during Phase 1 (parse + persist SIR).
@@ -56,8 +117,8 @@ struct PreparedSymbol {
     previous_embedding: Option<SymbolEmbeddingRecord>,
     /// Index into the batch embedding input vec, or `None` if embedding is disabled.
     embedding_slot: Option<usize>,
-    /// The store already held this SIR from an earlier ingest attempt that failed
-    /// downstream; the leaf was left as is and only the downstream work is redone.
+    /// The store still holds the write an earlier ingest attempt's receipt names (it
+    /// failed downstream); the leaf was left as is and only the downstream work is redone.
     resumed: bool,
 }
 
@@ -106,6 +167,9 @@ pub(crate) fn ingest_results(
         }
     };
 
+    // Sidecars and ingest receipts live beside the results.
+    let batch_dir = results_path.parent().unwrap_or_else(|| Path::new("."));
+
     let file = std::fs::File::open(results_path)
         .with_context(|| format!("failed to open batch results {}", results_path.display()))?;
     let reader = BufReader::new(file);
@@ -147,6 +211,7 @@ pub(crate) fn ingest_results(
                 &keymap,
                 &origins,
                 current_symbols,
+                batch_dir,
                 &line_chunk,
                 &mut summary,
                 &mut embedding_buffer,
@@ -167,6 +232,7 @@ pub(crate) fn ingest_results(
             &keymap,
             &origins,
             current_symbols,
+            batch_dir,
             &line_chunk,
             &mut summary,
             &mut embedding_buffer,
@@ -199,6 +265,7 @@ fn process_chunk(
     keymap: &HashMap<String, String>,
     origins: &HashMap<String, BatchRequestOrigin>,
     current_symbols: Option<&HashMap<String, Symbol>>,
+    batch_dir: &Path,
     lines: &[String],
     summary: &mut IngestSummary,
     embedding_buffer: &mut Vec<SymbolEmbeddingRecord>,
@@ -219,6 +286,7 @@ fn process_chunk(
             keymap,
             origins,
             current_symbols,
+            batch_dir,
         ) {
             Ok(None) => {
                 summary.superseded += 1;
@@ -345,6 +413,7 @@ fn prepare_symbol(
     keymap: &HashMap<String, String>,
     origins: &HashMap<String, BatchRequestOrigin>,
     current_symbols: Option<&HashMap<String, Symbol>>,
+    batch_dir: &Path,
 ) -> Result<Option<PreparedSymbol>> {
     let (symbol_id, prompt_hash, request_key, sir_json, reasoning_trace) =
         match provider.parse_result_line(raw_line)? {
@@ -467,32 +536,44 @@ fn prepare_symbol(
     // this result's hash over a SIR that replaced it.
     //
     // One newer write is this result's own: an earlier ingest attempt that persisted
-    // the SIR and then failed downstream (embedding, vector flush, fingerprint) leaves
-    // the store holding exactly the SIR this result canonicalizes to, so the retained
-    // sidecars can be re-ingested to finish. Such a result is resumed (the leaf is not
-    // rewritten, so its identity is unchanged) rather than dropped as superseded.
+    // the SIR and then failed downstream (embedding, vector flush, fingerprint) left a
+    // receipt naming the identity its write produced, so the retained sidecars can be
+    // re-ingested to finish. The result is resumed (the leaf is not rewritten, so its
+    // identity is unchanged) only while the store holds exactly that write; a
+    // same-content SIR written independently since (an injection, say) has a different
+    // identity and supersedes the result like any other.
+    let receipt_path = receipt_path(batch_dir, pass_config.pass.as_str(), &request_key);
     let (canonical_json, sir_hash_value, resumed) = {
         let _inject_guard =
             crate::sir_pipeline::acquire_inject_write_lock(pipeline.workspace_root())?;
         let current = current_sir_identity(store, &symbol_id)?;
         let (_, canonical_json, sir_hash_value) =
             pipeline.prepare_sir_for_persistence(store, &payload.symbol, &payload.sir)?;
-        let resumed = !payload.prior_sir.still_holds(current.as_ref())
-            && current
-                .as_ref()
-                .is_some_and(|current| current.sir_hash == sir_hash_value);
-        if resumed {
+        let resumed = if payload.prior_sir.still_holds(current.as_ref()) {
+            false
+        } else {
+            let receipt = receipt_path
+                .as_deref()
+                .and_then(|path| load_receipt(path, &request_key));
+            let resumable = match (receipt, current.as_ref()) {
+                (Some(receipt), Some(current)) => {
+                    receipt.identity == *current && current.sir_hash == sir_hash_value
+                }
+                _ => false,
+            };
+            if !resumable {
+                tracing::info!(
+                    symbol_id = %symbol_id,
+                    "skipping batch result: the stored SIR changed since the request was built"
+                );
+                return Ok(None);
+            }
             tracing::info!(
                 symbol_id = %symbol_id,
-                "resuming batch result: the store already holds this SIR from an earlier ingest attempt"
+                "resuming batch result: the store holds the write an earlier ingest attempt receipted"
             );
-        } else if !payload.prior_sir.still_holds(current.as_ref()) {
-            tracing::info!(
-                symbol_id = %symbol_id,
-                "skipping batch result: the stored SIR changed since the request was built"
-            );
-            return Ok(None);
-        }
+            true
+        };
         if let Some(origin) = origin
             && !resumed
         {
@@ -522,30 +603,33 @@ fn prepare_symbol(
             pipeline
                 .persist_sir_payload_into_sqlite(store, &payload, None)
                 .with_context(|| format!("failed to persist SIR payload for {symbol_id}"))?;
+            // Receipt the write before anything after it can fail, so a retry can tell
+            // this write from any other.
+            if let Some(path) = &receipt_path {
+                let identity = current_sir_identity(store, &symbol_id)?
+                    .ok_or_else(|| anyhow!("missing persisted SIR identity for {symbol_id}"))?;
+                write_receipt(
+                    path,
+                    &IngestReceipt {
+                        key: request_key.clone(),
+                        identity,
+                    },
+                )?;
+            }
         }
 
         let current_meta = store
             .get_sir_meta(&symbol_id)
             .with_context(|| format!("failed to reload SIR metadata for {symbol_id}"))?
             .ok_or_else(|| anyhow!("missing persisted SIR metadata for {symbol_id}"))?;
-        // A resumed result promotes its provenance only onto a row that carries none
-        // yet or already carries its own; a same-content SIR another request already
-        // claimed keeps that request's provenance.
-        let claims_provenance = !resumed
-            || current_meta
-                .prompt_hash
-                .as_deref()
-                .is_none_or(|existing| existing == prompt_hash);
-        if claims_provenance {
-            store
-                .upsert_sir_meta(prompt_hash_meta_record(
-                    current_meta,
-                    prompt_hash.clone(),
-                    payload.generation_pass.clone(),
-                    payload.reasoning_trace.clone(),
-                ))
-                .with_context(|| format!("failed to persist prompt_hash for {symbol_id}"))?;
-        }
+        store
+            .upsert_sir_meta(prompt_hash_meta_record(
+                current_meta,
+                prompt_hash.clone(),
+                payload.generation_pass.clone(),
+                payload.reasoning_trace.clone(),
+            ))
+            .with_context(|| format!("failed to persist prompt_hash for {symbol_id}"))?;
         (canonical_json, sir_hash_value, resumed)
     };
 
@@ -596,9 +680,15 @@ pub(crate) fn write_fingerprint_row(
 /// Split a request key `symbol_id|prompt_hash[|build_id]` into its symbol id and prompt
 /// hash (the build id only distinguishes sidecar entries, see `BuildSummary::build_id`).
 fn key_has_build_id(key: &str) -> bool {
+    key_build_id(key).is_some()
+}
+
+/// The build id of a three-part key (`symbol_id|prompt_hash|build_id`), if any.
+fn key_build_id(key: &str) -> Option<&str> {
     key.splitn(3, '|')
         .nth(2)
-        .is_some_and(|build_id| !build_id.trim().is_empty())
+        .map(str::trim)
+        .filter(|build_id| !build_id.is_empty())
 }
 
 fn parse_key(key: &str) -> Result<(&str, &str)> {
@@ -1006,6 +1096,7 @@ vector_backend = "sqlite"
             &HashMap::new(),
             &origins,
             Some(&current_symbols),
+            workspace,
         )
         .expect("prepare symbol");
         assert!(
@@ -1049,6 +1140,7 @@ vector_backend = "sqlite"
             &HashMap::new(),
             &origins,
             Some(&current_symbols),
+            workspace,
         )
         .expect("prepare symbol");
         assert!(
@@ -1078,6 +1170,7 @@ vector_backend = "sqlite"
             &HashMap::new(),
             &HashMap::new(),
             Some(&current_symbols),
+            workspace,
         ) {
             Err(err) => err,
             Ok(_) => panic!("a modern key without an origin must be refused"),
@@ -1108,6 +1201,7 @@ vector_backend = "sqlite"
             &HashMap::new(),
             &origins,
             Some(&current_symbols),
+            workspace,
         )
         .expect("prepare symbol");
         assert!(outcome.is_some());
@@ -1196,6 +1290,7 @@ vector_backend = "sqlite"
                 &HashMap::new(),
                 origins,
                 Some(&current_symbols),
+                workspace,
             )
             .expect("prepare symbol")
         };
@@ -1228,25 +1323,38 @@ vector_backend = "sqlite"
         assert_eq!(meta.prompt_hash.as_deref(), Some("prompt-retry"));
         assert_eq!(meta.generation_pass, "triage");
 
-        // A same-content SIR another request already claimed keeps that provenance.
-        store
-            .upsert_sir_meta(SirMetaRecord {
-                prompt_hash: Some("prompt-other".to_owned()),
-                generation_pass: "deep".to_owned(),
-                reasoning_trace: None,
-                ..meta
+        // The receipt names exactly that write.
+        let receipt_file = receipt_path(workspace, "triage", &key).expect("modern key");
+        assert_eq!(
+            load_receipt(&receipt_file, &key),
+            Some(IngestReceipt {
+                key: key.clone(),
+                identity: written.clone(),
             })
-            .expect("claim provenance");
-        let retry = prepare(&origins).expect("retry resumes the result");
-        assert!(retry.resumed);
+        );
+
+        // An independent write of the very same content (an injection, say) is not
+        // this result's own: its identity differs from the receipt, so the result is
+        // superseded and the injection keeps its provenance.
+        persist(&batch_sir, "injected");
+        let injected = current_sir_identity(&store, "sym-retry").expect("identity");
+        assert_ne!(injected, Some(written.clone()));
+        assert!(
+            prepare(&origins).is_none(),
+            "equal content does not identify the writer"
+        );
         let meta = store
             .get_sir_meta("sym-retry")
             .expect("load sir meta")
             .expect("sir meta exists");
-        assert_eq!(meta.prompt_hash.as_deref(), Some("prompt-other"));
-        assert_eq!(meta.generation_pass, "deep");
+        assert_eq!(meta.generation_pass, "injected");
+        assert_eq!(meta.prompt_hash, None);
+        assert_eq!(
+            current_sir_identity(&store, "sym-retry").expect("identity"),
+            injected
+        );
 
-        // A different SIR written since is not this result's own: superseded as before.
+        // A different SIR written since is superseded as before.
         persist(
             &SirAnnotation {
                 intent: "Reviewed by hand".to_owned(),
@@ -1313,6 +1421,7 @@ vector_backend = "sqlite"
             &HashMap::new(),
             &HashMap::new(),
             None,
+            workspace,
         )
         .expect("prepare symbol")
         .expect("result applied");
