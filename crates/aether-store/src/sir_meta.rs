@@ -446,15 +446,30 @@ impl SqliteStore {
             return Ok(Some(json));
         }
 
-        let path = self.sir_blob_path(symbol_id);
-
-        if !path.exists() {
+        let Some(content) = self.read_legacy_mirror(symbol_id)? else {
             return Ok(None);
-        }
-
-        let content = fs::read_to_string(path)?;
+        };
         self.upsert_sir_json_only(symbol_id, &content)?;
         Ok(Some(content))
+    }
+
+    /// The legacy file mirror of a symbol's SIR JSON, if one exists (`Ok(None)` when the
+    /// file is absent, also when it disappears between the existence check and the
+    /// read). Any other failure names the mirror path and the symbol, so a caller can
+    /// tell which file of which symbol could not be read.
+    fn read_legacy_mirror(&self, symbol_id: &str) -> Result<Option<String>, StoreError> {
+        let path = self.sir_blob_path(symbol_id);
+        match fs::read_to_string(&path) {
+            Ok(content) => Ok(Some(content)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(StoreError::Io(std::io::Error::new(
+                err.kind(),
+                format!(
+                    "failed to read the legacy SIR mirror {} for symbol {symbol_id}: {err}",
+                    path.display()
+                ),
+            ))),
+        }
     }
     pub(crate) fn store_upsert_sir_meta(&self, record: SirMetaRecord) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
@@ -613,11 +628,9 @@ impl SqliteStore {
             if snapshot.blob.is_some() {
                 return Ok(Some(snapshot));
             }
-            let path = self.sir_blob_path(symbol_id);
-            if !path.exists() {
+            let Some(mirrored) = self.read_legacy_mirror(symbol_id)? else {
                 return Ok(Some(snapshot));
-            }
-            let mirrored = fs::read_to_string(path)?;
+            };
             match self.read_sir_row(symbol_id)? {
                 None => return Ok(None),
                 Some(again) if again.identity == snapshot.identity => {

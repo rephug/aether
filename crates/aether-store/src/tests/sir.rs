@@ -27,6 +27,59 @@ fn read_sir_blob_prefers_sqlite_when_mirror_is_missing() {
 }
 
 #[test]
+fn an_unreadable_legacy_mirror_names_its_path_and_symbol() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    let store = SqliteStore::open(workspace).expect("open store");
+    store
+        .upsert_sir_meta(SirMetaRecord {
+            id: "sym-mirror".to_owned(),
+            sir_hash: "mirror-hash".to_owned(),
+            sir_version: 1,
+            provider: "legacy-provider".to_owned(),
+            model: "legacy-model".to_owned(),
+            generation_pass: "scan".to_owned(),
+            reasoning_trace: None,
+            prompt_hash: None,
+            staleness_score: None,
+            updated_at: 1_700_000_000,
+            sir_status: "fresh".to_owned(),
+            last_error: None,
+            last_attempt_at: 1_700_000_000,
+        })
+        .expect("upsert legacy metadata");
+    // A directory where the mirror file should be: the read fails for a reason other
+    // than absence, and the error must say which file of which symbol.
+    let mirror_path = workspace.join(".aether/sir/sym-mirror.json");
+    fs::create_dir_all(&mirror_path).expect("occupy the mirror path");
+
+    for err in [
+        store
+            .read_sir_blob("sym-mirror")
+            .expect_err("a directory in place of the mirror is a read failure"),
+        store
+            .get_sir_meta_with_blob("sym-mirror")
+            .expect_err("the row read fails the same way"),
+    ] {
+        let message = err.to_string();
+        assert!(
+            message.contains(&mirror_path.display().to_string()) && message.contains("sym-mirror"),
+            "unexpected error: {message}"
+        );
+    }
+
+    // A mirror that is simply absent is no error: the row stands without a blob.
+    fs::remove_dir(&mirror_path).expect("free the mirror path");
+    assert_eq!(store.read_sir_blob("sym-mirror").expect("read blob"), None);
+    assert!(
+        store
+            .get_sir_meta_with_blob("sym-mirror")
+            .expect("row read")
+            .is_some_and(|snapshot| snapshot.blob.is_none())
+    );
+}
+
+#[test]
 fn read_sir_blob_backfills_sqlite_from_mirror_without_overwriting_meta() {
     let temp = tempdir().expect("tempdir");
     let workspace = temp.path();
