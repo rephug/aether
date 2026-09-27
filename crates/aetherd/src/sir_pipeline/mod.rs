@@ -2585,8 +2585,9 @@ impl SirPipeline {
     /// call, again right before the vector is stored, and once more after it is stored.
     /// A vector for a SIR that was replaced in the meantime is never left in the store:
     /// the write is skipped, or undone when the replacement landed between the last
-    /// check and the write, so the symbol carries the newer SIR's vector once that
-    /// injector's own refresh runs, or none at all rather than a stale one.
+    /// check and the write (only this call's own vector is removed, never one a newer
+    /// writer stored since), so the symbol carries the newer SIR's vector once that
+    /// writer's refresh runs, or none at all rather than a stale one.
     pub fn refresh_embedding_if_current(
         &self,
         symbol_id: &str,
@@ -2638,9 +2639,15 @@ impl SirPipeline {
         if !still_current()? {
             // The SIR changed between the last check and the write: the vector just
             // stored describes the old SIR, so take it back out rather than let the new
-            // SIR read as semantically identical to the old one.
+            // SIR read as semantically identical to the old one. Only this call's own
+            // vector is removed (the delete is keyed on the SIR hash): a writer that
+            // does not take the embedding locks (the daemon's index or regenerate pass)
+            // may already have stored the newer SIR's vector, and that one must stay.
             self.runtime
-                .block_on(self.vector_store.delete_embedding(symbol_id))
+                .block_on(
+                    self.vector_store
+                        .delete_embedding_if_sir_hash(symbol_id, sir_hash_value),
+                )
                 .with_context(|| {
                     format!("failed to delete the superseded embedding for {symbol_id}")
                 })?;

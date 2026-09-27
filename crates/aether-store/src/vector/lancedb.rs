@@ -587,6 +587,39 @@ impl VectorStore for LanceVectorStore {
         Ok(())
     }
 
+    async fn delete_embedding_if_sir_hash(
+        &self,
+        symbol_id: &str,
+        sir_hash: &str,
+    ) -> Result<(), StoreError> {
+        self.migrate_from_sqlite_if_needed().await?;
+        let connection = self.connect().await?;
+        let predicate = format!(
+            "symbol_id = '{}' AND sir_hash = '{}'",
+            escape_sql_string(symbol_id),
+            escape_sql_string(sir_hash)
+        );
+
+        for name in connection
+            .table_names()
+            .execute()
+            .await
+            .map_err(map_lancedb_err)?
+            .into_iter()
+            .filter(|name| name.starts_with(VECTOR_TABLE_PREFIX))
+        {
+            let Ok(table) = connection.open_table(&name).execute().await else {
+                continue;
+            };
+            table
+                .delete(predicate.as_str())
+                .await
+                .map_err(map_lancedb_err)?;
+        }
+
+        Ok(())
+    }
+
     async fn delete_embeddings(&self, symbol_ids: &[String]) -> Result<(), StoreError> {
         self.migrate_from_sqlite_if_needed().await?;
         let requested = symbol_ids

@@ -188,6 +188,19 @@ impl SqliteStore {
         )?;
         Ok(())
     }
+    /// Delete the symbol's embedding only while it still carries `sir_hash` (one
+    /// statement, so no newer vector can slip in between a check and the delete).
+    pub fn delete_symbol_embedding_if_sir_hash(
+        &self,
+        symbol_id: &str,
+        sir_hash: &str,
+    ) -> Result<(), StoreError> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM sir_embeddings WHERE symbol_id = ?1 AND sir_hash = ?2",
+            params![symbol_id, sir_hash],
+        )?;
+        Ok(())
+    }
     pub(crate) fn store_search_symbols_semantic(
         &self,
         query_embedding: &[f32],

@@ -62,6 +62,15 @@ impl VectorStore for SqliteVectorStore {
         self.store.delete_symbol_embedding(symbol_id)
     }
 
+    async fn delete_embedding_if_sir_hash(
+        &self,
+        symbol_id: &str,
+        sir_hash: &str,
+    ) -> Result<(), StoreError> {
+        self.store
+            .delete_symbol_embedding_if_sir_hash(symbol_id, sir_hash)
+    }
+
     async fn delete_embeddings(&self, symbol_ids: &[String]) -> Result<(), StoreError> {
         self.store.delete_symbol_embeddings(symbol_ids)
     }
