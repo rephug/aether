@@ -139,6 +139,7 @@ fn sir_meta_round_trips_prompt_hash_and_fingerprint_rows() {
             generation_model: Some("gemini-3.1-flash-lite-preview".to_owned()),
             generation_pass: Some("scan".to_owned()),
             delta_sem: Some(0.12),
+            sir_write_generation: None,
         })
         .expect("insert fingerprint row");
 

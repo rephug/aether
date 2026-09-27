@@ -177,7 +177,7 @@ impl SharedState {
             None => true,
         };
         let store = Arc::new(SqliteStore::open(&workspace)?);
-        store.check_compatibility("core", 19)?;
+        store.check_compatibility("core", 20)?;
         let graph = open_shared_graph(&workspace, &config, false)?;
         let surreal_graph = Arc::new(Mutex::new(None));
         let vector_store = open_vector_store_sync_optional(&workspace, &config)?;
@@ -208,7 +208,7 @@ impl SharedState {
             None => true,
         };
         let store = Arc::new(SqliteStore::open(&workspace)?);
-        store.check_compatibility("core", 19)?;
+        store.check_compatibility("core", 20)?;
         let (graph, surreal_graph) = open_shared_graph_async(&workspace, &config, false).await?;
         let surreal_graph = Arc::new(Mutex::new(surreal_graph));
         let vector_store = open_vector_store_async_optional(&workspace, &config).await?;
@@ -240,7 +240,7 @@ impl SharedState {
             None => true,
         };
         let store = Arc::new(SqliteStore::open_readonly(&workspace)?);
-        store.check_compatibility("core", 19)?;
+        store.check_compatibility("core", 20)?;
         let (graph, surreal_graph) = open_shared_graph_async(&workspace, &config, true).await?;
         let surreal_graph = Arc::new(Mutex::new(surreal_graph));
         let vector_store = open_vector_store_async_optional(&workspace, &config).await?;
@@ -272,7 +272,7 @@ impl SharedState {
             None => true,
         };
         let store = Arc::new(SqliteStore::open_readonly(&workspace)?);
-        store.check_compatibility("core", 19)?;
+        store.check_compatibility("core", 20)?;
         let graph = open_shared_graph(&workspace, &config, true)?;
         let surreal_graph = Arc::new(Mutex::new(None));
         let vector_store = open_vector_store_sync_optional(&workspace, &config)?;
@@ -522,7 +522,7 @@ api_key_env = "{api_key_env}"
 
         assert!(ro.read_only);
         assert_eq!(ro.schema_version.component, "core");
-        assert_eq!(ro.schema_version.version, 19);
+        assert_eq!(ro.schema_version.version, 20);
         assert!(ro.schema_version.migrated_at > 0);
     }
 

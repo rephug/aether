@@ -224,6 +224,7 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
         generation_model.as_str(),
         "injected",
         delta_sem,
+        None,
     )
     .with_context(|| format!("failed to write fingerprint history for {}", record.id))?;
 

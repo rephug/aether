@@ -2180,6 +2180,7 @@ fn finalize_watcher_generation(
         pipeline.model_name(),
         generation_pass,
         cosine_distance_from_embeddings(previous_embedding, current_embedding.as_ref()),
+        None,
     )
     .with_context(|| format!("failed to write watcher fingerprint row for {}", symbol.id))
 }

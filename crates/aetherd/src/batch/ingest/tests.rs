@@ -588,6 +588,7 @@ fn a_resumed_result_writes_its_fingerprint_row_once_against_its_true_predecessor
         "scan-model",
         "scan",
         None,
+        None,
     )
     .expect("scan fingerprint");
     let built_against = current_sir_identity(&store, "sym-fp").expect("identity");
@@ -653,9 +654,10 @@ fn a_resumed_result_writes_its_fingerprint_row_once_against_its_true_predecessor
         Some("prompt-scan")
     );
 
-    // An older ingest of the very same prompt left a row of its own; a later ingest
-    // of that prompt that failed before its row is still a new event: the retry
-    // writes it rather than taking the old row for this write's.
+    // An older ingest of the very same prompt left a row of its own (no write
+    // generation, or another write's); a later ingest of that prompt that failed
+    // before its row is still a new event: the retry writes it rather than taking
+    // the old row for this write's, however close in time the two are.
     let history_before = store
         .list_sir_fingerprint_history("sym-fp")
         .expect("history")
@@ -669,18 +671,9 @@ fn a_resumed_result_writes_its_fingerprint_row_once_against_its_true_predecessor
         "triage-model",
         "triage",
         None,
+        None,
     )
     .expect("older same-prompt row");
-    // Its timestamp lies before the write the retry resumes.
-    {
-        let conn =
-            rusqlite::Connection::open(workspace.join(".aether/meta.sqlite")).expect("open sqlite");
-        conn.execute(
-            "UPDATE sir_fingerprint_history SET timestamp = timestamp - 3600 WHERE symbol_id = 'sym-fp'",
-            [],
-        )
-        .expect("age the rows");
-    }
     prepare_symbol(
         &pipeline,
         &store,
@@ -747,6 +740,7 @@ fn a_resumed_result_writes_its_fingerprint_row_once_against_its_true_predecessor
         "batch_scan",
         "scan-model",
         "scan",
+        None,
         None,
     )
     .expect("scan fingerprint");

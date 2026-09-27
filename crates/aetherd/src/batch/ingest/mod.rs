@@ -59,10 +59,10 @@ struct PreparedSymbol {
     /// The store still holds this result's own earlier write (an ingest attempt that
     /// failed downstream); the leaf was left as is and only the downstream work is redone.
     resumed: bool,
-    /// For a resumed result, the `updated_at` of that earlier write (the leaf row's
-    /// write time): downstream rows that belong to it were written at or after it,
-    /// which tells them from rows an older ingest of the same prompt left behind.
-    resumed_write_time: Option<i64>,
+    /// The `write_generation` of the leaf write this result stands on: the one phase 1
+    /// just made, or, for a resumed result, its own earlier write. Downstream rows
+    /// carry it, which tells them from rows an older ingest of the same prompt left.
+    write_generation: i64,
 }
 
 /// Map batch provider name to the closest `InferenceProviderKind`.
@@ -300,9 +300,9 @@ fn process_chunk(
         // "previous" metadata is its own write) the last prompt the symbol was
         // fingerprinted for. A resumed result may also have written its row before the
         // earlier attempt failed (in the vector flush, say): the row is appended once
-        // per result, never per attempt. Only a row written at or after that result's
-        // own leaf write counts as its row; an older row an earlier ingest of the same
-        // prompt left behind records that earlier event, not this one.
+        // per result, never per attempt. Only a row carrying this result's own leaf
+        // write generation counts as its row; an older row an earlier ingest of the
+        // same prompt left behind records that earlier event, not this one.
         let mut previous_prompt_hash = prep
             .previous_meta
             .as_ref()
@@ -315,9 +315,9 @@ fn process_chunk(
                 .with_context(|| {
                     format!("failed to read fingerprint history for {}", prep.symbol_id)
                 })?;
-            if let Some(write_time) = prep.resumed_write_time {
+            if prep.resumed {
                 fingerprint_written = history.iter().any(|row| {
-                    row.timestamp >= write_time
+                    row.sir_write_generation == Some(prep.write_generation)
                         && row.prompt_hash == prep.prompt_hash
                         && row.trigger == trigger
                 });
@@ -343,6 +343,7 @@ fn process_chunk(
                     prep.previous_embedding.as_ref(),
                     current_embedding.as_ref(),
                 ),
+                Some(prep.write_generation),
             )
             .with_context(|| format!("failed to write fingerprint row for {}", prep.symbol_id))?;
             summary.fingerprint_rows += 1;
@@ -517,13 +518,13 @@ fn prepare_symbol(
     // regeneration never writes a prompt hash, so a same-content SIR written
     // independently since supersedes the result like any other, and a different SIR
     // trivially does.
-    let (canonical_json, sir_hash_value, resumed_write_time) = {
+    let (canonical_json, sir_hash_value, resumed, write_generation) = {
         let _inject_guard =
             crate::sir_pipeline::acquire_inject_write_lock(pipeline.workspace_root())?;
         let current = current_sir_identity(store, &symbol_id)?;
         let (_, canonical_json, sir_hash_value) =
             pipeline.prepare_sir_for_persistence(store, &payload.symbol, &payload.sir)?;
-        let resumed_write_time = if payload.prior_sir.still_holds(current.as_ref()) {
+        let resumed_write = if payload.prior_sir.still_holds(current.as_ref()) {
             None
         } else {
             let current_meta = store
@@ -539,8 +540,8 @@ fn prepare_symbol(
                         && meta.provider == payload.provider_name
                         && meta.model == payload.model_name
                 })
-                .map(|(_, meta)| meta.updated_at);
-            let Some(write_time) = own_write else {
+                .map(|(identity, _)| identity.write_generation);
+            let Some(write_generation) = own_write else {
                 tracing::info!(
                     symbol_id = %symbol_id,
                     "skipping batch result: the stored SIR changed since the request was built"
@@ -551,9 +552,9 @@ fn prepare_symbol(
                 symbol_id = %symbol_id,
                 "resuming batch result: the store holds this result's own earlier write"
             );
-            Some(write_time)
+            Some(write_generation)
         };
-        let resumed = resumed_write_time.is_some();
+        let resumed = resumed_write.is_some();
         if let Some(origin) = origin
             && !resumed
         {
@@ -579,13 +580,19 @@ fn prepare_symbol(
                 return Ok(None);
             }
         }
-        if !resumed {
-            // Leaf, history, metadata and this request's provenance in one transaction.
-            pipeline
-                .persist_sir_payload_into_sqlite(store, &payload, None)
-                .with_context(|| format!("failed to persist SIR payload for {symbol_id}"))?;
-        }
-        (canonical_json, sir_hash_value, resumed_write_time)
+        let write_generation = match resumed_write {
+            Some(write_generation) => write_generation,
+            None => {
+                // Leaf, history, metadata and this request's provenance in one transaction.
+                pipeline
+                    .persist_sir_payload_into_sqlite(store, &payload, None)
+                    .with_context(|| format!("failed to persist SIR payload for {symbol_id}"))?;
+                current_sir_identity(store, &symbol_id)?
+                    .ok_or_else(|| anyhow!("missing persisted SIR identity for {symbol_id}"))?
+                    .write_generation
+            }
+        };
+        (canonical_json, sir_hash_value, resumed, write_generation)
     };
 
     Ok(Some(PreparedSymbol {
@@ -596,8 +603,8 @@ fn prepare_symbol(
         previous_meta,
         previous_embedding,
         embedding_slot: None,
-        resumed: resumed_write_time.is_some(),
-        resumed_write_time,
+        resumed,
+        write_generation,
     }))
 }
 
@@ -611,6 +618,7 @@ pub(crate) fn write_fingerprint_row(
     generation_model: &str,
     generation_pass: &str,
     delta_sem: Option<f64>,
+    sir_write_generation: Option<i64>,
 ) -> Result<()> {
     let (source_changed, neighbor_changed, config_changed) = previous_prompt_hash
         .map_or((false, false, false), |old| {
@@ -629,6 +637,7 @@ pub(crate) fn write_fingerprint_row(
             generation_model: Some(generation_model.to_owned()),
             generation_pass: Some(generation_pass.to_owned()),
             delta_sem,
+            sir_write_generation,
         })
         .with_context(|| format!("failed to insert fingerprint history row for {symbol_id}"))
 }

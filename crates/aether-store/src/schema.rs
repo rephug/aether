@@ -427,7 +427,8 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
             config_changed INTEGER NOT NULL DEFAULT 0,
             generation_model TEXT,
             generation_pass TEXT,
-            delta_sem REAL
+            delta_sem REAL,
+            sir_write_generation INTEGER
         );
 
         CREATE INDEX IF NOT EXISTS idx_fingerprint_symbol_time
@@ -685,6 +686,14 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         conn.execute("PRAGMA user_version = 19", [])?;
     }
 
+    if version < 20 {
+        // The leaf write a fingerprint row records, by its `write_generation`, so a
+        // retried batch ingest can tell its own row from an older row of the same
+        // prompt (timestamps have second resolution and do not order writes).
+        ensure_fingerprint_history_column(conn, "sir_write_generation", "INTEGER")?;
+        conn.execute("PRAGMA user_version = 20", [])?;
+    }
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -772,6 +781,24 @@ fn ensure_sir_column(
     }
 
     let sql = format!("ALTER TABLE sir ADD COLUMN {column_name} {column_definition}");
+    conn.execute(&sql, [])?;
+    Ok(())
+}
+fn ensure_fingerprint_history_column(
+    conn: &Connection,
+    column_name: &str,
+    column_definition: &str,
+) -> Result<(), StoreError> {
+    if !table_exists(conn, "sir_fingerprint_history")? {
+        return Ok(());
+    }
+
+    if table_has_column(conn, "sir_fingerprint_history", column_name)? {
+        return Ok(());
+    }
+
+    let sql =
+        format!("ALTER TABLE sir_fingerprint_history ADD COLUMN {column_name} {column_definition}");
     conn.execute(&sql, [])?;
     Ok(())
 }

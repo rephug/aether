@@ -1485,6 +1485,7 @@ fn seed_workspace(workspace: &std::path::Path) {
             generation_model: Some("gemini-flash".to_owned()),
             generation_pass: Some("scan".to_owned()),
             delta_sem: Some(0.42),
+            sir_write_generation: None,
         })
         .unwrap();
     store
@@ -1500,6 +1501,7 @@ fn seed_workspace(workspace: &std::path::Path) {
             generation_model: Some("gemini-flash".to_owned()),
             generation_pass: Some("triage".to_owned()),
             delta_sem: Some(0.15),
+            sir_write_generation: None,
         })
         .unwrap();
 }
