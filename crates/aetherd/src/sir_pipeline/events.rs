@@ -634,10 +634,20 @@ impl SirPipeline {
 
             match build_job(&self.workspace_root, symbol, priority_score, None) {
                 Ok(mut job) => {
-                    job.prior_sir = current_sir_identity(store, &job.symbol.id)?;
-                    if let Some(prompt_overrides) = prompt_overrides
-                        && let Some(override_spec) = prompt_overrides.get(job.symbol.id.as_str())
-                    {
+                    let override_spec = prompt_overrides
+                        .and_then(|overrides| overrides.get(job.symbol.id.as_str()));
+                    // A prompt built from a recorded baseline binds the job to that
+                    // baseline, not to whatever the row holds now: a SIR written in
+                    // between would otherwise be overwritten by a result whose
+                    // enrichment described the older one.
+                    job.prior_sir = match override_spec.map(|spec| &spec.prior_sir) {
+                        Some(PriorSir::Present(identity)) => Some(identity.clone()),
+                        Some(PriorSir::Absent) => None,
+                        Some(PriorSir::Unrecorded) | None => {
+                            current_sir_identity(store, &job.symbol.id)?
+                        }
+                    };
+                    if let Some(override_spec) = override_spec {
                         job.custom_prompt = Some(override_spec.prompt.clone());
                         job.deep_mode = override_spec.deep_mode;
                     }
@@ -833,6 +843,7 @@ impl SirPipeline {
                 SirPromptOverride {
                     prompt,
                     deep_mode: spec.use_cot,
+                    prior_sir: PriorSir::recorded(spec.baseline_sir_identity.clone()),
                 },
             );
         }

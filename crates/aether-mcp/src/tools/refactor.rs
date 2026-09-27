@@ -73,6 +73,11 @@ pub struct AetherRefactorPrepResponse {
     /// call, say) while the SIR was being generated; that newer SIR was kept.
     #[serde(default)]
     pub deep_superseded: u32,
+    /// Deep SIRs that were persisted but whose embedding refresh failed afterwards; the
+    /// SIR stands and counts as completed, the vector is refreshed by the next
+    /// `aetherd --index-once --embeddings-only` pass (see `notes`).
+    #[serde(default)]
+    pub deep_embedding_failed: u32,
     pub forced_cycle_members: u32,
     pub skipped_fresh: u32,
     pub notes: Vec<String>,
@@ -128,11 +133,16 @@ struct McpDeepScanOutcome {
     succeeded_ids: HashSet<String>,
     failed_symbol_ids: Vec<String>,
     superseded_symbol_ids: Vec<String>,
+    /// Persisted deep SIRs whose embedding refresh failed, with the error.
+    embedding_failures: Vec<(String, String)>,
 }
 
 /// What became of one deep-scan candidate's generated SIR.
 enum DeepSirPersist {
-    Persisted,
+    /// The leaf committed. `embedding_error` is set when the embedding refresh that
+    /// follows the commit failed: the SIR stands (it is fresh and current), only its
+    /// vector is stale until the next embeddings pass, so this is not a failed scan.
+    Persisted { embedding_error: Option<String> },
     /// The stored SIR changed while this one was being generated; nothing was written.
     Superseded,
 }
@@ -183,6 +193,13 @@ impl AetherMcpServer {
                 deep_outcome.failed_symbol_ids.len()
             ));
         }
+        if !deep_outcome.embedding_failures.is_empty() {
+            let (first_id, first_error) = &deep_outcome.embedding_failures[0];
+            notes.push(format!(
+                "{} deep SIRs were persisted but their embedding refresh failed (e.g. {first_id}: {first_error}); run 'aetherd --index-once --embeddings-only' to refresh their vectors.",
+                deep_outcome.embedding_failures.len()
+            ));
+        }
         notes.push(
             "Inference cost tracking is unavailable in the current provider abstraction; counts are reported instead.".to_owned(),
         );
@@ -223,6 +240,7 @@ impl AetherMcpServer {
             deep_failed: deep_outcome.failed_symbol_ids.len() as u32,
             deep_failed_symbol_ids: deep_outcome.failed_symbol_ids,
             deep_superseded: deep_outcome.superseded_symbol_ids.len() as u32,
+            deep_embedding_failed: deep_outcome.embedding_failures.len() as u32,
             forced_cycle_members: prep.forced_cycle_members as u32,
             skipped_fresh: prep.skipped_fresh as u32,
             notes,
@@ -356,8 +374,13 @@ impl AetherMcpServer {
                 use_cot,
                 timeout_secs,
             ) {
-                Ok(DeepSirPersist::Persisted) => {
+                Ok(DeepSirPersist::Persisted { embedding_error }) => {
                     outcome.succeeded_ids.insert(candidate.symbol.id.clone());
+                    if let Some(error) = embedding_error {
+                        outcome
+                            .embedding_failures
+                            .push((candidate.symbol.id.clone(), error));
+                    }
                 }
                 Ok(DeepSirPersist::Superseded) => {
                     outcome
@@ -484,14 +507,29 @@ impl AetherMcpServer {
                 None,
             )?;
         }
-        self.refresh_embedding_if_needed(
+        // The leaf is committed: a provider or vector-store failure here must not
+        // report the candidate as failed (the failure handler would then find a SIR
+        // whose identity no longer matches the baseline and leave it as is, and later
+        // runs would skip the fresh deep SIR with its stale vector for good). The SIR
+        // stands; the embedding is reported for the caller to refresh.
+        let embedding_error = match self.refresh_embedding_if_needed(
             embedding_pipeline,
             candidate.symbol.id.as_str(),
             sir_hash_value.as_str(),
             canonical_json.as_str(),
-        )?;
+        ) {
+            Ok(()) => None,
+            Err(err) => {
+                tracing::warn!(
+                    symbol_id = %candidate.symbol.id,
+                    error = %err,
+                    "deep SIR persisted but its embedding refresh failed"
+                );
+                Some(err.to_string())
+            }
+        };
 
-        Ok(DeepSirPersist::Persisted)
+        Ok(DeepSirPersist::Persisted { embedding_error })
     }
 
     /// Mark the SIR the failed attempt started from as stale with the error, but only

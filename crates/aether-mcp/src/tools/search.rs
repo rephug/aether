@@ -29,7 +29,8 @@ use crate::{AetherMcpError, SearchMode};
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherSymbolLookupRequest {
     /// Lexical query over symbol ids, qualified names, file paths, languages and kinds.
-    /// Ignored when `symbol_ids` is given.
+    /// Optional (empty by default) and ignored when `symbol_ids` is given.
+    #[serde(default)]
     pub query: String,
     pub limit: Option<u32>,
     /// Exact symbol ids to return instead of a query's matches (up to 200), in the order

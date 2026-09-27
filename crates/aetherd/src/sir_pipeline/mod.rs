@@ -92,12 +92,21 @@ pub struct ProcessEventStats {
 pub struct SirPromptOverride {
     pub prompt: String,
     pub deep_mode: bool,
+    /// The SIR the override's prompt was built from, when the caller recorded it: the
+    /// job then persists only while the store still holds exactly that SIR. Unrecorded,
+    /// the job binds to the SIR current when it is queued.
+    pub(crate) prior_sir: PriorSir,
 }
 
 #[derive(Debug, Clone)]
 pub struct SirDeepPromptSpec {
     pub enrichment: SirEnrichmentContext,
     pub use_cot: bool,
+    /// Identity of the SIR `enrichment` was built from (`None` when the symbol had no
+    /// SIR), read from the same row as that SIR; the deep job is bound to it, so a
+    /// replacement written between the enrichment and the queueing supersedes the job
+    /// rather than being overwritten by a result reasoned from the old baseline.
+    pub baseline_sir_identity: Option<SirIdentity>,
 }
 
 /// A pre-built quality pass candidate ready for batched inference.

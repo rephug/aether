@@ -622,6 +622,77 @@ fn build_job_records_the_hash_of_the_text_it_read_for_the_prompt() {
 }
 
 #[test]
+fn a_prompt_override_binds_the_job_to_the_baseline_it_was_built_from() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    write_embeddings_only_config(workspace);
+    let store = SqliteStore::open(workspace).expect("open store");
+    let pipeline = build_write_pipeline(workspace, Arc::new(PanicInferenceProvider));
+    let source = "fn deep() {}\n";
+    fs::create_dir_all(workspace.join("src")).expect("create src");
+    fs::write(workspace.join("src/lib.rs"), source).expect("write source");
+    let symbol = demo_type_symbol(
+        "sym-deep",
+        "deep",
+        "demo::deep",
+        "src/lib.rs",
+        SymbolKind::Function,
+        source,
+    );
+
+    // `regenerate --deep` builds its enrichment from this SIR...
+    pipeline
+        .persist_sir_payload_into_sqlite(&store, &payload_for(&symbol, &demo_sir(), "scan"), None)
+        .expect("persist baseline");
+    let baseline = current_sir_identity(&store, "sym-deep").expect("identity");
+    assert!(baseline.is_some());
+
+    // ...and another writer replaces it before the job is queued.
+    let reviewed = SirAnnotation {
+        intent: "Reviewed by hand".to_owned(),
+        confidence: 0.97,
+        ..demo_sir()
+    };
+    pipeline
+        .persist_sir_payload_into_sqlite(&store, &payload_for(&symbol, &reviewed, "injected"), None)
+        .expect("persist replacement");
+    let replacement = current_sir_identity(&store, "sym-deep").expect("identity");
+    assert_ne!(replacement, baseline);
+
+    let prepare = |prior_sir: PriorSir| {
+        let overrides = HashMap::from([(
+            symbol.id.clone(),
+            SirPromptOverride {
+                prompt: "deep prompt built from the baseline".to_owned(),
+                deep_mode: false,
+                prior_sir,
+            },
+        )]);
+        let mut out = Vec::<u8>::new();
+        let prepared = pipeline
+            .prepare_candidate_jobs(
+                &store,
+                "src/lib.rs",
+                vec![(symbol.clone(), false)],
+                true,
+                false,
+                &mut out,
+                None,
+                Some(&overrides),
+            )
+            .expect("prepare jobs");
+        assert_eq!(prepared.jobs.len(), 1);
+        prepared.jobs.into_iter().next().expect("one job").prior_sir
+    };
+
+    // A recorded baseline binds the job to the SIR its prompt describes, so the
+    // persist step will find the replacement and drop the result as superseded...
+    assert_eq!(prepare(PriorSir::recorded(baseline.clone())), baseline);
+    // ...while an unrecorded one binds to whatever the row holds when queued.
+    assert_eq!(prepare(PriorSir::Unrecorded), replacement);
+}
+
+#[test]
 fn a_failed_generation_marks_only_the_sir_it_started_from_stale() {
     let temp = tempdir().expect("tempdir");
     let workspace = temp.path();

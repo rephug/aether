@@ -289,28 +289,61 @@ fn process_chunk(
             );
         }
 
-        write_fingerprint_row(
-            store,
-            &prep.symbol_id,
-            &prep.prompt_hash,
-            prep.previous_meta
-                .as_ref()
-                .and_then(|record| record.prompt_hash.as_deref()),
-            format!("batch_{}", pass_config.pass.as_str()).as_str(),
-            pass_config.model.as_str(),
-            pass_config.pass.as_str(),
-            cosine_distance_from_embeddings(
-                prep.previous_embedding.as_ref(),
-                current_embedding.as_ref(),
-            ),
-        )
-        .with_context(|| format!("failed to write fingerprint row for {}", prep.symbol_id))?;
+        let trigger = format!("batch_{}", pass_config.pass.as_str());
+        // The row's predecessor is the prompt the symbol was last generated for: the
+        // previous metadata's prompt hash when it names another prompt, else (a SIR
+        // from an injection or the daemon carries none, and a resumed result's
+        // "previous" metadata is its own write) the last prompt the symbol was
+        // fingerprinted for. A resumed result may also have written its row before the
+        // earlier attempt failed (in the vector flush, say): the row is appended once
+        // per result, never per attempt.
+        let mut previous_prompt_hash = prep
+            .previous_meta
+            .as_ref()
+            .and_then(|record| record.prompt_hash.clone())
+            .filter(|previous| *previous != prep.prompt_hash);
+        let mut fingerprint_written = false;
+        if prep.resumed || previous_prompt_hash.is_none() {
+            let history = store
+                .list_sir_fingerprint_history(&prep.symbol_id)
+                .with_context(|| {
+                    format!("failed to read fingerprint history for {}", prep.symbol_id)
+                })?;
+            if prep.resumed {
+                fingerprint_written = history
+                    .iter()
+                    .any(|row| row.prompt_hash == prep.prompt_hash && row.trigger == trigger);
+            }
+            if previous_prompt_hash.is_none() {
+                previous_prompt_hash = history
+                    .iter()
+                    .rev()
+                    .find(|row| row.prompt_hash != prep.prompt_hash)
+                    .map(|row| row.prompt_hash.clone());
+            }
+        }
+        if !fingerprint_written {
+            write_fingerprint_row(
+                store,
+                &prep.symbol_id,
+                &prep.prompt_hash,
+                previous_prompt_hash.as_deref(),
+                trigger.as_str(),
+                pass_config.model.as_str(),
+                pass_config.pass.as_str(),
+                cosine_distance_from_embeddings(
+                    prep.previous_embedding.as_ref(),
+                    current_embedding.as_ref(),
+                ),
+            )
+            .with_context(|| format!("failed to write fingerprint row for {}", prep.symbol_id))?;
+            summary.fingerprint_rows += 1;
+        }
 
         summary.processed += 1;
         if prep.resumed {
             summary.resumed += 1;
         }
-        summary.fingerprint_rows += 1;
     }
 
     // Buffer new embedding records for vector store flush.
@@ -1236,6 +1269,256 @@ vector_backend = "sqlite"
         assert_eq!(
             current_sir_identity(&store, "sym-retry").expect("identity"),
             reviewed
+        );
+    }
+
+    struct FixedEmbeddingProvider;
+
+    #[async_trait]
+    impl aether_infer::EmbeddingProvider for FixedEmbeddingProvider {
+        async fn embed_text(&self, _text: &str) -> Result<Vec<f32>, aether_infer::InferError> {
+            Ok(vec![1.0, 0.0])
+        }
+
+        async fn embed_text_with_purpose(
+            &self,
+            _text: &str,
+            _purpose: EmbeddingPurpose,
+        ) -> Result<Vec<f32>, aether_infer::InferError> {
+            Ok(vec![1.0, 0.0])
+        }
+
+        async fn embed_texts_with_purpose(
+            &self,
+            texts: &[&str],
+            _purpose: EmbeddingPurpose,
+        ) -> Result<Vec<Vec<f32>>, aether_infer::InferError> {
+            Ok(vec![vec![1.0, 0.0]; texts.len()])
+        }
+    }
+
+    #[test]
+    fn a_resumed_result_writes_its_fingerprint_row_once_against_its_true_predecessor() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_only_config(workspace);
+        let config = aether_config::load_workspace_config(workspace).expect("load config");
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        let record = demo_symbol_record("sym-fp", "demo::fp");
+        store.upsert_symbol(record.clone()).expect("upsert symbol");
+        let pipeline = SirPipeline::new_embeddings_only_with(
+            workspace.to_path_buf(),
+            std::sync::Arc::new(FixedEmbeddingProvider),
+            "test_embedding".to_owned(),
+            "test-model".to_owned(),
+            None,
+        )
+        .map(|pipeline| pipeline.with_skip_surreal_sync(true))
+        .expect("build embeddings-only pipeline");
+        let source = "fn fp() {}\n";
+        fs::create_dir_all(workspace.join("src")).expect("create src");
+        fs::write(workspace.join("src/lib.rs"), source).expect("write source");
+        let symbol = Symbol {
+            content_hash: aether_core::content_hash(source),
+            range: SourceRange {
+                start: Position { line: 1, column: 1 },
+                end: Position {
+                    line: 1,
+                    column: source.trim_end().len() + 1,
+                },
+                start_byte: Some(0),
+                end_byte: Some(source.len()),
+            },
+            ..symbol_from_record(&record).expect("build symbol")
+        };
+
+        // The scan SIR the batch was built against, and the fingerprint row of the
+        // prompt that produced it.
+        pipeline
+            .persist_sir_payload_into_sqlite(
+                &store,
+                &UpsertSirIntentPayload {
+                    symbol: symbol.clone(),
+                    sir: demo_sir(),
+                    provider_name: "gemini".to_owned(),
+                    model_name: "scan-model".to_owned(),
+                    generation_pass: "scan".to_owned(),
+                    reasoning_trace: None,
+                    commit_hash: None,
+                    prompt_hash: None,
+                    prior_sir: PriorSir::Unrecorded,
+                },
+                None,
+            )
+            .expect("persist scan sir");
+        write_fingerprint_row(
+            &store,
+            "sym-fp",
+            "prompt-scan",
+            None,
+            "batch_scan",
+            "scan-model",
+            "scan",
+            None,
+        )
+        .expect("scan fingerprint");
+        let built_against = current_sir_identity(&store, "sym-fp").expect("identity");
+        let key = "sym-fp|prompt-fp|build-1".to_owned();
+        let origins = HashMap::from([(
+            key.clone(),
+            BatchRequestOrigin {
+                prior_sir: built_against,
+                source_hash: symbol.content_hash.clone(),
+            },
+        )]);
+        let current_symbols = HashMap::from([("sym-fp".to_owned(), symbol.clone())]);
+        let batch_sir = SirAnnotation {
+            intent: "Triage result".to_owned(),
+            ..demo_sir()
+        };
+        let provider = StubBatchProvider {
+            key,
+            text: serde_json::to_string(&batch_sir).expect("serialize sir"),
+            reasoning_trace: None,
+        };
+        let chunk = |summary: &mut IngestSummary| {
+            let mut buffer = Vec::new();
+            process_chunk(
+                &pipeline,
+                &store,
+                &triage_pass_config(),
+                &config,
+                &provider,
+                "gemini",
+                &HashMap::new(),
+                &origins,
+                Some(&current_symbols),
+                &["ignored".to_owned()],
+                summary,
+                &mut buffer,
+            )
+            .expect("process chunk");
+        };
+
+        // The first attempt persists the SIR and its fingerprint row, then (say) fails
+        // in the vector flush. The retry resumes: no second row.
+        let mut summary = IngestSummary::default();
+        chunk(&mut summary);
+        assert_eq!(
+            (summary.processed, summary.resumed, summary.fingerprint_rows),
+            (1, 0, 1)
+        );
+        let mut summary = IngestSummary::default();
+        chunk(&mut summary);
+        assert_eq!(
+            (summary.processed, summary.resumed, summary.fingerprint_rows),
+            (1, 1, 0)
+        );
+        let history = store
+            .list_sir_fingerprint_history("sym-fp")
+            .expect("history");
+        assert_eq!(history.len(), 2, "scan row plus one batch row: {history:?}");
+        let batch_row = &history[1];
+        assert_eq!(batch_row.prompt_hash, "prompt-fp");
+        assert_eq!(
+            batch_row.prompt_hash_previous.as_deref(),
+            Some("prompt-scan")
+        );
+
+        // An attempt that persisted the SIR but failed before its fingerprint row leaves
+        // no row; the resumed retry writes it against the last prompt the symbol was
+        // fingerprinted for, not against this result's own write.
+        let record2 = demo_symbol_record("sym-fp2", "demo::fp2");
+        store.upsert_symbol(record2.clone()).expect("upsert symbol");
+        let symbol2 = Symbol {
+            content_hash: symbol.content_hash.clone(),
+            range: symbol.range,
+            ..symbol_from_record(&record2).expect("build symbol")
+        };
+        pipeline
+            .persist_sir_payload_into_sqlite(
+                &store,
+                &UpsertSirIntentPayload {
+                    symbol: symbol2.clone(),
+                    sir: demo_sir(),
+                    provider_name: "gemini".to_owned(),
+                    model_name: "scan-model".to_owned(),
+                    generation_pass: "scan".to_owned(),
+                    reasoning_trace: None,
+                    commit_hash: None,
+                    prompt_hash: None,
+                    prior_sir: PriorSir::Unrecorded,
+                },
+                None,
+            )
+            .expect("persist scan sir");
+        write_fingerprint_row(
+            &store,
+            "sym-fp2",
+            "prompt-scan-2",
+            None,
+            "batch_scan",
+            "scan-model",
+            "scan",
+            None,
+        )
+        .expect("scan fingerprint");
+        let key2 = "sym-fp2|prompt-fp2|build-1".to_owned();
+        let origins2 = HashMap::from([(
+            key2.clone(),
+            BatchRequestOrigin {
+                prior_sir: current_sir_identity(&store, "sym-fp2").expect("identity"),
+                source_hash: symbol2.content_hash.clone(),
+            },
+        )]);
+        let current_symbols2 = HashMap::from([("sym-fp2".to_owned(), symbol2.clone())]);
+        let provider2 = StubBatchProvider {
+            key: key2,
+            text: serde_json::to_string(&batch_sir).expect("serialize sir"),
+            reasoning_trace: None,
+        };
+        // Phase 1 alone: the SIR lands, no fingerprint row yet.
+        prepare_symbol(
+            &pipeline,
+            &store,
+            &triage_pass_config(),
+            "ignored",
+            &provider2,
+            "gemini",
+            &HashMap::new(),
+            &origins2,
+            Some(&current_symbols2),
+        )
+        .expect("prepare symbol")
+        .expect("applied");
+        let mut summary = IngestSummary::default();
+        let mut buffer = Vec::new();
+        process_chunk(
+            &pipeline,
+            &store,
+            &triage_pass_config(),
+            &config,
+            &provider2,
+            "gemini",
+            &HashMap::new(),
+            &origins2,
+            Some(&current_symbols2),
+            &["ignored".to_owned()],
+            &mut summary,
+            &mut buffer,
+        )
+        .expect("process chunk");
+        assert_eq!((summary.resumed, summary.fingerprint_rows), (1, 1));
+        let history = store
+            .list_sir_fingerprint_history("sym-fp2")
+            .expect("history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].prompt_hash, "prompt-fp2");
+        assert_eq!(
+            history[1].prompt_hash_previous.as_deref(),
+            Some("prompt-scan-2"),
+            "the predecessor is the last fingerprinted prompt, not this result's own"
         );
     }
 
