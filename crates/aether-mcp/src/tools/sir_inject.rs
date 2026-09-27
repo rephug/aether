@@ -2,9 +2,7 @@ use aether_sir::{
     SirAnnotation, canonicalize_sir_json, normalize_complexity_label, normalize_optional_text,
     sir_hash, validate_sir,
 };
-use aether_store::{
-    SirHistoryStore, SirMetaRecord, SirStateStore, SymbolCatalogStore, SymbolRecord,
-};
+use aether_store::{SirMetaRecord, SirStateStore, SymbolCatalogStore, SymbolRecord};
 use std::collections::HashMap;
 
 use anyhow::Context as _;
@@ -422,33 +420,35 @@ impl AetherMcpServer {
         let generation_pass = normalize_optional_text_with_default(request.generation_pass, "deep");
         let rollup_identity = (provider.clone(), model.clone(), generation_pass.clone());
         let now = current_unix_timestamp();
-        let version_write = store.record_sir_version_if_changed(
-            symbol_id.as_str(),
-            hash.as_str(),
-            provider.as_str(),
-            model.as_str(),
-            canonical_json.as_str(),
-            now,
-            None,
-        )?;
-
-        store.write_sir_blob(symbol_id.as_str(), canonical_json.as_str())?;
-        let meta_record = SirMetaRecord {
+        // History version, leaf JSON and metadata land in one SQLite transaction (the
+        // same path the daemon's SIR pipeline uses): a failure between separate writes
+        // would leave the new JSON under the old hash and a `fresh` status, a leaf that
+        // the scan queries no longer select (its confidence is now high) and that the
+        // guard blocks from an ordinary retry, so it could never be repaired.
+        let mut meta_record = SirMetaRecord {
             id: symbol_id.clone(),
             sir_hash: hash.clone(),
-            sir_version: version_write.version,
+            sir_version: 1,
             provider,
             model,
             generation_pass,
             reasoning_trace: None,
             prompt_hash: None,
             staleness_score: None,
-            updated_at: version_write.updated_at,
+            updated_at: now,
             sir_status: "fresh".to_owned(),
             last_error: None,
-            last_attempt_at: version_write.updated_at,
+            last_attempt_at: now,
         };
-        store.upsert_sir_meta(meta_record.clone())?;
+        let version_write = store.persist_sir_state_atomically(
+            meta_record.clone(),
+            canonical_json.as_str(),
+            None,
+            None,
+        )?;
+        meta_record.sir_version = version_write.version;
+        meta_record.updated_at = version_write.updated_at;
+        meta_record.last_attempt_at = version_write.updated_at;
 
         // Aggregate reads (file and module level) are served from the file rollup, so
         // rebuild it from the leaves now rather than leaving the indexing-time rollup
