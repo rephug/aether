@@ -192,18 +192,18 @@ impl LanceVectorStore {
         connection: &LanceConnection,
         record: &VectorRecord,
     ) -> Result<(), StoreError> {
-        self.upsert_embedding_with_connection_when(connection, record, None, true)
+        self.upsert_embedding_with_connection_when(connection, record, MatchedArm::Always, true)
             .await
     }
 
-    /// `merge_insert` with the update arm guarded by `when_matched` (a LanceDB
-    /// predicate over `target.` columns, `None` = unconditional) and the insert arm
-    /// enabled by `insert_when_missing`; the guard and the write are one operation.
+    /// `merge_insert` whose update arm is `matched` (never, always, or only while a
+    /// LanceDB predicate over `target.` columns holds) and whose insert arm is enabled
+    /// by `insert_when_missing`; the guard and the write are one operation.
     async fn upsert_embedding_with_connection_when(
         &self,
         connection: &LanceConnection,
         record: &VectorRecord,
-        when_matched: Option<&str>,
+        matched: MatchedArm<'_>,
         insert_when_missing: bool,
     ) -> Result<(), StoreError> {
         let embedding_dim = record.embedding.len() as i32;
@@ -248,7 +248,15 @@ impl LanceVectorStore {
         let (schema, batch) = single_record_batch(record)?;
         let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
         let mut merge = table.merge_insert(&["symbol_id"]);
-        merge.when_matched_update_all(when_matched.map(str::to_owned));
+        match matched {
+            MatchedArm::Skip => {}
+            MatchedArm::Always => {
+                merge.when_matched_update_all(None);
+            }
+            MatchedArm::OnlyWhen(condition) => {
+                merge.when_matched_update_all(Some(condition.to_owned()));
+            }
+        }
         if insert_when_missing {
             merge.when_not_matched_insert_all();
         }
@@ -611,27 +619,29 @@ impl VectorStore for LanceVectorStore {
         if record.embedding.is_empty() {
             return Ok(false);
         }
-        let connection = self.connect().await?;
-        // The guard lives inside the merge: with an expected hash only a row still
-        // carrying it is updated (and nothing is inserted, so a row that moved to another
-        // provider/model table is not duplicated); with none expected only the insert arm
-        // runs, so an existing row is left alone.
-        match expected_sir_hash {
-            Some(expected) => {
-                let guard = format!("target.sir_hash = '{}'", escape_sql_string(expected));
-                self.upsert_embedding_with_connection_when(
-                    &connection,
-                    &record,
-                    Some(guard.as_str()),
-                    false,
-                )
-                .await?;
-            }
-            None => {
-                self.upsert_embedding_with_connection_when(&connection, &record, None, true)
-                    .await?;
-            }
+        // Vectors are keyed by symbol inside one table per provider/model/dimension, so
+        // the precondition is checked across all tables first (a vector under another
+        // identity counts as "a vector is stored"), then enforced again inside the merge
+        // on the destination table: with an expected hash the update arm runs only while
+        // the row still carries it, with none expected there is no update arm at all, and
+        // the insert arm always runs so a symbol whose vector moves to a new identity
+        // (an embed-only regeneration after changing the embedding model) still lands.
+        let current = self
+            .get_embedding_meta(record.symbol_id.as_str())
+            .await?
+            .map(|meta| meta.sir_hash);
+        if current.as_deref() != expected_sir_hash {
+            return Ok(false);
         }
+        let connection = self.connect().await?;
+        let guard = expected_sir_hash
+            .map(|expected| format!("target.sir_hash = '{}'", escape_sql_string(expected)));
+        let matched = match guard.as_deref() {
+            Some(condition) => MatchedArm::OnlyWhen(condition),
+            None => MatchedArm::Skip,
+        };
+        self.upsert_embedding_with_connection_when(&connection, &record, matched, true)
+            .await?;
         let stored = self.get_embedding_meta(record.symbol_id.as_str()).await?;
         Ok(stored.is_some_and(|meta| {
             meta.sir_hash == record.sir_hash
@@ -1047,6 +1057,17 @@ pub(crate) fn sanitize_for_table_name(value: &str) -> String {
         .chars()
         .take(48)
         .collect::<String>()
+}
+
+/// The update arm of a `merge_insert` on the vector tables.
+#[derive(Debug, Clone, Copy)]
+enum MatchedArm<'a> {
+    /// Never update a matching row.
+    Skip,
+    /// Always update a matching row.
+    Always,
+    /// Update a matching row only while this LanceDB predicate over `target.` holds.
+    OnlyWhen(&'a str),
 }
 
 fn escape_sql_string(value: &str) -> String {
