@@ -266,14 +266,19 @@ impl BatchProvider for OpenAiBatchProvider {
         self.download_file(output_file_id, &result_path).await?;
         result_paths.push(result_path);
 
-        // Download error file if present
+        // The error file holds the per-request failures of a completed batch. It is
+        // ingested like the output file (each line parses to an error result and is
+        // counted as skipped), so a build whose requests partly failed is not mistaken
+        // for one whose every request came back; a file that cannot be fetched is an
+        // error for the same reason.
         if let Some(error_file_id) = json["error_file_id"].as_str()
             && !error_file_id.is_empty()
         {
             let error_path = output_dir.join(format!("{}.errors.jsonl", batch_id));
-            if let Err(err) = self.download_file(error_file_id, &error_path).await {
-                tracing::warn!(error = %err, "failed to download OpenAI error file");
-            }
+            self.download_file(error_file_id, &error_path)
+                .await
+                .context("failed to download the OpenAI batch error file")?;
+            result_paths.push(error_path);
         }
 
         tracing::info!(

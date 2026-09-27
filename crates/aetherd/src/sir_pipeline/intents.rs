@@ -202,16 +202,31 @@ impl SirPipeline {
         }
 
         if status == WriteIntentStatus::SqliteDone {
-            self.refresh_embedding_if_needed(
-                store,
-                payload.symbol.id.as_str(),
-                sir_hash_value.as_str(),
-                canonical_json.as_str(),
-                false,
-                &mut std::io::sink(),
-                None,
-            )
-            .with_context(|| format!("failed vector write stage for intent {intent_id}"))?;
+            let outcome = self
+                .refresh_embedding_if_needed(
+                    store,
+                    payload.symbol.id.as_str(),
+                    sir_hash_value.as_str(),
+                    canonical_json.as_str(),
+                    false,
+                    &mut std::io::sink(),
+                    None,
+                )
+                .with_context(|| format!("failed vector write stage for intent {intent_id}"))?;
+            if outcome == EmbeddingRefresh::Superseded {
+                // The committed SIR was replaced while its vector was being generated:
+                // the replacing writer embeds its own, and the remaining stages would
+                // describe a leaf the store no longer holds. Retire the intent.
+                tracing::info!(
+                    intent_id = %intent_id,
+                    symbol_id = %payload.symbol.id,
+                    "retiring write intent: its SIR was replaced before its embedding was stored"
+                );
+                store
+                    .mark_intent_complete(intent_id)
+                    .with_context(|| format!("failed to retire superseded intent {intent_id}"))?;
+                return Ok(());
+            }
             store
                 .update_intent_status(intent_id, WriteIntentStatus::VectorDone)
                 .with_context(|| {

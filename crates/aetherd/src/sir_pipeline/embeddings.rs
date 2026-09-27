@@ -176,6 +176,7 @@ impl SirPipeline {
         let mut refreshed = 0usize;
         let mut skipped_no_sir = 0usize;
         let mut skipped_up_to_date = 0usize;
+        let mut superseded = 0usize;
         let mut errors = 0usize;
         let provider_name = self
             .embedding_provider_name
@@ -259,8 +260,11 @@ impl SirPipeline {
                 out,
                 existing_metas.get(symbol_id),
             ) {
-                Ok(true) => refreshed += 1,
-                Ok(false) => skipped_up_to_date += 1,
+                Ok(EmbeddingRefresh::Refreshed { .. }) => refreshed += 1,
+                Ok(EmbeddingRefresh::Unchanged) => skipped_up_to_date += 1,
+                // The SIR read above was replaced before its vector could be stored;
+                // the writer that replaced it embeds its own.
+                Ok(EmbeddingRefresh::Superseded) => superseded += 1,
                 Err(err) => {
                     errors += 1;
                     tracing::warn!(symbol_id = %symbol_id, error = %err, "failed to refresh embedding");
@@ -270,7 +274,7 @@ impl SirPipeline {
 
         writeln!(
             out,
-            "Re-embedded {refreshed} of {processed} symbols with {provider_name}/{model_name} ({skipped_no_sir} skipped: no current SIR, {skipped_up_to_date} already up to date, {errors} errors)"
+            "Re-embedded {refreshed} of {processed} symbols with {provider_name}/{model_name} ({skipped_no_sir} skipped: no current SIR, {skipped_up_to_date} already up to date, {superseded} superseded, {errors} errors)"
         )
         .context("failed to write embeddings-only summary")?;
 
@@ -437,6 +441,9 @@ impl SirPipeline {
     /// can land at any point during the provider call: the refresh re-reads the stored
     /// SIR hash before and after storing the vector (and once when a vector for the hash
     /// already exists) and stores or keeps nothing for a SIR the store no longer holds.
+    /// The outcome is returned as is: `Superseded` tells the caller that the SIR it
+    /// wrote is no longer the stored one, so its write is not to be recorded as
+    /// completed (that SIR's own writer embeds it); it must not be read as "unchanged".
     #[allow(clippy::too_many_arguments)]
     pub fn refresh_embedding_if_needed(
         &self,
@@ -447,7 +454,7 @@ impl SirPipeline {
         print_sir: bool,
         out: &mut dyn Write,
         prefetched_meta: Option<&VectorEmbeddingMetaRecord>,
-    ) -> Result<bool> {
+    ) -> Result<EmbeddingRefresh> {
         let _embed_guard = acquire_embed_write_lock(&self.workspace_root, symbol_id)?;
         let mut still_current = || -> Result<bool> {
             Ok(store
@@ -455,25 +462,21 @@ impl SirPipeline {
                 .with_context(|| format!("failed to read SIR metadata for {symbol_id}"))?
                 .is_some_and(|meta| meta.sir_hash == sir_hash_value))
         };
-        match self.refresh_embedding_if_current(
+        let outcome = self.refresh_embedding_if_current(
             symbol_id,
             sir_hash_value,
             canonical_json,
             prefetched_meta,
             &mut still_current,
-        )? {
-            EmbeddingRefresh::Refreshed { provider, model } => {
-                if print_sir {
-                    writeln!(
-                        out,
-                        "EMBEDDING_STORED symbol_id={symbol_id} provider={provider} model={model}"
-                    )
-                    .context("failed to write embedding print line")?;
-                }
-                Ok(true)
-            }
-            EmbeddingRefresh::Unchanged | EmbeddingRefresh::Superseded => Ok(false),
+        )?;
+        if print_sir && let EmbeddingRefresh::Refreshed { provider, model } = &outcome {
+            writeln!(
+                out,
+                "EMBEDDING_STORED symbol_id={symbol_id} provider={provider} model={model}"
+            )
+            .context("failed to write embedding print line")?;
         }
+        Ok(outcome)
     }
 
     /// Like `refresh_embedding_if_needed`, but for callers that already hold the

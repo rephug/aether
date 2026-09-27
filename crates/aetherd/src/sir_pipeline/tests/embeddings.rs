@@ -521,7 +521,7 @@ fn embeddings_only_calls_embedding_provider_not_inference() {
     let rendered = String::from_utf8(out).expect("utf8 output");
     assert!(rendered.contains("Re-embedding 3 symbols with test_embedding/test-model..."));
     assert!(rendered.contains(
-        "Re-embedded 3 of 3 symbols with test_embedding/test-model (0 skipped: no current SIR, 0 already up to date, 0 errors)"
+        "Re-embedded 3 of 3 symbols with test_embedding/test-model (0 skipped: no current SIR, 0 already up to date, 0 superseded, 0 errors)"
     ));
 }
 
@@ -576,7 +576,7 @@ fn embeddings_only_respects_skip_logic() {
     );
     let rendered = String::from_utf8(out).expect("utf8 output");
     assert!(rendered.contains(
-        "Re-embedded 1 of 3 symbols with test_embedding/test-model (0 skipped: no current SIR, 2 already up to date, 0 errors)"
+        "Re-embedded 1 of 3 symbols with test_embedding/test-model (0 skipped: no current SIR, 2 already up to date, 0 superseded, 0 errors)"
     ));
 }
 
@@ -634,7 +634,7 @@ fn embeddings_only_skips_symbols_without_sir() {
 
     let rendered = String::from_utf8(out).expect("utf8 output");
     assert!(rendered.contains(
-        "Re-embedded 1 of 2 symbols with test_embedding/test-model (1 skipped: no current SIR, 0 already up to date, 0 errors)"
+        "Re-embedded 1 of 2 symbols with test_embedding/test-model (1 skipped: no current SIR, 0 already up to date, 0 superseded, 0 errors)"
     ));
 }
 

@@ -39,6 +39,21 @@ pub(crate) const ORIGIN_SIDECAR_KIND: &str = "origin";
 /// Remove one build's sidecars once every result of that build has been ingested, so
 /// a directory used for repeated builds does not accumulate them. A sidecar that is
 /// already gone is not an error.
+/// How many of a build's `written` requests no result accounted for: a result is
+/// accounted for once it was applied (`processed`), left unapplied as superseded, or
+/// skipped (an error line, an unparsable line, a persist failure). A provider whose
+/// completed batch carries fewer results than requests (failures delivered in another
+/// file, or dropped) must not have the build read as complete: its sidecars are kept so
+/// the missing requests can be rebuilt or re-ingested.
+pub(crate) fn unaccounted_requests(
+    written: usize,
+    processed: usize,
+    superseded: usize,
+    skipped: usize,
+) -> usize {
+    written.saturating_sub(processed + superseded + skipped)
+}
+
 pub(crate) fn remove_build_sidecars(batch_dir: &Path, pass: &str, build_id: &str) -> Result<()> {
     for name in [
         keymap_sidecar_name(pass, build_id),
@@ -635,6 +650,23 @@ mod tests {
         assert_eq!(first.len(), 12);
         assert!(first.chars().all(|ch| ch.is_ascii_hexdigit()));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_build_is_accounted_for_only_when_every_written_request_has_a_result() {
+        assert_eq!(super::unaccounted_requests(5, 3, 1, 1), 0);
+        assert_eq!(
+            super::unaccounted_requests(5, 3, 1, 0),
+            1,
+            "a failed request delivered nowhere"
+        );
+        assert_eq!(super::unaccounted_requests(5, 5, 0, 0), 0);
+        assert_eq!(super::unaccounted_requests(0, 0, 0, 0), 0);
+        assert_eq!(
+            super::unaccounted_requests(2, 2, 0, 1),
+            0,
+            "a legacy sidecar may add results beyond this build's requests"
+        );
     }
 
     #[test]

@@ -188,7 +188,7 @@ impl SirPipeline {
             GenerationPersist::Superseded | GenerationPersist::Failed => return Ok(None),
         };
 
-        if let Err(err) = self.refresh_embedding_if_needed(
+        match self.refresh_embedding_if_needed(
             store,
             &generated.symbol.id,
             &persisted.sir_hash,
@@ -197,14 +197,45 @@ impl SirPipeline {
             out,
             None,
         ) {
-            let message = format!("{err:#}");
-            self.mark_intent_failed_safely(store, persisted.intent_id.as_str(), message.as_str());
-            tracing::error!(
-                symbol_id = %generated.symbol.id,
-                error = %err,
-                "embedding refresh error"
-            );
-            return Ok(None);
+            Ok(EmbeddingRefresh::Refreshed { .. } | EmbeddingRefresh::Unchanged) => {}
+            // Another writer (an injection, say) replaced this SIR while its vector was
+            // being generated. That writer embeds its own SIR; this intent's leaf is no
+            // longer the stored one, so retire it without recording a success or
+            // advancing it through stages the current leaf never completed.
+            Ok(EmbeddingRefresh::Superseded) => {
+                tracing::info!(
+                    symbol_id = %generated.symbol.id,
+                    "generated SIR was replaced before its embedding was stored; retiring its intent"
+                );
+                if let Err(err) = store.mark_intent_complete(&persisted.intent_id) {
+                    let message = format!("{err:#}");
+                    self.mark_intent_failed_safely(
+                        store,
+                        persisted.intent_id.as_str(),
+                        message.as_str(),
+                    );
+                    tracing::error!(
+                        symbol_id = %generated.symbol.id,
+                        error = %err,
+                        "failed to retire the superseded write intent"
+                    );
+                }
+                return Ok(None);
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                self.mark_intent_failed_safely(
+                    store,
+                    persisted.intent_id.as_str(),
+                    message.as_str(),
+                );
+                tracing::error!(
+                    symbol_id = %generated.symbol.id,
+                    error = %err,
+                    "embedding refresh error"
+                );
+                return Ok(None);
+            }
         }
 
         if let Err(err) =

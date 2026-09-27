@@ -8,7 +8,9 @@ use anyhow::{Context, Result, anyhow};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::batch::build::{build_pass_jsonl, remove_build_sidecars, snapshot_workspace_symbols};
+use crate::batch::build::{
+    build_pass_jsonl, remove_build_sidecars, snapshot_workspace_symbols, unaccounted_requests,
+};
 use crate::batch::extract::run_extract;
 use crate::batch::ingest::ingest_results;
 use crate::batch::{
@@ -194,6 +196,8 @@ fn run_full_batch_command(
 
         completed.sort_by_key(|job| job.chunk_index);
         let mut skipped_results = 0usize;
+        let mut processed_results = 0usize;
+        let mut superseded_results = 0usize;
         for job in completed {
             for result_path in job.result_paths {
                 let ingest_summary = ingest_results(
@@ -216,14 +220,41 @@ fn run_full_batch_command(
                     ingest_summary.fingerprint_rows
                 );
                 skipped_results += ingest_summary.skipped;
+                processed_results += ingest_summary.processed;
+                superseded_results += ingest_summary.superseded;
             }
         }
 
-        if failed.is_empty() && skipped_results == 0 {
+        // A build is complete only when a result came back for every request it wrote:
+        // a provider that delivers failed requests elsewhere, or not at all, must not
+        // have its sidecars removed and the pass reported as done with symbols left
+        // unprocessed.
+        let unaccounted = if failed.is_empty() {
+            unaccounted_requests(
+                build_summary.written,
+                processed_results,
+                superseded_results,
+                skipped_results,
+            )
+        } else {
+            0
+        };
+        if failed.is_empty() && skipped_results == 0 && unaccounted == 0 {
             // Every result of this build is applied or superseded: its sidecars have
             // served. A skipped result (unparsable line, persist error) may be
             // re-ingested by hand and needs its origin entry, so the sidecars stay.
             remove_build_sidecars(&runtime.batch_dir, pass.as_str(), build_id.as_str())?;
+        } else if unaccounted > 0 {
+            return Err(anyhow!(
+                "{} batch build {} is incomplete: {} request(s) were written but only {} result(s) came back ({} processed, {} superseded, {} skipped); kept the build's sidecars",
+                pass.as_str(),
+                build_id,
+                build_summary.written,
+                processed_results + superseded_results + skipped_results,
+                processed_results,
+                superseded_results,
+                skipped_results
+            ));
         } else if skipped_results > 0 && failed.is_empty() {
             println!(
                 "Kept the {} build {} sidecars: {} result(s) were skipped and may be re-ingested",
