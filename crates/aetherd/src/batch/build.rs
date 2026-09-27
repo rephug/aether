@@ -16,7 +16,13 @@ use crate::batch::hash::compute_prompt_hash;
 use crate::batch::{BatchProvider, BatchRuntimeConfig, PassConfig};
 use crate::cli::BatchPass;
 use crate::observer::ObserverState;
-use crate::sir_pipeline::build_job;
+use crate::sir_pipeline::{SirIdentity, build_job};
+
+/// The sidecar beside a pass's JSONL files holding each symbol's SIR identity at build
+/// time (see `BuildSummary::prior_sirs`).
+pub(crate) fn prior_sir_sidecar_name(pass: &str) -> String {
+    format!("{pass}.prior_sir.json")
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct BuildSummary {
@@ -27,6 +33,10 @@ pub(crate) struct BuildSummary {
     /// Maps symbol_id → full batch key (`symbol_id|prompt_hash`) for providers
     /// that truncate the key in their custom_id field (e.g. Anthropic's 64-char limit).
     pub keymap: HashMap<String, String>,
+    /// The SIR each symbol held when its request was built (`None`: no SIR), so ingest
+    /// can tell a result whose symbol was written meanwhile (an injection, say) and
+    /// leave that newer SIR alone.
+    pub prior_sirs: HashMap<String, Option<SirIdentity>>,
 }
 
 pub(crate) fn snapshot_workspace_symbols(workspace: &Path) -> Result<HashMap<String, Symbol>> {
@@ -107,6 +117,7 @@ pub(crate) fn build_pass_jsonl_for_ids(
         skipped: 0,
         unresolved_symbols: 0,
         keymap: HashMap::new(),
+        prior_sirs: HashMap::new(),
     };
     let symbol_ids = match candidate_ids {
         Some(ids) => ids.to_vec(),
@@ -252,14 +263,20 @@ pub(crate) fn build_pass_jsonl_for_ids(
             &neighbor_texts,
             pass_config.config_fingerprint(provider_name).as_str(),
         );
-        let existing_hash = store
+        let existing_meta = store
             .get_sir_meta(symbol_id.as_str())
-            .with_context(|| format!("failed to read SIR metadata for {symbol_id}"))?
-            .and_then(|record| record.prompt_hash);
-        if existing_hash.as_deref() == Some(prompt_hash.as_str()) {
+            .with_context(|| format!("failed to read SIR metadata for {symbol_id}"))?;
+        let existing_hash = existing_meta
+            .as_ref()
+            .and_then(|record| record.prompt_hash.as_deref());
+        if existing_hash == Some(prompt_hash.as_str()) {
             summary.skipped += 1;
             continue;
         }
+        summary.prior_sirs.insert(
+            symbol_id.clone(),
+            existing_meta.as_ref().map(SirIdentity::of),
+        );
 
         if writer.is_none() || current_lines >= runtime.jsonl_chunk_size {
             chunk_index += 1;
@@ -312,6 +329,23 @@ pub(crate) fn build_pass_jsonl_for_ids(
             serde_json::to_string(&summary.keymap).context("failed to serialize batch keymap")?;
         fs::write(&keymap_path, keymap_json)
             .with_context(|| format!("failed to write batch keymap {}", keymap_path.display()))?;
+    }
+    // Write the prior-SIR sidecar: the identity (hash and history version) each
+    // symbol's SIR had when the request was built. Ingest compares it, under the inject
+    // lock, right before persisting a result and skips results for symbols whose SIR
+    // moved on in the meantime.
+    if !summary.prior_sirs.is_empty() {
+        let prior_path = runtime
+            .batch_dir
+            .join(prior_sir_sidecar_name(pass_config.pass.as_str()));
+        let prior_json = serde_json::to_string(&summary.prior_sirs)
+            .context("failed to serialize batch prior-SIR sidecar")?;
+        fs::write(&prior_path, prior_json).with_context(|| {
+            format!(
+                "failed to write batch prior-SIR sidecar {}",
+                prior_path.display()
+            )
+        })?;
     }
 
     Ok(summary)

@@ -11,10 +11,14 @@ use aether_store::{
 };
 use anyhow::{Context, Result, anyhow};
 
+use crate::batch::build::prior_sir_sidecar_name;
 use crate::batch::hash::diff_prompt_hashes;
 use crate::batch::{BatchProvider, BatchResultLine, PassConfig};
 use crate::continuous::cosine_distance_from_embeddings;
-use crate::sir_pipeline::{EmbeddingInput, SirPipeline, UpsertSirIntentPayload};
+use crate::sir_pipeline::{
+    EmbeddingInput, PriorSir, SirIdentity, SirPipeline, UpsertSirIntentPayload,
+    current_sir_identity,
+};
 
 /// Number of embedding records to buffer before flushing to the vector store.
 /// Keeps memory modest (~600KB for 3072-dim f32 vectors) while reducing LanceDB
@@ -29,6 +33,9 @@ const EMBED_BATCH_SIZE: usize = 100;
 pub(crate) struct IngestSummary {
     pub processed: usize,
     pub skipped: usize,
+    /// Results left unapplied because the symbol's SIR was written (by an injection,
+    /// say) after the batch request was built; the newer SIR stands.
+    pub superseded: usize,
     pub fingerprint_rows: usize,
 }
 
@@ -71,6 +78,7 @@ pub(crate) fn ingest_results(
             "loaded batch keymap for prompt-hash recovery"
         );
     }
+    let prior_sirs = load_prior_sirs(results_path, pass_config.pass.as_str());
 
     let file = std::fs::File::open(results_path)
         .with_context(|| format!("failed to open batch results {}", results_path.display()))?;
@@ -111,6 +119,7 @@ pub(crate) fn ingest_results(
                 provider,
                 provider_name,
                 &keymap,
+                &prior_sirs,
                 &line_chunk,
                 &mut summary,
                 &mut embedding_buffer,
@@ -129,6 +138,7 @@ pub(crate) fn ingest_results(
             provider,
             provider_name,
             &keymap,
+            &prior_sirs,
             &line_chunk,
             &mut summary,
             &mut embedding_buffer,
@@ -159,6 +169,7 @@ fn process_chunk(
     provider: &dyn BatchProvider,
     provider_name: &str,
     keymap: &HashMap<String, String>,
+    prior_sirs: &HashMap<String, Option<SirIdentity>>,
     lines: &[String],
     summary: &mut IngestSummary,
     embedding_buffer: &mut Vec<SymbolEmbeddingRecord>,
@@ -177,8 +188,12 @@ fn process_chunk(
             provider,
             provider_name,
             keymap,
+            prior_sirs,
         ) {
-            Ok(mut prep) => {
+            Ok(None) => {
+                summary.superseded += 1;
+            }
+            Ok(Some(mut prep)) => {
                 if let Some((provider, model)) = embedding_identity {
                     prep.embedding_slot = Some(embed_inputs.len());
                     embed_inputs.push(EmbeddingInput {
@@ -284,7 +299,9 @@ fn process_chunk(
 /// Phase 1: Parse a single batch result line and persist SIR to SQLite.
 ///
 /// Does everything the old `ingest_result_line` did except embedding generation,
-/// contract verification, and fingerprint writing.
+/// contract verification, and fingerprint writing. `None`: the result was superseded
+/// (see `IngestSummary::superseded`) and nothing was written.
+#[allow(clippy::too_many_arguments)]
 fn prepare_symbol(
     pipeline: &SirPipeline,
     store: &SqliteStore,
@@ -293,7 +310,8 @@ fn prepare_symbol(
     provider: &dyn BatchProvider,
     provider_name: &str,
     keymap: &HashMap<String, String>,
-) -> Result<PreparedSymbol> {
+    prior_sirs: &HashMap<String, Option<SirIdentity>>,
+) -> Result<Option<PreparedSymbol>> {
     let (symbol_id, prompt_hash, sir_json, reasoning_trace) =
         match provider.parse_result_line(raw_line)? {
             BatchResultLine::Success {
@@ -383,29 +401,50 @@ fn prepare_symbol(
         generation_pass: pass_config.pass.as_str().to_owned(),
         reasoning_trace,
         commit_hash: None,
+        prior_sir: prior_sirs
+            .get(&symbol_id)
+            .map_or(PriorSir::Unrecorded, |identity| {
+                PriorSir::recorded(identity.clone())
+            }),
     };
+    // The result was generated from the SIR the symbol held at build time, possibly
+    // hours ago. Under the inject lock every leaf writer shares, persist it only while
+    // the store still holds exactly that SIR (hash and history version); a symbol
+    // written since (an `aether_sir_inject` from `/scan`, say) keeps its newer SIR. The
+    // prompt-hash promotion is a read-modify-write of the same row, so it stays under
+    // the lock too: it must neither clobber a later injection's provenance nor restore
+    // this result's hash over a SIR that replaced it.
     let (canonical_json, sir_hash_value) = {
         let _inject_guard =
             crate::sir_pipeline::acquire_inject_write_lock(pipeline.workspace_root())?;
-        pipeline
+        let current = current_sir_identity(store, &symbol_id)?;
+        if !payload.prior_sir.still_holds(current.as_ref()) {
+            tracing::info!(
+                symbol_id = %symbol_id,
+                "skipping batch result: the stored SIR changed since the request was built"
+            );
+            return Ok(None);
+        }
+        let persisted = pipeline
             .persist_sir_payload_into_sqlite(store, &payload, None)
-            .with_context(|| format!("failed to persist SIR payload for {symbol_id}"))?
+            .with_context(|| format!("failed to persist SIR payload for {symbol_id}"))?;
+
+        let current_meta = store
+            .get_sir_meta(&symbol_id)
+            .with_context(|| format!("failed to reload SIR metadata for {symbol_id}"))?
+            .ok_or_else(|| anyhow!("missing persisted SIR metadata for {symbol_id}"))?;
+        store
+            .upsert_sir_meta(prompt_hash_meta_record(
+                current_meta,
+                prompt_hash.clone(),
+                payload.generation_pass.clone(),
+                payload.reasoning_trace.clone(),
+            ))
+            .with_context(|| format!("failed to persist prompt_hash for {symbol_id}"))?;
+        persisted
     };
 
-    let current_meta = store
-        .get_sir_meta(&symbol_id)
-        .with_context(|| format!("failed to reload SIR metadata for {symbol_id}"))?
-        .ok_or_else(|| anyhow!("missing persisted SIR metadata for {symbol_id}"))?;
-    store
-        .upsert_sir_meta(prompt_hash_meta_record(
-            current_meta,
-            prompt_hash.clone(),
-            payload.generation_pass.clone(),
-            payload.reasoning_trace.clone(),
-        ))
-        .with_context(|| format!("failed to persist prompt_hash for {symbol_id}"))?;
-
-    Ok(PreparedSymbol {
+    Ok(Some(PreparedSymbol {
         symbol_id,
         prompt_hash,
         canonical_json,
@@ -413,7 +452,7 @@ fn prepare_symbol(
         previous_meta,
         previous_embedding,
         embedding_slot: None,
-    })
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -471,6 +510,26 @@ fn prompt_hash_meta_record(
         generation_pass,
         reasoning_trace,
         ..current_meta
+    }
+}
+
+/// Try to load the prior-SIR sidecar written during JSONL build (see
+/// `BuildSummary::prior_sirs`). A batch built without one is ingested unchecked.
+fn load_prior_sirs(results_path: &Path, pass: &str) -> HashMap<String, Option<SirIdentity>> {
+    let Some(batch_dir) = results_path.parent() else {
+        return HashMap::new();
+    };
+    let prior_path = batch_dir.join(prior_sir_sidecar_name(pass));
+    match std::fs::read_to_string(&prior_path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|err| {
+            tracing::warn!(
+                path = %prior_path.display(),
+                error = %err,
+                "failed to parse batch prior-SIR sidecar, results are ingested unchecked"
+            );
+            HashMap::new()
+        }),
+        Err(_) => HashMap::new(),
     }
 }
 
@@ -706,6 +765,113 @@ vector_backend = "sqlite"
     }
 
     #[test]
+    fn prepare_symbol_skips_a_result_whose_sir_moved_on_since_the_build() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_only_config(workspace);
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        let record = demo_symbol_record("sym-late", "demo::late");
+        store.upsert_symbol(record.clone()).expect("upsert symbol");
+        let pipeline = SirPipeline::new_embeddings_only(workspace.to_path_buf())
+            .map(|pipeline| pipeline.with_skip_surreal_sync(true))
+            .expect("build embeddings-only pipeline");
+        let symbol = symbol_from_record(&record).expect("build symbol");
+        let persist = |sir: &SirAnnotation, pass: &str| {
+            pipeline
+                .persist_sir_payload_into_sqlite(
+                    &store,
+                    &UpsertSirIntentPayload {
+                        symbol: symbol.clone(),
+                        sir: sir.clone(),
+                        provider_name: "gemini".to_owned(),
+                        model_name: "scan-model".to_owned(),
+                        generation_pass: pass.to_owned(),
+                        reasoning_trace: None,
+                        commit_hash: None,
+                        prior_sir: PriorSir::Unrecorded,
+                    },
+                    None,
+                )
+                .expect("persist payload");
+        };
+
+        // The batch was built while the store held the scan SIR...
+        persist(&demo_sir(), "scan");
+        let built_against = current_sir_identity(&store, "sym-late").expect("identity");
+        let prior_sirs = HashMap::from([("sym-late".to_owned(), built_against)]);
+
+        // ...and an injection replaced it before the result came back.
+        let reviewed = SirAnnotation {
+            intent: "Reviewed by hand".to_owned(),
+            confidence: 0.97,
+            ..demo_sir()
+        };
+        persist(&reviewed, "injected");
+        let reviewed_identity = current_sir_identity(&store, "sym-late").expect("identity");
+
+        let batch_sir = SirAnnotation {
+            intent: "Triage result from the older state".to_owned(),
+            ..demo_sir()
+        };
+        let provider = StubBatchProvider {
+            key: "sym-late|prompt-late".to_owned(),
+            text: serde_json::to_string(&batch_sir).expect("serialize sir"),
+            reasoning_trace: None,
+        };
+        let outcome = prepare_symbol(
+            &pipeline,
+            &store,
+            &triage_pass_config(),
+            "ignored",
+            &provider,
+            "gemini",
+            &HashMap::new(),
+            &prior_sirs,
+        )
+        .expect("prepare symbol");
+        assert!(
+            outcome.is_none(),
+            "a result for a replaced SIR is not applied"
+        );
+        let meta = store
+            .get_sir_meta("sym-late")
+            .expect("load sir meta")
+            .expect("sir meta exists");
+        assert_eq!(
+            Some(SirIdentity::of(&meta)),
+            reviewed_identity,
+            "the injected SIR must stand"
+        );
+        assert_eq!(meta.generation_pass, "injected");
+        assert_eq!(
+            meta.prompt_hash, None,
+            "no provenance from the skipped result"
+        );
+
+        // Built against the SIR the store still holds, the result is applied.
+        let prior_sirs = HashMap::from([("sym-late".to_owned(), reviewed_identity)]);
+        let outcome = prepare_symbol(
+            &pipeline,
+            &store,
+            &triage_pass_config(),
+            "ignored",
+            &provider,
+            "gemini",
+            &HashMap::new(),
+            &prior_sirs,
+        )
+        .expect("prepare symbol");
+        assert!(outcome.is_some());
+        let meta = store
+            .get_sir_meta("sym-late")
+            .expect("load sir meta")
+            .expect("sir meta exists");
+        assert_eq!(meta.sir_hash, aether_sir::sir_hash(&batch_sir));
+        assert_eq!(meta.prompt_hash.as_deref(), Some("prompt-late"));
+    }
+
+    #[test]
     fn prepare_symbol_promotes_metadata_when_sir_hash_is_unchanged() {
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();
@@ -732,6 +898,7 @@ vector_backend = "sqlite"
                     generation_pass: "scan".to_owned(),
                     reasoning_trace: None,
                     commit_hash: None,
+                    prior_sir: PriorSir::Unrecorded,
                 },
                 None,
             )
@@ -750,8 +917,10 @@ vector_backend = "sqlite"
             &provider,
             "gemini",
             &HashMap::new(),
+            &HashMap::new(),
         )
-        .expect("prepare symbol");
+        .expect("prepare symbol")
+        .expect("result applied");
 
         let meta = store
             .get_sir_meta("sym-batch")

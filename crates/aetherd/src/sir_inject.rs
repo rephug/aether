@@ -42,6 +42,19 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
     // lock every leaf writer shares, so a concurrent injection or indexer pass cannot
     // slip in between; released before the embedding refresh, which has its own lock.
     let inject_guard = crate::sir_pipeline::acquire_inject_write_lock(workspace)?;
+    // The selector was resolved before the lock: the running daemon may have removed
+    // the symbol (and its SIR) in between, and a leaf written now would be an orphan.
+    if store
+        .get_symbol_record(record.id.as_str())
+        .with_context(|| format!("failed to re-read symbol record for {}", record.id))?
+        .is_none()
+    {
+        return Err(anyhow!(
+            "symbol '{}' ({}) was removed from the index while the request was being prepared; nothing was injected",
+            record.qualified_name,
+            record.id
+        ));
+    }
     let fresh = load_fresh_symbol_source(workspace, &record)?;
     let existing_blob = store
         .read_sir_blob(record.id.as_str())
@@ -161,6 +174,7 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
         generation_pass: "injected".to_owned(),
         reasoning_trace: None,
         commit_hash: None,
+        prior_sir: crate::sir_pipeline::PriorSir::Unrecorded,
     };
     let (canonical_json, sir_hash) = persist_pipeline
         .persist_sir_payload_into_sqlite(&store, &payload, None)

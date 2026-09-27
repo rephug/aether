@@ -39,7 +39,8 @@ use tokio::task::JoinSet;
 
 pub(crate) use self::infer::build_job;
 use self::infer::{GeneratedSir, SirGenerationOutcome, SirJob, generate_sir_jobs};
-pub(crate) use self::persist::UpsertSirIntentPayload;
+pub(crate) use self::persist::{PriorSir, UpsertSirIntentPayload};
+pub use self::persist::{SirIdentity, current_sir_identity};
 use self::persist::{flatten_error_line, to_symbol_record, to_test_intent_record};
 use self::rollup::{
     FileLeafSir, aggregate_file_sir, concatenate_file_sir, file_sir_from_summary,
@@ -624,7 +625,7 @@ impl SirPipeline {
                 None,
             ) {
                 Ok(mut job) => {
-                    job.prior_sir_hash = self.observe_prior_sir_hash(store, &job.symbol.id)?;
+                    job.prior_sir = current_sir_identity(store, &job.symbol.id)?;
                     let prompt = if item.use_cot {
                         sir_prompt::build_enriched_sir_prompt_with_cot(
                             &job.symbol_text,
@@ -817,7 +818,7 @@ impl SirPipeline {
             );
             match build_job(&self.workspace_root, symbol, priority_score, None) {
                 Ok(mut job) => {
-                    job.prior_sir_hash = self.observe_prior_sir_hash(store, &job.symbol.id)?;
+                    job.prior_sir = current_sir_identity(store, &job.symbol.id)?;
                     jobs.push(job)
                 }
                 Err(err) => {
@@ -955,9 +956,16 @@ impl SirPipeline {
         event: &SymbolChangeEvent,
     ) -> Result<()> {
         for symbol in &event.removed {
-            store
-                .mark_removed(&symbol.id)
-                .with_context(|| format!("failed to mark symbol removed: {}", symbol.id))?;
+            // Removal deletes the symbol row and its SIR, so it takes the inject lock the
+            // leaf writers hold: an `aether_sir_inject` call that resolved this symbol
+            // re-checks it exists under that lock and cannot persist a leaf for a symbol
+            // removed underneath it (the `sir` table has no foreign key to catch that).
+            {
+                let _inject_guard = acquire_inject_write_lock(&self.workspace_root)?;
+                store
+                    .mark_removed(&symbol.id)
+                    .with_context(|| format!("failed to mark symbol removed: {}", symbol.id))?;
+            }
             let _embed_guard = acquire_embed_write_lock(&self.workspace_root, &symbol.id)?;
             self.runtime
                 .block_on(self.vector_store.delete_embedding(&symbol.id))
@@ -1027,7 +1035,7 @@ impl SirPipeline {
 
             match build_job(&self.workspace_root, symbol, priority_score, None) {
                 Ok(mut job) => {
-                    job.prior_sir_hash = self.observe_prior_sir_hash(store, &job.symbol.id)?;
+                    job.prior_sir = current_sir_identity(store, &job.symbol.id)?;
                     if let Some(prompt_overrides) = prompt_overrides
                         && let Some(override_spec) = prompt_overrides.get(job.symbol.id.as_str())
                     {
@@ -1299,19 +1307,6 @@ impl SirPipeline {
         Ok(Some(persisted.intent_id))
     }
 
-    /// The SIR hash the store holds for a symbol right now, recorded on a job before
-    /// generation so the persist step can tell whether another writer got there first.
-    fn observe_prior_sir_hash(
-        &self,
-        store: &SqliteStore,
-        symbol_id: &str,
-    ) -> Result<Option<String>> {
-        Ok(store
-            .get_sir_meta(symbol_id)
-            .with_context(|| format!("failed to read SIR metadata for {symbol_id}"))?
-            .map(|meta| meta.sir_hash))
-    }
-
     fn persist_successful_generation_sqlite(
         &self,
         store: &SqliteStore,
@@ -1335,12 +1330,14 @@ impl SirPipeline {
             };
 
         // Generation ran unlocked; under the inject lock every leaf writer shares, persist
-        // only while the store still holds the SIR this job started from. Otherwise
-        // another writer (an `aether_sir_inject` call with a reviewed, high-confidence
-        // SIR, say) landed meanwhile and must not be overwritten by this older result.
+        // only while the store still holds the SIR write this job started from (hash and
+        // history version: a symbol whose SIR went `H1 → H2 → H1` meanwhile was written
+        // twice and the job's H1 is not the current one). Otherwise another writer (an
+        // `aether_sir_inject` call with a reviewed, high-confidence SIR, say) landed
+        // meanwhile and must not be overwritten by this older result.
         let _inject_guard = acquire_inject_write_lock(&self.workspace_root)?;
-        let current_sir_hash = self.observe_prior_sir_hash(store, &generated.symbol.id)?;
-        if current_sir_hash != generated.prior_sir_hash {
+        let current_sir = current_sir_identity(store, &generated.symbol.id)?;
+        if current_sir != generated.prior_sir {
             tracing::info!(
                 symbol_id = %generated.symbol.id,
                 "skipping generated SIR: the stored SIR changed while it was being generated"
@@ -1356,6 +1353,7 @@ impl SirPipeline {
             generation_pass: generation_pass.to_owned(),
             reasoning_trace: generated.reasoning_trace.clone(),
             commit_hash: commit_hash.map(str::to_owned),
+            prior_sir: PriorSir::recorded(generated.prior_sir.clone()),
         };
         let payload_json = match payload.to_json_string() {
             Ok(json) => json,
@@ -2273,7 +2271,23 @@ impl SirPipeline {
         let mut sir_hash_value = sir_hash(&prepared_sir);
 
         if status == WriteIntentStatus::Pending {
+            // The intent's write never landed. It is still wanted only while the store
+            // holds the SIR the intent was planned against; a newer write (an injection
+            // that landed while the daemon was down, say) is not damage to repair but
+            // the result that wins, so the intent is retired instead.
             let _inject_guard = acquire_inject_write_lock(&self.workspace_root)?;
+            let current = current_sir_identity(store, payload.symbol.id.as_str())?;
+            if !payload.prior_sir.still_holds(current.as_ref()) {
+                tracing::info!(
+                    intent_id = %intent_id,
+                    symbol_id = %payload.symbol.id,
+                    "retiring write intent: the stored SIR changed since it was planned"
+                );
+                store
+                    .mark_intent_complete(intent_id)
+                    .with_context(|| format!("failed to retire superseded intent {intent_id}"))?;
+                return Ok(());
+            }
             let persisted = self
                 .persist_sir_payload_into_sqlite(store, payload, Some(intent_id))
                 .with_context(|| format!("failed sqlite write stage for intent {intent_id}"))?;
@@ -2281,25 +2295,25 @@ impl SirPipeline {
             sir_hash_value = persisted.1;
             status = WriteIntentStatus::SqliteDone;
         } else {
+            // The intent's SQLite write landed (the status is set in that transaction).
+            // A stored SIR that differs now was written afterwards by someone else, so
+            // this intent is superseded: leave the newer SIR alone (its own writer
+            // embeds it) and retire the intent rather than restore the older payload.
             let stored_blob = store
                 .read_sir_blob(payload.symbol.id.as_str())
                 .with_context(|| {
                     format!("failed to read sqlite SIR blob for intent {intent_id}")
                 })?;
-            let needs_sqlite_refresh = match stored_blob.as_deref() {
-                Some(stored_blob) => stored_blob != canonical_json,
-                None => true,
-            };
-            if needs_sqlite_refresh {
-                let _inject_guard = acquire_inject_write_lock(&self.workspace_root)?;
-                let persisted = self
-                    .persist_sir_payload_into_sqlite(store, payload, Some(intent_id))
-                    .with_context(|| {
-                        format!("failed sqlite refresh stage for intent {intent_id}")
-                    })?;
-                canonical_json = persisted.0;
-                sir_hash_value = persisted.1;
-                status = WriteIntentStatus::SqliteDone;
+            if stored_blob.as_deref() != Some(canonical_json.as_str()) {
+                tracing::info!(
+                    intent_id = %intent_id,
+                    symbol_id = %payload.symbol.id,
+                    "retiring write intent: its SIR was replaced after the sqlite stage"
+                );
+                store
+                    .mark_intent_complete(intent_id)
+                    .with_context(|| format!("failed to retire superseded intent {intent_id}"))?;
+                return Ok(());
             }
         }
 

@@ -267,6 +267,15 @@ impl AetherMcpServer {
         // shared with the daemon's rollup writer) lives in the pipeline crate.
         let _inject_guard = acquire_inject_write_lock(&self.state.workspace)
             .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
+        // The selector was resolved before the lock. The daemon removes symbols (row and
+        // SIR together) under this same lock, so once it is held the symbol either still
+        // exists or is gone for good; a leaf written for a removed symbol would be an
+        // orphan the `sir` table has no foreign key to reject.
+        if store.get_symbol_record(symbol_id.as_str())?.is_none() {
+            return Err(AetherMcpError::Message(format!(
+                "symbol '{qualified_name}' ({symbol_id}) was removed from the index while the request was being resolved; nothing was injected"
+            )));
+        }
         let previous_meta = store.get_sir_meta(symbol_id.as_str())?;
         let previous_blob = store.read_sir_blob(symbol_id.as_str())?;
         let previous_sir = previous_blob

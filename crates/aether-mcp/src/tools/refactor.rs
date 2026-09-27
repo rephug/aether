@@ -21,7 +21,9 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 use tokio::time::{sleep, timeout};
 
-use aetherd::sir_pipeline::{SirPipeline, acquire_embed_write_lock, acquire_inject_write_lock};
+use aetherd::sir_pipeline::{
+    SirPipeline, acquire_embed_write_lock, acquire_inject_write_lock, current_sir_identity,
+};
 
 use super::{AetherMcpServer, MCP_SCHEMA_VERSION, current_unix_timestamp};
 use crate::AetherMcpError;
@@ -64,6 +66,10 @@ pub struct AetherRefactorPrepResponse {
     pub deep_completed: u32,
     pub deep_failed: u32,
     pub deep_failed_symbol_ids: Vec<String>,
+    /// Deep scans whose symbol was written by someone else (an `aether_sir_inject`
+    /// call, say) while the SIR was being generated; that newer SIR was kept.
+    #[serde(default)]
+    pub deep_superseded: u32,
     pub forced_cycle_members: u32,
     pub skipped_fresh: u32,
     pub notes: Vec<String>,
@@ -118,6 +124,14 @@ struct McpDeepScanOutcome {
     requested: usize,
     succeeded_ids: HashSet<String>,
     failed_symbol_ids: Vec<String>,
+    superseded_symbol_ids: Vec<String>,
+}
+
+/// What became of one deep-scan candidate's generated SIR.
+enum DeepSirPersist {
+    Persisted,
+    /// The stored SIR changed while this one was being generated; nothing was written.
+    Superseded,
 }
 
 impl AetherMcpServer {
@@ -154,6 +168,12 @@ impl AetherMcpServer {
         self.state.store.create_snapshot(&snapshot)?;
 
         let mut notes = prep.notes;
+        if !deep_outcome.superseded_symbol_ids.is_empty() {
+            notes.push(format!(
+                "{} deep scans were superseded by SIRs written concurrently and left as written.",
+                deep_outcome.superseded_symbol_ids.len()
+            ));
+        }
         if !deep_outcome.failed_symbol_ids.is_empty() {
             notes.push(format!(
                 "{} deep scans did not complete successfully.",
@@ -199,6 +219,7 @@ impl AetherMcpServer {
             deep_completed: deep_outcome.succeeded_ids.len() as u32,
             deep_failed: deep_outcome.failed_symbol_ids.len() as u32,
             deep_failed_symbol_ids: deep_outcome.failed_symbol_ids,
+            deep_superseded: deep_outcome.superseded_symbol_ids.len() as u32,
             forced_cycle_members: prep.forced_cycle_members as u32,
             skipped_fresh: prep.skipped_fresh as u32,
             notes,
@@ -332,8 +353,13 @@ impl AetherMcpServer {
                 use_cot,
                 timeout_secs,
             ) {
-                Ok(()) => {
+                Ok(DeepSirPersist::Persisted) => {
                     outcome.succeeded_ids.insert(candidate.symbol.id.clone());
+                }
+                Ok(DeepSirPersist::Superseded) => {
+                    outcome
+                        .superseded_symbol_ids
+                        .push(candidate.symbol.id.clone());
                 }
                 Err(err) => {
                     outcome.failed_symbol_ids.push(candidate.symbol.id.clone());
@@ -362,7 +388,12 @@ impl AetherMcpServer {
         candidate: &PreparedRefactorCandidate,
         use_cot: bool,
         timeout_secs: u64,
-    ) -> Result<(), AetherMcpError> {
+    ) -> Result<DeepSirPersist, AetherMcpError> {
+        // The SIR write this generation starts from (hash and history version). The
+        // model call runs unlocked, so the result is persisted only while the store
+        // still holds exactly this write; a SIR another writer stored meanwhile wins.
+        let prior_sir = current_sir_identity(self.state.store.as_ref(), &candidate.symbol.id)
+            .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
         let symbol_text = extract_symbol_text(self.workspace(), &candidate.symbol)?;
         let context = build_sir_context(
             &candidate.symbol,
@@ -398,10 +429,20 @@ impl AetherMcpServer {
         let attempted_at = current_unix_timestamp();
         // The deep SIR is a leaf write like any other: history, JSON and metadata land in
         // one transaction under the workspace inject lock every SIR writer shares, so it
-        // cannot interleave with an `aether_sir_inject` call or a daemon rollup persist.
+        // cannot interleave with an `aether_sir_inject` call or a daemon rollup persist,
+        // and it lands only while the store still holds the SIR generation started from.
         {
             let _inject_guard = acquire_inject_write_lock(&self.state.workspace)
                 .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
+            let current_sir = current_sir_identity(self.state.store.as_ref(), &candidate.symbol.id)
+                .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
+            if current_sir != prior_sir {
+                tracing::info!(
+                    symbol_id = %candidate.symbol.id,
+                    "skipping deep SIR: the stored SIR changed while it was being generated"
+                );
+                return Ok(DeepSirPersist::Superseded);
+            }
             self.state.store.persist_sir_state_atomically(
                 SirMetaRecord {
                     id: candidate.symbol.id.clone(),
@@ -430,7 +471,7 @@ impl AetherMcpServer {
             canonical_json.as_str(),
         )?;
 
-        Ok(())
+        Ok(DeepSirPersist::Persisted)
     }
 
     fn record_failed_deep_attempt(
@@ -440,6 +481,10 @@ impl AetherMcpServer {
         model_name: &str,
         error_message: &str,
     ) -> Result<(), AetherMcpError> {
+        // A read-modify-write of the metadata row: under the inject lock so it carries
+        // the row's current hash and version, not a snapshot another writer replaced.
+        let _inject_guard = acquire_inject_write_lock(&self.state.workspace)
+            .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
         let current = self.state.store.get_sir_meta(symbol_id)?;
         let updated_at = current_unix_timestamp();
         self.state.store.upsert_sir_meta(SirMetaRecord {

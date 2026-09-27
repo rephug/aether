@@ -489,7 +489,7 @@ vector_backend = "sqlite"
             provider_name: "test_provider".to_owned(),
             model_name: "test_model".to_owned(),
             reasoning_trace: None,
-            prior_sir_hash: None,
+            prior_sir: None,
         };
 
         let mut out = Vec::new();
@@ -599,6 +599,7 @@ enabled = false
                     generation_pass: SIR_GENERATION_PASS_SCAN.to_owned(),
                     reasoning_trace: None,
                     commit_hash: None,
+                    prior_sir: PriorSir::Unrecorded,
                 },
                 None,
             )
@@ -615,6 +616,7 @@ enabled = false
                     generation_pass: SIR_GENERATION_PASS_TRIAGE.to_owned(),
                     reasoning_trace: Some("triage reasoning".to_owned()),
                     commit_hash: None,
+                    prior_sir: PriorSir::Unrecorded,
                 },
                 None,
             )
@@ -961,6 +963,348 @@ enabled = false
         );
     }
 
+    fn payload_for(symbol: &Symbol, sir: &SirAnnotation, pass: &str) -> UpsertSirIntentPayload {
+        UpsertSirIntentPayload {
+            symbol: symbol.clone(),
+            sir: sir.clone(),
+            provider_name: "test_provider".to_owned(),
+            model_name: "test_model".to_owned(),
+            generation_pass: pass.to_owned(),
+            reasoning_trace: None,
+            commit_hash: None,
+            prior_sir: PriorSir::Unrecorded,
+        }
+    }
+
+    #[test]
+    fn intent_payload_round_trips_the_prior_sir_record() {
+        let symbol = demo_type_symbol(
+            "sym-prior",
+            "prior",
+            "demo::prior",
+            "src/lib.rs",
+            SymbolKind::Function,
+            "fn prior() {}\n",
+        );
+        let mut payload = payload_for(&symbol, &demo_sir(), SIR_GENERATION_PASS_SCAN);
+
+        // Unrecorded: the key is left out, so the intent reads back as unrecorded.
+        let json = payload.to_json_string().expect("serialize");
+        assert!(!json.contains("prior_sir"));
+        let parsed = UpsertSirIntentPayload::from_json_str(&json).expect("parse");
+        assert_eq!(parsed.prior_sir, PriorSir::Unrecorded);
+        assert!(parsed.prior_sir.still_holds(None));
+        assert!(parsed.prior_sir.still_holds(Some(&SirIdentity {
+            sir_hash: "h".to_owned(),
+            sir_version: 7,
+        })));
+
+        // Absent: null, and only a store without a SIR still holds it.
+        payload.prior_sir = PriorSir::Absent;
+        let json = payload.to_json_string().expect("serialize");
+        assert!(json.contains("\"prior_sir\":null"));
+        let parsed = UpsertSirIntentPayload::from_json_str(&json).expect("parse");
+        assert_eq!(parsed.prior_sir, PriorSir::Absent);
+        assert!(parsed.prior_sir.still_holds(None));
+        assert!(!parsed.prior_sir.still_holds(Some(&SirIdentity {
+            sir_hash: "h".to_owned(),
+            sir_version: 1,
+        })));
+
+        // Present: hash and version both have to match.
+        let identity = SirIdentity {
+            sir_hash: "h1".to_owned(),
+            sir_version: 2,
+        };
+        payload.prior_sir = PriorSir::Present(identity.clone());
+        let json = payload.to_json_string().expect("serialize");
+        let parsed = UpsertSirIntentPayload::from_json_str(&json).expect("parse");
+        assert_eq!(parsed.prior_sir, PriorSir::Present(identity.clone()));
+        assert!(parsed.prior_sir.still_holds(Some(&identity)));
+        assert!(!parsed.prior_sir.still_holds(None));
+        assert!(!parsed.prior_sir.still_holds(Some(&SirIdentity {
+            sir_hash: "h1".to_owned(),
+            sir_version: 3,
+        })));
+        assert!(!parsed.prior_sir.still_holds(Some(&SirIdentity {
+            sir_hash: "h2".to_owned(),
+            sir_version: 2,
+        })));
+
+        // Intents written before the record existed carry no key at all.
+        let legacy = UpsertSirIntentPayload::from_json_str(
+            json.replace(",\"prior_sir\":{\"sir_hash\":\"h1\",\"sir_version\":2}", "")
+                .as_str(),
+        )
+        .expect("parse legacy payload");
+        assert_eq!(legacy.prior_sir, PriorSir::Unrecorded);
+    }
+
+    #[test]
+    fn persist_successful_generation_sqlite_skips_a_sir_whose_content_cycled_back() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_only_config(workspace);
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        let pipeline = build_write_pipeline(workspace, Arc::new(PanicInferenceProvider));
+        let symbol_id = "sym-cycle";
+        store
+            .upsert_symbol(demo_symbol(symbol_id, "demo::cycle"))
+            .expect("upsert symbol");
+        let symbol = demo_type_symbol(
+            symbol_id,
+            "cycle",
+            "demo::cycle",
+            "src/lib.rs",
+            SymbolKind::Function,
+            "fn cycle() {}\n",
+        );
+        let first = demo_sir();
+        let second = SirAnnotation {
+            intent: "Reviewed intent".to_owned(),
+            confidence: 0.95,
+            ..demo_sir()
+        };
+
+        // The job is queued while the store holds H1 (version 1)...
+        pipeline
+            .persist_sir_payload_into_sqlite(
+                &store,
+                &payload_for(&symbol, &first, SIR_GENERATION_PASS_SCAN),
+                None,
+            )
+            .expect("persist H1");
+        let prior_sir = current_sir_identity(&store, symbol_id).expect("identity");
+        assert_eq!(
+            prior_sir,
+            Some(SirIdentity {
+                sir_hash: sir_hash(&first),
+                sir_version: 1
+            })
+        );
+
+        // ...and while it generates, two injections take the SIR to H2 and back to H1.
+        for sir in [&second, &first] {
+            pipeline
+                .persist_sir_payload_into_sqlite(
+                    &store,
+                    &payload_for(&symbol, sir, "injected"),
+                    None,
+                )
+                .expect("inject");
+        }
+        let current = current_sir_identity(&store, symbol_id).expect("identity");
+        assert_eq!(
+            current,
+            Some(SirIdentity {
+                sir_hash: sir_hash(&first),
+                sir_version: 3
+            }),
+            "the same content written again is a new write generation"
+        );
+
+        let generated = infer::GeneratedSir {
+            symbol: symbol.clone(),
+            sir: SirAnnotation {
+                intent: "Generated later, from the older state".to_owned(),
+                ..demo_sir()
+            },
+            provider_name: "test_provider".to_owned(),
+            model_name: "test_model".to_owned(),
+            reasoning_trace: None,
+            prior_sir,
+        };
+        let persisted = pipeline
+            .persist_successful_generation_sqlite(
+                &store,
+                &generated,
+                SIR_GENERATION_PASS_SCAN,
+                None,
+            )
+            .expect("persist");
+        assert!(
+            matches!(persisted, GenerationPersist::Superseded),
+            "a hash match alone must not let the older generation through"
+        );
+        assert_eq!(
+            current_sir_identity(&store, symbol_id).expect("identity"),
+            current
+        );
+        assert_eq!(count_table_rows(workspace, "write_intents"), 0);
+
+        // The same generation against an unchanged store lands.
+        let generated = infer::GeneratedSir {
+            prior_sir: current,
+            ..generated
+        };
+        let persisted = pipeline
+            .persist_successful_generation_sqlite(
+                &store,
+                &generated,
+                SIR_GENERATION_PASS_SCAN,
+                None,
+            )
+            .expect("persist");
+        assert!(matches!(persisted, GenerationPersist::Persisted(_)));
+        assert_eq!(
+            store
+                .get_sir_meta(symbol_id)
+                .expect("meta")
+                .expect("meta exists")
+                .sir_hash,
+            sir_hash(&generated.sir)
+        );
+    }
+
+    #[test]
+    fn replay_retires_an_intent_whose_sir_moved_on() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_only_config(workspace);
+
+        let store = SqliteStore::open(workspace).expect("open store");
+        let pipeline = build_write_pipeline(workspace, Arc::new(PanicInferenceProvider));
+        let symbol_id = "sym-replay";
+        store
+            .upsert_symbol(demo_symbol(symbol_id, "demo::replay"))
+            .expect("upsert symbol");
+        let symbol = demo_type_symbol(
+            symbol_id,
+            "replay",
+            "demo::replay",
+            "src/lib.rs",
+            SymbolKind::Function,
+            "fn replay() {}\n",
+        );
+        let generated = demo_sir();
+        let reviewed = SirAnnotation {
+            intent: "Reviewed by hand".to_owned(),
+            confidence: 0.97,
+            ..demo_sir()
+        };
+        let reviewed_json = canonicalize_sir_json(&reviewed);
+        let intent_for = |intent_id: &str, status: WriteIntentStatus, payload_json: String| {
+            WriteIntent {
+                intent_id: intent_id.to_owned(),
+                symbol_id: symbol_id.to_owned(),
+                file_path: "src/lib.rs".to_owned(),
+                operation: IntentOperation::UpsertSir,
+                status,
+                payload_json: Some(payload_json),
+                created_at: 1_700_000_000,
+                completed_at: None,
+                error_message: None,
+            }
+        };
+
+        // A pending intent planned while the symbol had no SIR: an injection landed
+        // before the replay, so the intent is retired and the injected SIR stands.
+        let mut payload = payload_for(&symbol, &generated, SIR_GENERATION_PASS_SCAN);
+        payload.prior_sir = PriorSir::Absent;
+        let pending = intent_for(
+            "intent-pending",
+            WriteIntentStatus::Pending,
+            payload.to_json_string().expect("payload json"),
+        );
+        store.create_write_intent(&pending).expect("create intent");
+        pipeline
+            .persist_sir_payload_into_sqlite(
+                &store,
+                &payload_for(&symbol, &reviewed, "injected"),
+                None,
+            )
+            .expect("inject");
+        pipeline
+            .replay_upsert_sir_intent(&store, &pending, &payload, false)
+            .expect("replay pending intent");
+        assert_eq!(
+            store.read_sir_blob(symbol_id).expect("blob").as_deref(),
+            Some(reviewed_json.as_str()),
+            "the replay must not restore the generated SIR over the injected one"
+        );
+        assert_eq!(
+            store
+                .get_intent("intent-pending")
+                .expect("intent")
+                .expect("intent exists")
+                .status,
+            WriteIntentStatus::Complete
+        );
+
+        // An intent whose sqlite stage landed, then was replaced by an injection, is
+        // superseded too: the newer blob is left alone rather than refreshed back.
+        let payload = payload_for(&symbol, &generated, SIR_GENERATION_PASS_SCAN);
+        let done = intent_for(
+            "intent-done",
+            WriteIntentStatus::Pending,
+            payload.to_json_string().expect("payload json"),
+        );
+        store.create_write_intent(&done).expect("create intent");
+        pipeline
+            .persist_sir_payload_into_sqlite(&store, &payload, Some("intent-done"))
+            .expect("sqlite stage");
+        assert_eq!(
+            store
+                .get_intent("intent-done")
+                .expect("intent")
+                .expect("intent exists")
+                .status,
+            WriteIntentStatus::SqliteDone
+        );
+        pipeline
+            .persist_sir_payload_into_sqlite(
+                &store,
+                &payload_for(&symbol, &reviewed, "injected"),
+                None,
+            )
+            .expect("inject");
+        let done = WriteIntent {
+            status: WriteIntentStatus::SqliteDone,
+            ..done
+        };
+        pipeline
+            .replay_upsert_sir_intent(&store, &done, &payload, false)
+            .expect("replay sqlite_done intent");
+        assert_eq!(
+            store.read_sir_blob(symbol_id).expect("blob").as_deref(),
+            Some(reviewed_json.as_str())
+        );
+        assert_eq!(
+            store
+                .get_intent("intent-done")
+                .expect("intent")
+                .expect("intent exists")
+                .status,
+            WriteIntentStatus::Complete
+        );
+
+        // A pending intent planned against the SIR the store still holds is replayed.
+        let mut payload = payload_for(
+            &symbol,
+            &SirAnnotation {
+                intent: "Regenerated".to_owned(),
+                ..demo_sir()
+            },
+            SIR_GENERATION_PASS_SCAN,
+        );
+        payload.prior_sir =
+            PriorSir::recorded(current_sir_identity(&store, symbol_id).expect("identity"));
+        let pending = intent_for(
+            "intent-current",
+            WriteIntentStatus::Pending,
+            payload.to_json_string().expect("payload json"),
+        );
+        store.create_write_intent(&pending).expect("create intent");
+        pipeline
+            .replay_upsert_sir_intent(&store, &pending, &payload, false)
+            .expect("replay current intent");
+        assert_eq!(
+            store.read_sir_blob(symbol_id).expect("blob").as_deref(),
+            Some(canonicalize_sir_json(&payload.sir).as_str())
+        );
+    }
+
     #[test]
     fn persist_successful_generation_sqlite_rolls_back_when_sqlite_done_fails() {
         let temp = tempdir().expect("tempdir");
@@ -988,7 +1332,7 @@ enabled = false
             provider_name: "test_provider".to_owned(),
             model_name: "test_model".to_owned(),
             reasoning_trace: None,
-            prior_sir_hash: None,
+            prior_sir: None,
         };
 
         let persisted = pipeline
