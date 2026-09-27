@@ -298,6 +298,7 @@ vector_backend = "sqlite"
             Some(("test_embedding".to_owned(), "test-model".to_owned())),
             None,
             None,
+            None,
         )
         .expect("build pipeline")
     }
@@ -322,6 +323,7 @@ vector_backend = "sqlite"
             "test_model",
             embedding_provider,
             embedding_identity,
+            None,
             None,
             None,
         )
@@ -654,6 +656,72 @@ enabled = false
     /// runs out) and records how often it was asked.
     fn scripted_check(script: Vec<bool>) -> (Arc<Mutex<Vec<bool>>>, Arc<AtomicUsize>) {
         (Arc::new(Mutex::new(script)), Arc::new(AtomicUsize::new(0)))
+    }
+
+    #[test]
+    fn embeddings_only_pipeline_reuses_the_provider_and_vector_store_it_is_given() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_embeddings_only_config(workspace);
+        let store = SqliteStore::open(workspace).expect("open store");
+        store
+            .upsert_symbol(demo_symbol_record_with_kind(
+                "sym-shared",
+                "shared",
+                "function",
+                "src/lib.rs",
+            ))
+            .expect("upsert symbol");
+        let sir = demo_sir();
+        let sir_hash_value = seed_sir(&store, "sym-shared", &sir);
+        let canonical_json = canonicalize_sir_json(&sir);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn EmbeddingProvider> = Arc::new(CountingEmbeddingProvider {
+            calls: calls.clone(),
+            batch_calls: Arc::new(AtomicUsize::new(0)),
+            batch_sizes: Arc::new(Mutex::new(Vec::new())),
+            purposes: Arc::new(Mutex::new(Vec::new())),
+        });
+        let vector_store: Arc<dyn VectorStore> = Arc::new(
+            aether_store::SqliteVectorStore::new(workspace).expect("open vector store"),
+        );
+
+        let pipeline = SirPipeline::new_embeddings_only_with(
+            workspace.to_path_buf(),
+            provider,
+            "test_embedding",
+            "test-model",
+            Some(vector_store.clone()),
+        )
+        .expect("build pipeline");
+        assert!(
+            Arc::ptr_eq(pipeline.vector_store(), &vector_store),
+            "the pipeline must write through the vector store it was handed, not open another"
+        );
+
+        // The one pipeline serves symbol after symbol: each refresh goes through the same
+        // provider instance (a local model loads once) and lands in the shared store.
+        let mut still_current = || Ok(true);
+        let refreshed = pipeline
+            .refresh_embedding_if_current(
+                "sym-shared",
+                &sir_hash_value,
+                &canonical_json,
+                None,
+                &mut still_current,
+            )
+            .expect("refresh");
+        assert!(matches!(refreshed, EmbeddingRefresh::Refreshed { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let meta = pipeline
+            .runtime
+            .block_on(vector_store.get_embedding_meta("sym-shared"))
+            .expect("read meta")
+            .expect("vector stored");
+        assert_eq!(meta.sir_hash, sir_hash_value);
+        assert_eq!(meta.provider, "test_embedding");
+        assert_eq!(meta.model, "test-model");
     }
 
     #[test]

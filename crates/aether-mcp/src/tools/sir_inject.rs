@@ -6,7 +6,7 @@ use aether_store::{SirMetaRecord, SirStateStore, SymbolCatalogStore, SymbolRecor
 
 use aether_parse::language_for_path;
 use aetherd::sir_pipeline::{
-    EmbeddingRefresh, SirPipeline, acquire_embed_write_lock, acquire_inject_write_lock,
+    EmbeddingRefresh, acquire_embed_write_lock, acquire_inject_write_lock,
     refresh_local_file_rollup,
 };
 use schemars::JsonSchema;
@@ -493,9 +493,12 @@ impl AetherMcpServer {
             Ok(guard) => guard,
             Err(err) => return format!("failed: {err:#}"),
         };
-        let pipeline = match SirPipeline::new_embeddings_only(self.state.workspace.clone()) {
-            Ok(pipeline) => pipeline,
-            Err(err) => return format!("failed: {err:#}"),
+        // One embedding pipeline serves every inject and deep-scan call this server
+        // handles, so the provider's model is loaded once, not per call.
+        let pipeline = match self.state.embedding_pipeline() {
+            Ok(Some(pipeline)) => pipeline,
+            Ok(None) => return "skipped: embedding provider not configured".to_owned(),
+            Err(err) => return format!("failed: {err}"),
         };
         // Missing metadata counts as superseded too: the indexer removes a symbol's SIR
         // without the inject lock, and a vector written for it afterwards would be an

@@ -5,10 +5,14 @@ use aether_config::{
     AetherConfig, DEFAULT_OPENAI_COMPAT_API_KEY_ENV, EmbeddingProviderKind, EmbeddingVectorBackend,
     GraphBackend, load_workspace_config,
 };
+use aether_infer::{
+    EmbeddingProvider, EmbeddingProviderOverrides, load_embedding_provider_from_config,
+};
 use aether_store::{
     GraphStore, SchemaVersion, SqliteGraphStore, SqliteStore, SqliteVectorStore, SurrealGraphStore,
     VectorStore, open_vector_store,
 };
+use aetherd::sir_pipeline::SirPipeline;
 use tokio::sync::Mutex;
 
 use crate::AetherMcpError;
@@ -20,6 +24,9 @@ pub struct SharedState {
     pub graph: Arc<dyn GraphStore>,
     pub surreal_graph: Arc<Mutex<Option<Arc<SurrealGraphStore>>>>,
     pub vector_store: Option<Arc<dyn VectorStore>>,
+    /// The one embeddings-only pipeline every vector-writing tool call shares, built on
+    /// first use (see [`SharedState::embedding_pipeline`]).
+    embedding_pipeline: Arc<std::sync::Mutex<Option<Arc<SirPipeline>>>>,
     pub semantic_search_available: bool,
     pub config: Arc<AetherConfig>,
     pub read_only: bool,
@@ -118,6 +125,47 @@ fn env_var_configured(key_env: &str) -> bool {
 }
 
 impl SharedState {
+    /// The embeddings-only pipeline this server shares across every tool call that
+    /// writes a vector (`aether_sir_inject`, `aether_refactor_prep`'s deep scan, …).
+    ///
+    /// Loading an embedding provider is the expensive part of embedding: a local Candle
+    /// provider loads its model into memory, and each fresh provider would load it again,
+    /// so the provider is loaded once and kept for the life of the server, wrapped in a
+    /// pipeline that writes through this server's already-open vector store rather than
+    /// opening another connection. `None` when embeddings are disabled or no provider is
+    /// configured; a load that fails is not cached, so the next call retries it.
+    pub fn embedding_pipeline(&self) -> Result<Option<Arc<SirPipeline>>, AetherMcpError> {
+        let Some(vector_store) = self.vector_store.clone() else {
+            return Ok(None);
+        };
+        let mut slot = self
+            .embedding_pipeline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(pipeline) = slot.as_ref() {
+            return Ok(Some(pipeline.clone()));
+        }
+        let Some(loaded) = load_embedding_provider_from_config(
+            &self.workspace,
+            EmbeddingProviderOverrides::default(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let pipeline = Arc::new(
+            SirPipeline::new_embeddings_only_with(
+                self.workspace.clone(),
+                Arc::<dyn EmbeddingProvider>::from(loaded.provider),
+                loaded.provider_name,
+                loaded.model_name,
+                Some(vector_store),
+            )
+            .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?,
+        );
+        *slot = Some(pipeline.clone());
+        Ok(Some(pipeline))
+    }
+
     pub fn open_readwrite(workspace: &Path) -> Result<Self, AetherMcpError> {
         let workspace = workspace.canonicalize()?;
         let config = Arc::new(load_config(&workspace)?);
@@ -141,6 +189,7 @@ impl SharedState {
             graph,
             surreal_graph,
             vector_store,
+            embedding_pipeline: Arc::new(std::sync::Mutex::new(None)),
             semantic_search_available,
             config,
             read_only: false,
@@ -171,6 +220,7 @@ impl SharedState {
             graph,
             surreal_graph,
             vector_store,
+            embedding_pipeline: Arc::new(std::sync::Mutex::new(None)),
             semantic_search_available,
             config,
             read_only: false,
@@ -202,6 +252,7 @@ impl SharedState {
             graph,
             surreal_graph,
             vector_store,
+            embedding_pipeline: Arc::new(std::sync::Mutex::new(None)),
             semantic_search_available,
             config,
             read_only: true,
@@ -233,6 +284,7 @@ impl SharedState {
             graph,
             surreal_graph,
             vector_store,
+            embedding_pipeline: Arc::new(std::sync::Mutex::new(None)),
             semantic_search_available,
             config,
             read_only: true,

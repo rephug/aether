@@ -246,6 +246,7 @@ impl SirPipeline {
             loaded.model_name,
             embedding_provider,
             embedding_identity,
+            None,
             tiered_parse_fallback_provider,
             tiered_parse_fallback_model,
         )
@@ -268,6 +269,7 @@ impl SirPipeline {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -280,9 +282,30 @@ impl SirPipeline {
         .ok_or_else(|| {
             anyhow!("Embedding provider is not configured. Set [embeddings] in config.")
         })?;
-        let embedding_provider = Arc::<dyn EmbeddingProvider>::from(loaded_embedding.provider);
+        Self::new_embeddings_only_with(
+            workspace_root,
+            Arc::<dyn EmbeddingProvider>::from(loaded_embedding.provider),
+            loaded_embedding.provider_name,
+            loaded_embedding.model_name,
+            None,
+        )
+    }
+
+    /// An embeddings-only pipeline around an embedding provider (and, when given, a
+    /// vector store) the caller already holds. Loading a provider is expensive (a local
+    /// Candle provider loads its model, a remote one builds a client) and opening a
+    /// vector store makes another connection, so a process that embeds many symbols in
+    /// one pass, or serves many tool calls, builds this once and shares it rather than
+    /// paying that cost per symbol through [`SirPipeline::new_embeddings_only`].
+    pub fn new_embeddings_only_with(
+        workspace_root: PathBuf,
+        embedding_provider: Arc<dyn EmbeddingProvider>,
+        embedding_provider_name: impl Into<String>,
+        embedding_model_name: impl Into<String>,
+        vector_store: Option<Arc<dyn VectorStore>>,
+    ) -> Result<Self> {
         let embedding_identity =
-            Some((loaded_embedding.provider_name, loaded_embedding.model_name));
+            Some((embedding_provider_name.into(), embedding_model_name.into()));
         let placeholder_provider = Qwen3LocalProvider::new(None, None);
         let placeholder_provider_name = placeholder_provider.provider_name();
         let placeholder_model_name = placeholder_provider.model_name();
@@ -295,9 +318,15 @@ impl SirPipeline {
             placeholder_model_name,
             Some(embedding_provider),
             embedding_identity,
+            vector_store,
             None,
             None,
         )
+    }
+
+    /// The vector store this pipeline writes embeddings to.
+    pub fn vector_store(&self) -> &Arc<dyn VectorStore> {
+        &self.vector_store
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -309,6 +338,7 @@ impl SirPipeline {
         model_name: impl Into<String>,
         embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
         embedding_identity: Option<(String, String)>,
+        vector_store: Option<Arc<dyn VectorStore>>,
         tiered_parse_fallback_provider: Option<Arc<dyn InferenceProvider>>,
         tiered_parse_fallback_model: Option<String>,
     ) -> Result<Self> {
@@ -322,9 +352,12 @@ impl SirPipeline {
             .map_or((None, None), |identity| {
                 (Some(identity.0), Some(identity.1))
             });
-        let vector_store = runtime
-            .block_on(open_vector_store(&workspace_root))
-            .context("failed to initialize vector store")?;
+        let vector_store = match vector_store {
+            Some(vector_store) => vector_store,
+            None => runtime
+                .block_on(open_vector_store(&workspace_root))
+                .context("failed to initialize vector store")?,
+        };
         let contracts_config = load_workspace_config(&workspace_root)
             .ok()
             .and_then(|c| c.contracts);

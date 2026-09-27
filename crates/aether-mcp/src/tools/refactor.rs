@@ -11,8 +11,7 @@ use aether_analysis::{
 use aether_config::InferenceProviderKind;
 use aether_core::{Position, SourceRange, normalize_path};
 use aether_infer::{
-    EmbeddingProvider, EmbeddingProviderOverrides, InferenceProvider, ProviderOverrides,
-    SirContext, load_embedding_provider_from_config, load_provider_from_env_or_mock, sir_prompt,
+    InferenceProvider, ProviderOverrides, SirContext, load_provider_from_env_or_mock, sir_prompt,
 };
 use aether_sir::{canonicalize_sir_json, sir_hash, validate_sir};
 use aether_store::{SirMetaRecord, SirStateStore, SnapshotStore};
@@ -310,21 +309,9 @@ impl AetherMcpServer {
                 AetherMcpError::Message(format!("failed to build tokio runtime: {err}"))
             })?;
 
-        let embedding_loaded = if self.state.vector_store.is_some() {
-            load_embedding_provider_from_config(
-                self.workspace(),
-                EmbeddingProviderOverrides::default(),
-            )?
-        } else {
-            None
-        };
-        let embedding_provider = embedding_loaded.map(|loaded| {
-            (
-                Arc::<dyn EmbeddingProvider>::from(loaded.provider),
-                loaded.provider_name,
-                loaded.model_name,
-            )
-        });
+        // The server's one embedding pipeline serves every candidate: the provider (and
+        // a local provider's model) is loaded once per process, not once per symbol.
+        let embedding_pipeline = self.state.embedding_pipeline()?;
 
         let commit_hash = aether_core::GitContext::open(self.workspace())
             .and_then(|context| context.head_commit_hash());
@@ -339,7 +326,7 @@ impl AetherMcpServer {
                 provider.clone(),
                 provider_name.as_str(),
                 model_name.as_str(),
-                embedding_provider.as_ref(),
+                embedding_pipeline.as_deref(),
                 commit_hash.as_deref(),
                 candidate,
                 use_cot,
@@ -370,7 +357,7 @@ impl AetherMcpServer {
         provider: Arc<dyn InferenceProvider>,
         provider_name: &str,
         model_name: &str,
-        embedding_provider: Option<&(Arc<dyn EmbeddingProvider>, String, String)>,
+        embedding_pipeline: Option<&SirPipeline>,
         commit_hash: Option<&str>,
         candidate: &PreparedRefactorCandidate,
         use_cot: bool,
@@ -437,7 +424,7 @@ impl AetherMcpServer {
             )?;
         }
         self.refresh_embedding_if_needed(
-            embedding_provider,
+            embedding_pipeline,
             candidate.symbol.id.as_str(),
             sir_hash_value.as_str(),
             canonical_json.as_str(),
@@ -486,20 +473,19 @@ impl AetherMcpServer {
     /// before the provider call, before the vector is stored and after it is stored (and
     /// once when a vector for this hash already exists), the write is conditional on the
     /// vector observed beforehand, and a vector for a SIR that was replaced meanwhile is
-    /// never left behind. Exactly the path `aether_sir_inject` uses.
+    /// never left behind. Exactly the path `aether_sir_inject` uses, through the same
+    /// shared pipeline (`None` when embeddings are not configured: nothing to refresh).
     fn refresh_embedding_if_needed(
         &self,
-        embedding_provider: Option<&(Arc<dyn EmbeddingProvider>, String, String)>,
+        embedding_pipeline: Option<&SirPipeline>,
         symbol_id: &str,
         sir_hash_value: &str,
         canonical_json: &str,
     ) -> Result<(), AetherMcpError> {
-        if self.state.vector_store.is_none() || embedding_provider.is_none() {
+        let Some(pipeline) = embedding_pipeline else {
             return Ok(());
-        }
+        };
         let _embed_guard = acquire_embed_write_lock(&self.state.workspace, symbol_id)
-            .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
-        let pipeline = SirPipeline::new_embeddings_only(self.state.workspace.clone())
             .map_err(|err| AetherMcpError::Message(format!("{err:#}")))?;
         let store = self.state.store.as_ref();
         let mut still_current = || -> anyhow::Result<bool> {
