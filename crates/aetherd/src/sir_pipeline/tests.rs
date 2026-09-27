@@ -777,14 +777,34 @@ enabled = false
         assert_eq!(record.sir_hash, "hash-3");
         assert_eq!(calls.load(Ordering::SeqCst), 4);
 
-        // Already embedded for this hash: no provider call, no check needed.
+        // Already embedded for this hash and still current: no provider call, kept.
         let outcome = pipeline
-            .refresh_embedding_if_current("sym-guard", "hash-3", "{}", None, &mut || {
-                panic!("still_current must not be consulted when nothing is written")
-            })
+            .refresh_embedding_if_current("sym-guard", "hash-3", "{}", None, &mut || Ok(true))
             .expect("guarded refresh");
         assert_eq!(outcome, EmbeddingRefresh::Unchanged);
         assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert!(
+            pipeline
+                .load_symbol_embedding("sym-guard")
+                .expect("load embedding")
+                .is_some()
+        );
+
+        // Already embedded for this hash but the SIR has moved on (a repeated injection
+        // of an old hash after a concurrent newer one): the stale vector is removed
+        // without a provider call.
+        let outcome = pipeline
+            .refresh_embedding_if_current("sym-guard", "hash-3", "{}", None, &mut || Ok(false))
+            .expect("guarded refresh");
+        assert_eq!(outcome, EmbeddingRefresh::Superseded);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert!(
+            pipeline
+                .load_symbol_embedding("sym-guard")
+                .expect("load embedding")
+                .is_none(),
+            "a vector for a superseded SIR must not stay behind"
+        );
     }
 
     #[test]

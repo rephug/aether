@@ -12,8 +12,11 @@ perfection: deeper enrichment comes later. `batch-size` (default 100) caps how m
 symbols this session processes before stopping. `scopes=` (what `scripts/scan_all.sh`
 passes) is a comma-separated list of project-relative paths, each marked with a leading
 `+` (an include) or `-` (an exclude), so a path that itself starts with `-` is still an
-include when written `+-src`: use exactly those and skip step 1; `<crate>` is then only
-a label (it may read `dir:web` or `shared` for a synthetic unit).
+include when written `+-src`. Split the list on commas first, then percent-decode each
+entry and the `<crate>` label (`%2C` is a comma inside a path, `%20` a space, `%09` a
+tab, `%25` a percent sign): `+packages/foo%2Cbar` is the single directory
+`packages/foo,bar`. Use exactly those scopes and skip step 1; `<crate>` is then only a
+label (it may read `dir:web` or `shared` for a synthetic unit).
 
 ## Procedure
 

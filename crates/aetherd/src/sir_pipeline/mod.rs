@@ -2582,7 +2582,9 @@ impl SirPipeline {
     /// Like `refresh_embedding_if_needed`, but for callers that cannot hold the SIR
     /// fixed while the provider runs: `still_current` (typically "the store's SIR hash
     /// for this symbol is still `sir_hash_value`") is consulted before the provider
-    /// call, again right before the vector is stored, and once more after it is stored.
+    /// call, again right before the vector is stored, and once more after it is stored;
+    /// when a vector for this hash already exists it is consulted once, and the vector
+    /// is removed if the SIR has moved on.
     /// A vector for a SIR that was replaced in the meantime is never left in the store:
     /// the write is skipped, or undone when the replacement landed between the last
     /// check and the write (only this call's own vector is removed, never one a newer
@@ -2599,6 +2601,22 @@ impl SirPipeline {
         let Some(needed) =
             self.check_embedding_needed(symbol_id, sir_hash_value, prefetched_meta)?
         else {
+            // A vector for this hash is already stored (or no provider is configured).
+            // It is only right while the SIR is still this one: an injection that
+            // repeats an earlier hash can reach here after a concurrent injection
+            // installed a newer SIR, and if that injector's own refresh then fails the
+            // old vector would keep serving the new annotation. Take it back out.
+            if !still_current()? {
+                self.runtime
+                    .block_on(
+                        self.vector_store
+                            .delete_embedding_if_sir_hash(symbol_id, sir_hash_value),
+                    )
+                    .with_context(|| {
+                        format!("failed to delete the superseded embedding for {symbol_id}")
+                    })?;
+                return Ok(EmbeddingRefresh::Superseded);
+            }
             return Ok(EmbeddingRefresh::Unchanged);
         };
 

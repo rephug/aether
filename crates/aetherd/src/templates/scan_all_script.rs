@@ -295,6 +295,18 @@ crate_scopes() {
   fi
 }
 crate_scopes_display() { crate_scopes "$1" | tr '\t' ','; }
+# The /scan prompt is whitespace-tokenized and its scopes= list comma-separated, so the
+# unit label and every scope are percent-encoded (`%` first, then `,`, space and tab) and
+# /scan decodes each entry; a package under `packages/foo,bar` or `my lib/` stays one path.
+encode_arg() { printf '%s' "$1" | sed -e 's/%/%25/g' -e 's/,/%2C/g' -e 's/ /%20/g' -e "s/$(printf '\t')/%09/g"; }
+scan_scopes_arg() {
+  local scope out=""
+  while IFS= read -r scope || [ -n "$scope" ]; do
+    [ -z "$scope" ] && continue
+    out="${out:+$out,}$(encode_arg "$scope")"
+  done < <(crate_scopes "$1" | tr '\t' '\n')
+  printf '%s' "$out"
+}
 
 # Explicit units must not overlap: two sessions over the same symbols duplicate model work
 # and race `aether_sir_inject` (its confidence guard runs before the injection lock).
@@ -433,11 +445,13 @@ for crate in "${CRATES[@]}"; do
   safe_name="$(printf '%s' "$crate" | tr '/:' '__')"
   crate_log="$LOG_DIR/${safe_name}_${STAMP}_r${ROUND}.log"
   # The session receives the exact include/exclude scopes computed here (comma-separated,
-  # exclusions prefixed with "-"), so /scan never has to re-derive them and synthetic
-  # units (dir:<name>, directory remainders) carry their carve-outs.
-  scopes="$(crate_scopes_display "$crate")"
-  log "start $crate ($scopes) -> $crate_log"
-  ( if claude -p "/scan $crate $BATCH_SIZE scopes=$scopes" --allowedTools "mcp__aether*" > "$crate_log" 2>&1; then
+  # "+" includes and "-" exclusions, each percent-encoded), so /scan never has to
+  # re-derive them and synthetic units (dir:<name>, directory remainders) carry their
+  # carve-outs.
+  label="$(encode_arg "$crate")"
+  scopes="$(scan_scopes_arg "$crate")"
+  log "start $crate ($(crate_scopes_display "$crate")) -> $crate_log"
+  ( if claude -p "/scan $label $BATCH_SIZE scopes=$scopes" --allowedTools "mcp__aether*" > "$crate_log" 2>&1; then
       echo "done $crate"
     else
       touch "$FAIL_DIR/$safe_name"
