@@ -14,7 +14,7 @@ use crate::batch::write_fingerprint_row;
 use crate::cli::SirInjectArgs;
 use crate::continuous::cosine_distance_from_embeddings;
 use crate::sir_agent_support::{load_fresh_symbol_source, resolve_symbol, symbol_from_record};
-use crate::sir_pipeline::{SirPipeline, UpsertSirIntentPayload};
+use crate::sir_pipeline::{EmbeddingRefresh, SirPipeline, UpsertSirIntentPayload};
 
 const FORCE_CONFIDENCE_THRESHOLD: f32 = 0.5;
 const DEFAULT_INJECT_CONFIDENCE: f32 = 0.95;
@@ -225,7 +225,7 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
 
     drop(inject_guard);
     let delta_sem = if let Some(pipeline) = embedding_pipeline.as_mut() {
-        pipeline
+        let refresh = pipeline
             .refresh_embedding_if_needed(
                 &store,
                 record.id.as_str(),
@@ -236,6 +236,17 @@ fn execute_sir_inject_command(workspace: &Path, args: SirInjectArgs) -> Result<I
                 None,
             )
             .with_context(|| format!("failed to refresh embedding for {}", record.id))?;
+        if refresh == EmbeddingRefresh::Superseded {
+            // Another writer replaced this leaf while its vector was being generated.
+            // The vector in the store (if any) is that writer's, so no semantic delta
+            // may be attributed to this injection, no fingerprint row records it as
+            // applied, and the command does not report the write as standing.
+            let rendered = format!(
+                "SIR for {} was written but replaced by another writer before its embedding was stored; the newer SIR stands and nothing further was recorded for this injection.\n",
+                record.qualified_name
+            );
+            return Ok(InjectExecution { rendered });
+        }
         let current_embedding = pipeline
             .load_symbol_embedding(record.id.as_str())
             .with_context(|| format!("failed to load refreshed embedding for {}", record.id))?;

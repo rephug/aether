@@ -13,8 +13,10 @@ use rusqlite::Connection;
 use tempfile::tempdir;
 
 mod embeddings;
+mod intents;
 mod persistence;
 mod processing;
+mod source_guards;
 
 #[derive(Clone)]
 struct CountingEmbeddingProvider {
