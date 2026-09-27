@@ -49,6 +49,19 @@ mkdir -p "$LOG_DIR"
 
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$MASTER_LOG"; }
 
+# Unit names and scopes travel through a tab-separated table, a comma-separated list and
+# a whitespace-tokenized /scan prompt, so each is percent-encoded the moment it is
+# produced (`%` first, then `\`, tab, `,` and space) and decoded only where a real path
+# is needed (existence checks, SQL, human-readable log lines); /scan decodes its copy.
+pct_encode() {
+  printf '%s' "$1" | sed -e 's/%/%25/g' -e 's/\\/%5C/g' -e "s/$(printf '\t')/%09/g" -e 's/,/%2C/g' -e 's/ /%20/g'
+}
+pct_decode() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  printf '%b' "${s//%/\\x}"
+}
+
 if [ ! -f "$DB" ]; then
   echo "error: $DB not found. Index first with:" >&2
   echo "  aetherd --workspace . --index-once --full --inference-provider mock" >&2
@@ -112,10 +125,11 @@ index_top_level_scopes() {
   run_sql "SELECT DISTINCT CASE WHEN instr(file_path, '/') > 0 THEN substr(file_path, 1, instr(file_path, '/') - 1) ELSE file_path END FROM symbols ORDER BY 1;" | awk 'NF'
 }
 
-# Prints "name<TAB>scope[<TAB>scope...]" per scan unit, scopes relative to the workspace
-# root; every scope carries a marker, "+" for an include and "-" for an exclusion (a
-# nested member's directory carved out of its parent's scope, so no two units overlap),
-# so a path that itself begins with "-" is never mistaken for an exclusion. A target declared outside its package
+# Prints "name<TAB>scope[<TAB>scope...]" per scan unit, name and scopes percent-encoded
+# (see pct_encode) and scopes relative to the workspace root; every scope carries a
+# marker, "+" for an include and "-" for an exclusion (a nested member's directory carved
+# out of its parent's scope, so no two units overlap), so a path that itself begins with
+# "-" is never mistaken for an exclusion. A target declared outside its package
 # directory brings that directory in when this package is the only one targeting it (so
 # sibling modules such as `mod util;` → shared/util.rs are covered); when several
 # packages target the same external directory each gets only its target file plus its
@@ -139,6 +153,8 @@ discover_packages() {
   if command -v cargo >/dev/null 2>&1 && [ -f Cargo.toml ] && command -v python3 >/dev/null 2>&1; then
     table="$(cargo metadata --no-deps --format-version 1 2>/dev/null | AETHER_WORKSPACE="$WORKSPACE" AETHER_INDEX_TOPS="$index_tops" python3 -c '
 import json, os, sys
+def enc(s):
+    return s.replace("%", "%25").replace("\\", "%5C").replace("\t", "%09").replace(",", "%2C").replace(" ", "%20")
 meta = json.load(sys.stdin)
 # Scopes are relative to the AETHER workspace (where the index lives), which may be a
 # single package inside a larger Cargo workspace; packages outside it are ignored.
@@ -213,7 +229,7 @@ for name, scopes in units:
         for other in other_scopes:
             if any(other != s and other.startswith(s + os.sep) for s in scopes) and other not in excluded:
                 excluded.append(other)
-    print(name + "\t" + "\t".join(["+" + s for s in scopes] + ["-" + e for e in excluded]))
+    print(enc(name) + "\t" + "\t".join(["+" + enc(s) for s in scopes] + ["-" + enc(e) for e in excluded]))
 # Mixed project: an indexed top-level directory (or root-level file) that no package owns
 # becomes its own unit; one that merely contains packages becomes a unit minus them, so
 # TypeScript/Python sources beside the Rust packages are scanned too.
@@ -227,13 +243,17 @@ for top in os.environ.get("AETHER_INDEX_TOPS", "").split("\n"):
         continue
     carved = [s for s in package_scopes if s.startswith(top + os.sep)]
     name = "dir:" + top if top in unit_names else top
-    print(name + "\t" + "\t".join(["+" + top] + ["-" + s for s in carved]))
+    print(enc(name) + "\t" + "\t".join(["+" + enc(top)] + ["-" + enc(s) for s in carved]))
 ' 2>/dev/null || true)"
   fi
   if [ -n "$table" ]; then
     printf '%s\n' "$table"
   else
-    printf '%s\n' "$index_tops" | awk 'NF { printf "%s\t+%s\n", $0, $0 }'
+    while IFS= read -r top || [ -n "$top" ]; do
+      [ -z "$top" ] && continue
+      top="$(pct_encode "$top")"
+      printf '%s\t+%s\n' "$top" "$top"
+    done <<< "$index_tops"
   fi
 }
 
@@ -258,7 +278,7 @@ if [ "$#" -gt 0 ]; then
       echo "error: '$name' is not a scan unit; run scripts/scan_all.sh with no names to scan everything" >&2
       exit 1
     fi
-    CRATES+=("$unit")
+    CRATES+=("$(pct_encode "$unit")")
   done
 else
   while IFS= read -r name; do
@@ -271,9 +291,9 @@ else
 fi
 
 # Tab-separated scopes (directories or root-level target files, each marked "+" include
-# or "-" exclude) for one unit. `dir:<path>` always means that path; other names that are
-# not discovered units are taken as paths relative to the workspace root when they
-# exist, else as crates/<name>.
+# or "-" exclude, percent-encoded) for one encoded unit name. `dir:<path>` always means
+# that path; other names that are not discovered units are taken as paths relative to
+# the workspace root when they exist, else as crates/<name>.
 crate_scopes() {
   local found
   found="$(printf '%s\n' "$PACKAGE_TABLE" | awk -F '\t' -v crate="$1" '$1 == crate { sub(/^[^\t]*\t/, ""); print; exit }')"
@@ -281,23 +301,28 @@ crate_scopes() {
     printf '%s' "$found"
   elif [ "${1#dir:}" != "$1" ]; then
     printf '+%s' "${1#dir:}"
-  elif [ -e "$1" ]; then
+  elif [ -e "$(pct_decode "$1")" ]; then
     printf '+%s' "${1%/}"
   else
     printf '+crates/%s' "$1"
   fi
 }
-crate_scopes_display() { crate_scopes "$1" | tr '\t' ','; }
-# The /scan prompt is whitespace-tokenized and its scopes= list comma-separated, so the
-# unit label and every scope are percent-encoded (`%` first, then `,`, space and tab) and
-# /scan decodes each entry; a package under `packages/foo,bar` or `my lib/` stays one path.
-encode_arg() { printf '%s' "$1" | sed -e 's/%/%25/g' -e 's/,/%2C/g' -e 's/ /%20/g' -e "s/$(printf '\t')/%09/g"; }
-scan_scopes_arg() {
+# What /scan receives: the encoded scopes, comma-separated (see pct_encode); a package
+# under `packages/foo,bar` or `my lib/` stays one path.
+scan_scopes_arg() { crate_scopes "$1" | tr '\t' ','; }
+# Human-readable forms for log lines and error messages.
+unit_display() { pct_decode "$1"; }
+crate_scopes_display() {
   local scope out=""
   while IFS= read -r scope || [ -n "$scope" ]; do
     [ -z "$scope" ] && continue
-    out="${out:+$out,}$(encode_arg "$scope")"
+    out="${out:+$out,}$(pct_decode "$scope")"
   done < <(crate_scopes "$1" | tr '\t' '\n')
+  printf '%s' "$out"
+}
+units_display() {
+  local out="" u
+  for u in "$@"; do out="${out:+$out }$(unit_display "$u")"; done
   printf '%s' "$out"
 }
 
@@ -343,12 +368,12 @@ if [ "$#" -gt 0 ]; then
         dup="$kept"; break
       fi
       if units_overlap "$kept" "$crate"; then
-        echo "error: scan units '$kept' ($(crate_scopes_display "$kept")) and '$crate' ($(crate_scopes_display "$crate")) overlap; name only one of them" >&2
+        echo "error: scan units '$(unit_display "$kept")' ($(crate_scopes_display "$kept")) and '$(unit_display "$crate")' ($(crate_scopes_display "$crate")) overlap; name only one of them" >&2
         exit 1
       fi
     done
     if [ -n "$dup" ]; then
-      [ "$dup" != "$crate" ] && log "skipping '$crate': same scopes as '$dup'"
+      [ "$dup" != "$crate" ] && log "skipping '$(unit_display "$crate")': same scopes as '$(unit_display "$dup")'"
       continue
     fi
     UNIQUE+=("$crate")
@@ -380,9 +405,9 @@ scope_clause() {
     for scope in "${scopes[@]}"; do
       [ -z "$scope" ] && continue
       case "$scope" in
-        -*) excludes+=("$(scope_predicate "${scope#-}")") ;;
-        +*) includes+=("$(scope_predicate "${scope#+}")") ;;
-        *) includes+=("$(scope_predicate "$scope")") ;;
+        -*) excludes+=("$(scope_predicate "$(pct_decode "${scope#-}")")") ;;
+        +*) includes+=("$(scope_predicate "$(pct_decode "${scope#+}")")") ;;
+        *) includes+=("$(scope_predicate "$(pct_decode "$scope")")") ;;
       esac
     done
     [ "${#includes[@]}" -eq 0 ] && continue
@@ -413,7 +438,7 @@ count_targets() {
 NEXT_STEP="deepen the results with: aetherd --workspace . regenerate --deep --below-confidence 0.85 (or /refactor-deep on the files that matter most)"
 
 BEFORE="$(count_targets)"
-log "scan targets before: $BEFORE ([MOCK] or confidence < 0.2 in: ${CRATES[*]})"
+log "scan targets before: $BEFORE ([MOCK] or confidence < 0.2 in: $(units_display "${CRATES[@]}"))"
 if [ "$BEFORE" = "0" ]; then
   log "nothing to scan in the selected crates; $NEXT_STEP"
   exit 0
@@ -432,23 +457,22 @@ ROUND=$((ROUND + 1))
 log "round $ROUND: $ROUND_BEFORE target(s) remaining"
 for crate in "${CRATES[@]}"; do
   if [ "$(count_targets "$(scope_clause "$crate")")" = "0" ]; then
-    log "skip $crate ($(crate_scopes_display "$crate")): no scan targets"
+    log "skip $(unit_display "$crate") ($(crate_scopes_display "$crate")): no scan targets"
     continue
   fi
   safe_name="$(printf '%s' "$crate" | tr '/:' '__')"
   crate_log="$LOG_DIR/${safe_name}_${STAMP}_r${ROUND}.log"
   # The session receives the exact include/exclude scopes computed here (comma-separated,
-  # "+" includes and "-" exclusions, each percent-encoded), so /scan never has to
-  # re-derive them and synthetic units (dir:<name>, directory remainders) carry their
-  # carve-outs.
-  label="$(encode_arg "$crate")"
+  # "+" includes and "-" exclusions, percent-encoded like the unit label), so /scan never
+  # has to re-derive them and synthetic units (dir:<name>, directory remainders) carry
+  # their carve-outs.
   scopes="$(scan_scopes_arg "$crate")"
-  log "start $crate ($(crate_scopes_display "$crate")) -> $crate_log"
-  ( if claude -p "/scan $label $BATCH_SIZE scopes=$scopes" --allowedTools "mcp__aether*" > "$crate_log" 2>&1; then
-      echo "done $crate"
+  log "start $(unit_display "$crate") ($(crate_scopes_display "$crate")) -> $crate_log"
+  ( if claude -p "/scan $crate $BATCH_SIZE scopes=$scopes" --allowedTools "mcp__aether*" > "$crate_log" 2>&1; then
+      echo "done $(unit_display "$crate")"
     else
       touch "$FAIL_DIR/$safe_name"
-      echo "FAILED $crate (see $crate_log)"
+      echo "FAILED $(unit_display "$crate") (see $crate_log)"
     fi ) | tee -a "$MASTER_LOG" &
   while [ "$(running_jobs)" -ge "$MAX_PARALLEL" ]; do
     sleep 2

@@ -192,6 +192,20 @@ impl LanceVectorStore {
         connection: &LanceConnection,
         record: &VectorRecord,
     ) -> Result<(), StoreError> {
+        self.upsert_embedding_with_connection_when(connection, record, None, true)
+            .await
+    }
+
+    /// `merge_insert` with the update arm guarded by `when_matched` (a LanceDB
+    /// predicate over `target.` columns, `None` = unconditional) and the insert arm
+    /// enabled by `insert_when_missing`; the guard and the write are one operation.
+    async fn upsert_embedding_with_connection_when(
+        &self,
+        connection: &LanceConnection,
+        record: &VectorRecord,
+        when_matched: Option<&str>,
+        insert_when_missing: bool,
+    ) -> Result<(), StoreError> {
         let embedding_dim = record.embedding.len() as i32;
         if embedding_dim <= 0 {
             return Ok(());
@@ -234,9 +248,10 @@ impl LanceVectorStore {
         let (schema, batch) = single_record_batch(record)?;
         let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
         let mut merge = table.merge_insert(&["symbol_id"]);
-        merge
-            .when_matched_update_all(None)
-            .when_not_matched_insert_all();
+        merge.when_matched_update_all(when_matched.map(str::to_owned));
+        if insert_when_missing {
+            merge.when_not_matched_insert_all();
+        }
         merge
             .execute(Box::new(reader))
             .await
@@ -585,6 +600,44 @@ impl VectorStore for LanceVectorStore {
         }
 
         Ok(())
+    }
+
+    async fn upsert_embedding_if_sir_hash(
+        &self,
+        record: VectorRecord,
+        expected_sir_hash: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        self.migrate_from_sqlite_if_needed().await?;
+        if record.embedding.is_empty() {
+            return Ok(false);
+        }
+        let connection = self.connect().await?;
+        // The guard lives inside the merge: with an expected hash only a row still
+        // carrying it is updated (and nothing is inserted, so a row that moved to another
+        // provider/model table is not duplicated); with none expected only the insert arm
+        // runs, so an existing row is left alone.
+        match expected_sir_hash {
+            Some(expected) => {
+                let guard = format!("target.sir_hash = '{}'", escape_sql_string(expected));
+                self.upsert_embedding_with_connection_when(
+                    &connection,
+                    &record,
+                    Some(guard.as_str()),
+                    false,
+                )
+                .await?;
+            }
+            None => {
+                self.upsert_embedding_with_connection_when(&connection, &record, None, true)
+                    .await?;
+            }
+        }
+        let stored = self.get_embedding_meta(record.symbol_id.as_str()).await?;
+        Ok(stored.is_some_and(|meta| {
+            meta.sir_hash == record.sir_hash
+                && meta.provider == record.provider
+                && meta.model == record.model
+        }))
     }
 
     async fn delete_embedding_if_sir_hash(

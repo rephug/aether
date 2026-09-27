@@ -718,6 +718,48 @@ enabled = false
             "the vector written for the replaced SIR was deleted"
         );
 
+        // A writer without the embedding locks stores the newer SIR's vector during the
+        // provider call (before this call's write): the conditional write must not
+        // overwrite it, and the outcome is Superseded with the newer vector intact.
+        let (script, asked) = scripted_check(vec![true, true, false]);
+        let outcome = pipeline
+            .refresh_embedding_if_current("sym-guard", "hash-2a", "{}", None, &mut || {
+                let call = asked.fetch_add(1, Ordering::SeqCst) + 1;
+                if call == 2 {
+                    pipeline
+                        .runtime
+                        .block_on(pipeline.vector_store.upsert_embedding(
+                            SymbolEmbeddingRecord {
+                                symbol_id: "sym-guard".to_owned(),
+                                sir_hash: "hash-raced".to_owned(),
+                                provider: "test_embedding".to_owned(),
+                                model: "test-model".to_owned(),
+                                embedding: vec![0.0, 1.0],
+                                updated_at: 1_700_000_400,
+                            },
+                        ))
+                        .expect("racing writer stores its vector");
+                }
+                let mut script = script.lock().expect("script");
+                Ok(if script.is_empty() {
+                    true
+                } else {
+                    script.remove(0)
+                })
+            })
+            .expect("guarded refresh");
+        assert_eq!(outcome, EmbeddingRefresh::Superseded);
+        assert_eq!(asked.load(Ordering::SeqCst), 2, "no post-write check without a write");
+        let record = pipeline
+            .load_symbol_embedding("sym-guard")
+            .expect("load embedding")
+            .expect("the racing writer's vector survives");
+        assert_eq!(record.sir_hash, "hash-raced");
+        pipeline
+            .runtime
+            .block_on(pipeline.vector_store.delete_embedding("sym-guard"))
+            .expect("clear for the next case");
+
         // Replaced in that window by a writer that already stored the newer SIR's
         // vector (the daemon's index pass takes no embedding lock): only this call's
         // own vector may go, so the newer one survives.
@@ -775,14 +817,14 @@ enabled = false
             .expect("load embedding")
             .expect("vector stored");
         assert_eq!(record.sir_hash, "hash-3");
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
 
         // Already embedded for this hash and still current: no provider call, kept.
         let outcome = pipeline
             .refresh_embedding_if_current("sym-guard", "hash-3", "{}", None, &mut || Ok(true))
             .expect("guarded refresh");
         assert_eq!(outcome, EmbeddingRefresh::Unchanged);
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
         assert!(
             pipeline
                 .load_symbol_embedding("sym-guard")
@@ -797,7 +839,7 @@ enabled = false
             .refresh_embedding_if_current("sym-guard", "hash-3", "{}", None, &mut || Ok(false))
             .expect("guarded refresh");
         assert_eq!(outcome, EmbeddingRefresh::Superseded);
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
         assert!(
             pipeline
                 .load_symbol_embedding("sym-guard")

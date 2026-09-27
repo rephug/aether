@@ -99,6 +99,9 @@ pub struct QualityBatchItem {
 pub(crate) struct EmbeddingNeeded {
     pub provider: String,
     pub model: String,
+    /// The SIR hash of the vector currently stored for the symbol (`None`: no vector),
+    /// as observed by the check, so the write can be made conditional on it.
+    pub existing_sir_hash: Option<String>,
 }
 
 /// Outcome of `SirPipeline::refresh_embedding_if_current`.
@@ -2500,6 +2503,7 @@ impl SirPipeline {
                 .block_on(self.vector_store.get_embedding_meta(symbol_id))
                 .with_context(|| format!("failed to read embedding metadata for {symbol_id}"))?,
         };
+        let existing_sir_hash = existing_meta.as_ref().map(|meta| meta.sir_hash.clone());
         if let Some(existing_meta) = existing_meta
             && existing_meta.sir_hash == sir_hash_value
             && existing_meta.provider == provider_name
@@ -2511,6 +2515,7 @@ impl SirPipeline {
         Ok(Some(EmbeddingNeeded {
             provider: provider_name.to_owned(),
             model: model_name.to_owned(),
+            existing_sir_hash,
         }))
     }
 
@@ -2643,16 +2648,39 @@ impl SirPipeline {
         }
 
         let updated_at = unix_timestamp_secs();
-        self.runtime
-            .block_on(self.vector_store.upsert_embedding(SymbolEmbeddingRecord {
-                symbol_id: symbol_id.to_owned(),
-                sir_hash: sir_hash_value.to_owned(),
-                provider: needed.provider.clone(),
-                model: needed.model.clone(),
-                embedding,
-                updated_at,
-            }))
+        // The write is conditional on the vector the check observed still being the
+        // stored one: a writer that takes no embedding lock (the daemon's index or
+        // regenerate pass) may have stored the newer SIR's vector during the provider
+        // call, and a plain upsert keyed on the symbol would overwrite it.
+        let written = self
+            .runtime
+            .block_on(self.vector_store.upsert_embedding_if_sir_hash(
+                SymbolEmbeddingRecord {
+                    symbol_id: symbol_id.to_owned(),
+                    sir_hash: sir_hash_value.to_owned(),
+                    provider: needed.provider.clone(),
+                    model: needed.model.clone(),
+                    embedding,
+                    updated_at,
+                },
+                needed.existing_sir_hash.as_deref(),
+            ))
             .with_context(|| format!("failed to store embedding for {symbol_id}"))?;
+        if !written {
+            // Another writer got there first and its vector stands: for this very SIR
+            // nothing is missing, otherwise this call's SIR has been superseded.
+            let stored = self
+                .runtime
+                .block_on(self.vector_store.get_embedding_meta(symbol_id))
+                .with_context(|| format!("failed to read embedding metadata for {symbol_id}"))?;
+            return Ok(
+                if stored.is_some_and(|meta| meta.sir_hash == sir_hash_value) {
+                    EmbeddingRefresh::Unchanged
+                } else {
+                    EmbeddingRefresh::Superseded
+                },
+            );
+        }
 
         if !still_current()? {
             // The SIR changed between the last check and the write: the vector just

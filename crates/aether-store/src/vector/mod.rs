@@ -52,6 +52,16 @@ pub struct ProjectNoteVectorSearchResult {
 #[async_trait]
 pub trait VectorStore: Send + Sync {
     async fn upsert_embedding(&self, record: VectorRecord) -> Result<(), StoreError>;
+    /// Store `record` only while the symbol's stored vector still carries
+    /// `expected_sir_hash` (`None`: no vector is stored yet), as one operation with that
+    /// check, and report whether the write happened. A writer that checked the SIR
+    /// before a slow provider call can thus never overwrite a vector another writer
+    /// stored in the meantime.
+    async fn upsert_embedding_if_sir_hash(
+        &self,
+        record: VectorRecord,
+        expected_sir_hash: Option<&str>,
+    ) -> Result<bool, StoreError>;
     async fn upsert_embedding_batch(&self, records: Vec<VectorRecord>) -> Result<(), StoreError>;
     async fn get_embedding_meta(
         &self,

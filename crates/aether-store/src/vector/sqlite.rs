@@ -31,6 +31,15 @@ impl VectorStore for SqliteVectorStore {
         self.store.upsert_symbol_embedding(record)
     }
 
+    async fn upsert_embedding_if_sir_hash(
+        &self,
+        record: VectorRecord,
+        expected_sir_hash: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        self.store
+            .upsert_symbol_embedding_if_sir_hash(record, expected_sir_hash)
+    }
+
     async fn upsert_embedding_batch(&self, records: Vec<VectorRecord>) -> Result<(), StoreError> {
         for record in records {
             self.store.upsert_symbol_embedding(record)?;
