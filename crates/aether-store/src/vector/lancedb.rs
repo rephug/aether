@@ -688,28 +688,17 @@ impl VectorStore for LanceVectorStore {
             Some(_) => MatchedArm::Always,
             None => MatchedArm::Skip,
         };
-        self.upsert_embedding_with_connection_when(&connection, &record, matched, true)
-            .await?;
-        // Verify the destination row itself: the cross-table "latest" lookup breaks
-        // equal second-resolution timestamps arbitrarily, so a row left in another
-        // table by the previous identity, written in the same second, could otherwise
-        // be reported instead of the row this call just wrote.
-        let stored = self
-            .meta_in_table(&connection, &destination, record.symbol_id.as_str())
-            .await?;
-        let written = stored.is_some_and(|meta| {
-            meta.sir_hash == record.sir_hash
-                && meta.provider == record.provider
-                && meta.model == record.model
-                && meta.updated_at == record.updated_at
-        });
-        // A vector that moved to another identity leaves its observed row behind in the
-        // previous table. Take exactly that row out (keyed by its hash and write time)
-        // once the new row is verified: the cross-table "latest" lookups break equal
-        // second-resolution timestamps arbitrarily, so a leftover written in the same
-        // second could otherwise keep reading as the symbol's current vector and make
-        // every embeddings-only pass regenerate a vector it already has.
-        if written && let Some(observed) = expected {
+        // A vector moving to another identity leaves the observed row behind in the
+        // previous table, and the cross-table "latest" lookups break equal
+        // second-resolution timestamps arbitrarily, so such a leftover written in the
+        // same second could keep reading as the symbol's current vector and make every
+        // embeddings-only pass regenerate a vector it already has. Exactly that row
+        // (symbol, observed hash and write time) is removed first, before the
+        // destination write: a process that exits between the two leaves the symbol
+        // with no vector, which the next pass simply regenerates, never with two rows
+        // of different identities for later reads to pick between. Removing the row
+        // last would leave exactly that pair behind on a crash, with nothing to clean it up.
+        if let Some(observed) = expected {
             let source = table_name_for(
                 observed.provider.as_str(),
                 observed.model.as_str(),
@@ -732,7 +721,21 @@ impl VectorStore for LanceVectorStore {
                     .map_err(map_lancedb_err)?;
             }
         }
-        Ok(written)
+        self.upsert_embedding_with_connection_when(&connection, &record, matched, true)
+            .await?;
+        // Verify the destination row itself: the cross-table "latest" lookup breaks
+        // equal second-resolution timestamps arbitrarily, so a row left in another
+        // table by the previous identity, written in the same second, could otherwise
+        // be reported instead of the row this call just wrote.
+        let stored = self
+            .meta_in_table(&connection, &destination, record.symbol_id.as_str())
+            .await?;
+        Ok(stored.is_some_and(|meta| {
+            meta.sir_hash == record.sir_hash
+                && meta.provider == record.provider
+                && meta.model == record.model
+                && meta.updated_at == record.updated_at
+        }))
     }
 
     async fn delete_embedding_if_matches(
