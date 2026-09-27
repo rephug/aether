@@ -15,7 +15,7 @@ use anyhow::{Result, anyhow};
 
 use crate::cli::{BatchBuildArgs, BatchPass, BatchRunArgs};
 
-pub(crate) use build::build_pass_jsonl_for_ids;
+pub(crate) use build::{build_pass_jsonl_for_ids, snapshot_workspace_symbols};
 pub(crate) use ingest::{ingest_results, write_fingerprint_row};
 pub use run::run_batch_command;
 

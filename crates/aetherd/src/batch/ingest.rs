@@ -421,7 +421,17 @@ fn prepare_symbol(
     // embedding is only used for delta_sem in fingerprint rows.
     let previous_embedding: Option<SymbolEmbeddingRecord> = None;
 
+    // A key carrying a build id was written with an origin entry; a result whose entry
+    // is missing (sidecar moved, deleted or unreadable) is refused rather than ingested
+    // unchecked, since nothing else vouches for the SIR and source it was built from.
+    // Only a key from before origins existed (no build id) is ingested unchecked.
     let origin = origins.get(&request_key);
+    if origin.is_none() && key_has_build_id(&request_key) {
+        return Err(anyhow!(
+            "batch result '{request_key}' has no origin entry in the {} sidecar; refusing to ingest it unchecked",
+            origin_sidecar_name(pass_config.pass.as_str())
+        ));
+    }
     let provider_kind = provider_kind_from_name(provider_name);
     let payload = UpsertSirIntentPayload {
         symbol: symbol_from_record(&symbol_record)?,
@@ -532,6 +542,12 @@ pub(crate) fn write_fingerprint_row(
 
 /// Split a request key `symbol_id|prompt_hash[|build_id]` into its symbol id and prompt
 /// hash (the build id only distinguishes sidecar entries, see `BuildSummary::build_id`).
+fn key_has_build_id(key: &str) -> bool {
+    key.splitn(3, '|')
+        .nth(2)
+        .is_some_and(|build_id| !build_id.trim().is_empty())
+}
+
 fn parse_key(key: &str) -> Result<(&str, &str)> {
     let (symbol_id, rest) = key.split_once('|').unwrap_or((key, "unknown"));
     let prompt_hash = rest
@@ -821,6 +837,10 @@ vector_backend = "sqlite"
         );
         assert!(parse_key("|hash").is_err());
         assert!(parse_key("sym|").is_err());
+        assert!(key_has_build_id("sym|hash|0123456789ab"));
+        assert!(!key_has_build_id("sym|hash"));
+        assert!(!key_has_build_id("sym|hash|"));
+        assert!(!key_has_build_id("sym"));
     }
 
     #[test]
@@ -950,6 +970,35 @@ vector_backend = "sqlite"
         assert!(
             outcome.is_none(),
             "a result for an edited source is not applied"
+        );
+        assert_eq!(
+            store
+                .get_sir_meta("sym-late")
+                .expect("load sir meta")
+                .expect("sir meta exists")
+                .generation_pass,
+            "injected"
+        );
+
+        // A result carrying a build id but no origin entry is refused, not ingested
+        // unchecked.
+        let err = match prepare_symbol(
+            &pipeline,
+            &store,
+            &triage_pass_config(),
+            "ignored",
+            &provider,
+            "gemini",
+            &HashMap::new(),
+            &HashMap::new(),
+            Some(&current_symbols),
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("a modern key without an origin must be refused"),
+        };
+        assert!(
+            err.to_string().contains("no origin entry"),
+            "unexpected error: {err:#}"
         );
         assert_eq!(
             store

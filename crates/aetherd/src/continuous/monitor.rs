@@ -23,7 +23,7 @@ use super::{ensure_supported_schedule, parse_requeue_pass, resolve_continuous_co
 use crate::batch::hash::{compute_source_hash_segment, decompose_prompt_hash};
 use crate::batch::{
     BatchPollStatus, build_pass_jsonl_for_ids, create_batch_provider, ingest_results,
-    resolve_batch_runtime_config,
+    resolve_batch_runtime_config, snapshot_workspace_symbols,
 };
 use crate::indexer::run_structural_index_once;
 use crate::sir_pipeline::build_job;
@@ -220,6 +220,10 @@ fn run_monitor_once_inner(
                 .block_on(provider.download_results(&job_ids, &runtime.batch_dir))
                 .context("failed to download continuous batch results")?;
             submitted_chunks += 1;
+            // Checked against the source as it is now, not the snapshot the requests
+            // were built from before the remote wait.
+            let symbols_now = snapshot_workspace_symbols(workspace)
+                .context("failed to snapshot workspace symbols for continuous ingest")?;
             for results_jsonl in &result_paths {
                 let ingest_summary = ingest_results(
                     workspace,
@@ -229,7 +233,7 @@ fn run_monitor_once_inner(
                     config,
                     provider.as_ref(),
                     provider.name(),
-                    Some(&current_symbols),
+                    Some(&symbols_now),
                 )?;
                 ingested_results += ingest_summary.processed;
                 fingerprint_rows += ingest_summary.fingerprint_rows;
