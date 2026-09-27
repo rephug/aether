@@ -319,7 +319,7 @@ impl AetherMcpServer {
                 }
                 None => {
                     return Err(AetherMcpError::Message(format!(
-                        "{} no longer declares {qualified_name} as indexed (or cannot be read); nothing was injected: wait for re-indexing and look the symbol up again",
+                        "{} no longer declares {qualified_name} as indexed; nothing was injected: wait for re-indexing and look the symbol up again",
                         symbol.file_path
                     )));
                 }
@@ -702,16 +702,19 @@ impl AetherMcpServer {
         // right after the vector is stored, and removes a vector the newer SIR would
         // otherwise inherit. That injector's own refresh, queued behind the lock, then
         // embeds the newer SIR.
-        let _embed_guard = match acquire_embed_write_lock(&self.state.workspace, symbol_id) {
-            Ok(guard) => guard,
-            Err(err) => return format!("failed: {err:#}"),
-        };
         // One embedding pipeline serves every inject and deep-scan call this server
-        // handles, so the provider's model is loaded once, not per call.
+        // handles, so the provider's model is loaded once, not per call. It is resolved
+        // before the symbol's lock is taken: the first call may load a local model, and
+        // that setup depends on nothing the lock protects, so the daemon's embedding
+        // work, another injector, or the cleanup of this symbol must not wait for it.
         let pipeline = match self.state.embedding_pipeline() {
             Ok(Some(pipeline)) => pipeline,
             Ok(None) => return "skipped: embedding provider not configured".to_owned(),
             Err(err) => return format!("failed: {err}"),
+        };
+        let _embed_guard = match acquire_embed_write_lock(&self.state.workspace, symbol_id) {
+            Ok(guard) => guard,
+            Err(err) => return format!("failed: {err:#}"),
         };
         // Missing metadata counts as superseded too: the indexer removes a symbol's SIR
         // without the inject lock, and a vector written for it afterwards would be an

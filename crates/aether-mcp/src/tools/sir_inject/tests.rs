@@ -783,3 +783,98 @@ fn sir_inject_refuses_a_source_that_changed_since_it_was_read() {
         "unexpected error: {err}"
     );
 }
+
+#[test]
+fn live_source_failures_name_the_file_while_a_removed_file_reads_as_a_removed_symbol() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    write_test_config(workspace);
+    let source = "pub fn target() -> u32 {\n    1\n}\n";
+    fs::create_dir_all(workspace.join("src")).expect("create src");
+    fs::write(workspace.join("src/lib.rs"), source).expect("write source");
+    let symbols = aether_parse::SymbolExtractor::new()
+        .expect("parser")
+        .extract_from_path(Path::new("src/lib.rs"), source)
+        .expect("extract");
+    let symbol = symbols
+        .iter()
+        .find(|symbol| symbol.name == "target")
+        .expect("target symbol");
+    {
+        let store = aether_store::SqliteStore::open(workspace).expect("open store");
+        store
+            .upsert_symbol(SymbolRecord {
+                id: symbol.id.clone(),
+                file_path: symbol.file_path.clone(),
+                language: symbol.language.as_str().to_owned(),
+                kind: symbol.kind.as_str().to_owned(),
+                qualified_name: symbol.qualified_name.clone(),
+                signature_fingerprint: symbol.signature_fingerprint.clone(),
+                last_seen_at: 1_700_000_000,
+            })
+            .expect("upsert symbol");
+    }
+    let server = AetherMcpServer::new(workspace, false).expect("server");
+    let lookup = || {
+        server.aether_symbol_lookup_logic(crate::AetherSymbolLookupRequest {
+            query: String::new(),
+            limit: None,
+            symbol_ids: Some(vec![symbol.id.clone()]),
+            include_source: Some(true),
+        })
+    };
+    let inject = || {
+        server.aether_sir_inject_logic(AetherSirInjectRequest {
+            symbol: symbol.id.clone(),
+            intent: "Returns the answer".to_owned(),
+            behavior: None,
+            edge_cases: None,
+            side_effects: None,
+            dependencies: None,
+            error_modes: None,
+            confidence: Some(0.75),
+            inputs: None,
+            outputs: None,
+            complexity: None,
+            generation_pass: Some("scan".to_owned()),
+            model: None,
+            provider: None,
+            force: Some(true),
+            source_hash: Some(symbol.content_hash.clone()),
+        })
+    };
+
+    // The file exists but cannot be read (a directory stands in its place): neither
+    // tool may read that as "the symbol is gone". Both fail naming the file and the
+    // cause, so a scan that keeps skipping the symbol points at what to fix.
+    fs::remove_file(workspace.join("src/lib.rs")).expect("remove file");
+    fs::create_dir(workspace.join("src/lib.rs")).expect("directory in the file's place");
+    let err = lookup().expect_err("an unreadable file must fail the lookup");
+    assert!(
+        err.to_string().contains("failed to read src/lib.rs"),
+        "unexpected error: {err}"
+    );
+    let err = inject().expect_err("an unreadable file must fail the injection");
+    assert!(
+        err.to_string().contains("failed to read src/lib.rs"),
+        "unexpected error: {err}"
+    );
+    let store = aether_store::SqliteStore::open(workspace).expect("open store");
+    assert!(
+        store.get_sir_meta(&symbol.id).expect("meta").is_none(),
+        "the failed call wrote nothing"
+    );
+
+    // A file that is gone is the one case that means the symbol is gone with it: the
+    // lookup reports the indexed match without a source and the injection is refused
+    // as one for a symbol the file no longer declares.
+    fs::remove_dir(workspace.join("src/lib.rs")).expect("remove directory");
+    let found = lookup().expect("lookup");
+    assert_eq!(found.matches.len(), 1);
+    assert_eq!(found.matches[0].source_hash, None);
+    let err = inject().expect_err("a removed file must refuse the injection");
+    assert!(
+        err.to_string().contains("no longer declares"),
+        "unexpected error: {err}"
+    );
+}

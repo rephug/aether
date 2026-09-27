@@ -37,7 +37,8 @@ impl LiveSymbolSources {
     }
 
     /// The current content hash of `symbol_id` in `file_path`: `Ok(None)` when the file
-    /// cannot be read or parsed or no longer declares the symbol.
+    /// is gone or no longer declares the symbol; an error naming the file when it exists
+    /// but cannot be read or parsed.
     pub(crate) fn hash_for(
         &mut self,
         file_path: &str,
@@ -49,8 +50,8 @@ impl LiveSymbolSources {
     }
 
     /// The current text and content hash of `symbol_id` in `file_path`, both from one
-    /// read of the file: `Ok(None)` when the file cannot be read or parsed or no longer
-    /// declares the symbol.
+    /// read of the file: `Ok(None)` when the file is gone or no longer declares the
+    /// symbol; an error naming the file when it exists but cannot be read or parsed.
     pub(crate) fn source_for(
         &mut self,
         file_path: &str,
@@ -71,8 +72,19 @@ impl LiveSymbolSources {
         &mut self,
         file_path: &str,
     ) -> Result<Option<HashMap<String, LiveSymbolSource>>, AetherMcpError> {
-        let Ok(source) = std::fs::read_to_string(self.workspace.join(file_path)) else {
-            return Ok(None);
+        // Only a file that is gone means the symbol is gone with it. A file that exists
+        // but cannot be read (permissions, an I/O error, a directory in its place) is a
+        // failure the caller must see by name: read as "removed", `aether_symbol_lookup`
+        // would silently report the match without a source and `/scan` would skip the
+        // symbol on every pass with nothing pointing at the file or the cause.
+        let source = match std::fs::read_to_string(self.workspace.join(file_path)) {
+            Ok(source) => source,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(AetherMcpError::Message(format!(
+                    "failed to read {file_path} for its current symbol sources: {err}"
+                )));
+            }
         };
         if self.extractor.is_none() {
             self.extractor = Some(SymbolExtractor::new().map_err(|err| {
@@ -84,9 +96,13 @@ impl LiveSymbolSources {
                 "the parser is unavailable after initialization".to_owned(),
             ));
         };
-        let Ok(symbols) = extractor.extract_from_path(Path::new(file_path), &source) else {
-            return Ok(None);
-        };
+        let symbols = extractor
+            .extract_from_path(Path::new(file_path), &source)
+            .map_err(|err| {
+                AetherMcpError::Message(format!(
+                    "failed to parse {file_path} for its current symbol sources: {err:#}"
+                ))
+            })?;
         Ok(Some(
             symbols
                 .into_iter()

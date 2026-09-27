@@ -728,7 +728,7 @@ fn extract_symbol_text(
     let mut live = LiveSymbolSources::new(workspace);
     let Some(current) = live.source_for(symbol.file_path.as_str(), symbol.id.as_str())? else {
         return Err(AetherMcpError::Message(format!(
-            "{} no longer declares {} as indexed (or cannot be read); re-index before a deep scan",
+            "{} no longer declares {} as indexed; re-index before a deep scan",
             symbol.file_path, symbol.qualified_name
         )));
     };

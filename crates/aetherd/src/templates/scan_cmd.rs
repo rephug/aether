@@ -89,7 +89,10 @@ label (it may read `dir:web` or `shared` for a synthetic unit).
    to that text: the inject is refused if the file changed in between (the error says
    the source changed since it was read, or that the file no longer declares the
    symbol); skip such a symbol for this round, the daemon regenerates it from the new
-   source. A target the lookup does not return was removed from the index: skip it.
+   source. A target the lookup does not return was removed from the index: skip it. A
+   lookup or inject that fails saying a file could not be read or parsed names that
+   file and the cause: the symbol is not gone, so do not skip it silently; report the
+   error and stop the round.
 5. Target confidence 0.7–0.8 for scan-level SIRs. Use `force: true` only when replacing a
    `[MOCK]` placeholder that somehow carries a higher confidence. If an inject call
    returns an error saying the SIR was written but the file rollup could not be rebuilt,
