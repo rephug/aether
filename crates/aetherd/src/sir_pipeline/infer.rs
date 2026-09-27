@@ -37,7 +37,7 @@ pub(crate) struct SirJob {
     pub(crate) source_hash: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct GeneratedSir {
     pub(super) symbol: Symbol,
     pub(super) sir: SirAnnotation,

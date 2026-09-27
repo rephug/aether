@@ -492,6 +492,24 @@ impl AetherMcpServer {
             last_error: None,
             last_attempt_at: now,
         };
+        // The source was checked when the lock was taken; editors and the daemon's
+        // preparatory reads take no lock, so re-check right before the write and keep
+        // the window between the check and the commit as small as one parse. (Should an
+        // edit still slip in between, the leaf records the text it was bound to and the
+        // daemon's job for the edit replaces a SIR of older text rather than yielding to it.)
+        if let Some(expected) = request_source_hash.as_deref() {
+            let mut live = LiveSymbolSources::new(&self.state.workspace);
+            if live
+                .hash_for(symbol.file_path.as_str(), symbol_id.as_str())?
+                .as_deref()
+                != Some(expected)
+            {
+                return Err(AetherMcpError::Message(format!(
+                    "source for {qualified_name} ({}) changed while the injection was being prepared; nothing was injected: re-read the symbol and describe the new text, or leave it to the daemon's regeneration",
+                    symbol.file_path
+                )));
+            }
+        }
         let version_write = store.persist_sir_state_atomically_with_source(
             meta_record.clone(),
             canonical_json.as_str(),

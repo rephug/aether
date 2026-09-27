@@ -486,7 +486,7 @@ impl AetherMcpServer {
                 );
                 return Ok(DeepSirPersist::Superseded);
             }
-            self.state.store.persist_sir_state_atomically(
+            self.state.store.persist_sir_state_atomically_with_source(
                 SirMetaRecord {
                     id: candidate.symbol.id.clone(),
                     sir_hash: sir_hash_value.clone(),
@@ -505,6 +505,7 @@ impl AetherMcpServer {
                 canonical_json.as_str(),
                 commit_hash,
                 None,
+                Some(source_hash.as_str()),
             )?;
         }
         // The leaf is committed: a provider or vector-store failure here must not

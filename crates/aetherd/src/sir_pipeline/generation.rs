@@ -268,11 +268,31 @@ impl SirPipeline {
         let _inject_guard = acquire_inject_write_lock(&self.workspace_root)?;
         let current_sir = current_sir_identity(store, &generated.symbol.id)?;
         if current_sir != generated.prior_sir {
+            // One exception: a write bound to text older than what this job read (an
+            // injection that passed its source check just before an edit landed, then
+            // committed after it) does not supersede the job. The leaf records the text
+            // it was bound to; when that differs from the text this job read, and the
+            // source check below confirms the job's text is the current one, the stored
+            // SIR describes a body the symbol no longer has and this result replaces it,
+            // instead of leaving that SIR `fresh` with no job left to regenerate it.
+            let stored_source = store
+                .get_sir_source_hash(&generated.symbol.id)
+                .with_context(|| {
+                    format!("failed to read the source hash for {}", generated.symbol.id)
+                })?;
+            let stored_describes_older_text =
+                stored_source.is_some_and(|stored| stored != generated.source_hash);
+            if !stored_describes_older_text {
+                tracing::info!(
+                    symbol_id = %generated.symbol.id,
+                    "skipping generated SIR: the stored SIR changed while it was being generated"
+                );
+                return Ok(GenerationPersist::Superseded);
+            }
             tracing::info!(
                 symbol_id = %generated.symbol.id,
-                "skipping generated SIR: the stored SIR changed while it was being generated"
+                "the stored SIR changed while this job ran, but describes older text than the job read; replacing it"
             );
-            return Ok(GenerationPersist::Superseded);
         }
         // The stored SIR alone does not say the result is current: a symbol edited
         // while this job ran still holds the same SIR until the job that edit queued
@@ -350,11 +370,12 @@ impl SirPipeline {
             last_error: None,
             last_attempt_at: attempted_at,
         };
-        if let Err(err) = store.persist_sir_state_atomically(
+        if let Err(err) = store.persist_sir_state_atomically_with_source(
             meta,
             &canonical_json,
             payload.commit_hash.as_deref(),
             Some(intent.intent_id.as_str()),
+            Some(generated.source_hash.as_str()),
         ) {
             let message = format!("{err:#}");
             self.mark_intent_failed_safely(store, intent.intent_id.as_str(), message.as_str());

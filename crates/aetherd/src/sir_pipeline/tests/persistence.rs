@@ -713,6 +713,133 @@ fn a_prompt_override_binds_the_job_to_the_baseline_it_was_built_from() {
 }
 
 #[test]
+fn a_job_for_newer_text_replaces_a_sir_bound_to_older_text() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    write_embeddings_only_config(workspace);
+
+    let store = SqliteStore::open(workspace).expect("open store");
+    let pipeline = build_write_pipeline(workspace, Arc::new(PanicInferenceProvider));
+    let older = "fn late() {}\n";
+    let (symbol_x, record) = parsed_symbol(workspace, "src/lib.rs", older);
+    store.upsert_symbol(record).expect("upsert symbol");
+    let symbol_id = symbol_x.id.clone();
+    let leaf = |hash: &str| aether_store::SirMetaRecord {
+        id: symbol_id.clone(),
+        sir_hash: hash.to_owned(),
+        sir_version: 1,
+        provider: "manual".to_owned(),
+        model: "manual".to_owned(),
+        generation_pass: "injected".to_owned(),
+        reasoning_trace: None,
+        prompt_hash: None,
+        staleness_score: None,
+        updated_at: 1_700_000_000,
+        sir_status: SIR_STATUS_FRESH.to_owned(),
+        last_error: None,
+        last_attempt_at: 1_700_000_000,
+    };
+    // The store holds a SIR of the older text, and a job is queued against it after
+    // the body is edited (same signature, same id).
+    store
+        .persist_sir_state_atomically_with_source(
+            leaf("hash-older"),
+            r#"{"intent":"older","confidence":0.9}"#,
+            None,
+            None,
+            Some(symbol_x.content_hash.as_str()),
+        )
+        .expect("persist the SIR of the older text");
+    let newer = "fn late() {\n    2\n}\n";
+    let symbol_y = parsed_symbols(workspace, "src/lib.rs", newer)
+        .into_iter()
+        .next()
+        .expect("the edited source declares the symbol");
+    assert_eq!(symbol_y.id, symbol_id, "the edit keeps the id");
+    assert_ne!(symbol_y.content_hash, symbol_x.content_hash);
+    let queued_against = current_sir_identity(&store, &symbol_id).expect("identity");
+    let generated = infer::GeneratedSir {
+        symbol: symbol_y.clone(),
+        sir: SirAnnotation {
+            intent: "Describes the newer text".to_owned(),
+            ..demo_sir()
+        },
+        provider_name: "test_provider".to_owned(),
+        model_name: "test_model".to_owned(),
+        reasoning_trace: None,
+        prior_sir: queued_against,
+        source_hash: symbol_y.content_hash.clone(),
+    };
+
+    // While the job ran, an injection bound to the OLDER text committed (it passed its
+    // source check just before the edit): the identity moved on, but the stored SIR
+    // records the older text, so the job's result, for the current text, replaces it
+    // rather than yielding and leaving a SIR of the old body `fresh` for good.
+    store
+        .persist_sir_state_atomically_with_source(
+            leaf("hash-stale-injection"),
+            r#"{"intent":"stale injection of the older text","confidence":0.95}"#,
+            None,
+            None,
+            Some(symbol_x.content_hash.as_str()),
+        )
+        .expect("stale injection lands");
+    let persisted = pipeline
+        .persist_successful_generation_sqlite(&store, &generated, SIR_GENERATION_PASS_SCAN, None)
+        .expect("persist");
+    assert!(
+        matches!(persisted, GenerationPersist::Persisted(_)),
+        "a SIR bound to older text does not supersede the job for the current text"
+    );
+    let stored: SirAnnotation = serde_json::from_str(
+        &store
+            .read_sir_blob(&symbol_id)
+            .expect("read blob")
+            .expect("blob"),
+    )
+    .expect("parse blob");
+    assert_eq!(stored.intent, "Describes the newer text");
+    assert_eq!(
+        store.get_sir_source_hash(&symbol_id).expect("source hash"),
+        Some(symbol_y.content_hash.clone()),
+        "the daemon's write records the text it was generated from"
+    );
+
+    // An injection bound to the SAME text the job read, or one that records no text,
+    // still supersedes the job as before.
+    for (label, source) in [
+        ("same text", Some(symbol_y.content_hash.as_str())),
+        ("unrecorded text", None),
+    ] {
+        let generated = infer::GeneratedSir {
+            prior_sir: current_sir_identity(&store, &symbol_id).expect("identity"),
+            ..generated.clone()
+        };
+        store
+            .persist_sir_state_atomically_with_source(
+                leaf(&format!("hash-{}", label.replace(' ', "-"))),
+                r#"{"intent":"another writer","confidence":0.95}"#,
+                None,
+                None,
+                source,
+            )
+            .expect("competing write lands");
+        let persisted = pipeline
+            .persist_successful_generation_sqlite(
+                &store,
+                &generated,
+                SIR_GENERATION_PASS_SCAN,
+                None,
+            )
+            .expect("persist");
+        assert!(
+            matches!(persisted, GenerationPersist::Superseded),
+            "a write bound to the {label} supersedes the job"
+        );
+    }
+}
+
+#[test]
 fn a_failed_generation_for_a_removed_symbol_writes_no_marker() {
     let temp = tempdir().expect("tempdir");
     let workspace = temp.path();
