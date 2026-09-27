@@ -74,6 +74,57 @@ impl LanceVectorStore {
         self.workspace_root.join(".aether").join("meta.sqlite")
     }
 
+    /// The metadata of `symbol_id`'s row in one vector table (`None` when the table is
+    /// missing, has no recognizable dimension or holds no row for the symbol). The
+    /// cross-table "latest" lookup resolves equal second-resolution timestamps
+    /// arbitrarily, so a check that concerns one table reads that table directly.
+    async fn meta_in_table(
+        &self,
+        connection: &LanceConnection,
+        table_name: &str,
+        symbol_id: &str,
+    ) -> Result<Option<VectorEmbeddingMetaRecord>, StoreError> {
+        let Ok(table) = connection.open_table(table_name).execute().await else {
+            return Ok(None);
+        };
+        let schema = table.schema().await.map_err(map_lancedb_err)?;
+        let Some(embedding_dim) = embedding_dim_from_schema(schema.as_ref()) else {
+            return Ok(None);
+        };
+        let predicate = format!("symbol_id = '{}'", escape_sql_string(symbol_id));
+        let batches = table
+            .query()
+            .select(Select::columns(&[
+                "symbol_id",
+                "sir_hash",
+                "provider",
+                "model",
+                "updated_at",
+            ]))
+            .only_if(predicate.as_str())
+            .limit(1)
+            .execute()
+            .await
+            .map_err(map_lancedb_err)?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(map_lancedb_err)?;
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            return Ok(Some(VectorEmbeddingMetaRecord {
+                symbol_id: string_at(&batch, "symbol_id", 0)?,
+                sir_hash: string_at(&batch, "sir_hash", 0)?,
+                provider: string_at(&batch, "provider", 0)?,
+                model: string_at(&batch, "model", 0)?,
+                embedding_dim: i64::from(embedding_dim),
+                updated_at: int64_at(&batch, "updated_at", 0)?,
+            }));
+        }
+        Ok(None)
+    }
+
     pub(super) async fn connect(&self) -> Result<LanceConnection, StoreError> {
         connect(self.vectors_dir.to_string_lossy().as_ref())
             .execute()
@@ -455,7 +506,6 @@ impl VectorStore for LanceVectorStore {
     ) -> Result<Option<VectorEmbeddingMetaRecord>, StoreError> {
         self.migrate_from_sqlite_if_needed().await?;
         let connection = self.connect().await?;
-        let predicate = format!("symbol_id = '{}'", escape_sql_string(symbol_id));
 
         let mut latest = None::<VectorEmbeddingMetaRecord>;
         for name in connection
@@ -466,49 +516,12 @@ impl VectorStore for LanceVectorStore {
             .into_iter()
             .filter(|name| name.starts_with(VECTOR_TABLE_PREFIX))
         {
-            let Ok(table) = connection.open_table(&name).execute().await else {
+            let Some(record) = self.meta_in_table(&connection, &name, symbol_id).await? else {
                 continue;
             };
-            let schema = table.schema().await.map_err(map_lancedb_err)?;
-            let Some(embedding_dim) = embedding_dim_from_schema(schema.as_ref()) else {
-                continue;
-            };
-
-            let batches = table
-                .query()
-                .select(Select::columns(&[
-                    "symbol_id",
-                    "sir_hash",
-                    "provider",
-                    "model",
-                    "updated_at",
-                ]))
-                .only_if(predicate.as_str())
-                .limit(1)
-                .execute()
-                .await
-                .map_err(map_lancedb_err)?
-                .try_collect::<Vec<_>>()
-                .await
-                .map_err(map_lancedb_err)?;
-
-            for batch in batches {
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                let record = VectorEmbeddingMetaRecord {
-                    symbol_id: string_at(&batch, "symbol_id", 0)?,
-                    sir_hash: string_at(&batch, "sir_hash", 0)?,
-                    provider: string_at(&batch, "provider", 0)?,
-                    model: string_at(&batch, "model", 0)?,
-                    embedding_dim: i64::from(embedding_dim),
-                    updated_at: int64_at(&batch, "updated_at", 0)?,
-                };
-
-                match latest.as_ref() {
-                    Some(existing) if existing.updated_at >= record.updated_at => {}
-                    _ => latest = Some(record),
-                }
+            match latest.as_ref() {
+                Some(existing) if existing.updated_at >= record.updated_at => {}
+                _ => latest = Some(record),
             }
         }
 
@@ -677,7 +690,13 @@ impl VectorStore for LanceVectorStore {
         };
         self.upsert_embedding_with_connection_when(&connection, &record, matched, true)
             .await?;
-        let stored = self.get_embedding_meta(record.symbol_id.as_str()).await?;
+        // Verify the destination row itself: the cross-table "latest" lookup breaks
+        // equal second-resolution timestamps arbitrarily, so a row left in another
+        // table by the previous identity, written in the same second, could otherwise
+        // be reported instead of the row this call just wrote.
+        let stored = self
+            .meta_in_table(&connection, &destination, record.symbol_id.as_str())
+            .await?;
         Ok(stored.is_some_and(|meta| {
             meta.sir_hash == record.sir_hash
                 && meta.provider == record.provider

@@ -617,3 +617,63 @@ fn sir_request_queue_round_trip_works() {
             .is_empty()
     );
 }
+
+#[test]
+fn a_leaf_write_records_the_source_hash_it_was_given_and_clears_it_otherwise() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    let meta = |hash: &str| SirMetaRecord {
+        id: "sym-source".to_owned(),
+        sir_hash: hash.to_owned(),
+        sir_version: 1,
+        provider: "manual".to_owned(),
+        model: "manual".to_owned(),
+        generation_pass: "scan".to_owned(),
+        reasoning_trace: None,
+        prompt_hash: None,
+        staleness_score: None,
+        updated_at: 1_700_000_000,
+        sir_status: "fresh".to_owned(),
+        last_error: None,
+        last_attempt_at: 1_700_000_000,
+    };
+    assert_eq!(
+        store.get_sir_source_hash("sym-source").expect("read"),
+        None,
+        "no row, no hash"
+    );
+    store
+        .persist_sir_state_atomically_with_source(
+            meta("h1"),
+            r#"{"intent":"one","confidence":0.9}"#,
+            None,
+            None,
+            Some("source-1"),
+        )
+        .expect("persist with source");
+    assert_eq!(
+        store.get_sir_source_hash("sym-source").expect("read"),
+        Some("source-1".to_owned())
+    );
+    // Metadata-only updates (status changes) leave the column alone...
+    let mut current = store
+        .get_sir_meta("sym-source")
+        .expect("meta")
+        .expect("exists");
+    current.sir_status = "rollup_pending".to_owned();
+    store.upsert_sir_meta(current).expect("status update");
+    assert_eq!(
+        store.get_sir_source_hash("sym-source").expect("read"),
+        Some("source-1".to_owned())
+    );
+    // ...while a leaf write that does not know its source clears it.
+    store
+        .persist_sir_state_atomically(
+            meta("h2"),
+            r#"{"intent":"two","confidence":0.9}"#,
+            None,
+            None,
+        )
+        .expect("persist without source");
+    assert_eq!(store.get_sir_source_hash("sym-source").expect("read"), None);
+}

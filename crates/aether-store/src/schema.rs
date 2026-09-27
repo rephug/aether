@@ -694,6 +694,15 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         conn.execute("PRAGMA user_version = 20", [])?;
     }
 
+    if version < 21 {
+        // The content hash of the symbol source a leaf SIR describes, when the writer
+        // knew it (an injection bound to the text its caller read); set with every leaf
+        // write, cleared when the writer did not know it, so a leaf left `rollup_pending`
+        // can be told apart from a request describing newer text.
+        ensure_sir_column(conn, "source_hash", "TEXT")?;
+        conn.execute("PRAGMA user_version = 21", [])?;
+    }
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_version (

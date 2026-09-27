@@ -301,12 +301,13 @@ impl AetherMcpServer {
         // symbol and regenerates its SIR from the new source, and a leaf written now for
         // the old text would advance the identity that regeneration was planned against
         // and leave a SIR of the old implementation standing.
-        if let Some(expected) = request
+        let request_source_hash = request
             .source_hash
             .as_deref()
             .map(str::trim)
             .filter(|hash| !hash.is_empty())
-        {
+            .map(str::to_owned);
+        if let Some(expected) = request_source_hash.as_deref() {
             let mut live = LiveSymbolSources::new(&self.state.workspace);
             match live.hash_for(symbol.file_path.as_str(), symbol_id.as_str())? {
                 Some(current) if current == expected => {}
@@ -388,9 +389,23 @@ impl AetherMcpServer {
             && previous_sir
                 .as_ref()
                 .is_some_and(|previous| sir_hash(previous) == hash);
+        // A leaf left with an outstanding rollup describes the source its own injection
+        // was bound to (recorded with the leaf). When this request is bound to a
+        // different, current source, the symbol's body has changed since: the stored
+        // leaf is a SIR of the old text and is replaced rather than repaired, or it would
+        // pass as `fresh` while describing code that no longer exists.
+        let pending_describes_older_source = previous_rollup_failed
+            && match (
+                store.get_sir_source_hash(symbol_id.as_str())?,
+                request_source_hash.as_deref(),
+            ) {
+                (Some(stored), Some(current)) => stored != current,
+                _ => false,
+            };
         if previous_confidence.is_some_and(|confidence| confidence > FORCE_CONFIDENCE_THRESHOLD)
             && !request.force.unwrap_or(false)
             && !retries_failed_rollup
+            && !pending_describes_older_source
         {
             if let Some(previous_meta) = previous_meta
                 .as_ref()
@@ -472,11 +487,12 @@ impl AetherMcpServer {
             last_error: None,
             last_attempt_at: now,
         };
-        let version_write = store.persist_sir_state_atomically(
+        let version_write = store.persist_sir_state_atomically_with_source(
             meta_record.clone(),
             canonical_json.as_str(),
             None,
             None,
+            request_source_hash.as_deref(),
         )?;
         meta_record.sir_version = version_write.version;
         meta_record.updated_at = version_write.updated_at;
@@ -1348,9 +1364,95 @@ vector_backend = "sqlite"
             .expect("current source hash");
         assert_ne!(current, symbol.content_hash);
         let rebound = server
-            .aether_sir_inject_logic(request(Some(current)))
+            .aether_sir_inject_logic(request(Some(current.clone())))
             .expect("inject against the new text");
         assert_eq!(rebound.status, "injected");
+
+        // The leaf records the source it was bound to. A leaf left `rollup_pending` for
+        // text that has since changed is replaced by a request bound to the new text
+        // (not merely repaired), while one for the same text is repaired.
+        let store = aether_store::SqliteStore::open(workspace).expect("open store");
+        assert_eq!(
+            store.get_sir_source_hash(&symbol.id).expect("source hash"),
+            Some(current.clone())
+        );
+        let unforced = |intent: &str, source_hash: String| AetherSirInjectRequest {
+            symbol: symbol.id.clone(),
+            intent: intent.to_owned(),
+            behavior: None,
+            edge_cases: None,
+            side_effects: None,
+            dependencies: None,
+            error_modes: None,
+            confidence: Some(0.75),
+            inputs: None,
+            outputs: None,
+            complexity: None,
+            generation_pass: Some("scan".to_owned()),
+            model: None,
+            provider: None,
+            force: Some(false),
+            source_hash: Some(source_hash),
+        };
+        let mark_pending = || {
+            let meta = store
+                .get_sir_meta(&symbol.id)
+                .expect("get sir meta")
+                .expect("meta");
+            store
+                .upsert_sir_meta(aether_store::SirMetaRecord {
+                    sir_status: super::SIR_STATUS_ROLLUP_PENDING.to_owned(),
+                    ..meta
+                })
+                .expect("mark pending");
+        };
+        mark_pending();
+        let same_text = server
+            .aether_sir_inject_logic(unforced(
+                "Another annotation of the same text",
+                current.clone(),
+            ))
+            .expect("inject");
+        assert_eq!(same_text.status, "rollup_repaired");
+        mark_pending();
+        fs::write(
+            workspace.join("src/lib.rs"),
+            "pub fn target() -> u32 {\n    3\n}\n",
+        )
+        .expect("edit source again");
+        let newest = server
+            .aether_symbol_lookup_logic(crate::AetherSymbolLookupRequest {
+                query: String::new(),
+                limit: None,
+                symbol_ids: Some(vec![symbol.id.clone()]),
+                include_source: None,
+            })
+            .expect("lookup")
+            .matches
+            .into_iter()
+            .next()
+            .and_then(|entry| entry.source_hash)
+            .expect("newest source hash");
+        assert_ne!(newest, current);
+        let replaced = server
+            .aether_sir_inject_logic(unforced("Describes the newest text", newest.clone()))
+            .expect("inject");
+        assert_eq!(
+            replaced.status, "injected",
+            "a pending leaf of older text is replaced, not repaired"
+        );
+        assert_eq!(
+            store.get_sir_source_hash(&symbol.id).expect("source hash"),
+            Some(newest)
+        );
+        let stored: SirAnnotation = serde_json::from_str(
+            &store
+                .read_sir_blob(&symbol.id)
+                .expect("read blob")
+                .expect("blob"),
+        )
+        .expect("parse blob");
+        assert_eq!(stored.intent, "Describes the newest text");
 
         // A symbol the file no longer declares is refused too.
         fs::write(workspace.join("src/lib.rs"), "pub fn other() {}\n").expect("remove symbol");

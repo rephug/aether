@@ -465,10 +465,32 @@ impl SqliteStore {
     }
     pub fn persist_sir_state_atomically(
         &self,
+        record: SirMetaRecord,
+        sir_json_string: &str,
+        commit_hash: Option<&str>,
+        write_intent_id: Option<&str>,
+    ) -> Result<SirVersionWriteResult, StoreError> {
+        self.persist_sir_state_atomically_with_source(
+            record,
+            sir_json_string,
+            commit_hash,
+            write_intent_id,
+            None,
+        )
+    }
+
+    /// `persist_sir_state_atomically` that also records, in the same transaction, the
+    /// content hash of the symbol source this SIR describes (`sir.source_hash`). Every
+    /// leaf write sets the column: to the hash when the writer knew which text the SIR
+    /// was written for, to `NULL` otherwise, so the column never outlives the write it
+    /// belongs to.
+    pub fn persist_sir_state_atomically_with_source(
+        &self,
         mut record: SirMetaRecord,
         sir_json_string: &str,
         commit_hash: Option<&str>,
         write_intent_id: Option<&str>,
+        source_hash: Option<&str>,
     ) -> Result<SirVersionWriteResult, StoreError> {
         let symbol_id = record.id.trim();
         if symbol_id.is_empty() {
@@ -503,8 +525,8 @@ impl SqliteStore {
         // that observed the row before this write can tell, even when the content
         // hash and history version are unchanged.
         tx.execute(
-            "UPDATE sir SET write_generation = write_generation + 1 WHERE id = ?1",
-            params![record.id.as_str()],
+            "UPDATE sir SET write_generation = write_generation + 1, source_hash = ?2 WHERE id = ?1",
+            params![record.id.as_str(), source_hash],
         )?;
         if let Some(intent_id) = write_intent_id {
             update_intent_status_tx(&tx, intent_id, WriteIntentStatus::SqliteDone)?;
@@ -524,6 +546,21 @@ impl SqliteStore {
 
         Ok(write_result)
     }
+    /// The content hash of the symbol source the stored leaf describes, when its writer
+    /// recorded one (see `persist_sir_state_atomically_with_source`).
+    pub fn get_sir_source_hash(&self, symbol_id: &str) -> Result<Option<String>, StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = conn.prepare("SELECT source_hash FROM sir WHERE id = ?1")?;
+        let mut rows = stmt.query(params![symbol_id.trim()])?;
+        match rows.next()? {
+            Some(row) => Ok(row.get::<_, Option<String>>(0)?),
+            None => Ok(None),
+        }
+    }
+
     pub(crate) fn store_get_sir_meta(
         &self,
         symbol_id: &str,
