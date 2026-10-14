@@ -635,3 +635,46 @@ async fn causal_fragment_contains_search_and_animate_button() {
     assert!(body.contains("id=\"causal-animate\""));
     assert!(body.contains("id=\"causal-graph\""));
 }
+
+#[tokio::test]
+async fn wizard_detect_scans_workspace_root_whose_name_starts_with_dot() {
+    let (_tmp, app) = empty_app().await;
+    let workspace = tempfile::Builder::new()
+        .prefix(".dotted-workspace-")
+        .tempdir()
+        .unwrap();
+    let root = workspace.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+    fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    fs::write(root.join("README.md"), "# demo\n").unwrap();
+    // Hidden and vendor directories below the root must still be skipped.
+    fs::create_dir_all(root.join(".hidden")).unwrap();
+    fs::write(root.join(".hidden/skipped.rs"), "fn skipped() {}\n").unwrap();
+    fs::create_dir_all(root.join("target/debug")).unwrap();
+    fs::write(root.join("target/debug/skipped.rs"), "fn skipped() {}\n").unwrap();
+
+    let uri = format!(
+        "/dashboard/frag/wizard/detect?workspace_path={}",
+        crate::support::percent_encode(root.to_str().unwrap())
+    );
+    let response = app
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("Detected 3 files"), "body: {body}");
+    assert!(body.contains("Rust<span"), "body: {body}");
+    assert!(body.contains("(2)"), "body: {body}");
+    assert!(
+        !body.contains("No recognized source files found."),
+        "body: {body}"
+    );
+}
