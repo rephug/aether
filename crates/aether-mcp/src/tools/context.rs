@@ -7,7 +7,8 @@ use aether_core::{EdgeKind, Position, SourceRange};
 use aether_parse::{SymbolExtractor, language_for_path};
 use aether_sir::SirAnnotation;
 use aether_store::{
-    SirStateStore, SymbolCatalogStore, SymbolRecord, SymbolRelationStore, TestIntentStore,
+    SirStateStore, SymbolCatalogStore, SymbolRecord, SymbolRelationStore, TestIntentRecord,
+    TestIntentStore,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,13 @@ const DEFAULT_MAX_TOKENS: usize = 8_000;
 const CHARS_PER_TOKEN: usize = 4;
 const MAX_GRAPH_NEIGHBORS: usize = 20;
 const MAX_TEST_SUMMARIES: usize = 5;
+/// Outgoing edge kinds shown as a symbol's dependencies in the graph layer.
+const DEPENDENCY_EDGE_KINDS: [EdgeKind; 4] = [
+    EdgeKind::Calls,
+    EdgeKind::TypeRef,
+    EdgeKind::DependsOn,
+    EdgeKind::Implements,
+];
 const DEFAULT_DEPTH: u32 = 1;
 
 const LAYER_ORDER: [&str; 6] = ["source", "sir", "graph", "health", "reasoning", "tests"];
@@ -490,21 +498,51 @@ fn build_reasoning_layer(server: &AetherMcpServer, record: &SymbolRecord) -> Str
     }
 }
 
-fn build_tests_layer(store: &aether_store::SqliteStore, record: &SymbolRecord) -> String {
-    let intents = match store.list_test_intents_for_symbol(record.id.as_str()) {
-        Ok(intents) if !intents.is_empty() => intents,
-        Ok(_) => match store.list_test_intents_for_file(record.file_path.as_str()) {
-            Ok(intents) => intents,
-            Err(err) => {
-                return format!(
-                    "Unavailable: failed to list test intents for {}: {err}",
-                    record.file_path
-                );
+/// Test intents for `record`, most relevant first: tests attached to the symbol
+/// itself, then tests that call it directly, then other tests in its file. Each comes
+/// once, with the reason it was picked.
+fn collect_test_intents(
+    store: &aether_store::SqliteStore,
+    record: &SymbolRecord,
+) -> Result<Vec<(TestIntentRecord, &'static str)>, AetherMcpError> {
+    let mut intents = Vec::new();
+    let mut seen = HashSet::new();
+    let mut append = |rows: Vec<TestIntentRecord>, scope: &'static str| {
+        for intent in rows {
+            if seen.insert(intent.intent_id.clone()) {
+                intents.push((intent, scope));
             }
-        },
+        }
+    };
+
+    append(
+        store.list_test_intents_for_symbol(record.id.as_str())?,
+        "symbol",
+    );
+    // Test intents usually point at the test function, not the code under test, so
+    // look at who calls this symbol.
+    let mut callers = HashSet::new();
+    for edge in store.get_callers(record.qualified_name.as_str())? {
+        if callers.insert(edge.source_id.clone()) {
+            append(
+                store.list_test_intents_for_symbol(edge.source_id.as_str())?,
+                "direct test caller",
+            );
+        }
+    }
+    append(
+        store.list_test_intents_for_file(record.file_path.as_str())?,
+        "same file",
+    );
+    Ok(intents)
+}
+
+fn build_tests_layer(store: &aether_store::SqliteStore, record: &SymbolRecord) -> String {
+    let intents = match collect_test_intents(store, record) {
+        Ok(intents) => intents,
         Err(err) => {
             return format!(
-                "Unavailable: failed to list test intents for {}: {err}",
+                "Unavailable: failed to collect test intents for {}: {err}",
                 record.id
             );
         }
@@ -514,12 +552,21 @@ fn build_tests_layer(store: &aether_store::SqliteStore, record: &SymbolRecord) -
         return "No test intents recorded.".to_owned();
     }
 
-    intents
-        .into_iter()
-        .take(MAX_TEST_SUMMARIES)
-        .map(|intent| format!("- {}: {}", intent.test_name, intent.intent_text))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let shown = intents.len().min(MAX_TEST_SUMMARIES);
+    let mut lines = vec![format!(
+        "Showing {shown} of {} candidates; {} omitted (limit {MAX_TEST_SUMMARIES}). Order: tests attached to the symbol, direct test callers, then other tests in the same file. These are indexed relationships, not executed test coverage.",
+        intents.len(),
+        intents.len() - shown
+    )];
+    lines.extend(
+        intents
+            .into_iter()
+            .take(MAX_TEST_SUMMARIES)
+            .map(|(intent, scope)| {
+                format!("- [{scope}] {}: {}", intent.test_name, intent.intent_text)
+            }),
+    );
+    lines.join("\n")
 }
 
 fn build_graph_entries(
@@ -550,7 +597,8 @@ fn build_graph_entries(
         }
     }
 
-    let direct_dependencies = store.get_dependencies(record.id.as_str())?;
+    let direct_dependencies =
+        store.list_symbol_edges_for_source_and_kinds(record.id.as_str(), &DEPENDENCY_EDGE_KINDS)?;
     let mut frontier = Vec::<String>::new();
     for edge in direct_dependencies {
         let Some(target) =
@@ -578,11 +626,15 @@ fn build_graph_entries(
         return Ok(entries);
     }
 
-    let mut expanded = HashSet::<String>::new();
+    // Direct dependencies are already listed; don't repeat them as transitive ones.
+    let mut expanded = frontier.iter().cloned().collect::<HashSet<String>>();
     for current_depth in 2..=depth {
         let mut next_frontier = Vec::<String>::new();
         for source_id in frontier {
-            for edge in store.get_dependencies(source_id.as_str())? {
+            for edge in store.list_symbol_edges_for_source_and_kinds(
+                source_id.as_str(),
+                &DEPENDENCY_EDGE_KINDS,
+            )? {
                 let Some(target) =
                     store.get_symbol_by_qualified_name(edge.target_qualified_name.as_str())?
                 else {
@@ -1109,6 +1161,142 @@ vector_backend = "sqlite"
     }
 
     #[test]
+    fn graph_context_includes_call_and_type_edges_at_each_depth() {
+        let temp = tempdir().expect("tempdir");
+        let symbols = seed_workspace(temp.path(), false);
+        let find = |name: &str| {
+            symbols
+                .iter()
+                .find(|symbol| symbol.qualified_name == name)
+                .expect("fixture symbol")
+        };
+        let (target, callee, helper, caller) = (
+            find("target"),
+            find("callee"),
+            find("helper"),
+            find("caller"),
+        );
+        let server = AetherMcpServer::new(temp.path(), false).expect("server");
+        let store = server.state.store.as_ref();
+        store
+            .upsert_edges(&[
+                SymbolEdge {
+                    source_id: target.id.clone(),
+                    target_qualified_name: helper.qualified_name.clone(),
+                    edge_kind: EdgeKind::TypeRef,
+                    file_path: target.file_path.clone(),
+                },
+                SymbolEdge {
+                    source_id: callee.id.clone(),
+                    target_qualified_name: caller.qualified_name.clone(),
+                    edge_kind: EdgeKind::Calls,
+                    file_path: callee.file_path.clone(),
+                },
+                SymbolEdge {
+                    source_id: target.id.clone(),
+                    target_qualified_name: "unresolved_external".to_owned(),
+                    edge_kind: EdgeKind::Calls,
+                    file_path: target.file_path.clone(),
+                },
+            ])
+            .expect("typed edges");
+
+        let record = symbol_record(target);
+        let entries = super::build_graph_entries(store, &record, 2).expect("graph entries");
+        assert!(entries.iter().any(|entry| entry.section == "callees"
+            && entry.qualified_name == "callee"
+            && entry.relationship == "calls"));
+        assert!(entries.iter().any(|entry| entry.section == "callees"
+            && entry.qualified_name == "helper"
+            && entry.relationship == "type_ref"));
+        // `helper` is a direct dependency; it isn't repeated at depth 2.
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.section == "transitive_dependencies"
+                    && entry.qualified_name == "caller"
+                    && entry.depth == 2)
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.section == "transitive_dependencies"
+                    && entry.qualified_name == "helper")
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.qualified_name == "unresolved_external")
+        );
+
+        let graph = super::build_graph_layer(store, &record, 1);
+        assert!(graph.contains("### Callees (2)"), "{graph}");
+        assert!(graph.contains("`callee` (src/lib.rs) [calls]"), "{graph}");
+    }
+
+    #[test]
+    fn test_context_ranks_direct_test_callers_before_same_file_tests() {
+        let temp = tempdir().expect("tempdir");
+        let symbols = seed_workspace(temp.path(), false);
+        let find = |name: &str| {
+            symbols
+                .iter()
+                .find(|symbol| symbol.qualified_name == name)
+                .expect("fixture symbol")
+        };
+        let (target, caller) = (find("target"), find("caller"));
+        let server = AetherMcpServer::new(temp.path(), false).expect("server");
+        let store = server.state.store.as_ref();
+        // Six same-file tests that sort first, then the one test that calls `target`.
+        let mut intents = (0..6)
+            .map(|index| TestIntentRecord {
+                intent_id: format!("file-{index}"),
+                file_path: target.file_path.clone(),
+                test_name: format!("a_file_test_{index}"),
+                intent_text: "unrelated file test".to_owned(),
+                group_label: None,
+                language: "rust".to_owned(),
+                symbol_id: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .collect::<Vec<_>>();
+        intents.push(TestIntentRecord {
+            intent_id: "direct-caller-test".to_owned(),
+            file_path: caller.file_path.clone(),
+            test_name: "z_direct_target_test".to_owned(),
+            intent_text: "direct target assertion".to_owned(),
+            group_label: None,
+            language: "rust".to_owned(),
+            symbol_id: Some(caller.id.clone()),
+            created_at: 1,
+            updated_at: 1,
+        });
+        store
+            .replace_test_intents_for_file(&target.file_path, &intents)
+            .expect("test intents");
+
+        let record = symbol_record(target);
+        let layer = super::build_tests_layer(store, &record);
+        assert!(
+            layer.contains("Showing 5 of 7 candidates; 2 omitted"),
+            "{layer}"
+        );
+        assert!(
+            layer.contains("- [direct test caller] z_direct_target_test"),
+            "{layer}"
+        );
+        assert_eq!(layer.matches("z_direct_target_test").count(), 1);
+        assert!(
+            layer.find("z_direct_target_test").expect("direct")
+                < layer.find("a_file_test_0").expect("fallback")
+        );
+        assert!(layer.contains("[same file] a_file_test_0"));
+        assert!(!layer.contains("a_file_test_4"));
+        assert!(layer.contains("not executed test coverage"));
+    }
+
+    #[test]
     fn basic_context_assembly_includes_source_sir_graph_and_tests() {
         let temp = tempdir().expect("tempdir");
         let symbols = seed_workspace(temp.path(), false);
@@ -1140,8 +1328,13 @@ vector_backend = "sqlite"
                 .contains("**Intent:** target intent summary")
         );
         assert!(response.context.contains("## Dependencies"));
-        assert!(response.context.contains("caller"));
-        assert!(response.context.contains("callee"));
+        let graph = response
+            .layers
+            .iter()
+            .find(|layer| layer.name == "graph")
+            .expect("graph layer");
+        assert!(graph.content.contains("`caller` (src/lib.rs) [called_by]"));
+        assert!(graph.content.contains("`callee` (src/lib.rs) [calls]"));
         assert!(response.context.contains("## Reasoning Trace"));
         assert!(response.context.contains("rollback behavior"));
         assert!(response.context.contains("## Test Intents"));
