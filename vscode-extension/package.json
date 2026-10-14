@@ -118,7 +118,8 @@
     "compile": "npm run build",
     "typecheck": "tsc -p . --noEmit",
     "smoke": "node ./scripts/smoke.js",
-    "verify": "npm run build && npm run smoke"
+    "test": "node --test ./scripts/test-enhance.js",
+    "verify": "npm run build && npm run smoke && npm test"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
