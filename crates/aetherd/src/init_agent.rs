@@ -9,9 +9,9 @@ use clap::ValueEnum;
 
 use crate::templates::{
     AuditChangesCommandTemplate, AuditCommandTemplate, AuditReportCommandTemplate, ClaudeTemplate,
-    CodexInstructionsTemplate, CursorRulesTemplate, EnrichCommandTemplate,
-    ExplainAreaCommandTemplate, ImpactCommandTemplate, McpJsonTemplate, NextCommandTemplate,
-    OmpAgentsTemplate, PreFlightCommandTemplate, RefactorCommandTemplate,
+    CodexInstructionsTemplate, ContextCommandTemplate, CursorRulesTemplate, EnrichCommandTemplate,
+    ExplainAreaCommandTemplate, HealthCheckCommandTemplate, ImpactCommandTemplate, McpJsonTemplate,
+    NextCommandTemplate, OmpAgentsTemplate, PreFlightCommandTemplate, RefactorCommandTemplate,
     RefactorDeepCommandTemplate, ReviewCommandTemplate, ScanAllScriptTemplate, ScanCommandTemplate,
     SkillTemplate, TemplateContext,
 };
@@ -229,6 +229,14 @@ fn files_for_platform(platform: AgentPlatform, context: &TemplateContext) -> Vec
             ".claude/commands/impact.md",
             ImpactCommandTemplate::render(context),
         ));
+        files.push(GeneratedFile::new(
+            ".claude/commands/context.md",
+            ContextCommandTemplate::render(context),
+        ));
+        files.push(GeneratedFile::new(
+            ".claude/commands/health-check.md",
+            HealthCheckCommandTemplate::render(context),
+        ));
         files.push(GeneratedFile::script(
             "scripts/scan_all.sh",
             ScanAllScriptTemplate::render(context),
@@ -441,6 +449,8 @@ mod tests {
         assert!(workspace.join(".claude/commands/review.md").exists());
         assert!(workspace.join(".claude/commands/explain-area.md").exists());
         assert!(workspace.join(".claude/commands/impact.md").exists());
+        assert!(workspace.join(".claude/commands/context.md").exists());
+        assert!(workspace.join(".claude/commands/health-check.md").exists());
         assert!(workspace.join("scripts/scan_all.sh").exists());
         assert!(
             workspace
@@ -869,9 +879,18 @@ mod tests {
         assert!(impact.contains("argument-hint: <symbol>"));
         assert!(impact.contains("aether_blast_radius"));
 
+        let context = fs::read_to_string(workspace.join(".claude/commands/context.md"))
+            .expect("read context command");
+        assert!(context.contains("## Rules for the document"));
+
+        let health = fs::read_to_string(workspace.join(".claude/commands/health-check.md"))
+            .expect("read health-check command");
+        assert!(health.contains("aether_health_hotspots"));
+
         let claude = fs::read_to_string(workspace.join("CLAUDE.md")).expect("read claude");
         assert!(claude.contains("## Slash Commands"));
         assert!(claude.contains("`/pre-flight <task>`"));
+        assert!(claude.contains("`/health-check`"));
     }
 
     #[test]
