@@ -613,7 +613,21 @@ mod language_tests {
             Language::Python,
             Language::Go,
         ] {
+            lists_every_variant(language);
             assert_eq!(parse_language(language.as_str()), language);
+        }
+    }
+
+    /// Stops compiling when `Language` gains a variant, so the list above gets it too.
+    fn lists_every_variant(language: Language) {
+        match language {
+            Language::Rust
+            | Language::TypeScript
+            | Language::Tsx
+            | Language::JavaScript
+            | Language::Jsx
+            | Language::Python
+            | Language::Go => {}
         }
     }
 }
