@@ -1,6 +1,7 @@
 pub mod audit_changes_cmd;
 pub mod audit_cmd;
 pub mod audit_report_cmd;
+pub mod ci_review_workflow;
 pub mod claude_md;
 pub mod codex_instructions;
 pub mod context_cmd;
@@ -22,6 +23,7 @@ pub mod skill_md;
 pub use audit_changes_cmd::AuditChangesCommandTemplate;
 pub use audit_cmd::AuditCommandTemplate;
 pub use audit_report_cmd::AuditReportCommandTemplate;
+pub use ci_review_workflow::GithubReviewWorkflowTemplate;
 pub use claude_md::ClaudeTemplate;
 pub use codex_instructions::CodexInstructionsTemplate;
 pub use context_cmd::ContextCommandTemplate;
@@ -286,11 +288,11 @@ mod tests {
     use super::{
         AuditChangesCommandTemplate, AuditCommandTemplate, AuditReportCommandTemplate,
         ClaudeTemplate, CodexInstructionsTemplate, ContextCommandTemplate, CursorRulesTemplate,
-        EnrichCommandTemplate, ExplainAreaCommandTemplate, HealthCheckCommandTemplate,
-        ImpactCommandTemplate, McpJsonTemplate, NextCommandTemplate, OmpAgentsTemplate,
-        PreFlightCommandTemplate, RefactorCommandTemplate, RefactorDeepCommandTemplate,
-        ReviewCommandTemplate, ScanAllScriptTemplate, ScanCommandTemplate, SkillTemplate,
-        TOOL_DESCRIPTIONS, TemplateContext,
+        EnrichCommandTemplate, ExplainAreaCommandTemplate, GithubReviewWorkflowTemplate,
+        HealthCheckCommandTemplate, ImpactCommandTemplate, McpJsonTemplate, NextCommandTemplate,
+        OmpAgentsTemplate, PreFlightCommandTemplate, RefactorCommandTemplate,
+        RefactorDeepCommandTemplate, ReviewCommandTemplate, ScanAllScriptTemplate,
+        ScanCommandTemplate, SkillTemplate, TOOL_DESCRIPTIONS, TemplateContext,
     };
 
     fn sample_context() -> TemplateContext {
@@ -509,6 +511,76 @@ mod tests {
         // A banned word that names the project or an identifier stays as the code has it.
         assert!(rules.contains("the project's own name or an identifier in its code"));
         assert!(context.contains("four backticks"));
+    }
+
+    #[test]
+    fn review_workflow_is_advisory_keyless_and_sticky() {
+        let workflow = GithubReviewWorkflowTemplate::render(&sample_context());
+        assert!(workflow.starts_with("# Advisory AETHER review"));
+        assert!(workflow.contains("don't make it a required check"));
+        assert!(workflow.contains("\non:\n  pull_request:\n"));
+        assert!(!workflow.contains("pull_request_target"));
+        assert!(workflow.contains("permissions:\n  contents: read\n  pull-requests: write\n"));
+        assert!(workflow.contains("    continue-on-error: true\n"));
+        // Queued, not cancelled, so a first build is never thrown away mid-way.
+        assert!(workflow.contains("cancel-in-progress: false"));
+        // pipefail, so a failed listing or ls-remote fails its step instead of
+        // silently falling back.
+        assert!(workflow.contains("defaults:\n  run:\n    shell: bash\n"));
+        // The checkout must not leave the job token where the built tool can read it.
+        assert!(workflow.contains("persist-credentials: false"));
+
+        // aetherd: resolved strictly, restored from any earlier build, built only when
+        // needed, and saved as soon as it is built.
+        assert!(workflow.contains("\"refs/heads/$AETHER_REF\""));
+        assert!(workflow.contains("is not a branch, tag or commit"));
+        assert!(workflow.contains("uses: actions/cache/restore@v4"));
+        assert!(workflow.contains("restore-keys: aetherd-${{ runner.os }}-\n"));
+        assert!(workflow.contains("steps.restore.outputs.cache-matched-key == ''"));
+        assert!(workflow.contains(
+            "cargo +stable install --locked --git \"$AETHER_GIT_URL\" --rev \"$AETHER_REV\""
+        ));
+        assert!(workflow.contains("uses: actions/cache/save@v4"));
+        assert!(workflow.contains("if: steps.build.outcome == 'success'"));
+        // Scheduled and manual runs seed the default branch's cache.
+        assert!(workflow.contains("  schedule:\n"));
+        assert!(workflow.contains("  workflow_dispatch:\n"));
+
+        // Structural index only: no SIR generation, no secrets.
+        assert!(
+            workflow.contains("aetherd --workspace . --index-once --inference-provider mock\n")
+        );
+        assert!(!workflow.contains("--full"));
+        assert!(!workflow.contains("secrets."));
+        assert!(workflow.contains("GH_TOKEN: ${{ github.token }}"));
+
+        // One comment, found by its marker and author and edited in place; fork PRs
+        // (read-only token) get the job summary instead.
+        assert!(workflow.contains("MARKER = \"<!-- aether-review -->\""));
+        assert!(workflow.contains("marker='<!-- aether-review -->'"));
+        assert!(workflow.contains("select(.user.login == \\\"github-actions[bot]\\\""));
+        assert!(workflow.contains("gh api --method PATCH"));
+        assert!(workflow.contains("gh pr comment \"$PR_NUMBER\" --body-file aether-review.md"));
+        assert!(
+            workflow.contains("github.event.pull_request.head.repo.full_name == github.repository")
+        );
+        assert!(workflow.contains("cat aether-review.md >> \"$GITHUB_STEP_SUMMARY\""));
+        // A failed command must not read as a clean result.
+        assert!(workflow.contains("Unavailable: `aetherd blast-radius` failed"));
+        assert!(workflow.contains("Unavailable: `aetherd health` failed"));
+
+        for command in [
+            "blast-radius",
+            "\"health\"",
+            "health-score",
+            "mine-coupling",
+        ] {
+            assert!(workflow.contains(command), "{command}");
+        }
+        // health-score needs a Cargo workspace, not just any Cargo.toml.
+        assert!(workflow.contains("^\\[workspace\\]"));
+        assert!(workflow.ends_with("fi\n"));
+        assert!(!workflow.contains('\t'), "YAML must not contain tabs");
     }
 
     #[test]

@@ -10,10 +10,11 @@ use clap::ValueEnum;
 use crate::templates::{
     AuditChangesCommandTemplate, AuditCommandTemplate, AuditReportCommandTemplate, ClaudeTemplate,
     CodexInstructionsTemplate, ContextCommandTemplate, CursorRulesTemplate, EnrichCommandTemplate,
-    ExplainAreaCommandTemplate, HealthCheckCommandTemplate, ImpactCommandTemplate, McpJsonTemplate,
-    NextCommandTemplate, OmpAgentsTemplate, PreFlightCommandTemplate, RefactorCommandTemplate,
-    RefactorDeepCommandTemplate, ReviewCommandTemplate, ScanAllScriptTemplate, ScanCommandTemplate,
-    SkillTemplate, TemplateContext,
+    ExplainAreaCommandTemplate, GithubReviewWorkflowTemplate, HealthCheckCommandTemplate,
+    ImpactCommandTemplate, McpJsonTemplate, NextCommandTemplate, OmpAgentsTemplate,
+    PreFlightCommandTemplate, RefactorCommandTemplate, RefactorDeepCommandTemplate,
+    ReviewCommandTemplate, ScanAllScriptTemplate, ScanCommandTemplate, SkillTemplate,
+    TemplateContext,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -241,6 +242,10 @@ fn files_for_platform(platform: AgentPlatform, context: &TemplateContext) -> Vec
             "scripts/scan_all.sh",
             ScanAllScriptTemplate::render(context),
         ));
+        files.push(GeneratedFile::new(
+            ".github/workflows/aether-review.yml",
+            GithubReviewWorkflowTemplate::render(context),
+        ));
     }
 
     if matches!(platform, AgentPlatform::Codex | AgentPlatform::All) {
@@ -451,6 +456,11 @@ mod tests {
         assert!(workspace.join(".claude/commands/impact.md").exists());
         assert!(workspace.join(".claude/commands/context.md").exists());
         assert!(workspace.join(".claude/commands/health-check.md").exists());
+        assert!(
+            workspace
+                .join(".github/workflows/aether-review.yml")
+                .exists()
+        );
         assert!(workspace.join("scripts/scan_all.sh").exists());
         assert!(
             workspace
@@ -483,6 +493,9 @@ mod tests {
                 .written_files
                 .contains(&std::path::PathBuf::from("scripts/scan_all.sh"))
         );
+        assert!(outcome.written_files.contains(&std::path::PathBuf::from(
+            ".github/workflows/aether-review.yml"
+        )));
         let command = fs::read_to_string(workspace.join(".claude/commands/scan.md"))
             .expect("read scan command");
         assert!(command.contains("aether_sir_inject"));
@@ -521,6 +534,12 @@ mod tests {
         )
         .expect("init-agent codex should succeed");
         assert!(!temp.path().join(".claude/commands/scan.md").exists());
+        assert!(
+            !temp
+                .path()
+                .join(".github/workflows/aether-review.yml")
+                .exists()
+        );
         assert!(!temp.path().join("scripts/scan_all.sh").exists());
     }
 
