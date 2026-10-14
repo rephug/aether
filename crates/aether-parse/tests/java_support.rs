@@ -421,14 +421,14 @@ fn java_receivers_resolve_through_every_kind_of_declaration() {
         targets_from(&extracted, "Ledger::save", EdgeKind::TypeRef),
         strings(&["Record"])
     );
-    // From another top-level type, the file's only nested `Builder` is meant.
+    // Another class's nested type is not in scope by simple name.
     assert_eq!(
         targets_from(&extracted, "Factory::start", EdgeKind::Calls),
-        strings(&["Ledger::Builder"])
+        strings(&["Builder"])
     );
     assert_eq!(
         targets_from(&extracted, "Factory::start", EdgeKind::TypeRef),
-        strings(&["Ledger::Builder"])
+        strings(&["Builder"])
     );
     // A generic method's type parameter is not a type to reference.
     assert!(targets_from(&extracted, "Factory::keep", EdgeKind::TypeRef).is_empty());

@@ -988,8 +988,7 @@ impl FileContext {
     }
 
     /// The nested type a simple name refers to at `at`: a member type of an enclosing type,
-    /// innermost first; else, when the file declares no top-level type of that name, the
-    /// only nested type the file declares with it.
+    /// innermost first. Another class's nested types need an import or a qualified name.
     fn nested_type(&self, simple: &str, at: Node<'_>, source: &[u8]) -> Option<String> {
         let mut current = at.parent();
         while let Some(scope) = current {
@@ -1004,16 +1003,7 @@ impl FileContext {
             }
             current = scope.parent();
         }
-        if self.declared_types.contains(simple) {
-            return None;
-        }
-        let suffix = format!("::{simple}");
-        let mut matches = self
-            .declared_types
-            .iter()
-            .filter(|qualified| qualified.ends_with(&suffix));
-        let first = matches.next()?;
-        matches.next().is_none().then(|| first.clone())
+        None
     }
 
     /// Written type names that never point at a workspace declaration: `java.lang` types
