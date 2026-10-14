@@ -4,6 +4,8 @@ pub mod audit_report_cmd;
 pub mod claude_md;
 pub mod codex_instructions;
 pub mod cursor_rules;
+pub mod enrich_cmd;
+pub mod next_cmd;
 pub mod omp;
 pub mod refactor_cmd;
 pub mod refactor_deep_cmd;
@@ -17,6 +19,8 @@ pub use audit_report_cmd::AuditReportCommandTemplate;
 pub use claude_md::ClaudeTemplate;
 pub use codex_instructions::CodexInstructionsTemplate;
 pub use cursor_rules::CursorRulesTemplate;
+pub use enrich_cmd::EnrichCommandTemplate;
+pub use next_cmd::NextCommandTemplate;
 pub use omp::{McpJsonTemplate, OmpAgentsTemplate};
 pub use refactor_cmd::RefactorCommandTemplate;
 pub use refactor_deep_cmd::RefactorDeepCommandTemplate;
@@ -268,8 +272,10 @@ pub(crate) fn plain_tool_list() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaudeTemplate, CodexInstructionsTemplate, CursorRulesTemplate, McpJsonTemplate,
-        OmpAgentsTemplate, ScanAllScriptTemplate, ScanCommandTemplate, SkillTemplate,
+        AuditChangesCommandTemplate, AuditCommandTemplate, AuditReportCommandTemplate,
+        ClaudeTemplate, CodexInstructionsTemplate, CursorRulesTemplate, EnrichCommandTemplate,
+        McpJsonTemplate, NextCommandTemplate, OmpAgentsTemplate, RefactorCommandTemplate,
+        RefactorDeepCommandTemplate, ScanAllScriptTemplate, ScanCommandTemplate, SkillTemplate,
         TOOL_DESCRIPTIONS, TemplateContext,
     };
 
@@ -349,20 +355,55 @@ mod tests {
     }
 
     /// AETHER dogfoods its own generated assets: the checked-in copies must match the
-    /// templates byte for byte.
+    /// templates byte for byte. The slash commands are checked below.
     #[test]
-    fn checked_in_scan_assets_match_templates() {
+    fn checked_in_scan_script_matches_template() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .canonicalize()
             .expect("repo root");
         let context = sample_context();
-        let command = std::fs::read_to_string(root.join(".claude/commands/scan.md"))
-            .expect("read .claude/commands/scan.md");
-        assert_eq!(command, ScanCommandTemplate::render(&context));
         let script = std::fs::read_to_string(root.join("scripts/scan_all.sh"))
             .expect("read scripts/scan_all.sh");
         assert_eq!(script, ScanAllScriptTemplate::render(&context));
+    }
+
+    /// Every generated slash command is tracked in `.claude/commands/`, and each copy
+    /// must match its template byte for byte.
+    #[test]
+    fn checked_in_commands_match_templates() {
+        let commands = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repo root")
+            .join(".claude/commands");
+        let context = sample_context();
+        for (file, rendered) in [
+            ("audit.md", AuditCommandTemplate::render(&context)),
+            (
+                "audit-changes.md",
+                AuditChangesCommandTemplate::render(&context),
+            ),
+            (
+                "audit-report.md",
+                AuditReportCommandTemplate::render(&context),
+            ),
+            ("enrich.md", EnrichCommandTemplate::render(&context)),
+            ("next.md", NextCommandTemplate::render(&context)),
+            ("refactor.md", RefactorCommandTemplate::render(&context)),
+            (
+                "refactor-deep.md",
+                RefactorDeepCommandTemplate::render(&context),
+            ),
+            ("scan.md", ScanCommandTemplate::render(&context)),
+        ] {
+            let checked_in = std::fs::read_to_string(commands.join(file))
+                .unwrap_or_else(|err| panic!("read .claude/commands/{file}: {err}"));
+            assert_eq!(
+                checked_in, rendered,
+                ".claude/commands/{file} is out of date"
+            );
+        }
     }
 
     #[test]
