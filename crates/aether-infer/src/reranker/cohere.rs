@@ -18,8 +18,7 @@ pub struct CohereRerankerProvider {
 
 impl CohereRerankerProvider {
     pub fn from_env(api_key_env: &str) -> Result<Self, InferError> {
-        let api_key = std::env::var(api_key_env)
-            .ok()
+        let api_key = crate::env_vars::var(api_key_env)
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
             .map(aether_core::Secret::new)

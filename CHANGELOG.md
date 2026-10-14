@@ -9,6 +9,8 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Go parsing: functions, methods (`pkg::Type::Method`), structs, interfaces and named types;
+  call, import and type-reference edges; `func TestXxx(t *testing.T)` test intents.
 - `inference.provider = "omp"`: run SIR generation through the Oh My Pi auth gateway
   (`omp auth-gateway serve`) so models are addressed as omp routes (`provider/model`)
   and billed on the omp credential (subscription logins included). The gateway token is
@@ -28,9 +30,27 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 - GitHub Release packaging now publishes `aetherd` and `aether-mcp` binaries for
   x64 and arm64 across Linux, macOS, and Windows targets.
+- Zero-key onboarding (#152): `inference.provider = "mock"` writes `[MOCK]` placeholder
+  SIRs from tree-sitter facts at confidence 0.1, and `init-agent --platform claude` now
+  generates the `/scan` slash command, `scripts/scan_all.sh` and a project-scoped
+  `.mcp.json`, so Claude Code sessions can replace the placeholders with scan-level SIRs
+  without an inference API key.
+- `aether_audit_candidates` takes `include_deep` (#151); by default it now leaves out
+  symbols that already have a usable deep-pass SIR.
 
 ### Changed
 
 - CI now runs explicit required jobs for `fmt`, `clippy`, and workspace tests.
 - Release workflow now supports both semver tag pushes (`v*.*.*`) and manual
   dispatch with a required `tag` input.
+- SIR and embedding writers coordinate through inject and per-symbol embedding locks,
+  identity guards and source-hash binding (#152). Core schema 18 → 21; agent template
+  schema 3 → 4.
+
+### Fixed
+
+- `aether_sir_inject` refreshes the symbol's embedding after the write, so semantic
+  search reflects injected SIRs immediately (#151).
+- `aether_sir_inject` responses round confidence to four decimal places (#151).
+- Ollama deep-pass runs keep the model's `<think>` block as the SIR's reasoning trace
+  (#151).

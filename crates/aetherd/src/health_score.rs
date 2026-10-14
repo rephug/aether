@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use aether_analysis::HealthAnalyzer;
+use aether_analysis::{HealthAnalyzer, production_community_assignments};
 use aether_config::{AetherConfig, GraphBackend};
 use aether_core::{GitContext, SIR_STATUS_STALE, SymbolKind, normalize_path};
 use aether_graph_algo::GraphAlgorithmEdge;
@@ -246,6 +246,7 @@ fn compute_current_report(
             stores.map(|stores| &stores.store),
             stores.and_then(|stores| stores.graph.as_ref()),
             stores.map(|stores| stores.runtime),
+            config.planner.community_resolution,
         )?;
         compute_workspace_score_with_signals(
             workspace,
@@ -1394,6 +1395,7 @@ fn load_semantic_input(
     store: Option<&SqliteStore>,
     graph: Option<&SurrealGraphStore>,
     runtime: Option<&tokio::runtime::Runtime>,
+    community_resolution: f64,
 ) -> Result<Option<SemanticInput>> {
     let sqlite_path = workspace.join(".aether").join("meta.sqlite");
     if !sqlite_path.exists() {
@@ -1420,11 +1422,16 @@ fn load_semantic_input(
     }
 
     let drift_by_symbol = latest_semantic_drift_by_symbol(store)?;
-    let community_by_symbol = store
-        .list_latest_community_snapshot()
-        .unwrap_or_default()
+    // Computed now, without test symbols and at the planner's resolution, instead of
+    // read from the snapshot the last drift run stored (decision #89.1).
+    let community_by_symbol = runtime
+        .block_on(production_community_assignments(
+            store,
+            graph,
+            community_resolution,
+        ))
+        .context("failed to compute production communities")?
         .into_iter()
-        .map(|entry| (entry.symbol_id, entry.community_id))
         .collect::<HashMap<_, _>>();
 
     let mut files = HashMap::new();
@@ -2072,6 +2079,77 @@ model = "qwen3-embeddings-4B"
         assert!(crate_score.semantic_signals.is_some());
         assert!(crate_score.score_breakdown.is_some());
         assert!(execution.rendered.contains("\"git_signals\""));
+    }
+
+    #[test]
+    fn semantic_boundary_leakage_ignores_test_symbols_and_the_stored_snapshot() {
+        let workspace = create_workspace();
+        write_semantic_config(workspace.path());
+        let file = "crates/example/src/lib.rs";
+        write_file(
+            &workspace.path().join(file),
+            "pub fn p1() {}\npub fn p2() {}\npub fn p3() {}\n",
+        );
+        init_git_repo(workspace.path());
+        commit_all(workspace.path(), "initial");
+
+        let store = SqliteStore::open(workspace.path()).expect("open sqlite");
+        let symbols = [
+            "crate::p1",
+            "crate::p2",
+            "crate::p3",
+            "tests::t1",
+            "tests::t2",
+            "tests::t3",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(index, name)| symbol(&format!("sym-{index}"), name, file))
+        .collect::<Vec<_>>();
+        for symbol in &symbols {
+            store.upsert_symbol(symbol.clone()).expect("upsert symbol");
+        }
+        // A snapshot left by an earlier drift run that splits the file in two.
+        let snapshot = symbols
+            .iter()
+            .enumerate()
+            .map(|(index, symbol)| CommunitySnapshotRecord {
+                snapshot_id: "snapshot-1".to_owned(),
+                symbol_id: symbol.id.clone(),
+                community_id: if index < 3 { 1 } else { 2 },
+                captured_at: now_millis(),
+            })
+            .collect::<Vec<_>>();
+        store
+            .replace_community_snapshot("snapshot-1", now_millis(), &snapshot)
+            .expect("seed communities");
+        // The production functions call each other; the inline tests form their own
+        // cluster, which the unfiltered global Louvain would count as a second community.
+        seed_surreal_graph_snapshot(
+            workspace.path(),
+            &symbols,
+            &[
+                ("sym-0", "sym-1"),
+                ("sym-1", "sym-2"),
+                ("sym-0", "sym-2"),
+                ("sym-3", "sym-4"),
+                ("sym-4", "sym-5"),
+                ("sym-3", "sym-5"),
+            ],
+        );
+        drop(store);
+
+        let mut args = default_args();
+        args.semantic = true;
+        let execution =
+            execute_health_score_command(workspace.path(), &AetherConfig::default(), args)
+                .expect("semantic execution");
+
+        let signals = execution.report.crates[0]
+            .semantic_signals
+            .as_ref()
+            .expect("semantic signals");
+        assert_eq!(signals.boundary_leakage, 0.0);
     }
 
     #[test]
