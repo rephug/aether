@@ -118,7 +118,8 @@
     "compile": "npm run build",
     "typecheck": "tsc -p . --noEmit",
     "smoke": "node ./scripts/smoke.js",
-    "verify": "npm run build && npm run smoke"
+    "verify": "npm run build && npm run smoke && npm test",
+    "test": "node ./test/multi-root-regression.cjs"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
