@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
+use std::path::Path;
 
 use aether_analysis::{HealthAnalyzer, HealthInclude, HealthRequest};
 use aether_config::GraphBackend;
@@ -404,18 +405,20 @@ fn read_neighbor_intent_summary(store: &aether_store::SqliteStore, symbol_id: &s
 }
 
 fn build_source_layer(server: &AetherMcpServer, record: &SymbolRecord) -> String {
-    let full_path = server.workspace().join(&record.file_path);
-    let source = match fs::read_to_string(&full_path) {
-        Ok(source) => source,
-        Err(err) => {
-            return format!(
-                "Unavailable: failed to read source file {}: {err}",
-                full_path.display()
-            );
-        }
-    };
+    let source =
+        match super::common::contained_workspace_file(server.workspace(), &record.file_path)
+            .and_then(fs::read_to_string)
+        {
+            Ok(source) => source,
+            Err(err) => {
+                return format!(
+                    "Unavailable: failed to read source file {}: {err}",
+                    record.file_path
+                );
+            }
+        };
 
-    let language = match language_for_path(&full_path) {
+    let language = match language_for_path(Path::new(&record.file_path)) {
         Some(language) => language,
         None => {
             return source;
@@ -1106,6 +1109,32 @@ vector_backend = "sqlite"
         server
             .aether_sir_context_logic(request)
             .expect("sir context should succeed")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_layer_refuses_files_that_resolve_outside_the_workspace() {
+        let temp = tempdir().expect("tempdir");
+        let symbols = seed_workspace(temp.path(), false);
+        let target = symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "target")
+            .expect("target");
+        // After indexing, the indexed file is swapped for a link to another project.
+        let outside = tempdir().expect("outside tempdir");
+        fs::write(
+            outside.path().join("other.rs"),
+            "pub fn target() -> i32 {\n    7 // OUTSIDE_WORKSPACE\n}\n",
+        )
+        .expect("write outside source");
+        let lib = temp.path().join("src/lib.rs");
+        fs::remove_file(&lib).expect("remove indexed source");
+        std::os::unix::fs::symlink(outside.path().join("other.rs"), &lib).expect("symlink");
+        let server = AetherMcpServer::new(temp.path(), false).expect("server");
+
+        let layer = super::build_source_layer(&server, &symbol_record(target));
+        assert!(!layer.contains("OUTSIDE_WORKSPACE"), "{layer}");
+        assert!(layer.starts_with("Unavailable"), "{layer}");
     }
 
     #[test]

@@ -730,3 +730,48 @@ fn a_leaf_write_records_the_source_hash_it_was_given_and_clears_it_otherwise() {
         .expect("persist without source");
     assert_eq!(store.get_sir_source_hash("sym-source").expect("read"), None);
 }
+
+#[test]
+fn sir_mirror_paths_stay_inside_the_sir_directory() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    let store = SqliteStore::open(workspace).expect("open store");
+    let outside = workspace.join(".aether/outside.json");
+    fs::write(&outside, "{\"intent\":\"outside\"}").expect("write outside file");
+    let absolute = workspace.join("absolute");
+    fs::write(workspace.join("absolute.json"), "{\"intent\":\"absolute\"}")
+        .expect("write absolute file");
+
+    // IDs that would name a file outside `.aether/sir/` are never mirror file names.
+    let absolute_id = absolute.to_string_lossy().into_owned();
+    for symbol_id in [
+        "../outside",
+        absolute_id.as_str(),
+        "nested/../../outside",
+        "..",
+        ".",
+        "a\\b",
+    ] {
+        assert_eq!(
+            store.read_sir_blob(symbol_id).expect("read"),
+            None,
+            "{symbol_id:?} must not read a file outside the SIR directory"
+        );
+    }
+
+    store
+        .write_sir_blob("../escaped", "{\"intent\":\"escaped\"}")
+        .expect("write blob");
+    assert!(!workspace.join(".aether/escaped.json").exists());
+    assert_eq!(
+        store.read_sir_blob("../escaped").expect("read back"),
+        Some("{\"intent\":\"escaped\"}".to_owned()),
+        "the SQLite copy is still keyed by the ID"
+    );
+
+    store.mark_removed("../outside").expect("mark removed");
+    assert!(
+        outside.exists(),
+        "removing a symbol must not delete outside files"
+    );
+}
