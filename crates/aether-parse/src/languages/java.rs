@@ -385,12 +385,19 @@ fn call_edge(
         }
         _ => return None,
     };
-    // Overloads share a qualified name, so a call to the caller's own name (an overload
-    // delegating to another, or recursion) would resolve to every overload and read as a
-    // dependency cycle between them.
-    if symbols
-        .iter()
-        .any(|symbol| symbol.id == source_id && symbol.qualified_name == target)
+    // Overloads share a qualified name, so an unqualified or `this.` call to the caller's own
+    // name (an overload delegating to another, or recursion) would resolve to every overload
+    // and read as a dependency cycle between them. A same-named method reached through a
+    // field or `super.` may belong to a same-named class in another package and keeps its
+    // edge.
+    let calls_own_class = call.kind() == "method_invocation"
+        && call
+            .child_by_field_name("object")
+            .is_none_or(|object| object.kind() == "this");
+    if calls_own_class
+        && symbols
+            .iter()
+            .any(|symbol| symbol.id == source_id && symbol.qualified_name == target)
     {
         return None;
     }

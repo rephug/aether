@@ -509,4 +509,11 @@ fn java_overloads_share_a_qualified_name_but_not_an_id() {
         .collect::<Vec<_>>();
     targets.sort();
     assert_eq!(targets, ["Overloads::log"]);
+
+    // `super.store` in a class extending a same-named class from another package keeps its
+    // edge: only unqualified and `this.` calls to the caller's own name are dropped.
+    assert_eq!(
+        targets_from(&extracted, "Archive::store", EdgeKind::Calls),
+        strings(&["Archive::store"])
+    );
 }

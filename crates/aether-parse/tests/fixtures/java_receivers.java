@@ -139,3 +139,10 @@ class Overloads {
 
     private void log(String key) {}
 }
+
+class Archive extends com.acme.legacy.Archive {
+    @Override
+    void store(String key) {
+        super.store(key);
+    }
+}
