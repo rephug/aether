@@ -11,12 +11,12 @@ permissions:
 jobs:
   fmt:
     name: fmt
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt
       - name: Check formatting
@@ -24,12 +24,12 @@ jobs:
 
   clippy:
     name: clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy
       - name: Install system dependencies
@@ -48,7 +48,7 @@ jobs:
 
   test:
     name: test-${{ matrix.crate }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -60,6 +60,7 @@ jobs:
           - aether-store
           - aether-memory
           - aether-analysis
+          - aether-health
           - aether-dashboard
           - aether-query
           - aether-mcp
@@ -70,9 +71,9 @@ jobs:
           - aetherd
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -89,12 +90,12 @@ jobs:
 
   test-desktop:
     name: test-aether-desktop
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -114,12 +115,12 @@ jobs:
 
   test-aetherd-dashboard:
     name: test-aetherd-dashboard
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
       - name: Install system dependencies
         run: |
           sudo apt-get update
