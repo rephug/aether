@@ -584,3 +584,21 @@ async fn contracts_api_returns_ok() {
     assert!(json["data"].get("recent_violations").is_some());
     assert!(json["data"]["recent_violations"].is_array());
 }
+
+#[tokio::test]
+async fn contracts_dismiss_on_read_only_dashboard_returns_conflict() {
+    let (_tmp, app, _ids) = seeded_app().await;
+
+    let (status, json) = send_json(
+        &app,
+        "POST",
+        "/api/v1/contracts/dismiss",
+        Some(r#"{"violation_id":1}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json["error"], "read_only");
+    let message = json["message"].as_str().unwrap();
+    assert!(message.contains("aether_contract_dismiss"), "{message}");
+    assert!(!message.contains("--dismiss"), "{message}");
+}

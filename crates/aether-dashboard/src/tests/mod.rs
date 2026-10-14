@@ -51,6 +51,27 @@ async fn empty_app() -> (TempDir, axum::Router) {
     (temp, app)
 }
 
+/// Sends one request (with an optional JSON body) and returns the status and parsed JSON body.
+async fn send_json(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if body.is_some() {
+        builder = builder.header("content-type", "application/json");
+    }
+    let request = builder
+        .body(body.map_or_else(Body::empty, |raw| Body::from(raw.to_owned())))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap();
+    (status, json)
+}
+
 fn seed_workspace(workspace: &std::path::Path) {
     let mut config = AetherConfig::default();
     config.storage.graph_backend = GraphBackend::Sqlite;

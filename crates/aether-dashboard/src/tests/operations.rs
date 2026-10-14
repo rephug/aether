@@ -406,6 +406,37 @@ async fn presets_api_returns_builtin_presets() {
 }
 
 #[tokio::test]
+async fn presets_api_maps_client_errors_to_4xx() {
+    let (_tmp, app, _ids) = seeded_app().await;
+
+    let (status, json) =
+        send_json(&app, "POST", "/api/v1/presets", Some(r#"{"name":"   "}"#)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["error"], "bad_request");
+
+    let (status, json) =
+        send_json(&app, "POST", "/api/v1/presets", Some(r#"{"name":"quick"}"#)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json["error"], "conflict");
+
+    let (status, json) = send_json(&app, "DELETE", "/api/v1/presets/quick", None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json["error"], "conflict");
+
+    let (status, json) = send_json(&app, "DELETE", "/api/v1/presets/nope", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(json["error"], "not_found");
+
+    // A custom preset can still be created and deleted; deleting it twice is a 404.
+    let (status, _) = send_json(&app, "POST", "/api/v1/presets", Some(r#"{"name":"mine"}"#)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send_json(&app, "DELETE", "/api/v1/presets/mine", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send_json(&app, "DELETE", "/api/v1/presets/mine", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn presets_fragment_renders_preset_cards() {
     let (_tmp, app, _ids) = seeded_app().await;
 
@@ -496,6 +527,20 @@ async fn fingerprint_history_api_returns_timeline() {
     assert_eq!(json["data"]["symbol_id"].as_str().unwrap(), "sym-demo-run");
     assert!(json["data"]["entries"].is_array());
     assert_eq!(json["data"]["entries"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn fingerprint_history_api_without_symbol_id_returns_400() {
+    let (_tmp, app, _ids) = seeded_app().await;
+
+    for uri in [
+        "/api/v1/fingerprint-history",
+        "/api/v1/fingerprint-history?symbol_id=%20",
+    ] {
+        let (status, json) = send_json(&app, "GET", uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(json["error"], "bad_request", "{uri}");
+    }
 }
 
 #[tokio::test]

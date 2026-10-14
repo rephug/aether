@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
@@ -192,8 +193,11 @@ pub(crate) async fn dismiss_handler(
     Json(body): Json<DismissRequest>,
 ) -> impl IntoResponse {
     if state.shared.read_only {
-        return support::json_internal_error(
-            "Store is read-only. Dismiss via CLI: aetherd contract check --dismiss <id>".to_owned(),
+        return support::json_error(
+            StatusCode::CONFLICT,
+            "read_only",
+            "The dashboard store is read-only. Dismiss violations with the \
+             aether_contract_dismiss MCP tool.",
         );
     }
 
