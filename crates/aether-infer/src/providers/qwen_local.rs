@@ -212,6 +212,27 @@ impl InferenceProvider for Qwen3LocalProvider {
     }
 }
 
+pub(crate) async fn request_qwen_summary(
+    endpoint: &str,
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<String, InferError> {
+    let prompt = format!(
+        "System instruction:\n{system_prompt}\n\nUser prompt:\n{user_prompt}\n\nReturn exactly one concise sentence."
+    );
+    let body = build_ollama_text_generate_body(model, prompt.as_str());
+    let response_value: Value = inference_http_client()
+        .post(ollama_generate_endpoint(endpoint))
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    extract_local_text_part(&response_value)
+}
+
 #[cfg(test)]
 mod deep_response_tests {
     use super::parse_deep_response;
@@ -243,25 +264,4 @@ mod deep_response_tests {
         assert_eq!(candidate.reasoning_trace, None);
         assert!(parse_and_validate_sir(candidate.candidate_json.as_str()).is_ok());
     }
-}
-
-pub(crate) async fn request_qwen_summary(
-    endpoint: &str,
-    model: &str,
-    system_prompt: &str,
-    user_prompt: &str,
-) -> Result<String, InferError> {
-    let prompt = format!(
-        "System instruction:\n{system_prompt}\n\nUser prompt:\n{user_prompt}\n\nReturn exactly one concise sentence."
-    );
-    let body = build_ollama_text_generate_body(model, prompt.as_str());
-    let response_value: Value = inference_http_client()
-        .post(ollama_generate_endpoint(endpoint))
-        .json(&body)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    extract_local_text_part(&response_value)
 }
