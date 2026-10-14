@@ -10,10 +10,18 @@ import {
 } from 'vscode-languageclient/node';
 import { createEnhancePromptCommand } from './enhancePrompt';
 
-let client: LanguageClient | undefined;
+interface WorkspaceClient {
+  client: LanguageClient;
+  folder: vscode.WorkspaceFolder;
+  stopping: boolean;
+}
+
+const clients = new Map<string, WorkspaceClient>();
+let clientOperations: Promise<void> = Promise.resolve();
+let deactivating = false;
 let outputChannel: vscode.OutputChannel | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
-let workspaceMetaWatcher: vscode.FileSystemWatcher | undefined;
+const workspaceMetaWatchers = new Map<string, vscode.Disposable[]>();
 let statusRefreshTimer: NodeJS.Timeout | undefined;
 let selectedWorkspaceFolder: vscode.WorkspaceFolder | undefined;
 let lastSearchResults: SearchMatch[] = [];
@@ -87,6 +95,7 @@ const statusModel: StatusModel = {
 };
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  deactivating = false;
   outputChannel = vscode.window.createOutputChannel('AETHER');
   context.subscriptions.push(outputChannel);
 
@@ -95,7 +104,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   statusBarItem.show();
   context.subscriptions.push(statusBarItem);
 
-  resetWorkspaceSelectionAndWatcher(context);
+  resetWorkspaceSelectionAndWatcher();
   renderStatusBar();
 
   statusRefreshTimer = setInterval(() => {
@@ -111,15 +120,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
-    vscode.workspace.onDidChangeWorkspaceFolders(() => {
-      const previousWorkspace = selectedWorkspaceFolder?.uri.toString();
-      resetWorkspaceSelectionAndWatcher(context);
-      const nextWorkspace = selectedWorkspaceFolder?.uri.toString();
-      if (client && previousWorkspace !== nextWorkspace) {
-        void restartClient(context);
+    vscode.workspace.onDidChangeWorkspaceFolders((event) => {
+      for (const folder of event.removed) {
+        const entry = clients.get(workspaceKey(folder));
+        if (entry) {
+          entry.stopping = true;
+        }
       }
+      resetWorkspaceSelectionAndWatcher();
+      void startClient(context).catch((error: unknown) => {
+        setLastError(`Failed to update workspace clients (${String(error)})`);
+      });
     })
   );
+  context.subscriptions.push(new vscode.Disposable(disposeWorkspaceWatchers));
 
   context.subscriptions.push(
     vscode.commands.registerCommand('aether.restartServer', async () => {
@@ -166,10 +180,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 }
 
 export async function deactivate(): Promise<void> {
-  if (workspaceMetaWatcher) {
-    workspaceMetaWatcher.dispose();
-    workspaceMetaWatcher = undefined;
-  }
+  deactivating = true;
+  disposeWorkspaceWatchers();
 
   if (statusRefreshTimer) {
     clearInterval(statusRefreshTimer);
@@ -180,8 +192,15 @@ export async function deactivate(): Promise<void> {
 }
 
 async function restartClient(context: vscode.ExtensionContext): Promise<void> {
-  await stopClient();
-  await startClient(context);
+  await queueClientOperation(async () => {
+    try {
+      await stopAllClients();
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : String(error));
+    }
+    // Start whatever is missing even if some client refused to stop.
+    await synchronizeWorkspaceClients(context);
+  });
 }
 
 async function selectInferenceProvider(): Promise<void> {
@@ -225,19 +244,57 @@ async function selectInferenceProvider(): Promise<void> {
 }
 
 async function startClient(context: vscode.ExtensionContext): Promise<void> {
-  if (client) {
+  await queueClientOperation(() => synchronizeWorkspaceClients(context));
+}
+
+function queueClientOperation(operation: () => Promise<void>): Promise<void> {
+  clientOperations = clientOperations.then(operation, operation);
+  return clientOperations;
+}
+
+function workspaceKey(folder: vscode.WorkspaceFolder): string {
+  return folder.uri.toString();
+}
+
+function workspaceStillPresent(key: string): boolean {
+  return !deactivating &&
+    (vscode.workspace.workspaceFolders?.some((folder) => workspaceKey(folder) === key) ?? false);
+}
+
+async function synchronizeWorkspaceClients(context: vscode.ExtensionContext): Promise<void> {
+  if (deactivating) {
     return;
   }
-
-  const workspaceFolder = getSelectedWorkspaceFolder();
-  if (!workspaceFolder) {
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  const wanted = new Set(folders.map(workspaceKey));
+  for (const [key, entry] of clients) {
+    if (!wanted.has(key) || entry.stopping) {
+      try {
+        await stopWorkspaceClient(key, entry);
+      } catch (error) {
+        setLastError(`Failed to stop LSP for ${entry.folder.name} (${String(error)})`);
+      }
+    }
+  }
+  if (folders.length === 0) {
     const message = 'AETHER: Open a workspace folder first.';
     vscode.window.showErrorMessage(message);
     setLastError(message);
     return;
   }
+  for (const folder of folders) {
+    const key = workspaceKey(folder);
+    if (!clients.has(key) && workspaceStillPresent(key)) {
+      await startWorkspaceClient(context, folder);
+    }
+  }
+}
 
-  selectedWorkspaceFolder = workspaceFolder;
+async function startWorkspaceClient(
+  context: vscode.ExtensionContext,
+  workspaceFolder: vscode.WorkspaceFolder
+): Promise<void> {
+  const key = workspaceKey(workspaceFolder);
   statusModel.startupUntil = Date.now() + STARTUP_INDEXING_WINDOW_MS;
   renderStatusBar();
 
@@ -256,7 +313,13 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
     return;
   }
 
-  const settings = readSettings();
+  if (!workspaceStillPresent(key)) {
+    statusModel.startupUntil = 0;
+    renderStatusBar();
+    return;
+  }
+
+  const settings = readSettings(workspaceFolder.uri);
   const args = [
     '--',
     '--workspace',
@@ -285,33 +348,65 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
   const serverOptions: ServerOptions = executable;
 
   const clientOptions: LanguageClientOptions = {
-    documentSelector: [
-      { scheme: 'file', language: 'rust' },
-      { scheme: 'file', language: 'typescript' },
-      { scheme: 'file', language: 'typescriptreact' },
-      { scheme: 'file', language: 'javascript' },
-      { scheme: 'file', language: 'javascriptreact' },
-    ],
+    documentSelector: ['rust', 'typescript', 'typescriptreact', 'javascript', 'javascriptreact']
+      .map((language) => ({
+        scheme: 'file',
+        language,
+        pattern: `${workspaceFolder.uri.fsPath.replace(/\\/g, '/')
+          .replace(/[\[\]{}*?]/g, (character) => `[${character}]`)}/**/*`,
+      })),
+    workspaceFolder,
     outputChannel,
     middleware: {
       provideHover: async (document, position, token, next) => {
+        const ownsDocument = (): boolean => {
+          const owner = vscode.workspace.getWorkspaceFolder(document.uri);
+          return owner !== undefined && workspaceKey(owner) === key &&
+            workspaceStillPresent(key) && clients.get(key) === entry && !entry.stopping;
+        };
+        if (!ownsDocument()) {
+          return undefined;
+        }
         const hover = await next(document, position, token);
+        if (!ownsDocument()) {
+          return undefined;
+        }
         observeHoverForStaleWarning(document, position, hover);
         return hover;
       },
     },
   };
 
-  client = new LanguageClient('aether', 'AETHER LSP', serverOptions, clientOptions);
+  const entry: WorkspaceClient = {
+    client: new LanguageClient(`aether:${key}`, 'AETHER LSP', serverOptions, clientOptions),
+    folder: workspaceFolder,
+    stopping: false,
+  };
+  clients.set(key, entry);
 
   try {
-    await client.start();
-    clearLastError();
-    outputChannel?.appendLine(`AETHER: Started LSP with ${binaryPath}`);
+    await entry.client.start();
+    if (entry.stopping || !workspaceStillPresent(key)) {
+      await stopWorkspaceClient(key, entry);
+      return;
+    }
+    if (clients.size === (vscode.workspace.workspaceFolders?.length ?? 0)) {
+      clearLastError();
+    }
+    outputChannel?.appendLine(`AETHER: Started LSP for ${workspaceFolder.name} with ${binaryPath}`);
   } catch (error) {
-    client = undefined;
+    // A client whose start failed can't be stopped cleanly; forget it either way so the
+    // next folder sync or restart starts a fresh one.
+    if (clients.get(key) === entry) {
+      clients.delete(key);
+    }
+    try {
+      await entry.client.stop();
+    } catch (stopError) {
+      outputChannel?.appendLine(`AETHER: Failed to clean up LSP for ${workspaceFolder.name} (${String(stopError)})`);
+    }
     const message = error instanceof Error ? error.message : String(error);
-    const wrapped = `Failed to start language client (${message})`;
+    const wrapped = `Failed to start language client for ${workspaceFolder.name} (${message})`;
     setLastError(wrapped);
     vscode.window.showErrorMessage(`AETHER: ${wrapped}`);
   } finally {
@@ -745,8 +840,8 @@ function parseSearchMatch(value: unknown, index: number): SearchMatch {
   };
 }
 
-function readSettings(): AetherSettings {
-  const config = vscode.workspace.getConfiguration('aether');
+function readSettings(scope?: vscode.Uri): AetherSettings {
+  const config = vscode.workspace.getConfiguration('aether', scope);
 
   const provider = config.get<InferenceProvider>('inferenceProvider', 'auto');
   const model =
@@ -777,13 +872,29 @@ function normalizeSearchMode(value: string): SearchMode {
 }
 
 async function stopClient(): Promise<void> {
-  if (!client) {
-    return;
-  }
+  await queueClientOperation(stopAllClients);
+}
 
-  const runningClient = client;
-  client = undefined;
-  await runningClient.stop();
+async function stopWorkspaceClient(key: string, entry: WorkspaceClient): Promise<void> {
+  entry.stopping = true;
+  await entry.client.stop();
+  if (clients.get(key) === entry) {
+    clients.delete(key);
+  }
+}
+
+async function stopAllClients(): Promise<void> {
+  const failures: string[] = [];
+  for (const [key, entry] of clients) {
+    try {
+      await stopWorkspaceClient(key, entry);
+    } catch (error) {
+      failures.push(`${entry.folder.name}: ${String(error)}`);
+    }
+  }
+  if (failures.length > 0) {
+    throw new Error(`Failed to stop workspace language clients (${failures.join('; ')})`);
+  }
 }
 
 async function ensureAetherdBinary(repoRoot: string): Promise<string> {
@@ -912,40 +1023,39 @@ function getSelectedWorkspaceFolder(): vscode.WorkspaceFolder | undefined {
   return vscode.workspace.workspaceFolders?.[0];
 }
 
-function resetWorkspaceSelectionAndWatcher(context: vscode.ExtensionContext): void {
-  if (workspaceMetaWatcher) {
-    workspaceMetaWatcher.dispose();
-    workspaceMetaWatcher = undefined;
-  }
-
+function resetWorkspaceSelectionAndWatcher(): void {
   selectedWorkspaceFolder = getSelectedWorkspaceFolder();
-
-  if (!selectedWorkspaceFolder) {
-    renderStatusBar();
-    return;
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  const wanted = new Set(folders.map(workspaceKey));
+  for (const [key, subscriptions] of workspaceMetaWatchers) {
+    if (!wanted.has(key)) {
+      subscriptions.forEach((subscription) => subscription.dispose());
+      workspaceMetaWatchers.delete(key);
+    }
   }
-
-  const pattern = new vscode.RelativePattern(selectedWorkspaceFolder, '.aether/meta.sqlite');
-  workspaceMetaWatcher = vscode.workspace.createFileSystemWatcher(pattern);
-
-  context.subscriptions.push(workspaceMetaWatcher);
-  context.subscriptions.push(
-    workspaceMetaWatcher.onDidCreate(() => {
-      recordIndexActivity();
-    })
-  );
-  context.subscriptions.push(
-    workspaceMetaWatcher.onDidChange(() => {
-      recordIndexActivity();
-    })
-  );
-  context.subscriptions.push(
-    workspaceMetaWatcher.onDidDelete(() => {
-      recordIndexActivity();
-    })
-  );
-
+  for (const folder of folders) {
+    const key = workspaceKey(folder);
+    if (workspaceMetaWatchers.has(key)) {
+      continue;
+    }
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(folder, '.aether/meta.sqlite')
+    );
+    workspaceMetaWatchers.set(key, [
+      watcher,
+      watcher.onDidCreate(recordIndexActivity),
+      watcher.onDidChange(recordIndexActivity),
+      watcher.onDidDelete(recordIndexActivity),
+    ]);
+  }
   renderStatusBar();
+}
+
+function disposeWorkspaceWatchers(): void {
+  for (const subscriptions of workspaceMetaWatchers.values()) {
+    subscriptions.forEach((subscription) => subscription.dispose());
+  }
+  workspaceMetaWatchers.clear();
 }
 
 function recordIndexActivity(): void {
