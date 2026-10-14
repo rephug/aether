@@ -200,7 +200,7 @@ mod tests {
         let sir = vec![0.7_f32, 0.7, 0.0];
         let (status, sim) = verifier.classify_by_embedding(&clause, &sir);
         assert!(
-            sim >= 0.50 && sim <= 0.88,
+            (0.50..=0.88).contains(&sim),
             "similarity should be in ambiguous range, got {sim}"
         );
         assert_eq!(status, ClauseStatus::Ambiguous);
