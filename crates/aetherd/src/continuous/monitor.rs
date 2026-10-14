@@ -352,6 +352,7 @@ fn score_symbols(
 
     let mut base_score_by_symbol = HashMap::new();
     let mut delta_sem_by_symbol = HashMap::new();
+    let mut source_changed_symbols = HashSet::new();
     let mut scored = Vec::new();
     for symbol_id in candidate_ids {
         let Some(symbol) = symbols_by_id.get(symbol_id.as_str()).cloned() else {
@@ -366,14 +367,24 @@ fn score_symbols(
         } else {
             None
         };
-        let source_changed = missing_meta
-            || source_segment_changed(
+        let evidence = if missing_meta {
+            None
+        } else {
+            source_change_evidence(
+                store,
                 workspace,
                 &symbol,
                 meta.as_ref()
                     .and_then(|record| record.prompt_hash.as_deref()),
                 max_chars,
-            );
+            )?
+        };
+        // Without a recorded hash to compare, the symbol counts as changed for its own
+        // score (as before), but only a seen change propagates to its dependents.
+        let source_changed = missing_meta || evidence.unwrap_or(true);
+        if evidence == Some(true) {
+            source_changed_symbols.insert(symbol.id.clone());
+        }
         let model_deprecated = meta
             .as_ref()
             .is_some_and(|record| model_is_deprecated(record.model.as_str()));
@@ -424,6 +435,7 @@ fn score_symbols(
         &node_map,
         &base_score_by_symbol,
         &delta_sem_by_symbol,
+        &source_changed_symbols,
         continuous.neighbor_decay,
         continuous.neighbor_cutoff,
     );
@@ -504,23 +516,40 @@ fn compute_git_churn_by_file(
     churn
 }
 
+/// Whether `symbol`'s source differs from the text its SIR describes, or `None` when
+/// nothing recorded allows the comparison. The full-source hash the SIR's writer
+/// recorded (`sir.source_hash`) decides when present. Older SIRs fall back to the prompt
+/// hash's source segment, which covers only the text up to the pass's character limit,
+/// so an edit past that point goes unnoticed for them.
+fn source_change_evidence(
+    store: &SqliteStore,
+    workspace: &Path,
+    symbol: &Symbol,
+    stored_prompt_hash: Option<&str>,
+    max_chars: Option<usize>,
+) -> Result<Option<bool>> {
+    let described = store
+        .get_sir_source_hash(symbol.id.as_str())
+        .with_context(|| format!("failed to load the SIR source hash for {}", symbol.id))?;
+    Ok(match described {
+        Some(described) => Some(described != symbol.content_hash),
+        None => source_segment_changed(workspace, symbol, stored_prompt_hash, max_chars),
+    })
+}
+
+/// Compares the prompt hash's source segment with the symbol's current (truncated)
+/// text; `None` when there is no stored hash or the text can't be read.
 fn source_segment_changed(
     workspace: &Path,
     symbol: &Symbol,
     stored_prompt_hash: Option<&str>,
     max_chars: Option<usize>,
-) -> bool {
-    let Some(stored_source) = stored_prompt_hash.and_then(|hash| decompose_prompt_hash(hash).0)
-    else {
-        return true;
-    };
+) -> Option<bool> {
+    let stored_source = stored_prompt_hash.and_then(|hash| decompose_prompt_hash(hash).0)?;
     let current_source = build_job(workspace, symbol.clone(), None, max_chars)
         .map(|job| compute_source_hash_segment(job.symbol_text.as_str()))
-        .ok();
-    match current_source.as_deref() {
-        Some(segment) => segment != stored_source,
-        None => true,
-    }
+        .ok()?;
+    Some(current_source != stored_source)
 }
 
 fn source_hash_limit_for_pass(
@@ -558,24 +587,34 @@ fn load_dependency_graph(
     (graph, node_map)
 }
 
+/// Spreads staleness from each seed to the symbols that depend on it. A seed whose
+/// source changed propagates on that alone: a small (or missing) change in its SIR's
+/// description doesn't show that its callers' assumptions still hold. Other seeds are
+/// weighted by their semantic delta.
 fn propagate_neighbor_staleness(
     graph: &DiGraph<String, ()>,
     node_map: &HashMap<String, NodeIndex>,
     seed_staleness: &HashMap<String, f64>,
     delta_sem: &HashMap<String, f64>,
+    source_changed: &HashSet<String>,
     gamma: f64,
     cutoff: f64,
 ) -> HashMap<String, f64> {
     let mut induced = HashMap::<String, f64>::new();
     for (symbol_id, seed_score) in seed_staleness {
-        let Some(seed_delta) = delta_sem.get(symbol_id.as_str()).copied() else {
-            continue;
+        let weight = if source_changed.contains(symbol_id) {
+            1.0
+        } else {
+            let Some(seed_delta) = delta_sem.get(symbol_id.as_str()).copied() else {
+                continue;
+            };
+            seed_delta
         };
         let Some(&seed_idx) = node_map.get(symbol_id.as_str()) else {
             continue;
         };
 
-        let first_hop = seed_score * gamma * seed_delta;
+        let first_hop = seed_score * gamma * weight;
         if first_hop < cutoff {
             continue;
         }
@@ -761,14 +800,15 @@ fn unix_timestamp_secs() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
 
     use tempfile::tempdir;
 
     use super::{
         ContinuousStatusSnapshot, bands_from_scores, load_dependency_graph, load_status_snapshot,
-        propagate_neighbor_staleness, write_status_snapshot,
+        propagate_neighbor_staleness, source_change_evidence, source_segment_changed,
+        write_status_snapshot,
     };
 
     #[test]
@@ -791,12 +831,57 @@ mod tests {
             &node_map,
             &HashMap::from([("b".to_owned(), 1.0)]),
             &HashMap::from([("b".to_owned(), 1.0)]),
+            &HashSet::new(),
             0.5,
             0.1,
         );
 
         assert_eq!(induced.get("a").copied(), Some(0.5));
         assert_eq!(induced.get("c").copied(), Some(0.25));
+    }
+
+    #[test]
+    fn a_source_change_propagates_even_with_a_small_or_missing_delta() {
+        let edges = vec![
+            aether_store::GraphDependencyEdgeRecord {
+                source_symbol_id: "caller".to_owned(),
+                target_symbol_id: "changed".to_owned(),
+                edge_kind: "calls".to_owned(),
+            },
+            aether_store::GraphDependencyEdgeRecord {
+                source_symbol_id: "other_caller".to_owned(),
+                target_symbol_id: "described".to_owned(),
+                edge_kind: "calls".to_owned(),
+            },
+        ];
+        let (graph, node_map) = load_dependency_graph(&edges);
+        let seeds = HashMap::from([("changed".to_owned(), 1.0), ("described".to_owned(), 1.0)]);
+        // `changed` has a new source but its SIR barely moved; `described` only has
+        // a small description delta.
+        let deltas = HashMap::from([("changed".to_owned(), 0.19), ("described".to_owned(), 0.19)]);
+        let induced = propagate_neighbor_staleness(
+            &graph,
+            &node_map,
+            &seeds,
+            &deltas,
+            &HashSet::from(["changed".to_owned()]),
+            0.5,
+            0.1,
+        );
+        assert_eq!(induced.get("caller").copied(), Some(0.5));
+        assert_eq!(induced.get("other_caller"), None);
+
+        // No delta at all (a batch result has no previous embedding).
+        let induced = propagate_neighbor_staleness(
+            &graph,
+            &node_map,
+            &HashMap::from([("changed".to_owned(), 1.0)]),
+            &HashMap::new(),
+            &HashSet::from(["changed".to_owned()]),
+            0.5,
+            0.1,
+        );
+        assert_eq!(induced.get("caller").copied(), Some(0.5));
     }
 
     #[test]
@@ -824,5 +909,69 @@ mod tests {
         assert_eq!(bands.high, 1);
         assert_eq!(bands.medium, 1);
         assert_eq!(bands.low, 1);
+    }
+
+    fn parse_only_symbol(workspace: &std::path::Path, source: &str) -> aether_core::Symbol {
+        fs::create_dir_all(workspace.join("src")).expect("mkdir src");
+        fs::write(workspace.join("src/lib.rs"), source).expect("write source");
+        aether_parse::SymbolExtractor::new()
+            .expect("parser")
+            .extract_from_path(std::path::Path::new("src/lib.rs"), source)
+            .expect("parse")
+            .remove(0)
+    }
+
+    #[test]
+    fn an_edit_past_the_prompt_limit_counts_as_a_source_change() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let store = aether_store::SqliteStore::open(workspace).expect("open store");
+        let max_chars = 40;
+        let body = |tail: &str| {
+            format!(
+                "pub fn long() -> i32 {{\n    let first = 1;\n    let second = 2;\n    {tail}\n}}\n"
+            )
+        };
+
+        let before = parse_only_symbol(workspace, &body("first + second"));
+        let job = crate::sir_pipeline::build_job(workspace, before.clone(), None, Some(max_chars))
+            .expect("prompt input");
+        let prompt_hash = crate::batch::hash::compute_prompt_hash(&job.symbol_text, &[], "cfg");
+        aether_store::SirStateStore::write_sir_blob(&store, &before.id, "{\"intent\":\"x\"}")
+            .expect("write sir");
+        let conn =
+            rusqlite::Connection::open(workspace.join(".aether/meta.sqlite")).expect("open sqlite");
+        conn.execute(
+            "UPDATE sir SET source_hash = ?1 WHERE id = ?2",
+            [&before.content_hash, &before.id],
+        )
+        .expect("record source hash");
+
+        // Same symbol, edited only past the first `max_chars` characters.
+        let evidence = |symbol: &aether_core::Symbol, prompt_hash: Option<&str>| {
+            source_change_evidence(&store, workspace, symbol, prompt_hash, Some(max_chars))
+                .expect("compare")
+        };
+        let after = parse_only_symbol(workspace, &body("first * second"));
+        assert_eq!(after.id, before.id);
+        assert_eq!(
+            source_segment_changed(workspace, &after, Some(&prompt_hash), Some(max_chars)),
+            Some(false),
+            "the prompt-prefix check can't see this edit"
+        );
+        assert_eq!(evidence(&after, Some(&prompt_hash)), Some(true));
+        let restored = parse_only_symbol(workspace, &body("first + second"));
+        assert_eq!(evidence(&restored, Some(&prompt_hash)), Some(false));
+
+        // Without a recorded source hash, the prefix check is all there is; with no
+        // prompt hash either, there is nothing to compare.
+        conn.execute(
+            "UPDATE sir SET source_hash = NULL WHERE id = ?1",
+            [&before.id],
+        )
+        .expect("clear source hash");
+        let after = parse_only_symbol(workspace, &body("first * second"));
+        assert_eq!(evidence(&after, Some(&prompt_hash)), Some(false));
+        assert_eq!(evidence(&after, None), None);
     }
 }

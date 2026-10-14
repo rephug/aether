@@ -1,4 +1,5 @@
 mod causal;
+mod communities;
 mod coupling;
 mod drift;
 mod graph_algorithms;
@@ -11,6 +12,7 @@ pub use causal::{
     CausalAnalyzer, CausalChainChange, CausalChainCoupling, CausalChainEntry, CausalChainSirDiff,
     TraceCauseAnalysisWindow, TraceCauseRequest, TraceCauseResult, TraceCauseTarget,
 };
+pub use communities::{is_test_symbol, production_community_assignments, test_symbol_ids};
 pub use coupling::{
     AnalysisError, BlastRadiusEntry, BlastRadiusRequest, BlastRadiusResult, CouplingAnalyzer,
     CouplingEdge, CouplingMiningOutcome, CouplingType, MineCouplingRequest, RiskLevel,
