@@ -92,9 +92,11 @@ mod tests {
 
     use super::DocumentEmbedder;
 
+    type UpsertCall = (String, Vec<(String, Vec<f32>)>);
+
     #[derive(Default)]
     struct MockBackend {
-        upserts: Mutex<Vec<(String, Vec<(String, Vec<f32>)>)>>,
+        upserts: Mutex<Vec<UpsertCall>>,
         searches: Mutex<Vec<(String, Vec<f32>, usize)>>,
     }
 
