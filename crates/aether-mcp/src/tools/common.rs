@@ -27,6 +27,27 @@ pub(crate) struct LiveSymbolSources {
     by_file: HashMap<String, Option<HashMap<String, LiveSymbolSource>>>,
 }
 
+/// The real path of an indexed, workspace-relative `file_path`, provided it lies inside
+/// the workspace once symlinks are resolved. An index entry can outlive the file it
+/// named, and a link swapped in later (or a rooted or `..` path) must not make a tool
+/// read another project's source. A missing file reports `NotFound`; a path that
+/// resolves outside the workspace reports `PermissionDenied`.
+pub(crate) fn contained_workspace_file(
+    workspace: &Path,
+    file_path: &str,
+) -> std::io::Result<PathBuf> {
+    let root = workspace.canonicalize()?;
+    let resolved = root.join(file_path).canonicalize()?;
+    if resolved.starts_with(&root) {
+        Ok(resolved)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{file_path} resolves outside the workspace"),
+        ))
+    }
+}
+
 impl LiveSymbolSources {
     pub(crate) fn new(workspace: &Path) -> Self {
         Self {
@@ -77,7 +98,9 @@ impl LiveSymbolSources {
         // failure the caller must see by name: read as "removed", `aether_symbol_lookup`
         // would silently report the match without a source and `/scan` would skip the
         // symbol on every pass with nothing pointing at the file or the cause.
-        let source = match std::fs::read_to_string(self.workspace.join(file_path)) {
+        let source = match contained_workspace_file(&self.workspace, file_path)
+            .and_then(std::fs::read_to_string)
+        {
             Ok(source) => source,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => {
@@ -245,4 +268,42 @@ pub(crate) fn normalize_workspace_relative_path(
     }
 
     Ok(normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    use aether_parse::SymbolExtractor;
+    use tempfile::tempdir;
+
+    use super::LiveSymbolSources;
+
+    #[cfg(unix)]
+    #[test]
+    fn live_sources_refuse_files_that_resolve_outside_the_workspace() {
+        let workspace = tempdir().expect("tempdir");
+        let outside = tempdir().expect("outside tempdir");
+        let source = "pub fn alpha() -> i32 {\n    2 // OUTSIDE_WORKSPACE\n}\n";
+        fs::write(outside.path().join("other.rs"), source).expect("write outside source");
+        fs::create_dir_all(workspace.path().join("src")).expect("mkdir src");
+        std::os::unix::fs::symlink(
+            outside.path().join("other.rs"),
+            workspace.path().join("src/lib.rs"),
+        )
+        .expect("symlink");
+        let symbol_id = SymbolExtractor::new()
+            .expect("parser")
+            .extract_from_path(Path::new("src/lib.rs"), source)
+            .expect("parse")
+            .remove(0)
+            .id;
+
+        let mut sources = LiveSymbolSources::new(workspace.path());
+        let err = sources
+            .source_for("src/lib.rs", &symbol_id)
+            .expect_err("a file outside the workspace must not be read");
+        assert!(err.to_string().contains("outside the workspace"), "{err}");
+    }
 }
