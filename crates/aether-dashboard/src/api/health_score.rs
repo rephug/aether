@@ -189,13 +189,17 @@ async fn load_semantic_input(shared: &SharedState) -> Result<Option<SemanticInpu
     }
 
     let drift_by_symbol = latest_semantic_drift_by_symbol(shared.store.as_ref())?;
-    let community_by_symbol = shared
-        .store
-        .list_latest_community_snapshot()
-        .map_err(|err| format!("failed to list latest community snapshot: {err}"))?
-        .into_iter()
-        .map(|entry| (entry.symbol_id, entry.community_id))
-        .collect::<HashMap<_, _>>();
+    // Computed now, without test symbols and at the planner's resolution, instead of
+    // read from the snapshot the last drift run stored (decision #89.1).
+    let community_by_symbol = aether_analysis::production_community_assignments(
+        shared.store.as_ref(),
+        graph.as_ref(),
+        shared.config.planner.community_resolution,
+    )
+    .await
+    .map_err(|err| format!("failed to compute production communities: {err}"))?
+    .into_iter()
+    .collect::<HashMap<_, _>>();
 
     let mut files = HashMap::new();
     for entry in centrality.files {
