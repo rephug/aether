@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use aether_core::EdgeKind;
 use aether_graph_algo::{
-    GraphAlgorithmEdge, connected_components_sync, louvain_sync, page_rank_sync,
-    strongly_connected_components_sync,
+    GraphAlgorithmEdge, connected_components_sync, louvain_sync, louvain_with_resolution_sync,
+    page_rank_sync, strongly_connected_components_sync,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -199,6 +199,42 @@ impl SurrealGraphStore {
         let assignments = tokio::task::spawn_blocking(move || louvain_sync(&algo_edges))
             .await
             .map_err(|err| StoreError::Graph(format!("spawn_blocking louvain failed: {err}")))?;
+        let mut records = assignments
+            .into_iter()
+            .map(|(node, community)| (node, community as i64))
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(records)
+    }
+
+    /// Louvain communities over the structural dependency graph without the edges that
+    /// touch a symbol in `exclude_symbol_ids`, at the given `resolution` (γ; lower values
+    /// give fewer, larger communities). Excluded symbols get no assignment, and neither
+    /// does a symbol whose only edges were to excluded ones. Callers decide what to
+    /// exclude; [`Self::list_louvain_communities`] is the unfiltered γ = 1.0 variant.
+    pub async fn list_louvain_communities_filtered(
+        &self,
+        resolution: f64,
+        exclude_symbol_ids: &HashSet<String>,
+    ) -> Result<Vec<(String, i64)>, StoreError> {
+        let edges = self
+            .list_dependency_edges_raw()
+            .await?
+            .into_iter()
+            .filter(|edge| {
+                !exclude_symbol_ids.contains(&edge.source_id)
+                    && !exclude_symbol_ids.contains(&edge.target_id)
+            })
+            .collect::<Vec<_>>();
+        if edges.is_empty() {
+            return Ok(Vec::new());
+        }
+        let algo_edges = to_algo_edges(edges);
+        let assignments = tokio::task::spawn_blocking(move || {
+            louvain_with_resolution_sync(&algo_edges, resolution)
+        })
+        .await
+        .map_err(|err| StoreError::Graph(format!("spawn_blocking louvain failed: {err}")))?;
         let mut records = assignments
             .into_iter()
             .map(|(node, community)| (node, community as i64))
@@ -1408,6 +1444,131 @@ mod tests {
             signature_fingerprint: format!("sig-{id}"),
             last_seen_at: 1_700_000_000,
         }
+    }
+
+    async fn seed_calls(graph: &SurrealGraphStore, edges: &[(&str, &str)]) {
+        let mut seen = HashSet::new();
+        for (source, target) in edges {
+            for id in [source, target] {
+                if seen.insert(id.to_string()) {
+                    graph
+                        .upsert_symbol_node(&symbol(id, id, "src/lib.rs"))
+                        .await
+                        .expect("upsert symbol");
+                }
+            }
+            graph
+                .upsert_edge(&ResolvedEdge {
+                    source_id: (*source).to_owned(),
+                    target_id: (*target).to_owned(),
+                    edge_kind: EdgeKind::Calls,
+                    file_path: "src/lib.rs".to_owned(),
+                })
+                .await
+                .expect("upsert edge");
+        }
+    }
+
+    fn community_count(assignments: &[(String, i64)]) -> usize {
+        assignments
+            .iter()
+            .map(|(_, community)| *community)
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    #[tokio::test]
+    async fn louvain_filtered_excludes_test_symbols() {
+        let temp = tempdir().expect("tempdir");
+        let graph = SurrealGraphStore::open(temp.path())
+            .await
+            .expect("open graph");
+        seed_calls(
+            &graph,
+            &[
+                ("alpha", "beta"),
+                ("beta", "gamma"),
+                ("test_alpha", "alpha"),
+                ("test_alpha", "gamma"),
+                // Reachable only through the test: drops out with it.
+                ("test_alpha", "fixture_only"),
+            ],
+        )
+        .await;
+
+        let unfiltered = graph.list_louvain_communities().await.expect("louvain");
+        assert!(unfiltered.iter().any(|(id, _)| id == "test_alpha"));
+
+        let exclude = HashSet::from(["test_alpha".to_owned()]);
+        let filtered = graph
+            .list_louvain_communities_filtered(1.0, &exclude)
+            .await
+            .expect("filtered louvain");
+        let ids = filtered
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["alpha", "beta", "gamma"]);
+
+        let nothing_left = graph
+            .list_louvain_communities_filtered(
+                1.0,
+                &HashSet::from([
+                    "alpha".to_owned(),
+                    "beta".to_owned(),
+                    "test_alpha".to_owned(),
+                ]),
+            )
+            .await
+            .expect("filtered louvain");
+        assert!(nothing_left.is_empty());
+    }
+
+    #[tokio::test]
+    async fn louvain_filtered_uses_resolution() {
+        let temp = tempdir().expect("tempdir");
+        let graph = SurrealGraphStore::open(temp.path())
+            .await
+            .expect("open graph");
+        // Two five-symbol cliques joined by one edge.
+        let mut edges = Vec::new();
+        for group in [
+            ["a1", "a2", "a3", "a4", "a5"],
+            ["b1", "b2", "b3", "b4", "b5"],
+        ] {
+            for (index, source) in group.iter().enumerate() {
+                for target in &group[index + 1..] {
+                    edges.push((*source, *target));
+                }
+            }
+        }
+        edges.push(("a1", "b1"));
+        seed_calls(&graph, &edges).await;
+
+        let none = HashSet::new();
+        let coarse = graph
+            .list_louvain_communities_filtered(0.05, &none)
+            .await
+            .expect("coarse");
+        let default = graph
+            .list_louvain_communities_filtered(1.0, &none)
+            .await
+            .expect("default");
+        let fine = graph
+            .list_louvain_communities_filtered(3.0, &none)
+            .await
+            .expect("fine");
+        assert_eq!(coarse.len(), 10);
+        assert_eq!(community_count(&default), 2, "{default:?}");
+        assert_eq!(
+            default,
+            graph.list_louvain_communities().await.expect("unfiltered"),
+            "γ = 1.0 with nothing excluded matches the unfiltered method"
+        );
+        // A higher γ splits the cliques apart. A lower one can only merge communities;
+        // with these two well-separated cliques it leaves them as they are.
+        assert_eq!(community_count(&fine), 10, "{fine:?}");
+        assert_eq!(community_count(&coarse), 2, "{coarse:?}");
     }
 
     #[tokio::test]
