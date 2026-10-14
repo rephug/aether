@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use aether_store::SirFingerprintHistoryRecord;
 
+use crate::batch::hash::{compute_neighbor_hash_segment, decompose_prompt_hash};
+
 /// Result of semantic velocity computation for a single batch.
 #[derive(Debug, Clone)]
 pub struct VelocityResult {
@@ -25,7 +27,9 @@ pub struct VelocityResult {
 /// V_t = α × S_t + (1 - α) × V_{t-1}
 /// ```
 ///
-/// Model-upgrade spikes (config_changed=true AND source_changed=false) are filtered out.
+/// Model-upgrade spikes are filtered out: rows where the generation config changed but
+/// neither the source nor the neighbor intents did. A real neighbor change counts even
+/// when the config changed too (see [`neighbors_really_changed`]).
 pub fn compute_semantic_velocity(
     records: &[SirFingerprintHistoryRecord],
     pagerank_map: &HashMap<String, f64>,
@@ -33,10 +37,10 @@ pub fn compute_semantic_velocity(
     ema_alpha: f64,
     prev_velocity: Option<f64>,
 ) -> VelocityResult {
-    // Filter out model-upgrade spikes: config changed but source didn't
+    // Filter out model-upgrade spikes: only the config changed.
     let filtered: Vec<&SirFingerprintHistoryRecord> = records
         .iter()
-        .filter(|r| !r.config_changed || r.source_changed)
+        .filter(|r| !r.config_changed || r.source_changed || neighbors_really_changed(r))
         .collect();
 
     let symbols_regenerated = filtered.len();
@@ -90,6 +94,22 @@ pub fn compute_semantic_velocity(
     }
 }
 
+/// Whether the neighbor intents behind a fingerprint row changed. Scan, watcher and
+/// inject prompts carry no neighbor intents while triage and deep prompts do, so moving
+/// between the two flips the neighbor segment without any neighbor changing; only a
+/// change between two prompts that both carried neighbors counts.
+fn neighbors_really_changed(record: &SirFingerprintHistoryRecord) -> bool {
+    if !record.neighbor_changed {
+        return false;
+    }
+    let empty = compute_neighbor_hash_segment(&[]);
+    let segment = |hash: &str| decompose_prompt_hash(hash).1.map(str::to_owned);
+    let previous = record.prompt_hash_previous.as_deref().and_then(segment);
+    let current = segment(&record.prompt_hash);
+    previous.is_some_and(|previous| previous != empty)
+        && current.is_some_and(|current| current != empty)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,6 +120,16 @@ mod tests {
         source_changed: bool,
         config_changed: bool,
     ) -> SirFingerprintHistoryRecord {
+        make_record_with_neighbors(symbol_id, delta_sem, source_changed, false, config_changed)
+    }
+
+    fn make_record_with_neighbors(
+        symbol_id: &str,
+        delta_sem: f64,
+        source_changed: bool,
+        neighbor_changed: bool,
+        config_changed: bool,
+    ) -> SirFingerprintHistoryRecord {
         SirFingerprintHistoryRecord {
             symbol_id: symbol_id.to_owned(),
             timestamp: 1000,
@@ -107,7 +137,7 @@ mod tests {
             prompt_hash_previous: None,
             trigger: "batch".to_owned(),
             source_changed,
-            neighbor_changed: !source_changed,
+            neighbor_changed,
             config_changed,
             generation_model: None,
             generation_pass: None,
@@ -140,6 +170,50 @@ mod tests {
         let result = compute_semantic_velocity(&records, &pr, 0.15, 0.2, None);
         // sym_b is filtered, so 2 symbols regenerated
         assert_eq!(result.symbols_regenerated, 2);
+    }
+
+    /// A fingerprint row between two prompts, with its change flags derived from them.
+    fn transition(
+        symbol_id: &str,
+        before: (&[&str], &str),
+        after: (&[&str], &str),
+    ) -> SirFingerprintHistoryRecord {
+        use crate::batch::hash::{compute_prompt_hash, diff_prompt_hashes};
+        let previous = compute_prompt_hash("fn same() {}", before.0, before.1);
+        let current = compute_prompt_hash("fn same() {}", after.0, after.1);
+        let (source_changed, neighbor_changed, config_changed) =
+            diff_prompt_hashes(&previous, &current);
+        SirFingerprintHistoryRecord {
+            prompt_hash: current,
+            prompt_hash_previous: Some(previous),
+            ..make_record_with_neighbors(
+                symbol_id,
+                0.6,
+                source_changed,
+                neighbor_changed,
+                config_changed,
+            )
+        }
+    }
+
+    #[test]
+    fn velocity_keeps_neighbor_changes_that_coincide_with_a_config_change() {
+        let records = vec![
+            // Neighbor intents changed between two deep prompts: kept.
+            transition("sym_a", (&["old"], "deep:v1"), (&["new"], "deep:v2")),
+            // Scan (no neighbors) to deep: the segment flips, no neighbor changed.
+            transition("sym_b", (&[], "scan:v1"), (&["n"], "deep:v1")),
+            // Config only: filtered.
+            transition("sym_c", (&["n"], "deep:v1"), (&["n"], "deep:v2")),
+        ];
+        let pr = records
+            .iter()
+            .map(|record| (record.symbol_id.clone(), 1.0))
+            .collect::<HashMap<_, _>>();
+
+        let result = compute_semantic_velocity(&records, &pr, 0.15, 0.2, None);
+        assert_eq!(result.symbols_regenerated, 1);
+        assert_eq!(result.symbols_above_noise, 1);
     }
 
     #[test]

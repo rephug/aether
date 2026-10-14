@@ -6,11 +6,11 @@ Semantic intelligence engine for codebases. Indexes symbols into Semantic Intent
 Records (SIRs), stores relationships across SQLite + SurrealDB + vector store,
 and surfaces intelligence via LSP, MCP tools, CLI, and a web dashboard.
 
-Single developer, ~90K+ lines of Rust across a multi-crate workspace.
+Single developer, ~160K lines of Rust across a multi-crate workspace.
 
 ## Repo structure
 
-Rust workspace with 16+ crates under `crates/`.
+Rust workspace with 17 crates under `crates/`.
 
 Key crates and their roles:
 
@@ -21,7 +21,7 @@ Key crates and their roles:
 - `aether-sir` — SIR schema and validation
 - `aether-infer` — inference provider abstraction (Gemini native, OpenAI-compat, Ollama)
 - `aether-store` — SQLite + SurrealDB + vector storage (13 modules after refactor)
-- `aether-mcp` — MCP tools for AI agents (~4800 lines, refactor pending)
+- `aether-mcp` — stdio MCP server for AI agents (one module per tool family under `src/tools/`)
 - `aether-analysis` — drift detection, causal chains, graph health, community detection
 - `aether-memory` — project notes, session context, hybrid search
 - `aether-lsp` — Language Server Protocol implementation
@@ -60,23 +60,18 @@ Key crates and their roles:
 
 ## Validation commands
 
-Per-crate validation (use during iterative development):
+For every crate you change, before committing:
 
 ```bash
 cargo fmt --all --check
-cargo clippy -p <crate> -- -D warnings
+cargo clippy -p <crate> --all-targets -- -D warnings
 cargo test -p <crate>
 ```
 
-Full validation (before committing / PR):
+For `aetherd`, also run clippy and tests with `--features dashboard`, as CI does.
 
-```bash
-cargo fmt --all --check
-cargo clippy -p <crate> -- -D warnings
-cargo test -p <crate>
-```
-
-Never run `cargo test --workspace` or `cargo clippy --workspace` — run per-crate.
+Never run `cargo test --workspace` or `cargo clippy --workspace` — run per-crate, one
+cargo job at a time when worktrees share a target directory.
 
 ## Architecture decisions (locked — do not suggest alternatives)
 
@@ -85,21 +80,21 @@ Never run `cargo test --workspace` or `cargo clippy --workspace` — run per-cra
 - **Pipeline:** three-pass named scan → triage → deep
 - **Databases:** SQLite denormalized hot path + SurrealDB 3.0/SurrealKV for graph queries
 - **Vector store:** SQLite (active), LanceDB (intended backend, deferred due to perf bug)
-- **MCP transport:** HTTP/SSE
+- **MCP transport:** stdio (`aether-mcp`); `aether-query` serves read-only MCP over streamable HTTP (`POST /mcp`)
 - **Dashboard:** HTMX + D3.js + Tailwind CSS
 - **Build tools:** mold linker, sccache, cargo-nextest
 
 ## Build environment
 
-Build settings for WSL2 development environment (relevant if Codex needs to compile):
+Suggested build settings (relevant if Codex needs to compile):
 
 ```bash
-export CARGO_TARGET_DIR=/home/rephu/aether-target
-export CARGO_BUILD_JOBS=2
+export CARGO_TARGET_DIR="$HOME/aether-target"   # outside the repository
+export CARGO_BUILD_JOBS=2                       # raise it on machines with more memory
 export PROTOC=$(which protoc)
 export RUSTC_WRAPPER=sccache
-export TMPDIR=/home/rephu/aether-target/tmp
-mkdir -p $TMPDIR
+export TMPDIR="$CARGO_TARGET_DIR/tmp"
+mkdir -p "$TMPDIR"
 ```
 
 Do NOT use `/tmp/` for build artifacts (RAM-backed tmpfs in WSL2, causes OOM).
@@ -107,11 +102,15 @@ Do NOT use `/mnt/` paths for build targets (Windows 9P filesystem, too slow).
 
 ## Current state
 
-Phase 8 ("The Synthesizer") is active development. Recent work includes:
-- God File refactors of `aether-store` and `aether-config` (both split into 13 modules)
-- Embedding model validation (Gemini Embedding 2 locked at 3072-dim)
-- Community detection quality overhaul
-- TYPE_REF and IMPLEMENTS edge extraction
-- Triage concurrency fix (14x speedup)
+Core schema 21; agent template schema 4; `aether-mcp` exposes 39 tools (40 with the
+`verification` feature).
 
-Pending work: `aether-mcp` refactor, Boundary Leaker false positive fix, health score formula adjustment.
+Shipped: Phases 1–8 (apart from the deferred stages, the 7.5/7.7 vertical crates and
+8.18), Phase 9 stages 9.1–9.5 (Tauri desktop app), Phase 10 stages 10.1–10.7 (batch,
+continuous intelligence, agent hooks, Seismograph, intent contracts, task context,
+batch providers), the audit and contract MCP tools, the omp inference provider (#149),
+and Phase WF's first stage, the `/scan` zero-key onboarding command (#152).
+
+Planned, with specs in `docs/roadmap/`: the rest of Phase WF
+(`phase_wf_the_companion.md`), 5.6b, 8.18 (Boundary Leaker fix), 9.6, 10.1b, 10.5b
+(implicit contracts, part of the 10.5 spec) and Phase 11.

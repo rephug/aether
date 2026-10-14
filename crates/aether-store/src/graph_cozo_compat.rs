@@ -1,6 +1,6 @@
 #![allow(deprecated)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -66,6 +66,17 @@ impl CozoGraphStore {
 
     pub fn list_louvain_communities(&self) -> Result<Vec<(String, i64)>, StoreError> {
         Self::block_on_runtime(self.inner.list_louvain_communities())
+    }
+
+    pub fn list_louvain_communities_filtered(
+        &self,
+        resolution: f64,
+        exclude_symbol_ids: &HashSet<String>,
+    ) -> Result<Vec<(String, i64)>, StoreError> {
+        Self::block_on_runtime(
+            self.inner
+                .list_louvain_communities_filtered(resolution, exclude_symbol_ids),
+        )
     }
 
     pub fn list_cross_community_edges(
