@@ -386,6 +386,7 @@ fn detected_languages() -> Vec<String> {
     let mut has_typescript = false;
     let mut has_python = false;
     let mut has_go = false;
+    let mut has_csharp = false;
 
     for config in LanguageRegistry::default().configs() {
         match config.id {
@@ -393,6 +394,7 @@ fn detected_languages() -> Vec<String> {
             "typescript" | "tsx_js" => has_typescript = true,
             "python" => has_python = true,
             "go" => has_go = true,
+            "csharp" => has_csharp = true,
             _ => {}
         }
     }
@@ -409,6 +411,9 @@ fn detected_languages() -> Vec<String> {
     }
     if has_go {
         languages.push("Go".to_owned());
+    }
+    if has_csharp {
+        languages.push("C#".to_owned());
     }
 
     languages
@@ -952,7 +957,7 @@ mod tests {
     fn detected_languages_names_every_registered_parser() {
         assert_eq!(
             super::detected_languages(),
-            vec!["Rust", "TypeScript/JavaScript", "Python", "Go"]
+            vec!["Rust", "TypeScript/JavaScript", "Python", "Go", "C#"]
         );
     }
 

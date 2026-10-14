@@ -359,6 +359,7 @@ fn language_name(path: &Path) -> String {
         Some("jsx") => "jsx",
         Some("py") => "python",
         Some("go") => "go",
+        Some("cs") => "csharp",
         _ => "text",
     }
     .to_owned()

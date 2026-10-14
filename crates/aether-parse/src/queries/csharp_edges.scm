@@ -1,0 +1,9 @@
+(invocation_expression) @edge.call
+(object_creation_expression) @edge.call
+(using_directive) @edge.depends_on
+(method_declaration) @edge.type_ref
+(constructor_declaration) @edge.type_ref
+(class_declaration) @edge.implements
+(record_declaration) @edge.implements
+(struct_declaration) @edge.implements
+(interface_declaration) @edge.implements
