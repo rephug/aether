@@ -186,6 +186,8 @@ public class Report
 {
     public void Add(Payment.Status status) { }
 
+    public void Bill(Billing.Invoice invoice) { }
+
     public void Order() => new CreateOrder.Command().Send();
 }
 
@@ -194,4 +196,15 @@ public class Task { }
 public class Board : Task
 {
     public void Add(Task task) { }
+
+    public async System.Threading.Tasks.Task RunAsync() { }
+
+    public Task<int> CountAsync() => null;
+}
+
+public class Mapper
+{
+    private readonly Acme.Legacy.Mapper _legacy;
+
+    public int Map(int value) => _legacy.Map(value);
 }

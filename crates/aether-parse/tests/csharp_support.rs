@@ -509,10 +509,15 @@ fn csharp_dotted_names_keep_types_declared_in_other_files() {
         extract_with_edges(RECEIVERS_PATH, include_str!("fixtures/csharp_receivers.cs"));
 
     // `Payment` and `CreateOrder` are not namespaces the file declares or imports, so the
-    // dotted names are their nested types. `Acme.Model.Node` starts at a namespace.
+    // dotted names are their nested types. `Acme.Model.Node` and `Billing.Invoice` (inside
+    // `namespace Acme.Billing`) start at a namespace.
     assert_eq!(
         targets_from(&extracted, "Report::Add", EdgeKind::TypeRef),
         strings(&["Payment::Status"])
+    );
+    assert_eq!(
+        targets_from(&extracted, "Report::Bill", EdgeKind::TypeRef),
+        strings(&["Invoice"])
     );
     assert_eq!(
         targets_from(&extracted, "Report::Order", EdgeKind::Calls),
@@ -529,7 +534,8 @@ fn csharp_types_declared_in_the_file_are_not_mistaken_for_framework_types() {
     let extracted =
         extract_with_edges(RECEIVERS_PATH, include_str!("fixtures/csharp_receivers.cs"));
 
-    // The file declares its own `Task`.
+    // The file declares its own `Task`. The library's, written in full or with a type
+    // argument the file's `Task` doesn't take, is still left out.
     assert_eq!(
         targets_from(&extracted, "Board", EdgeKind::Implements),
         strings(&["Task"])
@@ -538,6 +544,36 @@ fn csharp_types_declared_in_the_file_are_not_mistaken_for_framework_types() {
         targets_from(&extracted, "Board::Add", EdgeKind::TypeRef),
         strings(&["Task"])
     );
+    assert!(targets_from(&extracted, "Board::RunAsync", EdgeKind::TypeRef).is_empty());
+    assert!(targets_from(&extracted, "Board::CountAsync", EdgeKind::TypeRef).is_empty());
+}
+
+#[test]
+fn csharp_calls_to_a_same_named_method_through_a_field_keep_their_edge() {
+    let extracted =
+        extract_with_edges(RECEIVERS_PATH, include_str!("fixtures/csharp_receivers.cs"));
+
+    // `Acme.Legacy.Mapper` is another `Mapper`: only unqualified and `this.` calls to the
+    // caller's own name are dropped.
+    assert_eq!(
+        targets_from(&extracted, "Mapper::Map", EdgeKind::Calls),
+        strings(&["Mapper::Map"])
+    );
+}
+
+#[test]
+fn csharp_partial_test_classes_and_record_structs_are_not_several_test_classes() {
+    let source = "public partial class ParserTests { [Fact] public void A() {} }\n\
+                  public partial class ParserTests { [Fact] public void B() {} }\n\
+                  public readonly record struct Cents(int Value);\n";
+    let extracted = extract_with_edges(TEST_PATH, source);
+    let mut names = extracted
+        .test_intents
+        .iter()
+        .map(|intent| intent.test_name.as_str())
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, ["A", "B"]);
 }
 
 #[test]

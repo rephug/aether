@@ -234,7 +234,7 @@ impl LanguageHooks for CSharpHooks {
         // Test classes in one file may reuse method names. A test is named by its path below
         // the file's outermost class, or by its full path when the file declares several
         // top-level classes. Helper enums, interfaces and structs don't count.
-        let several_top_level = FileTypes::of(node, source).top_level_classes > 1;
+        let several_top_level = FileTypes::of(node, source).top_level_classes.len() > 1;
         let test_name = match declaring_types(node, source) {
             Some(types) if several_top_level => format!("{}::{method_name}", types.join("::")),
             Some(types) if types.len() > 1 => format!("{}::{method_name}", types[1..].join("::")),
@@ -398,12 +398,14 @@ fn call_edge(
         }
         _ => return None,
     };
-    // Overloads share a qualified name, so a call to the caller's own name (an overload
-    // delegating to another, or recursion) would resolve to every overload and read as a
-    // dependency cycle between them.
-    if symbols
-        .iter()
-        .any(|symbol| symbol.id == source_id && symbol.qualified_name == target)
+    // Overloads share a qualified name, so an unqualified or `this.` call to the caller's own
+    // name (an overload delegating to another, or recursion) would resolve to every overload
+    // and read as a dependency cycle between them. A same-named method reached through a
+    // field or `base.` may belong to a same-named type elsewhere and keeps its edge.
+    if calls_own_type(call)
+        && symbols
+            .iter()
+            .any(|symbol| symbol.id == source_id && symbol.qualified_name == target)
     {
         return None;
     }
@@ -413,6 +415,23 @@ fn call_edge(
         edge_kind: EdgeKind::Calls,
         file_path: file_path.to_owned(),
     })
+}
+
+/// Whether an invocation calls a method of the enclosing type: `Name(...)` or `this.Name(...)`.
+fn calls_own_type(call: Node<'_>) -> bool {
+    let Some(function) = call
+        .child_by_field_name("function")
+        .filter(|_| call.kind() == "invocation_expression")
+    else {
+        return false;
+    };
+    match function.kind() {
+        "identifier" | "generic_name" => true,
+        "member_access_expression" => function
+            .child_by_field_name("expression")
+            .is_some_and(|receiver| receiver.kind() == "this"),
+        _ => false,
+    }
 }
 
 /// Spells a call the way C# methods are qualified (`Type::Method`) whenever the receiver's
@@ -814,17 +833,23 @@ fn type_written(node: Node<'_>, source: &[u8]) -> Option<String> {
 /// references to nested types the way their symbols are named.
 struct FileTypes {
     declared: HashSet<String>,
+    /// The declared types with type parameters (`Result<T>`), and those without (`Result`).
+    generic: HashSet<String>,
+    plain: HashSet<String>,
     /// Qualified names of the methods those types declare: `Order::Total`.
     methods: HashSet<String>,
-    /// First segments of the namespaces the file declares or imports, and `using` aliases:
-    /// a dotted name starting with one of them is namespace-qualified.
-    namespace_roots: HashSet<String>,
-    /// Top-level classes and records, the types that can hold tests.
-    top_level_classes: usize,
+    /// Segments of the namespaces the file declares or imports, and `using` aliases: a dotted
+    /// name starting with one of them is namespace-qualified.
+    namespaces: HashSet<String>,
+    /// Roots of the namespaces the file declares.
+    own_roots: HashSet<String>,
+    /// Names of the top-level classes and records, the types that can hold tests.
+    top_level_classes: HashSet<String>,
 }
 
-/// Namespace roots every C# file can name without a `using`.
-const KNOWN_NAMESPACE_ROOTS: &[&str] = &["System", "Microsoft"];
+/// Namespace roots of the .NET libraries. A dotted name starting at one names a library type
+/// (`System.Threading.Tasks.Task`) unless the file's own namespace starts there too.
+const LIBRARY_ROOTS: &[&str] = &["System", "Microsoft"];
 
 /// Containers whose children are declarations of the enclosing scope: namespaces, type bodies
 /// and `#if`/`#elif`/`#else` blocks.
@@ -846,12 +871,12 @@ impl FileTypes {
         }
         let mut types = Self {
             declared: HashSet::new(),
+            generic: HashSet::new(),
+            plain: HashSet::new(),
             methods: HashSet::new(),
-            namespace_roots: KNOWN_NAMESPACE_ROOTS
-                .iter()
-                .map(|root| (*root).to_owned())
-                .collect(),
-            top_level_classes: 0,
+            namespaces: HashSet::new(),
+            own_roots: HashSet::new(),
+            top_level_classes: HashSet::new(),
         };
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
@@ -861,11 +886,22 @@ impl FileTypes {
                         && let Some(parents) = declaring_types(node, source)
                     {
                         if parents.is_empty()
-                            && matches!(kind, "class_declaration" | "record_declaration")
+                            && (kind == "class_declaration"
+                                || (kind == "record_declaration" && !has_token(node, "struct")))
                         {
-                            types.top_level_classes += 1;
+                            types.top_level_classes.insert(name.clone());
                         }
-                        types.declared.insert(qualify(&parents, &name));
+                        let qualified = qualify(&parents, &name);
+                        let mut cursor = node.walk();
+                        if node
+                            .named_children(&mut cursor)
+                            .any(|child| child.kind() == "type_parameter_list")
+                        {
+                            types.generic.insert(qualified.clone());
+                        } else {
+                            types.plain.insert(qualified.clone());
+                        }
+                        types.declared.insert(qualified);
                     }
                     if let Some(body) = node.child_by_field_name("body") {
                         stack.push(body);
@@ -874,9 +910,9 @@ impl FileTypes {
                 // Member bodies never hold named types.
                 kind if DECLARATION_CONTAINERS.contains(&kind) => {
                     if let Some(name) = node.child_by_field_name("name") {
-                        types
-                            .namespace_roots
-                            .insert(namespace_root(&node_text(name, source)));
+                        let segments = namespace_segments(&node_text(name, source));
+                        types.own_roots.extend(segments.first().cloned());
+                        types.namespaces.extend(segments);
                     }
                     let mut cursor = node.walk();
                     stack.extend(node.named_children(&mut cursor));
@@ -884,11 +920,11 @@ impl FileTypes {
                 "using_directive" => {
                     if let Some(alias) = node.child_by_field_name("name") {
                         types
-                            .namespace_roots
+                            .namespaces
                             .insert(node_text(alias, source).trim().to_owned());
                     }
                     if let Some(target) = using_target(node, source) {
-                        types.namespace_roots.insert(namespace_root(&target));
+                        types.namespaces.extend(namespace_segments(&target));
                     }
                 }
                 "method_declaration" => {
@@ -926,22 +962,29 @@ impl FileTypes {
         immediate
     }
 
-    /// Spells a written type the way the parser qualifies C# types: the longest trailing
-    /// part of a dotted name that the file declares (`Order.Builder` → `Order::Builder`),
-    /// a simple name that refers to a nested type with its declaring types (`Builder` →
-    /// `Order::Builder`). A dotted name starting at a namespace keeps its last segment
-    /// (`Acme.Data.Repo` → `Repo`); one starting at a type declared elsewhere names a nested
-    /// type (`Payment.Status` → `Payment::Status`).
+    /// Spells a written type the way the parser qualifies C# types:
+    /// - a .NET library type written in full keeps its dotted name
+    ///   (`System.Threading.Tasks.Task`), which no workspace symbol has;
+    /// - the longest trailing part of a dotted name that the file declares (`Order.Builder` →
+    ///   `Order::Builder`), and a simple name that refers to a nested type with its declaring
+    ///   types (`Builder` → `Order::Builder`);
+    /// - a dotted name starting at a namespace the file declares or imports keeps its last
+    ///   segment (`Acme.Data.Repo` → `Repo`); one starting anywhere else starts at a type
+    ///   declared in another file and names its nested type (`Payment.Status` →
+    ///   `Payment::Status`).
     fn spell(&self, written: &str, at: Node<'_>, source: &[u8]) -> String {
         let segments = written.split('.').collect::<Vec<_>>();
         if let [first, .., last] = segments.as_slice() {
+            if LIBRARY_ROOTS.contains(first) && !self.own_roots.contains(*first) {
+                return written.to_owned();
+            }
             for start in 0..segments.len() {
                 let candidate = segments[start..].join("::");
                 if self.declared.contains(&candidate) {
                     return candidate;
                 }
             }
-            return if self.namespace_roots.contains(*first) {
+            return if self.namespaces.contains(*first) || LIBRARY_ROOTS.contains(first) {
                 (*last).to_owned()
             } else {
                 segments.join("::")
@@ -986,11 +1029,15 @@ fn simple_name(node: Node<'_>, source: &[u8]) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-/// The first segment of a namespace name: `Acme` for `Acme.Billing` or `global::Acme.Billing`.
-fn namespace_root(name: &str) -> String {
+/// The segments of a namespace name: `Acme`, `Billing` for `Acme.Billing` or
+/// `global::Acme.Billing`.
+fn namespace_segments(name: &str) -> Vec<String> {
     let name = name.split_whitespace().collect::<String>();
     let name = name.strip_prefix("global::").unwrap_or(&name);
-    name.split('.').next().unwrap_or(name).to_owned()
+    name.split('.')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn using_target(node: Node<'_>, source: &[u8]) -> Option<String> {
@@ -1083,9 +1130,11 @@ fn type_ref_edges(
 }
 
 /// Whether a written type, spelled as `spelled`, may be declared in the workspace: not a type
-/// parameter in scope, and not one of the listed base class library types unless the file
-/// declares a type of that name.
+/// parameter in scope, not a .NET library type written in full, and not one of the listed base
+/// class library types unless the file declares a type of that name and arity (`Task<int>` is
+/// still the library's when the file declares a plain `Task`).
 fn is_workspace_type(
+    node: Node<'_>,
     written: &str,
     spelled: &str,
     type_parameters: &HashSet<String>,
@@ -1094,7 +1143,29 @@ fn is_workspace_type(
     if !written.contains('.') && type_parameters.contains(written) {
         return false;
     }
-    types.declared.contains(spelled) || !BCL_TYPES.contains(&spelled)
+    if spelled.contains('.') {
+        return false;
+    }
+    let declared = if is_generic_use(node) {
+        &types.generic
+    } else {
+        &types.plain
+    };
+    declared.contains(spelled) || !BCL_TYPES.contains(&spelled)
+}
+
+/// Whether a written type carries type arguments: `Task<int>`, `Acme.Result<T>`, `Task<int>?`.
+fn is_generic_use(node: Node<'_>) -> bool {
+    match node.kind() {
+        "generic_name" => true,
+        "qualified_name" | "alias_qualified_name" => {
+            node.child_by_field_name("name").is_some_and(is_generic_use)
+        }
+        "nullable_type" | "pointer_type" | "ref_type" | "scoped_type" => {
+            node.child_by_field_name("type").is_some_and(is_generic_use)
+        }
+        _ => false,
+    }
 }
 
 fn collect_type_refs(
@@ -1108,7 +1179,7 @@ fn collect_type_refs(
         "identifier" | "qualified_name" | "alias_qualified_name" | "generic_name" => {
             if let Some(written) = type_written(node, source) {
                 let spelled = types.spell(&written, node, source);
-                if is_workspace_type(&written, &spelled, type_parameters, types) {
+                if is_workspace_type(node, &written, &spelled, type_parameters, types) {
                     out.push(spelled);
                 }
             }
@@ -1170,10 +1241,10 @@ fn implements_edges(
 
     let mut targets = base_types(declaration)
         .into_iter()
-        .filter_map(|base| type_written(base, source))
-        .filter_map(|written| {
+        .filter_map(|base| {
+            let written = type_written(base, source)?;
             let spelled = types.spell(&written, declaration, source);
-            is_workspace_type(&written, &spelled, &type_parameters, &types).then_some(spelled)
+            is_workspace_type(base, &written, &spelled, &type_parameters, &types).then_some(spelled)
         })
         .collect::<Vec<_>>();
     targets.sort();
