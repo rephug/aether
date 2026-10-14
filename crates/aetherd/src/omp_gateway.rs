@@ -498,10 +498,12 @@ mod tests {
         assert!(!run_uses_omp(&plain, InferenceProviderKind::Gemini));
         assert!(run_uses_omp(&plain, InferenceProviderKind::Omp));
 
-        let mut quality = AetherConfig::default();
-        quality.sir_quality = SirQualityConfig {
-            deep_provider: Some(" OMP ".to_owned()),
-            ..SirQualityConfig::default()
+        let quality = AetherConfig {
+            sir_quality: SirQualityConfig {
+                deep_provider: Some(" OMP ".to_owned()),
+                ..SirQualityConfig::default()
+            },
+            ..AetherConfig::default()
         };
         assert!(run_uses_omp(&quality, InferenceProviderKind::Gemini));
 
