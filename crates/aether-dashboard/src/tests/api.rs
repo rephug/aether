@@ -584,3 +584,136 @@ async fn contracts_api_returns_ok() {
     assert!(json["data"].get("recent_violations").is_some());
     assert!(json["data"]["recent_violations"].is_array());
 }
+
+async fn post_settings_form(app: &axum::Router, section: &str, form: &str) -> (StatusCode, String) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/settings/{section}"))
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(form.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+async fn get_settings_json(app: &axum::Router, section: &str) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/settings/{section}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn settings_save_tiered_without_tiered_fields_keeps_tiered_defaults() {
+    let (_tmp, app) = empty_app().await;
+
+    // What the inference form submitted after switching the provider to Tiered
+    // while [inference.tiered] was unset: no tiered.* inputs at all.
+    let (status, body) = post_settings_form(
+        &app,
+        "inference",
+        "provider=tiered&model=&api_key_env=GEMINI_API_KEY&concurrency=2",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, json) = get_settings_json(&app, "inference").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"]["provider"], "tiered");
+    let tiered = &json["data"]["tiered"];
+    assert_eq!(tiered["primary_threshold"].as_f64(), Some(0.8), "{tiered}");
+    assert_eq!(tiered["retry_with_fallback"], Value::Bool(true), "{tiered}");
+}
+
+#[tokio::test]
+async fn settings_save_tiered_without_tiered_fields_keeps_existing_tiered_table() {
+    let (tmp, app) = empty_app().await;
+
+    let stored_tiered = aether_config::TieredConfig {
+        primary: "openai_compat".to_owned(),
+        primary_model: Some("gpt-4o-mini".to_owned()),
+        primary_endpoint: Some("https://primary.example/v1".to_owned()),
+        primary_api_key_env: "PRIMARY_KEY".to_owned(),
+        primary_threshold: 0.6,
+        fallback_model: Some("fallback-model".to_owned()),
+        fallback_endpoint: Some("https://fallback.example/v1".to_owned()),
+        retry_with_fallback: false,
+    };
+    let mut config = aether_config::load_workspace_config(tmp.path()).unwrap();
+    config.inference.provider = aether_config::InferenceProviderKind::Tiered;
+    config.inference.tiered = Some(stored_tiered.clone());
+    save_workspace_config(tmp.path(), &config).unwrap();
+
+    // A hand-made save that only changes concurrency and sends no tiered.* fields
+    // must leave the stored tiered table as it is.
+    let (status, body) = post_settings_form(
+        &app,
+        "inference",
+        "provider=tiered&api_key_env=GEMINI_API_KEY&concurrency=8",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, json) = get_settings_json(&app, "inference").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"]["provider"], "tiered");
+    assert_eq!(json["data"]["concurrency"], 8);
+    assert_eq!(
+        json["data"]["tiered"],
+        serde_json::to_value(&stored_tiered).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn settings_save_rejects_values_that_would_make_config_unloadable() {
+    let (tmp, app) = empty_app().await;
+    let config_path = aether_config::config_path(tmp.path());
+    let before = fs::read(&config_path).unwrap();
+
+    for (section, form) in [
+        ("inference", "provider=bogus&api_key_env=X&concurrency=4"),
+        ("inference", "api_key_env=X&concurrency=4"),
+        (
+            "search",
+            "reranker=bogus&rerank_window=50&thresholds.default=0.5&thresholds.rust=0.5\
+             &thresholds.typescript=0.5&thresholds.python=0.5\
+             &providers.cohere.api_key_env=OTHER_KEY",
+        ),
+    ] {
+        let (status, body) = post_settings_form(&app, section, form).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{section} {form}: {body}"
+        );
+        assert!(body.contains("Validation errors"), "{body}");
+        if form.contains("bogus") {
+            assert!(body.contains("bogus"), "{body}");
+        }
+        assert_eq!(
+            fs::read(&config_path).unwrap(),
+            before,
+            "config.toml changed for {section} {form}"
+        );
+    }
+
+    let (status, json) = get_settings_json(&app, "inference").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"]["provider"], "auto");
+}

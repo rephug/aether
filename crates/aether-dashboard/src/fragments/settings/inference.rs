@@ -74,7 +74,9 @@ pub(crate) fn render(config: &AetherConfig, params: &HashMap<String, String>) ->
             ))
 
             @if provider_str == "tiered" {
-                (render_tiered_section(c.tiered.as_ref()))
+                // Render the defaults when [inference.tiered] is unset so saving
+                // submits them instead of leaving the tiered fields out of the form.
+                (render_tiered_section(&c.tiered.clone().unwrap_or_default()))
             }
 
             (helpers::save_reset_buttons("inference"))
@@ -82,18 +84,7 @@ pub(crate) fn render(config: &AetherConfig, params: &HashMap<String, String>) ->
     }
 }
 
-fn render_tiered_section(tiered: Option<&aether_config::TieredConfig>) -> Markup {
-    let t = match tiered {
-        Some(t) => t,
-        None => {
-            return html! {
-                p class="text-xs text-text-muted italic" {
-                    "Tiered configuration not set. Save with Tiered provider to initialize defaults."
-                }
-            };
-        }
-    };
-
+fn render_tiered_section(t: &aether_config::TieredConfig) -> Markup {
     let content = html! {
         (helpers::text_input(
             "tiered.primary",
