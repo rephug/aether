@@ -692,6 +692,7 @@ fn parse_language_field(language: Option<&str>) -> Result<Language, AetherMcpErr
         "javascript" => Ok(Language::JavaScript),
         "jsx" => Ok(Language::Jsx),
         "python" => Ok(Language::Python),
+        "go" => Ok(Language::Go),
         _ => Err(AetherMcpError::Message(format!(
             "unsupported language: {value}"
         ))),
@@ -830,4 +831,43 @@ fn meta_status_fields(
     let last_attempt_at = (meta.last_attempt_at > 0).then_some(meta.last_attempt_at);
 
     (sir_status, last_error, last_attempt_at)
+}
+
+#[cfg(test)]
+mod language_tests {
+    use aether_core::Language;
+
+    use super::parse_language_field;
+
+    #[test]
+    fn reads_every_stored_language_spelling() {
+        for language in [
+            Language::Rust,
+            Language::TypeScript,
+            Language::Tsx,
+            Language::JavaScript,
+            Language::Jsx,
+            Language::Python,
+            Language::Go,
+        ] {
+            lists_every_variant(language);
+            assert_eq!(
+                parse_language_field(Some(language.as_str())).expect("known language"),
+                language
+            );
+        }
+    }
+
+    /// Stops compiling when `Language` gains a variant, so the list above gets it too.
+    fn lists_every_variant(language: Language) {
+        match language {
+            Language::Rust
+            | Language::TypeScript
+            | Language::Tsx
+            | Language::JavaScript
+            | Language::Jsx
+            | Language::Python
+            | Language::Go => {}
+        }
+    }
 }

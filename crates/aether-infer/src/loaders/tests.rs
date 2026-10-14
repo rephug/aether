@@ -97,9 +97,7 @@ fn load_embedding_provider_openai_compat_requires_endpoint() {
             .as_nanos()
     );
 
-    unsafe {
-        env::set_var(&env_name, "test-key");
-    }
+    let _env = crate::env_vars::overrides::set(&env_name, "test-key");
 
     std::fs::write(
         workspace.join(".aether/config.toml"),
@@ -122,10 +120,6 @@ api_key_env = "{env_name}"
         Ok(_) => panic!("expected missing endpoint"),
         Err(err) => panic!("expected missing endpoint, got {err}"),
     }
-
-    unsafe {
-        env::remove_var(env_name);
-    }
 }
 
 #[test]
@@ -142,9 +136,7 @@ fn load_embedding_provider_openai_compat_requires_model() {
             .as_nanos()
     );
 
-    unsafe {
-        env::set_var(&env_name, "test-key");
-    }
+    let _env = crate::env_vars::overrides::set(&env_name, "test-key");
 
     std::fs::write(
         workspace.join(".aether/config.toml"),
@@ -166,10 +158,6 @@ api_key_env = "{env_name}"
         Err(InferError::MissingModel) => {}
         Ok(_) => panic!("expected missing model"),
         Err(err) => panic!("expected missing model, got {err}"),
-    }
-
-    unsafe {
-        env::remove_var(env_name);
     }
 }
 
@@ -218,9 +206,7 @@ fn load_embedding_provider_openai_compat_constructs_with_valid_config() {
             .as_nanos()
     );
 
-    unsafe {
-        env::set_var(&env_name, "test-key");
-    }
+    let _env = crate::env_vars::overrides::set(&env_name, "test-key");
 
     std::fs::write(
         workspace.join(".aether/config.toml"),
@@ -248,10 +234,6 @@ dimensions = 3072
         EmbeddingProviderKind::OpenAiCompat.as_str()
     );
     assert_eq!(loaded.model_name, "text-embedding-3-large");
-
-    unsafe {
-        env::remove_var(env_name);
-    }
 }
 
 #[test]
@@ -268,9 +250,7 @@ fn load_embedding_provider_gemini_native_requires_model() {
             .as_nanos()
     );
 
-    unsafe {
-        env::set_var(&env_name, "test-key");
-    }
+    let _env = crate::env_vars::overrides::set(&env_name, "test-key");
 
     std::fs::write(
         workspace.join(".aether/config.toml"),
@@ -291,10 +271,6 @@ api_key_env = "{env_name}"
         Err(InferError::MissingModel) => {}
         Ok(_) => panic!("expected missing model"),
         Err(err) => panic!("expected missing model, got {err}"),
-    }
-
-    unsafe {
-        env::remove_var(env_name);
     }
 }
 
@@ -340,9 +316,7 @@ fn load_embedding_provider_gemini_native_constructs_with_valid_config() {
             .as_nanos()
     );
 
-    unsafe {
-        env::set_var(&env_name, "test-key");
-    }
+    let _env = crate::env_vars::overrides::set(&env_name, "test-key");
 
     std::fs::write(
         workspace.join(".aether/config.toml"),
@@ -368,10 +342,6 @@ dimensions = 3072
         EmbeddingProviderKind::GeminiNative.as_str()
     );
     assert_eq!(loaded.model_name, "gemini-embedding-2-preview");
-
-    unsafe {
-        env::remove_var(env_name);
-    }
 }
 
 #[test]
@@ -428,9 +398,7 @@ fn load_provider_auto_chooses_gemini_when_key_present() {
             .as_nanos()
     );
 
-    unsafe {
-        env::set_var(&env_name, "test-key");
-    }
+    let _env = crate::env_vars::overrides::set(&env_name, "test-key");
 
     let loaded = load_provider_from_env_or_mock(
         temp.path(),
@@ -445,10 +413,6 @@ fn load_provider_auto_chooses_gemini_when_key_present() {
 
     assert_eq!(loaded.provider_name, InferenceProviderKind::Gemini.as_str());
     assert_eq!(loaded.model_name, GEMINI_DEFAULT_MODEL);
-
-    unsafe {
-        env::remove_var(env_name);
-    }
 }
 
 #[test]
@@ -529,9 +493,7 @@ fn load_provider_omp_requires_route_model() {
     let temp = tempdir().expect("tempdir");
     ensure_workspace_config(temp.path()).expect("ensure config");
     let env_name = "AETHER_TEST_OMP_TOKEN_ROUTE_ZZZZZ";
-    unsafe {
-        env::set_var(env_name, "gateway-token");
-    }
+    let _env = crate::env_vars::overrides::set(env_name, "gateway-token");
 
     let missing = load_provider_from_env_or_mock(
         temp.path(),
@@ -565,10 +527,6 @@ fn load_provider_omp_requires_route_model() {
         Ok(_) => panic!("expected invalid config, got a provider"),
         Err(other) => panic!("expected invalid config, got {other}"),
     }
-
-    unsafe {
-        env::remove_var(env_name);
-    }
 }
 
 #[test]
@@ -576,9 +534,7 @@ fn load_provider_omp_constructs_gateway_provider_from_env_token() {
     let temp = tempdir().expect("tempdir");
     ensure_workspace_config(temp.path()).expect("ensure config");
     let env_name = "AETHER_TEST_OMP_TOKEN_OK_ZZZZZ";
-    unsafe {
-        env::set_var(env_name, "gateway-token");
-    }
+    let _env = crate::env_vars::overrides::set(env_name, "gateway-token");
 
     let loaded = load_provider_from_env_or_mock(
         temp.path(),
@@ -595,10 +551,6 @@ fn load_provider_omp_constructs_gateway_provider_from_env_token() {
     assert_eq!(loaded.provider_name, InferenceProviderKind::Omp.as_str());
     assert_eq!(loaded.model_name, "anthropic/claude-fable-5");
     assert_eq!(loaded.provider.provider_name(), "omp");
-
-    unsafe {
-        env::remove_var(env_name);
-    }
 }
 
 #[test]
@@ -673,9 +625,7 @@ fn load_provider_openai_compat_requires_endpoint() {
             .expect("time")
             .as_nanos()
     );
-    unsafe {
-        env::set_var(&env_name, "test-key");
-    }
+    let _env = crate::env_vars::overrides::set(&env_name, "test-key");
 
     let result = load_provider_from_env_or_mock(
         temp.path(),
@@ -691,10 +641,6 @@ fn load_provider_openai_compat_requires_endpoint() {
         Err(InferError::MissingEndpoint) => {}
         _ => panic!("expected missing endpoint"),
     }
-
-    unsafe {
-        env::remove_var(env_name);
-    }
 }
 
 #[test]
@@ -709,9 +655,7 @@ fn load_provider_openai_compat_requires_model() {
             .expect("time")
             .as_nanos()
     );
-    unsafe {
-        env::set_var(&env_name, "test-key");
-    }
+    let _env = crate::env_vars::overrides::set(&env_name, "test-key");
 
     let result = load_provider_from_env_or_mock(
         temp.path(),
@@ -726,10 +670,6 @@ fn load_provider_openai_compat_requires_model() {
     match result {
         Err(InferError::MissingModel) => {}
         _ => panic!("expected missing model"),
-    }
-
-    unsafe {
-        env::remove_var(env_name);
     }
 }
 
@@ -792,9 +732,7 @@ reranker = "cohere"
             .expect("time")
             .as_nanos()
     );
-    unsafe {
-        env::remove_var(&env_name);
-    }
+    let _env = crate::env_vars::overrides::unset(&env_name);
 
     let result = load_reranker_provider_from_config(
         workspace,
