@@ -20,11 +20,11 @@ Every symbol gets a `[MOCK]` placeholder SIR at confidence 0.1 — the
 
 Gemini path (faster for 10K+ symbol codebases, ~$2):
 
-    aetherd --workspace . --index-once   # with [inference] configured for Gemini
+    aetherd --workspace . --index-once --full   # with [inference] configured for Gemini
 
 ## 2. Wire up your AI agent
 
-    aetherd --workspace . init-agent --platform claude   # or gemini | codex | cursor | all
+    aetherd --workspace . init-agent --platform claude   # or codex | cursor | omp | all
 
 This generates CLAUDE.md (behavioral guidance + required actions), a
 skill file, the AETHER slash commands under `.claude/commands/`,
@@ -43,7 +43,10 @@ running). To register it by hand instead:
     /next          # health-guided advisor picks the highest-value target
     /enrich <crate>  # deep SIRs with reasoning traces (Max subscription, $0)
 
-## 5. The daily loop
+## 5. The daily loop (planned)
+
+These workflow commands are planned and not available yet: `init-agent` doesn't
+generate them today.
 
     /health-check            # 30-second morning check-in
     /explain-area <target>   # orient in unfamiliar code
@@ -55,7 +58,9 @@ running). To register it by hand instead:
 ## Troubleshooting
 
 - **"attempt to write a readonly database" / lock errors:** stop the
-  daemon before CLI commands: `pkill -f aetherd && rm -f .aether/graph/LOCK`
-- **Semantic search feels stale after bulk enrichment:** run
-  `aetherd regenerate --embed-only` (until auto-refresh ships)
+  daemon before CLI commands: `pkill -x aetherd && rm -f .aether/graph/LOCK`
+- **Semantic search feels stale after bulk enrichment:** an MCP
+  `aether_sir_inject` refreshes that symbol's embedding automatically. For SIRs
+  written another way, re-embed with
+  `aetherd --workspace . --index-once --embeddings-only`.
 - Dashboard lives at http://localhost:9730 when the daemon is running.

@@ -14,6 +14,7 @@ use tempfile::tempdir;
 
 mod embeddings;
 mod intents;
+mod method_dependencies;
 mod persistence;
 mod processing;
 mod source_guards;

@@ -2,6 +2,11 @@
 
 This extension starts the AETHER LSP server over stdio and adds command/status UX for indexing and symbol search in Rust/TypeScript/JavaScript workspaces.
 
+In a multi-root workspace the extension starts one AETHER language server per folder,
+and each answers hovers only for files its folder owns (with nested folders, the
+innermost one). Adding or removing a folder starts or stops just that folder's server.
+The index and search commands still act on the first folder.
+
 ## What It Is Useful For
 
 - Quick symbol understanding while reading unfamiliar code.

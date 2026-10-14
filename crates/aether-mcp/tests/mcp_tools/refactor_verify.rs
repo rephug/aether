@@ -66,6 +66,42 @@ pub fn beta() -> i32 { alpha() }
     Ok(())
 }
 
+#[cfg(all(feature = "verification", unix))]
+#[test]
+fn mcp_verify_is_refused_by_a_read_only_server() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    fs::create_dir_all(workspace.join(".aether"))?;
+    fs::write(
+        workspace.join(".aether/config.toml"),
+        r#"[storage]
+graph_backend = "sqlite"
+
+[verify]
+commands = ["touch verify-ran.marker"]
+"#,
+    )?;
+    // Create the store, then serve it read-only.
+    drop(SharedState::open_readwrite(workspace)?);
+    let server = AetherMcpServer::from_state(
+        std::sync::Arc::new(SharedState::open_readonly(workspace)?),
+        false,
+    );
+
+    let result = Runtime::new()?.block_on(server.aether_verify(Parameters(AetherVerifyRequest {
+        commands: None,
+        mode: None,
+        fallback_to_host_on_unavailable: None,
+        fallback_to_container_on_unavailable: None,
+    })));
+    let Err(err) = result else {
+        panic!("a read-only server must not run verification commands");
+    };
+    assert!(err.to_string().contains("read-only"), "{err}");
+    assert!(!workspace.join("verify-ran.marker").exists());
+    Ok(())
+}
+
 #[cfg(feature = "verification")]
 #[test]
 fn mcp_verify_runs_allowlisted_subset_and_has_stable_response_shape() -> Result<()> {

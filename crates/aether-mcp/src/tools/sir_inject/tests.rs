@@ -7,7 +7,7 @@ use tempfile::tempdir;
 
 use super::{
     AetherSirInjectRequest, AetherSirInjectResponse, DEFAULT_INJECT_CONFIDENCE,
-    resolve_symbol_selector, round_confidence_for_display,
+    SYMBOL_SELECTOR_LABEL, resolve_symbol_selector, round_confidence_for_display,
 };
 use crate::AetherMcpServer;
 
@@ -100,7 +100,8 @@ fn resolve_symbol_selector_prefers_exact_matches() {
     seed_symbol(temp.path(), "sym-alpha", "crate::alpha");
     let store = aether_store::SqliteStore::open(temp.path()).expect("open store");
 
-    let resolved = resolve_symbol_selector(&store, "crate::alpha").expect("resolve symbol");
+    let resolved = resolve_symbol_selector(&store, SYMBOL_SELECTOR_LABEL, "crate::alpha")
+        .expect("resolve symbol");
     assert_eq!(resolved.id, "sym-alpha");
 }
 
