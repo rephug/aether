@@ -208,66 +208,169 @@ pub(crate) fn parse_and_validate_sir(candidate_json: &str) -> Result<SirAnnotati
 
 pub(crate) fn normalize_candidate_json(candidate_json: &str) -> String {
     let trimmed = candidate_json.trim();
+    // A response that already is a JSON object is returned as is: fence markers and
+    // `,}` / `,]` may legitimately appear inside its strings, and the repairs below
+    // must not touch them.
+    if is_json_object(trimmed) {
+        return trimmed.to_owned();
+    }
+
+    // Otherwise try each way of finding the object, most specific first, and keep the
+    // first that yields a JSON object. Fences found by the string-aware scanner come
+    // first; the plain text search for fences stays as a fallback for prose the scanner
+    // misreads (an unmatched brace followed by a stray quote, for instance).
+    let mut candidates = Vec::new();
+    let fences = fence_offsets(trimmed);
+    let tagged_fence = fences
+        .iter()
+        .copied()
+        .find(|&opening| is_json_tag(trimmed, opening));
+    for opening in [tagged_fence, fences.first().copied()]
+        .into_iter()
+        .flatten()
+    {
+        candidates.extend(extract_fenced_body(trimmed, opening, &fences));
+    }
     let lower = trimmed.to_ascii_lowercase();
-
-    let cleanup_trailing_commas = |input: &str| -> String {
-        let chars: Vec<char> = input.chars().collect();
-        let mut out = String::with_capacity(input.len());
-        let mut index = 0usize;
-
-        while index < chars.len() {
-            let current = chars[index];
-            if current == ',' {
-                let mut lookahead = index + 1;
-                while lookahead < chars.len() && chars[lookahead].is_whitespace() {
-                    lookahead += 1;
-                }
-
-                if lookahead < chars.len() && matches!(chars[lookahead], ']' | '}') {
-                    index += 1;
-                    continue;
-                }
-            }
-
-            out.push(current);
-            index += 1;
-        }
-
-        out
-    };
-
-    let extract_fenced_body = |input: &str, opening_idx: usize| -> Option<String> {
-        let fence_payload = input.get((opening_idx + 3)..)?;
-        let newline_idx = fence_payload.find('\n')?;
-        let body_start = opening_idx + 3 + newline_idx + 1;
-        let after_newline = input.get(body_start..)?;
-        let closing_idx = after_newline.find("```")?;
-        Some(after_newline[..closing_idx].trim().to_owned())
-    };
-
-    if let Some(idx) = lower.find("```json")
-        && let Some(extracted) = extract_fenced_body(trimmed, idx)
+    for opening in [lower.find("```json"), trimmed.find("```")]
+        .into_iter()
+        .flatten()
     {
-        return cleanup_trailing_commas(extracted.as_str());
+        candidates.extend(extract_fenced_bodies_plain(trimmed, opening));
     }
-
-    if let Some(idx) = trimmed.find("```")
-        && let Some(extracted) = extract_fenced_body(trimmed, idx)
-    {
-        return cleanup_trailing_commas(extracted.as_str());
-    }
-
     if trimmed.starts_with('{') {
-        return cleanup_trailing_commas(trimmed);
+        candidates.push(trimmed.to_owned());
     }
-
     if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}'))
         && start < end
     {
-        return cleanup_trailing_commas(&trimmed[start..=end]);
+        candidates.push(trimmed[start..=end].to_owned());
     }
 
-    trimmed.to_owned()
+    let candidates = candidates
+        .iter()
+        .map(|candidate| cleanup_trailing_commas(candidate))
+        .collect::<Vec<_>>();
+    candidates
+        .iter()
+        .find(|candidate| is_json_object(candidate))
+        .or(candidates.first())
+        .cloned()
+        .unwrap_or_else(|| trimmed.to_owned())
+}
+
+fn is_json_object(text: &str) -> bool {
+    matches!(serde_json::from_str::<Value>(text), Ok(Value::Object(_)))
+}
+
+/// Whether the fence opening at `opening` is tagged `json` (case-insensitive).
+fn is_json_tag(input: &str, opening: usize) -> bool {
+    input
+        .get(opening + 3..opening + 7)
+        .is_some_and(|tag| tag.eq_ignore_ascii_case("json"))
+}
+
+/// Removes commas that directly precede a closing `]` or `}`, leaving everything inside
+/// JSON strings untouched.
+fn cleanup_trailing_commas(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (index, &current) in chars.iter().enumerate() {
+        if in_string {
+            out.push(current);
+            if escaped {
+                escaped = false;
+            } else if current == '\\' {
+                escaped = true;
+            } else if current == '"' {
+                in_string = false;
+            }
+        } else if current == '"' {
+            in_string = true;
+            out.push(current);
+        } else if current == ',' {
+            let next = chars[index + 1..]
+                .iter()
+                .find(|candidate| !candidate.is_whitespace());
+            if !matches!(next, Some(']' | '}')) {
+                out.push(current);
+            }
+        } else {
+            out.push(current);
+        }
+    }
+
+    out
+}
+
+/// Byte offsets of the ```` ``` ```` markers outside JSON strings. Quotes only open a
+/// string inside a `{...}` or `[...]` container, so balanced quotes in surrounding
+/// prose don't hide a real fence.
+fn fence_offsets(input: &str) -> Vec<usize> {
+    let bytes = input.as_bytes();
+    let mut offsets = Vec::new();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        let current = bytes[index];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if current == b'\\' {
+                escaped = true;
+            } else if current == b'"' {
+                in_string = false;
+            }
+        } else if current == b'"' && depth > 0 {
+            in_string = true;
+        } else if matches!(current, b'{' | b'[') {
+            depth += 1;
+        } else if matches!(current, b'}' | b']') {
+            depth = depth.saturating_sub(1);
+        } else if bytes.get(index..index + 3) == Some(b"```".as_slice()) {
+            offsets.push(index);
+            index += 3;
+            continue;
+        }
+        index += 1;
+    }
+
+    offsets
+}
+
+/// The trimmed body between the fence that opens at `opening` (after its info line)
+/// and the next fence marker the scanner found.
+fn extract_fenced_body(input: &str, opening: usize, fences: &[usize]) -> Option<String> {
+    let info_and_body = input.get(opening + 3..)?;
+    let body_start = opening + 3 + info_and_body.find('\n')? + 1;
+    let closing = fences
+        .iter()
+        .copied()
+        .find(|offset| *offset >= body_start)?;
+    Some(input.get(body_start..closing)?.trim().to_owned())
+}
+
+/// The trimmed bodies between the fence that opens at `opening` and each later
+/// ```` ``` ```` in the text, nearest first, without regard to JSON strings.
+fn extract_fenced_bodies_plain(input: &str, opening: usize) -> Vec<String> {
+    let Some(info_and_body) = input.get(opening + 3..) else {
+        return Vec::new();
+    };
+    let Some(newline) = info_and_body.find('\n') else {
+        return Vec::new();
+    };
+    let body_start = opening + 3 + newline + 1;
+    let after = &input[body_start..];
+    after
+        .match_indices("```")
+        .map(|(closing, _)| after[..closing].trim().to_owned())
+        .collect()
 }
 
 #[cfg(test)]
@@ -336,6 +439,210 @@ mod tests {
     fn normalize_candidate_json_prefers_fenced_block_over_preamble_bracket_fallback() {
         let input = "<thinking>stuff</thinking>\n```json\n{\"intent\":\"test\"}\n```";
         assert_eq!(normalize_candidate_json(input), "{\"intent\":\"test\"}");
+    }
+
+    #[test]
+    fn normalize_candidate_json_passes_valid_json_through_unchanged() {
+        for input in [
+            r###"{
+  "intent": "Rejects the literal ,} token"
+}"###,
+            r###"{
+  "intent": "Returns the literal ,] token"
+}"###,
+            r###"{
+  "intent": "Rejects the literal ,  } token"
+}"###,
+            r###"{
+  "intent": "Rejects literal ,} and ,] tokens, escaped \"quotes\", backslashes \\, and Unicode λ."
+}"###,
+            r###"{
+  "intent": "Contains ```json and ``` fence text",
+  "inputs": [
+    "untouched"
+  ]
+}"###,
+            r###"{
+  "intent": "```json",
+  "inputs": ["untouched"],
+  "outputs": ["```"]
+}"###,
+        ] {
+            assert_eq!(normalize_candidate_json(input), input);
+        }
+    }
+
+    #[test]
+    fn normalize_candidate_json_repairs_only_structural_trailing_commas() {
+        let input = r###"{"intent":"Literal ,} and ,] plus \"quoted\" and \\ slashes λ","inputs":["a,]",],}"###;
+        let expected = r###"{"intent":"Literal ,} and ,] plus \"quoted\" and \\ slashes λ","inputs":["a,]"]}"###;
+        assert_eq!(normalize_candidate_json(input), expected);
+        let fenced = format!("```json\n{input}\n```");
+        assert_eq!(normalize_candidate_json(&fenced), expected);
+        assert!(serde_json::from_str::<Value>(expected).is_ok());
+    }
+
+    /// A complete annotation whose string fields hold fence markers and the comma
+    /// sequences the repair step looks for.
+    fn quoted_annotation(intent: &str) -> Value {
+        serde_json::json!({
+            "intent": intent,
+            "behavior": "preserve this optional field",
+            "inputs": ["literal ,] input", "second input"],
+            "outputs": ["literal ``` output", "result"],
+            "side_effects": ["none"],
+            "dependencies": ["module::thing"],
+            "error_modes": ["described error"],
+            "confidence": 0.87,
+            "edge_cases": "preserve this too",
+            "complexity": "medium",
+            "method_dependencies": {"method": ["callee", "literal ```json"]}
+        })
+    }
+
+    fn assert_parses_to(candidate: &str, expected: &Value) {
+        let expected: SirAnnotation =
+            serde_json::from_value(expected.clone()).expect("fixture is a SIR");
+        let actual = parse_and_validate_sir(candidate).expect("a complete valid SIR must parse");
+        assert_eq!(actual, expected, "annotation fields must survive unchanged");
+    }
+
+    #[test]
+    fn parse_and_validate_sir_keeps_fence_markers_inside_strings() {
+        let value = quoted_annotation("```json and ``` are literal string content");
+        assert_parses_to(&serde_json::to_string_pretty(&value).unwrap(), &value);
+
+        let mut split = quoted_annotation("```json");
+        split["outputs"] = serde_json::json!(["```"]);
+        assert_parses_to(&serde_json::to_string_pretty(&split).unwrap(), &split);
+    }
+
+    #[test]
+    fn parse_and_validate_sir_unwraps_fences_whose_json_quotes_fence_markers() {
+        let value = quoted_annotation("literal ``` closing marker and ,} punctuation");
+        let text = serde_json::to_string_pretty(&value).unwrap();
+        assert_parses_to(&format!("preface\n```JSON\n{text}\n```\nafter"), &value);
+        assert_parses_to(&format!("```\n{text}\n```"), &value);
+
+        let unicode = quoted_annotation("λ Ω literal ``` and escaped \"quotes\" plus \\ backslash");
+        let text = serde_json::to_string_pretty(&unicode).unwrap();
+        assert_parses_to(
+            &format!("λ preliminary text\n```json\n{text}\n```"),
+            &unicode,
+        );
+    }
+
+    #[test]
+    fn parse_and_validate_sir_finds_fences_after_quoted_prose() {
+        let value = quoted_annotation("selected annotation");
+        let text = serde_json::to_string(&value).unwrap();
+        assert_parses_to(
+            &format!("A prose \"quote\" precedes this response:\n```json\n{text}\n```"),
+            &value,
+        );
+    }
+
+    #[test]
+    fn parse_and_validate_sir_prefers_the_json_tagged_fence() {
+        let decoy = quoted_annotation("generic decoy");
+        let selected = quoted_annotation("JSON tagged selection");
+        assert_parses_to(
+            &format!("```text\n{decoy}\n```\n```json\n{selected}\n```"),
+            &selected,
+        );
+    }
+
+    #[test]
+    fn parse_and_validate_sir_finds_fences_after_prose_the_scanner_misreads() {
+        // An unmatched brace followed by an odd number of quotes leaves the
+        // string-aware scanner inside a "string"; the plain fence search still works.
+        let value = quoted_annotation("selected annotation");
+        let text = serde_json::to_string_pretty(&value).unwrap();
+        assert_parses_to(
+            &format!("Treats \"{{\" as an opener.\n```json\n{text}\n```"),
+            &value,
+        );
+        assert_parses_to(
+            &format!("```rust\nfn q(c: char) -> bool {{ c == '\"' }}\n```\n```json\n{text}\n```"),
+            &value,
+        );
+    }
+
+    #[test]
+    fn parse_and_validate_sir_unwraps_an_annotation_inside_a_bare_array() {
+        let value = quoted_annotation("wrapped in an array");
+        let text = serde_json::to_string(&value).unwrap();
+        assert_parses_to(&format!("[{text}]"), &value);
+    }
+
+    #[test]
+    fn parse_and_validate_sir_repairs_trailing_commas_without_touching_strings() {
+        let value = quoted_annotation("literal ,} and ,] punctuation");
+        let mut text = serde_json::to_string(&value).unwrap();
+        text.insert(text.len() - 1, ',');
+        assert_parses_to(&text, &value);
+        assert_parses_to(&format!("```json\n{text}\n```"), &value);
+    }
+
+    #[test]
+    fn parse_and_validate_sir_still_rejects_invalid_annotations() {
+        let mut wrong_type = quoted_annotation("valid intent");
+        wrong_type["inputs"] = serde_json::json!(42);
+        for input in [
+            "not JSON".to_owned(),
+            "{}".to_owned(),
+            wrong_type.to_string(),
+        ] {
+            let error = parse_and_validate_sir(&input).unwrap_err();
+            assert!(error.starts_with("json parse error:"), "{error}");
+        }
+        let mut out_of_range = quoted_annotation("valid intent");
+        out_of_range["confidence"] = serde_json::json!(2.0);
+        let error = parse_and_validate_sir(&out_of_range.to_string()).unwrap_err();
+        assert!(error.starts_with("sir validation error:"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn valid_quoted_annotation_does_not_spend_a_feedback_retry() {
+        let value = quoted_annotation("literal ```json and ``` markers plus ,] punctuation");
+        let expected: SirAnnotation = serde_json::from_value(value.clone()).unwrap();
+        let candidate = Arc::new(serde_json::to_string_pretty(&value).unwrap());
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let feedback_calls = Arc::new(AtomicUsize::new(0));
+
+        let actual = run_sir_parse_validation_retries_with_feedback(
+            2,
+            {
+                let candidate = candidate.clone();
+                let calls = first_calls.clone();
+                move || {
+                    let candidate = candidate.clone();
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(candidate.as_ref().clone())
+                    }
+                }
+            },
+            {
+                let candidate = candidate.clone();
+                let calls = feedback_calls.clone();
+                move |_previous: String, _error: String| {
+                    let candidate = candidate.clone();
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(candidate.as_ref().clone())
+                    }
+                }
+            },
+        )
+        .await
+        .expect("a valid annotation must be accepted on the first attempt");
+
+        assert_eq!(actual, expected);
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(feedback_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

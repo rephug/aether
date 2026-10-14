@@ -1,6 +1,10 @@
-use std::io::ErrorKind;
+use std::collections::VecDeque;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use aether_config::{AetherConfig, VerifyMode};
 use anyhow::{Context, Result};
@@ -174,8 +178,8 @@ fn run_host_verification_with_metadata(
         mode_requested,
         VerifyMode::Host,
         fallback_reason,
-        |workspace, _config, command| {
-            run_command_on_host(workspace, command).map_err(CommandExecutionError::Launch)
+        |workspace, config, command| {
+            run_command_on_host(workspace, config, command).map_err(CommandExecutionError::Launch)
         },
     )
 }
@@ -239,7 +243,7 @@ fn run_verification_with_executor(
         &Path,
         &AetherConfig,
         &str,
-    ) -> std::result::Result<Output, CommandExecutionError>,
+    ) -> std::result::Result<CommandOutput, CommandExecutionError>,
 ) -> Result<ExecutionOutcome> {
     let allowlisted_commands = config.verify.commands.clone();
     let requested_commands = request
@@ -338,16 +342,14 @@ fn run_verification_with_executor(
             }
         };
 
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        let exit_code = output.status.code();
-        let passed = exit_code == Some(0);
+        let exit_code = output.exit_code;
+        let passed = exit_code == Some(0) && !output.timed_out;
 
         command_results.push(VerificationCommandResult {
             command: command.clone(),
             exit_code,
-            stdout,
-            stderr,
+            stdout: output.stdout,
+            stderr: output.stderr,
             passed,
         });
 
@@ -373,7 +375,11 @@ fn run_verification_with_executor(
     })
 }
 
-fn run_command_on_host(workspace: &Path, command: &str) -> Result<std::process::Output> {
+fn run_command_on_host(
+    workspace: &Path,
+    config: &AetherConfig,
+    command: &str,
+) -> Result<CommandOutput> {
     let mut process = if cfg!(windows) {
         let mut process = Command::new("cmd");
         process.arg("/C");
@@ -384,10 +390,8 @@ fn run_command_on_host(workspace: &Path, command: &str) -> Result<std::process::
         process
     };
 
-    process
-        .arg(command)
-        .current_dir(workspace)
-        .output()
+    process.arg(command).current_dir(workspace);
+    run_bounded(process, CommandLimits::from_config(config))
         .with_context(|| format!("failed to execute verification command: {command}"))
 }
 
@@ -395,7 +399,7 @@ fn run_command_in_container(
     workspace: &Path,
     config: &AetherConfig,
     command: &str,
-) -> std::result::Result<std::process::Output, CommandExecutionError> {
+) -> std::result::Result<CommandOutput, CommandExecutionError> {
     let runtime = config.verify.container.runtime.trim();
     let image = config.verify.container.image.trim();
     let workdir = config.verify.container.workdir.trim();
@@ -414,7 +418,7 @@ fn run_command_in_container(
         .arg("-lc")
         .arg(command);
 
-    process.output().map_err(|err| {
+    run_bounded(process, CommandLimits::from_config(config)).map_err(|err| {
         if matches!(
             err.kind(),
             ErrorKind::NotFound | ErrorKind::PermissionDenied
@@ -434,7 +438,7 @@ fn run_command_in_microvm(
     workspace: &Path,
     config: &AetherConfig,
     command: &str,
-) -> std::result::Result<std::process::Output, CommandExecutionError> {
+) -> std::result::Result<CommandOutput, CommandExecutionError> {
     if !cfg!(target_os = "linux") {
         return Err(CommandExecutionError::RuntimeUnavailable(
             "microvm mode is unsupported on this host; currently only Linux hosts are supported. Use verify.mode=host or verify.mode=container".to_owned(),
@@ -486,7 +490,7 @@ fn run_command_in_microvm(
         .arg("--command")
         .arg(command);
 
-    process.output().map_err(|err| {
+    run_bounded(process, CommandLimits::from_config(config)).map_err(|err| {
         if matches!(
             err.kind(),
             ErrorKind::NotFound | ErrorKind::PermissionDenied
@@ -500,6 +504,205 @@ fn run_command_in_microvm(
             )))
         }
     })
+}
+
+/// What one verification command produced, within [`CommandLimits`].
+struct CommandOutput {
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    timed_out: bool,
+}
+
+/// How long a verification command may run and how much of each output stream is kept.
+#[derive(Debug, Clone, Copy)]
+struct CommandLimits {
+    timeout: Duration,
+    max_output_bytes: usize,
+}
+
+impl CommandLimits {
+    fn from_config(config: &AetherConfig) -> Self {
+        Self {
+            timeout: Duration::from_secs(config.verify.timeout_secs.max(1)),
+            max_output_bytes: config.verify.max_output_bytes.max(1),
+        }
+    }
+}
+
+/// How long to wait for the output readers once the process has ended. A background
+/// process the command started can keep a pipe open after the command itself exits.
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Runs `process` with its output captured within `limits.max_output_bytes` per stream
+/// and stops it, with any processes it started (on Unix), once `limits.timeout` passes.
+fn run_bounded(mut process: Command, limits: CommandLimits) -> std::io::Result<CommandOutput> {
+    process
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Its own process group, so a timeout can stop everything the command started.
+        process.process_group(0);
+    }
+    let mut child = process.spawn()?;
+    let mut stdout = CappedReader::spawn(child.stdout.take(), limits.max_output_bytes);
+    let mut stderr = CappedReader::spawn(child.stderr.take(), limits.max_output_bytes);
+
+    // A timeout too large to represent is no deadline at all.
+    let deadline = Instant::now().checked_add(limits.timeout);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(err) => {
+                stop_process_tree(&mut child);
+                return Err(err);
+            }
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            stop_process_tree(&mut child);
+            break None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+
+    // One grace period for both streams. If something the command started still holds
+    // a pipe once it runs out, stop it as well rather than leave it running.
+    let drain_deadline = Instant::now() + OUTPUT_DRAIN_GRACE;
+    let stdout_drained = stdout.wait_until(drain_deadline);
+    let stderr_drained = stderr.wait_until(drain_deadline);
+    if !(stdout_drained && stderr_drained) {
+        #[cfg(unix)]
+        stop_process_group(child.id());
+        let settle = Instant::now() + Duration::from_millis(200);
+        stdout.wait_until(settle);
+        stderr.wait_until(settle);
+    }
+    let stdout = stdout.text();
+    let mut stderr = stderr.text();
+    if status.is_none() {
+        stderr.push_str(&format!(
+            "\n[verification command stopped after {} s timeout]",
+            limits.timeout.as_secs()
+        ));
+    }
+    Ok(CommandOutput {
+        exit_code: status.and_then(|status| status.code()),
+        stdout,
+        stderr,
+        timed_out: status.is_none(),
+    })
+}
+
+fn stop_process_tree(child: &mut Child) {
+    // The group goes first, while the unreaped child still holds the group id.
+    #[cfg(unix)]
+    stop_process_group(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Kills the process group led by `leader` (every command runs in its own group, see
+/// `run_bounded`).
+#[cfg(unix)]
+fn stop_process_group(leader: u32) {
+    let _ = Command::new("kill")
+        .args(["-s", "KILL", "--"])
+        .arg(format!("-{leader}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Reads a child's output stream on its own thread, keeping the first and last
+/// `max_bytes / 2` bytes and discarding the middle, so the child never blocks on a
+/// full pipe.
+struct CappedReader {
+    captured: Arc<Mutex<CappedBytes>>,
+    done: mpsc::Receiver<()>,
+    finished: bool,
+}
+
+#[derive(Default)]
+struct CappedBytes {
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+    total: usize,
+}
+
+impl CappedReader {
+    fn spawn(stream: Option<impl Read + Send + 'static>, max_bytes: usize) -> Self {
+        let captured = Arc::new(Mutex::new(CappedBytes::default()));
+        let (done_tx, done) = mpsc::channel();
+        if let Some(mut stream) = stream {
+            let captured = Arc::clone(&captured);
+            let head_limit = max_bytes.div_ceil(2);
+            let tail_limit = max_bytes - head_limit;
+            thread::spawn(move || {
+                let mut buffer = [0u8; 8192];
+                loop {
+                    let read = match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => read,
+                    };
+                    let Ok(mut bytes) = captured.lock() else {
+                        break;
+                    };
+                    bytes.total += read;
+                    let chunk = &buffer[..read];
+                    let head_room = head_limit.saturating_sub(bytes.head.len()).min(read);
+                    let (to_head, rest) = chunk.split_at(head_room);
+                    bytes.head.extend_from_slice(to_head);
+                    let rest = &rest[rest.len().saturating_sub(tail_limit)..];
+                    bytes.tail.extend(rest.iter().copied());
+                    let excess = bytes.tail.len().saturating_sub(tail_limit);
+                    bytes.tail.drain(..excess);
+                }
+                let _ = done_tx.send(());
+            });
+        } else {
+            let _ = done_tx.send(());
+        }
+        Self {
+            captured,
+            done,
+            finished: false,
+        }
+    }
+
+    /// Waits until the stream ends or `deadline` passes; true when it ended.
+    fn wait_until(&mut self, deadline: Instant) -> bool {
+        if !self.finished {
+            let wait = deadline.saturating_duration_since(Instant::now());
+            self.finished = self.done.recv_timeout(wait).is_ok();
+        }
+        self.finished
+    }
+
+    /// The text captured so far.
+    fn text(self) -> String {
+        let Ok(bytes) = self.captured.lock() else {
+            return String::new();
+        };
+        let mut kept = bytes.head.clone();
+        kept.extend(bytes.tail.iter().copied());
+        if bytes.total == kept.len() {
+            // Nothing omitted: decode as one piece so no character is split.
+            return String::from_utf8_lossy(&kept).into_owned();
+        }
+        let mut text = String::from_utf8_lossy(&bytes.head).into_owned();
+        text.push_str(&format!(
+            "\n[... {} bytes of output omitted ...]\n",
+            bytes.total - kept.len()
+        ));
+        let tail = bytes.tail.iter().copied().collect::<Vec<_>>();
+        text.push_str(&String::from_utf8_lossy(&tail));
+        text
+    }
 }
 
 fn resolve_microvm_asset_path(workspace: &Path, asset: &str) -> PathBuf {
