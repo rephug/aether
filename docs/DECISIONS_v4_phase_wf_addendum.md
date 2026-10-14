@@ -51,3 +51,21 @@
 **Context:** Claude Code reads project commands from `.claude/commands/<name>.md`, with optional YAML front matter (`description`, `argument-hint`) and `$ARGUMENTS` substituted with whatever follows the command.
 
 **Decision:** Each template starts with front matter giving `description` and, where the command takes input, `argument-hint` (`<task description>`, `[base-branch]`, `<file, directory, crate or symbol>`, `<symbol>`), then a numbered, step-by-step body that ends with the exact shape of the answer, like the existing audit commands. File names are the command names: `pre-flight.md`, `review.md`, `explain-area.md`, `impact.md`.
+
+### 115. `/context` output is self-contained, with no AETHER jargon
+
+**Date:** 2026-10-14
+**Status:** ✅ Implemented (Stage WF.1b)
+
+**Context:** `/context` exists so that an assistant without MCP access (a web chat, another vendor's model) can work on part of the codebase. Anything in the pasted text that points at tools, ids or AETHER concepts is noise to that reader, and a hallucination risk.
+
+**Decision:** `/context <target>` (`ContextCommandTemplate`, `.claude/commands/context.md`) gathers with the same tools as `/explain-area` plus `aether_test_intents` and the crate health tools, then writes one Markdown document in a fixed order: purpose, key components, how it works, dependencies, guarantees and edge cases, known weak spots, key code (30 lines at most), about 1,500 words at most. The template's rules ban references to tools, slash commands or the conversation, AETHER vocabulary ("SIR", "symbol id", "confidence", "generation pass", "health score", "blast radius", "AETHER"), `aether_*` names and internal ids or hashes, and say what to write instead. A banned word that is the project's own name or an identifier in its code is kept as the code spells it, so the command also works on AETHER itself or on code with a `confidence` field. Inferred statements are marked "(inferred)". The document is printed inside a four-backtick fence so its own code excerpts survive copying. The command doesn't edit files or inject SIRs. `aetherd context` (clipboard-ready export) remains the scripted counterpart.
+
+### 116. `/health-check` caps at 5 worst crates and 3 recommendations
+
+**Date:** 2026-10-14
+**Status:** ✅ Implemented (Stage WF.1b)
+
+**Context:** A session-start check is only useful if it is read every time, so it has to fit in about 30 seconds and say nothing when there is nothing to say. `aether_status` reports SIR coverage but not confidence, and no MCP tool summarizes SIR confidence.
+
+**Decision:** `/health-check` (`HealthCheckCommandTemplate`, `.claude/commands/health-check.md`) calls `aether_status`, `aether_health_hotspots` (`limit` 5; it lists only crates scoring 75 or below, each with its top violation) and `aether_health` (cycles and risk hotspots, `limit` 5). Confidence comes from a SQL query on `.aether/meta.sqlite`, which `/next` and `/scan` also query directly, but opened read-only (`sqlite3 -readonly`, or Python's `sqlite3` with `mode=ro`): SIR count, average confidence, `[MOCK]` placeholders, other SIRs below 0.5 and deep SIRs, counting only non-empty rows with a symbol. The report has a fixed shape listing at most 5 crates and at most 3 one-line recommendations, each naming a command (`/scan`, `/enrich`, `/audit`, `/refactor`, `/next`). With coverage of at least 90%, no placeholders, average confidence of at least 0.7 and no crate in the hotspot list, it prints one "All healthy" line instead. A workspace with no indexed symbols (the MCP server creates an empty store on start, so `store_present` alone can't tell) gets a suggestion of the structural `aetherd --workspace . --index-once`, never a `--full` run that could call a paid provider. The CLAUDE.md template's Slash Commands section lists `/context` and `/health-check` and recommends `/health-check` at the start of a session; `AETHER_AGENT_SCHEMA_VERSION` 5 → 6 for that template change.

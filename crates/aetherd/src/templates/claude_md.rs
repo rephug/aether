@@ -45,9 +45,11 @@ const SLASH_COMMANDS_SECTION: &str = "
 - `/pre-flight <task>`: a briefing before implementing a task: what exists, the constraints, what could break and a recommended approach.
 - `/impact <symbol>`: the blast radius of changing a symbol, with a risk rating.
 - `/review [base-branch]`: a semantic review of the current branch against SIRs, callers and contracts.
+- `/context <target>`: a self-contained, plain-language briefing on an area, to paste into any AI chat.
+- `/health-check`: a 30-second overview of coverage, SIR confidence and the least healthy crates.
 - `/audit <crate-or-file>`, `/audit-changes [commit-range]`, `/audit-report`: bug audits and their recorded findings.
 - `/refactor <crate-or-file>`, `/refactor-deep [file-path]`: refactoring with intent snapshots.
 - `/scan <crate> [batch-size]`, `/enrich <crate-name>`, `/next`: SIR coverage, deeper SIRs, and what to work on next.
 
-Recommended workflow: `/explain-area` for an unfamiliar area, then `/pre-flight <task>`, implement, then `/review`. Run `/impact <symbol>` before changing a widely used symbol.
+Recommended workflow: `/explain-area` for an unfamiliar area, then `/pre-flight <task>`, implement, then `/review`. Run `/impact <symbol>` before changing a widely used symbol, and `/health-check` at the start of a session.
 ";

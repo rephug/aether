@@ -3,9 +3,11 @@ pub mod audit_cmd;
 pub mod audit_report_cmd;
 pub mod claude_md;
 pub mod codex_instructions;
+pub mod context_cmd;
 pub mod cursor_rules;
 pub mod enrich_cmd;
 pub mod explain_area_cmd;
+pub mod health_check_cmd;
 pub mod impact_cmd;
 pub mod next_cmd;
 pub mod omp;
@@ -22,9 +24,11 @@ pub use audit_cmd::AuditCommandTemplate;
 pub use audit_report_cmd::AuditReportCommandTemplate;
 pub use claude_md::ClaudeTemplate;
 pub use codex_instructions::CodexInstructionsTemplate;
+pub use context_cmd::ContextCommandTemplate;
 pub use cursor_rules::CursorRulesTemplate;
 pub use enrich_cmd::EnrichCommandTemplate;
 pub use explain_area_cmd::ExplainAreaCommandTemplate;
+pub use health_check_cmd::HealthCheckCommandTemplate;
 pub use impact_cmd::ImpactCommandTemplate;
 pub use next_cmd::NextCommandTemplate;
 pub use omp::{McpJsonTemplate, OmpAgentsTemplate};
@@ -281,11 +285,12 @@ pub(crate) fn plain_tool_list() -> String {
 mod tests {
     use super::{
         AuditChangesCommandTemplate, AuditCommandTemplate, AuditReportCommandTemplate,
-        ClaudeTemplate, CodexInstructionsTemplate, CursorRulesTemplate, EnrichCommandTemplate,
-        ExplainAreaCommandTemplate, ImpactCommandTemplate, McpJsonTemplate, NextCommandTemplate,
-        OmpAgentsTemplate, PreFlightCommandTemplate, RefactorCommandTemplate,
-        RefactorDeepCommandTemplate, ReviewCommandTemplate, ScanAllScriptTemplate,
-        ScanCommandTemplate, SkillTemplate, TOOL_DESCRIPTIONS, TemplateContext,
+        ClaudeTemplate, CodexInstructionsTemplate, ContextCommandTemplate, CursorRulesTemplate,
+        EnrichCommandTemplate, ExplainAreaCommandTemplate, HealthCheckCommandTemplate,
+        ImpactCommandTemplate, McpJsonTemplate, NextCommandTemplate, OmpAgentsTemplate,
+        PreFlightCommandTemplate, RefactorCommandTemplate, RefactorDeepCommandTemplate,
+        ReviewCommandTemplate, ScanAllScriptTemplate, ScanCommandTemplate, SkillTemplate,
+        TOOL_DESCRIPTIONS, TemplateContext,
     };
 
     fn sample_context() -> TemplateContext {
@@ -332,10 +337,17 @@ mod tests {
         assert!(rendered.contains(
             "Recommended workflow: `/explain-area` for an unfamiliar area, then `/pre-flight <task>`, implement, then `/review`."
         ));
-        for command in ["/pre-flight", "/review", "/explain-area", "/impact"] {
-            assert!(rendered.contains(&format!("- `{command} ")), "{command}");
+        for command in [
+            "/pre-flight",
+            "/review",
+            "/explain-area",
+            "/impact",
+            "/context",
+            "/health-check`",
+        ] {
+            assert!(rendered.contains(&format!("- `{command}")), "{command}");
         }
-        assert!(rendered.ends_with("before changing a widely used symbol.\n"));
+        assert!(rendered.ends_with("and `/health-check` at the start of a session.\n"));
     }
 
     fn command_templates(context: &TemplateContext) -> Vec<(&'static str, String)> {
@@ -346,8 +358,10 @@ mod tests {
                 AuditChangesCommandTemplate::render(context),
             ),
             ("audit-report", AuditReportCommandTemplate::render(context)),
+            ("context", ContextCommandTemplate::render(context)),
             ("enrich", EnrichCommandTemplate::render(context)),
             ("explain-area", ExplainAreaCommandTemplate::render(context)),
+            ("health-check", HealthCheckCommandTemplate::render(context)),
             ("impact", ImpactCommandTemplate::render(context)),
             ("next", NextCommandTemplate::render(context)),
             ("pre-flight", PreFlightCommandTemplate::render(context)),
@@ -372,6 +386,10 @@ mod tests {
                     .chars()
                     .take_while(|ch| ch.is_ascii_lowercase() || *ch == '_')
                     .collect();
+                if rendered[start..].starts_with("aether_*") {
+                    // The wildcard /context uses to ban tool names.
+                    continue;
+                }
                 assert!(
                     TOOL_DESCRIPTIONS.iter().any(|(tool, _)| *tool == name),
                     "/{command} names unknown tool {name}"
@@ -454,6 +472,70 @@ mod tests {
     }
 
     #[test]
+    fn context_template_keeps_its_output_free_of_aether_terms() {
+        let context = ContextCommandTemplate::render(&sample_context());
+        assert!(
+            context.starts_with(
+                "---\nargument-hint: <file, directory, crate or symbol>\ndescription: "
+            )
+        );
+        assert!(context.contains("$ARGUMENTS"));
+        assert!(context.contains("doesn't edit files or inject SIRs"));
+        for tool in [
+            "aether_get_sir",
+            "aether_sir_context",
+            "aether_call_chain",
+            "aether_dependencies",
+            "aether_test_intents",
+        ] {
+            assert!(context.contains(&format!("`{tool}`")), "/context {tool}");
+        }
+        // The document it asks for must stand alone and avoid AETHER vocabulary.
+        let rules = context
+            .split("## Rules for the document")
+            .nth(1)
+            .expect("rules section");
+        assert!(rules.contains("never refers to tools, slash commands, this conversation"));
+        for banned in [
+            "\"SIR\"",
+            "\"symbol id\"",
+            "\"confidence\"",
+            "\"generation pass\"",
+            "\"health score\"",
+            "\"blast radius\"",
+            "\"AETHER\"",
+            "`aether_*` names",
+        ] {
+            assert!(rules.contains(banned), "/context rules must ban {banned}");
+        }
+        // A banned word that names the project or an identifier stays as the code has it.
+        assert!(rules.contains("the project's own name or an identifier in its code"));
+        assert!(context.contains("four backticks"));
+    }
+
+    #[test]
+    fn health_check_template_caps_crates_and_recommendations() {
+        let health = HealthCheckCommandTemplate::render(&sample_context());
+        assert!(health.starts_with("---\ndescription: "));
+        assert!(health.contains("doesn't edit files or inject SIRs"));
+        for tool in ["aether_status", "aether_health_hotspots", "aether_health"] {
+            assert!(
+                health.contains(&format!("`{tool}`")),
+                "/health-check {tool}"
+            );
+        }
+        assert!(health.contains("If `symbol_count` is 0"));
+        assert!(health.contains("`percentage` is a fraction"));
+        assert!(health.contains("sqlite3 -readonly .aether/meta.sqlite"));
+        assert!(health.contains("mode=ro"));
+        assert!(health.contains("at most 5 crates"));
+        assert!(health.contains("at most 3 recommendations"));
+        assert!(health.contains("All healthy:"));
+        // Suggesting a full index run could start paid SIR generation.
+        assert!(!health.contains("--full"));
+    }
+
+    #[test]
     fn codex_template_renders_plain_text_instructions() {
         let rendered = CodexInstructionsTemplate::render(&sample_context());
 
@@ -531,10 +613,15 @@ mod tests {
                 "audit-report.md",
                 AuditReportCommandTemplate::render(&context),
             ),
+            ("context.md", ContextCommandTemplate::render(&context)),
             ("enrich.md", EnrichCommandTemplate::render(&context)),
             (
                 "explain-area.md",
                 ExplainAreaCommandTemplate::render(&context),
+            ),
+            (
+                "health-check.md",
+                HealthCheckCommandTemplate::render(&context),
             ),
             ("impact.md", ImpactCommandTemplate::render(&context)),
             ("next.md", NextCommandTemplate::render(&context)),
