@@ -124,6 +124,48 @@ async fn anatomy_file_fragment_contains_symbol_links_and_sir() {
 }
 
 #[tokio::test]
+async fn anatomy_file_fragment_keeps_symbols_from_every_layer_of_the_file() {
+    // src/lib.rs holds demo::run (Core Logic) and demo::helper (Utilities), so the
+    // file appears under two layers. Its detail must list both symbols, not only the
+    // ones from whichever layer was processed last.
+    let (_tmp, app, _ids) = seeded_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/anatomy/file?path=src/lib.rs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        body.contains("demo::run"),
+        "missing Core Logic symbol: {body}"
+    );
+    assert!(
+        body.contains("demo::helper"),
+        "missing Utilities symbol: {body}"
+    );
+    assert!(body.contains("Run demo task"), "missing SIR intent: {body}");
+    assert!(
+        body.contains("Core Logic"),
+        "missing Core Logic label: {body}"
+    );
+    assert!(
+        body.contains("Utilities"),
+        "missing Utilities label: {body}"
+    );
+}
+
+#[tokio::test]
 async fn search_fragment_contains_clickable_results() {
     let (_tmp, app, ids) = seeded_app().await;
     let response = app
