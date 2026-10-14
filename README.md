@@ -26,7 +26,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Rust-orange?style=flat-square&logo=rust" />
-  <img src="https://img.shields.io/badge/Rust%20%7C%20TypeScript%20%7C%20Python-green?style=flat-square&label=parses" />
+  <img src="https://img.shields.io/badge/Rust%20%7C%20TypeScript%20%7C%20Python%20%7C%20Go-green?style=flat-square&label=parses" />
   <img src="https://img.shields.io/badge/MCP-compatible-purple?style=flat-square" />
   <img src="https://img.shields.io/badge/136K-LOC-blue?style=flat-square" />
   <img src="https://img.shields.io/badge/vibe%20coded-100%25-ff69b4?style=flat-square" />
@@ -172,7 +172,7 @@ This is the full list. Not the highlights — everything. If another tool does a
 
 ### Parsing
 
-- **Multi-Language Support** — Rust, TypeScript/JavaScript, Python via tree-sitter.
+- **Multi-Language Support** — Rust, TypeScript/JavaScript, Python, Go via tree-sitter.
 - **Incremental Parsing** — Only re-parses changed files.
 - **Stable Symbol IDs** — BLAKE3 hash of qualified name + file path. Symbols keep their identity across renames within the same logical location.
 - **Structural Edge Extraction** — CALLS, DEPENDS_ON, TYPE_REF, and IMPLEMENTS edges extracted directly from AST. Not heuristic — structural.
@@ -854,7 +854,7 @@ For the curious (and the skeptical, which is probably all of you at this point):
 | Thing | What |
 |:------|:-----|
 | Language | Rust (17-crate workspace, ~136K LOC) |
-| Parsing | tree-sitter (Rust, TypeScript/JS, Python) |
+| Parsing | tree-sitter (Rust, TypeScript/JS, Python, Go) |
 | Graph DB | SurrealDB 3.0 + SurrealKV |
 | Vector Store | LanceDB (production default) |
 | Metadata | SQLite (WAL mode, schema v13) |

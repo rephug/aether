@@ -794,6 +794,7 @@ fn parse_language(raw: &str) -> Result<Language> {
         "javascript" => Ok(Language::JavaScript),
         "jsx" => Ok(Language::Jsx),
         "python" => Ok(Language::Python),
+        "go" => Ok(Language::Go),
         other => Err(anyhow!("unsupported symbol language '{other}'")),
     }
 }
@@ -819,3 +820,28 @@ fn unix_timestamp_secs() -> i64 {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod language_tests {
+    use aether_core::Language;
+
+    use super::parse_language;
+
+    #[test]
+    fn reads_every_stored_language_spelling() {
+        for language in [
+            Language::Rust,
+            Language::TypeScript,
+            Language::Tsx,
+            Language::JavaScript,
+            Language::Jsx,
+            Language::Python,
+            Language::Go,
+        ] {
+            assert_eq!(
+                parse_language(language.as_str()).expect("known language"),
+                language
+            );
+        }
+    }
+}

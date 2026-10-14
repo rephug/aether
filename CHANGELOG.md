@@ -9,6 +9,8 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Go parsing: functions, methods (`pkg::Type::Method`), structs, interfaces and named types;
+  call, import and type-reference edges; `func TestXxx(t *testing.T)` test intents.
 - `inference.provider = "omp"`: run SIR generation through the Oh My Pi auth gateway
   (`omp auth-gateway serve`) so models are addressed as omp routes (`provider/model`)
   and billed on the omp credential (subscription logins included). The gateway token is
