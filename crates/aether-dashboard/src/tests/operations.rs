@@ -433,6 +433,67 @@ async fn presets_fragment_renders_preset_cards() {
 }
 
 #[tokio::test]
+async fn presets_fragment_delete_button_confirms_before_deleting() {
+    let (tmp, app, _ids) = seeded_app().await;
+    let presets_dir = tmp.path().join(".aether/presets");
+    fs::create_dir_all(&presets_dir).unwrap();
+    fs::write(
+        presets_dir.join("team-review.toml"),
+        "[preset]\nname = \"team-review\"\ndescription = \"Custom preset\"\n\n[context]\nbudget = 8000\n",
+    )
+    .unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/presets")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+
+    // Pull the onclick handler of the custom preset's Delete button out of the markup.
+    let fetch_at = body
+        .find("fetch('/api/v1/presets/team-review'")
+        .expect("custom preset should render a Delete button");
+    let onclick_start = body[..fetch_at]
+        .rfind("onclick=\"")
+        .expect("delete request should be sent from an onclick handler")
+        + "onclick=\"".len();
+    let onclick_end = onclick_start + body[onclick_start..].find('"').unwrap();
+    let onclick = &body[onclick_start..onclick_end];
+
+    // The DELETE removes a user file, so the handler must ask first and stop
+    // before the request when the dialog is cancelled.
+    assert!(
+        onclick.starts_with("if(!confirm(this.dataset.confirm))return;"),
+        "Delete must return before sending DELETE unless the user confirms; onclick was: {onclick}"
+    );
+
+    // The handler reads the prompt from data-confirm, so that attribute on the
+    // same button must carry the message.
+    let tag_start = body[..onclick_start]
+        .rfind("<button")
+        .expect("onclick should belong to a button");
+    let tag_end = onclick_end + body[onclick_end..].find('>').unwrap();
+    let button_tag = &body[tag_start..tag_end];
+    assert!(
+        button_tag.contains("data-confirm=\"Delete preset 'team-review'?\""),
+        "Delete button must carry the prompt in data-confirm; tag was: {button_tag}"
+    );
+}
+
+#[tokio::test]
 async fn fingerprint_summary_api_returns_expected_fields() {
     let (_tmp, app, _ids) = seeded_app().await;
 
