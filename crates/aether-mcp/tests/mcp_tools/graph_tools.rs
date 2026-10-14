@@ -1073,3 +1073,106 @@ fn mcp_dependencies_keep_callers_across_typescript_dialects() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn mcp_dependencies_list_the_callers_of_every_overload() -> Result<()> {
+    // Hand-built Java rows. The two `Calc::add` overloads share a qualified name and
+    // calls to either are recorded by that name, so each overload lists every caller of
+    // `add`. The two `Shape::area`s belong to same-named classes in different files, so
+    // a call to `Shape::area` stays ambiguous and is attributed to neither.
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    write_test_config(workspace);
+    let java_method = |id: &str, qualified_name: &str, file_path: &str| SymbolRecord {
+        language: "java".to_owned(),
+        ..custom_symbol_record(id, qualified_name, file_path, "method")
+    };
+    let call = |source_id: &str, target: &str, file_path: &str| SymbolEdge {
+        source_id: source_id.to_owned(),
+        target_qualified_name: target.to_owned(),
+        edge_kind: EdgeKind::Calls,
+        file_path: file_path.to_owned(),
+    };
+    let store = SqliteStore::open(workspace)?;
+    for record in [
+        java_method("add-int", "Calc::add", "src/Calc.java"),
+        java_method("add-double", "Calc::add", "src/Calc.java"),
+        java_method("add-all", "Calc::addAll", "src/Calc.java"),
+        java_method("run", "App::run", "src/App.java"),
+        java_method("area-a", "Shape::area", "src/a/Shape.java"),
+        java_method("area-b", "Shape::area", "src/b/Shape.java"),
+    ] {
+        store.upsert_symbol(record)?;
+    }
+    store.upsert_edges(&[
+        call("add-all", "Calc::add", "src/Calc.java"),
+        call("run", "Calc::add", "src/App.java"),
+        call("run", "Shape::area", "src/App.java"),
+    ])?;
+    let server = AetherMcpServer::new(workspace, false)?;
+
+    for overload in ["add-int", "add-double"] {
+        assert_eq!(
+            caller_counts(&dependencies_for(&server, overload.to_owned())?),
+            BTreeMap::from([
+                ("App::run".to_owned(), None),
+                ("Calc::addAll".to_owned(), None),
+            ]),
+            "{overload}"
+        );
+    }
+    for area in ["area-a", "area-b"] {
+        let response = dependencies_for(&server, area.to_owned())?;
+        assert!(
+            response.callers.is_empty(),
+            "{area}: {:?}",
+            response.callers
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn mcp_dependencies_count_a_call_to_overloaded_methods_once() -> Result<()> {
+    // `Wrap` implements `From` twice, so two impl blocks declare `Wrap::from`. The call
+    // to `Wrap::from` reaches one of them without saying which, so both list `run` as a
+    // caller and `Wrap` counts it as one method called.
+    let temp = index_workspace(
+        "sqlite",
+        &[
+            (
+                "src/wrap.rs",
+                "pub struct Wrap(pub u32);\n\nimpl From<u8> for Wrap {\n    fn from(value: u8) -> Self { Wrap(value.into()) }\n}\n\nimpl From<u16> for Wrap {\n    fn from(value: u16) -> Self { Wrap(value.into()) }\n}\n",
+            ),
+            (
+                "src/run.rs",
+                "pub fn run() -> u32 {\n    Wrap::from(1u8).0\n}\n",
+            ),
+        ],
+    )?;
+    let workspace = temp.path();
+    let server = AetherMcpServer::new(workspace, false)?;
+
+    let overloads = SqliteStore::open(workspace)?
+        .list_symbols_for_file("src/wrap.rs")?
+        .into_iter()
+        .filter(|symbol| symbol.qualified_name == "Wrap::from")
+        .map(|symbol| symbol.id)
+        .collect::<Vec<_>>();
+    assert_eq!(overloads.len(), 2, "{overloads:?}");
+    for overload in overloads {
+        assert_eq!(
+            caller_counts(&dependencies_for(&server, overload)?),
+            BTreeMap::from([("run".to_owned(), None)])
+        );
+    }
+
+    let wrap = dependencies_for(&server, symbol_id_in(workspace, "src/wrap.rs", "Wrap")?)?;
+    assert!(wrap.aggregated);
+    assert_eq!(wrap.child_method_count, 2);
+    assert_eq!(
+        caller_counts(&wrap),
+        BTreeMap::from([("run".to_owned(), Some(1))])
+    );
+    Ok(())
+}
