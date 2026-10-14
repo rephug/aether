@@ -865,21 +865,70 @@ async function stopAllClients(): Promise<void> {
 }
 
 async function ensureAetherdBinary(repoRoot: string): Promise<string> {
-  const binaryName = process.platform === 'win32' ? 'aetherd.exe' : 'aetherd';
-  const binaryPath = path.join(repoRoot, 'target', 'debug', binaryName);
+  const configured = vscode.workspace.getConfiguration('aether').get<unknown>('aetherdPath', '');
+  const configuredPath = typeof configured === 'string' ? configured.trim() : '';
+  if (configuredPath) {
+    if (!path.isAbsolute(configuredPath) || !fs.existsSync(configuredPath)) {
+      throw new Error(
+        `aether.aetherdPath must be the absolute path of an existing aetherd binary: ${configuredPath}`
+      );
+    }
+    return configuredPath;
+  }
 
-  if (fs.existsSync(binaryPath)) {
-    return binaryPath;
+  const existing = findAetherdBinary(repoRoot);
+  if (existing) {
+    return existing;
   }
 
   outputChannel?.appendLine('AETHER: aetherd binary not found. Running cargo build -p aetherd');
   await runCargoBuild(repoRoot);
 
-  if (!fs.existsSync(binaryPath)) {
-    throw new Error(`binary not found after build: ${binaryPath}`);
+  const built = findAetherdBinary(repoRoot);
+  if (!built) {
+    throw new Error(
+      `binary not found after build: ${cargoAetherdPaths(repoRoot).join(' or ')}; ` +
+        'set aether.aetherdPath to the aetherd binary'
+    );
   }
 
-  return binaryPath;
+  return built;
+}
+
+function aetherdBinaryName(): string {
+  return process.platform === 'win32' ? 'aetherd.exe' : 'aetherd';
+}
+
+/**
+ * Where `cargo build -p aetherd`, run in `repoRoot` as runCargoBuild does, leaves the
+ * binary: under CARGO_TARGET_DIR (relative to the working directory) when it is set,
+ * otherwise under `<repoRoot>/target`. `<repoRoot>/target` is listed either way, for a
+ * binary built before CARGO_TARGET_DIR was set.
+ */
+function cargoAetherdPaths(repoRoot: string): string[] {
+  const binaryName = aetherdBinaryName();
+  const paths: string[] = [];
+  const cargoTargetDir = process.env.CARGO_TARGET_DIR;
+  if (cargoTargetDir) {
+    paths.push(path.resolve(repoRoot, cargoTargetDir, 'debug', binaryName));
+  }
+  paths.push(path.join(repoRoot, 'target', 'debug', binaryName));
+  return paths;
+}
+
+/** `aetherd` in each absolute PATH directory, in PATH order. */
+function pathAetherdPaths(): string[] {
+  const delimiter = process.platform === 'win32' ? ';' : ':';
+  return (process.env.PATH ?? '')
+    .split(delimiter)
+    .filter((directory) => directory.length > 0 && path.isAbsolute(directory))
+    .map((directory) => path.join(directory, aetherdBinaryName()));
+}
+
+function findAetherdBinary(repoRoot: string): string | undefined {
+  return [...cargoAetherdPaths(repoRoot), ...pathAetherdPaths()].find((candidate) =>
+    fs.existsSync(candidate)
+  );
 }
 
 function runCargoBuild(repoRoot: string): Promise<void> {

@@ -109,6 +109,12 @@
           "type": "number",
           "default": 9730,
           "description": "Port for the AETHER daemon HTTP API."
+        },
+        "aether.aetherdPath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Absolute path of the aetherd binary. When empty, AETHER looks in $CARGO_TARGET_DIR/debug, <repo>/target/debug and PATH, and runs cargo build -p aetherd if none has it."
         }
       }
     }
@@ -119,7 +125,7 @@
     "typecheck": "tsc -p . --noEmit",
     "smoke": "node ./scripts/smoke.js",
     "verify": "npm run build && npm run smoke && npm test",
-    "test": "node ./test/multi-root-regression.cjs && node ./test/symbol-navigation.cjs"
+    "test": "node ./test/multi-root-regression.cjs && node ./test/symbol-navigation.cjs && node ./test/aetherd-binary.cjs"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
