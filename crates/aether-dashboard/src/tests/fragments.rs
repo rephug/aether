@@ -635,3 +635,121 @@ async fn causal_fragment_contains_search_and_animate_button() {
     assert!(body.contains("id=\"causal-animate\""));
     assert!(body.contains("id=\"causal-graph\""));
 }
+
+/// A query value that would close an inline `<script>` element early if it
+/// were embedded without script-context escaping.
+const WIZARD_SCRIPT_BREAKOUT: &str = "</script><script>alert(document.domain)</script>";
+
+/// Percent-encode a query value so arbitrary characters survive the request URI.
+fn query_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                char::from(byte).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+/// Decode the entities maud emits when it escapes attribute values.
+fn html_attr_unescape(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+async fn wizard_fragment_body(uri: &str) -> String {
+    let response = crate::wizard_router()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap()
+}
+
+/// Parse the JSON string literal that follows `prefix` and ends at `terminator`.
+fn script_string_after(body: &str, prefix: &str, terminator: &str) -> String {
+    let start = body
+        .find(prefix)
+        .unwrap_or_else(|| panic!("missing {prefix:?} in {body}"))
+        + prefix.len();
+    let end = start + body[start..].find(terminator).unwrap();
+    serde_json::from_str(&body[start..end]).unwrap()
+}
+
+#[tokio::test]
+async fn wizard_steps_keep_query_values_inside_inline_script() {
+    let payload = query_encode(WIZARD_SCRIPT_BREAKOUT);
+
+    let environment = wizard_fragment_body(&format!(
+        "/dashboard/frag/wizard/step/3?workspace_path={payload}"
+    ))
+    .await;
+    let confirm = wizard_fragment_body(&format!(
+        "/dashboard/frag/wizard/step/5?workspace_path={payload}&provider={payload}&api_key_env={payload}"
+    ))
+    .await;
+
+    for (step, body) in [("environment", &environment), ("confirm", &confirm)] {
+        assert_eq!(
+            body.matches("<script").count(),
+            1,
+            "{step} step: a query value opened another script element:\n{body}"
+        );
+        assert!(
+            !body.contains("</script><script>"),
+            "{step} step: a query value closed the inline script:\n{body}"
+        );
+    }
+
+    // The escaped literals must still decode to the original values in JS.
+    assert_eq!(
+        script_string_after(&environment, "var ws = ", ";\n"),
+        WIZARD_SCRIPT_BREAKOUT
+    );
+    for key in ["workspacePath: ", "provider: ", "apiKeyEnv: "] {
+        assert_eq!(
+            script_string_after(&confirm, key, ",\n"),
+            WIZARD_SCRIPT_BREAKOUT,
+            "confirm step: {key}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn wizard_workspace_step_hx_vals_is_json_for_any_path() {
+    for workspace in [
+        r"C:\Users\dev\new-proj",
+        r#"/srv/a"b/proj"#,
+        r#"x","provider":"injected"#,
+    ] {
+        let body = wizard_fragment_body(&format!(
+            "/dashboard/frag/wizard/step/2?workspace_path={}",
+            query_encode(workspace)
+        ))
+        .await;
+        let start = body
+            .find("hx-vals=\"")
+            .unwrap_or_else(|| panic!("missing hx-vals for {workspace:?} in {body}"))
+            + "hx-vals=\"".len();
+        let end = start + body[start..].find('"').unwrap();
+        let hx_vals = html_attr_unescape(&body[start..end]);
+        let parsed: Value = serde_json::from_str(&hx_vals)
+            .unwrap_or_else(|err| panic!("hx-vals {hx_vals:?} is not valid JSON: {err}"));
+        assert_eq!(
+            parsed,
+            serde_json::json!({ "workspace_path": workspace }),
+            "hx-vals {hx_vals:?} did not round-trip {workspace:?}"
+        );
+    }
+}

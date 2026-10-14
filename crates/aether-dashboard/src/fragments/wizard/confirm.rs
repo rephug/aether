@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use maud::{Markup, html};
 
-use super::back_button;
+use super::{back_button, script_string_literal};
 
 /// Step 5: Summary and Start button.
 pub(crate) fn render(params: &HashMap<String, String>) -> Markup {
@@ -124,9 +124,9 @@ function startAether() {{
         }});
 }}
 "#,
-                workspace_json = serde_json::to_string(&workspace).unwrap_or_else(|_| "\"\"".to_owned()),
-                provider_json = serde_json::to_string(&provider).unwrap_or_else(|_| "\"cloud\"".to_owned()),
-                api_key_env_json = serde_json::to_string(&api_key_env).unwrap_or_else(|_| "\"GEMINI_API_KEY\"".to_owned()),
+                workspace_json = script_string_literal(&workspace),
+                provider_json = script_string_literal(&provider),
+                api_key_env_json = script_string_literal(&api_key_env),
                 enable_batch = enable_batch,
                 enable_continuous = enable_continuous,
             )))

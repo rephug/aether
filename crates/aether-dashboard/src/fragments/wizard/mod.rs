@@ -101,6 +101,21 @@ fn wizard_card(current_step: u32, content: Markup) -> Markup {
     }
 }
 
+/// Encode `value` as a JSON string literal that is safe inside an inline
+/// `<script>` element.
+///
+/// `serde_json` leaves `<`, `>` and `&` as-is, so a value containing
+/// `</script>` would end the script element early. Those characters only
+/// occur inside JSON string literals, so their `\uXXXX` escapes keep the
+/// literal valid and decode to the same value.
+pub(crate) fn script_string_literal(value: &str) -> String {
+    serde_json::Value::from(value)
+        .to_string()
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+}
+
 /// Shared "Back" button markup.
 pub(crate) fn back_button(step: u32, params: &HashMap<String, String>) -> Markup {
     let workspace = params.get("workspace_path").cloned().unwrap_or_default();
