@@ -4,13 +4,11 @@ use std::fs;
 use aether_core::{EdgeKind, Position, SourceRange};
 use aether_parse::{SymbolExtractor, language_for_path};
 use aether_sir::SirAnnotation;
-use aether_store::{
-    SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord, SymbolRelationStore,
-};
+use aether_store::{SirStateStore, SqliteStore, SymbolRecord, SymbolRelationStore};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::AetherMcpServer;
+use super::{AetherMcpServer, resolve_symbol_selector};
 use crate::AetherMcpError;
 
 const CHARS_PER_TOKEN: usize = 4;
@@ -134,84 +132,6 @@ struct QueueEntry {
     depth: u32,
     role: NodeRole,
     incoming_edge_kind: Option<EdgeKind>,
-}
-
-fn resolve_symbol_selector(
-    store: &SqliteStore,
-    selector: &str,
-) -> Result<SymbolRecord, AetherMcpError> {
-    let selector = selector.trim();
-    if selector.is_empty() {
-        return Err(AetherMcpError::Message(
-            "root_symbol must not be empty".to_owned(),
-        ));
-    }
-
-    if let Some(record) = store.get_symbol_record(selector)? {
-        return Ok(record);
-    }
-
-    let exact_matches = store.find_symbol_search_results_by_qualified_name(selector)?;
-    match exact_matches.as_slice() {
-        [only] => {
-            return store
-                .get_symbol_record(only.symbol_id.as_str())?
-                .ok_or_else(|| {
-                    AetherMcpError::Message(format!(
-                        "symbol search returned missing record: {}",
-                        only.symbol_id
-                    ))
-                });
-        }
-        [] => {}
-        many => {
-            let candidates = many
-                .iter()
-                .map(|candidate| {
-                    format!(
-                        "{} [{}]",
-                        candidate.qualified_name.trim(),
-                        candidate.file_path.trim()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n  - ");
-            return Err(AetherMcpError::Message(format!(
-                "ambiguous symbol selector '{selector}'. Candidates:\n  - {candidates}"
-            )));
-        }
-    }
-
-    let matches = store.search_symbols(selector, 10)?;
-    match matches.as_slice() {
-        [] => Err(AetherMcpError::Message(format!(
-            "symbol not found: {selector}"
-        ))),
-        [only] => store
-            .get_symbol_record(only.symbol_id.as_str())?
-            .ok_or_else(|| {
-                AetherMcpError::Message(format!(
-                    "symbol search returned missing record: {}",
-                    only.symbol_id
-                ))
-            }),
-        many => {
-            let candidates = many
-                .iter()
-                .map(|candidate| {
-                    format!(
-                        "{} [{}]",
-                        candidate.qualified_name.trim(),
-                        candidate.file_path.trim()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n  - ");
-            Err(AetherMcpError::Message(format!(
-                "ambiguous symbol selector '{selector}'. Candidates:\n  - {candidates}"
-            )))
-        }
-    }
 }
 
 fn truncate_by_char_count(content: &str, max_chars: usize) -> String {
@@ -416,7 +336,8 @@ impl AetherMcpServer {
         }
 
         let store = self.state.store.as_ref();
-        let root_record = resolve_symbol_selector(store, request.root_symbol.as_str())?;
+        let root_record =
+            resolve_symbol_selector(store, "root_symbol", request.root_symbol.as_str())?;
 
         let mut visited = HashSet::<String>::new();
         let mut queue = VecDeque::<QueueEntry>::new();

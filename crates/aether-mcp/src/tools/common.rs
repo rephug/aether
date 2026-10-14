@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use aether_core::{Position, SourceRange, normalize_path};
 use aether_parse::SymbolExtractor;
-use aether_store::{SqliteStore, SymbolCatalogStore, SymbolRecord};
+use aether_store::{SqliteStore, SymbolCatalogStore, SymbolRecord, SymbolSearchResult};
 
 use crate::AetherMcpError;
 
@@ -199,6 +199,78 @@ pub(crate) fn child_method_symbols(
     Ok(methods)
 }
 
+/// Name used for the selector in the empty-selector error by tools whose request field
+/// is `symbol`.
+pub(crate) const SYMBOL_SELECTOR_LABEL: &str = "symbol selector";
+
+/// Resolves the symbol a tool request names: an exact symbol id first, then an exact
+/// qualified name, then a symbol search. A lookup step that finds several symbols fails
+/// with the candidates listed instead of picking one. `selector_name` names the
+/// selector in the error for an empty one.
+pub(crate) fn resolve_symbol_selector(
+    store: &SqliteStore,
+    selector_name: &str,
+    selector: &str,
+) -> Result<SymbolRecord, AetherMcpError> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return Err(AetherMcpError::Message(format!(
+            "{selector_name} must not be empty"
+        )));
+    }
+
+    if let Some(record) = store.get_symbol_record(selector)? {
+        return Ok(record);
+    }
+
+    let exact_matches = store.find_symbol_search_results_by_qualified_name(selector)?;
+    match exact_matches.as_slice() {
+        [only] => return symbol_record_for_match(store, only),
+        [] => {}
+        many => return Err(ambiguous_selector(selector, many)),
+    }
+
+    let matches = store.search_symbols(selector, 10)?;
+    match matches.as_slice() {
+        [] => Err(AetherMcpError::Message(format!(
+            "symbol not found: {selector}"
+        ))),
+        [only] => symbol_record_for_match(store, only),
+        many => Err(ambiguous_selector(selector, many)),
+    }
+}
+
+fn symbol_record_for_match(
+    store: &SqliteStore,
+    found: &SymbolSearchResult,
+) -> Result<SymbolRecord, AetherMcpError> {
+    store
+        .get_symbol_record(found.symbol_id.as_str())?
+        .ok_or_else(|| {
+            AetherMcpError::Message(format!(
+                "symbol search returned missing record: {}",
+                found.symbol_id
+            ))
+        })
+}
+
+fn ambiguous_selector(selector: &str, candidates: &[SymbolSearchResult]) -> AetherMcpError {
+    let candidates = candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                "{} [{}]",
+                candidate.qualified_name.trim(),
+                candidate.file_path.trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n  - ");
+    AetherMcpError::Message(format!(
+        "ambiguous symbol selector '{selector}'. Candidates:\n  - {candidates}"
+    ))
+}
+
 pub(crate) fn normalize_workspace_relative_path(
     workspace: &Path,
     value: &str,
@@ -245,4 +317,118 @@ pub(crate) fn normalize_workspace_relative_path(
     }
 
     Ok(normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+
+    fn seed(store: &SqliteStore, id: &str, file_path: &str, qualified_name: &str) {
+        store
+            .upsert_symbol(SymbolRecord {
+                id: id.to_owned(),
+                file_path: file_path.to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: qualified_name.to_owned(),
+                signature_fingerprint: format!("sig-{id}"),
+                last_seen_at: 1_700_000_000,
+            })
+            .expect("upsert symbol");
+    }
+
+    fn message(result: Result<SymbolRecord, AetherMcpError>) -> String {
+        match result {
+            Ok(record) => panic!("expected an error, resolved {}", record.id),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    #[test]
+    fn resolve_symbol_selector_walks_id_then_qualified_name_then_search() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        seed(&store, "sym-alpha", "src/lib.rs", "crate::alpha");
+        seed(&store, "sym-gamma", "src/lib.rs", "crate::gamma_helper");
+        // An id that is also another symbol's qualified name: the id wins.
+        seed(&store, "crate::alpha", "src/other.rs", "crate::shadow");
+        // Makes a search for `crate::shadow` ambiguous, so only the exact qualified-name
+        // step can resolve it.
+        seed(
+            &store,
+            "sym-shadow-two",
+            "src/other.rs",
+            "crate::shadow_two",
+        );
+
+        let by_id =
+            resolve_symbol_selector(&store, SYMBOL_SELECTOR_LABEL, "sym-alpha").expect("by id");
+        assert_eq!(by_id.id, "sym-alpha");
+        let id_first = resolve_symbol_selector(&store, SYMBOL_SELECTOR_LABEL, "crate::alpha")
+            .expect("id first");
+        assert_eq!(id_first.id, "crate::alpha");
+        let by_name = resolve_symbol_selector(&store, SYMBOL_SELECTOR_LABEL, "crate::shadow")
+            .expect("by qualified name");
+        assert_eq!(by_name.id, "crate::alpha");
+        // Trimmed before the id lookup; untrimmed, the id lookup would miss and the
+        // qualified-name step would return `sym-alpha`.
+        let trimmed = resolve_symbol_selector(&store, SYMBOL_SELECTOR_LABEL, "  crate::alpha  ")
+            .expect("trimmed id");
+        assert_eq!(trimmed.id, "crate::alpha");
+        let by_search =
+            resolve_symbol_selector(&store, SYMBOL_SELECTOR_LABEL, "gamma").expect("by search");
+        assert_eq!(by_search.id, "sym-gamma");
+    }
+
+    #[test]
+    fn resolve_symbol_selector_reports_empty_missing_and_ambiguous_selectors() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        seed(&store, "sym-a", "src/a.rs", "crate::run");
+        seed(&store, "sym-b", "src/b.rs", "crate::run");
+        seed(&store, "sym-c", "src/c.rs", "crate::delta_one");
+        seed(&store, "sym-d", "src/d.rs", "crate::delta_two");
+        // A search for `crate::run` would list this one too; the qualified-name step doesn't.
+        seed(&store, "sym-e", "src/e.rs", "crate::runner");
+
+        assert_eq!(
+            message(resolve_symbol_selector(&store, "root_symbol", "   ")),
+            "root_symbol must not be empty"
+        );
+        assert_eq!(
+            message(resolve_symbol_selector(&store, SYMBOL_SELECTOR_LABEL, "")),
+            "symbol selector must not be empty"
+        );
+        assert_eq!(
+            message(resolve_symbol_selector(
+                &store,
+                SYMBOL_SELECTOR_LABEL,
+                "nowhere"
+            )),
+            "symbol not found: nowhere"
+        );
+
+        let same_name = message(resolve_symbol_selector(
+            &store,
+            SYMBOL_SELECTOR_LABEL,
+            "crate::run",
+        ));
+        assert!(
+            same_name.starts_with("ambiguous symbol selector 'crate::run'. Candidates:\n  - "),
+            "{same_name}"
+        );
+        assert!(same_name.contains("crate::run [src/a.rs]"), "{same_name}");
+        assert!(same_name.contains("crate::run [src/b.rs]"), "{same_name}");
+        assert!(!same_name.contains("crate::runner"), "{same_name}");
+
+        let search = message(resolve_symbol_selector(
+            &store,
+            SYMBOL_SELECTOR_LABEL,
+            "delta",
+        ));
+        assert!(search.contains("crate::delta_one [src/c.rs]"), "{search}");
+        assert!(search.contains("crate::delta_two [src/d.rs]"), "{search}");
+    }
 }
