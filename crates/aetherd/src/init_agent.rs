@@ -385,12 +385,14 @@ fn detected_languages() -> Vec<String> {
     let mut has_rust = false;
     let mut has_typescript = false;
     let mut has_python = false;
+    let mut has_go = false;
 
     for config in LanguageRegistry::default().configs() {
         match config.id {
             "rust" => has_rust = true,
             "typescript" | "tsx_js" => has_typescript = true,
             "python" => has_python = true,
+            "go" => has_go = true,
             _ => {}
         }
     }
@@ -404,6 +406,9 @@ fn detected_languages() -> Vec<String> {
     }
     if has_python {
         languages.push("Python".to_owned());
+    }
+    if has_go {
+        languages.push("Go".to_owned());
     }
 
     languages
@@ -941,6 +946,14 @@ mod tests {
         let disabled = fs::read_to_string(without_embeddings.path().join("CLAUDE.md"))
             .expect("read claude without embeddings");
         assert!(disabled.contains("lexical only"));
+    }
+
+    #[test]
+    fn detected_languages_names_every_registered_parser() {
+        assert_eq!(
+            super::detected_languages(),
+            vec!["Rust", "TypeScript/JavaScript", "Python", "Go"]
+        );
     }
 
     fn write_config_with_embeddings(workspace: &Path, embeddings_enabled: bool) {
