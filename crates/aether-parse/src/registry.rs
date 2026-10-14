@@ -184,6 +184,7 @@ pub fn default_registry() -> LanguageRegistry {
     registry.register(languages::rust::config());
     registry.register(languages::typescript::config());
     registry.register(languages::typescript::tsx_js_config());
+    registry.register(languages::go::config());
     registry.register(languages::java::config());
     registry
 }

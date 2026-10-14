@@ -140,6 +140,7 @@ impl SymbolExtractor {
             Language::TypeScript => "typescript",
             Language::Tsx | Language::JavaScript | Language::Jsx => "tsx_js",
             Language::Python => "python",
+            Language::Go => "go",
             Language::Java => "java",
         };
         self.registry.get_by_id(fallback_id)
@@ -481,6 +482,7 @@ pub fn language_for_path(path: &Path) -> Option<Language> {
         "js" => Some(Language::JavaScript),
         "jsx" => Some(Language::Jsx),
         "py" | "pyi" => Some(Language::Python),
+        "go" => Some(Language::Go),
         "java" => Some(Language::Java),
         _ => None,
     }

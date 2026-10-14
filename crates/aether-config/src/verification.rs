@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::constants::{
     DEFAULT_VERIFY_CONTAINER_IMAGE, DEFAULT_VERIFY_CONTAINER_RUNTIME,
-    DEFAULT_VERIFY_CONTAINER_WORKDIR, DEFAULT_VERIFY_MICROVM_MEMORY_MIB,
-    DEFAULT_VERIFY_MICROVM_RUNTIME, DEFAULT_VERIFY_MICROVM_VCPU_COUNT,
-    DEFAULT_VERIFY_MICROVM_WORKDIR,
+    DEFAULT_VERIFY_CONTAINER_WORKDIR, DEFAULT_VERIFY_MAX_OUTPUT_BYTES,
+    DEFAULT_VERIFY_MICROVM_MEMORY_MIB, DEFAULT_VERIFY_MICROVM_RUNTIME,
+    DEFAULT_VERIFY_MICROVM_VCPU_COUNT, DEFAULT_VERIFY_MICROVM_WORKDIR, DEFAULT_VERIFY_TIMEOUT_SECS,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,6 +17,13 @@ pub struct VerifyConfig {
     pub container: VerifyContainerConfig,
     #[serde(default)]
     pub microvm: VerifyMicrovmConfig,
+    /// Seconds one verification command may run before it is stopped.
+    #[serde(default = "default_verify_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Bytes of stdout, and of stderr, kept per command; longer output keeps its start
+    /// and end.
+    #[serde(default = "default_verify_max_output_bytes")]
+    pub max_output_bytes: usize,
 }
 
 impl Default for VerifyConfig {
@@ -26,6 +33,8 @@ impl Default for VerifyConfig {
             mode: VerifyMode::Host,
             container: VerifyContainerConfig::default(),
             microvm: VerifyMicrovmConfig::default(),
+            timeout_secs: default_verify_timeout_secs(),
+            max_output_bytes: default_verify_max_output_bytes(),
         }
     }
 }
@@ -120,6 +129,14 @@ impl Default for VerifyMicrovmConfig {
             fallback_to_host_on_unavailable: false,
         }
     }
+}
+
+fn default_verify_timeout_secs() -> u64 {
+    DEFAULT_VERIFY_TIMEOUT_SECS
+}
+
+fn default_verify_max_output_bytes() -> usize {
+    DEFAULT_VERIFY_MAX_OUTPUT_BYTES
 }
 
 pub(crate) fn default_verify_commands() -> Vec<String> {

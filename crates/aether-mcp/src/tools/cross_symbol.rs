@@ -1,16 +1,15 @@
 use std::collections::{HashSet, VecDeque};
 use std::fs;
+use std::path::Path;
 
 use aether_core::{EdgeKind, Position, SourceRange};
 use aether_parse::{SymbolExtractor, language_for_path};
 use aether_sir::SirAnnotation;
-use aether_store::{
-    SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord, SymbolRelationStore,
-};
+use aether_store::{SirStateStore, SqliteStore, SymbolRecord, SymbolRelationStore};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::AetherMcpServer;
+use super::{AetherMcpServer, resolve_symbol_selector};
 use crate::AetherMcpError;
 
 const CHARS_PER_TOKEN: usize = 4;
@@ -136,84 +135,6 @@ struct QueueEntry {
     incoming_edge_kind: Option<EdgeKind>,
 }
 
-fn resolve_symbol_selector(
-    store: &SqliteStore,
-    selector: &str,
-) -> Result<SymbolRecord, AetherMcpError> {
-    let selector = selector.trim();
-    if selector.is_empty() {
-        return Err(AetherMcpError::Message(
-            "root_symbol must not be empty".to_owned(),
-        ));
-    }
-
-    if let Some(record) = store.get_symbol_record(selector)? {
-        return Ok(record);
-    }
-
-    let exact_matches = store.find_symbol_search_results_by_qualified_name(selector)?;
-    match exact_matches.as_slice() {
-        [only] => {
-            return store
-                .get_symbol_record(only.symbol_id.as_str())?
-                .ok_or_else(|| {
-                    AetherMcpError::Message(format!(
-                        "symbol search returned missing record: {}",
-                        only.symbol_id
-                    ))
-                });
-        }
-        [] => {}
-        many => {
-            let candidates = many
-                .iter()
-                .map(|candidate| {
-                    format!(
-                        "{} [{}]",
-                        candidate.qualified_name.trim(),
-                        candidate.file_path.trim()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n  - ");
-            return Err(AetherMcpError::Message(format!(
-                "ambiguous symbol selector '{selector}'. Candidates:\n  - {candidates}"
-            )));
-        }
-    }
-
-    let matches = store.search_symbols(selector, 10)?;
-    match matches.as_slice() {
-        [] => Err(AetherMcpError::Message(format!(
-            "symbol not found: {selector}"
-        ))),
-        [only] => store
-            .get_symbol_record(only.symbol_id.as_str())?
-            .ok_or_else(|| {
-                AetherMcpError::Message(format!(
-                    "symbol search returned missing record: {}",
-                    only.symbol_id
-                ))
-            }),
-        many => {
-            let candidates = many
-                .iter()
-                .map(|candidate| {
-                    format!(
-                        "{} [{}]",
-                        candidate.qualified_name.trim(),
-                        candidate.file_path.trim()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n  - ");
-            Err(AetherMcpError::Message(format!(
-                "ambiguous symbol selector '{selector}'. Candidates:\n  - {candidates}"
-            )))
-        }
-    }
-}
-
 fn truncate_by_char_count(content: &str, max_chars: usize) -> String {
     if content.chars().count() <= max_chars {
         return content.to_owned();
@@ -313,11 +234,12 @@ fn extract_node_source(
     record: &SymbolRecord,
     max_source_tokens: usize,
 ) -> Option<String> {
-    let full_path = server.workspace().join(&record.file_path);
+    let full_path =
+        super::common::contained_workspace_file(server.workspace(), &record.file_path).ok()?;
     let source = fs::read_to_string(&full_path).ok()?;
     let truncated_full_file = middle_truncate_by_tokens(&source, max_source_tokens);
 
-    let Some(language) = language_for_path(&full_path) else {
+    let Some(language) = language_for_path(Path::new(&record.file_path)) else {
         return Some(truncated_full_file);
     };
 
@@ -416,7 +338,8 @@ impl AetherMcpServer {
         }
 
         let store = self.state.store.as_ref();
-        let root_record = resolve_symbol_selector(store, request.root_symbol.as_str())?;
+        let root_record =
+            resolve_symbol_selector(store, "root_symbol", request.root_symbol.as_str())?;
 
         let mut visited = HashSet::<String>::new();
         let mut queue = VecDeque::<QueueEntry>::new();
@@ -548,8 +471,8 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::{
-        AetherAuditCrossSymbolRequest, NodeRole, middle_truncate_by_chars, read_cross_symbol_sir,
-        truncate_by_char_count,
+        AetherAuditCrossSymbolRequest, NodeRole, extract_node_source, middle_truncate_by_chars,
+        read_cross_symbol_sir, truncate_by_char_count,
     };
     use crate::AetherMcpServer;
 
@@ -1020,5 +943,25 @@ pub fn root() -> i32 { helper() }
         assert!(sir.is_none());
         assert!(logs.contains("failed to parse SIR blob for cross-symbol audit context"));
         assert!(logs.contains("sym-invalid"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_source_refuses_files_that_resolve_outside_the_workspace() {
+        let temp = tempdir().expect("tempdir");
+        let symbols = seed_workspace(temp.path(), "pub fn alpha() -> i32 {\n    1\n}\n");
+        let alpha = symbols.get("alpha").expect("alpha");
+        let outside = tempdir().expect("outside tempdir");
+        fs::write(
+            outside.path().join("other.rs"),
+            "pub fn alpha() -> i32 {\n    2 // OUTSIDE_WORKSPACE\n}\n",
+        )
+        .expect("write outside source");
+        let indexed = temp.path().join(&alpha.file_path);
+        fs::remove_file(&indexed).expect("remove indexed source");
+        std::os::unix::fs::symlink(outside.path().join("other.rs"), &indexed).expect("symlink");
+        let server = AetherMcpServer::new(temp.path(), false).expect("server");
+
+        assert_eq!(extract_node_source(&server, alpha, 1_000), None);
     }
 }

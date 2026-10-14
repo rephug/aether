@@ -692,6 +692,7 @@ fn parse_language_field(language: Option<&str>) -> Result<Language, AetherMcpErr
         "javascript" => Ok(Language::JavaScript),
         "jsx" => Ok(Language::Jsx),
         "python" => Ok(Language::Python),
+        "go" => Ok(Language::Go),
         "java" => Ok(Language::Java),
         _ => Err(AetherMcpError::Message(format!(
             "unsupported language: {value}"
@@ -841,7 +842,7 @@ mod language_tests {
 
     #[test]
     fn reads_every_stored_language_spelling() {
-        let mut listed = [false; 7];
+        let mut listed = [false; 8];
         for language in [
             Language::Rust,
             Language::TypeScript,
@@ -849,6 +850,7 @@ mod language_tests {
             Language::JavaScript,
             Language::Jsx,
             Language::Python,
+            Language::Go,
             Language::Java,
         ] {
             listed[variant_index(language)] = true;
@@ -873,7 +875,8 @@ mod language_tests {
             Language::JavaScript => 3,
             Language::Jsx => 4,
             Language::Python => 5,
-            Language::Java => 6,
+            Language::Go => 6,
+            Language::Java => 7,
         }
     }
 }
