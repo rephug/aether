@@ -1,97 +1,92 @@
-# AETHER Code Intelligence
+# AETHER — working on this repository
 
-This project uses AETHER for local code intelligence. Use the MCP tools below to ground decisions before making risky edits.
+AETHER is a semantic intelligence engine for codebases. It parses every symbol with
+tree-sitter, records a Semantic Intent Record (SIR) for it, keeps symbols, edges and
+SIRs in SQLite plus a SurrealDB (SurrealKV) graph and a vector store, and serves the
+results through an LSP, MCP tools, a CLI, a web dashboard and a Tauri desktop app.
 
-## Agent Schema Version: 1
+This file is for agents changing AETHER itself. Projects that *use* AETHER get a
+generated CLAUDE.md from `aetherd init-agent`; this one is hand-written.
 
-## Inference Provider
-- `gemini`
+## Facts that are easy to get wrong
 
-## MCP Binary Hint
-- `./target/debug/aether-mcp`
+- **Core schema: 21.** `PRAGMA user_version` in `crates/aether-store/src/schema.rs`;
+  readers check `check_compatibility("core", 21)` (`aether-mcp`, `aether-dashboard`).
+  A schema bump is a deliberate, reviewed change, never a side effect.
+- **Agent template schema: 4.** `AETHER_AGENT_SCHEMA_VERSION` in `aether-core`; it is
+  written into the files `init-agent` generates. Bump it when a generated template
+  changes meaningfully.
+- **MCP:** `aether-mcp` is a stdio server with 39 tools (40 with the `verification`
+  feature, which adds `aether_verify`). `aether-query` serves the same tools read-only
+  over streamable HTTP (`POST /mcp`) for a live index; there is no read-write
+  MCP-over-HTTP server.
+- **Languages parsed:** Rust, TypeScript/JavaScript, Python.
+- Re-index from the CLI with `aetherd --workspace . --index-once` (`--full` for the
+  SIR passes). There is no `aether_index_once` MCP tool.
 
-## Available Tools
-- `aether_status`: Get AETHER local store status
-- `aether_symbol_lookup`: Lookup symbols by qualified name or file path
-- `aether_dependencies`: Get resolved callers and call dependencies for a symbol
-- `aether_usage_matrix`: Get a consumer-by-method usage matrix for a trait or struct, showing which files call which methods and suggesting method clusters for trait decomposition
-- `aether_suggest_trait_split`: Suggest how to decompose a large trait or struct into smaller capability groups based on consumer usage patterns
-- `aether_call_chain`: Get transitive call-chain levels for a symbol
-- `aether_search`: Search symbols by name, path, language, or kind
-- `aether_remember`: Store project memory note content with deterministic deduplication
-- `aether_session_note`: Capture an in-session project note with source_type=session
-- `aether_recall`: Recall project memory notes using lexical, semantic, or hybrid retrieval
-- `aether_ask`: Search symbols, notes, coupling, and test intents with unified ranking
-- `aether_audit_candidates`: Get ranked list of symbols most in need of deep audit review, combining structural risk with SIR confidence and reasoning trace uncertainty
-- `aether_audit_cross_symbol`: trace callers and callees with full SIR and source for cross-boundary audit
-- `aether_audit_submit`: Submit a structured audit finding for a symbol
-- `aether_audit_report`: Query audit findings by crate, severity, category, or status
-- `aether_audit_resolve`: Mark an audit finding as fixed, wontfix, or confirmed
-- `aether_contract_add`: add a behavioral contract on a symbol
-- `aether_contract_list`: list active intent contracts
-- `aether_contract_remove`: deactivate an intent contract
-- `aether_contract_check`: verify contracts against current SIR
-- `aether_contract_violations`: query contract violation history
-- `aether_contract_dismiss`: dismiss a contract violation
-- `aether_sir_inject`: Write an improved SIR annotation back to the store for a symbol
-- `aether_sir_context`: Assemble token-budgeted context for a symbol including source, SIR, graph neighbors, health, reasoning trace, and test intents in one call
-- `aether_enhance_prompt`: Enhance a raw coding prompt with indexed codebase context, symbol matches, files, and architectural notes
-- `aether_blast_radius`: Analyze coupled files and risk levels for blast-radius impact
-- `aether_test_intents`: Query extracted behavioral test intents for a file or symbol
-- `aether_drift_report`: Run semantic drift analysis with boundary and structural anomaly detection
-- `aether_health`: Get codebase health metrics including critical symbols, bottlenecks, dependency cycles, orphaned code, and risk hotspots.
-- `aether_health_hotspots`: Return the hottest workspace crates by health score with archetypes and top violations.
-- `aether_health_explain`: Explain one crate's health score, signals, violations, and split suggestions.
-- `aether_refactor_prep`: Prepare a file or crate for refactoring by deep-scanning the highest-risk symbols and saving an intent snapshot
-- `aether_verify_intent`: Compare current SIR against a saved refactor-prep snapshot and flag semantic drift
-- `aether_trace_cause`: Trace likely upstream semantic causes of a downstream breakage
-- `aether_acknowledge_drift`: Acknowledge drift findings and create a project note
-- `aether_symbol_timeline`: Get ordered SIR timeline entries for a symbol
-- `aether_why_changed`: Explain why a symbol changed between two SIR versions or timestamps
-- `aether_get_sir`: Get SIR for leaf/file/module level
-- `aether_explain`: Explain symbol at a file position using local SIR
-- `aether_verify`: Run allowlisted verification commands in host, container, or microvm mode
+## Workspace layout
 
-## Available Languages
-- Rust, TypeScript/JavaScript, Python
+17 crates under `crates/`:
 
-## Search Modes
-- lexical, semantic, hybrid (semantic search is enabled)
+- `aetherd` — CLI, daemon, indexer, SIR pipeline, batch and continuous jobs,
+  `init-agent` templates (`src/templates/`)
+- `aether-core` (symbol model, stable IDs), `aether-config`, `aether-parse`,
+  `aether-sir`, `aether-infer` (inference and embedding providers)
+- `aether-store` (SQLite, SurrealDB graph, vectors), `aether-graph-algo`,
+  `aether-analysis`, `aether-health`, `aether-memory`
+- `aether-mcp`, `aether-lsp`, `aether-query`, `aether-dashboard`, `aether-desktop`,
+  `aether-document`
 
-## Required Actions (mandatory)
-- Always call `aether_get_sir` before reverting, deleting, or refactoring symbols.
-- Always call `aether_why_changed` before reverting recent changes.
-- Always call `aether_verify` after modifying code.
-- If `aether_verify` fails, fix the issue before proceeding.
+Specs live in `docs/roadmap/`; decisions in `docs/DECISIONS*.md` and
+`docs/roadmap/DECISIONS_v4*.md`.
 
-## Recommended Actions (advisory)
-- Consider `aether_search` with hybrid mode when exploring unfamiliar code.
-- Consider `aether_symbol_timeline` when reviewing recent changes.
-- Consider `aether_call_chain` when tracing dependencies and downstream impact.
-- Call `aether_status` at task start to confirm index freshness.
+## Building and validating
 
-## Audit Workflow
+Per-crate cargo only. Never `--workspace`: a full workspace build or test needs more
+memory than many machines have. Run one cargo job at a time when several worktrees
+share a target directory.
 
-When asked to audit code for bugs, use AETHER MCP tools to guide deep analysis.
+For every crate you change:
 
-### Finding targets
-- Call `aether_health` for the target file or crate to get structural risk scores.
-- Symbols with high risk_score, high betweenness, or low test_count are priority targets.
-- Use `/audit <target>` for a guided audit workflow.
+```bash
+cargo fmt --all --check
+cargo clippy -p <crate> --all-targets -- -D warnings
+cargo test -p <crate>
+```
 
-### Recording results
-- Call `aether_remember` with structured AUDIT FINDING notes.
-- If `aether_audit_submit` is available, prefer it for structured queryable findings.
+For `aetherd`, also run clippy and tests with `--features dashboard`, as CI does.
+`aether-desktop` needs the WebKitGTK/GTK development packages that CI installs.
 
-### Refactoring workflow
-- Call `aether_refactor_prep` before refactoring to snapshot intents.
-- Call `aether_verify_intent` after refactoring to detect semantic drift.
-- Use `/refactor <target>` for a guided refactoring workflow.
+Keep the target directory outside the repository (set `CARGO_TARGET_DIR`), and point
+`TMPDIR` at a disk-backed directory if `/tmp` is small.
 
-## Staleness Guidance
-If you have made many rapid edits, call `aether_status` before trusting retrieval results. If symbol or SIR counts look stale, wait for indexing or run `aether_index_once`.
+## Worktree flow
 
-## Verify Commands
-- `cargo fmt --all --check`
-- `cargo clippy --workspace -- -D warnings`
-- `cargo test --workspace`
+- One branch and one worktree per change, created next to the checkout, never inside it:
+  `git worktree add -B <branch> ../<branch>`.
+- Never commit to `main`. Push the branch and open a PR with a descriptive title and
+  body; commit and PR text is indexed as project history, so explain the problem, the
+  root cause, the fix, the tests and the risk.
+- Reproduce first: write the failing test before the fix.
+
+## SurrealKV is single-process
+
+The SurrealKV graph store under `.aether/graph/` can be open in only one process at a
+time. A running `aetherd` daemon holds it, so CLI commands that need the store can't
+open it while the daemon runs (some detect the daemon and exit with guidance).
+
+- Stop the daemon before such commands: `pkill -x aetherd` (`-x` matches the binary
+  name only; `-f` would also kill your shell and any cargo job building aetherd).
+- Tests create their own temporary workspaces; never point tests or a second process at
+  a real `.aether` directory that a daemon is using.
+
+## Code conventions
+
+- No `unwrap()` or `expect()` in library code; `thiserror` in libraries, `anyhow` in
+  binaries, and `.context(...)` on fallible calls.
+- SIR JSON is canonical (sorted keys) and hashed; don't change hashing, prompt
+  fingerprints or SIR format in a way that makes stored SIRs look stale.
+- `aether-store` is called from many async tasks; watch lock scope and blocking I/O in
+  async code.
+- Don't add crates, swap out SurrealDB or tree-sitter, or recommend models and
+  providers without an explicit request.

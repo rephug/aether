@@ -932,7 +932,7 @@ mod tests {
             "hash-b2",
             r#"{"purpose":"new b","edge_cases":["one","two"],"dependencies":["db","cache"]}"#,
             None,
-            now.saturating_sub(1 * 86_400_000),
+            now.saturating_sub(86_400_000),
         );
         record_history(
             &store,
