@@ -9,9 +9,9 @@ use clap::ValueEnum;
 
 use crate::templates::{
     AuditChangesCommandTemplate, AuditCommandTemplate, AuditReportCommandTemplate, ClaudeTemplate,
-    CodexInstructionsTemplate, CursorRulesTemplate, McpJsonTemplate, OmpAgentsTemplate,
-    RefactorCommandTemplate, RefactorDeepCommandTemplate, ScanAllScriptTemplate,
-    ScanCommandTemplate, SkillTemplate, TemplateContext,
+    CodexInstructionsTemplate, CursorRulesTemplate, EnrichCommandTemplate, McpJsonTemplate,
+    NextCommandTemplate, OmpAgentsTemplate, RefactorCommandTemplate, RefactorDeepCommandTemplate,
+    ScanAllScriptTemplate, ScanCommandTemplate, SkillTemplate, TemplateContext,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -202,6 +202,14 @@ fn files_for_platform(platform: AgentPlatform, context: &TemplateContext) -> Vec
         files.push(GeneratedFile::new(
             ".claude/commands/scan.md",
             ScanCommandTemplate::render(context),
+        ));
+        files.push(GeneratedFile::new(
+            ".claude/commands/enrich.md",
+            EnrichCommandTemplate::render(context),
+        ));
+        files.push(GeneratedFile::new(
+            ".claude/commands/next.md",
+            NextCommandTemplate::render(context),
         ));
         files.push(GeneratedFile::script(
             "scripts/scan_all.sh",
@@ -409,6 +417,8 @@ mod tests {
         assert!(workspace.join(".claude/commands/audit-report.md").exists());
         assert!(workspace.join(".claude/commands/audit-changes.md").exists());
         assert!(workspace.join(".claude/commands/scan.md").exists());
+        assert!(workspace.join(".claude/commands/enrich.md").exists());
+        assert!(workspace.join(".claude/commands/next.md").exists());
         assert!(workspace.join("scripts/scan_all.sh").exists());
         assert!(
             workspace
@@ -799,6 +809,22 @@ mod tests {
         assert!(changes.contains("aether_search"));
         assert!(changes.contains("aether_get_sir"));
         assert!(changes.contains("aether_sir_inject"));
+
+        let enrich = fs::read_to_string(workspace.join(".claude/commands/enrich.md"))
+            .expect("read enrich command");
+        assert!(enrich.contains("argument-hint: <crate-name>"));
+        assert!(enrich.contains("aether_audit_candidates"));
+        assert!(enrich.contains("aether_sir_context"));
+        assert!(enrich.contains("aether_sir_inject"));
+        assert!(enrich.contains("`generation_pass`: \"deep\""));
+        assert!(enrich.contains("aether_audit_submit"));
+
+        let next = fs::read_to_string(workspace.join(".claude/commands/next.md"))
+            .expect("read next command");
+        assert!(next.contains("argument-hint: [--fix] [--enrich] [--audit]"));
+        assert!(next.contains("aether_health_hotspots"));
+        assert!(next.contains("aether_audit_report"));
+        assert!(next.contains("/enrich <worst-crate>"));
     }
 
     #[test]
