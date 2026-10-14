@@ -501,6 +501,34 @@ pub fn open_surreal_graph_store_readonly(
     )?
 }
 
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Switches the connection to WAL journaling, retrying while another connection
+/// holds a conflicting lock. Changing the journal mode can fail with SQLITE_BUSY
+/// without consulting the busy handler, so retry the pragma until `timeout`,
+/// sharing that one deadline with SQLite's own waits. Leaves the connection's
+/// busy timeout set to `timeout`.
+fn configure_wal(conn: &Connection, timeout: Duration) -> Result<(), StoreError> {
+    let started = Instant::now();
+    let result = loop {
+        conn.busy_timeout(timeout.saturating_sub(started.elapsed()))?;
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => break Ok(()),
+            Err(err)
+                if err.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
+                    && started.elapsed() < timeout =>
+            {
+                std::thread::sleep(
+                    Duration::from_millis(10).min(timeout.saturating_sub(started.elapsed())),
+                );
+            }
+            Err(err) => break Err(err),
+        }
+    };
+    conn.busy_timeout(timeout)?;
+    result.map_err(StoreError::from)
+}
+
 pub struct SqliteStore {
     conn: Mutex<Connection>,
     aether_dir: PathBuf,
@@ -536,13 +564,13 @@ impl SqliteStore {
         }
 
         let conn = Connection::open_with_flags(sqlite_path, flags)?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         if !read_only {
-            conn.pragma_update(None, "journal_mode", "WAL")?;
-        }
-        conn.busy_timeout(Duration::from_secs(5))?;
-        if !read_only {
+            configure_wal(&conn, SQLITE_BUSY_TIMEOUT)?;
             run_migrations(&conn)?;
         }
+        // Enabled only after migrating: the migration steps (the v16 `sir_quality`
+        // table rebuild, for one) are written to run with foreign keys off.
         conn.execute_batch("PRAGMA foreign_keys = ON")?;
 
         Ok(Self {

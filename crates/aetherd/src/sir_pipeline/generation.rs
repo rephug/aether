@@ -23,44 +23,22 @@ impl SirPipeline {
         symbol: &Symbol,
         sir: &mut SirAnnotation,
     ) -> Result<()> {
-        if !matches!(
-            symbol.kind.as_str(),
-            "trait" | "struct" | "enum" | "type_alias"
-        ) {
+        if !METHOD_PARENT_KINDS.contains(&symbol.kind.as_str()) {
             sir.method_dependencies = None;
             return Ok(());
         }
 
-        let prefix = format!("{}::", symbol.qualified_name);
-        let mut method_dependencies = BTreeMap::new();
+        let mut packages = PackageRoots::new(self.workspace_root.as_path());
+        let parent = MethodParent {
+            id: symbol.id.as_str(),
+            qualified_name: symbol.qualified_name.as_str(),
+            file_path: symbol.file_path.as_str(),
+            language: symbol.language.as_str(),
+        };
+        let mut method_dependencies = owned_method_dependencies(store, &parent, &mut packages)?;
 
-        for (child, edge) in store.list_method_dependency_edges_for_type(
-            symbol.qualified_name.as_str(),
-            &[EdgeKind::Calls, EdgeKind::TypeRef],
-        )? {
-            let Some(method_name) = child.qualified_name.strip_prefix(prefix.as_str()) else {
-                continue;
-            };
-
-            let dependency = edge
-                .target_qualified_name
-                .rsplit("::")
-                .next()
-                .unwrap_or(edge.target_qualified_name.as_str())
-                .trim_start_matches("r#")
-                .trim()
-                .to_owned();
-
-            if !dependency.is_empty() {
-                method_dependencies
-                    .entry(method_name.to_owned())
-                    .or_insert_with(Vec::new)
-                    .push(dependency);
-            }
-        }
-
-        // Trait method declarations are indexed without the trait:: prefix.
-        // Fall back to same-file implementor methods when the direct prefix lookup is empty.
+        // Trait method declarations are indexed without the trait:: prefix. Fall back
+        // to the methods of a same-file type that implements this trait.
         if method_dependencies.is_empty() && symbol.kind.as_str() == "trait" {
             let mut candidates = store
                 .list_symbols_for_file(symbol.file_path.as_str())?
@@ -77,40 +55,25 @@ impl SirPipeline {
             });
 
             for candidate in candidates {
-                let implementor_edges = store.list_method_dependency_edges_for_type(
-                    candidate.qualified_name.as_str(),
-                    &[EdgeKind::Calls, EdgeKind::TypeRef],
-                )?;
-                if implementor_edges.is_empty() {
+                let implements_trait = store
+                    .list_symbol_edges_for_source_and_kinds(
+                        candidate.id.as_str(),
+                        &[EdgeKind::Implements],
+                    )?
+                    .iter()
+                    .any(|edge| edge.target_qualified_name == symbol.qualified_name);
+                if !implements_trait {
                     continue;
                 }
 
-                let implementor_prefix = format!("{}::", candidate.qualified_name);
-                for (child, edge) in implementor_edges {
-                    let Some(method_name) = child
-                        .qualified_name
-                        .strip_prefix(implementor_prefix.as_str())
-                    else {
-                        continue;
-                    };
-
-                    let dependency = edge
-                        .target_qualified_name
-                        .rsplit("::")
-                        .next()
-                        .unwrap_or(edge.target_qualified_name.as_str())
-                        .trim_start_matches("r#")
-                        .trim()
-                        .to_owned();
-
-                    if !dependency.is_empty() {
-                        method_dependencies
-                            .entry(method_name.to_owned())
-                            .or_insert_with(Vec::new)
-                            .push(dependency);
-                    }
-                }
-
+                let implementor = MethodParent {
+                    id: candidate.id.as_str(),
+                    qualified_name: candidate.qualified_name.as_str(),
+                    file_path: candidate.file_path.as_str(),
+                    language: candidate.language.as_str(),
+                };
+                method_dependencies =
+                    owned_method_dependencies(store, &implementor, &mut packages)?;
                 if !method_dependencies.is_empty() {
                     tracing::debug!(
                         trait_name = %symbol.qualified_name,
@@ -691,5 +654,154 @@ impl SirPipeline {
         )?;
 
         Ok((canonical_json, sir_hash_value))
+    }
+}
+
+/// Symbol kinds whose SIR lists the dependencies of their methods.
+const METHOD_PARENT_KINDS: [&str; 4] = ["trait", "struct", "enum", "type_alias"];
+
+/// Files whose directory is the root of a package.
+const PACKAGE_MANIFESTS: [&str; 3] = ["Cargo.toml", "package.json", "pyproject.toml"];
+
+/// The type whose methods are being collected.
+struct MethodParent<'a> {
+    id: &'a str,
+    qualified_name: &'a str,
+    file_path: &'a str,
+    language: &'a str,
+}
+
+/// Dependencies of the methods that belong to `parent`, keyed by method name, with
+/// each dependency spelled by its leaf name.
+///
+/// Rust qualified names carry no module path, so `Store::load` can name a method of
+/// any `Store`. A method counts for `parent` only when it is a direct child in the
+/// same language, declared in the parent's file or in another file of the same
+/// package, and that package declares no other type with the parent's name.
+fn owned_method_dependencies(
+    store: &SqliteStore,
+    parent: &MethodParent<'_>,
+    packages: &mut PackageRoots<'_>,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let prefix = format!("{}::", parent.qualified_name);
+    // The package whose other files may declare the parent's methods, worked out on
+    // first use: `None` when the parent's package is unknown or not unique to it.
+    let mut owner_package: Option<Option<PathBuf>> = None;
+    let mut method_dependencies = BTreeMap::new();
+
+    for (child, edge) in store.list_method_dependency_edges_for_type(
+        parent.qualified_name,
+        &[EdgeKind::Calls, EdgeKind::TypeRef],
+    )? {
+        let Some(method_name) = child.qualified_name.strip_prefix(prefix.as_str()) else {
+            continue;
+        };
+        if method_name.is_empty() || method_name.contains("::") || child.language != parent.language
+        {
+            continue;
+        }
+        if child.file_path != parent.file_path {
+            let package = match &owner_package {
+                Some(package) => package.clone(),
+                None => {
+                    let package = if is_only_type_in_package(store, parent, packages)? {
+                        packages.package_of(parent.file_path)
+                    } else {
+                        None
+                    };
+                    owner_package = Some(package.clone());
+                    package
+                }
+            };
+            let Some(package) = package else {
+                continue;
+            };
+            if packages.package_of(child.file_path.as_str()) != Some(package) {
+                continue;
+            }
+        }
+
+        let dependency = edge
+            .target_qualified_name
+            .rsplit("::")
+            .next()
+            .unwrap_or(edge.target_qualified_name.as_str())
+            .trim_start_matches("r#")
+            .trim()
+            .to_owned();
+        if !dependency.is_empty() {
+            method_dependencies
+                .entry(method_name.to_owned())
+                .or_insert_with(Vec::new)
+                .push(dependency);
+        }
+    }
+
+    Ok(method_dependencies)
+}
+
+/// Whether `parent` is the only type with its qualified name (and language) that its
+/// package declares.
+fn is_only_type_in_package(
+    store: &SqliteStore,
+    parent: &MethodParent<'_>,
+    packages: &mut PackageRoots<'_>,
+) -> Result<bool> {
+    let Some(package) = packages.package_of(parent.file_path) else {
+        return Ok(false);
+    };
+    let mut same_package = Vec::new();
+    for candidate in store.find_symbol_search_results_by_qualified_name(parent.qualified_name)? {
+        if candidate.language == parent.language
+            && METHOD_PARENT_KINDS.contains(&candidate.kind.as_str())
+            && packages.package_of(candidate.file_path.as_str()).as_ref() == Some(&package)
+        {
+            same_package.push(candidate.symbol_id);
+        }
+    }
+    Ok(same_package.len() == 1 && same_package[0] == parent.id)
+}
+
+/// Maps workspace-relative files to their package: the nearest directory from the
+/// file's own up to the workspace root that holds a package manifest, or the
+/// workspace root when none does.
+struct PackageRoots<'a> {
+    workspace_root: &'a Path,
+    by_dir: HashMap<PathBuf, PathBuf>,
+}
+
+impl<'a> PackageRoots<'a> {
+    fn new(workspace_root: &'a Path) -> Self {
+        Self {
+            workspace_root,
+            by_dir: HashMap::new(),
+        }
+    }
+
+    /// The workspace-relative package directory of `file_path`, or `None` when the
+    /// path isn't a plain relative path inside the workspace.
+    fn package_of(&mut self, file_path: &str) -> Option<PathBuf> {
+        let file_path = Path::new(file_path);
+        if !file_path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        {
+            return None;
+        }
+        let dir = file_path.parent().unwrap_or(Path::new("")).to_path_buf();
+        if let Some(package) = self.by_dir.get(&dir) {
+            return Some(package.clone());
+        }
+        let package = dir
+            .ancestors()
+            .find(|ancestor| {
+                PACKAGE_MANIFESTS
+                    .iter()
+                    .any(|manifest| self.workspace_root.join(ancestor).join(manifest).is_file())
+            })
+            .unwrap_or(Path::new(""))
+            .to_path_buf();
+        self.by_dir.insert(dir, package.clone());
+        Some(package)
     }
 }
