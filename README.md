@@ -158,7 +158,7 @@ This is the full list. Not the highlights — everything. If another tool does a
 ### Surfaces
 
 - **33 CLI Commands** — Organized by purpose: intelligence queries, context assembly, presets, contracts, seismograph, batch/continuous, maintenance.
-- **26 MCP Tools** — Structured access for AI agents. Every response includes `schema_version` for forward compatibility.
+- **39 MCP Tools** (40 with the `verification` feature) — Structured access for AI agents. Every response includes `schema_version` for forward compatibility.
 - **40+ Dashboard Pages** — HTMX + D3.js + Tailwind. Seismograph timelines, tectonic plate treemaps, velocity gauges, contract health monitors, blast radius radial trees, force-directed architecture maps, time machine, causal explorer.
 - **VS Code Extension** — Semantic hover intelligence. Status bar. Command palette integration.
 - **Tauri Desktop App** — System tray, onboarding wizard, native installers (MSI/DMG/AppImage/DEB), auto-update.
@@ -168,7 +168,7 @@ This is the full list. Not the highlights — everything. If another tool does a
 
 - **Fully Offline Operation** — Ollama + qwen3.5:4b for inference, Candle for embeddings and reranking. Zero cloud calls. No API keys. No telemetry.
 - **No Code Leaves Your Machine** — Unless you explicitly choose a cloud provider, everything runs locally.
-- **Schema Migrations** — Through version 13. Forward-compatible. Your data survives upgrades.
+- **Schema Migrations** — Through version 21. Forward-compatible. Your data survives upgrades.
 
 ### Parsing
 
@@ -249,7 +249,7 @@ Everything in AETHER is a complex workflow built on simple decisions. I didn't n
 
 **327 commits. 109 pull requests. 17 Rust crates. 136,000 lines of code. Five weeks.**
 
-From zero to a semantic intelligence engine with Personalized PageRank, Noisy-OR staleness models, community detection, a three-pass inference pipeline, a continuous intelligence daemon, a batch processing system, a 40-page interactive dashboard, 26 MCP tools, 33 CLI commands, a Seismograph that tracks semantic earthquakes, intent contracts that enforce behavioral expectations, a Tauri desktop app with system tray integration, and a task context engine that uses Reciprocal Rank Fusion to rank every symbol in your codebase by relevance to whatever you're working on.
+From zero to a semantic intelligence engine with Personalized PageRank, Noisy-OR staleness models, community detection, a three-pass inference pipeline, a continuous intelligence daemon, a batch processing system, a 40-page interactive dashboard, 39 MCP tools, 33 CLI commands, a Seismograph that tracks semantic earthquakes, intent contracts that enforce behavioral expectations, a Tauri desktop app with system tray integration, and a task context engine that uses Reciprocal Rank Fusion to rank every symbol in your codebase by relevance to whatever you're working on.
 
 I need to sit down. I'm getting dizzy just reading that back.
 
@@ -283,10 +283,10 @@ Some people hear "vibe coded" and think "toy project." And maybe they're right? 
 - A Seismograph engine with PageRank-weighted EMA semantic velocity, Louvain community stability scoring, time-respecting epicenter tracing, and logistic regression aftershock prediction
 - Intent contracts with a two-stage verification cascade (embedding cosine pre-filter → LLM judge), leaky bucket violation handling, and cross-symbol contract propagation through the enrichment context
 - 40+ dashboard pages with D3 force-directed graphs, interactive architecture maps, seismograph timelines, tectonic plate visualizations, and contract health monitoring
-- 26 MCP tools for AI agent integration
+- 39 MCP tools for AI agent integration (40 with the `verification` feature)
 - 33 CLI commands
 - A Tauri 2.x desktop app with system tray, notifications, onboarding wizard, and auto-update
-- Schema migrations through version 13
+- Schema migrations through version 21
 - A Gemini Batch API integration that costs 50% less than real-time inference
 - A watcher that monitors `.git` for branch switches, pulls, and merges
 
@@ -373,7 +373,7 @@ Your code changes
        │
        ▼
   You query it however you want
-  CLI (33 commands) · LSP hover · MCP tools (26) · Dashboard (40+ pages) · Desktop app
+  CLI (33 commands) · LSP hover · MCP tools (39) · Dashboard (40+ pages) · Desktop app
 ```
 
 All of this runs locally. No code leaves your machine unless you choose a cloud inference provider. Run Ollama and AETHER works fully offline with real AI-generated intelligence — no API keys, no cloud calls, nothing phoning home.
@@ -387,7 +387,7 @@ All of this runs locally. No code leaves your machine unless you choose a cloud 
 ```bash
 git clone https://github.com/rephug/aether.git
 cd aether
-cargo build -p aetherd -p aether-query
+cargo build -p aetherd -p aether-mcp -p aether-query
 ```
 
 Index your project:
@@ -430,7 +430,7 @@ Hook up your AI agent:
 
 ```bash
 # Register as MCP server for Claude Code
-claude mcp add --transport stdio --scope project aether -- aetherd --workspace . --mcp
+claude mcp add --transport stdio --scope project aether -- aether-mcp --workspace .
 ```
 
 Now your agent has persistent, structured access to your entire codebase's meaning. It doesn't have to re-read files every session. It doesn't have to guess. It *knows*.
@@ -640,7 +640,7 @@ The desktop app wraps the same dashboard you get from `aetherd --workspace .` �
 
 ## The MCP Tools
 
-Register AETHER with any MCP-compatible agent (Claude Code, Codex, etc.) and it gets structured access to everything. 26 tools, zero guessing.
+Register AETHER with any MCP-compatible agent (Claude Code, Codex, etc.) and it gets structured access to everything. 39 tools (40 with the `verification` feature), zero guessing.
 
 ### Search & Lookup
 
@@ -682,7 +682,7 @@ Register AETHER with any MCP-compatible agent (Claude Code, Codex, etc.) and it 
 | `aether_why_changed` | Semantic diff between any two SIR versions |
 | `aether_refactor_prep` | Snapshot intent before refactoring |
 | `aether_verify_intent` | Compare current SIR against a saved snapshot |
-| `aether_verify` | Verify semantic contracts on a symbol |
+| `aether_verify` | Run the workspace's allowlisted verification commands (only with the `verification` feature) |
 
 ### Memory
 
@@ -692,6 +692,35 @@ Register AETHER with any MCP-compatible agent (Claude Code, Codex, etc.) and it 
 | `aether_session_note` | Capture an in-session note for agent workflows |
 | `aether_recall` | Retrieve notes by semantic search |
 | `aether_test_intents` | Test guard coverage for a symbol |
+
+### Audit
+
+| Tool | What It Does |
+|:-----|:------------|
+| `aether_audit_candidates` | Symbols most in need of a deep audit, from structural risk plus SIR confidence |
+| `aether_audit_cross_symbol` | Callers and callees with full SIR and source for a cross-boundary audit |
+| `aether_audit_submit` | Record a structured audit finding for a symbol |
+| `aether_audit_report` | Query findings by crate, severity, category, or status |
+| `aether_audit_resolve` | Mark a finding fixed, wontfix, or confirmed |
+
+### Contracts
+
+| Tool | What It Does |
+|:-----|:------------|
+| `aether_contract_add` | Add a behavioral contract to a symbol |
+| `aether_contract_list` | List active intent contracts |
+| `aether_contract_check` | Verify contracts against the current SIR |
+| `aether_contract_violations` | Query contract violation history |
+| `aether_contract_dismiss` | Dismiss a contract violation |
+| `aether_contract_remove` | Deactivate a contract |
+
+### Context & SIR Authoring
+
+| Tool | What It Does |
+|:-----|:------------|
+| `aether_sir_context` | Token-budgeted context for a symbol: source, SIR, graph neighbors, health, test intents |
+| `aether_sir_inject` | Write or update a symbol's SIR from an agent's own analysis |
+| `aether_enhance_prompt` | Enrich a coding prompt with matching symbols, files, and notes from the index |
 
 Every response includes `schema_version` for forward compatibility. Your agent scripts won't break when AETHER updates. (At least that was the goal. Forward compatibility is one of those things that's easy to claim and hard to prove.)
 
@@ -857,7 +886,7 @@ For the curious (and the skeptical, which is probably all of you at this point):
 | Parsing | tree-sitter (Rust, TypeScript/JS, Python) |
 | Graph DB | SurrealDB 3.0 + SurrealKV |
 | Vector Store | LanceDB (production default) |
-| Metadata | SQLite (WAL mode, schema v13) |
+| Metadata | SQLite (WAL mode, schema v21) |
 | Embeddings | Gemini Embedding 2 (3072-dim, production default) |
 | Local Embeddings | Qwen3-Embedding-0.6B via Candle |
 | Reranking | Qwen3-Reranker-0.6B via Candle |
@@ -885,7 +914,7 @@ These are the closest tools in the "give your AI agent context" space. They're g
 | Ranks by relevance | No — you pick files manually | No — includes everything | No | Yes — RRF + Personalized PageRank |
 | Token budget control | Manual file selection | Output-level truncation | Output-level truncation | Per-symbol slicing with budget allocation |
 | Platform | macOS | CLI, cross-platform | CLI | CLI + MCP + dashboard + desktop app |
-| MCP server | Yes | Yes | No | Yes (26 tools) |
+| MCP server | Yes | Yes | No | Yes (39 tools) |
 | Works offline | Yes | Yes | Yes | Yes |
 
 The core difference: they export files. AETHER understands what's in them and ranks it by what matters for your task.
@@ -902,7 +931,7 @@ The core difference: they export files. AETHER understands what's in them and ra
 | Batch reindexing | N/A | N/A | Proprietary | N/A | Gemini Batch API (50% off) |
 | Works offline | Yes | No | No | Usually no | Yes — Ollama + Candle |
 | Tracks meaning changes | No | No | No | No | Git-linked SIR versioning |
-| Agent-accessible | No | Not really | Proprietary | Ad hoc | 26 MCP tools |
+| Agent-accessible | No | Not really | Proprietary | Ad hoc | 39 MCP tools |
 | Detects drift | No | No | No | No | Automatic, zero config |
 | Finds root causes | No | No | No | No | Causal chain traversal |
 | Knows what's dangerous | No | No | No | No | PageRank × drift × tests |
@@ -928,9 +957,9 @@ cargo test -p aether-store
 cargo test -p aether-mcp
 cargo test -p aetherd
 
-# Lint
+# Lint (per crate, like the tests)
 cargo fmt --all --check
-cargo clippy --workspace -- -D warnings
+cargo clippy -p <crate> --all-targets -- -D warnings
 ```
 
 If you find bugs — and I'm sure there are bugs, there are always bugs, I lie awake thinking about the bugs I haven't found yet — please open an issue. Be as specific as you can. And maybe be a little gentle? I'm doing my best here.

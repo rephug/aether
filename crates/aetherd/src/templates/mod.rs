@@ -306,6 +306,8 @@ mod tests {
         assert!(!rendered.contains("recommended path"));
         assert!(rendered.contains("--inference-provider mock"));
         assert!(rendered.contains("./scripts/scan_all.sh"));
+        assert!(rendered.contains("run `aetherd --workspace . --index-once`"));
+        assert!(!rendered.contains("aether_index_once"));
     }
 
     #[test]
@@ -316,6 +318,8 @@ mod tests {
         assert!(rendered.contains("Agent schema version: 7"));
         assert!(rendered.contains("Inference provider: mock"));
         assert!(rendered.contains("semantic search is enabled"));
+        assert!(rendered.contains("run aetherd --workspace . --index-once"));
+        assert!(!rendered.contains("aether_index_once"));
     }
 
     #[test]
@@ -325,6 +329,8 @@ mod tests {
         assert!(rendered.contains("1. Before editing or refactoring"));
         assert!(rendered.contains("Agent schema version: 7"));
         assert!(rendered.contains("aether_verify"));
+        assert!(rendered.contains("run aetherd --workspace . --index-once"));
+        assert!(!rendered.contains("aether_index_once"));
     }
 
     #[test]
