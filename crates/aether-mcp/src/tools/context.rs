@@ -8,8 +8,7 @@ use aether_core::{EdgeKind, Position, SourceRange};
 use aether_parse::{SymbolExtractor, language_for_path};
 use aether_sir::SirAnnotation;
 use aether_store::{
-    SirStateStore, SymbolCatalogStore, SymbolRecord, SymbolRelationStore, TestIntentRecord,
-    TestIntentStore,
+    SirStateStore, SymbolRecord, SymbolRelationStore, TestIntentRecord, TestIntentStore,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
