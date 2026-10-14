@@ -65,6 +65,37 @@ impl SirPipeline {
             priority_score,
             generation_pass,
             None,
+            None,
+        )
+    }
+
+    /// Like [`Self::process_event_with_priority_and_pass`], for symbols the caller selected
+    /// from SIRs it read earlier: each job in `planned_against` persists only while the
+    /// store still holds that SIR, so one written after the selection (a manual
+    /// injection while earlier jobs ran, say) stands, unless it records older source
+    /// text than the job read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_event_planned_against(
+        &self,
+        store: &SqliteStore,
+        event: &SymbolChangeEvent,
+        force: bool,
+        print_sir: bool,
+        out: &mut dyn Write,
+        priority_score: Option<f64>,
+        generation_pass: &str,
+        planned_against: &HashMap<String, SirIdentity>,
+    ) -> Result<ProcessEventStats> {
+        self.process_event_with_priority_and_pass_and_overrides(
+            store,
+            event,
+            force,
+            print_sir,
+            out,
+            priority_score,
+            generation_pass,
+            None,
+            Some(planned_against),
         )
     }
 
@@ -79,6 +110,7 @@ impl SirPipeline {
         priority_score: Option<f64>,
         generation_pass: &str,
         prompt_overrides: Option<&HashMap<String, SirPromptOverride>>,
+        planned_against: Option<&HashMap<String, SirIdentity>>,
     ) -> Result<ProcessEventStats> {
         self.process_removed_symbols(store, event)?;
         if !self.skip_local_edges {
@@ -110,6 +142,7 @@ impl SirPipeline {
                 out,
                 priority_score,
                 prompt_overrides,
+                planned_against,
             )?;
             self.log_prepared_jobs(event.file_path.as_str(), &prepared);
 
@@ -614,6 +647,7 @@ impl SirPipeline {
         out: &mut dyn Write,
         priority_score: Option<f64>,
         prompt_overrides: Option<&HashMap<String, SirPromptOverride>>,
+        planned_against: Option<&HashMap<String, SirIdentity>>,
     ) -> Result<PreparedCandidateJobs> {
         let mut jobs = Vec::new();
         let mut skipped_existing = 0usize;
@@ -649,11 +683,15 @@ impl SirPipeline {
                     // baseline, not to whatever the row holds now: a SIR written in
                     // between would otherwise be overwritten by a result whose
                     // enrichment described the older one. Without one, the job binds
-                    // to the SIR observed when it was selected.
+                    // to the identity the caller planned against, if it gave one, and
+                    // otherwise to the SIR observed above.
                     job.prior_sir = match override_spec.map(|spec| &spec.prior_sir) {
                         Some(PriorSir::Present(identity)) => Some(identity.clone()),
                         Some(PriorSir::Absent) => None,
-                        Some(PriorSir::Unrecorded) | None => observed_sir,
+                        Some(PriorSir::Unrecorded) | None => planned_against
+                            .and_then(|planned| planned.get(job.symbol.id.as_str()))
+                            .cloned()
+                            .or(observed_sir),
                     };
                     if let Some(override_spec) = override_spec {
                         job.custom_prompt = Some(override_spec.prompt.clone());
@@ -893,6 +931,7 @@ impl SirPipeline {
             priority_score,
             generation_pass,
             Some(&prompt_overrides),
+            None,
         )
     }
 

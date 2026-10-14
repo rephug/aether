@@ -94,7 +94,8 @@ pub struct SirPromptOverride {
     pub deep_mode: bool,
     /// The SIR the override's prompt was built from, when the caller recorded it: the
     /// job then persists only while the store still holds exactly that SIR. Unrecorded,
-    /// the job binds to the SIR current when it is queued.
+    /// the job binds to the caller's planned identity, if any, or else to the SIR
+    /// current when it is queued.
     pub(crate) prior_sir: PriorSir,
 }
 
