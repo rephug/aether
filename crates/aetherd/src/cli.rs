@@ -1040,13 +1040,13 @@ pub struct SeismographRunOnceArgs {}
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
 pub struct SeismographTrainArgs {}
 
-#[derive(Debug, Clone, PartialEq, Eq, Args)]
+#[derive(Debug, Clone, PartialEq, Args)]
 pub struct ContractArgs {
     #[command(subcommand)]
     pub command: ContractCommand,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+#[derive(Debug, Clone, PartialEq, Subcommand)]
 pub enum ContractCommand {
     /// Add contract clauses to a symbol
     Add(ContractAddArgs),
@@ -1056,6 +1056,8 @@ pub enum ContractCommand {
     Remove(ContractRemoveArgs),
     /// Force-run contract verification
     Check(ContractCheckArgs),
+    /// Infer contracts from SIR history (requires [contracts] implicit_inference_enabled = true)
+    Infer(ContractInferArgs),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
@@ -1089,6 +1091,18 @@ pub struct ContractRemoveArgs {
 pub struct ContractCheckArgs {
     /// Optional symbol to check. If omitted, checks all contracted symbols.
     pub symbol: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Parser)]
+pub struct ContractInferArgs {
+    /// Symbol qualified name or ID
+    pub symbol: String,
+    /// Report what would be inferred without writing contracts
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Clustering radius as cosine distance, 0 < eps <= 0.5 (default 0.12)
+    #[arg(long, value_parser = parse_infer_eps)]
+    pub eps: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Subcommand)]
@@ -1432,6 +1446,20 @@ fn parse_refactor_prep_output_format(value: &str) -> Result<RefactorPrepOutputFo
     value.parse()
 }
 
+fn parse_infer_eps(value: &str) -> Result<f64, String> {
+    let parsed = value
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| format!("invalid eps '{value}', expected a number"))?;
+    if parsed.is_finite() && parsed > 0.0 && parsed <= 0.5 {
+        Ok(parsed)
+    } else {
+        Err(format!(
+            "invalid eps '{value}', expected a cosine distance with 0 < eps <= 0.5"
+        ))
+    }
+}
+
 fn parse_since_duration(value: &str) -> Result<Duration, String> {
     let trimmed = value.trim().to_ascii_lowercase();
     if trimmed.len() < 2 {
@@ -1470,8 +1498,9 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        Cli, Commands, ContinuousCommand, PresetCommand, PresetShowArgs, SeismographCommand,
-        SeismographRunOnceArgs, SeismographStatusArgs, parse_since_duration,
+        Cli, Commands, ContinuousCommand, ContractArgs, ContractCommand, ContractInferArgs,
+        PresetCommand, PresetShowArgs, SeismographCommand, SeismographRunOnceArgs,
+        SeismographStatusArgs, parse_since_duration,
     };
     use crate::init_agent::AgentPlatform;
 
@@ -2696,6 +2725,65 @@ mod tests {
                 );
             }
             other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn contract_infer_parses_flags() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "--workspace",
+            ".",
+            "contract",
+            "infer",
+            "sym_abc",
+            "--dry-run",
+            "--eps",
+            "0.1",
+        ])
+        .expect("contract infer should parse");
+        assert_eq!(
+            cli.command,
+            Some(Commands::Contract(ContractArgs {
+                command: ContractCommand::Infer(ContractInferArgs {
+                    symbol: "sym_abc".to_owned(),
+                    dry_run: true,
+                    eps: Some(0.1),
+                }),
+            }))
+        );
+    }
+
+    #[test]
+    fn contract_infer_defaults_flags() {
+        let cli = Cli::try_parse_from(["aetherd", "--workspace", ".", "contract", "infer", "sym"])
+            .expect("contract infer should parse");
+        assert_eq!(
+            cli.command,
+            Some(Commands::Contract(ContractArgs {
+                command: ContractCommand::Infer(ContractInferArgs {
+                    symbol: "sym".to_owned(),
+                    dry_run: false,
+                    eps: None,
+                }),
+            }))
+        );
+    }
+
+    #[test]
+    fn contract_infer_rejects_out_of_range_eps() {
+        for raw in ["0", "0.9", "nan", "abc", "-0.1", "inf"] {
+            let result = Cli::try_parse_from([
+                "aetherd",
+                "--workspace",
+                ".",
+                "contract",
+                "infer",
+                "sym",
+                "--eps",
+                raw,
+            ]);
+            assert!(result.is_err(), "--eps {raw} should be rejected");
         }
     }
 }
