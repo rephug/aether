@@ -329,7 +329,21 @@ impl SqliteStore {
                 last_seen_at: row.get(6)?,
             })
         })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
 
+    /// Every indexed symbol's `(id, qualified_name, file_path)`, ordered by id, for
+    /// passes that classify the whole workspace (such as finding test symbols).
+    pub fn list_symbol_names_and_paths(&self) -> Result<Vec<(String, String, String)>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, qualified_name, file_path
+            FROM symbols
+            ORDER BY id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
     pub fn list_all_symbol_ids(&self) -> Result<Vec<String>, StoreError> {
