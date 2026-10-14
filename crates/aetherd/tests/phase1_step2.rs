@@ -1140,6 +1140,122 @@ fn stage3_host_verification_captures_failure_status_and_output()
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn stage3_host_verification_stops_a_command_at_its_timeout()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+
+    // The background `sleep` keeps the output pipe open; it has to be stopped too.
+    for command in ["sleep 30", "sleep 30 & echo $! > background.pid; sleep 30"] {
+        let config = AetherConfig {
+            verify: VerifyConfig {
+                commands: vec![command.to_owned()],
+                timeout_secs: 1,
+                ..VerifyConfig::default()
+            },
+            ..AetherConfig::default()
+        };
+        let started = std::time::Instant::now();
+        let result = run_host_verification(workspace, &config, VerificationRequest::default())?;
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{command:?} ran for {:?}",
+            started.elapsed()
+        );
+        assert!(!result.passed);
+        assert_eq!(result.command_results.len(), 1);
+        let outcome = &result.command_results[0];
+        assert_eq!(outcome.exit_code, None);
+        assert!(!outcome.passed);
+        assert!(
+            outcome.stderr.contains("stopped after 1 s timeout"),
+            "{:?}",
+            outcome.stderr
+        );
+    }
+
+    // The background process was stopped with the command, not left running.
+    let pid = fs::read_to_string(workspace.join("background.pid"))?;
+    let gone = (0..50).any(|_| {
+        let alive = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if alive {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        !alive
+    });
+    assert!(gone, "background process {} is still running", pid.trim());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn stage3_host_verification_stops_a_background_process_left_holding_the_output()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    let config = AetherConfig {
+        verify: VerifyConfig {
+            commands: vec!["sleep 30 & echo $! > background.pid; echo finished".to_owned()],
+            ..VerifyConfig::default()
+        },
+        ..AetherConfig::default()
+    };
+
+    let started = std::time::Instant::now();
+    let result = run_host_verification(workspace, &config, VerificationRequest::default())?;
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert!(result.passed);
+    assert_eq!(result.command_results[0].stdout, "finished\n");
+
+    let pid = fs::read_to_string(workspace.join("background.pid"))?;
+    let gone = (0..50).any(|_| {
+        let alive = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if alive {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        !alive
+    });
+    assert!(gone, "background process {} is still running", pid.trim());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn stage3_host_verification_caps_a_noisy_command_output() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    let config = AetherConfig {
+        verify: VerifyConfig {
+            commands: vec!["yes aether | head -c 200000; echo done".to_owned()],
+            max_output_bytes: 1000,
+            ..VerifyConfig::default()
+        },
+        ..AetherConfig::default()
+    };
+
+    let result = run_host_verification(workspace, &config, VerificationRequest::default())?;
+
+    assert!(result.passed);
+    let stdout = &result.command_results[0].stdout;
+    assert!(stdout.len() < 1200, "kept {} bytes", stdout.len());
+    assert!(stdout.starts_with("aether\naether\n"));
+    assert!(stdout.ends_with("done\n"), "the end of the output is kept");
+    assert!(stdout.contains("bytes of output omitted"));
+    Ok(())
+}
+
 #[test]
 fn stage3_host_verification_rejects_commands_not_in_allowlist()
 -> Result<(), Box<dyn std::error::Error>> {
