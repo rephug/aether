@@ -473,6 +473,96 @@ async fn blast_radius_invalid_symbol_returns_404() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
+async fn blast_radius_rings(app: axum::Router, symbol_id: &str) -> (Vec<Vec<String>>, Value) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/blast-radius?symbol_id={symbol_id}&depth=2&min_coupling=0.0"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    let data = json["data"].clone();
+    let rings = data["rings"]
+        .as_array()
+        .expect("rings array")
+        .iter()
+        .map(|ring| {
+            ring["nodes"]
+                .as_array()
+                .expect("ring nodes array")
+                .iter()
+                .map(|node| node["symbol_id"].as_str().unwrap_or_default().to_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    (rings, data)
+}
+
+#[tokio::test]
+async fn blast_radius_walks_callers_not_callees() {
+    // Seed call graph: main -> run -> helper. Changing a symbol affects the
+    // symbols that call it, so the rings must walk callers outward.
+    let (_tmp, app, _ids) = seeded_app().await;
+
+    let (helper_rings, helper_data) = blast_radius_rings(app.clone(), "sym-demo-helper").await;
+    assert_eq!(
+        helper_rings,
+        vec![
+            vec!["sym-demo-run".to_owned()],
+            vec!["sym-demo-main".to_owned()],
+        ]
+    );
+    assert_eq!(helper_data["total_impacted"].as_u64(), Some(2));
+    assert_eq!(
+        helper_data["rings"][1]["nodes"][0]["parent_symbol_id"].as_str(),
+        Some("sym-demo-run")
+    );
+
+    let (run_rings, run_data) = blast_radius_rings(app, "sym-demo-run").await;
+    assert_eq!(
+        run_rings,
+        vec![vec!["sym-demo-main".to_owned()], Vec::<String>::new()]
+    );
+    assert_eq!(run_data["total_impacted"].as_u64(), Some(1));
+}
+
+#[tokio::test]
+async fn blast_radius_follows_call_edges_only() {
+    // A type reference is not a call, so it must not pull the referencing
+    // symbol into the blast radius of the referenced one.
+    let (tmp, app, _ids) = seeded_app().await;
+    SqliteStore::open(tmp.path())
+        .unwrap()
+        .upsert_edges(&[SymbolEdge {
+            source_id: "sym-demo-helper".to_owned(),
+            target_qualified_name: "demo::main".to_owned(),
+            edge_kind: EdgeKind::TypeRef,
+            file_path: "src/lib.rs".to_owned(),
+        }])
+        .unwrap();
+
+    let (main_rings, main_data) = blast_radius_rings(app.clone(), "sym-demo-main").await;
+    assert_eq!(main_rings, vec![Vec::<String>::new(), Vec::<String>::new()]);
+    assert_eq!(main_data["total_impacted"].as_u64(), Some(0));
+
+    let (helper_rings, _) = blast_radius_rings(app, "sym-demo-helper").await;
+    assert_eq!(
+        helper_rings,
+        vec![
+            vec!["sym-demo-run".to_owned()],
+            vec!["sym-demo-main".to_owned()],
+        ]
+    );
+}
+
 #[tokio::test]
 async fn architecture_api_empty_returns_not_computed() {
     let (_tmp, app) = empty_app().await;
