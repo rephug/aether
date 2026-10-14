@@ -1,4 +1,5 @@
 mod embedding;
+mod env_vars;
 mod http;
 mod loaders;
 mod providers;

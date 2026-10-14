@@ -1,6 +1,7 @@
 //! Dependency, usage-matrix and trait-split tools over the resolved symbol graph.
 
 use super::*;
+use aether_mcp::AetherDependenciesResponse;
 
 #[test]
 fn mcp_dependencies_returns_callers_and_dependencies() -> Result<()> {
@@ -876,5 +877,199 @@ fn mcp_dependencies_aggregate_type_level_call_relationships() -> Result<()> {
     assert_eq!(dependencies.get("helper_one"), Some(&Some(2)));
     assert_eq!(dependencies.get("helper_two"), Some(&Some(2)));
 
+    Ok(())
+}
+
+/// Indexes `files` (workspace-relative path, contents) into a fresh workspace that
+/// uses `graph_backend`.
+fn index_workspace(graph_backend: &str, files: &[(&str, &str)]) -> Result<tempfile::TempDir> {
+    let temp = tempdir()?;
+    write_test_config(temp.path());
+    let config_path = temp.path().join(".aether/config.toml");
+    let config = fs::read_to_string(&config_path)?.replace(
+        "graph_backend = \"sqlite\"",
+        &format!("graph_backend = \"{graph_backend}\""),
+    );
+    assert!(config.contains(&format!("graph_backend = \"{graph_backend}\"")));
+    fs::write(&config_path, config)?;
+    for (path, contents) in files {
+        let path = temp.path().join(path);
+        fs::create_dir_all(path.parent().expect("file has a parent"))?;
+        fs::write(path, contents)?;
+    }
+    run_index_and_seed_sir(temp.path())?;
+    Ok(temp)
+}
+
+fn symbol_id_in(workspace: &Path, file_path: &str, qualified_name: &str) -> Result<String> {
+    Ok(SqliteStore::open(workspace)?
+        .list_symbols_for_file(file_path)?
+        .into_iter()
+        .find(|symbol| symbol.qualified_name == qualified_name)
+        .unwrap_or_else(|| panic!("{qualified_name} should be indexed in {file_path}"))
+        .id)
+}
+
+fn dependencies_for(
+    server: &AetherMcpServer,
+    symbol_id: String,
+) -> Result<AetherDependenciesResponse> {
+    Ok(Runtime::new()?
+        .block_on(server.aether_dependencies(Parameters(AetherDependenciesRequest { symbol_id })))
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0)
+}
+
+fn caller_counts(response: &AetherDependenciesResponse) -> BTreeMap<String, Option<u32>> {
+    response
+        .callers
+        .iter()
+        .map(|row| (row.qualified_name.clone(), row.methods_called))
+        .collect()
+}
+
+#[test]
+fn mcp_dependencies_attribute_callers_to_the_selected_symbol_only() -> Result<()> {
+    for graph_backend in ["sqlite", "surreal"] {
+        assert_callers_attributed_to_selected_symbol(graph_backend)?;
+    }
+    Ok(())
+}
+
+fn assert_callers_attributed_to_selected_symbol(graph_backend: &str) -> Result<()> {
+    // Three `alpha`s: a method of `Calc`, a free function, and a method of a second
+    // `Calc` in another file. Every call is recorded with the bare target `alpha`.
+    let temp = index_workspace(
+        graph_backend,
+        &[
+            (
+                "src/calc.rs",
+                "pub struct Calc;\n\nimpl Calc {\n    pub fn alpha(&self) -> i32 { 1 }\n}\n\npub fn run_calc() -> i32 {\n    let calc = Calc;\n    calc.alpha()\n}\n",
+            ),
+            (
+                "src/free.rs",
+                "pub fn alpha() -> i32 { 2 }\n\npub fn run_free() -> i32 {\n    alpha()\n}\n",
+            ),
+            (
+                "src/other.rs",
+                "pub struct Calc;\n\nimpl Calc {\n    pub fn alpha(&self) -> i32 { 3 }\n}\n\npub fn run_other() -> i32 {\n    let c = Calc;\n    c.alpha()\n}\n",
+            ),
+        ],
+    )?;
+    let workspace = temp.path();
+    let server = AetherMcpServer::new(workspace, false)?;
+
+    let calc = dependencies_for(&server, symbol_id_in(workspace, "src/calc.rs", "Calc")?)?;
+    assert!(calc.aggregated);
+    assert_eq!(calc.child_method_count, 1);
+    assert_eq!(calc.caller_count, 1, "{graph_backend}");
+    assert_eq!(
+        caller_counts(&calc),
+        BTreeMap::from([("run_calc".to_owned(), Some(1))]),
+        "{graph_backend}"
+    );
+
+    let calc_alpha = dependencies_for(
+        &server,
+        symbol_id_in(workspace, "src/calc.rs", "Calc::alpha")?,
+    )?;
+    assert!(!calc_alpha.aggregated);
+    assert_eq!(calc_alpha.caller_count, 1);
+    assert_eq!(
+        caller_counts(&calc_alpha),
+        BTreeMap::from([("run_calc".to_owned(), None)])
+    );
+
+    let free_alpha = dependencies_for(&server, symbol_id_in(workspace, "src/free.rs", "alpha")?)?;
+    assert_eq!(
+        caller_counts(&free_alpha),
+        BTreeMap::from([("run_free".to_owned(), None)])
+    );
+
+    let other_alpha = dependencies_for(
+        &server,
+        symbol_id_in(workspace, "src/other.rs", "Calc::alpha")?,
+    )?;
+    assert_eq!(
+        caller_counts(&other_alpha),
+        BTreeMap::from([("run_other".to_owned(), None)])
+    );
+
+    Ok(())
+}
+
+#[test]
+fn mcp_dependencies_narrow_cross_file_callers_to_their_package() -> Result<()> {
+    // The callers live in files with no `alpha` of their own, so each call narrows to
+    // the `Calc::alpha` in its own package. `run_root` sits outside both packages, so
+    // its call stays ambiguous and is attributed to neither.
+    let calc = "pub struct Calc;\n\nimpl Calc {\n    pub fn alpha(&self) -> i32 { 1 }\n}\n";
+    let run = |name: &str| {
+        format!("pub fn {name}() -> i32 {{\n    let calc = Calc;\n    calc.alpha()\n}}\n")
+    };
+    let (run_a, run_b, run_root) = (run("run_a"), run("run_b"), run("run_root"));
+    let temp = index_workspace(
+        "sqlite",
+        &[
+            ("crates/a/Cargo.toml", "[package]\nname = \"a\"\n"),
+            ("crates/a/src/lib.rs", calc),
+            ("crates/a/src/run.rs", run_a.as_str()),
+            ("crates/b/Cargo.toml", "[package]\nname = \"b\"\n"),
+            ("crates/b/src/lib.rs", calc),
+            ("crates/b/src/run.rs", run_b.as_str()),
+            ("src/run_root.rs", run_root.as_str()),
+        ],
+    )?;
+    let workspace = temp.path();
+    let server = AetherMcpServer::new(workspace, false)?;
+
+    let a_alpha = dependencies_for(
+        &server,
+        symbol_id_in(workspace, "crates/a/src/lib.rs", "Calc::alpha")?,
+    )?;
+    assert_eq!(
+        caller_counts(&a_alpha),
+        BTreeMap::from([("run_a".to_owned(), None)])
+    );
+    let b_calc = dependencies_for(
+        &server,
+        symbol_id_in(workspace, "crates/b/src/lib.rs", "Calc")?,
+    )?;
+    assert_eq!(
+        caller_counts(&b_calc),
+        BTreeMap::from([("run_b".to_owned(), Some(1))])
+    );
+
+    Ok(())
+}
+
+#[test]
+fn mcp_dependencies_keep_callers_across_typescript_dialects() -> Result<()> {
+    // A `.tsx` component calling a function from a `.ts` module: the two files have
+    // different language tags but call each other.
+    let temp = index_workspace(
+        "sqlite",
+        &[
+            (
+                "src/utils.ts",
+                "export function formatDate(): string {\n  return \"today\";\n}\n",
+            ),
+            (
+                "src/App.tsx",
+                "import { formatDate } from \"./utils\";\n\nexport function App(): string {\n  return formatDate();\n}\n",
+            ),
+        ],
+    )?;
+    let workspace = temp.path();
+    let server = AetherMcpServer::new(workspace, false)?;
+
+    let format_date = dependencies_for(
+        &server,
+        symbol_id_in(workspace, "src/utils.ts", "formatDate")?,
+    )?;
+    assert_eq!(
+        caller_counts(&format_date),
+        BTreeMap::from([("App".to_owned(), None)])
+    );
     Ok(())
 }

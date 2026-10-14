@@ -442,6 +442,7 @@ fn parse_language(raw: &str) -> Language {
         "javascript" => Language::JavaScript,
         "jsx" => Language::Jsx,
         "python" => Language::Python,
+        "go" => Language::Go,
         _ => Language::Rust,
     }
 }
@@ -591,6 +592,42 @@ mod tests {
             qualified_name: qualified_name.to_owned(),
             signature_fingerprint: format!("sig-{id}"),
             last_seen_at: 1_700_000_000,
+        }
+    }
+}
+
+#[cfg(test)]
+mod language_tests {
+    use aether_core::Language;
+
+    use super::parse_language;
+
+    #[test]
+    fn reads_every_stored_language_spelling() {
+        for language in [
+            Language::Rust,
+            Language::TypeScript,
+            Language::Tsx,
+            Language::JavaScript,
+            Language::Jsx,
+            Language::Python,
+            Language::Go,
+        ] {
+            lists_every_variant(language);
+            assert_eq!(parse_language(language.as_str()), language);
+        }
+    }
+
+    /// Stops compiling when `Language` gains a variant, so the list above gets it too.
+    fn lists_every_variant(language: Language) {
+        match language {
+            Language::Rust
+            | Language::TypeScript
+            | Language::Tsx
+            | Language::JavaScript
+            | Language::Jsx
+            | Language::Python
+            | Language::Go => {}
         }
     }
 }

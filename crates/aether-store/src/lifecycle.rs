@@ -275,7 +275,10 @@ impl SqliteStore {
             if !deleted.insert(symbol_id.clone()) {
                 continue;
             }
-            match fs::remove_file(self.sir_blob_path(symbol_id.as_str())) {
+            let Some(path) = self.sir_blob_path(symbol_id.as_str()) else {
+                continue;
+            };
+            match fs::remove_file(path) {
                 Ok(()) => {}
                 Err(err) if err.kind() == ErrorKind::NotFound => {}
                 Err(err) => {
@@ -294,7 +297,10 @@ impl SqliteStore {
                 if !written.insert(symbol_id.clone()) {
                     continue;
                 }
-                if let Err(err) = fs::write(self.sir_blob_path(symbol_id.as_str()), sir_json) {
+                let Some(path) = self.sir_blob_path(symbol_id.as_str()) else {
+                    continue;
+                };
+                if let Err(err) = fs::write(path, sir_json) {
                     tracing::warn!(
                         symbol_id = %symbol_id,
                         error = %err,
@@ -318,11 +324,12 @@ impl SqliteStore {
             tx.commit()?;
         }
 
-        let path = self.sir_blob_path(symbol_id);
-        match fs::remove_file(path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
+        if let Some(path) = self.sir_blob_path(symbol_id) {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
         }
 
         Ok(())

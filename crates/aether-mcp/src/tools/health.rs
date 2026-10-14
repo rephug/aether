@@ -379,13 +379,18 @@ impl AetherMcpServer {
         }
 
         let drift_by_symbol = latest_semantic_drift_by_symbol(self.state.store.as_ref())?;
-        let community_by_symbol = self
-            .state
-            .store
-            .list_latest_community_snapshot()?
-            .into_iter()
-            .map(|entry| (entry.symbol_id, entry.community_id))
-            .collect::<HashMap<_, _>>();
+        // Computed now, without test symbols and at the planner's resolution, instead of
+        // read from the snapshot the last drift run stored (decision #89.1). An error
+        // reaches the caller, which logs it and scores without semantic signals.
+        let graph = self.state.surreal_graph_for_health().await?;
+        let community_by_symbol = aether_analysis::production_community_assignments(
+            self.state.store.as_ref(),
+            graph.as_ref(),
+            self.state.config.planner.community_resolution,
+        )
+        .await?
+        .into_iter()
+        .collect::<HashMap<_, _>>();
 
         let mut files = HashMap::new();
         for entry in centrality.files {

@@ -13,6 +13,7 @@ use crate::AetherMcpError;
 use crate::state::SharedState;
 
 mod audit;
+mod callers;
 mod common;
 mod context;
 mod contract;
@@ -55,8 +56,9 @@ pub use usage_matrix::*;
 pub use verification::*;
 
 pub(crate) use common::{
-    LiveSymbolSources, child_method_symbols, effective_limit, is_type_symbol_kind,
-    normalize_workspace_relative_path, symbol_leaf_name,
+    LiveSymbolSources, SYMBOL_SELECTOR_LABEL, child_method_symbols, effective_limit,
+    is_type_symbol_kind, normalize_workspace_relative_path, resolve_symbol_selector,
+    symbol_leaf_name,
 };
 
 pub const SERVER_NAME: &str = "aether";
