@@ -1,5 +1,3 @@
-use std::env;
-
 use aether_config::{InferenceProviderKind, parse_gemini_thinking_level};
 use aether_core::Secret;
 use aether_sir::SirAnnotation;
@@ -31,8 +29,7 @@ impl GeminiProvider {
         model: Option<String>,
         thinking: Option<String>,
     ) -> Result<Self, InferError> {
-        let api_key = env::var(api_key_env)
-            .ok()
+        let api_key = crate::env_vars::var(api_key_env)
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
             .ok_or_else(|| InferError::MissingApiKey(api_key_env.to_owned()))?;
