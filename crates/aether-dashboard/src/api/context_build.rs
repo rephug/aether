@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::path::{Component, Path};
 use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
@@ -12,6 +14,8 @@ use crate::support::{self, DashboardState};
 const MAX_TREE_FILES: usize = 500;
 const CHARS_PER_TOKEN: f64 = 3.5;
 const DEFAULT_BUDGET: usize = 32_000;
+/// Upper bound on a requested token budget; keeps per-layer arithmetic in range.
+const MAX_BUDGET: usize = 1_000_000;
 const DEFAULT_DEPTH: usize = 2;
 const GRAPH_NEIGHBOR_LIMIT: usize = 12;
 
@@ -302,10 +306,27 @@ pub(crate) async fn context_build_handler(
     State(state): State<Arc<DashboardState>>,
     Json(req): Json<ContextBuildRequest>,
 ) -> impl IntoResponse {
+    if let Some(target) = req
+        .targets
+        .iter()
+        .find(|target| !is_workspace_relative(target))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "bad_request",
+                "message": format!(
+                    "target must be a workspace-relative path without '..' components: {target}"
+                ),
+            })),
+        )
+            .into_response();
+    }
+
     let shared = state.shared.clone();
     let graph = shared.graph.clone();
     let layers = req.layers.unwrap_or_default();
-    let budget = req.budget.unwrap_or(DEFAULT_BUDGET);
+    let budget = req.budget.unwrap_or(DEFAULT_BUDGET).min(MAX_BUDGET);
     let depth = req.depth.unwrap_or(DEFAULT_DEPTH);
     let format = req.format.unwrap_or_else(|| "markdown".to_string());
     let targets = req.targets.clone();
@@ -377,7 +398,7 @@ async fn build_context(params: ContextBuildParams) -> Result<ContextBuildRespons
     // Compute per-layer budget limits
     let layer_budgets: HashMap<&str, usize> = LAYER_SUGGESTIONS
         .iter()
-        .map(|(name, pct)| (*name, budget * pct / 100))
+        .map(|(name, pct)| (*name, budget.saturating_mul(*pct) / 100))
         .collect();
 
     // Header
@@ -677,13 +698,18 @@ fn build_sir_section(
 }
 
 fn read_source_file(shared: &SharedState, file_path: &str, _lang: &str) -> String {
-    let full_path = shared.workspace.join(file_path);
+    let full_path = match shared.workspace.join(file_path).canonicalize() {
+        Ok(path) => path,
+        // File may have been deleted since indexing
+        Err(_) => return format!("// Source file not found: {file_path}\n"),
+    };
+    // The workspace is canonical, so this also catches symlinks that leave it.
+    if !full_path.starts_with(&shared.workspace) {
+        return format!("// Source file is outside the workspace: {file_path}\n");
+    }
     match std::fs::read_to_string(&full_path) {
         Ok(content) => content,
-        Err(_) => {
-            // File may have been deleted since indexing
-            format!("// Source file not found: {file_path}\n")
-        }
+        Err(_) => format!("// Source file not found: {file_path}\n"),
     }
 }
 
@@ -760,8 +786,9 @@ fn sir_intent_summary(store: &Arc<aether_store::SqliteStore>, symbol_id: &str) -
         && let Some(intent) = parsed.get("intent").and_then(|v| v.as_str())
     {
         let first_line = intent.lines().next().unwrap_or(intent);
-        if first_line.len() > 80 {
-            return format!("{}...", &first_line[..77]);
+        if first_line.chars().count() > 80 {
+            let head: String = first_line.chars().take(77).collect();
+            return format!("{head}...");
         }
         return first_line.to_string();
     }
@@ -939,6 +966,14 @@ fn build_memory_section(shared: &SharedState, file_path: &str) -> String {
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
+/// True when joining `target` onto the workspace cannot leave it lexically:
+/// no root, drive prefix or `..` components.
+fn is_workspace_relative(target: &str) -> bool {
+    Path::new(target)
+        .components()
+        .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+}
+
 fn estimate_tokens(content: &str) -> usize {
     ((content.len() as f64) / CHARS_PER_TOKEN).ceil() as usize
 }
@@ -948,8 +983,12 @@ fn truncate_to_tokens(content: &str, max_tokens: usize) -> String {
     if content.len() <= max_chars {
         content.to_string()
     } else {
-        // Truncate at a line boundary
-        let truncated = &content[..max_chars.min(content.len())];
+        // Back off to a char boundary, then truncate at a line boundary
+        let mut end = max_chars.min(content.len());
+        while !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        let truncated = &content[..end];
         match truncated.rfind('\n') {
             Some(pos) => format!("{}\n... (truncated)", &truncated[..pos]),
             None => format!("{truncated}\n... (truncated)"),
