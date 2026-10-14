@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -287,6 +288,7 @@ fn files_for_platform(platform: AgentPlatform, context: &TemplateContext) -> Vec
 fn build_template_context(workspace: &Path, config: &AetherConfig) -> TemplateContext {
     TemplateContext {
         languages: detected_languages(),
+        source_suffixes: source_suffixes(),
         verify_commands: config.verify.commands.clone(),
         embeddings_enabled: config.embeddings.enabled,
         inference_provider: config.inference.provider.as_str().to_owned(),
@@ -412,6 +414,23 @@ fn detected_languages() -> Vec<String> {
     }
 
     languages
+}
+
+/// Every extension a registered parser claims, as a `.ext` suffix, sorted and deduplicated.
+fn source_suffixes() -> Vec<String> {
+    LanguageRegistry::default()
+        .configs()
+        .iter()
+        .flat_map(|config| config.extensions)
+        .map(|extension| {
+            format!(
+                ".{}",
+                extension.trim_start_matches('.').to_ascii_lowercase()
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 #[cfg(test)]
@@ -954,6 +973,30 @@ mod tests {
             super::detected_languages(),
             vec!["Rust", "TypeScript/JavaScript", "Python", "Go"]
         );
+    }
+
+    #[test]
+    fn review_workflow_filters_on_every_registered_extension() {
+        assert_eq!(
+            super::source_suffixes(),
+            vec![".go", ".js", ".jsx", ".py", ".pyi", ".rs", ".ts", ".tsx"]
+        );
+
+        let temp = tempdir().expect("tempdir");
+        write_config_with_embeddings(temp.path(), false);
+        run_init_agent(
+            temp.path(),
+            InitAgentOptions {
+                platform: AgentPlatform::Claude,
+                force: false,
+            },
+        )
+        .expect("init-agent claude should succeed");
+        let workflow = fs::read_to_string(temp.path().join(".github/workflows/aether-review.yml"))
+            .expect("read review workflow");
+        assert!(workflow.contains(
+            "\n          SOURCE_SUFFIXES = (\".go\", \".js\", \".jsx\", \".py\", \".pyi\", \".rs\", \".ts\", \".tsx\")\n"
+        ));
     }
 
     fn write_config_with_embeddings(workspace: &Path, embeddings_enabled: bool) {

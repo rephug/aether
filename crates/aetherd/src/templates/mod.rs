@@ -45,6 +45,8 @@ pub use skill_md::SkillTemplate;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateContext {
     pub languages: Vec<String>,
+    /// File suffixes (`.rs`, `.py`, ...) the registered parsers handle.
+    pub source_suffixes: Vec<String>,
     pub verify_commands: Vec<String>,
     pub embeddings_enabled: bool,
     pub inference_provider: String,
@@ -298,6 +300,7 @@ mod tests {
     fn sample_context() -> TemplateContext {
         TemplateContext {
             languages: vec!["Rust".to_owned(), "Python".to_owned()],
+            source_suffixes: vec![".py".to_owned(), ".pyi".to_owned(), ".rs".to_owned()],
             verify_commands: vec![
                 "cargo fmt --all --check".to_owned(),
                 "cargo clippy --workspace -- -D warnings".to_owned(),
@@ -570,6 +573,10 @@ mod tests {
         // A failed command must not read as a clean result.
         assert!(workflow.contains("Unavailable: `aetherd blast-radius` failed"));
         assert!(workflow.contains("Unavailable: `aetherd health` failed"));
+        // Changed files are filtered on the context's suffixes, as one Python tuple.
+        assert!(workflow.contains("\n          SOURCE_SUFFIXES = (\".py\", \".pyi\", \".rs\")\n"));
+        assert!(workflow.contains("if path.endswith(SOURCE_SUFFIXES)]"));
+        assert!(!workflow.contains("@SOURCE_SUFFIXES@"));
 
         for command in [
             "blast-radius",
