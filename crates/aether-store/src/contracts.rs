@@ -192,6 +192,29 @@ impl SqliteStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn list_violations_for_symbol_and_contract(
+        &self,
+        symbol_id: &str,
+        contract_id: i64,
+        limit: usize,
+    ) -> Result<Vec<IntentViolationRecord>, StoreError> {
+        let limit = limit.clamp(1, 1000);
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, contract_id, symbol_id, sir_version, violation_type,
+                   confidence, reason, detected_at, dismissed, dismissed_at,
+                   dismissed_reason
+            FROM intent_violations
+            WHERE symbol_id = ?1 AND contract_id = ?2
+            ORDER BY detected_at DESC
+            LIMIT ?3
+            "#,
+        )?;
+        let rows = stmt.query_map(params![symbol_id, contract_id, limit], map_violation_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn list_recent_violations(
         &self,
         limit: usize,
@@ -375,6 +398,37 @@ mod tests {
 
         let by_symbol = store.list_violations_for_symbol("sym_abc", 10).unwrap();
         assert_eq!(by_symbol.len(), 1);
+    }
+
+    #[test]
+    fn list_violations_for_symbol_and_contract_filters_on_both() {
+        let (store, _dir) = open_test_store();
+        let first = store
+            .insert_intent_contract("sym_abc", "must", "clause one", None, "human")
+            .unwrap();
+        let second = store
+            .insert_intent_contract("sym_abc", "must", "clause two", None, "human")
+            .unwrap();
+        let first_violation = store
+            .insert_intent_violation(first, "sym_abc", 1, "embedding_fail", None, None)
+            .unwrap();
+        store
+            .insert_intent_violation(second, "sym_abc", 2, "embedding_fail", None, None)
+            .unwrap();
+        store
+            .insert_intent_violation(first, "sym_other", 3, "embedding_fail", None, None)
+            .unwrap();
+
+        let violations = store
+            .list_violations_for_symbol_and_contract("sym_abc", first, 10)
+            .unwrap();
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].id, first_violation);
+
+        let none = store
+            .list_violations_for_symbol_and_contract("sym_abc", 9999, 10)
+            .unwrap();
+        assert!(none.is_empty());
     }
 
     #[test]
