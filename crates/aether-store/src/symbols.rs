@@ -293,6 +293,45 @@ impl SqliteStore {
 
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+    /// Every symbol a call target could name: an exact qualified-name match and, when
+    /// the target is a bare name (no `::`), each symbol whose qualified name ends in
+    /// `::<target>`, since method calls are recorded by their bare method name.
+    pub fn list_symbols_for_call_target(
+        &self,
+        target: &str,
+    ) -> Result<Vec<SymbolRecord>, StoreError> {
+        let target = target.trim();
+        if target.is_empty() {
+            return Ok(Vec::new());
+        }
+        let member_suffix = (!target.contains("::")).then(|| format!("::{target}"));
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, file_path, language, kind, qualified_name, signature_fingerprint, last_seen_at
+            FROM symbols
+            WHERE qualified_name = ?1
+               OR (?2 IS NOT NULL
+                   AND length(qualified_name) > length(?2)
+                   AND substr(qualified_name, -length(?2)) = ?2)
+            ORDER BY file_path ASC, qualified_name ASC, id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![target, member_suffix], |row| {
+            Ok(SymbolRecord {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                language: row.get(2)?,
+                kind: row.get(3)?,
+                qualified_name: row.get(4)?,
+                signature_fingerprint: row.get(5)?,
+                last_seen_at: row.get(6)?,
+            })
+        })?;
+
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
     pub fn list_all_symbol_ids(&self) -> Result<Vec<String>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
