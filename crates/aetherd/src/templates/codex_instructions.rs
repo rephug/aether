@@ -22,7 +22,7 @@ impl CodexInstructionsTemplate {
             .join("\n");
 
         format!(
-            "AETHER CODE INTELLIGENCE INSTRUCTIONS\n\nAgent schema version: {}\nInference provider: {}\nMCP binary hint: {}\n\nAvailable tools:\n{}\n\nAvailable languages: {}\nSearch modes: {}\n\nRequired actions (mandatory):\n{}\n\nRecommended actions (advisory):\n{}\n\nStaleness guidance:\nIf you have made many rapid edits, call aether_status before trusting retrieval results. If counts look stale, wait for indexing or trigger aether_index_once.\n\nVerify commands:\n{}\n",
+            "AETHER CODE INTELLIGENCE INSTRUCTIONS\n\nAgent schema version: {}\nInference provider: {}\nMCP binary hint: {}\n\nAvailable tools:\n{}\n\nAvailable languages: {}\nSearch modes: {}\n\nRequired actions (mandatory):\n{}\n\nRecommended actions (advisory):\n{}\n\nStaleness guidance:\nIf you have made many rapid edits, call aether_status before trusting retrieval results. If counts look stale, wait for indexing or run aetherd --workspace . --index-once.\n\nVerify commands:\n{}\n",
             context.agent_schema_version,
             context.inference_provider,
             context.mcp_binary_hint,

@@ -19,9 +19,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::callers::CallerAttribution;
 use super::{
     AetherMcpServer, LiveSymbolSources, child_method_symbols, effective_limit, is_type_symbol_kind,
-    symbol_leaf_name,
 };
 use crate::state::semantic_search_unavailability;
 use crate::{AetherMcpError, SearchMode};
@@ -319,10 +319,10 @@ impl AetherMcpServer {
         };
 
         let graph_store = self.state.graph.as_ref();
+        let mut attribution = CallerAttribution::new(store, self.workspace());
         if !is_type_symbol_kind(symbol.kind.as_str()) {
-            let callers = graph_store
-                .get_callers(&symbol.qualified_name)
-                .await?
+            let callers = attribution
+                .callers_of(&symbol)?
                 .into_iter()
                 .map(AetherDependencyCaller::from)
                 .collect::<Vec<_>>();
@@ -353,32 +353,12 @@ impl AetherMcpServer {
 
         for child_method in &child_methods {
             let child_key = child_method.id.clone();
-            let mut seen_caller_ids = HashSet::<String>::new();
 
-            for caller in graph_store
-                .get_callers(child_method.qualified_name.as_str())
-                .await?
-            {
-                if !seen_caller_ids.insert(caller.id.clone()) {
-                    continue;
-                }
+            for caller in attribution.callers_of(child_method)? {
                 let entry = callers_by_id
                     .entry(caller.id.clone())
                     .or_insert_with(|| (caller, HashSet::new()));
                 entry.1.insert(child_key.clone());
-            }
-
-            let method_name = symbol_leaf_name(child_method.qualified_name.as_str());
-            if method_name != child_method.qualified_name {
-                for caller in graph_store.get_callers(method_name).await? {
-                    if !seen_caller_ids.insert(caller.id.clone()) {
-                        continue;
-                    }
-                    let entry = callers_by_id
-                        .entry(caller.id.clone())
-                        .or_insert_with(|| (caller, HashSet::new()));
-                    entry.1.insert(child_key.clone());
-                }
             }
 
             for dependency in graph_store

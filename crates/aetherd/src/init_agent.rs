@@ -9,9 +9,12 @@ use clap::ValueEnum;
 
 use crate::templates::{
     AuditChangesCommandTemplate, AuditCommandTemplate, AuditReportCommandTemplate, ClaudeTemplate,
-    CodexInstructionsTemplate, CursorRulesTemplate, McpJsonTemplate, OmpAgentsTemplate,
-    RefactorCommandTemplate, RefactorDeepCommandTemplate, ScanAllScriptTemplate,
-    ScanCommandTemplate, SkillTemplate, TemplateContext,
+    CodexInstructionsTemplate, ContextCommandTemplate, CursorRulesTemplate, EnrichCommandTemplate,
+    ExplainAreaCommandTemplate, GithubReviewWorkflowTemplate, HealthCheckCommandTemplate,
+    ImpactCommandTemplate, McpJsonTemplate, NextCommandTemplate, OmpAgentsTemplate,
+    PreFlightCommandTemplate, RefactorCommandTemplate, RefactorDeepCommandTemplate,
+    ReviewCommandTemplate, ScanAllScriptTemplate, ScanCommandTemplate, SkillTemplate,
+    TemplateContext,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -203,9 +206,45 @@ fn files_for_platform(platform: AgentPlatform, context: &TemplateContext) -> Vec
             ".claude/commands/scan.md",
             ScanCommandTemplate::render(context),
         ));
+        files.push(GeneratedFile::new(
+            ".claude/commands/enrich.md",
+            EnrichCommandTemplate::render(context),
+        ));
+        files.push(GeneratedFile::new(
+            ".claude/commands/next.md",
+            NextCommandTemplate::render(context),
+        ));
+        files.push(GeneratedFile::new(
+            ".claude/commands/pre-flight.md",
+            PreFlightCommandTemplate::render(context),
+        ));
+        files.push(GeneratedFile::new(
+            ".claude/commands/review.md",
+            ReviewCommandTemplate::render(context),
+        ));
+        files.push(GeneratedFile::new(
+            ".claude/commands/explain-area.md",
+            ExplainAreaCommandTemplate::render(context),
+        ));
+        files.push(GeneratedFile::new(
+            ".claude/commands/impact.md",
+            ImpactCommandTemplate::render(context),
+        ));
+        files.push(GeneratedFile::new(
+            ".claude/commands/context.md",
+            ContextCommandTemplate::render(context),
+        ));
+        files.push(GeneratedFile::new(
+            ".claude/commands/health-check.md",
+            HealthCheckCommandTemplate::render(context),
+        ));
         files.push(GeneratedFile::script(
             "scripts/scan_all.sh",
             ScanAllScriptTemplate::render(context),
+        ));
+        files.push(GeneratedFile::new(
+            ".github/workflows/aether-review.yml",
+            GithubReviewWorkflowTemplate::render(context),
         ));
     }
 
@@ -409,6 +448,19 @@ mod tests {
         assert!(workspace.join(".claude/commands/audit-report.md").exists());
         assert!(workspace.join(".claude/commands/audit-changes.md").exists());
         assert!(workspace.join(".claude/commands/scan.md").exists());
+        assert!(workspace.join(".claude/commands/enrich.md").exists());
+        assert!(workspace.join(".claude/commands/next.md").exists());
+        assert!(workspace.join(".claude/commands/pre-flight.md").exists());
+        assert!(workspace.join(".claude/commands/review.md").exists());
+        assert!(workspace.join(".claude/commands/explain-area.md").exists());
+        assert!(workspace.join(".claude/commands/impact.md").exists());
+        assert!(workspace.join(".claude/commands/context.md").exists());
+        assert!(workspace.join(".claude/commands/health-check.md").exists());
+        assert!(
+            workspace
+                .join(".github/workflows/aether-review.yml")
+                .exists()
+        );
         assert!(workspace.join("scripts/scan_all.sh").exists());
         assert!(
             workspace
@@ -441,6 +493,9 @@ mod tests {
                 .written_files
                 .contains(&std::path::PathBuf::from("scripts/scan_all.sh"))
         );
+        assert!(outcome.written_files.contains(&std::path::PathBuf::from(
+            ".github/workflows/aether-review.yml"
+        )));
         let command = fs::read_to_string(workspace.join(".claude/commands/scan.md"))
             .expect("read scan command");
         assert!(command.contains("aether_sir_inject"));
@@ -479,6 +534,12 @@ mod tests {
         )
         .expect("init-agent codex should succeed");
         assert!(!temp.path().join(".claude/commands/scan.md").exists());
+        assert!(
+            !temp
+                .path()
+                .join(".github/workflows/aether-review.yml")
+                .exists()
+        );
         assert!(!temp.path().join("scripts/scan_all.sh").exists());
     }
 
@@ -799,6 +860,56 @@ mod tests {
         assert!(changes.contains("aether_search"));
         assert!(changes.contains("aether_get_sir"));
         assert!(changes.contains("aether_sir_inject"));
+
+        let enrich = fs::read_to_string(workspace.join(".claude/commands/enrich.md"))
+            .expect("read enrich command");
+        assert!(enrich.contains("argument-hint: <crate-name>"));
+        assert!(enrich.contains("aether_audit_candidates"));
+        assert!(enrich.contains("aether_sir_context"));
+        assert!(enrich.contains("aether_sir_inject"));
+        assert!(enrich.contains("`generation_pass`: \"deep\""));
+        assert!(enrich.contains("aether_audit_submit"));
+
+        let next = fs::read_to_string(workspace.join(".claude/commands/next.md"))
+            .expect("read next command");
+        assert!(next.contains("argument-hint: [--fix] [--enrich] [--audit]"));
+        assert!(next.contains("aether_health_hotspots"));
+        assert!(next.contains("aether_audit_report"));
+        assert!(next.contains("/enrich <worst-crate>"));
+
+        let pre_flight = fs::read_to_string(workspace.join(".claude/commands/pre-flight.md"))
+            .expect("read pre-flight command");
+        assert!(pre_flight.contains("argument-hint: <task description>"));
+        assert!(pre_flight.contains("aether_sir_context"));
+        assert!(pre_flight.contains("aether_contract_list"));
+
+        let review = fs::read_to_string(workspace.join(".claude/commands/review.md"))
+            .expect("read review command");
+        assert!(review.contains("argument-hint: [base-branch]"));
+        assert!(review.contains("aether_contract_check"));
+        assert!(review.contains("aether_sir_inject"));
+
+        let explain = fs::read_to_string(workspace.join(".claude/commands/explain-area.md"))
+            .expect("read explain-area command");
+        assert!(explain.contains("aether_call_chain"));
+
+        let impact = fs::read_to_string(workspace.join(".claude/commands/impact.md"))
+            .expect("read impact command");
+        assert!(impact.contains("argument-hint: <symbol>"));
+        assert!(impact.contains("aether_blast_radius"));
+
+        let context = fs::read_to_string(workspace.join(".claude/commands/context.md"))
+            .expect("read context command");
+        assert!(context.contains("## Rules for the document"));
+
+        let health = fs::read_to_string(workspace.join(".claude/commands/health-check.md"))
+            .expect("read health-check command");
+        assert!(health.contains("aether_health_hotspots"));
+
+        let claude = fs::read_to_string(workspace.join("CLAUDE.md")).expect("read claude");
+        assert!(claude.contains("## Slash Commands"));
+        assert!(claude.contains("`/pre-flight <task>`"));
+        assert!(claude.contains("`/health-check`"));
     }
 
     #[test]
