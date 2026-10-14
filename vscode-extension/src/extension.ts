@@ -9,6 +9,7 @@ import {
   Executable,
 } from 'vscode-languageclient/node';
 import { createEnhancePromptCommand } from './enhancePrompt';
+import { revealSymbolDefinition } from './symbolNavigation';
 
 interface WorkspaceClient {
   client: LanguageClient;
@@ -710,13 +711,12 @@ async function openSearchMatch(
     preview: false,
   });
 
-  const symbolName = extractLeafSymbolName(match.qualified_name);
-  if (symbolName) {
-    const range = findFirstSymbolRange(document, symbolName);
-    if (range) {
-      editor.selection = new vscode.Selection(range.start, range.end);
-      editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
-    }
+  if (!await revealSymbolDefinition(editor, match.qualified_name)) {
+    // A warning, not an error: the file is open, only the jump is missing.
+    vscode.window.showWarningMessage(
+      `AETHER: Opened the file; the definition of ${match.qualified_name} is unavailable or ambiguous.`
+    );
+    return;
   }
 
   clearLastError();
@@ -728,39 +728,6 @@ function resolveWorkspacePath(workspaceFolder: vscode.WorkspaceFolder, filePath:
   }
 
   return path.join(workspaceFolder.uri.fsPath, filePath);
-}
-
-function extractLeafSymbolName(qualifiedName: string): string | undefined {
-  const segments = qualifiedName
-    .split(/::|\.|#/)
-    .map((part) => part.trim())
-    .filter((part) => part.length > 0);
-
-  const leaf = (segments[segments.length - 1] ?? qualifiedName).trim();
-  const withoutSuffix = leaf.replace(/\(.*$/, '').replace(/<.*$/, '').trim();
-  return withoutSuffix.length > 0 ? withoutSuffix : undefined;
-}
-
-function findFirstSymbolRange(
-  document: vscode.TextDocument,
-  symbolName: string
-): vscode.Range | undefined {
-  const escaped = escapeRegExp(symbolName);
-  const regex = new RegExp(`\\b${escaped}\\b`);
-  const text = document.getText();
-  const matchIndex = text.search(regex);
-
-  if (matchIndex < 0) {
-    return undefined;
-  }
-
-  const start = document.positionAt(matchIndex);
-  const end = document.positionAt(matchIndex + symbolName.length);
-  return new vscode.Range(start, end);
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function parseSearchEnvelope(stdout: string): SearchEnvelope {

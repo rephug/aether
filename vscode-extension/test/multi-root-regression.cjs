@@ -161,6 +161,7 @@ function environment(options = {}) {
       if (name === 'child_process') return { spawn: fakeSpawn };
       if (name === 'vscode-languageclient/node') return { LanguageClient };
       if (name === './enhancePrompt') return { createEnhancePromptCommand() { state.enhanceFactoryCalls = (state.enhanceFactoryCalls || 0) + 1; return () => { throw new Error('Enhance command deliberately not executed'); }; } };
+      if (name === './symbolNavigation') return { revealSymbolDefinition: async () => true };
       throw new Error('Unexpected module import: ' + name);
     },
   };
