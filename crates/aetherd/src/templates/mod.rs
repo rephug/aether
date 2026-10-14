@@ -443,10 +443,10 @@ mod tests {
             assert!(rendered.contains("$ARGUMENTS"));
             assert!(rendered.ends_with('\n'));
         }
-        // Three commands say they only read; /review writes only what the user approves
-        // and, like the others, never asks for a refactor-prep deep scan.
+        // Three commands never write; /review writes only what the user approves and, like
+        // the others, never asks for a refactor-prep deep scan.
         for rendered in [&pre_flight, &explain, &impact] {
-            assert!(rendered.contains("only reads"));
+            assert!(rendered.contains("doesn't edit files or inject SIRs"));
         }
         assert!(!review.contains("`aether_refactor_prep`"));
     }

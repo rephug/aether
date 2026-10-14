@@ -5,7 +5,7 @@ description: Assess the blast radius of changing a symbol before editing it
 
 Assess what could break if $ARGUMENTS changes.
 
-This command only reads.
+This command doesn't edit files or inject SIRs.
 
 ## Step 1: Resolve the symbol
 Call `aether_search` with `query` set to $ARGUMENTS, `mode` set to `lexical` and `limit`

@@ -5,7 +5,8 @@ description: Explain an unfamiliar area of the codebase in plain prose
 
 Explain $ARGUMENTS to a developer who has not worked on it before.
 
-This command only reads. Keep the explanation readable in two minutes.
+This command doesn't edit files or inject SIRs. Keep the explanation readable in two
+minutes.
 
 ## Step 1: Resolve the target
 - **File:** call `aether_get_sir` with `level` set to `file` and `file_path` set to it.
@@ -18,10 +19,10 @@ This command only reads. Keep the explanation readable in two minutes.
 
 ## Step 2: Find the main pieces
 1. Start from the `exports` the file or module SIR from Step 1 lists (for a symbol
-   target, its own file's). Call `aether_symbol_lookup` with `query` set to the path and
-   `limit` set to 100 to get their `symbol_id`s.
-2. Pick the 3-6 symbols that matter most: public entry points and the types other code
-   builds on.
+   target, its own file's) and pick the 3-6 that matter most: public entry points and
+   the types other code builds on.
+2. Get each one's `symbol_id` with `aether_symbol_lookup`, `query` set to its qualified
+   name (a lookup by path returns only the first 100 symbols, alphabetically).
 3. Call `aether_get_sir` with each one's `symbol_id`. Read the source where a SIR's
    confidence is below 0.5 or its intent starts with `[MOCK]`.
 

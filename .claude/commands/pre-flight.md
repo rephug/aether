@@ -5,8 +5,8 @@ description: Brief the affected area before implementing a task, using AETHER st
 
 Prepare a pre-implementation briefing for this task: $ARGUMENTS
 
-This command only reads. Do not edit files, inject SIRs or run `aether_refactor_prep`
-(it calls the configured inference provider) during a pre-flight.
+This command doesn't edit files or inject SIRs. Do not run `aether_refactor_prep`
+during a pre-flight: it calls the configured inference provider.
 
 ## Step 1: Resolve the affected area
 1. Pick the task's key nouns (types, functions, modules, files) and call `aether_search`
