@@ -39,6 +39,32 @@ async fn seeded_app() -> (TempDir, axum::Router, TestIds) {
     )
 }
 
+/// Id of a Python symbol that sorts after the seeded Rust `demo::` symbols.
+const PYTHON_SYMBOL_ID: &str = "sym-demo-zz-script";
+
+/// `seeded_app` plus one Python symbol whose name sorts last, so a lexical
+/// search for "demo" returns it only after the three Rust symbols.
+async fn seeded_app_with_python_symbol() -> (TempDir, axum::Router) {
+    let temp = TempDir::new().unwrap();
+    seed_workspace(temp.path());
+    let store = SqliteStore::open(temp.path()).unwrap();
+    store
+        .upsert_symbol(SymbolRecord {
+            id: PYTHON_SYMBOL_ID.to_owned(),
+            file_path: "scripts/zz_script.py".to_owned(),
+            language: "python".to_owned(),
+            kind: "function".to_owned(),
+            qualified_name: "demo::zz_script".to_owned(),
+            signature_fingerprint: "sig-zz-script".to_owned(),
+            last_seen_at: 1_700_000_020,
+        })
+        .unwrap();
+    drop(store);
+    let state = Arc::new(SharedState::open_readonly_async(temp.path()).await.unwrap());
+    let app = dashboard_router(state);
+    (temp, app)
+}
+
 async fn empty_app() -> (TempDir, axum::Router) {
     let temp = TempDir::new().unwrap();
     let mut config = AetherConfig::default();

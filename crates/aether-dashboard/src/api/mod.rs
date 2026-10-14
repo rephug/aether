@@ -40,7 +40,7 @@ mod memory_timeline;
 mod overview;
 pub(crate) mod presets;
 pub(crate) mod prompts;
-mod search;
+pub(crate) mod search;
 mod seismograph;
 pub(crate) mod settings;
 pub(crate) mod spec;

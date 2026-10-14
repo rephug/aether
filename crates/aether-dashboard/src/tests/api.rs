@@ -88,6 +88,57 @@ async fn search_api_returns_results() {
 }
 
 #[tokio::test]
+async fn search_api_applies_filters_before_limit() {
+    let (_tmp, app) = seeded_app_with_python_symbol().await;
+
+    // The only Python match sorts after three Rust matches, so it is outside
+    // a store window of `limit` rows.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/search?q=demo&lang=python&limit=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    let ids = json["data"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["symbol_id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![PYTHON_SYMBOL_ID.to_owned()]);
+    assert_eq!(json["data"]["count"], 1);
+}
+
+#[tokio::test]
+async fn search_api_filtered_results_still_respect_limit() {
+    let (_tmp, app) = seeded_app_with_python_symbol().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/search?q=demo&lang=rust&limit=2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    let results = json["data"]["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|row| row["language"] == "rust"));
+}
+
+#[tokio::test]
 async fn changes_api_returns_shape() {
     let (_tmp, app, _ids) = seeded_app().await;
 
