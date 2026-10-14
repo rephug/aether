@@ -1211,8 +1211,10 @@ mod tests {
     #[test]
     fn threshold_precedence_manual_overrides_calibrated_and_default() {
         let mut mismatched = HashSet::new();
-        let mut thresholds = SearchThresholdsConfig::default();
-        thresholds.rust = 0.83;
+        let thresholds = SearchThresholdsConfig {
+            rust: 0.83,
+            ..SearchThresholdsConfig::default()
+        };
         let calibrated_thresholds = SearchCalibratedThresholdsConfig {
             rust: Some(0.61),
             ..SearchCalibratedThresholdsConfig::default()
