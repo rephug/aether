@@ -30,6 +30,24 @@ impl ClaudeTemplate {
             required,
             recommended,
             verify_commands_markdown(context)
-        )
+        ) + SLASH_COMMANDS_SECTION
     }
 }
+
+/// Appended after the rest of the guidance: the generated slash commands and the
+/// workflow that strings them together.
+const SLASH_COMMANDS_SECTION: &str = "
+## Slash Commands
+
+`init-agent` writes these Claude Code commands to `.claude/commands/`:
+
+- `/explain-area <target>`: a plain-prose explanation of a file, directory, crate or symbol.
+- `/pre-flight <task>`: a briefing before implementing a task: what exists, the constraints, what could break and a recommended approach.
+- `/impact <symbol>`: the blast radius of changing a symbol, with a risk rating.
+- `/review [base-branch]`: a semantic review of the current branch against SIRs, callers and contracts.
+- `/audit <crate-or-file>`, `/audit-changes [commit-range]`, `/audit-report`: bug audits and their recorded findings.
+- `/refactor <crate-or-file>`, `/refactor-deep [file-path]`: refactoring with intent snapshots.
+- `/scan <crate> [batch-size]`, `/enrich <crate-name>`, `/next`: SIR coverage, deeper SIRs, and what to work on next.
+
+Recommended workflow: `/explain-area` for an unfamiliar area, then `/pre-flight <task>`, implement, then `/review`. Run `/impact <symbol>` before changing a widely used symbol.
+";
