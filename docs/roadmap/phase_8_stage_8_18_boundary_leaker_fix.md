@@ -222,3 +222,10 @@ parameter and a set of symbol IDs to exclude. Call sites use γ=0.5
 (matching the file-scoped planner) and exclude test symbols via name/path
 heuristics. Health scoring computes communities on the fly using this
 method instead of reading the `community_snapshot` table.
+
+## Implementation notes (2026-10-14)
+
+- **Test heuristic, widened.** Qualified names in the index are file-relative, so Rust's inline `#[cfg(test)] mod tests` functions appear as `tests::name` and match neither `test_*` nor a `tests/` path. `aether_analysis::is_test_symbol` also treats a `tests`/`test` module segment, `tests.rs` module files, `__tests__/` directories and the usual Python, Go and JS/TS test file names as tests. On AETHER's own index that excludes 1,126 of 5,294 symbols; the spec's narrower rule would exclude 210.
+- **One helper for every caller.** `aether_analysis::production_community_assignments(store, graph, resolution)` gathers the test ids (`SqliteStore::list_symbol_names_and_paths`) and calls `list_louvain_communities_filtered`. Drift boundary records, `aetherd health-score --semantic`, the MCP health tools and the dashboard's health score all use it, so the three health surfaces agree. None of them reads `community_snapshot` for health any more.
+- **Unchanged:** `list_louvain_communities()` and the `aetherd communities` listing (still unfiltered, γ = 1.0). The snapshot that drift stores now holds production symbols only, at the planner's γ, which `enhance` and the seismograph read.
+- **Measured** on a copy of AETHER's own index (release builds, `health-score --semantic`): before, with main reading a `community_snapshot` last written on 2026-03-13 (2,722 symbols), 77/100 and 3 Boundary Leakers (aether-graph-algo, aether-memory, aether-query); after, computed live, 76/100 and none. Boundary leakage fell for aether-graph-algo, aether-query, aether-memory and aether-health and rose for aether-store (0.17 → 0.34) and aetherd (0.07 → 0.10); the LOC-weighted workspace score went from 76.70 to 76.49, which rounds from 77 to 76, while the unweighted mean of the crate scores rose from 85.35 to 86.18.

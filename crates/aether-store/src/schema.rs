@@ -7,7 +7,21 @@ pub struct SchemaVersion {
     pub migrated_at: i64,
 }
 pub(crate) fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
-    let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    // Take the write lock before reading the version and hold it until the final
+    // version is written. Two connections opening the same store (the LSP and the
+    // index thread, or aetherd and aether-mcp) then never act on a stale version,
+    // and a failure part-way through publishes nothing.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let version: i32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    apply_migrations(&tx, version)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Applies every migration step above `version`. The caller holds the write
+/// transaction that `version` was read in.
+pub(crate) fn apply_migrations(tx: &Transaction<'_>, version: i32) -> Result<(), StoreError> {
+    let conn: &Connection = tx;
 
     if version < 1 {
         conn.execute_batch(

@@ -63,6 +63,9 @@ impl AetherMcpServer {
         &self,
         request: AetherVerifyRequest,
     ) -> Result<AetherVerifyResponse, AetherMcpError> {
+        // Verification runs project commands, which can write; a read-only server
+        // must not run them.
+        self.state.require_writable()?;
         let execution = run_verification(
             self.workspace(),
             self.state.config.as_ref(),
