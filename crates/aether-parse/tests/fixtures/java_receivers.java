@@ -129,7 +129,13 @@ class Factory {
 }
 
 class Overloads {
-    void find(String key) {}
+    void find(String key) {
+        find(key, 10);
+    }
 
-    void find(String key, int limit) {}
+    void find(String key, int limit) {
+        log(key);
+    }
+
+    private void log(String key) {}
 }

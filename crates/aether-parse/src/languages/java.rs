@@ -385,6 +385,15 @@ fn call_edge(
         }
         _ => return None,
     };
+    // Overloads share a qualified name, so a call to the caller's own name (an overload
+    // delegating to another, or recursion) would resolve to every overload and read as a
+    // dependency cycle between them.
+    if symbols
+        .iter()
+        .any(|symbol| symbol.id == source_id && symbol.qualified_name == target)
+    {
+        return None;
+    }
     Some(SymbolEdge {
         source_id,
         target_qualified_name: target,

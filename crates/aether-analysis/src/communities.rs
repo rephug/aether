@@ -14,8 +14,8 @@ use crate::coupling::AnalysisError;
 /// - the leaf name starts with `test_`;
 /// - a module segment of the qualified name is `tests` or `test`, which covers Rust's
 ///   inline `#[cfg(test)] mod tests` (qualified names are file-relative, `tests::…`);
-/// - the file sits under a `tests/` or `__tests__/` directory, or is a `tests.rs`
-///   module file;
+/// - the file sits under a `tests/`, `__tests__/` or `src/test/` (Maven and Gradle)
+///   directory, or is a `tests.rs` module file;
 /// - the file name follows a common test convention: `test_*.py`, `*_test.py`,
 ///   `*_test.go`, or contains `.test.` / `.spec.` (the JavaScript and TypeScript
 ///   conventions, applied to any language).
@@ -38,7 +38,7 @@ pub fn is_test_symbol(qualified_name: &str, file_path: &str) -> bool {
     let path = normalize_path(file_path).to_ascii_lowercase();
     let in_test_dir =
         |dir: &str| path.starts_with(&format!("{dir}/")) || path.contains(&format!("/{dir}/"));
-    if in_test_dir("tests") || in_test_dir("__tests__") {
+    if in_test_dir("tests") || in_test_dir("__tests__") || in_test_dir("src/test") {
         return true;
     }
     let file_name = path.rsplit('/').next().unwrap_or(path.as_str());
@@ -95,6 +95,11 @@ mod tests {
             ("renders", "web/src/App.spec.ts"),
             ("renders", "web/src/__tests__/App.tsx"),
             ("renders", "Web\\Src\\__Tests__\\App.tsx"),
+            (
+                "PaymentServiceTest::chargesCard",
+                "billing/src/test/java/com/acme/PaymentServiceTest.java",
+            ),
+            ("Fixtures::order", "src/test/java/com/acme/Fixtures.java"),
         ] {
             assert!(
                 is_test_symbol(qualified_name, file_path),
@@ -115,6 +120,7 @@ mod tests {
             ("load", "src/tests_support.rs"),
             ("load", "pkg/testing.py"),
             ("render", "web/src/latest.ts"),
+            ("Contest::score", "src/main/java/com/acme/test/Contest.java"),
         ] {
             assert!(
                 !is_test_symbol(qualified_name, file_path),

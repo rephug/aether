@@ -497,4 +497,16 @@ fn java_overloads_share_a_qualified_name_but_not_an_id() {
         .collect::<Vec<_>>();
     assert_eq!(overloads.len(), 2);
     assert_ne!(overloads[0].id, overloads[1].id);
+
+    // One overload delegating to the other gets no edge: it would resolve to both overloads
+    // and read as a cycle between them.
+    let mut targets = extracted
+        .edges
+        .iter()
+        .filter(|edge| edge.edge_kind == EdgeKind::Calls)
+        .filter(|edge| overloads.iter().any(|symbol| symbol.id == edge.source_id))
+        .map(|edge| edge.target_qualified_name.as_str())
+        .collect::<Vec<_>>();
+    targets.sort();
+    assert_eq!(targets, ["Overloads::log"]);
 }
