@@ -334,7 +334,7 @@ impl AetherMcpServer {
 
     #[tool(
         name = "aether_contract_list",
-        description = "List active intent contracts, optionally filtered by symbol"
+        description = "List intent contracts, optionally filtered by symbol. Returns active contracts only unless include_inactive is true; each contract has an active flag"
     )]
     pub async fn aether_contract_list(
         &self,
