@@ -22,9 +22,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04
             target: aarch64-unknown-linux-gnu
           - runner: macos-13
             target: x86_64-apple-darwin
@@ -38,13 +38,13 @@ jobs:
     steps:
       - name: Checkout (manual dispatch tag)
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ inputs.tag }}
 
       - name: Checkout (tag push)
         if: github.event_name != 'workflow_dispatch'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Resolve release tag
         id: resolve_tag
@@ -70,7 +70,7 @@ jobs:
           echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: ${{ matrix.target }}
 
@@ -146,7 +146,7 @@ jobs:
 
   publish-release:
     name: Publish GitHub Release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: build-artifacts
 
     steps:
