@@ -604,6 +604,7 @@ mod language_tests {
 
     #[test]
     fn reads_every_stored_language_spelling() {
+        let mut listed = [false; 7];
         for language in [
             Language::Rust,
             Language::TypeScript,
@@ -613,21 +614,26 @@ mod language_tests {
             Language::Python,
             Language::Go,
         ] {
-            lists_every_variant(language);
+            listed[variant_index(language)] = true;
             assert_eq!(parse_language(language.as_str()), language);
         }
+        assert!(
+            listed.iter().all(|listed| *listed),
+            "a variant is missing from the list"
+        );
     }
 
-    /// Stops compiling when `Language` gains a variant, so the list above gets it too.
-    fn lists_every_variant(language: Language) {
+    /// Numbers every variant. A new variant stops this from compiling, and a variant left
+    /// out of the list above fails the test.
+    fn variant_index(language: Language) -> usize {
         match language {
-            Language::Rust
-            | Language::TypeScript
-            | Language::Tsx
-            | Language::JavaScript
-            | Language::Jsx
-            | Language::Python
-            | Language::Go => {}
+            Language::Rust => 0,
+            Language::TypeScript => 1,
+            Language::Tsx => 2,
+            Language::JavaScript => 3,
+            Language::Jsx => 4,
+            Language::Python => 5,
+            Language::Go => 6,
         }
     }
 }
