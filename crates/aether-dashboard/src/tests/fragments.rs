@@ -194,6 +194,83 @@ async fn search_fragment_contains_clickable_results() {
     )));
 }
 
+async fn search_fragment_body(app: axum::Router, uri: &str) -> String {
+    let response = app
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn search_fragment_renders_only_filtered_results() {
+    let (_tmp, app) = seeded_app_with_python_symbol().await;
+    let body = search_fragment_body(app, "/dashboard/frag/search?q=demo&lang=python").await;
+
+    assert!(body.contains(&format!("data-symbol-id=\"{PYTHON_SYMBOL_ID}\"")));
+    for rust_id in ["sym-demo-run", "sym-demo-helper", "sym-demo-main"] {
+        assert!(
+            !body.contains(&format!("data-symbol-id=\"{rust_id}\"")),
+            "rust symbol {rust_id} should be filtered out"
+        );
+    }
+    assert!(body.contains(">1 results<"));
+}
+
+#[tokio::test]
+async fn search_fragment_endpoint_matches_rendered_limit() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let body = search_fragment_body(app, "/dashboard/frag/search?q=demo").await;
+
+    assert!(body.contains("data-endpoint=\"/api/v1/search?q=demo&amp;mode=hybrid&amp;limit=50\""));
+}
+
+#[tokio::test]
+async fn search_fragment_percent_encodes_urls() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    // q = "a&b#c", lang = "x&risk=high"
+    let body = search_fragment_body(
+        app,
+        "/dashboard/frag/search?q=a%26b%23c&mode=lexical&lang=x%26risk%3Dhigh",
+    )
+    .await;
+
+    assert!(body.contains("hx-get=\"/dashboard/frag/search?q=a%26b%23c&amp;mode=hybrid\""));
+    assert!(body.contains(
+        "data-endpoint=\"/api/v1/search?q=a%26b%23c&amp;mode=lexical&amp;limit=50&amp;lang=x%26risk%3Dhigh\""
+    ));
+    assert!(!body.contains("q=a&amp;b"));
+    assert!(!body.contains("lang=x&amp;risk=high"));
+}
+
+#[tokio::test]
+async fn search_fragment_reports_filtered_search_failure() {
+    let (tmp, app, _ids) = seeded_app().await;
+    // The filtered search reads dependency edges after the store query, so a
+    // missing edge table makes it fail while the store search still works.
+    let conn = Connection::open(tmp.path().join(".aether/meta.sqlite")).unwrap();
+    conn.execute_batch("DROP TABLE symbol_edges").unwrap();
+    drop(conn);
+
+    let body = search_fragment_body(app, "/dashboard/frag/search?q=demo&lang=rust").await;
+
+    assert!(body.contains("Failed to apply search filters"));
+    assert!(body.contains("no such table"));
+    assert!(!body.contains("No symbols matched your query"));
+    assert!(!body.contains("id=\"search-result-count\""));
+    assert!(!body.contains("data-endpoint="));
+    assert!(!body.contains("data-symbol-id="));
+    // The filter form stays so the user can change or clear the filters.
+    assert!(body.contains("id=\"search-filter-form\""));
+}
+
 #[tokio::test]
 async fn changes_fragment_renders_content() {
     let (_tmp, app, _ids) = seeded_app().await;

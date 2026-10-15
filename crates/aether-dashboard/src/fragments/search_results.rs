@@ -7,7 +7,11 @@ use serde::Deserialize;
 
 use aether_store::SymbolCatalogStore;
 
+use crate::api::search::{self, SearchQuery};
 use crate::support::{self, DashboardState};
+
+/// Maximum number of result cards the fragment renders.
+const SEARCH_FRAGMENT_LIMIT: u32 = 50;
 
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct SearchFragmentQuery {
@@ -42,25 +46,74 @@ pub(crate) async fn search_fragment(
         });
     }
 
-    let mut endpoint = format!("/api/v1/search?q={}&mode={}", trimmed, mode);
+    // The endpoint asks for the same number of rows the fragment renders, so
+    // the client script can fill in details for every card.
+    let mut endpoint = format!(
+        "/api/v1/search?q={}&mode={}&limit={SEARCH_FRAGMENT_LIMIT}",
+        support::percent_encode(&trimmed),
+        support::percent_encode(&mode)
+    );
     if let Some(lang) = query.lang.as_deref().filter(|v| !v.trim().is_empty()) {
-        endpoint.push_str(format!("&lang={}", lang).as_str());
+        endpoint.push_str(format!("&lang={}", support::percent_encode(lang)).as_str());
     }
     if let Some(risk) = query.risk.as_deref().filter(|v| !v.trim().is_empty()) {
-        endpoint.push_str(format!("&risk={}", risk).as_str());
+        endpoint.push_str(format!("&risk={}", support::percent_encode(risk)).as_str());
     }
     if let Some(drift) = query.drift.as_deref().filter(|v| !v.trim().is_empty()) {
-        endpoint.push_str(format!("&drift={}", drift).as_str());
+        endpoint.push_str(format!("&drift={}", support::percent_encode(drift)).as_str());
     }
     if let Some(has_tests) = query.has_tests {
         endpoint.push_str(format!("&has_tests={has_tests}").as_str());
     }
 
-    let results = state
-        .shared
-        .store
-        .search_symbols(&trimmed, 50)
-        .unwrap_or_default();
+    let search_query = SearchQuery {
+        q: Some(trimmed.clone()),
+        limit: Some(SEARCH_FRAGMENT_LIMIT),
+        mode: Some(mode.clone()),
+        lang: query.lang.clone(),
+        risk: query.risk.clone(),
+        drift: query.drift.clone(),
+        has_tests: query.has_tests,
+    };
+    // `filter_error` is set when the filtered search fails or times out. The
+    // fragment then shows the error in place of the result list, because an
+    // empty list would claim that nothing matched.
+    let (results, filter_error) = if search_query.has_filters() {
+        // Render the rows the filtered search API returns, in store order.
+        let shared = state.shared.clone();
+        match support::run_async_with_timeout(move || {
+            search::matching_symbol_ids(shared, search_query)
+        })
+        .await
+        {
+            Ok(matched) => {
+                let rows = state
+                    .shared
+                    .store
+                    .search_symbols(&trimmed, search::FILTERED_SEARCH_WINDOW)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|row| matched.contains(row.symbol_id.as_str()))
+                    .collect();
+                (rows, None)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "dashboard: failed to load filtered search fragment results"
+                );
+                let detail = support::extract_timeout_error_message(err.as_str()).unwrap_or(err);
+                (Vec::new(), Some(detail))
+            }
+        }
+    } else {
+        let rows = state
+            .shared
+            .store
+            .search_symbols(&trimmed, SEARCH_FRAGMENT_LIMIT)
+            .unwrap_or_default();
+        (rows, None)
+    };
 
     support::html_markup_response(html! {
         div class="space-y-4" data-page="search" data-query=(trimmed.clone()) {
@@ -73,7 +126,9 @@ pub(crate) async fn search_fragment(
 
             div class="flex flex-wrap items-center justify-between gap-3" {
                 h2 class="text-lg font-semibold" { "Smart Search" }
-                span class="badge badge-muted" id="search-result-count" { (results.len()) " results" }
+                @if filter_error.is_none() {
+                    span class="badge badge-muted" id="search-result-count" { (results.len()) " results" }
+                }
             }
 
             div class="grid gap-4 xl:grid-cols-[220px_minmax(0,1fr)]" {
@@ -84,7 +139,7 @@ pub(crate) async fn search_fragment(
                             @for m in ["lexical", "semantic", "hybrid"] {
                                 button
                                     class={"px-2 py-1 rounded-md border border-surface-3/50 hover:bg-surface-3/40 " (if mode.eq_ignore_ascii_case(m) { "bg-surface-3/40" } else { "" })}
-                                    hx-get={"/dashboard/frag/search?q=" (trimmed.as_str()) "&mode=" (m)}
+                                    hx-get={"/dashboard/frag/search?q=" (support::percent_encode(&trimmed)) "&mode=" (m)}
                                     hx-target="#main-content" {
                                     (m)
                                 }
@@ -139,8 +194,12 @@ pub(crate) async fn search_fragment(
                     }
                 }
 
-                section class="space-y-3" id="smart-search-results" data-endpoint=(endpoint) {
-                    @if results.is_empty() {
+                // Without a data-endpoint the client script does not fetch
+                // details or overwrite the error with a result count.
+                section class="space-y-3" id="smart-search-results" data-endpoint=[filter_error.is_none().then_some(endpoint.as_str())] {
+                    @if let Some(detail) = filter_error.as_deref() {
+                        (support::html_error_state("Failed to apply search filters", detail))
+                    } @else if results.is_empty() {
                         (support::html_empty_state("No symbols matched your query", None))
                     } @else {
                         @for row in results {
