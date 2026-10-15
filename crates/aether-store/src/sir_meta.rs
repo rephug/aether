@@ -611,6 +611,141 @@ impl SqliteStore {
         }
     }
 
+    /// Mark `stale` the SIR of every listed symbol whose recorded source hash differs from
+    /// its current one (`current`: each symbol id with the content hash of its body as
+    /// parsed now). A leaf that never recorded its source cannot be compared and is left
+    /// alone. Only `fresh` (or `ready`) leaves move: a `stale` one stays so, and the
+    /// `rollup_failed`/`rollup_pending` markers of an injection keep their own repair
+    /// path. Only leaves written at or before `written_by` (unix seconds) are compared:
+    /// `current` was read at that time, so a leaf written later may describe newer text
+    /// than `current` does. Comparison and update are one statement per row in one
+    /// transaction, so a writer that records the current source meanwhile is never
+    /// marked. Returns the ids marked, sorted.
+    pub fn mark_sir_stale_for_changed_sources(
+        &self,
+        current: &[(String, String)],
+        written_by: i64,
+    ) -> Result<Vec<String>, StoreError> {
+        if current.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        let mut marked = Vec::new();
+        {
+            let mut update = tx.prepare(
+                r#"
+                UPDATE sir
+                SET sir_status = 'stale'
+                WHERE id = ?1
+                  AND COALESCE(TRIM(source_hash), '') <> ''
+                  AND source_hash <> ?2
+                  AND LOWER(TRIM(sir_status)) IN ('fresh', 'ready')
+                  AND updated_at <= ?3
+                "#,
+            )?;
+            for (symbol_id, source_hash) in current {
+                let symbol_id = symbol_id.trim();
+                if symbol_id.is_empty() {
+                    continue;
+                }
+                if update.execute(params![symbol_id, source_hash.trim(), written_by])? > 0 {
+                    marked.push(symbol_id.to_owned());
+                }
+            }
+        }
+        tx.commit()?;
+
+        marked.sort();
+        marked.dedup();
+        Ok(marked)
+    }
+
+    /// Mark the listed SIR rows `stale` when they are `fresh` (or `ready`): rows whose
+    /// inputs changed without the row being rebuilt, such as the rollup of a file whose
+    /// symbols changed. Rows in any other status, and ids without a row, are left as they
+    /// are. Returns how many rows were marked.
+    pub fn mark_sir_stale(&self, ids: &[String]) -> Result<usize, StoreError> {
+        let ids = ids
+            .iter()
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty())
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        let mut marked = 0usize;
+        {
+            let mut update = tx.prepare(
+                r#"
+                UPDATE sir
+                SET sir_status = 'stale'
+                WHERE id = ?1
+                  AND LOWER(TRIM(sir_status)) IN ('fresh', 'ready')
+                "#,
+            )?;
+            for id in ids {
+                marked += update.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(marked)
+    }
+
+    /// The leaves among `current` (each symbol id with the content hash of its body as
+    /// parsed now) whose recorded source hash differs from the current one, each with its
+    /// `sir_status`, sorted by id. A leaf that never recorded its source is not listed: it
+    /// cannot be compared, and neither is one written after `written_by` (unix seconds;
+    /// see `mark_sir_stale_for_changed_sources`). Unlike the status alone, this tells a
+    /// leaf written for an older body from one left `stale` by a failed attempt to
+    /// regenerate an unchanged body.
+    pub fn list_sir_source_changes(
+        &self,
+        current: &[(String, String)],
+        written_by: i64,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        if current.is_empty() {
+            return Ok(Vec::new());
+        }
+        let current = current
+            .iter()
+            .map(|(symbol_id, source_hash)| (symbol_id.trim(), source_hash.trim()))
+            .collect::<HashMap<_, _>>();
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, source_hash, sir_status
+            FROM sir
+            WHERE COALESCE(TRIM(source_hash), '') <> ''
+              AND updated_at <= ?1
+            ORDER BY id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![written_by], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            ))
+        })?;
+        let mut changed = Vec::new();
+        for row in rows {
+            let (symbol_id, recorded, status) = row?;
+            if current
+                .get(symbol_id.as_str())
+                .is_some_and(|source_hash| *source_hash != recorded.trim())
+            {
+                changed.push((symbol_id, status.trim().to_ascii_lowercase()));
+            }
+        }
+        Ok(changed)
+    }
+
     pub(crate) fn store_get_sir_meta(
         &self,
         symbol_id: &str,

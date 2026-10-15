@@ -43,9 +43,12 @@ use crate::sir_pipeline::{
 
 mod enrichment;
 mod git_watch;
+#[cfg(test)]
+mod index_once_tests;
 mod priority;
 mod quality;
 mod reconciliation;
+mod snapshot;
 mod structural;
 mod worker;
 
@@ -60,7 +63,10 @@ use self::worker::{SharedQueueState, enqueue_symbols_missing_sir, spawn_semantic
 
 use self::quality::{run_deep_pass, run_triage_pass};
 use self::reconciliation::{
-    execute_symbol_reconciliation, plan_symbol_reconciliation, print_reconciliation_dry_run,
+    SnapshotScope, plan_symbol_reconciliation, print_reconciliation_dry_run,
+};
+use self::snapshot::{
+    delete_vector_embeddings, files_with_outdated_rollups, symbols_with_stale_source, sync_snapshot,
 };
 
 const REQUEST_POLL_BATCH: usize = 128;
@@ -227,7 +233,12 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
 
         // A dry run writes nothing, so every id in the store predates the snapshot.
         let pre_existing_ids = store.list_all_symbol_ids()?.into_iter().collect();
-        let plan = plan_symbol_reconciliation(&store, &symbols_by_id, &pre_existing_ids)?;
+        let plan = plan_symbol_reconciliation(
+            &store,
+            &symbols_by_id,
+            &pre_existing_ids,
+            &SnapshotScope::of(&observer),
+        )?;
         let mut stdout = std::io::stdout();
         print_reconciliation_dry_run(&plan, &mut stdout)?;
         return Ok(());
@@ -238,18 +249,13 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
     let mut stdout = std::io::stdout();
     let (initial_events, symbols_by_id, symbol_count) = collect_initial_snapshot(&observer);
 
-    let pre_existing_ids = store.list_all_symbol_ids()?.into_iter().collect();
-    for event in &initial_events {
-        structural.process_event(&store, event)?;
-    }
-
-    let reconciliation_plan =
-        plan_symbol_reconciliation(&store, &symbols_by_id, &pre_existing_ids)?;
-    let _ = execute_symbol_reconciliation(
+    sync_snapshot(
         &config.workspace,
         &store,
-        &reconciliation_plan,
-        |symbol_ids| structural.delete_symbols_batch(symbol_ids),
+        &mut structural,
+        &SnapshotScope::of(&observer),
+        &initial_events,
+        &symbols_by_id,
         |symbol_ids| sir_pipeline.delete_embeddings(symbol_ids),
     )?;
 
@@ -264,7 +270,13 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
     let candidate_symbol_ids = if config.force {
         store.list_all_symbol_ids()?
     } else {
-        store.list_symbol_ids_without_sir()?
+        // Symbols without a SIR, and symbols whose SIR the snapshot sync marked stale
+        // because it was written for a body the symbol no longer has.
+        let mut ids = store.list_symbol_ids_without_sir()?;
+        ids.extend(symbols_with_stale_source(&store, &symbols_by_id)?);
+        ids.sort();
+        ids.dedup();
+        ids
     };
 
     let mut symbols_by_file = BTreeMap::<String, Vec<Symbol>>::new();
@@ -318,6 +330,27 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
         failures = scan_stats.failure_count,
         "Bulk scan complete"
     );
+
+    // The scan rebuilt the rollups of the files it regenerated leaves in. A file can still
+    // hold a stale rollup (it lost symbols, or a structural run flagged it) or none at
+    // all; those are rebuilt from the leaves as they are now.
+    let outdated_rollups = files_with_outdated_rollups(&store, &symbols_by_id)?;
+    if !outdated_rollups.is_empty() {
+        tracing::info!(
+            file_count = outdated_rollups.len(),
+            "Rebuilding {} stale or missing file rollups",
+            outdated_rollups.len()
+        );
+        sir_pipeline
+            .refresh_file_rollups(
+                &store,
+                outdated_rollups,
+                SIR_GENERATION_PASS_SCAN,
+                config.print_sir,
+                &mut stdout,
+            )
+            .context("failed to rebuild stale file rollups")?;
+    }
 
     let workspace_config = ensure_workspace_config(&config.workspace)
         .context("failed to load workspace config for quality passes")?;
@@ -416,12 +449,17 @@ fn run_initial_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> 
 
     let (observer, store) = initialize_observer_and_store(config)?;
     let mut structural = StructuralIndexer::new(config.workspace.clone())?;
-    let mut symbol_count = 0usize;
+    let (initial_events, symbols_by_id, symbol_count) = collect_initial_snapshot(&observer);
 
-    for event in observer.initial_symbol_events() {
-        symbol_count += event.added.len() + event.updated.len();
-        structural.process_event(store.as_ref(), &event)?;
-    }
+    sync_snapshot(
+        &config.workspace,
+        store.as_ref(),
+        &mut structural,
+        &SnapshotScope::of(&observer),
+        &initial_events,
+        &symbols_by_id,
+        |symbol_ids| delete_vector_embeddings(&config.workspace, symbol_ids),
+    )?;
 
     tracing::info!(
         symbol_count,

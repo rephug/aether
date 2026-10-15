@@ -55,6 +55,19 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `aetherd --index-once` no longer serves stale SIR after edits made while nothing was
+  watching. A symbol whose body changed since its SIR was written (its recorded
+  `source_hash` no longer matches) is marked `stale`, including a SIR that
+  reconciliation migrated onto a re-identified symbol; `--full` regenerates those leaves
+  (not ones left stale by a failed attempt on an unchanged body). Plain `--index-once`
+  now reconciles and prunes like `--full`: symbols deleted from the workspace leave
+  `symbols`, `sir` and their `.aether/sir/<id>.json` mirrors. File rollups of changed
+  files are marked `stale` (or removed when no leaf SIR is left), and `--full` rebuilds
+  stale and missing rollups. Pruning now runs before the graph sync, so stale ids are no
+  longer written to the graph first. Symbols of a file or directory the snapshot could
+  not read (permissions, non-UTF-8 content) are kept instead of being pruned as deleted,
+  by `--index-once` and `--full` alike. Nor are rows a daemon wrote after the snapshot
+  began: a snapshot never prunes, migrates or marks stale what it cannot have seen.
 - `inference.provider = "openai_compat"` now sends `[inference] thinking` as
   `reasoning_effort`, as `omp` already did. `[inference] timeout_secs` now lifts the
   request timeout of `openai_compat` and `omp` as well as `qwen3_local`, so a model that

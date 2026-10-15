@@ -42,6 +42,13 @@ pub struct ObserverState {
     workspace: PathBuf,
     extractor: SymbolExtractor,
     snapshots: HashMap<PathBuf, FileSnapshot>,
+    /// Workspace-relative paths the last `seed_from_disk` could not read: files, and
+    /// directories whose walk failed (`""`: the whole workspace). Their absence from the
+    /// snapshot says nothing about the symbols stored for them.
+    unread_paths: Vec<String>,
+    /// When the last `seed_from_disk` started reading the workspace (unix seconds; 0
+    /// before any). The snapshot cannot speak for a store row written after it.
+    seeded_at: i64,
 }
 
 impl ObserverState {
@@ -50,16 +57,49 @@ impl ObserverState {
             workspace,
             extractor: SymbolExtractor::new()?,
             snapshots: HashMap::new(),
+            unread_paths: Vec::new(),
+            seeded_at: 0,
         })
     }
 
+    /// See `ObserverState::seeded_at`.
+    pub fn seeded_at(&self) -> i64 {
+        self.seeded_at
+    }
+
+    /// See `ObserverState::unread_paths`: what the snapshot is missing because it could
+    /// not be read, not because it is gone.
+    pub fn unread_paths(&self) -> &[String] {
+        &self.unread_paths
+    }
+
     pub fn seed_from_disk(&mut self) -> Result<()> {
+        self.seeded_at = crate::time::current_unix_timestamp_secs();
+        self.unread_paths.clear();
         for entry in WalkBuilder::new(&self.workspace)
             .standard_filters(true)
             .build()
         {
-            let Ok(entry) = entry else {
-                continue;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    if let Some(gap) = walk_error_gap(&err) {
+                        let gap = if gap.as_os_str().is_empty() {
+                            String::new()
+                        } else {
+                            normalize_path(
+                                &relative_workspace_path(&self.workspace, &gap).to_string_lossy(),
+                            )
+                        };
+                        tracing::warn!(
+                            path = %gap,
+                            error = %err,
+                            "workspace walk could not read a path; its stored symbols are kept"
+                        );
+                        self.unread_paths.push(gap);
+                    }
+                    continue;
+                }
             };
             if !entry
                 .file_type()
@@ -83,7 +123,17 @@ impl ObserverState {
 
             let source = match fs::read_to_string(full_path) {
                 Ok(source) => source,
-                Err(_) => continue,
+                // Gone since the walk listed it: nothing of it is left to keep.
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %display_path,
+                        error = %err,
+                        "could not read source file; its stored symbols are kept"
+                    );
+                    self.unread_paths.push(display_path);
+                    continue;
+                }
             };
 
             let symbols = self
@@ -214,6 +264,22 @@ impl ObserverState {
             .collect::<Vec<_>>();
         paths.sort();
         paths
+    }
+}
+
+/// The path a workspace walk error left unread: the file or directory it names, or the
+/// whole workspace (an empty path) for an I/O error that names none. `None` for errors
+/// that skip no source file: an ignore file's glob or line, a symlink loop back into the
+/// walk.
+fn walk_error_gap(err: &ignore::Error) -> Option<PathBuf> {
+    match err {
+        ignore::Error::WithPath { path, .. } => Some(path.clone()),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            walk_error_gap(err)
+        }
+        ignore::Error::Partial(errs) => errs.iter().find_map(walk_error_gap),
+        ignore::Error::Io(_) => Some(PathBuf::new()),
+        _ => None,
     }
 }
 
