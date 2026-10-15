@@ -197,8 +197,14 @@ pub(crate) fn symbol_leaf_name(qualified_name: &str) -> &str {
         .unwrap_or(qualified_name)
 }
 
+/// Kinds that declare a type, whose methods are qualified under its name (`Type::method`):
+/// Rust structs, traits, enums and type aliases, and the classes and interfaces of the
+/// other languages (TypeScript, Python, Java, C#).
 pub(crate) fn is_type_symbol_kind(kind: &str) -> bool {
-    matches!(kind.trim(), "struct" | "trait" | "enum" | "type_alias")
+    matches!(
+        kind.trim(),
+        "struct" | "trait" | "enum" | "type_alias" | "class" | "interface"
+    )
 }
 
 pub(crate) fn child_method_symbols(

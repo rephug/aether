@@ -369,9 +369,21 @@ fn build_source_layer(server: &AetherMcpServer, record: &SymbolRecord) -> String
         }
     };
 
-    symbols
+    // Overloads share a qualified name, so the name only stands in for an ID the file no
+    // longer produces, and only when it names one symbol.
+    let symbol = symbols
         .iter()
-        .find(|symbol| symbol.id == record.id || symbol.qualified_name == record.qualified_name)
+        .find(|symbol| symbol.id == record.id)
+        .or_else(|| {
+            let mut named = symbols
+                .iter()
+                .filter(|symbol| symbol.qualified_name == record.qualified_name);
+            match (named.next(), named.next()) {
+                (Some(symbol), None) => Some(symbol),
+                _ => None,
+            }
+        });
+    symbol
         .and_then(|symbol| extract_symbol_source_text(&source, symbol.range))
         .unwrap_or(source)
 }
@@ -1109,6 +1121,57 @@ vector_backend = "sqlite"
         let layer = super::build_source_layer(&server, &symbol_record(target));
         assert!(!layer.contains("OUTSIDE_WORKSPACE"), "{layer}");
         assert!(layer.starts_with("Unavailable"), "{layer}");
+    }
+
+    #[test]
+    fn source_layer_picks_the_overload_by_id() {
+        // Two `Wrap::from`s with distinct IDs, as Java and C# overloads have.
+        let temp = tempdir().expect("tempdir");
+        write_test_config(temp.path());
+        fs::create_dir_all(temp.path().join("src")).expect("mkdir src");
+        fs::write(
+            temp.path().join("src/lib.rs"),
+            "pub struct Wrap(pub u32);\n\nimpl From<u8> for Wrap {\n    fn from(value: u8) -> Self {\n        Wrap(value.into()) // U8_BODY\n    }\n}\n\nimpl From<u16> for Wrap {\n    fn from(value: u16) -> Self {\n        Wrap(value.into()) // U16_BODY\n    }\n}\n",
+        )
+        .expect("write source");
+        let symbols = parse_symbols(temp.path(), "src/lib.rs");
+        let overloads = symbols
+            .iter()
+            .filter(|symbol| symbol.qualified_name == "Wrap::from")
+            .collect::<Vec<_>>();
+        let [first, second] = overloads.as_slice() else {
+            panic!("expected two Wrap::from overloads, got {overloads:?}");
+        };
+        assert_ne!(first.id, second.id);
+        let server = AetherMcpServer::new(temp.path(), false).expect("server");
+
+        // The later overload must not show the earlier one's body.
+        for (overload, own, other) in [
+            (first, "U8_BODY", "U16_BODY"),
+            (second, "U16_BODY", "U8_BODY"),
+        ] {
+            let layer = super::build_source_layer(&server, &symbol_record(overload));
+            assert!(layer.contains(own), "{layer}");
+            assert!(!layer.contains(other), "{layer}");
+        }
+
+        // An ID the file no longer produces falls back to the name only when the name
+        // is unique; an overloaded name shows the whole file.
+        let wrap = symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "Wrap")
+            .expect("Wrap struct");
+        let stale = |symbol: &aether_core::Symbol| SymbolRecord {
+            id: "stale-id".to_owned(),
+            ..symbol_record(symbol)
+        };
+        let layer = super::build_source_layer(&server, &stale(wrap));
+        assert_eq!(layer.trim(), "pub struct Wrap(pub u32);");
+        let layer = super::build_source_layer(&server, &stale(second));
+        assert!(
+            layer.contains("U8_BODY") && layer.contains("U16_BODY"),
+            "{layer}"
+        );
     }
 
     #[test]

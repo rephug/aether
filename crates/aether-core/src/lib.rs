@@ -171,6 +171,10 @@ pub enum Language {
     Jsx,
     Python,
     Go,
+    Java,
+    // Spelled like `as_str`, which is what the store and symbol ids use.
+    #[serde(rename = "csharp")]
+    CSharp,
 }
 
 impl Language {
@@ -183,6 +187,8 @@ impl Language {
             Self::Jsx => "jsx",
             Self::Python => "python",
             Self::Go => "go",
+            Self::Java => "java",
+            Self::CSharp => "csharp",
         }
     }
 }

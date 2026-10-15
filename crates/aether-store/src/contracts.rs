@@ -120,24 +120,14 @@ impl SqliteStore {
     }
 
     /// List a symbol's contracts ordered by id, optionally including
-    /// deactivated rows.
+    /// deactivated rows. Same as [`Self::list_contracts_for_symbol`], which
+    /// keeps the active-only case on the partial index.
     pub fn list_intent_contracts_for_symbol(
         &self,
         symbol_id: &str,
         include_inactive: bool,
     ) -> Result<Vec<IntentContractRecord>, StoreError> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT id, symbol_id, clause_type, clause_text, clause_embedding_json,
-                   created_at, created_by, active, violation_streak
-            FROM intent_contracts
-            WHERE symbol_id = ?1 AND (?2 = 1 OR active = 1)
-            ORDER BY id
-            "#,
-        )?;
-        let rows = stmt.query_map(params![symbol_id, include_inactive], map_contract_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        self.list_contracts_for_symbol(symbol_id, include_inactive)
     }
 
     pub fn list_all_active_contracts(&self) -> Result<Vec<IntentContractRecord>, StoreError> {
@@ -148,6 +138,60 @@ impl SqliteStore {
                    created_at, created_by, active, violation_streak
             FROM intent_contracts
             WHERE active = 1
+            ORDER BY symbol_id, id
+            "#,
+        )?;
+        let rows = stmt.query_map([], map_contract_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Lists contracts for `symbol_id`, ordered by id.
+    ///
+    /// With `include_inactive = false` this is identical to
+    /// [`Self::list_active_contracts_for_symbol`]; with `true` it also returns
+    /// deactivated (removed) contracts, distinguishable by their `active` flag.
+    pub fn list_contracts_for_symbol(
+        &self,
+        symbol_id: &str,
+        include_inactive: bool,
+    ) -> Result<Vec<IntentContractRecord>, StoreError> {
+        if !include_inactive {
+            return self.list_active_contracts_for_symbol(symbol_id);
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, symbol_id, clause_type, clause_text, clause_embedding_json,
+                   created_at, created_by, active, violation_streak
+            FROM intent_contracts
+            WHERE symbol_id = ?1
+            ORDER BY id
+            "#,
+        )?;
+        let rows = stmt.query_map(params![symbol_id], map_contract_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Lists contracts across all symbols, ordered by symbol id then id.
+    ///
+    /// With `include_inactive = false` this is identical to
+    /// [`Self::list_all_active_contracts`]; with `true` it also returns
+    /// deactivated (removed) contracts, distinguishable by their `active` flag.
+    pub fn list_all_contracts(
+        &self,
+        include_inactive: bool,
+    ) -> Result<Vec<IntentContractRecord>, StoreError> {
+        if !include_inactive {
+            return self.list_all_active_contracts();
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, symbol_id, clause_type, clause_text, clause_embedding_json,
+                   created_at, created_by, active, violation_streak
+            FROM intent_contracts
             ORDER BY symbol_id, id
             "#,
         )?;
@@ -565,6 +609,81 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].symbol_id, "sym_a");
         assert_eq!(all[1].symbol_id, "sym_b");
+    }
+
+    fn ids_and_flags(contracts: &[IntentContractRecord]) -> Vec<(i64, bool)> {
+        contracts
+            .iter()
+            .map(|contract| (contract.id, contract.active))
+            .collect()
+    }
+
+    #[test]
+    fn list_contracts_for_symbol_honors_include_inactive() {
+        let (store, _dir) = open_test_store();
+        let kept = store
+            .insert_intent_contract("sym_a", "must", "kept clause", None, "human")
+            .unwrap();
+        let removed = store
+            .insert_intent_contract("sym_a", "must_not", "removed clause", None, "human")
+            .unwrap();
+        let other = store
+            .insert_intent_contract("sym_b", "must", "other symbol", None, "human")
+            .unwrap();
+        store.deactivate_contract(removed).unwrap();
+
+        let active_only = store.list_contracts_for_symbol("sym_a", false).unwrap();
+        assert_eq!(ids_and_flags(&active_only), vec![(kept, true)]);
+        assert_eq!(
+            active_only,
+            store.list_active_contracts_for_symbol("sym_a").unwrap()
+        );
+
+        let with_inactive = store.list_contracts_for_symbol("sym_a", true).unwrap();
+        assert_eq!(
+            ids_and_flags(&with_inactive),
+            vec![(kept, true), (removed, false)]
+        );
+        assert_eq!(with_inactive[1].clause_text, "removed clause");
+        assert!(with_inactive.iter().all(|c| c.symbol_id == "sym_a"));
+
+        let other_symbol = store.list_contracts_for_symbol("sym_b", true).unwrap();
+        assert_eq!(ids_and_flags(&other_symbol), vec![(other, true)]);
+
+        assert!(
+            store
+                .list_contracts_for_symbol("sym_missing", true)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn list_all_contracts_honors_include_inactive() {
+        let (store, _dir) = open_test_store();
+        let b_kept = store
+            .insert_intent_contract("sym_b", "must", "b kept", None, "human")
+            .unwrap();
+        let a_removed = store
+            .insert_intent_contract("sym_a", "must", "a removed", None, "human")
+            .unwrap();
+        let a_kept = store
+            .insert_intent_contract("sym_a", "preserves", "a kept", None, "agent")
+            .unwrap();
+        store.deactivate_contract(a_removed).unwrap();
+
+        let active_only = store.list_all_contracts(false).unwrap();
+        assert_eq!(
+            ids_and_flags(&active_only),
+            vec![(a_kept, true), (b_kept, true)]
+        );
+        assert_eq!(active_only, store.list_all_active_contracts().unwrap());
+
+        let with_inactive = store.list_all_contracts(true).unwrap();
+        assert_eq!(
+            ids_and_flags(&with_inactive),
+            vec![(a_removed, false), (a_kept, true), (b_kept, true)]
+        );
     }
 
     #[test]

@@ -5,8 +5,17 @@
 //! method name as their target. A call edge's target can therefore name several
 //! symbols: same-named methods of different types, a free function, or the same type
 //! declared twice. A caller counts for the selected symbol only when the edge's target
-//! narrows to that one symbol. TypeScript and Python record calls by their callee text
-//! (`obj.alpha`, `self.alpha`), so the bare-name expansion applies to Rust only.
+//! narrows to that one symbol or to its overloads. TypeScript and Python record calls
+//! by their callee text (`obj.alpha`, `self.alpha`), so the bare-name expansion applies
+//! to Rust only.
+//!
+//! Overloads share a qualified name, language and file but not an ID: Java and C#
+//! overloaded methods (`Type::method`), or a Rust method of a trait a type implements
+//! twice (`impl From<u8> for Wrap` and `impl From<u16> for Wrap` both declare
+//! `Wrap::from`). A call edge can't tell them apart, so a call to that name counts for
+//! every overload. Same-named symbols in different files stay ambiguous, C# partial
+//! classes included, since neither Java nor C# puts the package or namespace in the
+//! qualified name.
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -36,14 +45,14 @@ impl<'a> CallerAttribution<'a> {
         }
     }
 
-    /// The callers whose call edges resolve to `symbol` alone, ordered by qualified
-    /// name and ID.
+    /// The callers whose call edges resolve to `symbol` or its overloads alone, ordered
+    /// by qualified name and ID.
     ///
     /// An edge counts when its target is the symbol's qualified name or, for a Rust
     /// method, its bare name. The symbols that target could name (in the caller's
     /// language family) are narrowed to the caller's own file; if none are there, to
     /// the caller's package; otherwise all are kept. The caller is attributed only when
-    /// exactly one candidate remains and it is `symbol`.
+    /// every remaining candidate is `symbol` or one of its overloads.
     pub(crate) fn callers_of(
         &mut self,
         symbol: &SymbolRecord,
@@ -128,7 +137,10 @@ impl<'a> CallerAttribution<'a> {
             }
         };
 
-        Ok(narrowed.len() == 1 && narrowed[0].id == symbol.id)
+        Ok(!narrowed.is_empty()
+            && narrowed
+                .iter()
+                .all(|candidate| is_same_or_overload(candidate, symbol)))
     }
 
     fn candidates(&mut self, target: &str) -> Result<&Vec<SymbolRecord>, AetherMcpError> {
@@ -149,6 +161,15 @@ impl<'a> CallerAttribution<'a> {
             .insert(symbol_id.to_owned(), record.clone());
         Ok(record)
     }
+}
+
+/// Whether `candidate` is `symbol` or an overload of it: a symbol with the same
+/// qualified name and language declared in the same file.
+fn is_same_or_overload(candidate: &SymbolRecord, symbol: &SymbolRecord) -> bool {
+    candidate.id == symbol.id
+        || (candidate.qualified_name == symbol.qualified_name
+            && candidate.language == symbol.language
+            && candidate.file_path == symbol.file_path)
 }
 
 /// Languages that can call each other's symbols share a family.

@@ -1,0 +1,9 @@
+(method_invocation) @edge.call
+(object_creation_expression) @edge.call
+(import_declaration) @edge.depends_on
+(method_declaration) @edge.type_ref
+(constructor_declaration) @edge.type_ref
+(class_declaration) @edge.implements
+(interface_declaration) @edge.implements
+(enum_declaration) @edge.implements
+(record_declaration) @edge.implements

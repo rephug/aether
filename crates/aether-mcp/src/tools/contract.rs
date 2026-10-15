@@ -13,8 +13,6 @@ use crate::AetherMcpError;
 const DEFAULT_VIOLATION_LIMIT: u32 = 20;
 const MAX_VIOLATION_LIMIT: u32 = 1000;
 const CLAUDE_CODE_CREATOR: &str = "claude_code";
-const NOTE_ACTIVE_ONLY: &str =
-    "include_inactive is not yet supported - showing active contracts only";
 const NOTE_INVALID_CLAUSE_EMBEDDING: &str =
     "Stored clause embedding is invalid and could not be compared.";
 const NOTE_NO_EMBEDDING: &str = "No embedding available for comparison.";
@@ -47,7 +45,8 @@ pub struct AetherContractAddResponse {
 pub struct AetherContractListRequest {
     /// Optional symbol ID or qualified name to filter by
     pub symbol: Option<String>,
-    /// Include inactive/deactivated contracts (default false)
+    /// Also return inactive (removed/deactivated) contracts (default false).
+    /// Each returned contract carries an `active` flag.
     pub include_inactive: Option<bool>,
 }
 
@@ -68,6 +67,7 @@ pub struct ContractOutput {
 pub struct AetherContractListResponse {
     pub contracts: Vec<ContractOutput>,
     pub total: u32,
+    /// Reserved for informational notes; currently always null.
     pub note: Option<String>,
 }
 
@@ -379,11 +379,12 @@ impl AetherMcpServer {
         request: AetherContractListRequest,
     ) -> Result<AetherContractListResponse, AetherMcpError> {
         let store = self.state.store.as_ref();
+        let include_inactive = request.include_inactive.unwrap_or(false);
         let contracts = if let Some(symbol) = request.symbol.as_deref() {
             let symbol = resolve_symbol_selector(store, SYMBOL_SELECTOR_LABEL, symbol)?;
-            store.list_active_contracts_for_symbol(symbol.id.as_str())?
+            store.list_contracts_for_symbol(symbol.id.as_str(), include_inactive)?
         } else {
-            store.list_all_active_contracts()?
+            store.list_all_contracts(include_inactive)?
         };
 
         let symbol_ids = contracts
@@ -403,10 +404,7 @@ impl AetherMcpServer {
         Ok(AetherContractListResponse {
             total: outputs.len() as u32,
             contracts: outputs,
-            note: request
-                .include_inactive
-                .filter(|value| *value)
-                .map(|_| NOTE_ACTIVE_ONLY.to_owned()),
+            note: None,
         })
     }
 
@@ -660,7 +658,7 @@ mod tests {
     use super::{
         AetherContractAddRequest, AetherContractCheckRequest, AetherContractDismissRequest,
         AetherContractListRequest, AetherContractRemoveRequest, AetherContractViolationsRequest,
-        CLAUDE_CODE_CREATOR, NOTE_ACTIVE_ONLY, NOTE_INVALID_CLAUSE_EMBEDDING, NOTE_NO_EMBEDDING,
+        CLAUDE_CODE_CREATOR, NOTE_INVALID_CLAUSE_EMBEDDING, NOTE_NO_EMBEDDING,
     };
     use crate::AetherMcpServer;
     use aether_store::{
@@ -774,7 +772,8 @@ model = "{embedding_model}"
             .expect("list contracts");
 
         assert_eq!(list.total, 1);
-        assert_eq!(list.note.as_deref(), Some(NOTE_ACTIVE_ONLY));
+        assert_eq!(list.note, None);
+        assert!(list.contracts[0].active);
         assert_eq!(list.contracts[0].id, add.contract_id);
         assert_eq!(
             list.contracts[0].qualified_name.as_deref(),
@@ -841,6 +840,142 @@ model = "{embedding_model}"
             .expect("list contracts");
         assert_eq!(list.total, 0);
         assert!(list.contracts.is_empty());
+    }
+
+    fn add_test_contract(server: &AetherMcpServer, symbol: &str, clause_text: &str) -> i64 {
+        server
+            .aether_contract_add_logic(
+                AetherContractAddRequest {
+                    symbol: symbol.to_owned(),
+                    clause_type: "must".to_owned(),
+                    clause_text: clause_text.to_owned(),
+                    created_by: None,
+                },
+                None,
+            )
+            .expect("add contract")
+            .contract_id
+    }
+
+    fn list_ids_and_flags(
+        server: &AetherMcpServer,
+        symbol: Option<&str>,
+        include_inactive: Option<bool>,
+    ) -> Vec<(i64, bool)> {
+        let list = server
+            .aether_contract_list_logic(AetherContractListRequest {
+                symbol: symbol.map(str::to_owned),
+                include_inactive,
+            })
+            .expect("list contracts");
+        assert_eq!(list.total as usize, list.contracts.len());
+        assert_eq!(list.note, None);
+        list.contracts
+            .iter()
+            .map(|contract| (contract.id, contract.active))
+            .collect()
+    }
+
+    #[test]
+    fn contract_list_include_inactive_returns_removed_contracts() {
+        let temp = tempdir().expect("tempdir");
+        write_test_config(temp.path(), false, "mock-64d");
+        seed_symbol(temp.path(), "sym-a", "crate::payments::process");
+        seed_symbol(temp.path(), "sym-b", "crate::payments::refund");
+        let server = AetherMcpServer::new(temp.path(), false).expect("server");
+
+        let kept = add_test_contract(&server, "sym-a", "reject zero amounts");
+        let removed = add_test_contract(&server, "sym-a", "log every attempt");
+        let other = add_test_contract(&server, "sym-b", "refund at most once");
+        server
+            .aether_contract_remove_logic(AetherContractRemoveRequest {
+                contract_id: removed,
+            })
+            .expect("remove contract");
+
+        // Default (absent) and explicit false keep the active-only behavior.
+        for include_inactive in [None, Some(false)] {
+            assert_eq!(
+                list_ids_and_flags(&server, Some("crate::payments::process"), include_inactive),
+                vec![(kept, true)],
+                "symbol filter, include_inactive={include_inactive:?}"
+            );
+            assert_eq!(
+                list_ids_and_flags(&server, None, include_inactive),
+                vec![(kept, true), (other, true)],
+                "no filter, include_inactive={include_inactive:?}"
+            );
+        }
+
+        // include_inactive=true also returns the removed contract, flagged inactive.
+        assert_eq!(
+            list_ids_and_flags(&server, Some("crate::payments::process"), Some(true)),
+            vec![(kept, true), (removed, false)]
+        );
+        assert_eq!(
+            list_ids_and_flags(&server, Some("sym-b"), Some(true)),
+            vec![(other, true)]
+        );
+        assert_eq!(
+            list_ids_and_flags(&server, None, Some(true)),
+            vec![(kept, true), (removed, false), (other, true)]
+        );
+
+        let list = server
+            .aether_contract_list_logic(AetherContractListRequest {
+                symbol: Some("sym-a".to_owned()),
+                include_inactive: Some(true),
+            })
+            .expect("list contracts");
+        let removed_output = list
+            .contracts
+            .iter()
+            .find(|contract| contract.id == removed)
+            .expect("removed contract listed");
+        assert_eq!(removed_output.clause_text, "log every attempt");
+        assert_eq!(
+            removed_output.qualified_name.as_deref(),
+            Some("crate::payments::process")
+        );
+    }
+
+    #[test]
+    fn contract_list_request_json_include_inactive_is_optional() {
+        let temp = tempdir().expect("tempdir");
+        write_test_config(temp.path(), false, "mock-64d");
+        seed_symbol(temp.path(), "sym-a", "crate::payments::process");
+        let server = AetherMcpServer::new(temp.path(), false).expect("server");
+
+        let kept = add_test_contract(&server, "sym-a", "reject zero amounts");
+        let removed = add_test_contract(&server, "sym-a", "log every attempt");
+        server
+            .aether_contract_remove_logic(AetherContractRemoveRequest {
+                contract_id: removed,
+            })
+            .expect("remove contract");
+
+        let list_json = |request: serde_json::Value| {
+            let request: AetherContractListRequest =
+                serde_json::from_value(request).expect("parse request");
+            let response = server
+                .aether_contract_list_logic(request)
+                .expect("list contracts");
+            serde_json::to_value(response).expect("serialize response")
+        };
+
+        let absent = list_json(serde_json::json!({}));
+        assert_eq!(absent["total"], 1);
+        assert_eq!(absent["note"], serde_json::Value::Null);
+        assert_eq!(absent["contracts"][0]["id"], kept);
+        assert_eq!(absent["contracts"][0]["active"], true);
+
+        let included = list_json(serde_json::json!({ "include_inactive": true }));
+        assert_eq!(included["total"], 2);
+        assert_eq!(included["note"], serde_json::Value::Null);
+        assert_eq!(included["contracts"][0]["id"], kept);
+        assert_eq!(included["contracts"][0]["active"], true);
+        assert_eq!(included["contracts"][1]["id"], removed);
+        assert_eq!(included["contracts"][1]["active"], false);
     }
 
     #[test]

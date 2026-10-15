@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -287,6 +288,7 @@ fn files_for_platform(platform: AgentPlatform, context: &TemplateContext) -> Vec
 fn build_template_context(workspace: &Path, config: &AetherConfig) -> TemplateContext {
     TemplateContext {
         languages: detected_languages(),
+        source_suffixes: source_suffixes(),
         verify_commands: config.verify.commands.clone(),
         embeddings_enabled: config.embeddings.enabled,
         inference_provider: config.inference.provider.as_str().to_owned(),
@@ -386,6 +388,8 @@ fn detected_languages() -> Vec<String> {
     let mut has_typescript = false;
     let mut has_python = false;
     let mut has_go = false;
+    let mut has_java = false;
+    let mut has_csharp = false;
 
     for config in LanguageRegistry::default().configs() {
         match config.id {
@@ -393,6 +397,8 @@ fn detected_languages() -> Vec<String> {
             "typescript" | "tsx_js" => has_typescript = true,
             "python" => has_python = true,
             "go" => has_go = true,
+            "java" => has_java = true,
+            "csharp" => has_csharp = true,
             _ => {}
         }
     }
@@ -410,8 +416,31 @@ fn detected_languages() -> Vec<String> {
     if has_go {
         languages.push("Go".to_owned());
     }
+    if has_java {
+        languages.push("Java".to_owned());
+    }
+    if has_csharp {
+        languages.push("C#".to_owned());
+    }
 
     languages
+}
+
+/// Every extension a registered parser claims, as a `.ext` suffix, sorted and deduplicated.
+fn source_suffixes() -> Vec<String> {
+    LanguageRegistry::default()
+        .configs()
+        .iter()
+        .flat_map(|config| config.extensions)
+        .map(|extension| {
+            format!(
+                ".{}",
+                extension.trim_start_matches('.').to_ascii_lowercase()
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 #[cfg(test)]
@@ -952,8 +981,41 @@ mod tests {
     fn detected_languages_names_every_registered_parser() {
         assert_eq!(
             super::detected_languages(),
-            vec!["Rust", "TypeScript/JavaScript", "Python", "Go"]
+            vec![
+                "Rust",
+                "TypeScript/JavaScript",
+                "Python",
+                "Go",
+                "Java",
+                "C#"
+            ]
         );
+    }
+
+    #[test]
+    fn review_workflow_filters_on_every_registered_extension() {
+        assert_eq!(
+            super::source_suffixes(),
+            vec![
+                ".cs", ".go", ".java", ".js", ".jsx", ".py", ".pyi", ".rs", ".ts", ".tsx"
+            ]
+        );
+
+        let temp = tempdir().expect("tempdir");
+        write_config_with_embeddings(temp.path(), false);
+        run_init_agent(
+            temp.path(),
+            InitAgentOptions {
+                platform: AgentPlatform::Claude,
+                force: false,
+            },
+        )
+        .expect("init-agent claude should succeed");
+        let workflow = fs::read_to_string(temp.path().join(".github/workflows/aether-review.yml"))
+            .expect("read review workflow");
+        assert!(workflow.contains(
+            "\n          SOURCE_SUFFIXES = (\".cs\", \".go\", \".java\", \".js\", \".jsx\", \".py\", \".pyi\", \".rs\", \".ts\", \".tsx\")\n"
+        ));
     }
 
     fn write_config_with_embeddings(workspace: &Path, embeddings_enabled: bool) {
