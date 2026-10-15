@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::future::IntoFuture;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use aether_config::{DEFAULT_GRAPH_OPEN_TIMEOUT_SECS, load_workspace_config};
@@ -56,7 +56,9 @@ pub unsafe fn set_surrealkv_sizing_env() {
 
 #[derive(Clone)]
 pub struct SurrealGraphStore {
-    db: Surreal<Db>,
+    // Clones share one session. A cloned `Surreal` handle is a new SurrealDB session, and a
+    // new session's first request can fail (see `retry_until_session_registered`).
+    db: Arc<Surreal<Db>>,
 }
 
 impl SurrealGraphStore {
@@ -90,22 +92,23 @@ impl SurrealGraphStore {
             existing
         } else {
             let open_timeout = open_timeout.unwrap_or_else(|| graph_open_timeout(&workspace_root));
+            let runtime = surreal_runtime()?;
             let mut open_error = None;
             let mut db_opt = None;
             for attempt in 0..10 {
                 match wait_for_open(
-                    Surreal::new::<SurrealKv>(graph_dir.clone()),
+                    runtime.spawn(Surreal::new::<SurrealKv>(graph_dir.clone()).into_future()),
                     SURREAL_OPEN_SLOW_AFTER,
                     open_timeout,
                     &graph_dir,
                 )
                 .await
                 {
-                    Ok(Ok(db)) => {
+                    Ok(Ok(Ok(db))) => {
                         db_opt = Some(db);
                         break;
                     }
-                    Ok(Err(err)) => {
+                    Ok(Ok(Err(err))) => {
                         let message = err.to_string();
                         if message.contains("LOCK is already locked") && attempt < 9 {
                             // Another thread of this process may have opened the store
@@ -121,6 +124,12 @@ impl SurrealGraphStore {
                         }
                         open_error =
                             Some(StoreError::Graph(format!("SurrealDB open failed: {err}")));
+                        break;
+                    }
+                    Ok(Err(err)) => {
+                        open_error = Some(StoreError::Graph(format!(
+                            "SurrealDB open task failed: {err}"
+                        )));
                         break;
                     }
                     Err(_) => {
@@ -148,12 +157,11 @@ impl SurrealGraphStore {
         // writes with a transaction conflict. One open sets them up; the others wait.
         let setup_lock = store_setup_lock(&graph_dir)?;
         let _setup = setup_lock.lock().await;
-        db.use_ns("aether")
-            .use_db("graph")
+        retry_until_session_registered(|| db.use_ns("aether").use_db("graph"))
             .await
             .map_err(|err| StoreError::Graph(format!("SurrealDB namespace setup failed: {err}")))?;
 
-        let store = Self { db };
+        let store = Self { db: Arc::new(db) };
         if !is_schema_initialized(&graph_dir)? {
             store.ensure_schema().await?;
             mark_schema_initialized(graph_dir.clone())?;
@@ -952,9 +960,9 @@ fn graph_open_timeout(workspace_root: &Path) -> Duration {
 
 /// Waits up to `limit` for one SurrealDB open, logging once it has taken `slow_after`.
 ///
-/// A slow open is never abandoned and restarted: SurrealDB opens the store in a task it
-/// spawns, which keeps running and holds the store's lock after its caller stops waiting,
-/// so a fresh open would only fail on that lock and redo the same slow work.
+/// A slow open is never abandoned and restarted: the open runs in a task on
+/// [`surreal_runtime`], which keeps running and holds the store's lock after its caller
+/// stops waiting, so a fresh open would only fail on that lock and redo the same slow work.
 async fn wait_for_open<F: IntoFuture>(
     open: F,
     slow_after: Duration,
@@ -973,6 +981,59 @@ async fn wait_for_open<F: IntoFuture>(
         "SurrealDB open is slow; still waiting"
     );
     tokio::time::timeout(limit - slow_after, open).await
+}
+
+/// The runtime every SurrealDB handle in this process is opened on. SurrealDB runs a
+/// handle's router, and the tasks that answer its requests, on the runtime that opened it,
+/// and the process keeps one handle per store for its whole life. A handle opened on a
+/// short-lived runtime (a command's, a test's, the structural indexer's) stopped answering
+/// once that runtime shut down, and one opened on a current-thread runtime stalled whenever
+/// nothing was driving that runtime. This runtime is never shut down.
+fn surreal_runtime() -> Result<&'static tokio::runtime::Runtime, StoreError> {
+    static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .thread_name("aether-surreal")
+                .enable_all()
+                .build()
+                .map_err(|err| format!("failed to initialize SurrealDB tokio runtime: {err}"))
+        })
+        .as_ref()
+        .map_err(|err| StoreError::Graph(err.clone()))
+}
+
+/// How many times a new session's first request is sent before "Session not found" is
+/// returned. One retry always suffices (see [`retry_until_session_registered`]).
+const SESSION_REGISTRATION_ATTEMPTS: usize = 3;
+
+/// Sends a new session's first request, and sends it again if it reached SurrealDB before
+/// the session did.
+///
+/// SurrealDB 3.0 registers a new session (a new handle, or a clone of one) on one channel
+/// and takes requests on another. Its router reads the session channel first, but when its
+/// thread is preempted between reading the two channels, a request sent right after its
+/// session can get there first and fail with "Session not found". The router reads every
+/// waiting session message before it takes another request, so the session is registered by
+/// the time the retry arrives.
+async fn retry_until_session_registered<T, E, F, Fut>(mut request: F) -> Result<T, E>
+where
+    E: std::fmt::Display,
+    F: FnMut() -> Fut,
+    Fut: IntoFuture<Output = Result<T, E>>,
+{
+    let mut attempt = 1;
+    loop {
+        match request().await {
+            Err(err)
+                if attempt < SESSION_REGISTRATION_ATTEMPTS
+                    && err.to_string().contains("Session not found") =>
+            {
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
 }
 
 fn surreal_handle_cache() -> &'static Mutex<HashMap<std::path::PathBuf, Surreal<Db>>> {
@@ -1677,6 +1738,147 @@ mod tests {
         SurrealGraphStore::open(workspace.join("sub").join(".."))
             .await
             .expect("open the same store through another spelling");
+    }
+
+    fn current_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime")
+    }
+
+    #[test]
+    fn a_store_still_answers_after_the_runtime_that_opened_it_shuts_down() {
+        // The process keeps one handle per store. Commands, tests and the structural indexer
+        // open stores on runtimes of their own; once the first opener's runtime shut down,
+        // every later open of that store failed with "Failed to send command".
+        let temp = tempdir().expect("tempdir");
+        let first = current_thread_runtime();
+        let graph = first
+            .block_on(SurrealGraphStore::open(temp.path()))
+            .expect("first open");
+        first
+            .block_on(graph.upsert_symbol_node(&symbol("sym-a", "a", "src/lib.rs")))
+            .expect("write");
+        drop(graph);
+        drop(first);
+
+        let second = current_thread_runtime();
+        let graph = second
+            .block_on(SurrealGraphStore::open(temp.path()))
+            .expect("open after the first runtime shut down");
+        assert_eq!(
+            second
+                .block_on(graph.list_all_symbol_ids())
+                .expect("read after the first runtime shut down"),
+            vec!["sym-a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_store_answers_while_the_runtime_that_opened_it_is_idle() {
+        // A current-thread runtime runs its tasks only inside `block_on`. A handle opened on
+        // one stalled every other runtime's requests while that runtime sat idle.
+        let temp = tempdir().expect("tempdir");
+        let opener = current_thread_runtime();
+        opener
+            .block_on(SurrealGraphStore::open(temp.path()))
+            .expect("first open");
+
+        let other = current_thread_runtime();
+        let graph = other
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    SurrealGraphStore::open(temp.path()),
+                )
+                .await
+            })
+            .expect("open from another runtime does not stall")
+            .expect("open from another runtime");
+        other
+            .block_on(graph.list_all_symbol_ids())
+            .expect("read from another runtime");
+        drop(opener);
+    }
+
+    #[tokio::test]
+    async fn a_request_that_beats_its_session_is_sent_again() {
+        let mut sent = 0;
+        let result: Result<&str, String> = retry_until_session_registered(|| {
+            sent += 1;
+            let first = sent == 1;
+            async move {
+                if first {
+                    Err("Session not found: 4f1c2a9e-0d55-4c1e-9a43-5d3f0b8e2c71".to_owned())
+                } else {
+                    Ok("namespace set")
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(result, Ok("namespace set"));
+        assert_eq!(sent, 2);
+    }
+
+    #[tokio::test]
+    async fn other_errors_and_a_missing_session_are_returned() {
+        let mut sent = 0;
+        let result: Result<(), String> = retry_until_session_registered(|| {
+            sent += 1;
+            async { Err("Failed to send command: sending into a closed channel".to_owned()) }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(sent, 1, "only a missing session is retried");
+
+        let mut sent = 0;
+        let result: Result<(), String> = retry_until_session_registered(|| {
+            sent += 1;
+            async { Err("Session not found: 4f1c2a9e-0d55-4c1e-9a43-5d3f0b8e2c71".to_owned()) }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(sent, SESSION_REGISTRATION_ATTEMPTS);
+    }
+
+    /// The race needs SurrealDB's router thread to be preempted between reading its two
+    /// channels, so no test can force it. Pinned to one core (`taskset -c 0 cargo test -p
+    /// aether-store --lib new_sessions -- --ignored`), these first requests failed with
+    /// "Session not found" about five times per run without the retry.
+    #[test]
+    #[ignore = "stress test; pin it to one core to make the race likely"]
+    fn new_sessions_survive_racing_the_router() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let db = runtime
+            .block_on(Surreal::new::<SurrealKv>(temp.path().join("graph")).into_future())
+            .expect("open SurrealKV");
+        // Define the namespace once: concurrent first definitions conflict on their own.
+        runtime
+            .block_on(retry_until_session_registered(|| {
+                db.use_ns("aether").use_db("graph")
+            }))
+            .expect("define the namespace");
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..2_000 {
+                        let session = db.clone();
+                        runtime
+                            .block_on(retry_until_session_registered(|| {
+                                session.use_ns("aether").use_db("graph")
+                            }))
+                            .expect("first request on a new session");
+                    }
+                });
+            }
+        });
     }
 
     fn symbol(id: &str, qualified_name: &str, file_path: &str) -> SymbolRecord {
