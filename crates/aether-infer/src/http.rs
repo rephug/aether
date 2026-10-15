@@ -138,7 +138,14 @@ where
     Ok(())
 }
 
-pub(crate) fn build_ollama_generate_body(model: &str, prompt: &str, num_ctx: u32) -> Value {
+/// `num_predict` caps the reply length, so a model that keeps emitting JSON tokens stops
+/// there instead of running until the request times out.
+pub(crate) fn build_ollama_generate_body(
+    model: &str,
+    prompt: &str,
+    num_ctx: u32,
+    num_predict: u32,
+) -> Value {
     json!({
         "model": model,
         "prompt": prompt,
@@ -147,7 +154,8 @@ pub(crate) fn build_ollama_generate_body(model: &str, prompt: &str, num_ctx: u32
         "think": false,
         "options": {
             "temperature": aether_config::OLLAMA_SIR_TEMPERATURE,
-            "num_ctx": num_ctx
+            "num_ctx": num_ctx,
+            "num_predict": num_predict
         }
     })
 }
@@ -163,14 +171,20 @@ pub(crate) fn build_ollama_text_generate_body(model: &str, prompt: &str) -> Valu
     })
 }
 
-pub(crate) fn build_ollama_deep_generate_body(model: &str, prompt: &str, num_ctx: u32) -> Value {
+pub(crate) fn build_ollama_deep_generate_body(
+    model: &str,
+    prompt: &str,
+    num_ctx: u32,
+    num_predict: u32,
+) -> Value {
     json!({
         "model": model,
         "prompt": prompt,
         "stream": false,
         "options": {
             "temperature": 0.3,
-            "num_ctx": num_ctx
+            "num_ctx": num_ctx,
+            "num_predict": num_predict
         }
     })
 }
@@ -409,7 +423,7 @@ mod tests {
 
     #[test]
     fn qwen3_local_generate_body_sets_temperature_in_options() {
-        let body = build_ollama_generate_body("qwen2.5-coder:7b", "return strict json", 4096);
+        let body = build_ollama_generate_body("qwen2.5-coder:7b", "return strict json", 4096, 2048);
         assert_eq!(
             body.pointer("/options/temperature"),
             Some(&json!(aether_config::OLLAMA_SIR_TEMPERATURE))
@@ -418,12 +432,31 @@ mod tests {
     }
 
     #[test]
+    fn qwen3_local_generate_body_caps_generated_tokens() {
+        let body = build_ollama_generate_body("qwen2.5-coder:7b", "return strict json", 4096, 1536);
+        assert_eq!(body.pointer("/options/num_predict"), Some(&json!(1536)));
+        assert_eq!(body.pointer("/options/num_ctx"), Some(&json!(4096)));
+        assert_eq!(body.pointer("/format"), Some(&json!("json")));
+        assert_eq!(body.pointer("/prompt"), Some(&json!("return strict json")));
+        // Ollama reads the cap only from `options`.
+        assert_eq!(body.pointer("/num_predict"), None);
+    }
+
+    #[test]
     fn qwen3_local_deep_generate_body_enables_larger_context_without_json_format() {
-        let body = build_ollama_deep_generate_body("qwen3.5:4b", "analyze deeply", 8192);
+        let body = build_ollama_deep_generate_body("qwen3.5:4b", "analyze deeply", 8192, 8192);
         assert_eq!(body.pointer("/options/temperature"), Some(&json!(0.3)));
         assert_eq!(body.pointer("/options/num_ctx"), Some(&json!(8192)));
         assert_eq!(body.pointer("/format"), None);
         assert_eq!(body.pointer("/think"), None);
+    }
+
+    #[test]
+    fn qwen3_local_deep_generate_body_caps_generated_tokens() {
+        let body = build_ollama_deep_generate_body("qwen3.5:4b", "analyze deeply", 8192, 6000);
+        assert_eq!(body.pointer("/options/num_predict"), Some(&json!(6000)));
+        assert_eq!(body.pointer("/prompt"), Some(&json!("analyze deeply")));
+        assert_eq!(body.pointer("/num_predict"), None);
     }
 
     #[test]

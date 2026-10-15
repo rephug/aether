@@ -450,6 +450,30 @@ fn load_provider_auto_prefers_qwen_when_ollama_is_reachable() {
 }
 
 #[test]
+fn local_provider_caps_sir_replies_at_configured_max_output_tokens() {
+    let num_predict = |provider: Qwen3LocalProvider| {
+        provider
+            .sir_request_body("prompt")
+            .pointer("/options/num_predict")
+            .and_then(serde_json::Value::as_u64)
+    };
+
+    assert_eq!(
+        num_predict(local_provider(None, None, None, Some(1024))),
+        Some(1024)
+    );
+    let default_cap = Some(u64::from(aether_config::OLLAMA_SIR_NUM_PREDICT));
+    assert_eq!(
+        num_predict(local_provider(None, None, None, None)),
+        default_cap
+    );
+    assert_eq!(
+        num_predict(local_provider(None, None, None, Some(0))),
+        default_cap
+    );
+}
+
+#[test]
 fn load_provider_openai_compat_requires_api_key_with_fabricated_env_var() {
     let temp = tempdir().expect("tempdir");
     ensure_workspace_config(temp.path()).expect("ensure config");

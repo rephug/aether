@@ -522,6 +522,7 @@ mod tests {
                 tiered: None,
                 omp: crate::OmpConfig::default(),
                 timeout_secs: None,
+                max_output_tokens: None,
             },
             sir_quality: SirQualityConfig::default(),
             storage: StorageConfig {

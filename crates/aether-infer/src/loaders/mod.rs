@@ -48,6 +48,7 @@ pub fn load_inference_provider_from_config(
     } = overrides;
     let selected_provider = provider.unwrap_or(config.inference.provider);
     let attempt_timeout_secs = config.inference.timeout_secs;
+    let max_output_tokens = config.inference.max_output_tokens;
     let selected_model = first_non_empty(model, config.inference.model);
     let selected_endpoint = first_non_empty(endpoint, config.inference.endpoint);
     let selected_thinking = resolve_inference_thinking(thinking, config.inference.thinking);
@@ -66,6 +67,7 @@ pub fn load_inference_provider_from_config(
                     Some(ollama_endpoint.clone()),
                     selected_model.clone(),
                     attempt_timeout_secs,
+                    max_output_tokens,
                 );
                 tracing::info!(
                     endpoint = %ollama_endpoint,
@@ -126,7 +128,12 @@ pub fn load_inference_provider_from_config(
             })
         }
         InferenceProviderKind::Qwen3Local => {
-            let provider = local_provider(selected_endpoint, selected_model, attempt_timeout_secs);
+            let provider = local_provider(
+                selected_endpoint,
+                selected_model,
+                attempt_timeout_secs,
+                max_output_tokens,
+            );
             Ok(LoadedProvider {
                 model_name: provider.model_name(),
                 provider: Box::new(provider),
@@ -263,18 +270,24 @@ fn omp_gateway_token_path() -> Option<PathBuf> {
 
 /// A local Ollama provider whose requests may run as long as `[inference] timeout_secs`
 /// lets one attempt run, plus a margin so the attempt timeout fires first. It never lowers
-/// the default request timeout.
+/// the default request timeout. `[inference] max_output_tokens`, when set above 0, replaces
+/// the default cap on SIR reply length.
 fn local_provider(
     endpoint: Option<String>,
     model: Option<String>,
     attempt_timeout_secs: Option<u64>,
+    max_output_tokens: Option<u32>,
 ) -> Qwen3LocalProvider {
     let provider = Qwen3LocalProvider::new(endpoint, model);
-    match attempt_timeout_secs.map(|secs| secs.saturating_add(10)) {
+    let provider = match attempt_timeout_secs.map(|secs| secs.saturating_add(10)) {
         Some(request_secs) if request_secs > 120 => {
             provider.with_request_timeout_secs(request_secs)
         }
         _ => provider,
+    };
+    match max_output_tokens.filter(|tokens| *tokens > 0) {
+        Some(tokens) => provider.with_max_output_tokens(tokens),
+        None => provider,
     }
 }
 

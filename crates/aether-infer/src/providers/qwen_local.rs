@@ -1,4 +1,7 @@
-use aether_config::{DEFAULT_QWEN_ENDPOINT, DEFAULT_QWEN_MODEL, InferenceProviderKind};
+use aether_config::{
+    DEFAULT_QWEN_ENDPOINT, DEFAULT_QWEN_MODEL, InferenceProviderKind, OLLAMA_DEEP_SIR_NUM_PREDICT,
+    OLLAMA_SIR_NUM_PREDICT,
+};
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -38,6 +41,7 @@ pub struct Qwen3LocalProvider {
     client: reqwest::Client,
     endpoint: String,
     model: String,
+    max_output_tokens: u32,
 }
 
 impl Qwen3LocalProvider {
@@ -47,6 +51,7 @@ impl Qwen3LocalProvider {
             endpoint: normalize_optional(endpoint)
                 .unwrap_or_else(|| DEFAULT_QWEN_ENDPOINT.to_owned()),
             model: normalize_optional(model).unwrap_or_else(|| DEFAULT_QWEN_MODEL.to_owned()),
+            max_output_tokens: OLLAMA_SIR_NUM_PREDICT,
         }
     }
 
@@ -57,8 +62,23 @@ impl Qwen3LocalProvider {
         self
     }
 
+    /// Cap each SIR reply at this many generated tokens instead of the default 2048, as set
+    /// by `[inference] max_output_tokens`. Deep-mode replies keep their own cap.
+    pub fn with_max_output_tokens(mut self, max_output_tokens: u32) -> Self {
+        self.max_output_tokens = max_output_tokens.max(1);
+        self
+    }
+
+    pub(crate) fn sir_request_body(&self, prompt: &str) -> Value {
+        build_ollama_generate_body(&self.model, prompt, 4096, self.max_output_tokens)
+    }
+
+    fn deep_sir_request_body(&self, prompt: &str) -> Value {
+        build_ollama_deep_generate_body(&self.model, prompt, 8192, OLLAMA_DEEP_SIR_NUM_PREDICT)
+    }
+
     async fn request_candidate_json_with_prompt(&self, prompt: &str) -> Result<String, InferError> {
-        let body = build_ollama_generate_body(&self.model, prompt, 4096);
+        let body = self.sir_request_body(prompt);
 
         let response_value: Value = self
             .client
@@ -70,14 +90,27 @@ impl Qwen3LocalProvider {
             .json()
             .await?;
 
+        self.warn_if_reply_hit_token_cap(&response_value, self.max_output_tokens);
         extract_local_text_part(&response_value)
+    }
+
+    /// Ollama reports `done_reason: "length"` when a reply stopped at `num_predict`. Its JSON
+    /// is then almost certainly cut off, and this explains the parse retry that follows.
+    fn warn_if_reply_hit_token_cap(&self, response_value: &Value, max_output_tokens: u32) {
+        if response_value.get("done_reason").and_then(Value::as_str) == Some("length") {
+            tracing::warn!(
+                model = %self.model,
+                max_output_tokens,
+                "local SIR reply stopped at the output token cap"
+            );
+        }
     }
 
     async fn request_deep_candidate_with_prompt(
         &self,
         prompt: &str,
     ) -> Result<DeepCandidate, InferError> {
-        let body = build_ollama_deep_generate_body(&self.model, prompt, 8192);
+        let body = self.deep_sir_request_body(prompt);
 
         let response_value: Value = self
             .client
@@ -89,6 +122,7 @@ impl Qwen3LocalProvider {
             .json()
             .await?;
 
+        self.warn_if_reply_hit_token_cap(&response_value, OLLAMA_DEEP_SIR_NUM_PREDICT);
         let raw = extract_local_text_part(&response_value)?;
         Ok(parse_deep_response(raw.as_str()))
     }
@@ -270,5 +304,131 @@ mod deep_response_tests {
         );
         assert_eq!(candidate.reasoning_trace, None);
         assert!(parse_and_validate_sir(candidate.candidate_json.as_str()).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod request_body_tests {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::thread::JoinHandle;
+
+    use aether_config::{OLLAMA_DEEP_SIR_NUM_PREDICT, OLLAMA_SIR_NUM_PREDICT};
+    use serde_json::{Value, json};
+
+    use super::Qwen3LocalProvider;
+    use crate::sir_prompt;
+    use crate::types::{InferenceProvider, SirContext};
+
+    const SIR_REPLY: &str = r#"{"intent":"Adds two numbers","inputs":["a","b"],"outputs":["sum"],"side_effects":[],"dependencies":[],"error_modes":[],"confidence":0.8}"#;
+    const SYMBOL_TEXT: &str = "def add(a, b):\n    return a + b\n";
+
+    fn context() -> SirContext {
+        SirContext {
+            language: "python".to_owned(),
+            file_path: "calc.py".to_owned(),
+            qualified_name: "calc::add".to_owned(),
+            priority_score: None,
+            kind: "function".to_owned(),
+            is_public: true,
+            line_count: 2,
+        }
+    }
+
+    /// A stand-in Ollama that answers one `/api/generate` request with a valid SIR and
+    /// returns the JSON body it received.
+    fn serve_one_generate_request() -> (String, JoinHandle<Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test ollama listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept generate request");
+            let mut reader = BufReader::new(stream);
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read request header");
+                let line = line.trim_end();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse().expect("content length");
+                }
+            }
+            let mut body = vec![0_u8; content_length];
+            reader.read_exact(&mut body).expect("read request body");
+
+            let reply =
+                json!({"response": SIR_REPLY, "done": true, "done_reason": "stop"}).to_string();
+            let mut stream = reader.into_inner();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            )
+            .expect("write reply");
+            serde_json::from_slice(&body).expect("request body is JSON")
+        });
+        (endpoint, server)
+    }
+
+    #[tokio::test]
+    async fn sir_request_caps_generated_tokens_and_keeps_the_prompt() {
+        let (endpoint, server) = serve_one_generate_request();
+        let provider = Qwen3LocalProvider::new(Some(endpoint), Some("phi4-mini".to_owned()));
+
+        let sir = provider
+            .generate_sir(SYMBOL_TEXT, &context())
+            .await
+            .expect("generate sir");
+        let body = server.join().expect("join test ollama");
+
+        assert_eq!(sir.intent, "Adds two numbers");
+        assert_eq!(
+            body.pointer("/options/num_predict"),
+            Some(&json!(OLLAMA_SIR_NUM_PREDICT))
+        );
+        assert_eq!(body.pointer("/options/num_ctx"), Some(&json!(4096)));
+        assert_eq!(body.pointer("/format"), Some(&json!("json")));
+        let expected_prompt = sir_prompt::build_sir_prompt_for_kind(SYMBOL_TEXT, &context());
+        assert_eq!(body.pointer("/prompt"), Some(&json!(expected_prompt)));
+    }
+
+    #[tokio::test]
+    async fn configured_cap_reaches_the_sir_request() {
+        let (endpoint, server) = serve_one_generate_request();
+        let provider = Qwen3LocalProvider::new(Some(endpoint), Some("phi4-mini".to_owned()))
+            .with_max_output_tokens(1024);
+
+        provider
+            .generate_sir_from_prompt("return strict json", &context(), false)
+            .await
+            .expect("generate sir");
+        let body = server.join().expect("join test ollama");
+
+        assert_eq!(body.pointer("/options/num_predict"), Some(&json!(1024)));
+        assert_eq!(body.pointer("/prompt"), Some(&json!("return strict json")));
+    }
+
+    #[tokio::test]
+    async fn deep_request_uses_the_deep_cap() {
+        let (endpoint, server) = serve_one_generate_request();
+        let provider = Qwen3LocalProvider::new(Some(endpoint), Some("qwen3.5:4b".to_owned()))
+            .with_max_output_tokens(1024);
+
+        provider
+            .generate_sir_from_prompt_with_meta("analyze deeply", &context(), true)
+            .await
+            .expect("generate deep sir");
+        let body = server.join().expect("join test ollama");
+
+        assert_eq!(
+            body.pointer("/options/num_predict"),
+            Some(&json!(OLLAMA_DEEP_SIR_NUM_PREDICT))
+        );
+        assert_eq!(body.pointer("/options/num_ctx"), Some(&json!(8192)));
+        assert_eq!(body.pointer("/format"), None);
     }
 }
