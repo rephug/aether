@@ -13,35 +13,52 @@
 //! overloaded methods (`Type::method`), or a Rust method of a trait a type implements
 //! twice (`impl From<u8> for Wrap` and `impl From<u16> for Wrap` both declare
 //! `Wrap::from`). A call edge can't tell them apart, so a call to that name counts for
-//! every overload. Same-named symbols in different files stay ambiguous, C# partial
-//! classes included, since neither Java nor C# puts the package or namespace in the
-//! qualified name.
+//! every overload. Same-named symbols in different files stay ambiguous unless the
+//! caller's file or module (Cargo crate, npm package, Maven or Gradle module, .NET
+//! project, ...) narrows them to one, C# partial classes included, since neither Java
+//! nor C# puts the package or namespace in the qualified name.
 
 use std::collections::HashMap;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 
-use aether_store::{SqliteStore, SymbolRecord, SymbolRelationStore};
+use aether_parse::ModuleRoots;
+use aether_store::{
+    NameSite, SqliteStore, SymbolRecord, SymbolRelationStore, call_target_candidates,
+    call_targets_of, narrow_call_edge_candidates, narrow_name_candidates,
+};
 
-use super::common::symbol_leaf_name;
 use crate::AetherMcpError;
-
-/// Files whose directory is the root of a package.
-const PACKAGE_MANIFESTS: [&str; 3] = ["Cargo.toml", "package.json", "pyproject.toml"];
 
 pub(crate) struct CallerAttribution<'a> {
     store: &'a SqliteStore,
-    packages: PackageRoots<'a>,
+    modules: ModuleRoots,
+    /// Whether a Rust bare-name call reaches only methods in the caller's own file
+    /// ([`narrow_call_edge_candidates`]), as context views resolve call edges.
+    member_calls_within_file: bool,
     candidates_by_target: HashMap<String, Vec<SymbolRecord>>,
     records_by_id: HashMap<String, Option<SymbolRecord>>,
 }
 
 impl<'a> CallerAttribution<'a> {
-    pub(crate) fn new(store: &'a SqliteStore, workspace_root: &'a Path) -> Self {
+    /// Attribution for `aether_dependencies`: a Rust bare-name call can reach a method
+    /// anywhere in the caller's module.
+    pub(crate) fn new(store: &'a SqliteStore, workspace_root: &Path) -> Self {
         Self {
             store,
-            packages: PackageRoots::new(workspace_root),
+            modules: ModuleRoots::new(workspace_root),
+            member_calls_within_file: false,
             candidates_by_target: HashMap::new(),
             records_by_id: HashMap::new(),
+        }
+    }
+
+    /// Attribution for context views, which resolve call edges the same way in both
+    /// directions: a Rust bare-name call reaches a method only in the caller's own
+    /// file, so calls such as `v.len()` don't crowd a method's callers.
+    pub(crate) fn for_context(store: &'a SqliteStore, workspace_root: &Path) -> Self {
+        Self {
+            member_calls_within_file: true,
+            ..Self::new(store, workspace_root)
         }
     }
 
@@ -51,23 +68,14 @@ impl<'a> CallerAttribution<'a> {
     /// An edge counts when its target is the symbol's qualified name or, for a Rust
     /// method, its bare name. The symbols that target could name (in the caller's
     /// language family) are narrowed to the caller's own file; if none are there, to
-    /// the caller's package; otherwise all are kept. The caller is attributed only when
+    /// the caller's module; otherwise all are kept. The caller is attributed only when
     /// every remaining candidate is `symbol` or one of its overloads.
     pub(crate) fn callers_of(
         &mut self,
         symbol: &SymbolRecord,
     ) -> Result<Vec<SymbolRecord>, AetherMcpError> {
-        let mut targets = vec![symbol.qualified_name.clone()];
-        let leaf = symbol_leaf_name(symbol.qualified_name.as_str());
-        if symbol.language == "rust"
-            && leaf != symbol.qualified_name
-            && matches!(symbol.kind.as_str(), "method" | "function")
-        {
-            targets.push(leaf.to_owned());
-        }
-
         let mut callers = HashMap::<String, SymbolRecord>::new();
-        for target in &targets {
+        for target in &call_targets_of(symbol) {
             for edge in SymbolRelationStore::get_callers(self.store, target)? {
                 if callers.contains_key(&edge.source_id) {
                     continue;
@@ -96,51 +104,21 @@ impl<'a> CallerAttribution<'a> {
         target: &str,
         symbol: &SymbolRecord,
     ) -> Result<bool, AetherMcpError> {
-        // Only Rust records a call by the bare name of a member; elsewhere a target
-        // names exactly the symbol with that qualified name.
-        let bare_member_calls = caller.language == "rust";
-        let caller_family = language_family(caller.language.as_str());
-        let candidates = self
-            .candidates(target)?
-            .iter()
-            .filter(|candidate| {
-                language_family(candidate.language.as_str()) == caller_family
-                    && (bare_member_calls || candidate.qualified_name == target)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-
-        let in_caller_file = candidates
-            .iter()
-            .filter(|candidate| candidate.file_path == caller.file_path)
-            .collect::<Vec<_>>();
-        let narrowed = if !in_caller_file.is_empty() {
-            in_caller_file
+        self.candidates(target)?;
+        let candidates = &self.candidates_by_target[target];
+        let modules = &mut self.modules;
+        let mut module_of = |file_path: &str| modules.module_of(file_path);
+        let site = NameSite::of(caller);
+        let resolution = if self.member_calls_within_file {
+            narrow_call_edge_candidates(candidates, target, site, &mut module_of)
         } else {
-            let caller_package = self.packages.package_of(caller.file_path.as_str());
-            let in_caller_package = match caller_package {
-                Some(package) => candidates
-                    .iter()
-                    .filter(|candidate| {
-                        self.packages
-                            .package_of(candidate.file_path.as_str())
-                            .as_ref()
-                            == Some(&package)
-                    })
-                    .collect::<Vec<_>>(),
-                None => Vec::new(),
-            };
-            if in_caller_package.is_empty() {
-                candidates.iter().collect()
-            } else {
-                in_caller_package
-            }
+            narrow_name_candidates(
+                call_target_candidates(candidates, target, caller.language.as_str()),
+                Some(site),
+                &mut module_of,
+            )
         };
-
-        Ok(!narrowed.is_empty()
-            && narrowed
-                .iter()
-                .all(|candidate| is_same_or_overload(candidate, symbol)))
+        Ok(resolution.reaches(symbol))
     }
 
     fn candidates(&mut self, target: &str) -> Result<&Vec<SymbolRecord>, AetherMcpError> {
@@ -160,66 +138,5 @@ impl<'a> CallerAttribution<'a> {
         self.records_by_id
             .insert(symbol_id.to_owned(), record.clone());
         Ok(record)
-    }
-}
-
-/// Whether `candidate` is `symbol` or an overload of it: a symbol with the same
-/// qualified name and language declared in the same file.
-fn is_same_or_overload(candidate: &SymbolRecord, symbol: &SymbolRecord) -> bool {
-    candidate.id == symbol.id
-        || (candidate.qualified_name == symbol.qualified_name
-            && candidate.language == symbol.language
-            && candidate.file_path == symbol.file_path)
-}
-
-/// Languages that can call each other's symbols share a family.
-fn language_family(language: &str) -> &str {
-    match language {
-        "typescript" | "tsx" | "javascript" | "jsx" => "ecmascript",
-        other => other,
-    }
-}
-
-/// Maps workspace-relative files to their package: the nearest directory from the
-/// file's own up to the workspace root that holds a package manifest, or the
-/// workspace root when none does.
-struct PackageRoots<'a> {
-    workspace_root: &'a Path,
-    by_dir: HashMap<PathBuf, PathBuf>,
-}
-
-impl<'a> PackageRoots<'a> {
-    fn new(workspace_root: &'a Path) -> Self {
-        Self {
-            workspace_root,
-            by_dir: HashMap::new(),
-        }
-    }
-
-    /// The workspace-relative package directory of `file_path`, or `None` when the
-    /// path isn't a plain relative path inside the workspace.
-    fn package_of(&mut self, file_path: &str) -> Option<PathBuf> {
-        let file_path = Path::new(file_path);
-        if !file_path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
-        {
-            return None;
-        }
-        let dir = file_path.parent().unwrap_or(Path::new("")).to_path_buf();
-        if let Some(package) = self.by_dir.get(&dir) {
-            return Some(package.clone());
-        }
-        let package = dir
-            .ancestors()
-            .find(|ancestor| {
-                PACKAGE_MANIFESTS
-                    .iter()
-                    .any(|manifest| self.workspace_root.join(ancestor).join(manifest).is_file())
-            })
-            .unwrap_or(Path::new(""))
-            .to_path_buf();
-        self.by_dir.insert(dir, package.clone());
-        Some(package)
     }
 }

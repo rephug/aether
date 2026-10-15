@@ -193,6 +193,26 @@ impl Language {
     }
 }
 
+/// The stored language names (`Language::as_str`) of TypeScript, TSX, JavaScript and
+/// JSX, which form one language family.
+pub const ECMASCRIPT_LANGUAGES: [&str; 4] = ["typescript", "tsx", "javascript", "jsx"];
+
+/// The family of a stored language name. Code can only call or name symbols of its own
+/// family: TypeScript, TSX, JavaScript and JSX form one, and every other language is a
+/// family of its own.
+pub fn language_family(language: &str) -> &str {
+    if ECMASCRIPT_LANGUAGES.contains(&language) {
+        "ecmascript"
+    } else {
+        language
+    }
+}
+
+/// Whether two stored language names belong to the same [`language_family`].
+pub fn same_language_family(left: &str, right: &str) -> bool {
+    language_family(left) == language_family(right)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd)]
 #[serde(rename_all = "snake_case")]
 pub enum SymbolKind {
@@ -397,6 +417,28 @@ fn blake3_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typescript_and_javascript_share_a_language_family() {
+        for left in ECMASCRIPT_LANGUAGES {
+            for right in ECMASCRIPT_LANGUAGES {
+                assert!(same_language_family(left, right), "{left} and {right}");
+            }
+        }
+        for language in [
+            Language::Rust,
+            Language::Python,
+            Language::Go,
+            Language::Java,
+            Language::CSharp,
+        ] {
+            let language = language.as_str();
+            assert!(same_language_family(language, language));
+            assert!(!same_language_family(language, "typescript"));
+        }
+        assert!(!same_language_family("java", "csharp"));
+        assert!(!same_language_family("python", "go"));
+    }
 
     fn sample_symbol(id: &str, name: &str, content_hash: &str) -> Symbol {
         Symbol {

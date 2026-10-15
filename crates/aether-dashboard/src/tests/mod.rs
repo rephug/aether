@@ -19,6 +19,7 @@ use crate::{SharedState, dashboard_router};
 
 mod api;
 mod fragments;
+mod language_family;
 mod operations;
 
 struct TestIds {
