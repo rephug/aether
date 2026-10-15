@@ -71,17 +71,20 @@ pub fn is_test_file(path: &str) -> bool {
 }
 
 /// Whether a symbol is test code: its file is ([`is_test_file`]), its leaf name starts
-/// with `test_`, or a module segment of its qualified name is `tests` or `test`. Rust
-/// qualified names are file-relative, so the last covers Rust's inline
-/// `#[cfg(test)] mod tests` (`tests::rejects_empty_input`). The `test_` prefix keeps its
-/// case, so constants like `TEST_RUNNER` stay production code.
+/// with `test_`, or, in a Rust file, a module segment of its qualified name is `tests` or
+/// `test`. Rust qualified names are file-relative, so that covers the inline
+/// `#[cfg(test)] mod tests` (`tests::rejects_empty_input`); in other languages the first
+/// segment is a package (Go's `test::Run` in `internal/test` is production code). The
+/// `test_` prefix keeps its case, so constants like `TEST_RUNNER` stay production code.
 pub fn is_test_symbol(qualified_name: &str, file_path: &str) -> bool {
     let mut segments = qualified_name.split("::").collect::<Vec<_>>();
     let leaf = segments.pop().unwrap_or(qualified_name);
+    let rust = file_path.trim().to_ascii_lowercase().ends_with(".rs");
     leaf.starts_with("test_")
-        || segments
-            .iter()
-            .any(|segment| matches!(*segment, "tests" | "test"))
+        || (rust
+            && segments
+                .iter()
+                .any(|segment| matches!(*segment, "tests" | "test")))
         || is_test_file(file_path)
 }
 
@@ -212,13 +215,14 @@ mod tests {
         ("render", "web/src/testimonials.tsx", false),
         ("render", "web/src/test_ids.ts", false),
         // Go: `_test.go` files, and a `test/` directory of integration tests.
-        ("TestTotals", "pkg/billing_test.go", true),
-        ("harness", "test/e2e/harness.go", true),
-        ("Total", "pkg/billing.go", false),
-        ("Run", "src/cmd/go/internal/test/test.go", false),
-        ("Helpers", "pkg/tests.go", false),
-        ("Fixture", "pkg/billing_tests.go", false),
-        ("Score", "pkg/contest/contest.go", false),
+        ("store::TestTotals", "pkg/billing_test.go", true),
+        ("e2e::harness", "test/e2e/harness.go", true),
+        ("store::Total", "pkg/billing.go", false),
+        ("test::Run", "src/cmd/go/internal/test/test.go", false),
+        ("tests::Helpers", "pkg/tests/helpers.go", true),
+        ("store::Helpers", "pkg/tests.go", false),
+        ("store::Fixture", "pkg/billing_tests.go", false),
+        ("contest::Score", "pkg/contest/contest.go", false),
         // Java: Maven's and Gradle's `src/test`, but not a `test` package under `src/main`.
         (
             "PaymentServiceTest::chargesCard",
