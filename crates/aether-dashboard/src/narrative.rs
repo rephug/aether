@@ -131,12 +131,7 @@ pub fn classify_layer(file_path: &str, qualified_name: &str, sir_intent: Option<
     let symbol = qualified_name.to_ascii_lowercase();
     let intent = sir_intent.unwrap_or_default().to_ascii_lowercase();
 
-    if file.contains("/tests/")
-        || file.starts_with("tests/")
-        || file.ends_with("_test.rs")
-        || symbol.contains("::tests")
-        || symbol.contains("test::")
-    {
+    if aether_core::is_test_symbol(qualified_name, file_path) {
         return layer_by_name("Tests");
     }
 

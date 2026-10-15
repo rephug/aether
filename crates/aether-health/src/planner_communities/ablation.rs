@@ -165,15 +165,8 @@ fn run_ablation_report(crate_name: &str) {
 
     println!("\nAblation for {} ({})", input.crate_name, input.file_path);
     println!(
-        "{:<28} {:>11} {:>8} {:>9} {:>8} {:>8} {:>10} {}",
-        "configuration",
-        "communities",
-        "largest",
-        "smallest",
-        "loners",
-        "conf",
-        "stability",
-        "top modules"
+        "{:<28} {:>11} {:>8} {:>9} {:>8} {:>8} {:>10} top modules",
+        "configuration", "communities", "largest", "smallest", "loners", "conf", "stability",
     );
 
     for (label, options) in variants {
@@ -322,7 +315,7 @@ fn load_ablation_input(crate_name: &str) -> Option<AblationInput> {
             name: ablation_symbol_name(record.qualified_name.as_str()),
             qualified_name: record.qualified_name.clone(),
             kind: ablation_parse_symbol_kind(record.kind.as_str()),
-            is_test: ablation_is_test(record.qualified_name.as_str(), record.file_path.as_str()),
+            is_test: aether_core::is_test_symbol(&record.qualified_name, &record.file_path),
             embedding: embedding_by_id.get(record.id.as_str()).cloned(),
         })
         .collect::<Vec<_>>();
@@ -746,9 +739,4 @@ fn ablation_parse_symbol_kind(raw: &str) -> SymbolKind {
         "type_alias" | "typealias" => SymbolKind::TypeAlias,
         _ => SymbolKind::Function,
     }
-}
-
-fn ablation_is_test(qualified_name: &str, file_path: &str) -> bool {
-    let leaf = ablation_symbol_name(qualified_name).to_ascii_lowercase();
-    leaf.starts_with("test_") || file_path.contains("/tests/") || file_path.contains("\\tests\\")
 }

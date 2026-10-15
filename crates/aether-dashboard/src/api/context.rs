@@ -159,12 +159,7 @@ pub(crate) fn build_context_data(
         .symbols
         .iter()
         .filter(|candidate| {
-            candidate.layer_name == "Tests"
-                || candidate.file_path.to_ascii_lowercase().contains("/tests/")
-                || candidate
-                    .file_path
-                    .to_ascii_lowercase()
-                    .starts_with("tests/")
+            candidate.layer_name == "Tests" || aether_core::is_test_file(&candidate.file_path)
         })
         .map(|candidate| candidate.file_path.clone())
         .collect::<BTreeSet<_>>()

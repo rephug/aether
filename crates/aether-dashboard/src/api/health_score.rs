@@ -235,17 +235,7 @@ async fn load_semantic_input(shared: &SharedState) -> Result<Option<SemanticInpu
                     })
             })
             .count();
-        let mut community_freq = HashMap::new();
-        for symbol in &symbols {
-            if let Some(community_id) = community_by_symbol.get(symbol.id.as_str()).copied() {
-                *community_freq.entry(community_id).or_insert(0usize) += 1;
-            }
-        }
-        let threshold = 3_usize.max((symbols.len() as f64 * 0.2).ceil() as usize);
-        let community_count = community_freq
-            .values()
-            .filter(|&&count| count >= threshold)
-            .count();
+        let community_count = aether_analysis::file_community_count(&symbols, &community_by_symbol);
         let has_test_coverage = symbols.iter().any(|symbol| {
             shared
                 .store

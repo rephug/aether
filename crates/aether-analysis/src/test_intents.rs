@@ -2,7 +2,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use aether_core::{file_source_id, normalize_path};
+use aether_core::test_code::CSHARP_TEST_PROJECT_SUFFIXES;
+use aether_core::{file_source_id, is_test_file, normalize_path};
 use aether_store::{
     SqliteStore, SurrealGraphStore, SymbolRelationStore, TestIntentStore, TestedByRecord,
     block_on_store_future, open_surreal_graph_store_readonly, open_surreal_graph_store_sync,
@@ -124,7 +125,7 @@ impl TestIntentAnalyzer {
             } else {
                 edge.file_a
             };
-            if is_probably_test_file(target.as_str()) {
+            if is_test_file(target.as_str()) {
                 continue;
             }
             add_candidate(
@@ -323,7 +324,7 @@ impl TestIntentAnalyzer {
         for dep in deps {
             for target in self.resolve_import_target(test_file, dep.target_qualified_name.as_str())
             {
-                if is_probably_test_file(target.as_str()) {
+                if is_test_file(target.as_str()) {
                     continue;
                 }
                 targets.insert(target);
@@ -552,24 +553,6 @@ fn java_main_source_for_test(path: &str) -> Option<String> {
     Some(format!("{root}src/main/java/{base}.java"))
 }
 
-/// Suffixes .NET solutions give the project that tests another one.
-const CSHARP_TEST_PROJECT_SUFFIXES: [&str; 4] =
-    [".UnitTests", ".IntegrationTests", ".Tests", ".Test"];
-
-/// Whether a normalized `.cs` path follows .NET test naming: a `*Tests.cs` or `*Test.cs` file,
-/// or a file in a `*.Tests`, `*.Test`, `*.UnitTests` or `*.IntegrationTests` project. C# names
-/// test classes and projects in PascalCase, so these checks keep their case.
-pub(crate) fn is_csharp_test_path(path: &str) -> bool {
-    path.ends_with(".cs")
-        && (path.ends_with("Tests.cs")
-            || path.ends_with("Test.cs")
-            || path.split('/').any(|segment| {
-                CSHARP_TEST_PROJECT_SUFFIXES
-                    .iter()
-                    .any(|suffix| segment.len() > suffix.len() && segment.ends_with(suffix))
-            }))
-}
-
 /// .NET solutions keep tests in a sibling project: `Acme.Billing.Tests/PaymentTests.cs`
 /// tests `Acme.Billing/Payment.cs`, often under `tests/` and `src/` roots.
 fn csharp_sources_for_test(path: &str) -> Vec<String> {
@@ -624,32 +607,6 @@ fn csharp_sources_for_test(path: &str) -> Vec<String> {
 
 fn normalize_repo_path(path: &str) -> String {
     normalize_path(path.trim())
-}
-
-fn is_probably_test_file(path: &str) -> bool {
-    let normalized = normalize_repo_path(path);
-    if normalized.contains("/tests/")
-        || normalized.contains("/__tests__/")
-        || normalized.starts_with("src/test/")
-        || normalized.contains("/src/test/")
-    {
-        return true;
-    }
-    if is_csharp_test_path(&normalized) {
-        return true;
-    }
-
-    let file_name = Path::new(normalized.as_str())
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    file_name.starts_with("test_")
-        || file_name.ends_with("_test.rs")
-        || file_name.ends_with("_tests.rs")
-        || file_name.ends_with("_test.go")
-        || file_name.contains(".test.")
-        || file_name.contains(".spec.")
 }
 
 #[cfg(test)]
@@ -751,8 +708,8 @@ mod tests {
             }),
             "expected naming-convention link to store/payment.go, got {links:?}"
         );
-        assert!(is_probably_test_file("store/payment_test.go"));
-        assert!(!is_probably_test_file("store/payment.go"));
+        assert!(is_test_file("store/payment_test.go"));
+        assert!(!is_test_file("store/payment.go"));
     }
 
     #[test]
@@ -794,7 +751,7 @@ mod tests {
             }),
             "expected naming-convention link to Payment.java, got {links:?}"
         );
-        assert!(is_probably_test_file(test_file));
+        assert!(is_test_file(test_file));
         assert_eq!(
             java_main_source_for_test("src/test/java/a/WidgetIT.java").as_deref(),
             Some("src/main/java/a/Widget.java")
@@ -841,9 +798,9 @@ mod tests {
             }),
             "expected naming-convention link to Payment.cs, got {links:?}"
         );
-        assert!(is_probably_test_file(test_file));
-        assert!(is_probably_test_file("Acme.Billing.Tests/Helpers.cs"));
-        assert!(!is_probably_test_file("src/Acme.Billing/Contest.cs"));
+        assert!(is_test_file(test_file));
+        assert!(is_test_file("Acme.Billing.Tests/Helpers.cs"));
+        assert!(!is_test_file("src/Acme.Billing/Contest.cs"));
         assert_eq!(
             csharp_sources_for_test("Acme.Billing.Tests/PaymentTest.cs"),
             vec!["Acme.Billing/Payment.cs".to_owned()]
