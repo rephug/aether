@@ -188,10 +188,15 @@ deep_timeout_secs = 180
 [storage]
 mirror_sir_files = true
 graph_backend = "surreal" # surreal | cozo | sqlite
+# graph_open_timeout_secs = 60
 ```
 
 - SIR source of truth is SQLite at `.aether/meta.sqlite`.
 - Optional mirror files under `.aether/sir/*.json` are secondary copies only.
+- `graph_open_timeout_secs`
+  - How long opening the SurrealDB graph store may take before the command fails with `SurrealDB open timed out`. Unset or `0` means 60 seconds.
+  - An open that takes more than 5 seconds is logged as slow and keeps going. On a heavily loaded machine, for example while a local model runs on the CPU, opening the store can take longer than usual.
+  - A store that another process holds still fails after a few seconds with `already locked`, whatever this limit is.
 
 ## Embeddings
 

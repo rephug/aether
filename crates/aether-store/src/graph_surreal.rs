@@ -1,9 +1,11 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::future::IntoFuture;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use aether_config::{DEFAULT_GRAPH_OPEN_TIMEOUT_SECS, load_workspace_config};
 use aether_core::EdgeKind;
 use aether_graph_algo::{
     GraphAlgorithmEdge, connected_components_sync, louvain_sync, louvain_with_resolution_sync,
@@ -23,6 +25,9 @@ use super::{
 
 pub type CrossCommunityEdge = (String, String, String, i64, i64);
 
+/// After this long an open is logged as slow. It keeps running until the open timeout.
+const SURREAL_OPEN_SLOW_AFTER: Duration = Duration::from_secs(5);
+
 #[derive(Clone)]
 pub struct SurrealGraphStore {
     db: Surreal<Db>,
@@ -40,12 +45,15 @@ impl SurrealGraphStore {
         let db = if let Some(existing) = cached_surreal_handle(&graph_dir)? {
             existing
         } else {
+            let open_timeout = graph_open_timeout(&workspace_root);
             let mut open_error = None;
             let mut db_opt = None;
             for attempt in 0..10 {
-                match tokio::time::timeout(
-                    Duration::from_secs(5),
+                match wait_for_open(
                     Surreal::new::<SurrealKv>(graph_dir.clone()),
+                    SURREAL_OPEN_SLOW_AFTER,
+                    open_timeout,
+                    &graph_dir,
                 )
                 .await
                 {
@@ -72,10 +80,11 @@ impl SurrealGraphStore {
                         break;
                     }
                     Err(_) => {
-                        open_error = Some(StoreError::Graph(
-                            "SurrealDB open timed out (is another aetherd process holding the lock?)"
-                                .to_owned(),
-                        ));
+                        open_error = Some(StoreError::Graph(format!(
+                            "SurrealDB open timed out after {}s (on a busy machine, raise \
+                             [storage] graph_open_timeout_secs)",
+                            open_timeout.as_secs()
+                        )));
                         break;
                     }
                 }
@@ -882,6 +891,41 @@ impl SurrealGraphStore {
     }
 }
 
+/// `[storage] graph_open_timeout_secs`, or 60 s when it is unset or 0.
+fn graph_open_timeout(workspace_root: &Path) -> Duration {
+    let secs = load_workspace_config(workspace_root)
+        .ok()
+        .and_then(|config| config.storage.graph_open_timeout_secs)
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_GRAPH_OPEN_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Waits up to `limit` for one SurrealDB open, logging once it has taken `slow_after`.
+///
+/// A slow open is never abandoned and restarted: SurrealDB opens the store in a task it
+/// spawns, which keeps running and holds the store's lock after its caller stops waiting,
+/// so a fresh open would only fail on that lock and redo the same slow work.
+async fn wait_for_open<F: IntoFuture>(
+    open: F,
+    slow_after: Duration,
+    limit: Duration,
+    graph_dir: &Path,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    let mut open = std::pin::pin!(open.into_future());
+    let slow_after = slow_after.min(limit);
+    if let Ok(output) = tokio::time::timeout(slow_after, open.as_mut()).await {
+        return Ok(output);
+    }
+    tracing::warn!(
+        graph_dir = %graph_dir.display(),
+        waited_secs = slow_after.as_secs(),
+        limit_secs = limit.as_secs(),
+        "SurrealDB open is slow; still waiting"
+    );
+    tokio::time::timeout(limit - slow_after, open).await
+}
+
 fn surreal_handle_cache() -> &'static Mutex<HashMap<std::path::PathBuf, Surreal<Db>>> {
     static CACHE: OnceLock<Mutex<HashMap<std::path::PathBuf, Surreal<Db>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -1471,6 +1515,57 @@ mod tests {
                 .expect("read through the second handle"),
             vec!["sym-a".to_owned()]
         );
+    }
+
+    #[tokio::test]
+    async fn slow_open_is_awaited_past_the_slow_mark() {
+        // Under load an open can take longer than the 5 s that used to fail it outright.
+        let started = std::time::Instant::now();
+        let opened = wait_for_open(
+            async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                "opened"
+            },
+            Duration::from_millis(50),
+            Duration::from_secs(30),
+            Path::new("graph"),
+        )
+        .await
+        .expect("a slow open within the limit succeeds");
+
+        assert_eq!(opened, "opened");
+        assert!(started.elapsed() >= Duration::from_millis(300));
+    }
+
+    #[tokio::test]
+    async fn open_that_never_finishes_fails_at_the_limit() {
+        let started = std::time::Instant::now();
+        let result = wait_for_open(
+            std::future::pending::<()>(),
+            Duration::from_millis(20),
+            Duration::from_millis(150),
+            Path::new("graph"),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(started.elapsed() >= Duration::from_millis(150));
+    }
+
+    #[test]
+    fn graph_open_timeout_comes_from_storage_config() {
+        let temp = tempdir().expect("tempdir");
+        let default_timeout = Duration::from_secs(DEFAULT_GRAPH_OPEN_TIMEOUT_SECS);
+        assert_eq!(graph_open_timeout(temp.path()), default_timeout);
+
+        let config_path = temp.path().join(".aether").join("config.toml");
+        fs::create_dir_all(temp.path().join(".aether")).expect("create .aether");
+        fs::write(&config_path, "[storage]\ngraph_open_timeout_secs = 180\n")
+            .expect("write config");
+        assert_eq!(graph_open_timeout(temp.path()), Duration::from_secs(180));
+
+        fs::write(&config_path, "[storage]\ngraph_open_timeout_secs = 0\n").expect("write config");
+        assert_eq!(graph_open_timeout(temp.path()), default_timeout);
     }
 
     #[tokio::test]
