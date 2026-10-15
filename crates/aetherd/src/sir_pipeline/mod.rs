@@ -387,9 +387,13 @@ impl SirPipeline {
                 .block_on(open_vector_store(&workspace_root))
                 .context("failed to initialize vector store")?,
         };
-        let contracts_config = load_workspace_config(&workspace_root)
-            .ok()
-            .and_then(|c| c.contracts);
+        let workspace_config = load_workspace_config(&workspace_root).ok();
+        let inference_timeout_secs = workspace_config
+            .as_ref()
+            .and_then(|config| config.inference.timeout_secs)
+            .unwrap_or(INFERENCE_ATTEMPT_TIMEOUT_SECS)
+            .max(1);
+        let contracts_config = workspace_config.and_then(|c| c.contracts);
         let provider_name: String = provider_name.into();
         // The mock provider's 0.1 placeholders are intentional: no quality-floor warning.
         let quality_monitor = if provider_name == InferenceProviderKind::Mock.as_str() {
@@ -409,7 +413,7 @@ impl SirPipeline {
             vector_store,
             runtime,
             sir_concurrency: concurrency,
-            inference_timeout_secs: INFERENCE_ATTEMPT_TIMEOUT_SECS,
+            inference_timeout_secs,
             quality_monitor: Mutex::new(quality_monitor),
             tiered_parse_fallback_provider,
             tiered_parse_fallback_model,
