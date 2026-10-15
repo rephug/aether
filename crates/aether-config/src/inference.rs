@@ -129,6 +129,11 @@ pub struct InferenceConfig {
     /// `[inference.omp]`: how AETHER brings up the Oh My Pi broker and gateway itself.
     #[serde(default)]
     pub omp: OmpConfig,
+    /// Seconds one SIR generation attempt may take during scans and incremental updates
+    /// before it is abandoned and retried. Unset keeps 90. Raise it for local models on
+    /// slow hardware; it also lifts the local Ollama provider's request timeout to match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
 }
 
 impl Default for InferenceConfig {
@@ -142,6 +147,7 @@ impl Default for InferenceConfig {
             thinking: None,
             tiered: None,
             omp: OmpConfig::default(),
+            timeout_secs: None,
         }
     }
 }
@@ -283,9 +289,20 @@ fn default_tiered_retry_with_fallback() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        GeminiThinkingLevel, InferenceProviderKind, gemini_thinking_fingerprint,
+        GeminiThinkingLevel, InferenceConfig, InferenceProviderKind, gemini_thinking_fingerprint,
         parse_gemini_thinking_level,
     };
+
+    #[test]
+    fn inference_timeout_secs_is_optional() {
+        let unset: InferenceConfig = toml::from_str("provider = \"qwen3_local\"").expect("parse");
+        assert_eq!(unset.timeout_secs, None);
+        assert_eq!(InferenceConfig::default().timeout_secs, None);
+
+        let set: InferenceConfig =
+            toml::from_str("provider = \"qwen3_local\"\ntimeout_secs = 300").expect("parse");
+        assert_eq!(set.timeout_secs, Some(300));
+    }
 
     #[test]
     fn inference_provider_kind_from_str_accepts_openai_compat() {

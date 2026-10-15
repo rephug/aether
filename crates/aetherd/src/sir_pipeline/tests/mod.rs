@@ -372,6 +372,26 @@ fn build_write_pipeline_with_embeddings(
     .expect("build pipeline")
 }
 
+#[test]
+fn scan_attempt_timeout_comes_from_inference_config() {
+    let temp = tempdir().expect("tempdir");
+    write_embeddings_only_config(temp.path());
+    let provider: Arc<dyn InferenceProvider> = Arc::new(PanicInferenceProvider);
+    let default_pipeline = build_write_pipeline(temp.path(), provider.clone());
+    assert_eq!(
+        default_pipeline.inference_timeout_secs,
+        INFERENCE_ATTEMPT_TIMEOUT_SECS
+    );
+    drop(default_pipeline);
+
+    let config_path = temp.path().join(".aether/config.toml");
+    let mut config = fs::read_to_string(&config_path).expect("read config");
+    config.push_str("\n[inference]\ntimeout_secs = 300\n");
+    fs::write(&config_path, config).expect("write config");
+    let configured = build_write_pipeline(temp.path(), provider);
+    assert_eq!(configured.inference_timeout_secs, 300);
+}
+
 fn make_quality_batch_items(symbols: &[Symbol]) -> Vec<QualityBatchItem> {
     symbols
         .iter()

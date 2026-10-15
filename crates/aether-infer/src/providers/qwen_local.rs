@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use crate::http::{
     build_ollama_deep_generate_body, build_ollama_generate_body, build_ollama_text_generate_body,
-    inference_http_client, ollama_generate_endpoint,
+    inference_http_client, inference_http_client_with_timeout, ollama_generate_endpoint,
 };
 use crate::providers::PARSE_VALIDATION_RETRIES;
 use crate::sir_parsing::{
@@ -48,6 +48,13 @@ impl Qwen3LocalProvider {
                 .unwrap_or_else(|| DEFAULT_QWEN_ENDPOINT.to_owned()),
             model: normalize_optional(model).unwrap_or_else(|| DEFAULT_QWEN_MODEL.to_owned()),
         }
+    }
+
+    /// Allow each request this long instead of the default 120 s, so a configured
+    /// `[inference] timeout_secs` above that isn't cut short by the HTTP client.
+    pub fn with_request_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.client = inference_http_client_with_timeout(timeout_secs);
+        self
     }
 
     async fn request_candidate_json_with_prompt(&self, prompt: &str) -> Result<String, InferError> {
