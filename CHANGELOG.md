@@ -55,6 +55,25 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `aetherd --index-once` no longer serves stale SIR after edits made while nothing was
+  watching. A symbol whose body changed since its SIR was written (its recorded
+  `source_hash` no longer matches) is marked `stale`, including a SIR that
+  reconciliation migrated onto a re-identified symbol; `--full` regenerates those leaves
+  (not ones left stale by a failed attempt on an unchanged body). Plain `--index-once`
+  now reconciles and prunes like `--full`: symbols deleted from the workspace leave
+  `symbols`, `sir` and their `.aether/sir/<id>.json` mirrors. File rollups of changed
+  files are marked `stale` (or removed when no leaf SIR is left), and `--full` rebuilds
+  stale and missing rollups. Pruning now runs before the graph sync, so stale ids are no
+  longer written to the graph first. Symbols of a file or directory the snapshot could
+  not read (permissions, non-UTF-8 content) are kept instead of being pruned as deleted,
+  by `--index-once` and `--full` alike. Nor are rows a daemon wrote after the snapshot
+  began: a snapshot never prunes, migrates or marks stale what it cannot have seen.
+- The watching daemon catches edits made while it was stopped. Its startup syncs the
+  store like `--index-once` does: removed symbols are pruned, and changed ones are
+  marked stale. It then queues the leaves whose source changed alongside SIR-less ones,
+  and rebuilds the remaining outdated file rollups a few at a time between symbol tasks.
+  `aetherd batch extract` and the continuous monitor's structural refresh sync the same
+  way.
 - Name resolution across languages and modules (#214). Edges resolve only to symbols of
   the source's language family (TypeScript and JavaScript count as one), so a Java call
   no longer reaches a same-named TypeScript method. Callers of Java and C# classes are
