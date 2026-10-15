@@ -423,7 +423,13 @@ pub async fn summarize_text_with_config(
             };
             let api_base = selected_endpoint.ok_or(InferError::MissingEndpoint)?;
             let model = selected_model.ok_or(InferError::MissingModel)?;
-            let provider = OpenAiCompatProvider::new(Secret::new(api_key), api_base, model);
+            let provider = openai_compat_provider(
+                Secret::new(api_key),
+                api_base,
+                model,
+                config.inference.thinking.as_deref(),
+                config.inference.timeout_secs,
+            );
             let summary = provider.request_summary(system_prompt, user_prompt).await?;
             Ok(clean_summary(summary))
         }
