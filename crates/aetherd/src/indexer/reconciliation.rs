@@ -36,6 +36,14 @@ impl ReconciliationPlan {
     fn is_empty(&self) -> bool {
         self.migrations.is_empty() && self.prunes.is_empty()
     }
+
+    /// The stored symbols the plan deletes: the pruned ones and the old ids of migrations.
+    pub(super) fn removed_symbols(&self) -> impl Iterator<Item = &SymbolRecord> {
+        self.migrations
+            .iter()
+            .map(|entry| &entry.old_symbol)
+            .chain(self.prunes.iter().map(|entry| &entry.symbol))
+    }
 }
 
 fn symbol_reconciliation_key(symbol: &Symbol) -> ReconciliationKey {

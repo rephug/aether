@@ -60,6 +60,7 @@ mod locks;
 mod persist;
 mod rollup;
 
+pub(crate) use self::file_rollups::invalidate_file_rollups;
 pub use self::file_rollups::refresh_local_file_rollup;
 
 pub use locks::{
