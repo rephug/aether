@@ -878,7 +878,7 @@ fn marking_stale_by_source_moves_only_fresh_leaves_whose_recorded_source_changed
     ]
     .map(|(id, hash)| (id.to_owned(), hash.to_owned()));
     let marked = store
-        .mark_sir_stale_for_changed_sources(&current)
+        .mark_sir_stale_for_changed_sources(&current, i64::MAX)
         .expect("mark stale");
     assert_eq!(marked, vec!["sym-changed".to_owned()]);
 
@@ -906,7 +906,7 @@ fn marking_stale_by_source_moves_only_fresh_leaves_whose_recorded_source_changed
     // changed too, the unknown one cannot be compared.
     assert_eq!(
         store
-            .list_sir_source_changes(&current)
+            .list_sir_source_changes(&current, i64::MAX)
             .expect("list source changes"),
         vec![
             ("sym-changed".to_owned(), "stale".to_owned()),
@@ -915,7 +915,7 @@ fn marking_stale_by_source_moves_only_fresh_leaves_whose_recorded_source_changed
     );
     assert!(
         store
-            .mark_sir_stale_for_changed_sources(&current)
+            .mark_sir_stale_for_changed_sources(&current, i64::MAX)
             .expect("mark again")
             .is_empty(),
         "an already stale leaf is not marked twice"
@@ -950,7 +950,7 @@ fn a_leaf_left_stale_by_a_failed_attempt_on_an_unchanged_body_is_no_source_chang
     let current = [("sym-failed".to_owned(), "source-same".to_owned())];
     assert!(
         store
-            .list_sir_source_changes(&current)
+            .list_sir_source_changes(&current, i64::MAX)
             .expect("list source changes")
             .is_empty()
     );
@@ -988,6 +988,61 @@ fn upsert_symbols_writes_every_row_and_updates_existing_ones() {
             .get_symbol_record("sym-batch")
             .expect("read")
             .is_some()
+    );
+}
+
+#[test]
+fn a_leaf_written_after_the_snapshot_is_not_compared_with_it() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    store
+        .persist_sir_state_atomically_with_source(
+            SirMetaRecord {
+                id: "sym-newer".to_owned(),
+                updated_at: 1_700_000_500,
+                ..sir_meta_record()
+            },
+            r#"{"intent":"newer","confidence":0.9}"#,
+            None,
+            None,
+            Some("source-newer"),
+        )
+        .expect("persist leaf");
+    let written_at = store
+        .get_sir_meta("sym-newer")
+        .expect("meta")
+        .expect("exists")
+        .updated_at;
+
+    // The snapshot read the file before this leaf was written for a newer body.
+    let snapshot = [("sym-newer".to_owned(), "source-older".to_owned())];
+    let taken_at = written_at - 1;
+    assert!(
+        store
+            .list_sir_source_changes(&snapshot, taken_at)
+            .expect("list")
+            .is_empty()
+    );
+    assert!(
+        store
+            .mark_sir_stale_for_changed_sources(&snapshot, taken_at)
+            .expect("mark")
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .get_sir_meta("sym-newer")
+            .expect("meta")
+            .expect("exists")
+            .sir_status,
+        "fresh"
+    );
+    // A snapshot taken after the write does compare it.
+    assert_eq!(
+        store
+            .mark_sir_stale_for_changed_sources(&snapshot, written_at)
+            .expect("mark"),
+        vec!["sym-newer".to_owned()]
     );
 }
 

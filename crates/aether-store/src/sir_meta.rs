@@ -616,12 +616,15 @@ impl SqliteStore {
     /// parsed now). A leaf that never recorded its source cannot be compared and is left
     /// alone. Only `fresh` (or `ready`) leaves move: a `stale` one stays so, and the
     /// `rollup_failed`/`rollup_pending` markers of an injection keep their own repair
-    /// path. Comparison and update are one statement per row in one transaction, so a
-    /// writer that records the current source meanwhile is never marked. Returns the ids
-    /// marked, sorted.
+    /// path. Only leaves written at or before `written_by` (unix seconds) are compared:
+    /// `current` was read at that time, so a leaf written later may describe newer text
+    /// than `current` does. Comparison and update are one statement per row in one
+    /// transaction, so a writer that records the current source meanwhile is never
+    /// marked. Returns the ids marked, sorted.
     pub fn mark_sir_stale_for_changed_sources(
         &self,
         current: &[(String, String)],
+        written_by: i64,
     ) -> Result<Vec<String>, StoreError> {
         if current.is_empty() {
             return Ok(Vec::new());
@@ -639,6 +642,7 @@ impl SqliteStore {
                   AND COALESCE(TRIM(source_hash), '') <> ''
                   AND source_hash <> ?2
                   AND LOWER(TRIM(sir_status)) IN ('fresh', 'ready')
+                  AND updated_at <= ?3
                 "#,
             )?;
             for (symbol_id, source_hash) in current {
@@ -646,7 +650,7 @@ impl SqliteStore {
                 if symbol_id.is_empty() {
                     continue;
                 }
-                if update.execute(params![symbol_id, source_hash.trim()])? > 0 {
+                if update.execute(params![symbol_id, source_hash.trim(), written_by])? > 0 {
                     marked.push(symbol_id.to_owned());
                 }
             }
@@ -695,11 +699,14 @@ impl SqliteStore {
     /// The leaves among `current` (each symbol id with the content hash of its body as
     /// parsed now) whose recorded source hash differs from the current one, each with its
     /// `sir_status`, sorted by id. A leaf that never recorded its source is not listed: it
-    /// cannot be compared. Unlike the status alone, this tells a leaf written for an older
-    /// body from one left `stale` by a failed attempt to regenerate an unchanged body.
+    /// cannot be compared, and neither is one written after `written_by` (unix seconds;
+    /// see `mark_sir_stale_for_changed_sources`). Unlike the status alone, this tells a
+    /// leaf written for an older body from one left `stale` by a failed attempt to
+    /// regenerate an unchanged body.
     pub fn list_sir_source_changes(
         &self,
         current: &[(String, String)],
+        written_by: i64,
     ) -> Result<Vec<(String, String)>, StoreError> {
         if current.is_empty() {
             return Ok(Vec::new());
@@ -715,10 +722,11 @@ impl SqliteStore {
             SELECT id, source_hash, sir_status
             FROM sir
             WHERE COALESCE(TRIM(source_hash), '') <> ''
+              AND updated_at <= ?1
             ORDER BY id ASC
             "#,
         )?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![written_by], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,

@@ -7,7 +7,9 @@
 use aether_core::Language;
 use aether_store::open_vector_store;
 
-use super::reconciliation::{execute_symbol_reconciliation, plan_symbol_reconciliation};
+use super::reconciliation::{
+    SnapshotScope, execute_symbol_reconciliation, plan_symbol_reconciliation,
+};
 use super::structural::{StructuralIndexer, to_symbol_record};
 use super::*;
 use crate::sir_pipeline::{
@@ -15,9 +17,10 @@ use crate::sir_pipeline::{
 };
 
 /// Sync the store to `events`, the workspace's structural snapshot (`symbols_by_id` is
-/// the same snapshot keyed by id). `unread_paths` are the files and directories the
-/// snapshot could not read (see `ObserverState::unread_paths`): symbols stored for them
-/// are kept. `vector_cleanup` deletes the embeddings of pruned and migrated ids.
+/// the same snapshot keyed by id). `scope` says what the snapshot can speak for: stored
+/// symbols of files it could not read, and rows and leaves written after it began (a
+/// daemon indexing meanwhile), are left as they are. `vector_cleanup` deletes the
+/// embeddings of pruned and migrated ids.
 ///
 /// The order matters, and every step is recorded before the next one can lose track of
 /// it, so a run interrupted anywhere (a cancelled index, an error in the structural
@@ -41,9 +44,9 @@ pub(super) fn sync_snapshot<VectorCleanup>(
     workspace: &Path,
     store: &SqliteStore,
     structural: &mut StructuralIndexer,
+    scope: &SnapshotScope<'_>,
     events: &[SymbolChangeEvent],
     symbols_by_id: &HashMap<String, Symbol>,
-    unread_paths: &[String],
     vector_cleanup: VectorCleanup,
 ) -> Result<()>
 where
@@ -59,16 +62,9 @@ where
         .collect::<HashSet<_>>();
     let current = current_sources(symbols_by_id);
 
-    let mut plan = plan_symbol_reconciliation(store, symbols_by_id, &pre_existing_ids)?;
-    let spared = plan.spare_unread_files(unread_paths);
-    if spared > 0 {
-        tracing::warn!(
-            spared,
-            "Kept {spared} stored symbols of files the snapshot could not read"
-        );
-    }
+    let plan = plan_symbol_reconciliation(store, symbols_by_id, &pre_existing_ids, scope)?;
     let changed_sources = store
-        .list_sir_source_changes(&current)
+        .list_sir_source_changes(&current, scope.taken_at)
         .context("failed to compare stored SIR sources with the snapshot")?
         .into_iter()
         .map(|(symbol_id, _)| symbol_id)
@@ -121,7 +117,7 @@ where
     )?;
 
     let stale_ids = store
-        .mark_sir_stale_for_changed_sources(&current)
+        .mark_sir_stale_for_changed_sources(&current, scope.taken_at)
         .context("failed to mark the SIR of changed symbols stale")?;
     if !stale_ids.is_empty() {
         tracing::info!(
@@ -171,7 +167,7 @@ pub(super) fn symbols_with_stale_source(
     symbols_by_id: &HashMap<String, Symbol>,
 ) -> Result<Vec<String>> {
     Ok(store
-        .list_sir_source_changes(&current_sources(symbols_by_id))
+        .list_sir_source_changes(&current_sources(symbols_by_id), i64::MAX)
         .context("failed to list leaves whose source changed")?
         .into_iter()
         .filter(|(_, status)| status == "stale")

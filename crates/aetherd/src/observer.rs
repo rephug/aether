@@ -46,6 +46,9 @@ pub struct ObserverState {
     /// directories whose walk failed (`""`: the whole workspace). Their absence from the
     /// snapshot says nothing about the symbols stored for them.
     unread_paths: Vec<String>,
+    /// When the last `seed_from_disk` started reading the workspace (unix seconds; 0
+    /// before any). The snapshot cannot speak for a store row written after it.
+    seeded_at: i64,
 }
 
 impl ObserverState {
@@ -55,7 +58,13 @@ impl ObserverState {
             extractor: SymbolExtractor::new()?,
             snapshots: HashMap::new(),
             unread_paths: Vec::new(),
+            seeded_at: 0,
         })
+    }
+
+    /// See `ObserverState::seeded_at`.
+    pub fn seeded_at(&self) -> i64 {
+        self.seeded_at
     }
 
     /// See `ObserverState::unread_paths`: what the snapshot is missing because it could
@@ -65,6 +74,8 @@ impl ObserverState {
     }
 
     pub fn seed_from_disk(&mut self) -> Result<()> {
+        self.seeded_at = crate::time::current_unix_timestamp_secs();
+        self.unread_paths.clear();
         for entry in WalkBuilder::new(&self.workspace)
             .standard_filters(true)
             .build()

@@ -62,7 +62,9 @@ use self::structural::StructuralIndexer;
 use self::worker::{SharedQueueState, enqueue_symbols_missing_sir, spawn_semantic_worker};
 
 use self::quality::{run_deep_pass, run_triage_pass};
-use self::reconciliation::{plan_symbol_reconciliation, print_reconciliation_dry_run};
+use self::reconciliation::{
+    SnapshotScope, plan_symbol_reconciliation, print_reconciliation_dry_run,
+};
 use self::snapshot::{
     delete_vector_embeddings, files_with_outdated_rollups, symbols_with_stale_source, sync_snapshot,
 };
@@ -231,8 +233,12 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
 
         // A dry run writes nothing, so every id in the store predates the snapshot.
         let pre_existing_ids = store.list_all_symbol_ids()?.into_iter().collect();
-        let mut plan = plan_symbol_reconciliation(&store, &symbols_by_id, &pre_existing_ids)?;
-        plan.spare_unread_files(observer.unread_paths());
+        let plan = plan_symbol_reconciliation(
+            &store,
+            &symbols_by_id,
+            &pre_existing_ids,
+            &SnapshotScope::of(&observer),
+        )?;
         let mut stdout = std::io::stdout();
         print_reconciliation_dry_run(&plan, &mut stdout)?;
         return Ok(());
@@ -247,9 +253,9 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
         &config.workspace,
         &store,
         &mut structural,
+        &SnapshotScope::of(&observer),
         &initial_events,
         &symbols_by_id,
-        observer.unread_paths(),
         |symbol_ids| sir_pipeline.delete_embeddings(symbol_ids),
     )?;
 
@@ -449,9 +455,9 @@ fn run_initial_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> 
         &config.workspace,
         store.as_ref(),
         &mut structural,
+        &SnapshotScope::of(&observer),
         &initial_events,
         &symbols_by_id,
-        observer.unread_paths(),
         |symbol_ids| delete_vector_embeddings(&config.workspace, symbol_ids),
     )?;
 
