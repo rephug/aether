@@ -255,6 +255,14 @@ impl TestIntentAnalyzer {
             }
         }
 
+        // Go keeps `foo_test.go` in the same package directory as `foo.go`.
+        if let Some(base) = normalized.strip_suffix("_test.go") {
+            let candidate = format!("{base}.go");
+            if let Some(existing) = self.ensure_existing_repo_file(candidate.as_str()) {
+                candidates.insert(existing);
+            }
+        }
+
         if normalized.contains("/__tests__/") {
             let candidate = normalized.replace("/__tests__/", "/");
             if let Some(existing) = self.ensure_existing_repo_file(candidate.as_str()) {
@@ -532,6 +540,7 @@ fn is_probably_test_file(path: &str) -> bool {
     file_name.starts_with("test_")
         || file_name.ends_with("_test.rs")
         || file_name.ends_with("_tests.rs")
+        || file_name.ends_with("_test.go")
         || file_name.contains(".test.")
         || file_name.contains(".spec.")
 }
@@ -594,6 +603,49 @@ mod tests {
             }),
             "expected naming-convention link to src/payment.rs"
         );
+    }
+
+    #[test]
+    fn infers_go_target_file_from_same_directory_test_file() {
+        let temp = tempdir().expect("tempdir");
+        fs::create_dir_all(temp.path().join("store")).expect("create package dir");
+        fs::write(
+            temp.path().join("store/payment.go"),
+            "package store\n\nfunc Charge() {}\n",
+        )
+        .expect("write source");
+        fs::write(
+            temp.path().join("store/payment_test.go"),
+            "package store\n\nimport \"testing\"\n\nfunc TestCharge(t *testing.T) {}\n",
+        )
+        .expect("write test");
+
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        store
+            .replace_test_intents_for_file(
+                "store/payment_test.go",
+                &[test_intent(
+                    "store/payment_test.go",
+                    "TestCharge",
+                    "charges correctly",
+                )],
+            )
+            .expect("write intents");
+
+        let analyzer = TestIntentAnalyzer::new(temp.path()).expect("create analyzer");
+        let links = analyzer
+            .refresh_for_test_file("store/payment_test.go")
+            .expect("refresh links");
+        assert!(
+            links.iter().any(|link| {
+                link.target_file == "store/payment.go"
+                    && link.inference_method == "naming_convention"
+                    && (link.confidence - 0.9).abs() < 1e-6
+            }),
+            "expected naming-convention link to store/payment.go, got {links:?}"
+        );
+        assert!(is_probably_test_file("store/payment_test.go"));
+        assert!(!is_probably_test_file("store/payment.go"));
     }
 
     #[test]

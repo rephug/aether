@@ -1,16 +1,13 @@
 use std::collections::BTreeMap;
 
 use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
-use aether_store::{
-    IntentContractRecord, IntentViolationRecord, SirStateStore, SqliteStore, SymbolCatalogStore,
-    SymbolRecord,
-};
+use aether_store::{IntentContractRecord, IntentViolationRecord, SirStateStore, SqliteStore};
 use aetherd::contracts::{ClauseStatus, ContractVerifier};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::AetherMcpServer;
+use super::{AetherMcpServer, SYMBOL_SELECTOR_LABEL, resolve_symbol_selector};
 use crate::AetherMcpError;
 
 const DEFAULT_VIOLATION_LIMIT: u32 = 20;
@@ -192,84 +189,6 @@ fn validate_clause_type(value: &str) -> Result<String, AetherMcpError> {
     }
 }
 
-fn resolve_symbol_selector(
-    store: &SqliteStore,
-    selector: &str,
-) -> Result<SymbolRecord, AetherMcpError> {
-    let selector = selector.trim();
-    if selector.is_empty() {
-        return Err(AetherMcpError::Message(
-            "symbol selector must not be empty".to_owned(),
-        ));
-    }
-
-    if let Some(record) = store.get_symbol_record(selector)? {
-        return Ok(record);
-    }
-
-    let exact_matches = store.find_symbol_search_results_by_qualified_name(selector)?;
-    match exact_matches.as_slice() {
-        [only] => {
-            return store
-                .get_symbol_record(only.symbol_id.as_str())?
-                .ok_or_else(|| {
-                    AetherMcpError::Message(format!(
-                        "symbol search returned missing record: {}",
-                        only.symbol_id
-                    ))
-                });
-        }
-        [] => {}
-        many => {
-            let candidates = many
-                .iter()
-                .map(|candidate| {
-                    format!(
-                        "{} [{}]",
-                        candidate.qualified_name.trim(),
-                        candidate.file_path.trim()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n  - ");
-            return Err(AetherMcpError::Message(format!(
-                "ambiguous symbol selector '{selector}'. Candidates:\n  - {candidates}"
-            )));
-        }
-    }
-
-    let matches = store.search_symbols(selector, 10)?;
-    match matches.as_slice() {
-        [] => Err(AetherMcpError::Message(format!(
-            "symbol not found: {selector}"
-        ))),
-        [only] => store
-            .get_symbol_record(only.symbol_id.as_str())?
-            .ok_or_else(|| {
-                AetherMcpError::Message(format!(
-                    "symbol search returned missing record: {}",
-                    only.symbol_id
-                ))
-            }),
-        many => {
-            let candidates = many
-                .iter()
-                .map(|candidate| {
-                    format!(
-                        "{} [{}]",
-                        candidate.qualified_name.trim(),
-                        candidate.file_path.trim()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n  - ");
-            Err(AetherMcpError::Message(format!(
-                "ambiguous symbol selector '{selector}'. Candidates:\n  - {candidates}"
-            )))
-        }
-    }
-}
-
 fn qualified_names_by_symbol_id(
     store: &SqliteStore,
     symbol_ids: &[String],
@@ -426,7 +345,8 @@ impl AetherMcpServer {
         self.state.require_writable()?;
 
         let store = self.state.store.as_ref();
-        let symbol = resolve_symbol_selector(store, request.symbol.as_str())?;
+        let symbol =
+            resolve_symbol_selector(store, SYMBOL_SELECTOR_LABEL, request.symbol.as_str())?;
         let clause_type = validate_clause_type(request.clause_type.as_str())?;
         let clause_text = request.clause_text.trim();
         if clause_text.is_empty() {
@@ -461,7 +381,7 @@ impl AetherMcpServer {
         let store = self.state.store.as_ref();
         let include_inactive = request.include_inactive.unwrap_or(false);
         let contracts = if let Some(symbol) = request.symbol.as_deref() {
-            let symbol = resolve_symbol_selector(store, symbol)?;
+            let symbol = resolve_symbol_selector(store, SYMBOL_SELECTOR_LABEL, symbol)?;
             store.list_contracts_for_symbol(symbol.id.as_str(), include_inactive)?
         } else {
             store.list_all_contracts(include_inactive)?
@@ -514,7 +434,7 @@ impl AetherMcpServer {
     ) -> Result<AetherContractCheckResponse, AetherMcpError> {
         let store = self.state.store.as_ref();
         let contracts = if let Some(symbol) = request.symbol.as_deref() {
-            let symbol = resolve_symbol_selector(store, symbol)?;
+            let symbol = resolve_symbol_selector(store, SYMBOL_SELECTOR_LABEL, symbol)?;
             store.list_active_contracts_for_symbol(symbol.id.as_str())?
         } else {
             store.list_all_active_contracts()?
@@ -665,7 +585,7 @@ impl AetherMcpServer {
             .clamp(1, MAX_VIOLATION_LIMIT) as usize;
 
         let violations = if let Some(symbol) = request.symbol.as_deref() {
-            let symbol = resolve_symbol_selector(store, symbol)?;
+            let symbol = resolve_symbol_selector(store, SYMBOL_SELECTOR_LABEL, symbol)?;
             store.list_violations_for_symbol(symbol.id.as_str(), limit)?
         } else if let Some(contract_id) = request.contract_id {
             store.list_violations_for_contract(contract_id, limit)?
