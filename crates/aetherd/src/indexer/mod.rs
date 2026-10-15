@@ -49,6 +49,8 @@ mod priority;
 mod quality;
 mod reconciliation;
 mod snapshot;
+#[cfg(test)]
+mod startup_tests;
 mod structural;
 mod worker;
 
@@ -59,7 +61,7 @@ use self::git_watch::{
 };
 pub use self::priority::compute_symbol_priority_scores;
 use self::structural::StructuralIndexer;
-use self::worker::{SharedQueueState, enqueue_symbols_missing_sir, spawn_semantic_worker};
+use self::worker::{SharedQueueState, enqueue_symbols_needing_sir, spawn_semantic_worker};
 
 use self::quality::{run_deep_pass, run_triage_pass};
 use self::reconciliation::{
@@ -70,6 +72,8 @@ use self::snapshot::{
 };
 
 const REQUEST_POLL_BATCH: usize = 128;
+/// File rollups a worker rebuilds per turn from those left outdated at startup.
+const PENDING_ROLLUP_CHUNK: usize = 4;
 const WORKER_IDLE_SLEEP_MS: u64 = 200;
 #[derive(Debug, Clone)]
 pub struct IndexerConfig {
@@ -487,9 +491,15 @@ pub(crate) fn run_structural_index_once(
     let store = SqliteStore::open(workspace).context("failed to initialize local store")?;
     let mut structural = StructuralIndexer::new(workspace.to_path_buf())?;
     let (initial_events, symbols_by_id, symbol_count) = collect_initial_snapshot(&observer);
-    for event in &initial_events {
-        structural.process_event(&store, event)?;
-    }
+    sync_snapshot(
+        workspace,
+        &store,
+        &mut structural,
+        &SnapshotScope::of(&observer),
+        &initial_events,
+        &symbols_by_id,
+        |symbol_ids| delete_vector_embeddings(workspace, symbol_ids),
+    )?;
     Ok((store, symbols_by_id, symbol_count))
 }
 
@@ -505,37 +515,12 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
     let (mut observer, store) = initialize_observer_and_store(&config)?;
     let watcher_runtime = WatcherRuntimeConfig::from_workspace(&config)?;
     let mut structural = StructuralIndexer::new(config.workspace.clone())?;
-
-    let mut initial_symbol_index = HashMap::<String, Symbol>::new();
-    let mut initial_symbols = Vec::<Symbol>::new();
-    let mut symbol_count = 0usize;
-
-    for event in observer.initial_symbol_events() {
-        symbol_count += event.added.len() + event.updated.len();
-        collect_changed_symbols(&event, &mut initial_symbols);
-        for symbol in event.added.iter().chain(event.updated.iter()) {
-            initial_symbol_index.insert(symbol.id.clone(), symbol.clone());
-        }
-        structural.process_event(store.as_ref(), &event)?;
-    }
-    tracing::info!(
-        symbol_count,
-        "Structural index complete: {} symbols indexed, lexical search + graph queries available",
-        symbol_count
-    );
-
-    let queue_state = SharedQueueState::new(initial_symbol_index);
-    let queued = enqueue_symbols_missing_sir(
+    let queue_state = start_from_snapshot(
         config.workspace.as_path(),
+        &observer,
         store.as_ref(),
-        &queue_state,
-        &initial_symbols,
+        &mut structural,
     )?;
-    tracing::info!(
-        queued,
-        "Scan pass queued: {} symbols for SIR generation",
-        queued
-    );
 
     let mut worker_started = 0usize;
     for worker_id in 0..config.sir_concurrency.max(1) {
@@ -684,6 +669,65 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
             }
         }
     }
+}
+
+/// The daemon's starting point: the store synced to the workspace as found at startup,
+/// and the queue the semantic workers start from. Nothing watched the workspace while
+/// the daemon was down, so the startup snapshot is synced as `--index-once` syncs it
+/// (removed symbols pruned, changed ones marked stale, changed files' rollups flagged).
+/// The queue holds every symbol without a SIR, or with one written for a body it no
+/// longer has. The rollups still outdated after the sync are set aside for the workers
+/// to rebuild a few at a time between symbol tasks, except those of files with a queued
+/// symbol, which processing that symbol rebuilds.
+fn start_from_snapshot(
+    workspace: &Path,
+    observer: &ObserverState,
+    store: &SqliteStore,
+    structural: &mut StructuralIndexer,
+) -> Result<SharedQueueState> {
+    let (initial_events, symbols_by_id, symbol_count) = collect_initial_snapshot(observer);
+    sync_snapshot(
+        workspace,
+        store,
+        structural,
+        &SnapshotScope::of(observer),
+        &initial_events,
+        &symbols_by_id,
+        |symbol_ids| delete_vector_embeddings(workspace, symbol_ids),
+    )?;
+    tracing::info!(
+        symbol_count,
+        "Structural index complete: {} symbols indexed, lexical search + graph queries available",
+        symbol_count
+    );
+
+    let mut outdated_rollups = files_with_outdated_rollups(store, &symbols_by_id)?;
+    let queue_state = SharedQueueState::new(symbols_by_id.clone());
+    let queued = enqueue_symbols_needing_sir(workspace, store, &queue_state, &symbols_by_id)?;
+    // A queued leaf's processing rebuilds its file's rollup (also when generation fails),
+    // so only the files without one are set aside.
+    {
+        let queue = queue_state.lock_queue();
+        for symbol in symbols_by_id.values() {
+            if queue.contains(&symbol.id) {
+                outdated_rollups.remove(&symbol.file_path);
+            }
+        }
+    }
+    tracing::info!(
+        queued,
+        "Scan pass queued: {} symbols for SIR generation",
+        queued
+    );
+    if !outdated_rollups.is_empty() {
+        tracing::info!(
+            file_count = outdated_rollups.len(),
+            "{} stale or missing file rollups will be rebuilt between symbol tasks",
+            outdated_rollups.len()
+        );
+        queue_state.add_pending_rollups(outdated_rollups);
+    }
+    Ok(queue_state)
 }
 
 fn initialize_observer_and_store(

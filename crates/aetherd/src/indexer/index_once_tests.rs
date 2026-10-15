@@ -1,5 +1,6 @@
 //! End-to-end `--index-once` runs against a store indexed before the workspace changed:
 //! edited symbols, symbols removed or re-identified, and the file rollups over them.
+//! The workspace and store helpers are shared with `startup_tests`.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -17,10 +18,10 @@ use super::snapshot::sync_snapshot;
 use super::structural::StructuralIndexer;
 use super::{IndexerConfig, ObserverState, collect_initial_snapshot, run_initial_index_once};
 
-const MODULE: &str = "pkg/mod.py";
-const GONE: &str = "pkg/gone.py";
+pub(super) const MODULE: &str = "pkg/mod.py";
+pub(super) const GONE: &str = "pkg/gone.py";
 
-const MODULE_V1: &str = "def keep(value):
+pub(super) const MODULE_V1: &str = "def keep(value):
     return value + 1
 
 
@@ -33,7 +34,7 @@ def removed(value):
 ";
 
 /// `edited` gets a new body (and one more line); its signature, and so its id, stay.
-const MODULE_BODY_EDIT: &str = "def keep(value):
+pub(super) const MODULE_BODY_EDIT: &str = "def keep(value):
     return value + 1
 
 
@@ -47,7 +48,7 @@ def removed(value):
 ";
 
 /// `edited` gets a new signature, and so a new id; `removed` is deleted.
-const MODULE_REIDENTIFIED: &str = "def keep(value):
+pub(super) const MODULE_REIDENTIFIED: &str = "def keep(value):
     return value + 1
 
 
@@ -56,7 +57,7 @@ def edited(value, limit=2):
 ";
 
 /// `removed` is deleted; nothing else changes.
-const MODULE_WITHOUT_REMOVED: &str = "def keep(value):
+pub(super) const MODULE_WITHOUT_REMOVED: &str = "def keep(value):
     return value + 1
 
 
@@ -64,7 +65,7 @@ def edited(value):
     return value > 1
 ";
 
-const GONE_V1: &str = "def vanish():
+pub(super) const GONE_V1: &str = "def vanish():
     return None
 ";
 
@@ -78,7 +79,7 @@ def edited(value, limit=2):
     return value > limit
 ";
 
-fn write_workspace(workspace: &Path) {
+pub(super) fn write_workspace(workspace: &Path) {
     fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
     fs::write(
         workspace.join(".aether/config.toml"),
@@ -100,7 +101,7 @@ vector_backend = "sqlite"
     fs::write(workspace.join(GONE), GONE_V1).expect("write second module");
 }
 
-fn index_once(workspace: &Path, full: bool) {
+pub(super) fn index_once(workspace: &Path, full: bool) {
     run_initial_index_once(&IndexerConfig {
         workspace: workspace.to_path_buf(),
         debounce_ms: 300,
@@ -124,7 +125,7 @@ fn index_once(workspace: &Path, full: bool) {
 }
 
 /// The symbols the parser finds in `file_path` as it is on disk now.
-fn parse(workspace: &Path, file_path: &str) -> Vec<Symbol> {
+pub(super) fn parse(workspace: &Path, file_path: &str) -> Vec<Symbol> {
     let source = fs::read_to_string(workspace.join(file_path)).expect("read source");
     SymbolExtractor::new()
         .expect("parser")
@@ -132,7 +133,7 @@ fn parse(workspace: &Path, file_path: &str) -> Vec<Symbol> {
         .expect("parse source")
 }
 
-fn named(symbols: &[Symbol], name: &str) -> Symbol {
+pub(super) fn named(symbols: &[Symbol], name: &str) -> Symbol {
     symbols
         .iter()
         .find(|symbol| symbol.name == name)
@@ -140,13 +141,13 @@ fn named(symbols: &[Symbol], name: &str) -> Symbol {
         .clone()
 }
 
-struct Leaf {
-    status: String,
-    version: i64,
-    source_hash: Option<String>,
+pub(super) struct Leaf {
+    pub(super) status: String,
+    pub(super) version: i64,
+    pub(super) source_hash: Option<String>,
 }
 
-fn leaf(store: &SqliteStore, symbol_id: &str) -> Option<Leaf> {
+pub(super) fn leaf(store: &SqliteStore, symbol_id: &str) -> Option<Leaf> {
     let meta = store.get_sir_meta(symbol_id).expect("read SIR meta")?;
     Some(Leaf {
         status: meta.sir_status,
@@ -155,7 +156,7 @@ fn leaf(store: &SqliteStore, symbol_id: &str) -> Option<Leaf> {
     })
 }
 
-fn stored_symbol_ids(store: &SqliteStore) -> BTreeSet<String> {
+pub(super) fn stored_symbol_ids(store: &SqliteStore) -> BTreeSet<String> {
     store
         .list_all_symbol_ids()
         .expect("list symbols")
@@ -163,18 +164,18 @@ fn stored_symbol_ids(store: &SqliteStore) -> BTreeSet<String> {
         .collect()
 }
 
-fn rollup_id(file_path: &str) -> String {
+pub(super) fn rollup_id(file_path: &str) -> String {
     synthetic_file_sir_id("python", file_path)
 }
 
-fn rollup(store: &SqliteStore, file_path: &str) -> Option<FileSir> {
+pub(super) fn rollup(store: &SqliteStore, file_path: &str) -> Option<FileSir> {
     store
         .read_sir_blob(&rollup_id(file_path))
         .expect("read rollup")
         .map(|blob| serde_json::from_str(&blob).expect("rollup JSON"))
 }
 
-fn mirror_path(workspace: &Path, symbol_id: &str) -> std::path::PathBuf {
+pub(super) fn mirror_path(workspace: &Path, symbol_id: &str) -> std::path::PathBuf {
     workspace
         .join(".aether/sir")
         .join(format!("{symbol_id}.json"))
