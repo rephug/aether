@@ -209,8 +209,10 @@ impl SharedState {
         };
         let store = Arc::new(SqliteStore::open(&workspace)?);
         store.check_compatibility("core", 21)?;
-        let (graph, surreal_graph) = open_shared_graph_async(&workspace, &config, false).await?;
-        let surreal_graph = Arc::new(Mutex::new(surreal_graph));
+        let graph = open_shared_graph(&workspace, &config, false)?;
+        // SurrealDB opens on first use (or `warm_surreal_graph`): an open can take seconds on
+        // a busy machine, and an MCP client gives up on a slow startup.
+        let surreal_graph = Arc::new(Mutex::new(None));
         let vector_store = open_vector_store_async_optional(&workspace, &config).await?;
         let schema_version = store.get_schema_version()?;
 
@@ -241,8 +243,9 @@ impl SharedState {
         };
         let store = Arc::new(SqliteStore::open_readonly(&workspace)?);
         store.check_compatibility("core", 21)?;
-        let (graph, surreal_graph) = open_shared_graph_async(&workspace, &config, true).await?;
-        let surreal_graph = Arc::new(Mutex::new(surreal_graph));
+        let graph = open_shared_graph(&workspace, &config, true)?;
+        // SurrealDB opens on first use, as in `open_readwrite_async`.
+        let surreal_graph = Arc::new(Mutex::new(None));
         let vector_store = open_vector_store_async_optional(&workspace, &config).await?;
         let schema_version = store.get_schema_version()?;
 
@@ -328,6 +331,26 @@ impl SharedState {
     pub async fn surreal_graph_for_health(&self) -> Result<Arc<SurrealGraphStore>, AetherMcpError> {
         self.surreal_graph().await
     }
+
+    /// Opens the SurrealDB graph in the background, so the first tool that needs it does not
+    /// wait for the whole open. A tool that arrives first waits for this open to finish.
+    pub fn warm_surreal_graph(self: &Arc<Self>) {
+        if !matches!(
+            self.config.storage.graph_backend,
+            GraphBackend::Surreal | GraphBackend::Cozo
+        ) {
+            return;
+        }
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(err) = state.surreal_graph().await {
+                tracing::warn!(
+                    error = %err,
+                    "SurrealDB graph unavailable (daemon may hold lock), using SQLite only"
+                );
+            }
+        });
+    }
 }
 
 fn ensure_workspace_store_ready(workspace: &Path) -> Result<(), AetherMcpError> {
@@ -407,40 +430,6 @@ fn open_shared_graph(
         }
     };
     Ok(graph)
-}
-
-async fn open_shared_graph_async(
-    workspace: &Path,
-    config: &AetherConfig,
-    read_only: bool,
-) -> Result<(Arc<dyn GraphStore>, Option<Arc<SurrealGraphStore>>), AetherMcpError> {
-    let graph: Arc<dyn GraphStore> = if read_only {
-        Arc::new(SqliteGraphStore::open_readonly(workspace)?)
-    } else {
-        Arc::new(SqliteGraphStore::open(workspace)?)
-    };
-
-    let surreal = match config.storage.graph_backend {
-        GraphBackend::Surreal => {
-            match if read_only {
-                SurrealGraphStore::open_readonly(workspace).await
-            } else {
-                SurrealGraphStore::open(workspace).await
-            } {
-                Ok(store) => Some(Arc::new(store)),
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "SurrealDB graph unavailable (daemon may hold lock), using SQLite only"
-                    );
-                    None
-                }
-            }
-        }
-        GraphBackend::Sqlite | GraphBackend::Cozo => None,
-    };
-
-    Ok((graph, surreal))
 }
 
 #[cfg(test)]
@@ -636,5 +625,20 @@ api_key_env = "{api_key_env}"
             .expect("load dependencies");
         assert_eq!(dependencies.len(), 1);
         assert_eq!(dependencies[0].id, "sym-beta");
+    }
+
+    #[tokio::test]
+    async fn async_open_defers_the_surreal_graph_until_first_use() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_test_config_with_backend(workspace, "surreal");
+
+        let state = SharedState::open_readwrite_async(workspace)
+            .await
+            .expect("open state");
+        assert!(state.surreal_graph.lock().await.is_none());
+
+        state.surreal_graph().await.expect("open on first use");
+        assert!(state.surreal_graph.lock().await.is_some());
     }
 }

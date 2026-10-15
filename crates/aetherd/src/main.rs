@@ -61,6 +61,8 @@ use aetherd::verify_intent::run_verify_intent_command;
 use anyhow::{Context, Result, anyhow};
 
 fn main() -> Result<()> {
+    // SAFETY: first thing in main, before anything starts another thread.
+    unsafe { aether_store::set_surrealkv_sizing_env() };
     let cli = parse_cli();
     if let Err(err) = run(cli) {
         eprintln!("Error: {err:?}");

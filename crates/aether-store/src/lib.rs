@@ -52,7 +52,7 @@ mod vector;
 #[deprecated(note = "use GraphStore dispatch or SurrealGraphStore directly")]
 pub use graph_cozo_compat::CozoGraphStore; // #[deprecated]
 pub use graph_sqlite::SqliteGraphStore;
-pub use graph_surreal::SurrealGraphStore;
+pub use graph_surreal::{SURREALKV_SIZING_ENV, SurrealGraphStore, set_surrealkv_sizing_env};
 pub use vector::{
     LanceVectorStore, ProjectNoteVectorRecord, ProjectNoteVectorSearchResult, SqliteVectorStore,
     VectorEmbeddingMetaRecord, VectorRecord, VectorSearchResult, VectorStore, open_vector_store,
