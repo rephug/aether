@@ -29,6 +29,13 @@ pub const OLLAMA_DEFAULT_ENDPOINT: &str = "http://127.0.0.1:11434";
 pub const SIR_QUALITY_FLOOR_CONFIDENCE: f32 = 0.3;
 pub const SIR_QUALITY_FLOOR_WINDOW: usize = 10;
 pub const OLLAMA_SIR_TEMPERATURE: f32 = 0.1;
+/// Most tokens one local (Ollama) SIR reply may generate, sent as `num_predict`. Without a
+/// cap a small model in JSON mode can keep emitting tokens for many minutes on a CPU.
+/// Normal SIR replies stay far below it.
+pub const OLLAMA_SIR_NUM_PREDICT: u32 = 2048;
+/// The same cap for deep-mode replies, which include the model's `<think>` reasoning. It
+/// matches the deep request's context window.
+pub const OLLAMA_DEEP_SIR_NUM_PREDICT: u32 = 8192;
 pub const DEFAULT_SIR_CONCURRENCY: usize = 2;
 pub const GEMINI_DEFAULT_CONCURRENCY: usize = 16;
 pub const DEFAULT_COHERE_API_KEY_ENV: &str = "COHERE_API_KEY";

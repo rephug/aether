@@ -474,7 +474,8 @@ fn resolve_tiered_parse_fallback_provider(
     let fallback = Qwen3LocalProvider::new(
         tiered.fallback_endpoint.clone(),
         tiered.fallback_model.clone(),
-    );
+    )
+    .with_max_output_tokens(config.inference.max_output_tokens);
     let model_name = fallback.model_name();
     Ok(Some((Arc::new(fallback), model_name)))
 }
