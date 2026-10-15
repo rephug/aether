@@ -5,9 +5,9 @@
 //! method name as their target. A call edge's target can therefore name several
 //! symbols: same-named methods of different types, a free function, or the same type
 //! declared twice. A caller counts for the selected symbol only when the edge's target
-//! narrows to that one symbol or to its overloads. TypeScript and Python record calls
-//! by their callee text (`obj.alpha`, `self.alpha`), so the bare-name expansion applies
-//! to Rust only.
+//! narrows to that one symbol or to its overloads. TypeScript records calls by their
+//! callee text (`obj.alpha`, `this.alpha`) and Python by the callee's qualified name, so
+//! the bare-name expansion applies to Rust only.
 //!
 //! Overloads share a qualified name, language and file but not an ID: Java and C#
 //! overloaded methods (`Type::method`), or a Rust method of a trait a type implements
