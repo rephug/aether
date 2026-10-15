@@ -7,9 +7,13 @@ pub(crate) const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.
 const OLLAMA_PULL_SUCCESS_STATUS: &str = "success";
 
 pub(crate) fn inference_http_client() -> reqwest::Client {
+    inference_http_client_with_timeout(120)
+}
+
+pub(crate) fn inference_http_client_with_timeout(timeout_secs: u64) -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(timeout_secs.max(1)))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }

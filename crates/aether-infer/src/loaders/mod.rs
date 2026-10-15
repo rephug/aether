@@ -47,6 +47,7 @@ pub fn load_inference_provider_from_config(
         thinking,
     } = overrides;
     let selected_provider = provider.unwrap_or(config.inference.provider);
+    let attempt_timeout_secs = config.inference.timeout_secs;
     let selected_model = first_non_empty(model, config.inference.model);
     let selected_endpoint = first_non_empty(endpoint, config.inference.endpoint);
     let selected_thinking = resolve_inference_thinking(thinking, config.inference.thinking);
@@ -61,8 +62,11 @@ pub fn load_inference_provider_from_config(
             let ollama_endpoint = normalize_optional(selected_endpoint.clone())
                 .unwrap_or_else(|| DEFAULT_QWEN_ENDPOINT.to_owned());
             if is_ollama_reachable_blocking(&ollama_endpoint) {
-                let provider =
-                    Qwen3LocalProvider::new(Some(ollama_endpoint.clone()), selected_model.clone());
+                let provider = local_provider(
+                    Some(ollama_endpoint.clone()),
+                    selected_model.clone(),
+                    attempt_timeout_secs,
+                );
                 tracing::info!(
                     endpoint = %ollama_endpoint,
                     model = %provider.model_name(),
@@ -122,7 +126,7 @@ pub fn load_inference_provider_from_config(
             })
         }
         InferenceProviderKind::Qwen3Local => {
-            let provider = Qwen3LocalProvider::new(selected_endpoint, selected_model);
+            let provider = local_provider(selected_endpoint, selected_model, attempt_timeout_secs);
             Ok(LoadedProvider {
                 model_name: provider.model_name(),
                 provider: Box::new(provider),
@@ -255,6 +259,23 @@ fn omp_gateway_token_path() -> Option<PathBuf> {
     }
     let home = read_env_non_empty("HOME").or_else(|| read_env_non_empty("USERPROFILE"))?;
     Some(Path::new(&home).join(OMP_GATEWAY_TOKEN_FILE))
+}
+
+/// A local Ollama provider whose requests may run as long as `[inference] timeout_secs`
+/// lets one attempt run, plus a margin so the attempt timeout fires first. It never lowers
+/// the default request timeout.
+fn local_provider(
+    endpoint: Option<String>,
+    model: Option<String>,
+    attempt_timeout_secs: Option<u64>,
+) -> Qwen3LocalProvider {
+    let provider = Qwen3LocalProvider::new(endpoint, model);
+    match attempt_timeout_secs.map(|secs| secs.saturating_add(10)) {
+        Some(request_secs) if request_secs > 120 => {
+            provider.with_request_timeout_secs(request_secs)
+        }
+        _ => provider,
+    }
 }
 
 pub fn load_provider_from_env_or_mock(
