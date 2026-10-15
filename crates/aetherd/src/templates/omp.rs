@@ -14,17 +14,22 @@ impl OmpAgentsTemplate {
 }
 
 /// Project-root `.mcp.json` registering the AETHER MCP server for omp (and any other
-/// client that reads the `mcpServers` shape).
+/// client that reads the `mcpServers` shape), with `--tools` when the setup picks a
+/// tool profile other than the workspace config's default.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct McpJsonTemplate;
 
 impl McpJsonTemplate {
     pub fn render(context: &TemplateContext) -> String {
+        let mut args = vec!["--workspace", "."];
+        if let Some(profile) = context.mcp_tools_arg {
+            args.extend(["--tools", profile.as_str()]);
+        }
         let value = serde_json::json!({
             "mcpServers": {
                 "aether": {
                     "command": context.mcp_binary_hint,
-                    "args": ["--workspace", "."]
+                    "args": args
                 }
             }
         });

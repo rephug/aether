@@ -433,6 +433,8 @@ Hook up your AI agent:
 claude mcp add --transport stdio --scope project aether -- aether-mcp --workspace .
 ```
 
+Add `--tools compact` to serve only the six tools coding agents use most (symbol lookup and search, dependencies, call chain, SIR context, test intents): the tool list then takes a fraction of the context it otherwise adds to every request. See [MCP Tool Profile](docs/CONFIG.md#mcp-tool-profile).
+
 Now your agent has persistent, structured access to your entire codebase's meaning. It doesn't have to re-read files every session. It doesn't have to guess. It *knows*.
 
 (Assuming I set everything up correctly. Which I... believe I did.)
@@ -646,6 +648,8 @@ The desktop app wraps the same dashboard you get from `aetherd --workspace .` â€
 ## The MCP Tools
 
 Register AETHER with any MCP-compatible agent (Claude Code, Codex, etc.) and it gets structured access to everything. 39 tools (40 with the `verification` feature), zero guessing.
+
+Every listed tool sits in the agent's context on every request. `aether-mcp --tools compact` (or `[mcp] tools = "compact"`) lists only `aether_symbol_lookup`, `aether_search`, `aether_dependencies`, `aether_call_chain`, `aether_sir_context` and `aether_test_intents`, in about a twelfth of the space; see [MCP Tool Profile](docs/CONFIG.md#mcp-tool-profile).
 
 ### Search & Lookup
 

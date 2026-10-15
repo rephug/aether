@@ -503,6 +503,7 @@ fn run_init_agent_command(workspace: &Path, args: InitAgentArgs) -> Result<()> {
         InitAgentOptions {
             platform: args.platform,
             force: args.force,
+            mcp_tools: args.mcp_tools,
         },
     )
     .context("failed to generate agent integration files")?;

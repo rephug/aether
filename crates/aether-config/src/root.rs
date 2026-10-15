@@ -13,6 +13,7 @@ use crate::{
     embeddings::EmbeddingsConfig,
     health::{HealthConfig, HealthScoreConfig},
     inference::InferenceConfig,
+    mcp::McpConfig,
     normalize::normalize_config,
     planner::PlannerConfig,
     search::{ProvidersConfig, SearchConfig},
@@ -53,6 +54,8 @@ pub struct AetherConfig {
     pub health_score: HealthScoreConfig,
     #[serde(default)]
     pub dashboard: DashboardConfig,
+    #[serde(default)]
+    pub mcp: McpConfig,
     #[serde(default)]
     pub continuous: Option<ContinuousConfig>,
     #[serde(default)]

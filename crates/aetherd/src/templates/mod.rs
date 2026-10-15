@@ -1,9 +1,12 @@
+use aether_config::McpToolProfile;
+
 pub mod audit_changes_cmd;
 pub mod audit_cmd;
 pub mod audit_report_cmd;
 pub mod ci_review_workflow;
 pub mod claude_md;
 pub mod codex_instructions;
+pub mod compact;
 pub mod context_cmd;
 pub mod cursor_rules;
 pub mod enrich_cmd;
@@ -26,6 +29,7 @@ pub use audit_report_cmd::AuditReportCommandTemplate;
 pub use ci_review_workflow::GithubReviewWorkflowTemplate;
 pub use claude_md::ClaudeTemplate;
 pub use codex_instructions::CodexInstructionsTemplate;
+pub use compact::CompactGuidanceTemplate;
 pub use context_cmd::ContextCommandTemplate;
 pub use cursor_rules::CursorRulesTemplate;
 pub use enrich_cmd::EnrichCommandTemplate;
@@ -52,6 +56,9 @@ pub struct TemplateContext {
     pub inference_provider: String,
     pub agent_schema_version: u32,
     pub mcp_binary_hint: String,
+    /// The `--tools` profile `.mcp.json` passes to aether-mcp; `None` leaves the choice
+    /// to `[mcp] tools` in the workspace config.
+    pub mcp_tools_arg: Option<McpToolProfile>,
 }
 
 pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 40] = [
@@ -287,14 +294,17 @@ pub(crate) fn plain_tool_list() -> String {
 
 #[cfg(test)]
 mod tests {
+    use aether_config::COMPACT_MCP_TOOLS;
+
     use super::{
         AuditChangesCommandTemplate, AuditCommandTemplate, AuditReportCommandTemplate,
-        ClaudeTemplate, CodexInstructionsTemplate, ContextCommandTemplate, CursorRulesTemplate,
-        EnrichCommandTemplate, ExplainAreaCommandTemplate, GithubReviewWorkflowTemplate,
-        HealthCheckCommandTemplate, ImpactCommandTemplate, McpJsonTemplate, NextCommandTemplate,
-        OmpAgentsTemplate, PreFlightCommandTemplate, RefactorCommandTemplate,
-        RefactorDeepCommandTemplate, ReviewCommandTemplate, ScanAllScriptTemplate,
-        ScanCommandTemplate, SkillTemplate, TOOL_DESCRIPTIONS, TemplateContext,
+        ClaudeTemplate, CodexInstructionsTemplate, CompactGuidanceTemplate, ContextCommandTemplate,
+        CursorRulesTemplate, EnrichCommandTemplate, ExplainAreaCommandTemplate,
+        GithubReviewWorkflowTemplate, HealthCheckCommandTemplate, ImpactCommandTemplate,
+        McpJsonTemplate, McpToolProfile, NextCommandTemplate, OmpAgentsTemplate,
+        PreFlightCommandTemplate, RefactorCommandTemplate, RefactorDeepCommandTemplate,
+        ReviewCommandTemplate, ScanAllScriptTemplate, ScanCommandTemplate, SkillTemplate,
+        TOOL_DESCRIPTIONS, TemplateContext,
     };
 
     fn sample_context() -> TemplateContext {
@@ -310,6 +320,7 @@ mod tests {
             inference_provider: "mock".to_owned(),
             agent_schema_version: 7,
             mcp_binary_hint: "./target/debug/aether-mcp".to_owned(),
+            mcp_tools_arg: None,
         }
     }
 
@@ -378,6 +389,50 @@ mod tests {
             ("review", ReviewCommandTemplate::render(context)),
             ("scan", ScanCommandTemplate::render(context)),
         ]
+    }
+
+    /// Every `aether_*` tool name `rendered` mentions, sorted and deduplicated.
+    fn named_tools(rendered: &str) -> Vec<String> {
+        let mut names = rendered
+            .match_indices("aether_")
+            .map(|(start, _)| {
+                rendered[start..]
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_lowercase() || *ch == '_')
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Compact guidance must point at every tool the compact profile serves and at no
+    /// tool it refuses.
+    #[test]
+    fn compact_guidance_names_exactly_the_compact_tools() {
+        let mut context = sample_context();
+        let rendered = CompactGuidanceTemplate::render(&context);
+        let mut expected = COMPACT_MCP_TOOLS.map(str::to_owned).to_vec();
+        expected.sort();
+        assert_eq!(named_tools(&rendered), expected);
+        assert!(rendered.contains("Agent Schema Version: 7"));
+        assert!(rendered.contains("`--tools compact`"));
+        assert!(rendered.contains("- `cargo test --workspace`"));
+        assert!(rendered.contains("mode `hybrid`"));
+
+        context.embeddings_enabled = false;
+        let rendered = CompactGuidanceTemplate::render(&context);
+        assert!(!rendered.contains("hybrid") && rendered.contains("embeddings are off"));
+
+        // The point of the profile: far less guidance in every request's context.
+        let full = ClaudeTemplate::render(&sample_context());
+        assert!(
+            rendered.len() * 4 < full.len(),
+            "{} vs {}",
+            rendered.len(),
+            full.len()
+        );
     }
 
     /// Slash commands are static text, so a renamed or removed tool would go unnoticed:
@@ -741,6 +796,28 @@ mod tests {
         );
         assert_eq!(parsed["mcpServers"]["aether"]["args"][0], "--workspace");
         assert!(rendered.ends_with('\n'));
+    }
+
+    #[test]
+    fn mcp_json_template_passes_the_tools_profile_only_when_set() {
+        let args = |mcp_tools_arg| {
+            let context = TemplateContext {
+                mcp_tools_arg,
+                ..sample_context()
+            };
+            let parsed: serde_json::Value =
+                serde_json::from_str(&McpJsonTemplate::render(&context)).expect("valid json");
+            parsed["mcpServers"]["aether"]["args"].clone()
+        };
+        assert_eq!(args(None), serde_json::json!(["--workspace", "."]));
+        assert_eq!(
+            args(Some(McpToolProfile::Compact)),
+            serde_json::json!(["--workspace", ".", "--tools", "compact"])
+        );
+        assert_eq!(
+            args(Some(McpToolProfile::Full)),
+            serde_json::json!(["--workspace", ".", "--tools", "full"])
+        );
     }
 
     #[test]
