@@ -14,6 +14,8 @@ pub struct LanguageConfig {
     pub symbol_query: Query,
     pub edge_query: Query,
     pub test_intent_query: Option<Query>,
+    /// Files whose presence marks a directory as the root of a module, such as
+    /// `Cargo.toml`. A marker `*<suffix>` matches any file whose name ends in `<suffix>`.
     pub module_markers: &'static [&'static str],
     pub hooks: Option<Box<dyn LanguageHooks>>,
 }

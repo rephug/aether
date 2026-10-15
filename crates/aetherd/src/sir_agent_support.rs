@@ -1,6 +1,6 @@
 use aether_core::{Language, Position, SourceRange, Symbol, SymbolKind};
 use aether_parse::SymbolExtractor;
-use aether_store::{SqliteStore, SymbolCatalogStore, SymbolRecord};
+use aether_store::{SqliteStore, SymbolCatalogStore, SymbolRecord, SymbolSearchResult};
 use anyhow::{Context, Result, anyhow};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,11 +23,14 @@ pub(crate) fn resolve_symbol(store: &SqliteStore, selector: &str) -> Result<Symb
         return Ok(record);
     }
 
-    if let Some(record) = store
-        .get_symbol_by_qualified_name(selector)
-        .with_context(|| format!("failed to look up qualified name '{selector}'"))?
-    {
-        return Ok(record);
+    // A qualified name that several symbols share is ambiguous, not the first of them.
+    let exact_matches = store
+        .find_symbol_search_results_by_qualified_name(selector)
+        .with_context(|| format!("failed to look up qualified name '{selector}'"))?;
+    match exact_matches.as_slice() {
+        [] => {}
+        [only] => return load_search_result(store, only),
+        many => return Err(ambiguous_selector(selector, many)),
     }
 
     let matches = store
@@ -35,32 +38,38 @@ pub(crate) fn resolve_symbol(store: &SqliteStore, selector: &str) -> Result<Symb
         .with_context(|| format!("failed to search symbols for '{selector}'"))?;
     match matches.as_slice() {
         [] => Err(anyhow!("symbol not found: {selector}")),
-        [only] => store
-            .get_symbol_record(only.symbol_id.as_str())
-            .with_context(|| {
-                format!(
-                    "failed to load symbol record for search result '{}'",
-                    only.symbol_id
-                )
-            })?
-            .ok_or_else(|| anyhow!("symbol search returned missing record: {}", only.symbol_id)),
-        _ => {
-            let candidates = matches
-                .iter()
-                .map(|candidate| {
-                    format!(
-                        "{} [{}]",
-                        candidate.qualified_name.trim(),
-                        candidate.file_path.trim()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n  - ");
-            Err(anyhow!(
-                "ambiguous symbol selector '{selector}'. Candidates:\n  - {candidates}"
-            ))
-        }
+        [only] => load_search_result(store, only),
+        many => Err(ambiguous_selector(selector, many)),
     }
+}
+
+fn load_search_result(store: &SqliteStore, found: &SymbolSearchResult) -> Result<SymbolRecord> {
+    store
+        .get_symbol_record(found.symbol_id.as_str())
+        .with_context(|| {
+            format!(
+                "failed to load symbol record for search result '{}'",
+                found.symbol_id
+            )
+        })?
+        .ok_or_else(|| anyhow!("symbol search returned missing record: {}", found.symbol_id))
+}
+
+fn ambiguous_selector(selector: &str, candidates: &[SymbolSearchResult]) -> anyhow::Error {
+    let candidates = candidates
+        .iter()
+        .map(|candidate| {
+            // The ID tells apart overloads, which share a name and file.
+            format!(
+                "{} [{}] id {}",
+                candidate.qualified_name.trim(),
+                candidate.file_path.trim(),
+                candidate.symbol_id.trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n  - ");
+    anyhow!("ambiguous symbol selector '{selector}'. Candidates:\n  - {candidates}")
 }
 
 pub(crate) fn load_fresh_symbol_source(
@@ -355,6 +364,43 @@ mod tests {
 
         let err = resolve_symbol(&store, "alpha").expect_err("ambiguous should fail");
         assert!(err.to_string().contains("ambiguous symbol selector"));
+    }
+
+    #[test]
+    fn resolve_symbol_reports_a_qualified_name_several_symbols_share() {
+        let temp = write_workspace();
+        let store = aether_store::SqliteStore::open(temp.path()).expect("open store");
+        for (id, file_path) in [
+            ("sym-a", "crates/a/src/lib.rs"),
+            ("sym-b", "crates/b/src/lib.rs"),
+        ] {
+            store
+                .upsert_symbol(symbol_record(id, file_path, "Config::load", id))
+                .expect("upsert symbol");
+        }
+
+        // Neither is picked; the error names both, with IDs to select one by.
+        let err = resolve_symbol(&store, "Config::load")
+            .expect_err("a shared qualified name should be ambiguous")
+            .to_string();
+        assert!(
+            err.contains("ambiguous symbol selector 'Config::load'"),
+            "{err}"
+        );
+        assert!(
+            err.contains("Config::load [crates/a/src/lib.rs] id sym-a"),
+            "{err}"
+        );
+        assert!(
+            err.contains("Config::load [crates/b/src/lib.rs] id sym-b"),
+            "{err}"
+        );
+        assert_eq!(
+            resolve_symbol(&store, "sym-b")
+                .expect("resolve by id")
+                .file_path,
+            "crates/b/src/lib.rs"
+        );
     }
 
     #[test]

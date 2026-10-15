@@ -56,9 +56,9 @@ pub use usage_matrix::*;
 pub use verification::*;
 
 pub(crate) use common::{
-    LiveSymbolSources, SYMBOL_SELECTOR_LABEL, child_method_symbols, effective_limit,
-    is_type_symbol_kind, normalize_workspace_relative_path, resolve_symbol_selector,
-    symbol_leaf_name,
+    LiveSymbolSources, SYMBOL_SELECTOR_LABEL, ambiguous_selector, child_method_symbols,
+    effective_limit, is_type_symbol_kind, normalize_workspace_relative_path,
+    resolve_symbol_selector, symbol_leaf_name,
 };
 
 pub const SERVER_NAME: &str = "aether";

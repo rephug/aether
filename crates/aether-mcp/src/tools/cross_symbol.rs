@@ -3,12 +3,13 @@ use std::fs;
 use std::path::Path;
 
 use aether_core::{EdgeKind, Position, SourceRange};
-use aether_parse::{SymbolExtractor, language_for_path};
+use aether_parse::{ModuleRoots, SymbolExtractor, language_for_path};
 use aether_sir::SirAnnotation;
-use aether_store::{SirStateStore, SqliteStore, SymbolRecord, SymbolRelationStore};
+use aether_store::{NameResolution, NameSite, SirStateStore, SqliteStore, SymbolRecord};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::callers::CallerAttribution;
 use super::{AetherMcpServer, resolve_symbol_selector};
 use crate::AetherMcpError;
 
@@ -253,9 +254,15 @@ fn extract_node_source(
         Err(_) => return Some(truncated_full_file),
     };
 
+    // By ID first: overloads share the qualified name.
     let symbol_source = symbols
         .iter()
-        .find(|symbol| symbol.id == record.id || symbol.qualified_name == record.qualified_name)
+        .find(|symbol| symbol.id == record.id)
+        .or_else(|| {
+            symbols
+                .iter()
+                .find(|symbol| symbol.qualified_name == record.qualified_name)
+        })
         .and_then(|symbol| extract_symbol_source_text(&source, symbol.range))
         .unwrap_or(source);
 
@@ -347,6 +354,11 @@ impl AetherMcpServer {
         let mut caller_count = 0u32;
         let mut callee_count = 0u32;
         let mut max_discovered_depth = 0u32;
+        let mut modules = ModuleRoots::new(self.workspace());
+        let mut attribution = CallerAttribution::for_context(store, self.workspace());
+        // Callee names that several symbols share and the caller's file and module
+        // don't narrow to one; they aren't followed.
+        let mut ambiguous_callees = Vec::<String>::new();
 
         visited.insert(root_record.id.clone());
         queue.push_back(QueueEntry {
@@ -389,10 +401,19 @@ impl AetherMcpServer {
                     record.id.as_str(),
                     &[EdgeKind::Calls],
                 )? {
-                    let Some(target) =
-                        store.get_symbol_by_qualified_name(edge.target_qualified_name.as_str())?
-                    else {
-                        continue;
+                    let target = match store.resolve_call_edge(
+                        edge.target_qualified_name.as_str(),
+                        NameSite::of(&record),
+                        &mut |file_path| modules.module_of(file_path),
+                    )? {
+                        NameResolution::Found(mut overloads) => overloads.swap_remove(0),
+                        NameResolution::NotFound => continue,
+                        NameResolution::Ambiguous(_) => {
+                            if !ambiguous_callees.contains(&edge.target_qualified_name) {
+                                ambiguous_callees.push(edge.target_qualified_name);
+                            }
+                            continue;
+                        }
                     };
                     if !visited.insert(target.id.clone()) {
                         continue;
@@ -410,10 +431,7 @@ impl AetherMcpServer {
             }
 
             if direction.includes_callers() {
-                for edge in store.get_callers(record.qualified_name.as_str())? {
-                    let Some(caller) = store.get_symbol_record(edge.source_id.as_str())? else {
-                        continue;
-                    };
+                for caller in attribution.callers_of(&record)? {
                     if !visited.insert(caller.id.clone()) {
                         continue;
                     }
@@ -424,14 +442,14 @@ impl AetherMcpServer {
                         symbol_id: caller.id,
                         depth: next_depth,
                         role: NodeRole::Caller,
-                        incoming_edge_kind: Some(edge.edge_kind),
+                        incoming_edge_kind: Some(EdgeKind::Calls),
                     });
                 }
             }
         }
 
         let total_found = visited.len().min(u32::MAX as usize) as u32;
-        let traversal_summary = format!(
+        let mut traversal_summary = format!(
             "Traversed {} from {}: {} callers, {} callees across {} levels ({} symbols returned, {} found before cap)",
             direction.label(),
             root_record.qualified_name,
@@ -441,6 +459,12 @@ impl AetherMcpServer {
             chain.len(),
             total_found,
         );
+        if !ambiguous_callees.is_empty() {
+            traversal_summary.push_str(&format!(
+                "; not followed, as several symbols share each name: {}",
+                ambiguous_callees.join(", ")
+            ));
+        }
 
         Ok(AetherAuditCrossSymbolResponse {
             root_symbol_id: root_record.id,

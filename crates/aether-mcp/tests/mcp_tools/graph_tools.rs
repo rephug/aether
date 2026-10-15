@@ -1103,6 +1103,114 @@ fn mcp_dependencies_narrow_cross_file_callers_to_their_package() -> Result<()> {
 }
 
 #[test]
+fn mcp_dependencies_narrow_java_and_csharp_callers_to_their_module() -> Result<()> {
+    // Two Maven modules and two .NET projects each declare their own `UserService`, so
+    // `UserService::getUser` (Java) and `UserService::GetUser` (C#) name two methods.
+    // Each controller's call narrows to the method in its own module or project. `App`
+    // sits in the parent Maven module, which declares no `UserService`, so its call stays
+    // ambiguous and is attributed to neither.
+    let java_service = |package: &str| {
+        format!(
+            "package com.acme.{package};\n\npublic class UserService {{\n    public String getUser(String id) {{\n        return id;\n    }}\n}}\n"
+        )
+    };
+    let java_caller = |package: &str, class: &str| {
+        format!(
+            "package com.acme.{package};\n\npublic class {class} {{\n    private final UserService users;\n\n    public {class}(UserService users) {{\n        this.users = users;\n    }}\n\n    public String show(String id) {{\n        return users.getUser(id);\n    }}\n}}\n"
+        )
+    };
+    let csharp_service = |namespace: &str| {
+        format!(
+            "namespace Acme.{namespace};\n\npublic class UserService\n{{\n    public string GetUser(string id)\n    {{\n        return id;\n    }}\n}}\n"
+        )
+    };
+    let csharp_caller = |namespace: &str, class: &str| {
+        format!(
+            "namespace Acme.{namespace};\n\npublic class {class}\n{{\n    private readonly UserService _users;\n\n    public {class}(UserService users)\n    {{\n        _users = users;\n    }}\n\n    public string Show(string id)\n    {{\n        return _users.GetUser(id);\n    }}\n}}\n"
+        )
+    };
+    let main = "src/main/java/com/acme";
+    let files = [
+        (
+            "pom.xml".to_owned(),
+            "<project><modules><module>billing</module><module>orders</module></modules></project>\n"
+                .to_owned(),
+        ),
+        ("billing/pom.xml".to_owned(), "<project/>\n".to_owned()),
+        (
+            format!("billing/{main}/billing/UserService.java"),
+            java_service("billing"),
+        ),
+        (
+            format!("billing/{main}/billing/BillingController.java"),
+            java_caller("billing", "BillingController"),
+        ),
+        ("orders/build.gradle.kts".to_owned(), "plugins {}\n".to_owned()),
+        (
+            format!("orders/{main}/orders/UserService.java"),
+            java_service("orders"),
+        ),
+        (
+            format!("orders/{main}/orders/OrdersController.java"),
+            java_caller("orders", "OrdersController"),
+        ),
+        (format!("{main}/App.java"), java_caller("app", "App")),
+        ("Directory.Build.props".to_owned(), "<Project/>\n".to_owned()),
+        ("src/Billing/Billing.csproj".to_owned(), "<Project/>\n".to_owned()),
+        ("src/Billing/UserService.cs".to_owned(), csharp_service("Billing")),
+        (
+            "src/Billing/BillingController.cs".to_owned(),
+            csharp_caller("Billing", "BillingController"),
+        ),
+        ("src/Orders/Orders.csproj".to_owned(), "<Project/>\n".to_owned()),
+        ("src/Orders/UserService.cs".to_owned(), csharp_service("Orders")),
+        (
+            "src/Orders/OrdersController.cs".to_owned(),
+            csharp_caller("Orders", "OrdersController"),
+        ),
+    ];
+    let files = files
+        .iter()
+        .map(|(path, contents)| (path.as_str(), contents.as_str()))
+        .collect::<Vec<_>>();
+    let temp = index_workspace("sqlite", &files)?;
+    let workspace = temp.path();
+    let server = AetherMcpServer::new(workspace, false)?;
+
+    for (file, method, caller) in [
+        (
+            format!("billing/{main}/billing/UserService.java"),
+            "UserService::getUser",
+            "BillingController::show",
+        ),
+        (
+            format!("orders/{main}/orders/UserService.java"),
+            "UserService::getUser",
+            "OrdersController::show",
+        ),
+        (
+            "src/Billing/UserService.cs".to_owned(),
+            "UserService::GetUser",
+            "BillingController::Show",
+        ),
+        (
+            "src/Orders/UserService.cs".to_owned(),
+            "UserService::GetUser",
+            "OrdersController::Show",
+        ),
+    ] {
+        let response = dependencies_for(&server, symbol_id_in(workspace, &file, method)?)?;
+        assert_eq!(
+            caller_counts(&response),
+            BTreeMap::from([(caller.to_owned(), None)]),
+            "{file}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn mcp_dependencies_keep_callers_across_typescript_dialects() -> Result<()> {
     // A `.tsx` component calling a function from a `.ts` module: the two files have
     // different language tags but call each other.

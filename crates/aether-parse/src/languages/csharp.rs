@@ -30,8 +30,10 @@ pub fn config() -> LanguageConfig {
         symbol_query,
         edge_query,
         test_intent_query: Some(test_intent_query),
-        // Project files (`*.csproj`) have no fixed name, so only solution-wide files qualify.
-        module_markers: &["Directory.Build.props", "global.json"],
+        // Each project file (`Api.csproj`) is a module, and `Directory.Build.props` marks
+        // the files of a solution outside its projects. (`global.json` is left out: other
+        // languages use that name too.)
+        module_markers: &["*.csproj", "Directory.Build.props"],
         hooks: Some(Box::new(CSharpHooks)),
     }
 }

@@ -4,16 +4,18 @@ use std::path::Path;
 
 use aether_analysis::{HealthAnalyzer, HealthInclude, HealthRequest};
 use aether_config::GraphBackend;
-use aether_core::{EdgeKind, Position, SourceRange};
-use aether_parse::{SymbolExtractor, language_for_path};
+use aether_core::{EdgeKind, Position, SourceRange, SymbolEdge};
+use aether_parse::{ModuleRoots, SymbolExtractor, language_for_path};
 use aether_sir::SirAnnotation;
 use aether_store::{
-    SirStateStore, SymbolRecord, SymbolRelationStore, TestIntentRecord, TestIntentStore,
+    NameResolution, NameSite, SirStateStore, SymbolRecord, TestIntentRecord, TestIntentStore,
+    ambiguity_label, ambiguity_note,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use super::callers::CallerAttribution;
 use super::{AetherMcpServer, SYMBOL_SELECTOR_LABEL, resolve_symbol_selector};
 use crate::AetherMcpError;
 
@@ -439,6 +441,7 @@ fn build_reasoning_layer(server: &AetherMcpServer, record: &SymbolRecord) -> Str
 /// once, with the reason it was picked.
 fn collect_test_intents(
     store: &aether_store::SqliteStore,
+    workspace: &Path,
     record: &SymbolRecord,
 ) -> Result<Vec<(TestIntentRecord, &'static str)>, AetherMcpError> {
     let mut intents = Vec::new();
@@ -457,14 +460,11 @@ fn collect_test_intents(
     );
     // Test intents usually point at the test function, not the code under test, so
     // look at who calls this symbol.
-    let mut callers = HashSet::new();
-    for edge in store.get_callers(record.qualified_name.as_str())? {
-        if callers.insert(edge.source_id.clone()) {
-            append(
-                store.list_test_intents_for_symbol(edge.source_id.as_str())?,
-                "direct test caller",
-            );
-        }
+    for caller in CallerAttribution::for_context(store, workspace).callers_of(record)? {
+        append(
+            store.list_test_intents_for_symbol(caller.id.as_str())?,
+            "direct test caller",
+        );
     }
     append(
         store.list_test_intents_for_file(record.file_path.as_str())?,
@@ -473,8 +473,12 @@ fn collect_test_intents(
     Ok(intents)
 }
 
-fn build_tests_layer(store: &aether_store::SqliteStore, record: &SymbolRecord) -> String {
-    let intents = match collect_test_intents(store, record) {
+fn build_tests_layer(
+    store: &aether_store::SqliteStore,
+    workspace: &Path,
+    record: &SymbolRecord,
+) -> String {
+    let intents = match collect_test_intents(store, workspace, record) {
         Ok(intents) => intents,
         Err(err) => {
             return format!(
@@ -505,24 +509,67 @@ fn build_tests_layer(store: &aether_store::SqliteStore, record: &SymbolRecord) -
     lines.join("\n")
 }
 
+/// A graph entry for a dependency whose name several symbols share, which neither the
+/// referring file nor its module narrows to one.
+fn ambiguous_graph_entry(
+    section: &'static str,
+    edge_kind: EdgeKind,
+    depth: u32,
+    target_qualified_name: &str,
+    candidates: &[SymbolRecord],
+) -> GraphEntry {
+    GraphEntry {
+        section,
+        relationship: relation_label(edge_kind),
+        depth,
+        qualified_name: target_qualified_name.to_owned(),
+        file_path: ambiguity_label(candidates),
+        intent_summary: ambiguity_note(candidates),
+    }
+}
+
+/// What the target of `edge`, written by `source`, names: a call by the rule for call
+/// edges ([`narrow_call_edge_candidates`](aether_store::narrow_call_edge_candidates)),
+/// any other edge by its exact qualified name.
+fn resolve_dependency(
+    store: &aether_store::SqliteStore,
+    edge: &SymbolEdge,
+    source: &SymbolRecord,
+    modules: &mut ModuleRoots,
+) -> Result<NameResolution, AetherMcpError> {
+    let target = edge.target_qualified_name.as_str();
+    let site = NameSite::of(source);
+    let mut module_of = |file_path: &str| modules.module_of(file_path);
+    Ok(if edge.edge_kind == EdgeKind::Calls {
+        store.resolve_call_edge(target, site, &mut module_of)?
+    } else {
+        store.resolve_qualified_name(target, Some(site), &mut module_of)?
+    })
+}
+
+/// The callers of `record`, its dependencies and, from depth 2, their dependencies.
+///
+/// A dependency's name resolves from the file of the symbol that wrote it (see
+/// [`narrow_name_candidates`](aether_store::narrow_name_candidates)); a name that stays
+/// ambiguous is listed as such and not followed. Callers are those whose call edges
+/// resolve to `record` or its overloads.
 fn build_graph_entries(
     store: &aether_store::SqliteStore,
+    workspace: &Path,
     record: &SymbolRecord,
     depth: u32,
 ) -> Result<Vec<GraphEntry>, AetherMcpError> {
     let mut entries = Vec::<GraphEntry>::new();
     let mut seen = HashSet::<String>::new();
+    let mut modules = ModuleRoots::new(workspace);
 
-    for edge in store.get_callers(record.qualified_name.as_str())? {
-        let Some(caller) = store.get_symbol_record(edge.source_id.as_str())? else {
-            continue;
-        };
+    for caller in CallerAttribution::for_context(store, workspace).callers_of(record)? {
         if !seen.insert(format!("caller::{}", caller.id)) {
             continue;
         }
         entries.push(GraphEntry {
             section: "callers",
-            relationship: inverse_relation_label(edge.edge_kind),
+            relationship: inverse_relation_label(EdgeKind::Calls),
             depth: 1,
             qualified_name: caller.qualified_name.clone(),
             file_path: caller.file_path.clone(),
@@ -535,15 +582,28 @@ fn build_graph_entries(
 
     let direct_dependencies =
         store.list_symbol_edges_for_source_and_kinds(record.id.as_str(), &DEPENDENCY_EDGE_KINDS)?;
-    let mut frontier = Vec::<String>::new();
+    let mut frontier = Vec::<SymbolRecord>::new();
     for edge in direct_dependencies {
-        let Some(target) =
-            store.get_symbol_by_qualified_name(edge.target_qualified_name.as_str())?
-        else {
-            continue;
+        let target = match resolve_dependency(store, &edge, record, &mut modules)? {
+            NameResolution::Found(mut overloads) => overloads.swap_remove(0),
+            NameResolution::NotFound => continue,
+            NameResolution::Ambiguous(candidates) => {
+                if seen.insert(format!("ambiguous::{}", edge.target_qualified_name)) {
+                    entries.push(ambiguous_graph_entry(
+                        "callees",
+                        edge.edge_kind,
+                        1,
+                        edge.target_qualified_name.as_str(),
+                        &candidates,
+                    ));
+                    if entries.len() >= MAX_GRAPH_NEIGHBORS {
+                        return Ok(entries);
+                    }
+                }
+                continue;
+            }
         };
         if seen.insert(format!("dependency::{}", target.id)) {
-            frontier.push(target.id.clone());
             entries.push(GraphEntry {
                 section: "callees",
                 relationship: relation_label(edge.edge_kind),
@@ -552,6 +612,7 @@ fn build_graph_entries(
                 file_path: target.file_path.clone(),
                 intent_summary: read_neighbor_intent_summary(store, target.id.as_str()),
             });
+            frontier.push(target);
             if entries.len() >= MAX_GRAPH_NEIGHBORS {
                 return Ok(entries);
             }
@@ -563,23 +624,39 @@ fn build_graph_entries(
     }
 
     // Direct dependencies are already listed; don't repeat them as transitive ones.
-    let mut expanded = frontier.iter().cloned().collect::<HashSet<String>>();
+    let mut expanded = frontier
+        .iter()
+        .map(|target| target.id.clone())
+        .collect::<HashSet<String>>();
     for current_depth in 2..=depth {
-        let mut next_frontier = Vec::<String>::new();
-        for source_id in frontier {
+        let mut next_frontier = Vec::<SymbolRecord>::new();
+        for source in frontier {
             for edge in store.list_symbol_edges_for_source_and_kinds(
-                source_id.as_str(),
+                source.id.as_str(),
                 &DEPENDENCY_EDGE_KINDS,
             )? {
-                let Some(target) =
-                    store.get_symbol_by_qualified_name(edge.target_qualified_name.as_str())?
-                else {
-                    continue;
+                let target = match resolve_dependency(store, &edge, &source, &mut modules)? {
+                    NameResolution::Found(mut overloads) => overloads.swap_remove(0),
+                    NameResolution::NotFound => continue,
+                    NameResolution::Ambiguous(candidates) => {
+                        if seen.insert(format!("ambiguous::{}", edge.target_qualified_name)) {
+                            entries.push(ambiguous_graph_entry(
+                                "transitive_dependencies",
+                                edge.edge_kind,
+                                current_depth,
+                                edge.target_qualified_name.as_str(),
+                                &candidates,
+                            ));
+                            if entries.len() >= MAX_GRAPH_NEIGHBORS {
+                                return Ok(entries);
+                            }
+                        }
+                        continue;
+                    }
                 };
                 if target.id == record.id || !expanded.insert(target.id.clone()) {
                     continue;
                 }
-                next_frontier.push(target.id.clone());
                 if seen.insert(format!("transitive::{}", target.id)) {
                     entries.push(GraphEntry {
                         section: "transitive_dependencies",
@@ -593,6 +670,7 @@ fn build_graph_entries(
                         return Ok(entries);
                     }
                 }
+                next_frontier.push(target);
             }
         }
         if next_frontier.is_empty() {
@@ -606,10 +684,11 @@ fn build_graph_entries(
 
 fn build_graph_layer(
     store: &aether_store::SqliteStore,
+    workspace: &Path,
     record: &SymbolRecord,
     depth: u32,
 ) -> String {
-    let entries = match build_graph_entries(store, record, depth) {
+    let entries = match build_graph_entries(store, workspace, record, depth) {
         Ok(entries) => entries,
         Err(err) => return format!("Unavailable: failed to build graph context: {err}"),
     };
@@ -831,10 +910,10 @@ impl AetherMcpServer {
             let content = match layer_name {
                 "source" => build_source_layer(self, &record),
                 "sir" => build_sir_layer(self, &record),
-                "graph" => build_graph_layer(store, &record, depth),
+                "graph" => build_graph_layer(store, self.workspace(), &record, depth),
                 "health" => build_health_layer(self, &record),
                 "reasoning" => build_reasoning_layer(self, &record),
-                "tests" => build_tests_layer(store, &record),
+                "tests" => build_tests_layer(store, self.workspace(), &record),
                 _ => continue,
             };
             layers.push(SirContextLayer {
@@ -1175,6 +1254,144 @@ vector_backend = "sqlite"
     }
 
     #[test]
+    fn graph_context_resolves_shared_names_from_the_callers_module_or_says_they_are_ambiguous() {
+        // Two Maven modules each declare `Config::load`, and a TypeScript file declares
+        // it too. A Java caller in `billing` reaches billing's; one in the parent module
+        // can't tell billing's from orders', so the name is listed as ambiguous.
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        for manifest in ["pom.xml", "billing/pom.xml", "orders/pom.xml"] {
+            let path = workspace.join(manifest);
+            fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+            fs::write(path, "<project/>\n").expect("write manifest");
+        }
+        let store = SqliteStore::open(workspace).expect("open store");
+        let method =
+            |id: &str, file_path: &str, language: &str, qualified_name: &str| SymbolRecord {
+                id: id.to_owned(),
+                file_path: file_path.to_owned(),
+                language: language.to_owned(),
+                kind: "method".to_owned(),
+                qualified_name: qualified_name.to_owned(),
+                signature_fingerprint: format!("sig-{id}"),
+                last_seen_at: 1_700_000_000,
+            };
+        let billing_load = method("b-load", "billing/src/Config.java", "java", "Config::load");
+        let billing_run = method("b-run", "billing/src/Job.java", "java", "Job::run");
+        let app_run = method("app-run", "src/App.java", "java", "App::run");
+        for record in [
+            billing_load.clone(),
+            method("o-load", "orders/src/Config.java", "java", "Config::load"),
+            method(
+                "ts-load",
+                "billing/web/config.ts",
+                "typescript",
+                "Config::load",
+            ),
+            billing_run.clone(),
+            app_run.clone(),
+        ] {
+            store.upsert_symbol(record).expect("upsert symbol");
+        }
+        let call = |source: &SymbolRecord| SymbolEdge {
+            source_id: source.id.clone(),
+            target_qualified_name: "Config::load".to_owned(),
+            edge_kind: EdgeKind::Calls,
+            file_path: source.file_path.clone(),
+        };
+        store
+            .upsert_edges(&[call(&billing_run), call(&app_run)])
+            .expect("upsert edges");
+
+        let entries =
+            super::build_graph_entries(&store, workspace, &billing_run, 1).expect("billing graph");
+        let callees = entries
+            .iter()
+            .filter(|entry| entry.section == "callees")
+            .map(|entry| (entry.qualified_name.as_str(), entry.file_path.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(callees, vec![("Config::load", "billing/src/Config.java")]);
+
+        let entries =
+            super::build_graph_entries(&store, workspace, &app_run, 2).expect("app graph");
+        assert_eq!(
+            entries.len(),
+            1,
+            "{:?}",
+            entries.iter().map(|e| &e.file_path).collect::<Vec<_>>()
+        );
+        assert_eq!(entries[0].qualified_name, "Config::load");
+        assert_eq!(entries[0].file_path, "ambiguous: 2 candidates");
+        assert_eq!(
+            entries[0].intent_summary,
+            "Ambiguous: 2 symbols share this name (billing/src/Config.java, orders/src/Config.java)."
+        );
+
+        // Billing's `Config::load` has one caller: the parent module's call is ambiguous.
+        let entries =
+            super::build_graph_entries(&store, workspace, &billing_load, 1).expect("load graph");
+        let callers = entries
+            .iter()
+            .filter(|entry| entry.section == "callers")
+            .map(|entry| entry.qualified_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(callers, vec!["Job::run"]);
+    }
+
+    #[test]
+    fn graph_context_resolves_rust_method_calls_within_the_callers_file() {
+        // `S::run` calls `self.helper()`, recorded as the bare name `helper`. `S::helper`
+        // is in the same file, so that is the callee; the free `helper` in another file
+        // of the crate is not, and `main`'s `v.len()` doesn't reach `Buf::len`.
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let store = SqliteStore::open(workspace).expect("open store");
+        let rust = |id: &str, file_path: &str, kind: &str, qualified_name: &str| SymbolRecord {
+            id: id.to_owned(),
+            file_path: file_path.to_owned(),
+            language: "rust".to_owned(),
+            kind: kind.to_owned(),
+            qualified_name: qualified_name.to_owned(),
+            signature_fingerprint: format!("sig-{id}"),
+            last_seen_at: 1_700_000_000,
+        };
+        let run = rust("run", "src/s.rs", "method", "S::run");
+        let method_helper = rust("s-helper", "src/s.rs", "method", "S::helper");
+        let free_helper = rust("free-helper", "src/util.rs", "function", "helper");
+        let buf_len = rust("buf-len", "src/buf.rs", "method", "Buf::len");
+        let main = rust("main", "src/main.rs", "function", "main");
+        for record in [&run, &method_helper, &free_helper, &buf_len, &main] {
+            store.upsert_symbol(record.clone()).expect("upsert symbol");
+        }
+        let call = |source: &SymbolRecord, target: &str| SymbolEdge {
+            source_id: source.id.clone(),
+            target_qualified_name: target.to_owned(),
+            edge_kind: EdgeKind::Calls,
+            file_path: source.file_path.clone(),
+        };
+        store
+            .upsert_edges(&[call(&run, "helper"), call(&main, "len")])
+            .expect("upsert edges");
+
+        let section = |record: &SymbolRecord, section: &str| {
+            super::build_graph_entries(&store, workspace, record, 1)
+                .expect("graph entries")
+                .into_iter()
+                .filter(|entry| entry.section == section)
+                .map(|entry| entry.qualified_name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(section(&run, "callees"), vec!["S::helper".to_owned()]);
+        assert_eq!(
+            section(&method_helper, "callers"),
+            vec!["S::run".to_owned()]
+        );
+        assert!(section(&free_helper, "callers").is_empty());
+        assert!(section(&main, "callees").is_empty());
+        assert!(section(&buf_len, "callers").is_empty());
+    }
+
+    #[test]
     fn graph_context_includes_call_and_type_edges_at_each_depth() {
         let temp = tempdir().expect("tempdir");
         let symbols = seed_workspace(temp.path(), false);
@@ -1216,7 +1433,8 @@ vector_backend = "sqlite"
             .expect("typed edges");
 
         let record = symbol_record(target);
-        let entries = super::build_graph_entries(store, &record, 2).expect("graph entries");
+        let entries =
+            super::build_graph_entries(store, temp.path(), &record, 2).expect("graph entries");
         assert!(entries.iter().any(|entry| entry.section == "callees"
             && entry.qualified_name == "callee"
             && entry.relationship == "calls"));
@@ -1243,7 +1461,7 @@ vector_backend = "sqlite"
                 .any(|entry| entry.qualified_name == "unresolved_external")
         );
 
-        let graph = super::build_graph_layer(store, &record, 1);
+        let graph = super::build_graph_layer(store, temp.path(), &record, 1);
         assert!(graph.contains("### Callees (2)"), "{graph}");
         assert!(graph.contains("`callee` (src/lib.rs) [calls]"), "{graph}");
     }
@@ -1291,7 +1509,7 @@ vector_backend = "sqlite"
             .expect("test intents");
 
         let record = symbol_record(target);
-        let layer = super::build_tests_layer(store, &record);
+        let layer = super::build_tests_layer(store, temp.path(), &record);
         assert!(
             layer.contains("Showing 5 of 7 candidates; 2 omitted"),
             "{layer}"

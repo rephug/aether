@@ -111,6 +111,164 @@ fn same_name_types_in_different_packages_keep_their_own_methods() {
 }
 
 #[test]
+fn same_name_types_in_maven_modules_and_dotnet_projects_keep_their_own_methods() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    write_embeddings_only_config(workspace);
+    for (manifest, contents) in [
+        ("pom.xml", "<project/>\n"),
+        ("billing/pom.xml", "<project/>\n"),
+        ("orders/build.gradle.kts", "plugins {}\n"),
+        ("Directory.Build.props", "<Project/>\n"),
+        ("src/Billing/Billing.csproj", "<Project/>\n"),
+        ("src/Orders/Orders.csproj", "<Project/>\n"),
+    ] {
+        let path = workspace.join(manifest);
+        fs::create_dir_all(path.parent().expect("manifest has a parent")).expect("create dir");
+        fs::write(path, contents).expect("write manifest");
+    }
+
+    // Each Maven or Gradle module declares its own `Status` enum; Java declares methods
+    // in their type's file, so these keep their own methods by file alone. Each .NET
+    // project declares its own `partial struct Money` whose `Round` is in a second file,
+    // which counts for the project's `Money` only once projects are told apart.
+    let java = "src/main/java/com/acme";
+    let record = |id: &str, qualified_name: &str, kind: &str, file_path: String, language: &str| {
+        SymbolRecord {
+            language: language.to_owned(),
+            ..demo_symbol_record_with_kind(id, qualified_name, kind, file_path.as_str())
+        }
+    };
+    let records = [
+        record(
+            "b-status",
+            "Status",
+            "enum",
+            format!("billing/{java}/Status.java"),
+            "java",
+        ),
+        record(
+            "b-label",
+            "Status::label",
+            "method",
+            format!("billing/{java}/Status.java"),
+            "java",
+        ),
+        record(
+            "o-status",
+            "Status",
+            "enum",
+            format!("orders/{java}/Status.java"),
+            "java",
+        ),
+        record(
+            "o-label",
+            "Status::label",
+            "method",
+            format!("orders/{java}/Status.java"),
+            "java",
+        ),
+        record(
+            "b-money",
+            "Money",
+            "struct",
+            "src/Billing/Money.cs".to_owned(),
+            "csharp",
+        ),
+        record(
+            "b-round",
+            "Money::Round",
+            "method",
+            "src/Billing/Rounding.cs".to_owned(),
+            "csharp",
+        ),
+        record(
+            "o-money",
+            "Money",
+            "struct",
+            "src/Orders/Money.cs".to_owned(),
+            "csharp",
+        ),
+        record(
+            "o-round",
+            "Money::Round",
+            "method",
+            "src/Orders/Rounding.cs".to_owned(),
+            "csharp",
+        ),
+    ];
+    let edges = [
+        calls(
+            "b-label",
+            "BillingLabels",
+            &format!("billing/{java}/Status.java"),
+        ),
+        calls(
+            "o-label",
+            "OrderLabels",
+            &format!("orders/{java}/Status.java"),
+        ),
+        calls("b-round", "BillingMath", "src/Billing/Rounding.cs"),
+        calls("o-round", "OrderMath", "src/Orders/Rounding.cs"),
+    ];
+
+    let typed = |id: &str, name: &str, kind: SymbolKind, file_path: String, language| Symbol {
+        language,
+        ..type_symbol(id, name, kind, file_path.as_str())
+    };
+    let cases = [
+        (
+            typed(
+                "b-status",
+                "Status",
+                SymbolKind::Enum,
+                format!("billing/{java}/Status.java"),
+                Language::Java,
+            ),
+            deps(&[("label", &["BillingLabels"])]),
+        ),
+        (
+            typed(
+                "o-status",
+                "Status",
+                SymbolKind::Enum,
+                format!("orders/{java}/Status.java"),
+                Language::Java,
+            ),
+            deps(&[("label", &["OrderLabels"])]),
+        ),
+        (
+            typed(
+                "b-money",
+                "Money",
+                SymbolKind::Struct,
+                "src/Billing/Money.cs".to_owned(),
+                Language::CSharp,
+            ),
+            deps(&[("Round", &["BillingMath"])]),
+        ),
+        (
+            typed(
+                "o-money",
+                "Money",
+                SymbolKind::Struct,
+                "src/Orders/Money.cs".to_owned(),
+                Language::CSharp,
+            ),
+            deps(&[("Round", &["OrderMath"])]),
+        ),
+    ];
+    for (parent, expected) in cases {
+        assert_eq!(
+            inject_for(workspace, &records, &edges, &parent),
+            expected,
+            "{}",
+            parent.file_path
+        );
+    }
+}
+
+#[test]
 fn cross_file_methods_of_a_type_unique_in_its_package_are_attributed() {
     let temp = tempdir().expect("tempdir");
     let workspace = temp.path();

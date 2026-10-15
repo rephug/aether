@@ -173,17 +173,22 @@ impl SqliteStore {
     pub fn list_graph_dependency_edges(
         &self,
     ) -> Result<Vec<GraphDependencyEdgeRecord>, StoreError> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let sql = format!(
             r#"
+            WITH {EDGE_FILE_LANGUAGE_CTE}
             SELECT e.source_id, target.id, e.edge_kind
             FROM symbol_edges e
+            LEFT JOIN edge_file_language source_file ON source_file.file_path = e.file_path
             JOIN symbols target
               ON target.qualified_name = e.target_qualified_name
+             AND {family}
             WHERE e.edge_kind IN ('calls', 'depends_on', 'type_ref', 'implements')
             ORDER BY e.source_id ASC, target.id ASC, e.edge_kind ASC
             "#,
-        )?;
+            family = edge_source_family_matches_sql("source_file.language", "target.language"),
+        );
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], |row| {
             Ok(GraphDependencyEdgeRecord {
                 source_symbol_id: row.get(0)?,
@@ -272,21 +277,24 @@ impl SqliteStore {
             graph_store.upsert_symbol_node(symbol).await?;
         }
 
+        let family = same_language_family_sql("source.language", "target.language");
         let (unresolved_edges, resolved) = {
             let conn = self.conn.lock().unwrap();
             let mut unresolved_edges = 0usize;
-            let mut unresolved_stmt = conn.prepare(
+            let mut unresolved_stmt = conn.prepare(&format!(
                 r#"
                 SELECT e.source_id, e.target_qualified_name, e.edge_kind
                 FROM symbol_edges e
                 JOIN symbols source ON source.id = e.source_id
-                LEFT JOIN symbols target ON target.qualified_name = e.target_qualified_name
+                LEFT JOIN symbols target
+                  ON target.qualified_name = e.target_qualified_name
+                 AND {family}
                 WHERE e.file_path = ?1
                   AND e.edge_kind IN ('calls', 'type_ref', 'implements')
                   AND target.id IS NULL
                 ORDER BY e.source_id ASC, e.target_qualified_name ASC, e.edge_kind ASC
-                "#,
-            )?;
+                "#
+            ))?;
             let unresolved_rows = unresolved_stmt.query_map(params![file_path], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -306,17 +314,19 @@ impl SqliteStore {
                 );
             }
 
-            let mut resolved_stmt = conn.prepare(
+            let mut resolved_stmt = conn.prepare(&format!(
                 r#"
                 SELECT e.source_id, target.id, e.edge_kind, e.file_path
                 FROM symbol_edges e
                 JOIN symbols source ON source.id = e.source_id
-                JOIN symbols target ON target.qualified_name = e.target_qualified_name
+                JOIN symbols target
+                  ON target.qualified_name = e.target_qualified_name
+                 AND {family}
                 WHERE e.file_path = ?1
                   AND e.edge_kind IN ('calls', 'type_ref', 'implements')
                 ORDER BY e.source_id ASC, target.id ASC, e.edge_kind ASC
-                "#,
-            )?;
+                "#
+            ))?;
             let resolved_rows = resolved_stmt.query_map(params![file_path], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -411,46 +421,55 @@ impl SqliteStore {
             "#,
             params![file_path],
         )?;
+        let family = same_language_family_sql("s_source.language", "s_target.language");
         tx.execute(
-            r#"
-            INSERT OR REPLACE INTO symbol_neighbors (
-                symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file
-            )
-            SELECT
-                e.source_id,
-                s_target.id,
-                e.edge_kind,
-                s_target.qualified_name,
-                s_target.file_path
-            FROM symbol_edges e
-            JOIN symbols s_source ON s_source.id = e.source_id
-            JOIN symbols s_target ON s_target.qualified_name = e.target_qualified_name
-            WHERE s_source.file_path = ?1
-            "#,
+            &format!(
+                r#"
+                INSERT OR REPLACE INTO symbol_neighbors (
+                    symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file
+                )
+                SELECT
+                    e.source_id,
+                    s_target.id,
+                    e.edge_kind,
+                    s_target.qualified_name,
+                    s_target.file_path
+                FROM symbol_edges e
+                JOIN symbols s_source ON s_source.id = e.source_id
+                JOIN symbols s_target
+                  ON s_target.qualified_name = e.target_qualified_name
+                 AND {family}
+                WHERE s_source.file_path = ?1
+                "#
+            ),
             params![file_path],
         )?;
         tx.execute(
-            r#"
-            INSERT OR REPLACE INTO symbol_neighbors (
-                symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file
-            )
-            SELECT
-                s_target.id,
-                e.source_id,
-                CASE e.edge_kind
-                    WHEN 'calls' THEN 'called_by'
-                    WHEN 'depends_on' THEN 'depended_on_by'
-                    WHEN 'implements' THEN 'implemented_by'
-                    WHEN 'type_ref' THEN 'type_ref_by'
-                    ELSE e.edge_kind || '_reverse'
-                END,
-                s_source.qualified_name,
-                s_source.file_path
-            FROM symbol_edges e
-            JOIN symbols s_source ON s_source.id = e.source_id
-            JOIN symbols s_target ON s_target.qualified_name = e.target_qualified_name
-            WHERE s_source.file_path = ?1
-            "#,
+            &format!(
+                r#"
+                INSERT OR REPLACE INTO symbol_neighbors (
+                    symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file
+                )
+                SELECT
+                    s_target.id,
+                    e.source_id,
+                    CASE e.edge_kind
+                        WHEN 'calls' THEN 'called_by'
+                        WHEN 'depends_on' THEN 'depended_on_by'
+                        WHEN 'implements' THEN 'implemented_by'
+                        WHEN 'type_ref' THEN 'type_ref_by'
+                        ELSE e.edge_kind || '_reverse'
+                    END,
+                    s_source.qualified_name,
+                    s_source.file_path
+                FROM symbol_edges e
+                JOIN symbols s_source ON s_source.id = e.source_id
+                JOIN symbols s_target
+                  ON s_target.qualified_name = e.target_qualified_name
+                 AND {family}
+                WHERE s_source.file_path = ?1
+                "#
+            ),
             params![file_path],
         )?;
         tx.commit()?;
@@ -603,22 +622,27 @@ impl SqliteStore {
             return Ok(false);
         }
 
+        let family = same_language_family_sql("s_source.language", "s_target.language");
         let exists = self.conn.lock().unwrap().query_row(
-            r#"
-            SELECT EXISTS (
-                SELECT 1
-                FROM symbol_edges e
-                JOIN symbols s_source ON s_source.id = e.source_id
-                JOIN symbols s_target ON s_target.qualified_name = e.target_qualified_name
-                WHERE e.edge_kind IN ('calls', 'depends_on', 'type_ref', 'implements')
-                  AND (
-                      (s_source.file_path = ?1 AND s_target.file_path = ?2)
-                      OR
-                      (s_source.file_path = ?2 AND s_target.file_path = ?1)
-                  )
-                LIMIT 1
-            )
-            "#,
+            &format!(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM symbol_edges e
+                    JOIN symbols s_source ON s_source.id = e.source_id
+                    JOIN symbols s_target
+                      ON s_target.qualified_name = e.target_qualified_name
+                     AND {family}
+                    WHERE e.edge_kind IN ('calls', 'depends_on', 'type_ref', 'implements')
+                      AND (
+                          (s_source.file_path = ?1 AND s_target.file_path = ?2)
+                          OR
+                          (s_source.file_path = ?2 AND s_target.file_path = ?1)
+                      )
+                    LIMIT 1
+                )
+                "#
+            ),
             params![file_a, file_b],
             |row| row.get::<_, i64>(0),
         )?;

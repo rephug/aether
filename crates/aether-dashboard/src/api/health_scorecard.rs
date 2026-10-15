@@ -6,6 +6,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use aether_config::GraphBackend;
+use aether_store::{EDGE_FILE_LANGUAGE_CTE, edge_source_family_matches_sql};
 
 use crate::state::SharedState;
 use crate::support::{self, DashboardState};
@@ -226,21 +227,28 @@ fn load_sqlite_metrics(shared: &SharedState) -> Result<(i64, i64, f64, i64, f64)
         Err(_) => 0.0,
     };
 
-    // Orphan count: symbols with no edges (neither as source nor target)
+    // Orphan count: symbols with no edges (neither as source nor target). An edge
+    // reaches a symbol only from the symbol's own language family.
     let orphan_count = match conn.query_row(
-        r#"
-        SELECT COUNT(*)
-        FROM symbols s
-        WHERE NOT EXISTS (
-            SELECT 1 FROM symbol_edges e
-            WHERE e.source_id = s.id
-        )
-        AND NOT EXISTS (
-            SELECT 1 FROM symbol_edges e2
-            JOIN symbols t ON t.qualified_name = e2.target_qualified_name
-            WHERE t.id = s.id
-        )
-        "#,
+        &format!(
+            r#"
+            WITH {EDGE_FILE_LANGUAGE_CTE}
+            SELECT COUNT(*)
+            FROM symbols s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM symbol_edges e
+                WHERE e.source_id = s.id
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM symbol_edges e2
+                LEFT JOIN edge_file_language source_file
+                  ON source_file.file_path = e2.file_path
+                WHERE e2.target_qualified_name = s.qualified_name
+                  AND {family}
+            )
+            "#,
+            family = edge_source_family_matches_sql("source_file.language", "s.language"),
+        ),
         [],
         |row| row.get::<_, i64>(0),
     ) {

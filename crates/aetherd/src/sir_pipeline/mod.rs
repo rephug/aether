@@ -19,7 +19,7 @@ use aether_infer::{
 };
 #[cfg(test)]
 use aether_infer::{InferError, SirContext};
-use aether_parse::SymbolExtractor;
+use aether_parse::{ModuleRoots, SymbolExtractor};
 use aether_sir::{
     FileSir, SirAnnotation, canonicalize_file_sir_json, canonicalize_sir_json, file_sir_hash,
     sir_hash, synthetic_file_sir_id, validate_sir,

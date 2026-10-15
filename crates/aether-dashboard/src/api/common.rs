@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use aether_analysis::{GraphAlgorithmEdge, connected_components, louvain_communities, page_rank};
 use aether_config::GraphBackend;
+use aether_store::{EDGE_FILE_LANGUAGE_CTE, edge_source_family_matches_sql};
 
 use crate::state::SharedState;
 use crate::support;
@@ -89,14 +90,19 @@ pub(crate) fn load_dependency_algo_edges(
     };
 
     let mut stmt = conn
-        .prepare(
+        .prepare(&format!(
             r#"
+            WITH {EDGE_FILE_LANGUAGE_CTE}
             SELECT e.source_id, t.id, e.edge_kind
             FROM symbol_edges e
-            JOIN symbols t ON t.qualified_name = e.target_qualified_name
+            LEFT JOIN edge_file_language source_file ON source_file.file_path = e.file_path
+            JOIN symbols t
+              ON t.qualified_name = e.target_qualified_name
+             AND {family}
             WHERE e.edge_kind IN ('calls', 'depends_on', 'type_ref', 'implements')
             "#,
-        )
+            family = edge_source_family_matches_sql("source_file.language", "t.language"),
+        ))
         .map_err(|e| e.to_string())?;
 
     let rows = stmt

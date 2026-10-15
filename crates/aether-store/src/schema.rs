@@ -743,7 +743,7 @@ pub(crate) fn apply_migrations(tx: &Transaction<'_>, version: i32) -> Result<(),
 
     Ok(())
 }
-fn rebuild_symbol_neighbors(conn: &Connection) -> Result<(), StoreError> {
+pub(crate) fn rebuild_symbol_neighbors(conn: &Connection) -> Result<(), StoreError> {
     if !table_exists(conn, "symbol_neighbors")?
         || !table_exists(conn, "symbol_edges")?
         || !table_exists(conn, "symbols")?
@@ -752,7 +752,8 @@ fn rebuild_symbol_neighbors(conn: &Connection) -> Result<(), StoreError> {
     }
 
     conn.execute("DELETE FROM symbol_neighbors", [])?;
-    conn.execute_batch(
+    let family = same_language_family_sql("s_source.language", "s_target.language");
+    conn.execute_batch(&format!(
         r#"
         INSERT OR REPLACE INTO symbol_neighbors (
             symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file
@@ -765,7 +766,9 @@ fn rebuild_symbol_neighbors(conn: &Connection) -> Result<(), StoreError> {
             s_target.file_path
         FROM symbol_edges e
         JOIN symbols s_source ON s_source.id = e.source_id
-        JOIN symbols s_target ON s_target.qualified_name = e.target_qualified_name;
+        JOIN symbols s_target
+          ON s_target.qualified_name = e.target_qualified_name
+         AND {family};
 
         INSERT OR REPLACE INTO symbol_neighbors (
             symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file
@@ -784,9 +787,11 @@ fn rebuild_symbol_neighbors(conn: &Connection) -> Result<(), StoreError> {
             s_source.file_path
         FROM symbol_edges e
         JOIN symbols s_source ON s_source.id = e.source_id
-        JOIN symbols s_target ON s_target.qualified_name = e.target_qualified_name;
-        "#,
-    )?;
+        JOIN symbols s_target
+          ON s_target.qualified_name = e.target_qualified_name
+         AND {family};
+        "#
+    ))?;
 
     Ok(())
 }

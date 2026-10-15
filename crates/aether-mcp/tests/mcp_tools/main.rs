@@ -57,7 +57,9 @@ fn symbol_access_count(workspace: &Path, symbol_id: &str) -> Result<i64> {
 fn rebuild_symbol_neighbors(workspace: &Path) -> Result<()> {
     let conn = Connection::open(workspace.join(".aether/meta.sqlite"))?;
     conn.execute("DELETE FROM symbol_neighbors", [])?;
-    conn.execute_batch(
+    // The same rows the store writes: edges resolve within the source's language family.
+    let family = aether_store::same_language_family_sql("s_source.language", "s_target.language");
+    conn.execute_batch(&format!(
         r#"
         INSERT OR REPLACE INTO symbol_neighbors (
             symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file
@@ -70,7 +72,9 @@ fn rebuild_symbol_neighbors(workspace: &Path) -> Result<()> {
             s_target.file_path
         FROM symbol_edges e
         JOIN symbols s_source ON s_source.id = e.source_id
-        JOIN symbols s_target ON s_target.qualified_name = e.target_qualified_name;
+        JOIN symbols s_target
+          ON s_target.qualified_name = e.target_qualified_name
+         AND {family};
 
         INSERT OR REPLACE INTO symbol_neighbors (
             symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file
@@ -89,9 +93,11 @@ fn rebuild_symbol_neighbors(workspace: &Path) -> Result<()> {
             s_source.file_path
         FROM symbol_edges e
         JOIN symbols s_source ON s_source.id = e.source_id
-        JOIN symbols s_target ON s_target.qualified_name = e.target_qualified_name;
-        "#,
-    )?;
+        JOIN symbols s_target
+          ON s_target.qualified_name = e.target_qualified_name
+         AND {family};
+        "#
+    ))?;
     Ok(())
 }
 

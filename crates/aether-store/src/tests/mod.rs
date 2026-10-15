@@ -192,9 +192,12 @@ fn seed_live_symbol_cleanup_state(store: &SqliteStore, symbol_id: &str) {
     let mut record = symbol_record();
     record.id = symbol_id.to_owned();
     record.qualified_name = format!("demo::{symbol_id}");
+    // The neighbor is in the symbol's language, so the edge resolves to it.
     let mut neighbor = symbol_record_ts();
     neighbor.id = format!("{symbol_id}-neighbor");
     neighbor.qualified_name = format!("demo::{symbol_id}::neighbor");
+    neighbor.file_path = "src/neighbor.rs".to_owned();
+    neighbor.language = record.language.clone();
 
     store
         .upsert_symbol(record.clone())
@@ -226,6 +229,13 @@ fn seed_live_symbol_cleanup_state(store: &SqliteStore, symbol_id: &str) {
     store
         .populate_symbol_neighbors(record.file_path.as_str())
         .expect("populate cleanup neighbors");
+    assert!(
+        !store
+            .get_symbol_neighbors(symbol_id)
+            .expect("load cleanup neighbors")
+            .is_empty(),
+        "the cleanup fixture should start with neighbor rows"
+    );
     store
         .enqueue_sir_request(symbol_id)
         .expect("enqueue cleanup request");
@@ -469,6 +479,7 @@ fn implements_edge(source_id: &str, target: &str, file_path: &str) -> SymbolEdge
 
 mod audit;
 mod basic;
+mod language_family;
 mod migrations;
 mod neighbors;
 mod notes_and_analysis;
