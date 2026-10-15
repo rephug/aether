@@ -13,6 +13,10 @@ use crate::parser::{TestIntent, humanize_test_name, normalize_intent_text};
 use crate::parser::{build_symbol, named_child_text, node_text};
 use crate::registry::{LanguageConfig, LanguageHooks, QueryCaptures};
 
+mod workspace;
+
+pub(crate) use workspace::PythonWorkspace;
+
 pub fn config() -> LanguageConfig {
     let ts_language = tree_sitter_python::LANGUAGE.into();
     let symbol_query = Query::new(&ts_language, include_str!("../queries/python_symbols.scm"))

@@ -564,3 +564,86 @@ fn process_quality_batch_batches_embeddings_and_completes_intents() {
             .is_some()
     );
 }
+
+#[test]
+fn process_event_resolves_python_calls_through_package_reexports() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    write_embeddings_only_config(workspace);
+    for (path, source) in [
+        ("pkg/__init__.py", "from .impl import f\n"),
+        ("pkg/impl.py", "def f():\n    return 1\n"),
+        (
+            "tests/test_pkg.py",
+            "from pkg import f\n\n\ndef test_f():\n    f()\n",
+        ),
+    ] {
+        let full_path = workspace.join(path);
+        fs::create_dir_all(full_path.parent().expect("parent")).expect("create dirs");
+        fs::write(full_path, source).expect("write source");
+    }
+
+    let store = SqliteStore::open(workspace).expect("open store");
+    let source = fs::read_to_string(workspace.join("tests/test_pkg.py")).expect("read source");
+    let test_f = SymbolExtractor::new()
+        .expect("symbol extractor")
+        .extract_with_edges_from_path(Path::new("tests/test_pkg.py"), &source)
+        .expect("extract source")
+        .symbols
+        .into_iter()
+        .find(|symbol| symbol.qualified_name == "tests.test_pkg::test_f")
+        .expect("test symbol");
+    store
+        .upsert_symbol(demo_symbol_record_with_kind(
+            test_f.id.as_str(),
+            test_f.qualified_name.as_str(),
+            test_f.kind.as_str(),
+            test_f.file_path.as_str(),
+        ))
+        .expect("upsert symbol");
+
+    let provider = Arc::new(FixedInferenceProvider {
+        sir: SirAnnotation {
+            intent: "Checks f".to_owned(),
+            behavior: None,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            side_effects: Vec::new(),
+            dependencies: Vec::new(),
+            error_modes: Vec::new(),
+            confidence: 0.9,
+            edge_cases: None,
+            complexity: None,
+            method_dependencies: None,
+        },
+    });
+    let pipeline = build_write_pipeline(workspace, provider).with_skip_surreal_sync(true);
+    let event = SymbolChangeEvent {
+        file_path: "tests/test_pkg.py".to_owned(),
+        language: Language::Python,
+        added: Vec::new(),
+        removed: Vec::new(),
+        updated: vec![test_f.clone()],
+    };
+    pipeline
+        .process_event_with_priority_and_pass(
+            &store,
+            &event,
+            true,
+            false,
+            &mut Vec::new(),
+            None,
+            SIR_GENERATION_PASS_REGENERATED,
+        )
+        .expect("process event");
+
+    // The pipeline re-extracts the file's edges as the structural indexer does: through
+    // the package's re-export, not as the raw `pkg::f`.
+    let targets = store
+        .list_symbol_edges_for_source_and_kinds(test_f.id.as_str(), &[EdgeKind::Calls])
+        .expect("read edges")
+        .into_iter()
+        .map(|edge| edge.target_qualified_name)
+        .collect::<Vec<_>>();
+    assert_eq!(targets, vec!["pkg.impl::f".to_owned()]);
+}
