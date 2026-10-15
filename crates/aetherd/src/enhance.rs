@@ -898,14 +898,6 @@ fn resolve_symbol_query(
         records.push(record);
     }
 
-    if let Some(record) = store
-        .get_symbol_by_qualified_name(query)
-        .with_context(|| format!("failed to resolve symbol name {query}"))?
-        && seen.insert(record.id.clone())
-    {
-        records.push(record);
-    }
-
     for candidate in store
         .find_symbol_search_results_by_qualified_name(query)
         .with_context(|| format!("failed to search symbol name {query}"))?

@@ -24,8 +24,10 @@ mod contracts;
 mod embeddings;
 mod fingerprint_history;
 mod graph;
+mod language_family;
 mod lexical;
 mod lifecycle;
+mod name_resolution;
 mod project_notes;
 mod schema;
 mod seismograph;
@@ -69,6 +71,13 @@ pub use graph::{
     CouplingEdgeRecord, GraphDependencyEdgeRecord, GraphSyncStats, ResolvedEdge,
     SymbolNeighborRecord, TestedByRecord, UpstreamDependencyEdgeRecord,
     UpstreamDependencyNodeRecord, UpstreamDependencyTraversal,
+};
+pub use language_family::{
+    EDGE_FILE_LANGUAGE_CTE, edge_source_family_matches_sql, same_language_family_sql,
+};
+pub use name_resolution::{
+    NameResolution, NameSite, ambiguity_label, ambiguity_note, call_target_candidates,
+    call_targets_of, narrow_name_candidates,
 };
 pub use project_notes::{
     ProjectEntityRefRecord, ProjectNoteEmbeddingRecord, ProjectNoteRecord,

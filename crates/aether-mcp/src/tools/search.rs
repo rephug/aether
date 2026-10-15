@@ -21,7 +21,8 @@ use serde_json::Value;
 
 use super::callers::CallerAttribution;
 use super::{
-    AetherMcpServer, LiveSymbolSources, child_method_symbols, effective_limit, is_type_symbol_kind,
+    AetherMcpServer, LiveSymbolSources, ambiguous_selector, child_method_symbols, effective_limit,
+    is_type_symbol_kind,
 };
 use crate::state::semantic_search_unavailability;
 use crate::{AetherMcpError, SearchMode};
@@ -474,7 +475,13 @@ impl AetherMcpServer {
             start_symbol = store.get_symbol_record(&symbol_id_input)?;
         }
         if start_symbol.is_none() && !qualified_name_input.is_empty() {
-            start_symbol = store.get_symbol_by_qualified_name(&qualified_name_input)?;
+            let exact_matches =
+                store.find_symbol_search_results_by_qualified_name(&qualified_name_input)?;
+            match exact_matches.as_slice() {
+                [] => {}
+                [only] => start_symbol = store.get_symbol_record(only.symbol_id.as_str())?,
+                many => return Err(ambiguous_selector(qualified_name_input.as_str(), many)),
+            }
         }
         let Some(start_symbol) = start_symbol else {
             return Ok(AetherCallChainResponse {

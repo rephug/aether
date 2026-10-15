@@ -506,9 +506,22 @@ fn resolve_symbol_id(store: &SqliteStore, selector: &str) -> Result<String> {
     if let Ok(Some(_)) = store.get_symbol_record(selector) {
         return Ok(selector.to_owned());
     }
-    // Try qualified name lookup
-    if let Ok(Some(record)) = store.get_symbol_by_qualified_name(selector) {
-        return Ok(record.id);
+    // Try qualified name lookup; a name several symbols share is ambiguous.
+    if let Ok(matches) = store.find_symbol_search_results_by_qualified_name(selector) {
+        match matches.as_slice() {
+            [] => {}
+            [only] => return Ok(only.symbol_id.clone()),
+            many => {
+                let candidates = many
+                    .iter()
+                    .map(|candidate| format!("{} [{}]", candidate.symbol_id, candidate.file_path))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(anyhow!(
+                    "symbol '{selector}' is ambiguous; use one of these IDs: {candidates}"
+                ));
+            }
+        }
     }
     Err(anyhow!(
         "symbol '{selector}' not found (tried as ID and qualified name)"

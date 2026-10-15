@@ -28,7 +28,7 @@ impl SirPipeline {
             return Ok(());
         }
 
-        let mut packages = PackageRoots::new(self.workspace_root.as_path());
+        let mut packages = ModuleRoots::new(self.workspace_root.as_path());
         let parent = MethodParent {
             id: symbol.id.as_str(),
             qualified_name: symbol.qualified_name.as_str(),
@@ -660,9 +660,6 @@ impl SirPipeline {
 /// Symbol kinds whose SIR lists the dependencies of their methods.
 const METHOD_PARENT_KINDS: [&str; 4] = ["trait", "struct", "enum", "type_alias"];
 
-/// Files whose directory is the root of a package.
-const PACKAGE_MANIFESTS: [&str; 3] = ["Cargo.toml", "package.json", "pyproject.toml"];
-
 /// The type whose methods are being collected.
 struct MethodParent<'a> {
     id: &'a str,
@@ -674,14 +671,16 @@ struct MethodParent<'a> {
 /// Dependencies of the methods that belong to `parent`, keyed by method name, with
 /// each dependency spelled by its leaf name.
 ///
-/// Rust qualified names carry no module path, so `Store::load` can name a method of
-/// any `Store`. A method counts for `parent` only when it is a direct child in the
-/// same language, declared in the parent's file or in another file of the same
-/// package, and that package declares no other type with the parent's name.
+/// Rust, Java and C# qualified names carry no module, package or namespace, so
+/// `Store::load` can name a method of any `Store`. A method counts for `parent` only
+/// when it is a direct child in the same language, declared in the parent's file or in
+/// another file of the same package (the parent's [`ModuleRoots`] module: a crate, a
+/// Maven or Gradle module, a .NET project, ...), and that package declares no other
+/// type with the parent's name.
 fn owned_method_dependencies(
     store: &SqliteStore,
     parent: &MethodParent<'_>,
-    packages: &mut PackageRoots<'_>,
+    packages: &mut ModuleRoots,
 ) -> Result<BTreeMap<String, Vec<String>>> {
     let prefix = format!("{}::", parent.qualified_name);
     // The package whose other files may declare the parent's methods, worked out on
@@ -705,7 +704,7 @@ fn owned_method_dependencies(
                 Some(package) => package.clone(),
                 None => {
                     let package = if is_only_type_in_package(store, parent, packages)? {
-                        packages.package_of(parent.file_path)
+                        packages.module_of(parent.file_path)
                     } else {
                         None
                     };
@@ -716,7 +715,7 @@ fn owned_method_dependencies(
             let Some(package) = package else {
                 continue;
             };
-            if packages.package_of(child.file_path.as_str()) != Some(package) {
+            if packages.module_of(child.file_path.as_str()) != Some(package) {
                 continue;
             }
         }
@@ -745,63 +744,19 @@ fn owned_method_dependencies(
 fn is_only_type_in_package(
     store: &SqliteStore,
     parent: &MethodParent<'_>,
-    packages: &mut PackageRoots<'_>,
+    packages: &mut ModuleRoots,
 ) -> Result<bool> {
-    let Some(package) = packages.package_of(parent.file_path) else {
+    let Some(package) = packages.module_of(parent.file_path) else {
         return Ok(false);
     };
     let mut same_package = Vec::new();
     for candidate in store.find_symbol_search_results_by_qualified_name(parent.qualified_name)? {
         if candidate.language == parent.language
             && METHOD_PARENT_KINDS.contains(&candidate.kind.as_str())
-            && packages.package_of(candidate.file_path.as_str()).as_ref() == Some(&package)
+            && packages.module_of(candidate.file_path.as_str()).as_ref() == Some(&package)
         {
             same_package.push(candidate.symbol_id);
         }
     }
     Ok(same_package.len() == 1 && same_package[0] == parent.id)
-}
-
-/// Maps workspace-relative files to their package: the nearest directory from the
-/// file's own up to the workspace root that holds a package manifest, or the
-/// workspace root when none does.
-struct PackageRoots<'a> {
-    workspace_root: &'a Path,
-    by_dir: HashMap<PathBuf, PathBuf>,
-}
-
-impl<'a> PackageRoots<'a> {
-    fn new(workspace_root: &'a Path) -> Self {
-        Self {
-            workspace_root,
-            by_dir: HashMap::new(),
-        }
-    }
-
-    /// The workspace-relative package directory of `file_path`, or `None` when the
-    /// path isn't a plain relative path inside the workspace.
-    fn package_of(&mut self, file_path: &str) -> Option<PathBuf> {
-        let file_path = Path::new(file_path);
-        if !file_path
-            .components()
-            .all(|component| matches!(component, std::path::Component::Normal(_)))
-        {
-            return None;
-        }
-        let dir = file_path.parent().unwrap_or(Path::new("")).to_path_buf();
-        if let Some(package) = self.by_dir.get(&dir) {
-            return Some(package.clone());
-        }
-        let package = dir
-            .ancestors()
-            .find(|ancestor| {
-                PACKAGE_MANIFESTS
-                    .iter()
-                    .any(|manifest| self.workspace_root.join(ancestor).join(manifest).is_file())
-            })
-            .unwrap_or(Path::new(""))
-            .to_path_buf();
-        self.by_dir.insert(dir, package.clone());
-        Some(package)
-    }
 }

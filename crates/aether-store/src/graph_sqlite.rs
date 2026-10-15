@@ -5,7 +5,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rusqlite::{Connection, OpenFlags, params};
 
-use super::{GraphStore, ResolvedEdge, StoreError, SymbolRecord, run_migrations};
+use super::{
+    GraphStore, ResolvedEdge, StoreError, SymbolRecord, run_migrations, same_language_family_sql,
+};
 
 pub struct SqliteGraphStore {
     sqlite_path: PathBuf,
@@ -77,9 +79,14 @@ impl GraphStore for SqliteGraphStore {
             return Ok(Vec::new());
         }
 
+        // A call edge to the name counts unless every symbol with that name is outside
+        // the caller's language family. The languages of those symbols are read once.
         let conn = self.connection()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             r#"
+            WITH target_languages(language) AS MATERIALIZED (
+                SELECT DISTINCT language FROM symbols WHERE qualified_name = ?1
+            )
             SELECT DISTINCT
                 s.id,
                 s.file_path,
@@ -97,13 +104,22 @@ impl GraphStore for SqliteGraphStore {
                 UNION
                 SELECT e.source_id AS caller_id
                 FROM symbol_edges e
+                JOIN symbols caller ON caller.id = e.source_id
                 WHERE e.edge_kind = 'calls'
                   AND e.target_qualified_name = ?1
+                  AND (
+                      NOT EXISTS (SELECT 1 FROM target_languages)
+                      OR EXISTS (
+                          SELECT 1 FROM target_languages target
+                          WHERE {family}
+                      )
+                  )
             ) callers
             JOIN symbols s ON s.id = callers.caller_id
             ORDER BY s.qualified_name ASC, s.id ASC
             "#,
-        )?;
+            family = same_language_family_sql("caller.language", "target.language"),
+        ))?;
         let rows = stmt.query_map(params![qualified_name], |row| {
             Ok(SymbolRecord {
                 id: row.get(0)?,
@@ -169,21 +185,26 @@ impl GraphStore for SqliteGraphStore {
         }
 
         let conn = self.connection()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             r#"
-            WITH RECURSIVE reachable(symbol_id, depth) AS (
-                SELECT target.id, 1
+            WITH RECURSIVE reachable(symbol_id, language, depth) AS (
+                SELECT target.id, target.language, 1
                 FROM symbol_edges e
-                JOIN symbols target ON target.qualified_name = e.target_qualified_name
+                JOIN symbols source ON source.id = e.source_id
+                JOIN symbols target
+                  ON target.qualified_name = e.target_qualified_name
+                 AND {start_family}
                 WHERE e.edge_kind = 'calls'
                   AND e.source_id = ?1
                 UNION ALL
-                SELECT target.id, reachable.depth + 1
+                SELECT target.id, target.language, reachable.depth + 1
                 FROM reachable
                 JOIN symbol_edges e
                   ON e.source_id = reachable.symbol_id
                  AND e.edge_kind = 'calls'
-                JOIN symbols target ON target.qualified_name = e.target_qualified_name
+                JOIN symbols target
+                  ON target.qualified_name = e.target_qualified_name
+                 AND {step_family}
                 WHERE reachable.depth < ?2
             ),
             ranked AS (
@@ -204,7 +225,9 @@ impl GraphStore for SqliteGraphStore {
             JOIN symbols s ON s.id = ranked.symbol_id
             ORDER BY ranked.depth ASC, s.qualified_name ASC, s.id ASC
             "#,
-        )?;
+            start_family = same_language_family_sql("source.language", "target.language"),
+            step_family = same_language_family_sql("reachable.language", "target.language"),
+        ))?;
         let rows = stmt.query_map(params![symbol_id, depth as i64], |row| {
             Ok((
                 SymbolRecord {

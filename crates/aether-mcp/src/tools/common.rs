@@ -283,14 +283,19 @@ fn symbol_record_for_match(
         })
 }
 
-fn ambiguous_selector(selector: &str, candidates: &[SymbolSearchResult]) -> AetherMcpError {
+pub(crate) fn ambiguous_selector(
+    selector: &str,
+    candidates: &[SymbolSearchResult],
+) -> AetherMcpError {
     let candidates = candidates
         .iter()
         .map(|candidate| {
+            // The ID tells apart overloads, which share a name and file.
             format!(
-                "{} [{}]",
+                "{} [{}] id {}",
                 candidate.qualified_name.trim(),
-                candidate.file_path.trim()
+                candidate.file_path.trim(),
+                candidate.symbol_id.trim()
             )
         })
         .collect::<Vec<_>>()

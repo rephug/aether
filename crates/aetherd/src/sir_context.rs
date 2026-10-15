@@ -5,11 +5,13 @@ use std::path::{Path, PathBuf};
 
 use aether_core::{GitContext, Language, normalize_path};
 use aether_health::{ScoreReport, workspace_health_config_or_default};
+use aether_parse::ModuleRoots;
 use aether_sir::{FileSir, SirAnnotation, canonicalize_file_sir_json, synthetic_file_sir_id};
 use aether_store::{
-    CouplingEdgeRecord, DriftStore, ProjectNoteStore, SirStateStore, SqliteStore,
-    SurrealGraphStore, SymbolCatalogStore, SymbolRecord, SymbolRelationStore,
-    TaskContextHistoryRecord, TestIntentStore, block_on_store_future,
+    CouplingEdgeRecord, DriftStore, NameResolution, NameSite, ProjectNoteStore, SirStateStore,
+    SqliteStore, SurrealGraphStore, SymbolCatalogStore, SymbolRecord, SymbolRelationStore,
+    TaskContextHistoryRecord, TestIntentStore, ambiguity_label, ambiguity_note,
+    block_on_store_future, call_target_candidates, call_targets_of, narrow_name_candidates,
     open_surreal_graph_store_readonly,
 };
 use anyhow::{Context, Result, anyhow};
@@ -1218,17 +1220,9 @@ fn collect_same_file_slice_neighbors(
         return Ok(Vec::new());
     }
 
+    let mut names = NameResolver::new(store);
     let mut neighbor_depths: HashMap<String, u32> = HashMap::new();
-    for edge in store
-        .get_callers(record.qualified_name.as_str())
-        .with_context(|| format!("failed to list callers for {}", record.qualified_name))?
-    {
-        let Some(caller) = store
-            .get_symbol_record(edge.source_id.as_str())
-            .with_context(|| format!("failed to load caller {}", edge.source_id))?
-        else {
-            continue;
-        };
+    for caller in names.callers_of(record)? {
         if caller.file_path == record.file_path && caller.id != record.id {
             neighbor_depths
                 .entry(caller.id)
@@ -1238,27 +1232,29 @@ fn collect_same_file_slice_neighbors(
     }
 
     let mut seen = HashSet::new();
-    let mut frontier = vec![record.id.clone()];
+    let mut frontier = vec![record.clone()];
     for current_depth in 1..=depth {
         let mut next_frontier = Vec::new();
-        for source_id in frontier {
+        for source in frontier {
             let edges = store
-                .get_dependencies(source_id.as_str())
-                .with_context(|| format!("failed to list dependencies for {}", source_id))?;
+                .get_dependencies(source.id.as_str())
+                .with_context(|| format!("failed to list dependencies for {}", source.id))?;
             for edge in edges {
-                let Some(target) = store
-                    .get_symbol_by_qualified_name(edge.target_qualified_name.as_str())
+                let Some(target) = names
+                    .resolve(edge.target_qualified_name.as_str(), &source)
                     .with_context(|| {
                         format!(
                             "failed to resolve dependency '{}'",
                             edge.target_qualified_name
                         )
                     })?
+                    .found()
+                    .cloned()
                 else {
                     continue;
                 };
                 if seen.insert(target.id.clone()) {
-                    next_frontier.push(target.id.clone());
+                    next_frontier.push(target.clone());
                 }
                 if target.file_path == record.file_path && target.id != record.id {
                     neighbor_depths
@@ -2204,13 +2200,15 @@ fn resolve_symbol_with_file_hint(
     {
         candidates.push(record);
     }
-    if let Some(record) = store
-        .get_symbol_by_qualified_name(selector)
+    for record in store
+        .list_symbols_by_qualified_name(selector)
         .with_context(|| format!("failed to look up qualified name '{selector}'"))?
-        && normalize_path(record.file_path.as_str()) == file_hint
-        && !candidates.iter().any(|candidate| candidate.id == record.id)
     {
-        candidates.push(record);
+        if normalize_path(record.file_path.as_str()) == file_hint
+            && !candidates.iter().any(|candidate| candidate.id == record.id)
+        {
+            candidates.push(record);
+        }
     }
     let search = store
         .search_symbols(selector, 25)
@@ -2238,7 +2236,12 @@ fn resolve_symbol_with_file_hint(
         _ => {
             let options = candidates
                 .iter()
-                .map(|record| format!("{} [{}]", record.qualified_name, record.file_path))
+                .map(|record| {
+                    format!(
+                        "{} [{}] id {}",
+                        record.qualified_name, record.file_path, record.id
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n  - ");
             Err(anyhow!(
@@ -2581,6 +2584,96 @@ fn prepare_test_guards(
         .collect())
 }
 
+/// Resolves qualified names written in the store's workspace from the file of the
+/// symbol that wrote them (see [`narrow_name_candidates`]).
+struct NameResolver<'a> {
+    store: &'a SqliteStore,
+    modules: ModuleRoots,
+    candidates_by_name: HashMap<String, Vec<SymbolRecord>>,
+    call_candidates_by_target: HashMap<String, Vec<SymbolRecord>>,
+}
+
+impl<'a> NameResolver<'a> {
+    fn new(store: &'a SqliteStore) -> Self {
+        Self {
+            store,
+            modules: ModuleRoots::new(store.workspace_root().unwrap_or_default()),
+            candidates_by_name: HashMap::new(),
+            call_candidates_by_target: HashMap::new(),
+        }
+    }
+
+    /// What `qualified_name` names when `site` writes it.
+    fn resolve(&mut self, qualified_name: &str, site: &SymbolRecord) -> Result<NameResolution> {
+        if !self.candidates_by_name.contains_key(qualified_name) {
+            let candidates = self.store.list_symbols_by_qualified_name(qualified_name)?;
+            self.candidates_by_name
+                .insert(qualified_name.to_owned(), candidates);
+        }
+        let modules = &mut self.modules;
+        Ok(narrow_name_candidates(
+            self.candidates_by_name[qualified_name].clone(),
+            Some(NameSite::of(site)),
+            &mut |file_path| modules.module_of(file_path),
+        ))
+    }
+
+    /// The callers whose call edges resolve to `symbol` or one of its overloads, each
+    /// once, attributed the way MCP `aether_dependencies` attributes them: an edge to
+    /// the symbol's qualified name or, for a Rust method, its bare name counts when it
+    /// resolves from the caller's file to `symbol`.
+    fn callers_of(&mut self, symbol: &SymbolRecord) -> Result<Vec<SymbolRecord>> {
+        let mut seen = HashSet::new();
+        let mut callers = Vec::new();
+        for target in call_targets_of(symbol) {
+            let edges = self
+                .store
+                .get_callers(target.as_str())
+                .with_context(|| format!("failed to list callers of {target}"))?;
+            for edge in edges {
+                if seen.contains(&edge.source_id) {
+                    continue;
+                }
+                let Some(caller) = self
+                    .store
+                    .get_symbol_record(edge.source_id.as_str())
+                    .with_context(|| format!("failed to load caller {}", edge.source_id))?
+                else {
+                    continue;
+                };
+                if self
+                    .resolve_call(edge.target_qualified_name.as_str(), &caller)?
+                    .reaches(symbol)
+                {
+                    seen.insert(caller.id.clone());
+                    callers.push(caller);
+                }
+            }
+        }
+        Ok(callers)
+    }
+
+    /// What the call target `target` names when `site` calls it.
+    fn resolve_call(&mut self, target: &str, site: &SymbolRecord) -> Result<NameResolution> {
+        if !self.call_candidates_by_target.contains_key(target) {
+            let candidates = self.store.list_symbols_for_call_target(target)?;
+            self.call_candidates_by_target
+                .insert(target.to_owned(), candidates);
+        }
+        let candidates = call_target_candidates(
+            &self.call_candidates_by_target[target],
+            target,
+            site.language.as_str(),
+        );
+        let modules = &mut self.modules;
+        Ok(narrow_name_candidates(
+            candidates,
+            Some(NameSite::of(site)),
+            &mut |file_path| modules.module_of(file_path),
+        ))
+    }
+}
+
 fn prepare_dependencies(
     store: &SqliteStore,
     record: &SymbolRecord,
@@ -2588,22 +2681,35 @@ fn prepare_dependencies(
     let edges = store
         .get_dependencies(record.id.as_str())
         .with_context(|| format!("failed to list dependencies for {}", record.id))?;
+    let mut names = NameResolver::new(store);
     let mut prepared = Vec::new();
     let mut seen = HashSet::new();
     for edge in edges {
         if !seen.insert(edge.target_qualified_name.clone()) {
             continue;
         }
-        let Some(target) = store
-            .get_symbol_by_qualified_name(edge.target_qualified_name.as_str())
+        let target = match names
+            .resolve(edge.target_qualified_name.as_str(), record)
             .with_context(|| {
                 format!(
                     "failed to resolve dependency '{}'",
                     edge.target_qualified_name
                 )
-            })?
-        else {
-            continue;
+            })? {
+            NameResolution::Found(mut overloads) => overloads.swap_remove(0),
+            NameResolution::NotFound => continue,
+            NameResolution::Ambiguous(candidates) => {
+                let note = ambiguity_note(&candidates);
+                prepared.push(PreparedItem {
+                    cost_text: format!("{}\n{}", edge.target_qualified_name, note),
+                    value: DependencyContext {
+                        qualified_name: edge.target_qualified_name,
+                        file_path: ambiguity_label(&candidates),
+                        intent_summary: note,
+                    },
+                });
+                continue;
+            }
         };
         let summary = read_intent_summary(store, target.id.as_str())
             .unwrap_or_else(|| "No SIR recorded.".to_owned());
@@ -2626,21 +2732,8 @@ fn prepare_callers(
     store: &SqliteStore,
     record: &SymbolRecord,
 ) -> Result<Vec<PreparedItem<CallerContext>>> {
-    let edges = store
-        .get_callers(record.qualified_name.as_str())
-        .with_context(|| format!("failed to list callers for {}", record.qualified_name))?;
     let mut prepared = Vec::new();
-    let mut seen = HashSet::new();
-    for edge in edges {
-        let Some(caller) = store
-            .get_symbol_record(edge.source_id.as_str())
-            .with_context(|| format!("failed to load caller {}", edge.source_id))?
-        else {
-            continue;
-        };
-        if !seen.insert(caller.id.clone()) {
-            continue;
-        }
+    for caller in NameResolver::new(store).callers_of(record)? {
         prepared.push(PreparedItem {
             cost_text: format!("{}\n{}", caller.qualified_name, caller.file_path),
             value: CallerContext {
@@ -2656,21 +2749,8 @@ fn prepare_callers_with_intent(
     store: &SqliteStore,
     record: &SymbolRecord,
 ) -> Result<Vec<PreparedItem<NeighborSummary>>> {
-    let edges = store
-        .get_callers(record.qualified_name.as_str())
-        .with_context(|| format!("failed to list callers for {}", record.qualified_name))?;
     let mut prepared = Vec::new();
-    let mut seen = HashSet::new();
-    for edge in edges {
-        let Some(caller) = store
-            .get_symbol_record(edge.source_id.as_str())
-            .with_context(|| format!("failed to load caller {}", edge.source_id))?
-        else {
-            continue;
-        };
-        if !seen.insert(caller.id.clone()) {
-            continue;
-        }
+    for caller in NameResolver::new(store).callers_of(record)? {
         let summary = read_intent_summary(store, caller.id.as_str())
             .unwrap_or_else(|| "Caller relationship".to_owned());
         prepared.push(PreparedItem {
@@ -2796,32 +2876,55 @@ fn prepare_transitive_dependencies(
     record: &SymbolRecord,
     depth: u32,
 ) -> Result<Vec<PreparedItem<TransitiveDependencyContext>>> {
+    let mut names = NameResolver::new(store);
     let mut prepared = Vec::new();
     let mut seen = HashSet::new();
-    let mut frontier = vec![record.id.clone()];
+    let mut frontier = vec![record.clone()];
 
     for current_depth in 1..=depth {
         let mut next_frontier = Vec::new();
-        for source_id in frontier {
+        for source in frontier {
             let edges = store
-                .get_dependencies(source_id.as_str())
-                .with_context(|| format!("failed to list dependencies for {}", source_id))?;
+                .get_dependencies(source.id.as_str())
+                .with_context(|| format!("failed to list dependencies for {}", source.id))?;
             for edge in edges {
-                let Some(target) = store
-                    .get_symbol_by_qualified_name(edge.target_qualified_name.as_str())
+                let target = match names
+                    .resolve(edge.target_qualified_name.as_str(), &source)
                     .with_context(|| {
                         format!(
                             "failed to resolve transitive dependency '{}'",
                             edge.target_qualified_name
                         )
-                    })?
-                else {
-                    continue;
+                    })? {
+                    NameResolution::Found(mut overloads) => overloads.swap_remove(0),
+                    NameResolution::NotFound => continue,
+                    NameResolution::Ambiguous(candidates) => {
+                        // Listed once, from depth 2; a direct dependency is listed with
+                        // the dependencies instead.
+                        if seen.insert(format!("ambiguous::{}", edge.target_qualified_name))
+                            && current_depth >= 2
+                        {
+                            let note = ambiguity_note(&candidates);
+                            prepared.push(PreparedItem {
+                                cost_text: format!(
+                                    "{}\n{}\n{}",
+                                    edge.target_qualified_name, note, current_depth
+                                ),
+                                value: TransitiveDependencyContext {
+                                    qualified_name: edge.target_qualified_name,
+                                    file_path: ambiguity_label(&candidates),
+                                    intent_summary: note,
+                                    depth: current_depth,
+                                },
+                            });
+                        }
+                        continue;
+                    }
                 };
                 if !seen.insert(target.id.clone()) {
                     continue;
                 }
-                next_frontier.push(target.id.clone());
+                next_frontier.push(target.clone());
                 if current_depth < 2 {
                     continue;
                 }
@@ -3518,7 +3621,7 @@ mod tests {
     use std::process::Command;
     use std::sync::{Arc, Mutex};
 
-    use aether_core::Language;
+    use aether_core::{EdgeKind, Language, SymbolEdge};
     use aether_sir::{FileSir, synthetic_file_sir_id};
     use aether_store::{
         ProjectNoteStore, SirMetaRecord, SirStateStore, SqliteStore, SymbolCatalogStore,
@@ -3781,6 +3884,84 @@ vector_backend = "sqlite"
             workspace,
             &["config", "user.email", "aether-test@example.com"],
         );
+    }
+
+    #[test]
+    fn dependencies_and_callers_resolve_from_the_symbols_module_or_are_reported_ambiguous() {
+        // Two Maven modules each declare `Config::load`. `Job::run` in billing reaches
+        // billing's; `App::run` in the parent module can't tell them apart.
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_test_config(workspace);
+        for manifest in ["pom.xml", "billing/pom.xml", "orders/pom.xml"] {
+            let path = workspace.join(manifest);
+            fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+            fs::write(path, "<project/>\n").expect("write manifest");
+        }
+        let store = SqliteStore::open(workspace).expect("open store");
+        let method = |id: &str, file_path: &str, qualified_name: &str| SymbolRecord {
+            id: id.to_owned(),
+            file_path: file_path.to_owned(),
+            language: "java".to_owned(),
+            kind: "method".to_owned(),
+            qualified_name: qualified_name.to_owned(),
+            signature_fingerprint: format!("sig-{id}"),
+            last_seen_at: 1_700_000_000,
+        };
+        let billing_load = method("b-load", "billing/src/Config.java", "Config::load");
+        let job_run = method("b-run", "billing/src/Job.java", "Job::run");
+        let app_run = method("app-run", "src/App.java", "App::run");
+        for record in [
+            billing_load.clone(),
+            method("o-load", "orders/src/Config.java", "Config::load"),
+            job_run.clone(),
+            app_run.clone(),
+        ] {
+            store.upsert_symbol(record).expect("upsert symbol");
+        }
+        let mut edges = Vec::new();
+        for source in [&job_run, &app_run] {
+            for edge_kind in [EdgeKind::Calls, EdgeKind::DependsOn] {
+                edges.push(SymbolEdge {
+                    source_id: source.id.clone(),
+                    target_qualified_name: "Config::load".to_owned(),
+                    edge_kind,
+                    file_path: source.file_path.clone(),
+                });
+            }
+        }
+        store.upsert_edges(&edges).expect("upsert edges");
+
+        let dependencies = |record: &SymbolRecord| {
+            super::prepare_dependencies(&store, record)
+                .expect("prepare dependencies")
+                .into_iter()
+                .map(|item| (item.value.file_path, item.value.intent_summary))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            dependencies(&job_run),
+            vec![(
+                "billing/src/Config.java".to_owned(),
+                "No SIR recorded.".to_owned()
+            )]
+        );
+        assert_eq!(
+            dependencies(&app_run),
+            vec![(
+                "ambiguous: 2 candidates".to_owned(),
+                "Ambiguous: 2 symbols share this name (billing/src/Config.java, \
+                 orders/src/Config.java)."
+                    .to_owned()
+            )]
+        );
+
+        let callers = super::prepare_callers(&store, &billing_load)
+            .expect("prepare callers")
+            .into_iter()
+            .map(|item| item.value.qualified_name)
+            .collect::<Vec<_>>();
+        assert_eq!(callers, vec!["Job::run".to_owned()]);
     }
 
     #[test]
