@@ -22,6 +22,15 @@ From repo root, build `aetherd`:
 cargo build -p aetherd
 ```
 
+The extension uses the first `aetherd` it finds:
+
+1. the `aether.aetherdPath` setting, when set (user settings only);
+2. `$CARGO_TARGET_DIR/debug/aetherd`, when `CARGO_TARGET_DIR` is set;
+3. `<repo>/target/debug/aetherd`;
+4. `aetherd` on `PATH`.
+
+If none exists, it runs `cargo build -p aetherd` in the repo root and looks again.
+
 ## Run in Extension Development Host
 
 1. Open `vscode-extension/` in VS Code.
@@ -74,6 +83,7 @@ Available settings:
 - `aether.inferenceEndpoint`: local endpoint for `qwen3_local` (default `http://127.0.0.1:11434`)
 - `aether.geminiApiKeyEnv`: env var name for Gemini key (default `GEMINI_API_KEY`)
 - `aether.searchMode`: `lexical | semantic | hybrid` (default `lexical`)
+- `aether.aetherdPath`: absolute path of the `aetherd` binary (default empty: search as described under Prerequisites)
 
 ## Provider Notes
 
