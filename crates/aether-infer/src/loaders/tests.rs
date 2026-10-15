@@ -757,6 +757,58 @@ fn load_provider_openai_compat_sends_configured_thinking_as_reasoning_effort() {
     assert_eq!(body["reasoning_effort"], "max");
 }
 
+#[test]
+fn summarize_text_with_openai_compat_sends_configured_thinking() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    ensure_workspace_config(workspace).expect("ensure config");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake endpoint");
+    let endpoint = format!("http://{}/v1", listener.local_addr().expect("local addr"));
+    let env_name = "AETHER_TEST_OPENAI_COMPAT_SUMMARY_KEY_ZZZZZ";
+    let _env = crate::env_vars::overrides::set(env_name, "test-key");
+    std::fs::write(
+        workspace.join(".aether/config.toml"),
+        format!(
+            "[inference]\nprovider = \"openai_compat\"\nmodel = \"gpt-6-luna\"\n\
+             endpoint = \"{endpoint}\"\napi_key_env = \"{env_name}\"\nthinking = \"high\"\n"
+        ),
+    )
+    .expect("write config");
+
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept request");
+        let body = read_http_request_body(&mut stream);
+        let reply = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "A short summary."}}]
+        })
+        .to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+            reply.len()
+        )
+        .expect("write response");
+        body
+    });
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let summary = runtime
+        .block_on(summarize_text_with_config(
+            workspace,
+            "Summarize.",
+            "Some text.",
+        ))
+        .expect("summary request");
+    assert_eq!(summary.as_deref(), Some("A short summary."));
+
+    let body: serde_json::Value =
+        serde_json::from_slice(&server.join().expect("join fake endpoint")).expect("json body");
+    assert_eq!(body["reasoning_effort"], "high");
+}
+
 /// Read one HTTP/1.1 request from `stream` and return its body.
 fn read_http_request_body(stream: &mut std::net::TcpStream) -> Vec<u8> {
     let mut request = Vec::new();
