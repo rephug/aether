@@ -8,6 +8,8 @@ const RECONCILE_DUPLICATE_STALE_REASON: &str = "duplicate stale symbol matched c
 const RECONCILE_AMBIGUOUS_CURRENT_REASON: &str =
     "multiple current symbols matched reconciliation tuple";
 const RECONCILE_MISSING_CURRENT_REASON: &str = "no current symbol matched reconciliation tuple";
+const RECONCILE_UNCHANGED_SIBLING_REASON: &str =
+    "only an unchanged sibling matched reconciliation tuple";
 
 type ReconciliationKey = (String, String, String);
 
@@ -59,9 +61,15 @@ fn stale_symbol_updated_at(store: &SqliteStore, symbol_id: &str) -> Result<i64> 
         .unwrap_or(0))
 }
 
+/// Plans how stale symbol ids (in the store, not in the snapshot) are reconciled with the
+/// snapshot. `pre_existing_ids` are the ids the store held before the snapshot was written:
+/// a current symbol among them is unchanged, so it can't be the new identity of a stale one.
+/// Java and C# overloads share `(file, qualified_name, kind)`; without this, deleting one
+/// overload would move its SIR and contracts onto the overload that remains.
 pub(super) fn plan_symbol_reconciliation(
     store: &SqliteStore,
     symbols_by_id: &HashMap<String, Symbol>,
+    pre_existing_ids: &HashSet<String>,
 ) -> Result<ReconciliationPlan> {
     let snapshot_ids = symbols_by_id.keys().cloned().collect::<HashSet<_>>();
     let stale_symbols = store
@@ -101,6 +109,13 @@ pub(super) fn plan_symbol_reconciliation(
                     .extend(stale_matches.into_iter().map(|symbol| PlannedPrune {
                         symbol,
                         reason: RECONCILE_MISSING_CURRENT_REASON,
+                    }));
+            }
+            1 if pre_existing_ids.contains(current_matches[0].id.as_str()) => {
+                plan.prunes
+                    .extend(stale_matches.into_iter().map(|symbol| PlannedPrune {
+                        symbol,
+                        reason: RECONCILE_UNCHANGED_SIBLING_REASON,
                     }));
             }
             1 => {
@@ -293,7 +308,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use tempfile::tempdir;
 
@@ -376,7 +391,8 @@ mod tests {
         );
 
         let symbols_by_id = HashMap::from_iter([(new_symbol.id.clone(), new_symbol.clone())]);
-        let plan = plan_symbol_reconciliation(&store, &symbols_by_id).expect("plan reconcile");
+        let plan = plan_symbol_reconciliation(&store, &symbols_by_id, &HashSet::new())
+            .expect("plan reconcile");
 
         assert_eq!(plan.migrations.len(), 1);
         assert_eq!(plan.migrations[0].old_symbol.id, old_b.id);
@@ -407,7 +423,8 @@ mod tests {
             .count_symbols_with_sir()
             .expect("count symbols before dry run");
         let symbols_by_id = HashMap::from_iter([(new_symbol.id.clone(), new_symbol.clone())]);
-        let plan = plan_symbol_reconciliation(&store, &symbols_by_id).expect("plan reconcile");
+        let plan = plan_symbol_reconciliation(&store, &symbols_by_id, &HashSet::new())
+            .expect("plan reconcile");
 
         let mut output = Vec::<u8>::new();
         print_reconciliation_dry_run(&plan, &mut output).expect("print dry run report");
@@ -451,7 +468,8 @@ mod tests {
         );
 
         let symbols_by_id = HashMap::from_iter([(new_symbol.id.clone(), new_symbol.clone())]);
-        let plan = plan_symbol_reconciliation(&store, &symbols_by_id).expect("plan reconcile");
+        let plan = plan_symbol_reconciliation(&store, &symbols_by_id, &HashSet::new())
+            .expect("plan reconcile");
         let (migrated, pruned) =
             execute_symbol_reconciliation(temp.path(), &store, &plan, |_| Ok(()), |_| Ok(()))
                 .expect("execute reconcile");
@@ -483,11 +501,13 @@ mod tests {
         );
 
         let symbols_by_id = HashMap::from_iter([(new_symbol.id.clone(), new_symbol.clone())]);
-        let first_plan = plan_symbol_reconciliation(&store, &symbols_by_id).expect("first plan");
+        let first_plan = plan_symbol_reconciliation(&store, &symbols_by_id, &HashSet::new())
+            .expect("first plan");
         execute_symbol_reconciliation(temp.path(), &store, &first_plan, |_| Ok(()), |_| Ok(()))
             .expect("first reconcile");
 
-        let second_plan = plan_symbol_reconciliation(&store, &symbols_by_id).expect("second plan");
+        let second_plan = plan_symbol_reconciliation(&store, &symbols_by_id, &HashSet::new())
+            .expect("second plan");
         assert!(second_plan.is_empty());
         let (migrated, pruned) = execute_symbol_reconciliation(
             temp.path(),
@@ -503,5 +523,94 @@ mod tests {
             .count_symbols_with_sir()
             .expect("count coverage after second reconcile");
         assert_eq!((total_symbols, symbols_with_sir), (1, 1));
+    }
+
+    #[test]
+    fn a_removed_overload_is_pruned_instead_of_migrated_onto_its_sibling() {
+        // Java and C# overloads share (file, qualified_name, kind): `parse(String)` and
+        // `parse(byte[])`. Deleting the first must not hand its SIR to the second.
+        let temp = tempdir().expect("tempdir");
+        write_default_config(temp.path());
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        let removed = test_symbol("sym-parse-string", "sig-parse-string");
+        let sibling = test_symbol("sym-parse-bytes", "sig-parse-bytes");
+        upsert_symbol_snapshot(&store, &removed, 10);
+        upsert_symbol_snapshot(&store, &sibling, 10);
+        upsert_sir_state(
+            &store,
+            removed.id.as_str(),
+            "hash-string",
+            r#"{"intent":"parses a decimal string"}"#,
+            200,
+        );
+        upsert_sir_state(
+            &store,
+            sibling.id.as_str(),
+            "hash-bytes",
+            r#"{"intent":"reads a big-endian int"}"#,
+            100,
+        );
+
+        let pre_existing_ids = HashSet::from([removed.id.clone(), sibling.id.clone()]);
+        let symbols_by_id = HashMap::from_iter([(sibling.id.clone(), sibling.clone())]);
+        let plan = plan_symbol_reconciliation(&store, &symbols_by_id, &pre_existing_ids)
+            .expect("plan reconcile");
+        assert!(plan.migrations.is_empty());
+        assert_eq!(plan.prunes.len(), 1);
+        assert_eq!(plan.prunes[0].symbol.id, removed.id);
+        assert_eq!(plan.prunes[0].reason, RECONCILE_UNCHANGED_SIBLING_REASON);
+
+        let (migrated, pruned) =
+            execute_symbol_reconciliation(temp.path(), &store, &plan, |_| Ok(()), |_| Ok(()))
+                .expect("execute reconcile");
+        assert_eq!((migrated, pruned), (0, 1));
+        assert_eq!(
+            store
+                .read_sir_blob(sibling.id.as_str())
+                .expect("read sibling SIR")
+                .as_deref(),
+            Some(r#"{"intent":"reads a big-endian int"}"#)
+        );
+        assert!(
+            store
+                .get_symbol_record(removed.id.as_str())
+                .expect("query removed overload")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_new_identity_next_to_an_unchanged_sibling_is_ambiguous() {
+        // One overload changed its signature (new id) while its sibling stayed: the stale id
+        // can't be matched to either with confidence, so it is pruned.
+        let temp = tempdir().expect("tempdir");
+        write_default_config(temp.path());
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        let old = test_symbol("sym-find-old", "sig-find-old");
+        let sibling = test_symbol("sym-find-limit", "sig-find-limit");
+        let renewed = test_symbol("sym-find-new", "sig-find-new");
+        upsert_symbol_snapshot(&store, &old, 10);
+        upsert_symbol_snapshot(&store, &sibling, 10);
+        upsert_sir_state(
+            &store,
+            old.id.as_str(),
+            "hash-old",
+            r#"{"intent":"old"}"#,
+            100,
+        );
+
+        let pre_existing_ids = HashSet::from([old.id.clone(), sibling.id.clone()]);
+        let symbols_by_id = HashMap::from_iter([
+            (sibling.id.clone(), sibling.clone()),
+            (renewed.id.clone(), renewed.clone()),
+        ]);
+        let plan = plan_symbol_reconciliation(&store, &symbols_by_id, &pre_existing_ids)
+            .expect("plan reconcile");
+        assert!(plan.migrations.is_empty());
+        assert_eq!(plan.prunes.len(), 1);
+        assert_eq!(plan.prunes[0].symbol.id, old.id);
+        assert_eq!(plan.prunes[0].reason, RECONCILE_AMBIGUOUS_CURRENT_REASON);
     }
 }

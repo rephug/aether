@@ -225,7 +225,9 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
             symbol_count
         );
 
-        let plan = plan_symbol_reconciliation(&store, &symbols_by_id)?;
+        // A dry run writes nothing, so every id in the store predates the snapshot.
+        let pre_existing_ids = store.list_all_symbol_ids()?.into_iter().collect();
+        let plan = plan_symbol_reconciliation(&store, &symbols_by_id, &pre_existing_ids)?;
         let mut stdout = std::io::stdout();
         print_reconciliation_dry_run(&plan, &mut stdout)?;
         return Ok(());
@@ -236,11 +238,13 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
     let mut stdout = std::io::stdout();
     let (initial_events, symbols_by_id, symbol_count) = collect_initial_snapshot(&observer);
 
+    let pre_existing_ids = store.list_all_symbol_ids()?.into_iter().collect();
     for event in &initial_events {
         structural.process_event(&store, event)?;
     }
 
-    let reconciliation_plan = plan_symbol_reconciliation(&store, &symbols_by_id)?;
+    let reconciliation_plan =
+        plan_symbol_reconciliation(&store, &symbols_by_id, &pre_existing_ids)?;
     let _ = execute_symbol_reconciliation(
         &config.workspace,
         &store,
