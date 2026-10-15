@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aether_core::{
     EdgeKind, Language, Position, SourceRange, Symbol, SymbolEdge, SymbolKind, content_hash,
@@ -10,6 +10,7 @@ use anyhow::{Result, anyhow};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Parser, Point, QueryCursor};
 
+use crate::languages::python::PythonWorkspace;
 use crate::registry::{LanguageConfig, LanguageRegistry, QueryCaptures, default_registry};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +33,7 @@ pub struct TestIntent {
 pub struct SymbolExtractor {
     registry: LanguageRegistry,
     parsers: HashMap<&'static str, Parser>,
+    python_workspace: Option<PythonWorkspace>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,7 +63,40 @@ impl SymbolExtractor {
             parsers.insert(config.id, parser);
         }
 
-        Ok(Self { registry, parsers })
+        Ok(Self {
+            registry,
+            parsers,
+            python_workspace: None,
+        })
+    }
+
+    /// Resolves Python call targets through the workspace's other files, read from `root`,
+    /// to which the paths of extracted files are relative. A call of a name that a package's
+    /// `__init__.py` (or any module) imports from another module targets the module that
+    /// defines it (`pkg.impl::f` rather than `pkg::f`), and an absolute import of a
+    /// `src/`-layout package from outside its `src/` directory gains the `src` prefix its
+    /// symbols have. Targets that can't be followed to a definition keep their spelling.
+    ///
+    /// The extractor keeps what it read; [`Self::refresh_workspace_file`] tells it about
+    /// changes.
+    pub fn with_workspace_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.python_workspace = Some(PythonWorkspace::new(root.into()));
+        self
+    }
+
+    /// Re-reads a workspace path (a file or a directory) after it changed, appeared or went
+    /// away. Returns the files whose Python call targets were resolved through what it held
+    /// before and may resolve differently now: their extracted edges are stale, so extract
+    /// them again. Edits that rebind no name those files looked up return none. Empty
+    /// without a workspace root.
+    pub fn refresh_workspace_file(&mut self, file_path: &str) -> Vec<String> {
+        match (
+            self.python_workspace.as_mut(),
+            self.parsers.get_mut(PYTHON_CONFIG_ID),
+        ) {
+            (Some(workspace), Some(parser)) => workspace.refresh(parser, file_path),
+            _ => Vec::new(),
+        }
     }
 
     pub fn extract_from_path(&mut self, path: &Path, source: &str) -> Result<Vec<Symbol>> {
@@ -96,6 +131,7 @@ impl SymbolExtractor {
         extract_with_config(
             &self.registry,
             &mut self.parsers,
+            self.python_workspace.as_mut(),
             language,
             &file_path,
             source,
@@ -118,6 +154,7 @@ impl SymbolExtractor {
         extract_with_config(
             &self.registry,
             &mut self.parsers,
+            self.python_workspace.as_mut(),
             language,
             &normalized_file_path,
             source,
@@ -148,9 +185,13 @@ impl SymbolExtractor {
     }
 }
 
+/// The id of the language config whose call targets [`PythonWorkspace`] resolves.
+const PYTHON_CONFIG_ID: &str = "python";
+
 fn extract_with_config(
     registry: &LanguageRegistry,
     parsers: &mut HashMap<&'static str, Parser>,
+    python_workspace: Option<&mut PythonWorkspace>,
     language: Language,
     file_path: &str,
     source: &str,
@@ -174,6 +215,13 @@ fn extract_with_config(
     symbols.sort_by(|a, b| a.id.cmp(&b.id));
 
     let mut edges = extract_edges(language, file_path, source_bytes, root, config, &symbols);
+    if language == Language::Python
+        && config.id == PYTHON_CONFIG_ID
+        && let Some(workspace) = python_workspace
+    {
+        // The tree stays valid while the parser reads the modules the targets name.
+        workspace.resolve_calls(parser, file_path, &mut edges);
+    }
     sort_and_dedupe_edges(&mut edges);
 
     let mut test_intents =
@@ -242,7 +290,7 @@ fn extract_edges(
             symbols,
         );
     }
-    if language == Language::Python && config.id == "python" {
+    if language == Language::Python && config.id == PYTHON_CONFIG_ID {
         return crate::languages::python::extract_python_edges(
             file_path,
             source,

@@ -98,20 +98,8 @@ def test_place_returns_an_order():
     Ok(())
 }
 
-fn find<'a>(symbols: &'a [SymbolRecord], qualified_name: &str) -> &'a SymbolRecord {
-    symbols
-        .iter()
-        .find(|symbol| symbol.qualified_name == qualified_name)
-        .unwrap_or_else(|| panic!("missing indexed symbol {qualified_name}"))
-}
-
-#[test]
-fn structural_index_resolves_python_call_edges() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = tempdir()?;
-    let workspace = temp.path();
-    write_workspace(workspace)?;
-
-    let config = IndexerConfig {
+fn indexer_config(workspace: &Path) -> IndexerConfig {
+    IndexerConfig {
         workspace: workspace.to_path_buf(),
         debounce_ms: 300,
         print_events: false,
@@ -129,8 +117,23 @@ fn structural_index_resolves_python_call_edges() -> Result<(), Box<dyn std::erro
         inference_endpoint: None,
         inference_api_key_env: None,
         pause_flag: None,
-    };
-    run_initial_index_once(&config)?;
+    }
+}
+
+fn find<'a>(symbols: &'a [SymbolRecord], qualified_name: &str) -> &'a SymbolRecord {
+    symbols
+        .iter()
+        .find(|symbol| symbol.qualified_name == qualified_name)
+        .unwrap_or_else(|| panic!("missing indexed symbol {qualified_name}"))
+}
+
+#[test]
+fn structural_index_resolves_python_call_edges() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    write_workspace(workspace)?;
+
+    run_initial_index_once(&indexer_config(workspace))?;
 
     let store = SqliteStore::open(workspace)?;
     let mut symbols = Vec::new();
@@ -210,5 +213,95 @@ fn structural_index_resolves_python_call_edges() -> Result<(), Box<dyn std::erro
     assert_eq!(intents[0].language, "python");
     assert_eq!(intents[0].symbol_id.as_deref(), Some(test.id.as_str()));
 
+    Ok(())
+}
+
+/// A package that re-exports its API from submodules, and a `src/` layout whose tests sit
+/// outside `src/`.
+#[test]
+fn structural_index_resolves_python_calls_through_reexports_and_src_layouts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    write_workspace(workspace)?;
+    for (path, source) in [
+        (
+            "kit/__init__.py",
+            "from .text import *\nfrom .numbers import scale as resize\n",
+        ),
+        (
+            "kit/text.py",
+            "__all__ = [\"slug\"]\n\n\ndef slug(value):\n    return _clean(value)\n\n\ndef _clean(value):\n    return value\n",
+        ),
+        ("kit/numbers.py", "def scale(value):\n    return value\n"),
+        (
+            "tests/test_kit.py",
+            "import kit\nfrom kit import slug, resize\n\n\ndef test_kit():\n    slug(\"a\")\n    resize(1)\n    kit.slug(\"b\")\n",
+        ),
+        (
+            "app/src/billing/__init__.py",
+            "from .invoice import total\n",
+        ),
+        (
+            "app/src/billing/invoice.py",
+            "class Invoice:\n    def amount(self):\n        return 1\n\n\ndef total():\n    return Invoice().amount()\n",
+        ),
+        (
+            "app/tests/test_billing.py",
+            "from billing import total\nfrom billing.invoice import Invoice\n\n\ndef test_total():\n    total()\n    Invoice.amount(None)\n",
+        ),
+    ] {
+        let full_path = workspace.join(path);
+        fs::create_dir_all(full_path.parent().expect("parent"))?;
+        fs::write(full_path, source)?;
+    }
+    run_initial_index_once(&indexer_config(workspace))?;
+
+    let store = SqliteStore::open(workspace)?;
+    let mut symbols = Vec::new();
+    for file in [
+        "kit/text.py",
+        "kit/numbers.py",
+        "tests/test_kit.py",
+        "app/src/billing/invoice.py",
+        "app/tests/test_billing.py",
+    ] {
+        symbols.extend(store.list_symbols_for_file(file)?);
+    }
+    let slug = find(&symbols, "kit.text::slug");
+    let scale = find(&symbols, "kit.numbers::scale");
+    let test_kit = find(&symbols, "tests.test_kit::test_kit");
+    let total = find(&symbols, "app.src.billing.invoice::total");
+    let amount = find(&symbols, "app.src.billing.invoice::Invoice::amount");
+    let test_total = find(&symbols, "app.tests.test_billing::test_total");
+
+    let resolved = store
+        .list_graph_dependency_edges()?
+        .into_iter()
+        .filter(|edge| edge.edge_kind == "calls")
+        .collect::<Vec<_>>();
+    let callees = |source: &SymbolRecord| {
+        let mut callees = resolved
+            .iter()
+            .filter(|edge| edge.source_symbol_id == source.id)
+            .map(|edge| edge.target_symbol_id.clone())
+            .collect::<Vec<_>>();
+        callees.sort();
+        callees
+    };
+    let ids = |records: &[&SymbolRecord]| {
+        let mut ids = records
+            .iter()
+            .map(|record| record.id.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    };
+
+    // `from kit import slug, resize` and `kit.slug()`: `kit/__init__.py` takes `slug` from
+    // `text` with `*` and imports `scale` as `resize`.
+    assert_eq!(callees(test_kit), ids(&[slug, scale]));
+    // `from billing import total`, from `app/tests/`, reaches `app/src/billing/`.
+    assert_eq!(callees(test_total), ids(&[total, amount]));
     Ok(())
 }
