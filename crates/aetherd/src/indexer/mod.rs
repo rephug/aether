@@ -51,7 +51,7 @@ mod worker;
 
 pub use self::enrichment::build_enrichment_context;
 use self::git_watch::{
-    GitDebounceState, handle_watch_result, process_git_trigger, process_reindex_path,
+    GitDebounceState, handle_watch_result, process_debounced_paths, process_git_trigger,
     resolve_git_watch_dir,
 };
 pub use self::priority::compute_symbol_priority_scores;
@@ -634,22 +634,16 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
         }
 
         let due = debounce_queue.drain_due(now, debounce_window);
-        if due.is_empty() {
-            continue;
-        }
-        for path in due {
-            if let Err(err) = process_reindex_path(
+        if !due.is_empty() {
+            process_debounced_paths(
                 &config,
                 &mut observer,
                 &mut structural,
                 store.as_ref(),
                 &queue_state,
-                &path,
-            ) {
-                tracing::error!(path = %path.display(), error = %err, "process error");
-            }
+                due,
+            );
         }
-        structural.reindex_stale_files(store.as_ref());
     }
 }
 

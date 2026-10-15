@@ -87,9 +87,14 @@ class Widget:
         "pkg/stars.py",
         "def starred():\n    return 4\n\n\ndef _hidden():\n    return 5\n",
     ),
+    // Beside the package's own name: relative imports don't consult `sys.path`.
+    ("pkg/pkg.py", "VALUE = 1\n"),
     (
         "pkg/listed.py",
-        r#"__all__ = ["exported"]
+        r#"__all__ = [
+    # The public API.
+    "exported",
+]
 
 
 def exported():
@@ -309,6 +314,13 @@ def test_quote():
             "services/api/tests/test_handlers.py",
             "from api_pkg.handlers import handle\n\n\ndef test_handle():\n    handle()\n",
         ),
+        // `uv init --package backend`: the package is named like the project directory.
+        ("backend/src/backend/__init__.py", ""),
+        ("backend/src/backend/api.py", "def fetch():\n    return 1\n"),
+        (
+            "backend/tests/test_api.py",
+            "from backend.api import fetch\n\n\ndef test_fetch():\n    fetch()\n",
+        ),
     ]);
     let mut extractor = extractor(dir.path());
     assert_eq!(
@@ -338,6 +350,10 @@ def test_quote():
             "services/api/tests/test_handlers.py"
         ),
         sorted(&["services.api.src.api_pkg.handlers::handle"])
+    );
+    assert_eq!(
+        targets(&mut extractor, dir.path(), "backend/tests/test_api.py"),
+        sorted(&["backend.src.backend.api::fetch"])
     );
 }
 
@@ -410,7 +426,7 @@ Widget.build = _fast
         ),
         (
             "patch/impl.py",
-            "class Widget:\n    def build(self):\n        return self\n",
+            "class Widget:\n    def build(self):\n        return self\n\n    def size(self):\n        return 1\n",
         ),
         // A package's submodule is one of its attributes once imported, so `*` may take it.
         (
@@ -436,6 +452,7 @@ def run():
     render()
     Widget()
     Widget.build(None)
+    Widget.size(None)
     tool()
 "#,
         ),
@@ -457,6 +474,8 @@ def run():
             "plug::render",
             "patch.impl::Widget",
             "patch::Widget::build",
+            // Only the replaced member keeps its spelling.
+            "patch.impl::Widget::size",
             "top::tool",
         ])
     );

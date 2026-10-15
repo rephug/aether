@@ -73,8 +73,8 @@ struct ModuleSummary {
     /// which may hold any name.
     star_imports: Vec<Option<String>>,
     all: All,
-    /// Names the file assigns attributes on (`Widget.build = …`), which may replace or add
-    /// the members a target names.
+    /// Attributes the file assigns through a name (`Widget.build` for `Widget.build = …`),
+    /// which replace or add the members targets name.
     patched: BTreeSet<String>,
 }
 
@@ -345,10 +345,10 @@ impl Lookup<'_> {
         let (module, file) = self.locate(module, from_file)?;
         let summary = self.summary(&file)?;
         let (first, rest) = names.split_first()?;
-        if !rest.is_empty() {
+        if let Some(member) = rest.first() {
             // `Widget.build = …` replaces or adds the member the target names.
             self.query(Read::Module(Arc::from(file.as_str())), first);
-            if summary.patched.contains(first) {
+            if summary.patched.contains(&format!("{first}.{member}")) {
                 return None;
             }
         }
@@ -473,8 +473,18 @@ impl Lookup<'_> {
     /// `sys.path` when the file runs as a script and in pytest's default `prepend` mode.
     fn locate(&mut self, module: &str, from_file: &str) -> Option<(String, String)> {
         let segments = module_segments(module);
-        let head = segments.first()?.clone();
+        if segments.is_empty() {
+            return None;
+        }
         let directories = python_directory_segments(from_file);
+        // The file's own package and what is inside it (a relative import, a package
+        // importing itself) are where the file is: relative imports don't consult
+        // `sys.path`.
+        if !directories.is_empty() && segments.starts_with(&directories) {
+            return self
+                .module_file("", &segments)
+                .map(|file| (segments.join("."), file));
+        }
         if !directories.is_empty()
             && self
                 .module_file(&directories.join("/"), &segments)
@@ -483,13 +493,7 @@ impl Lookup<'_> {
             return None;
         }
         let at_root = self.module_file("", &segments);
-        // The file's own top-level directory is the root's (relative imports, a package
-        // importing itself), never a `src/` package.
-        let under_src = if directories.first() == Some(&head) {
-            None
-        } else {
-            self.src_module(&directories, &segments)
-        };
+        let under_src = self.src_module(&directories, &segments);
         match (at_root, under_src) {
             (Some(file), None) => Some((segments.join("."), file)),
             (None, Some((src, file))) => Some((
@@ -638,7 +642,13 @@ fn changed_names(previous: &FileState, current: &FileState) -> Changed {
                 )
                 .map(|(name, _)| name.clone())
                 .collect::<BTreeSet<_>>();
-            names.extend(before.patched.symmetric_difference(&after.patched).cloned());
+            names.extend(
+                before
+                    .patched
+                    .symmetric_difference(&after.patched)
+                    .filter_map(|attribute| attribute.split_once('.'))
+                    .map(|(name, _)| name.to_owned()),
+            );
             Changed::Names(names)
         }
         _ => Changed::All,
@@ -783,13 +793,20 @@ fn module_statements(
             all_mentions += 1;
         }
         if matches!(node.kind(), "assignment" | "augmented_assignment")
-            && let Some(object) = node
+            && let Some(left) = node
                 .child_by_field_name("left")
                 .filter(|left| left.kind() == "attribute")
-                .and_then(|left| left.child_by_field_name("object"))
-                .filter(|object| object.kind() == "identifier")
+            && let (Some(object), Some(attribute)) = (
+                left.child_by_field_name("object")
+                    .filter(|object| object.kind() == "identifier"),
+                left.child_by_field_name("attribute"),
+            )
         {
-            patched.insert(node_text(object, source));
+            patched.insert(format!(
+                "{}.{}",
+                node_text(object, source),
+                node_text(attribute, source)
+            ));
         }
         if cursor.goto_first_child() {
             continue;
@@ -825,6 +842,7 @@ fn string_sequence(node: Node<'_>, source: &[u8]) -> Option<BTreeSet<String>> {
     }
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
+        .filter(|item| item.kind() != "comment")
         .map(|item| {
             if item.kind() != "string" {
                 return None;

@@ -55,6 +55,12 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Python call edges follow package re-exports and `src/` layouts: `from pkg import f`,
+  where `pkg/__init__.py` re-exports `f` from a submodule, now reaches the defining
+  module's symbol, and tests outside `src/` reach `src.pkg…` symbols. Targets Python could
+  bind more than one way stay unresolved. The first `aetherd batch run` afterwards
+  regenerates the SIRs of Python symbols whose callers or callees newly resolve, because
+  their neighbor context changes.
 - `aether_sir_inject` refreshes the symbol's embedding after the write, so semantic
   search reflects injected SIRs immediately (#151).
 - `aether_sir_inject` responses round confidence to four decimal places (#151).

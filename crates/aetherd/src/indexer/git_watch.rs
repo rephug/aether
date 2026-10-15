@@ -198,6 +198,7 @@ pub(super) fn process_reindex_paths(
     queue_state: &SharedQueueState,
     paths: Vec<PathBuf>,
 ) -> Result<()> {
+    refresh_paths(config, structural, &paths);
     let processed = paths.iter().try_for_each(|path| {
         process_reindex_path(config, observer, structural, store, queue_state, path)
     });
@@ -205,7 +206,41 @@ pub(super) fn process_reindex_paths(
     processed
 }
 
-pub(super) fn process_reindex_path(
+/// Re-indexes the paths the watcher's debounce released. A path that fails is logged and
+/// the rest go on.
+pub(super) fn process_debounced_paths(
+    config: &IndexerConfig,
+    observer: &mut ObserverState,
+    structural: &mut StructuralIndexer,
+    store: &SqliteStore,
+    queue_state: &SharedQueueState,
+    paths: Vec<PathBuf>,
+) {
+    refresh_paths(config, structural, &paths);
+    for path in &paths {
+        if let Err(err) =
+            process_reindex_path(config, observer, structural, store, queue_state, path)
+        {
+            tracing::error!(path = %path.display(), error = %err, "process error");
+        }
+    }
+    structural.reindex_stale_files(store);
+}
+
+/// Re-reads a batch of changed paths for the Python call targets resolved through them,
+/// symbols or not (a package's `__init__.py` that only re-exports has none), before any
+/// file of the batch is re-extracted. The files whose targets they may move are
+/// re-extracted once the batch is done (`StructuralIndexer::reindex_stale_files`), also
+/// when it stops early.
+fn refresh_paths(config: &IndexerConfig, structural: &mut StructuralIndexer, paths: &[PathBuf]) {
+    for path in paths {
+        structural.refresh_file(&normalize_path(
+            &relative_workspace_path(&config.workspace, path).to_string_lossy(),
+        ));
+    }
+}
+
+fn process_reindex_path(
     config: &IndexerConfig,
     observer: &mut ObserverState,
     structural: &mut StructuralIndexer,
@@ -213,12 +248,6 @@ pub(super) fn process_reindex_path(
     queue_state: &SharedQueueState,
     path: &Path,
 ) -> Result<()> {
-    // Python call targets elsewhere may have been resolved through this path, symbols or
-    // not (a package's `__init__.py` that only re-exports has none). The files they are in
-    // are re-extracted once the batch is done (`StructuralIndexer::reindex_stale_files`).
-    structural.refresh_file(&normalize_path(
-        &relative_workspace_path(&config.workspace, path).to_string_lossy(),
-    ));
     match observer.process_path(path) {
         Ok(Some(event)) => {
             if config.print_events {
@@ -637,5 +666,17 @@ mod tests {
         )
         .expect("reindex the package");
         assert_eq!(callees(), vec![id("pkg/new.py", "pkg.new::f")]);
+
+        // The same through the watcher's debounce path.
+        fs::write(workspace.join("pkg/__init__.py"), "from .old import f\n").expect("edit");
+        process_debounced_paths(
+            &config,
+            &mut observer,
+            &mut structural,
+            &store,
+            &queue_state,
+            vec![workspace.join("pkg/__init__.py")],
+        );
+        assert_eq!(callees(), vec![id("pkg/old.py", "pkg.old::f")]);
     }
 }
