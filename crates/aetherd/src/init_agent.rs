@@ -996,7 +996,9 @@ mod tests {
     fn review_workflow_filters_on_every_registered_extension() {
         assert_eq!(
             super::source_suffixes(),
-            vec![".go", ".js", ".jsx", ".py", ".pyi", ".rs", ".ts", ".tsx"]
+            vec![
+                ".cs", ".go", ".java", ".js", ".jsx", ".py", ".pyi", ".rs", ".ts", ".tsx"
+            ]
         );
 
         let temp = tempdir().expect("tempdir");
@@ -1012,7 +1014,7 @@ mod tests {
         let workflow = fs::read_to_string(temp.path().join(".github/workflows/aether-review.yml"))
             .expect("read review workflow");
         assert!(workflow.contains(
-            "\n          SOURCE_SUFFIXES = (\".go\", \".js\", \".jsx\", \".py\", \".pyi\", \".rs\", \".ts\", \".tsx\")\n"
+            "\n          SOURCE_SUFFIXES = (\".cs\", \".go\", \".java\", \".js\", \".jsx\", \".py\", \".pyi\", \".rs\", \".ts\", \".tsx\")\n"
         ));
     }
 
