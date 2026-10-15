@@ -16,17 +16,15 @@ pub struct ConfigWarning {
     pub message: String,
 }
 
-fn provider_ignores_gemini_thinking(
+fn provider_ignores_thinking(
     provider: InferenceProviderKind,
     tiered: Option<&TieredConfig>,
 ) -> bool {
     match provider {
         InferenceProviderKind::Gemini | InferenceProviderKind::Auto => false,
-        // The omp gateway forwards `reasoning_effort`, so thinking is honoured there too.
-        InferenceProviderKind::Omp => false,
-        InferenceProviderKind::Qwen3Local
-        | InferenceProviderKind::OpenAiCompat
-        | InferenceProviderKind::Mock => true,
+        // `openai_compat` and the omp gateway send thinking as `reasoning_effort`.
+        InferenceProviderKind::OpenAiCompat | InferenceProviderKind::Omp => false,
+        InferenceProviderKind::Qwen3Local | InferenceProviderKind::Mock => true,
         InferenceProviderKind::Tiered => tiered.is_some_and(|tiered| {
             !tiered
                 .primary
@@ -273,10 +271,7 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
     }
 
     if config.inference.thinking.is_some()
-        && provider_ignores_gemini_thinking(
-            config.inference.provider,
-            config.inference.tiered.as_ref(),
-        )
+        && provider_ignores_thinking(config.inference.provider, config.inference.tiered.as_ref())
     {
         warnings.push(ConfigWarning {
             code: "inference_thinking_ignored_for_provider",
@@ -295,7 +290,7 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
             config.sir_quality.triage_provider.as_deref(),
             config.inference.provider,
         )
-        && provider_ignores_gemini_thinking(provider, config.inference.tiered.as_ref())
+        && provider_ignores_thinking(provider, config.inference.tiered.as_ref())
     {
         warnings.push(ConfigWarning {
             code: "sir_quality_triage_thinking_ignored_for_provider",
@@ -311,7 +306,7 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
             config.sir_quality.deep_provider.as_deref(),
             config.inference.provider,
         )
-        && provider_ignores_gemini_thinking(provider, config.inference.tiered.as_ref())
+        && provider_ignores_thinking(provider, config.inference.tiered.as_ref())
     {
         warnings.push(ConfigWarning {
             code: "sir_quality_deep_thinking_ignored_for_provider",
@@ -674,7 +669,7 @@ provider = "qwen3_local"
 
 [sir_quality]
 triage_thinking = "high"
-deep_provider = "openai_compat"
+deep_provider = "mock"
 deep_thinking = "medium"
 "#,
         )
@@ -683,6 +678,29 @@ deep_thinking = "medium"
         let codes = warning_codes(&validate_config(&config));
         assert!(codes.contains(&"sir_quality_triage_thinking_ignored_for_provider"));
         assert!(codes.contains(&"sir_quality_deep_thinking_ignored_for_provider"));
+    }
+
+    #[test]
+    fn validate_config_openai_compat_honours_thinking() {
+        let config = parse_workspace_config_str(
+            r#"
+[inference]
+provider = "openai_compat"
+thinking = "max"
+
+[sir_quality]
+triage_thinking = "low"
+deep_provider = "openai_compat"
+deep_thinking = "high"
+"#,
+        )
+        .expect("parse config");
+
+        let codes = warning_codes(&validate_config(&config));
+        assert!(
+            !codes.iter().any(|code| code.contains("thinking_ignored")),
+            "{codes:?}"
+        );
     }
 
     #[test]
