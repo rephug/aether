@@ -134,6 +134,10 @@ pub struct InferenceConfig {
     /// slow hardware; it also lifts the local Ollama provider's request timeout to match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    /// Most tokens one SIR reply from the local Ollama provider may generate (Ollama
+    /// `num_predict`). Unset or 0 keeps 2048. Deep-mode replies keep their own cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
 }
 
 impl Default for InferenceConfig {
@@ -148,6 +152,7 @@ impl Default for InferenceConfig {
             tiered: None,
             omp: OmpConfig::default(),
             timeout_secs: None,
+            max_output_tokens: None,
         }
     }
 }
@@ -302,6 +307,17 @@ mod tests {
         let set: InferenceConfig =
             toml::from_str("provider = \"qwen3_local\"\ntimeout_secs = 300").expect("parse");
         assert_eq!(set.timeout_secs, Some(300));
+    }
+
+    #[test]
+    fn inference_max_output_tokens_is_optional() {
+        let unset: InferenceConfig = toml::from_str("provider = \"qwen3_local\"").expect("parse");
+        assert_eq!(unset.max_output_tokens, None);
+        assert_eq!(InferenceConfig::default().max_output_tokens, None);
+
+        let set: InferenceConfig =
+            toml::from_str("provider = \"qwen3_local\"\nmax_output_tokens = 1024").expect("parse");
+        assert_eq!(set.max_output_tokens, Some(1024));
     }
 
     #[test]

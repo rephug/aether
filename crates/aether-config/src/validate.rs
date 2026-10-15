@@ -63,6 +63,9 @@ fn effective_quality_provider(
     }
 }
 
+/// Below this, `[inference] max_output_tokens` can cut off a normal SIR reply.
+const MIN_SUGGESTED_MAX_OUTPUT_TOKENS: u32 = 1024;
+
 pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
     let mut warnings = Vec::new();
 
@@ -326,6 +329,37 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
         });
     }
 
+    if let Some(max_output_tokens) = config
+        .inference
+        .max_output_tokens
+        .filter(|tokens| *tokens > 0)
+    {
+        if !matches!(
+            config.inference.provider,
+            InferenceProviderKind::Auto
+                | InferenceProviderKind::Qwen3Local
+                | InferenceProviderKind::Tiered
+        ) {
+            warnings.push(ConfigWarning {
+                code: "inference_max_output_tokens_ignored_for_provider",
+                message: format!(
+                    "inference.max_output_tokens only caps the local Ollama provider; it is \
+                     ignored for inference.provider={}",
+                    config.inference.provider.as_str()
+                ),
+            });
+        } else if max_output_tokens < MIN_SUGGESTED_MAX_OUTPUT_TOKENS {
+            warnings.push(ConfigWarning {
+                code: "inference_max_output_tokens_low",
+                message: format!(
+                    "inference.max_output_tokens = {max_output_tokens} can cut off normal SIR \
+                     replies, which reach about 1,200 tokens; use at least \
+                     {MIN_SUGGESTED_MAX_OUTPUT_TOKENS}"
+                ),
+            });
+        }
+    }
+
     let container_defaults = VerifyContainerConfig::default();
     let container_settings_ignored =
         config.verify.mode == VerifyMode::Host && config.verify.container != container_defaults;
@@ -435,6 +469,35 @@ mod tests {
     }
 
     #[test]
+    fn validate_config_checks_max_output_tokens() {
+        let with_cap = |provider: InferenceProviderKind, tokens: u32| {
+            let mut config = AetherConfig::default();
+            config.inference.provider = provider;
+            config.inference.max_output_tokens = Some(tokens);
+            warning_codes(&validate_config(&config))
+                .into_iter()
+                .filter(|code| code.starts_with("inference_max_output_tokens"))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            with_cap(InferenceProviderKind::Gemini, 2048),
+            vec!["inference_max_output_tokens_ignored_for_provider"]
+        );
+        assert_eq!(
+            with_cap(InferenceProviderKind::OpenAiCompat, 2048),
+            vec!["inference_max_output_tokens_ignored_for_provider"]
+        );
+        assert_eq!(
+            with_cap(InferenceProviderKind::Qwen3Local, 256),
+            vec!["inference_max_output_tokens_low"]
+        );
+        assert!(with_cap(InferenceProviderKind::Qwen3Local, 2048).is_empty());
+        assert!(with_cap(InferenceProviderKind::Tiered, 4096).is_empty());
+        assert!(with_cap(InferenceProviderKind::Gemini, 0).is_empty());
+    }
+
+    #[test]
     fn validate_config_omp_requires_a_route_model() {
         let codes = warning_codes(&validate_config(&omp_config(None, None)));
         assert!(codes.contains(&"inference_omp_model_missing"), "{codes:?}");
@@ -517,6 +580,7 @@ mod tests {
                 tiered: None,
                 omp: crate::OmpConfig::default(),
                 timeout_secs: None,
+                max_output_tokens: None,
             },
             sir_quality: SirQualityConfig::default(),
             storage: StorageConfig {
