@@ -6,6 +6,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+/// Maximum number of SIR JSON bytes included in the judge prompt.
+const SIR_EXCERPT_MAX_BYTES: usize = 2000;
+
 #[derive(Debug, Clone)]
 pub struct JudgeResult {
     pub violated: bool,
@@ -27,11 +30,7 @@ pub fn judge_clause(
                          contract. Respond with ONLY a JSON object: \
                          {\"violated\": true/false, \"reason\": \"brief explanation\"}";
 
-    let sir_excerpt = if sir_json.len() > 2000 {
-        &sir_json[..2000]
-    } else {
-        sir_json
-    };
+    let sir_excerpt = sir_excerpt(sir_json, SIR_EXCERPT_MAX_BYTES);
 
     let user_prompt = format!(
         "Contract type: {clause_type}\n\
@@ -65,6 +64,14 @@ pub fn judge_clause(
             })
         }
     }
+}
+
+/// Cut `sir_json` to at most `max_bytes` bytes for the judge prompt.
+///
+/// SIR JSON keeps non-ASCII text unescaped, so the cut backs off to the
+/// nearest char boundary instead of slicing through a multi-byte character.
+fn sir_excerpt(sir_json: &str, max_bytes: usize) -> &str {
+    &sir_json[..sir_json.floor_char_boundary(max_bytes)]
 }
 
 fn parse_judge_response(text: &str) -> Result<JudgeResult> {
@@ -163,5 +170,35 @@ mod tests {
     #[test]
     fn extract_json_object_no_json() {
         assert_eq!(extract_json_object("no json here"), None);
+    }
+
+    #[test]
+    fn sir_excerpt_keeps_short_input_whole() {
+        let sir = r#"{"intent":"short → ok","confidence":0.9}"#;
+        assert_eq!(sir_excerpt(sir, SIR_EXCERPT_MAX_BYTES), sir);
+        let exact = "a".repeat(SIR_EXCERPT_MAX_BYTES);
+        assert_eq!(sir_excerpt(&exact, SIR_EXCERPT_MAX_BYTES), exact);
+    }
+
+    #[test]
+    fn sir_excerpt_truncates_ascii_at_limit() {
+        let sir = "a".repeat(SIR_EXCERPT_MAX_BYTES + 10);
+        let excerpt = sir_excerpt(&sir, SIR_EXCERPT_MAX_BYTES);
+        assert_eq!(excerpt.len(), SIR_EXCERPT_MAX_BYTES);
+    }
+
+    #[test]
+    fn sir_excerpt_does_not_split_multibyte_char_at_limit() {
+        // 'é' is two bytes and starts at byte 1999, so the limit falls inside it.
+        let two_byte = format!("{}é tail", "a".repeat(SIR_EXCERPT_MAX_BYTES - 1));
+        let excerpt = sir_excerpt(&two_byte, SIR_EXCERPT_MAX_BYTES);
+        assert_eq!(excerpt.len(), SIR_EXCERPT_MAX_BYTES - 1);
+        assert!(two_byte.starts_with(excerpt));
+
+        // '→' is three bytes and starts at byte 1998, so the limit falls inside it.
+        let three_byte = format!("{}→ maps input", "a".repeat(SIR_EXCERPT_MAX_BYTES - 2));
+        let excerpt = sir_excerpt(&three_byte, SIR_EXCERPT_MAX_BYTES);
+        assert_eq!(excerpt.len(), SIR_EXCERPT_MAX_BYTES - 2);
+        assert!(three_byte.starts_with(excerpt));
     }
 }
