@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, State};
-use axum::response::IntoResponse;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
 use crate::support::{self, DashboardState};
@@ -171,7 +172,7 @@ pub(crate) async fn create_preset_handler(
             });
             support::api_json(state.shared.as_ref(), data).into_response()
         }
-        Err(err) => support::json_internal_error(err),
+        Err(err) => err.into_response(),
     }
 }
 
@@ -188,7 +189,37 @@ pub(crate) async fn delete_preset_handler(
             });
             support::api_json(state.shared.as_ref(), data).into_response()
         }
-        Err(err) => support::json_internal_error(err),
+        Err(err) => err.into_response(),
+    }
+}
+
+/// Why creating or deleting a preset failed; client mistakes map to 4xx, not 500.
+#[derive(Debug)]
+enum PresetError {
+    /// The request itself is invalid, such as an empty name (400).
+    BadRequest(String),
+    /// No custom preset has this name (404).
+    NotFound(String),
+    /// The name belongs to a built-in preset, which cannot be changed (409).
+    Conflict(String),
+    /// Filesystem or serialization failure (500).
+    Internal(String),
+}
+
+impl IntoResponse for PresetError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::BadRequest(message) => {
+                support::json_error(StatusCode::BAD_REQUEST, "bad_request", message)
+            }
+            Self::NotFound(message) => {
+                support::json_error(StatusCode::NOT_FOUND, "not_found", message)
+            }
+            Self::Conflict(message) => {
+                support::json_error(StatusCode::CONFLICT, "conflict", message)
+            }
+            Self::Internal(message) => support::json_internal_error(message),
+        }
     }
 }
 
@@ -233,13 +264,20 @@ pub(crate) fn load_presets_data(workspace: &std::path::Path) -> Result<PresetsDa
     Ok(PresetsData { presets, total })
 }
 
-fn create_preset(workspace: &std::path::Path, body: &CreatePresetRequest) -> Result<(), String> {
+fn create_preset(
+    workspace: &std::path::Path,
+    body: &CreatePresetRequest,
+) -> Result<(), PresetError> {
     let name = body.name.trim();
     if name.is_empty() {
-        return Err("preset name cannot be empty".to_owned());
+        return Err(PresetError::BadRequest(
+            "preset name cannot be empty".to_owned(),
+        ));
     }
     if builtin_preset_entries().iter().any(|p| p.name == name) {
-        return Err(format!("cannot overwrite built-in preset '{name}'"));
+        return Err(PresetError::Conflict(format!(
+            "cannot overwrite built-in preset '{name}'"
+        )));
     }
 
     let safe_name: String = name
@@ -254,7 +292,7 @@ fn create_preset(workspace: &std::path::Path, body: &CreatePresetRequest) -> Res
         .collect();
     let presets_dir = workspace.join(".aether/presets");
     std::fs::create_dir_all(&presets_dir)
-        .map_err(|e| format!("failed to create presets dir: {e}"))?;
+        .map_err(|e| PresetError::Internal(format!("failed to create presets dir: {e}")))?;
 
     let config = PresetConfig {
         preset: PresetMeta {
@@ -271,17 +309,20 @@ fn create_preset(workspace: &std::path::Path, body: &CreatePresetRequest) -> Res
         },
         task_template: None,
     };
-    let toml_str =
-        toml::to_string_pretty(&config).map_err(|e| format!("failed to serialize preset: {e}"))?;
+    let toml_str = toml::to_string_pretty(&config)
+        .map_err(|e| PresetError::Internal(format!("failed to serialize preset: {e}")))?;
     let path = presets_dir.join(format!("{safe_name}.toml"));
-    std::fs::write(&path, toml_str).map_err(|e| format!("failed to write preset: {e}"))?;
+    std::fs::write(&path, toml_str)
+        .map_err(|e| PresetError::Internal(format!("failed to write preset: {e}")))?;
     Ok(())
 }
 
-fn delete_preset(workspace: &std::path::Path, name: &str) -> Result<(), String> {
+fn delete_preset(workspace: &std::path::Path, name: &str) -> Result<(), PresetError> {
     let name = name.trim();
     if builtin_preset_entries().iter().any(|p| p.name == name) {
-        return Err(format!("cannot delete built-in preset '{name}'"));
+        return Err(PresetError::Conflict(format!(
+            "cannot delete built-in preset '{name}'"
+        )));
     }
 
     let safe_name: String = name
@@ -298,8 +339,9 @@ fn delete_preset(workspace: &std::path::Path, name: &str) -> Result<(), String> 
         .join(".aether/presets")
         .join(format!("{safe_name}.toml"));
     if !path.exists() {
-        return Err(format!("preset '{name}' not found"));
+        return Err(PresetError::NotFound(format!("preset '{name}' not found")));
     }
-    std::fs::remove_file(&path).map_err(|e| format!("failed to delete preset: {e}"))?;
+    std::fs::remove_file(&path)
+        .map_err(|e| PresetError::Internal(format!("failed to delete preset: {e}")))?;
     Ok(())
 }

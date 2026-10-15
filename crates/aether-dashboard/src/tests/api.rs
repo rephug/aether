@@ -1451,3 +1451,21 @@ async fn settings_save_rejects_values_that_would_make_config_unloadable() {
     assert_eq!(status, StatusCode::OK, "{json}");
     assert_eq!(json["data"]["provider"], "auto");
 }
+
+#[tokio::test]
+async fn contracts_dismiss_on_read_only_dashboard_returns_conflict() {
+    let (_tmp, app, _ids) = seeded_app().await;
+
+    let (status, json) = send_json(
+        &app,
+        "POST",
+        "/api/v1/contracts/dismiss",
+        Some(r#"{"violation_id":1}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json["error"], "read_only");
+    let message = json["message"].as_str().unwrap();
+    assert!(message.contains("aether_contract_dismiss"), "{message}");
+    assert!(!message.contains("--dismiss"), "{message}");
+}

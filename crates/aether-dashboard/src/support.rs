@@ -322,6 +322,23 @@ pub(crate) fn json_internal_error(message: impl Into<String>) -> Response {
         .into_response()
 }
 
+/// JSON error with an explicit status and error code, for client errors (4xx)
+/// that must not be reported as `internal_error`.
+pub(crate) fn json_error(
+    status: StatusCode,
+    error: &'static str,
+    message: impl Into<String>,
+) -> Response {
+    (
+        status,
+        Json(ErrorBody {
+            error,
+            message: message.into(),
+        }),
+    )
+        .into_response()
+}
+
 pub(crate) fn json_timeout_error(message: impl Into<String>) -> Response {
     (
         StatusCode::GATEWAY_TIMEOUT,
