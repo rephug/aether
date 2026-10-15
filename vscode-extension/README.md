@@ -93,4 +93,7 @@ Run extension verification scripts:
 ```bash
 npm run build
 npm run smoke
+npm test
 ```
+
+`npm run verify` runs all three.
