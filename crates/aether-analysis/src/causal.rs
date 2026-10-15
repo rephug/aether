@@ -145,7 +145,7 @@ impl LookbackContext {
                 }
                 lower_bound_ms.is_some_and(|bound| row.created_at >= bound)
             }
-            Self::Days { cutoff_ms } => row.created_at >= *cutoff_ms,
+            Self::Days { cutoff_ms } => history_created_at_ms(row.created_at) >= *cutoff_ms,
         }
     }
 
@@ -758,6 +758,17 @@ fn symbol_leaf_name(qualified_name: &str) -> String {
         .to_owned()
 }
 
+/// The indexer records SIR history `created_at` in Unix seconds, while other writers use
+/// milliseconds. Day windows compare against a millisecond cutoff, so read values below
+/// the millisecond range as seconds.
+fn history_created_at_ms(created_at: i64) -> i64 {
+    if created_at > 0 && created_at < 1_000_000_000_000 {
+        created_at.saturating_mul(1000)
+    } else {
+        created_at
+    }
+}
+
 fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -784,8 +795,47 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        CausalAnalyzer, LookbackContext, TraceCauseRequest, now_millis, resolve_change_metadata,
+        CausalAnalyzer, LookbackContext, LookbackSpec, TraceCauseRequest, now_millis,
+        parse_lookback_spec, resolve_change_metadata,
     };
+
+    #[test]
+    fn parse_lookback_spec_reads_day_suffix_as_days() {
+        assert!(matches!(parse_lookback_spec("7d"), LookbackSpec::Days(7)));
+        assert!(matches!(
+            parse_lookback_spec(" 30D "),
+            LookbackSpec::Days(30)
+        ));
+        assert!(matches!(parse_lookback_spec("90d"), LookbackSpec::Days(90)));
+        assert!(matches!(
+            parse_lookback_spec("30 commits"),
+            LookbackSpec::Commits(30)
+        ));
+    }
+
+    #[test]
+    fn day_window_includes_history_recorded_in_seconds() {
+        const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+        let now_ms = now_millis();
+        let context = LookbackContext::Days {
+            cutoff_ms: now_ms - 30 * DAY_MS,
+        };
+        let row = |created_at: i64| SirHistoryRecord {
+            symbol_id: "sym-1".to_owned(),
+            version: 2,
+            sir_hash: "hash-2".to_owned(),
+            provider: "mock".to_owned(),
+            model: "mock".to_owned(),
+            created_at,
+            sir_json: "{\"purpose\":\"demo\"}".to_owned(),
+            commit_hash: None,
+        };
+
+        assert!(context.contains_history_entry(&row((now_ms - 2 * DAY_MS) / 1000)));
+        assert!(!context.contains_history_entry(&row((now_ms - 45 * DAY_MS) / 1000)));
+        assert!(context.contains_history_entry(&row(now_ms - 2 * DAY_MS)));
+        assert!(!context.contains_history_entry(&row(now_ms - 45 * DAY_MS)));
+    }
 
     #[test]
     fn resolve_change_metadata_fallback_converts_seconds_to_millis() {

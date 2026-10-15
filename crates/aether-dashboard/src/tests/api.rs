@@ -632,6 +632,156 @@ async fn causal_chain_api_returns_shape_and_envelope() {
     assert!(json["data"]["overall_confidence"].is_number());
 }
 
+/// The causal explorer's lookback select sends `7d`, `30d` and `90d`. Each must be a
+/// window of that many days, not of that many commits. The workspace has no git
+/// repository and the SIR history rows carry no commit hash, so only a day window can
+/// include them. Timestamps are in seconds, as the indexer records them.
+#[tokio::test]
+async fn causal_chain_api_lookback_select_values_are_day_windows() {
+    use aether_store::{
+        GraphStore, ResolvedEdge, SirHistoryStore, SurrealGraphStore, block_on_store_future,
+    };
+
+    const DAY_SECS: i64 = 24 * 60 * 60;
+
+    let temp = TempDir::new().unwrap();
+    let workspace = temp.path().to_path_buf();
+    let mut config = AetherConfig::default();
+    config.storage.graph_backend = GraphBackend::Surreal;
+    config.embeddings.enabled = false;
+    save_workspace_config(&workspace, &config).unwrap();
+
+    let symbol = |id: &str, qualified_name: &str, file_path: &str| SymbolRecord {
+        id: id.to_owned(),
+        file_path: file_path.to_owned(),
+        language: "rust".to_owned(),
+        kind: "function".to_owned(),
+        qualified_name: qualified_name.to_owned(),
+        signature_fingerprint: format!("sig-{id}"),
+        last_seen_at: 1_700_000_000,
+    };
+    let target = symbol("sym-causal-target", "demo::target", "src/lib.rs");
+    let recent = symbol("sym-causal-recent", "demo::recent", "src/recent.rs");
+    let older = symbol("sym-causal-older", "demo::older", "src/older.rs");
+
+    let store = SqliteStore::open(&workspace).unwrap();
+    for record in [&target, &recent, &older] {
+        store.upsert_symbol(record.clone()).unwrap();
+    }
+    let now_secs = chrono::Utc::now().timestamp();
+    // `recent` last changed 2 days ago and `older` 45 days ago.
+    let changed_days_ago_by_symbol = [(recent.id.as_str(), 2_i64), (older.id.as_str(), 45)];
+    for (symbol_id, changed_days_ago) in changed_days_ago_by_symbol {
+        store
+            .record_sir_version_if_changed(
+                symbol_id,
+                "hash-v1",
+                "mock",
+                "mock",
+                r#"{"purpose":"old purpose","edge_cases":[],"dependencies":[]}"#,
+                now_secs - (changed_days_ago + 1) * DAY_SECS,
+                None,
+            )
+            .unwrap();
+        store
+            .record_sir_version_if_changed(
+                symbol_id,
+                "hash-v2",
+                "mock",
+                "mock",
+                r#"{"purpose":"new purpose","edge_cases":["timeout"],"dependencies":["queue"]}"#,
+                now_secs - changed_days_ago * DAY_SECS,
+                None,
+            )
+            .unwrap();
+    }
+    drop(store);
+
+    let graph_records = [target.clone(), recent.clone(), older.clone()];
+    block_on_store_future(async move {
+        // The first SurrealKV open has a 5 s timeout, which a heavily loaded test machine
+        // can hit. Later opens reuse the cached handle, so only this one needs a retry.
+        let mut attempts_left = 3;
+        let graph = loop {
+            attempts_left -= 1;
+            match SurrealGraphStore::open(&workspace).await {
+                Ok(graph) => break graph,
+                Err(err) if attempts_left == 0 => panic!("open Surreal graph store: {err}"),
+                Err(_) => continue,
+            }
+        };
+        for record in &graph_records {
+            graph.upsert_symbol_node(record).await.unwrap();
+        }
+        for upstream in &graph_records[1..] {
+            graph
+                .upsert_edge(&ResolvedEdge {
+                    source_id: graph_records[0].id.clone(),
+                    target_id: upstream.id.clone(),
+                    edge_kind: EdgeKind::Calls,
+                    file_path: graph_records[0].file_path.clone(),
+                })
+                .await
+                .unwrap();
+        }
+    })
+    .unwrap();
+
+    let state = Arc::new(SharedState::open_readonly_async(temp.path()).await.unwrap());
+    let app = dashboard_router(state);
+
+    for (lookback, expected) in [
+        ("7d", vec![recent.id.as_str()]),
+        ("30d", vec![recent.id.as_str()]),
+        ("90d", vec![older.id.as_str(), recent.id.as_str()]),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/causal-chain?symbol_id={}&depth=3&lookback={lookback}",
+                        target.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let chain = json["data"]["chain"].as_array().unwrap();
+        let mut chain_ids = chain
+            .iter()
+            .map(|row| row["symbol_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        chain_ids.sort();
+        assert_eq!(
+            chain_ids, expected,
+            "lookback={lookback} should cover the last {lookback} of SIR changes; response: {json}"
+        );
+
+        // Each row's timestamp is when that symbol's SIR changed, not the request time.
+        // Without commit metadata the analyzer reports the change date as an epoch
+        // number in seconds, which the dashboard must convert to milliseconds.
+        for row in chain {
+            let symbol_id = row["symbol_id"].as_str().unwrap();
+            let changed_days_ago = changed_days_ago_by_symbol
+                .iter()
+                .find(|(id, _)| *id == symbol_id)
+                .map(|(_, days)| *days)
+                .unwrap();
+            assert_eq!(
+                row["timestamp"].as_i64(),
+                Some((now_secs - changed_days_ago * DAY_SECS) * 1000),
+                "lookback={lookback}: {symbol_id} timestamp should be its change time; response: {json}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn unknown_static_path_returns_404() {
     let (_tmp, app, _ids) = seeded_app().await;
