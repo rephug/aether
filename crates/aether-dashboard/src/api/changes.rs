@@ -581,6 +581,8 @@ fn is_git_workspace(workspace: &Path) -> bool {
         .unwrap_or(false)
 }
 
+const GIT_LOG_FIELD_SEPARATOR: char = '\x1f';
+
 fn load_git_changes(workspace: &Path, period: &PeriodSpec) -> Result<Vec<GitChange>, String> {
     let output = Command::new("git")
         .arg("-C")
@@ -588,7 +590,9 @@ fn load_git_changes(workspace: &Path, period: &PeriodSpec) -> Result<Vec<GitChan
         .args([
             "log",
             period.git_since,
-            "--format=%H|%s|%an|%aI",
+            // Fields are separated by ASCII unit separator (0x1f) and the free-text
+            // subject comes last, so '|' or tabs in a subject cannot shift fields.
+            "--format=%H%x1f%an%x1f%aI%x1f%s",
             "--name-status",
         ])
         .output()
@@ -609,12 +613,12 @@ fn load_git_changes(workspace: &Path, period: &PeriodSpec) -> Result<Vec<GitChan
             continue;
         }
 
-        if !line.contains('\t') {
-            let mut parts = line.splitn(4, '|');
+        if line.contains(GIT_LOG_FIELD_SEPARATOR) {
+            let mut parts = line.splitn(4, GIT_LOG_FIELD_SEPARATOR);
             let _hash = parts.next();
-            let message = parts.next();
             let author = parts.next();
             let timestamp = parts.next();
+            let message = parts.next();
 
             if let (Some(message), Some(author), Some(timestamp)) = (message, author, timestamp) {
                 current_message = message.trim().to_owned();
@@ -727,4 +731,92 @@ fn normalize_timestamp_millis(raw: i64) -> i64 {
 fn system_time_millis(value: SystemTime) -> Option<i64> {
     let duration = value.duration_since(UNIX_EPOCH).ok()?;
     Some(duration.as_millis() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+
+    use chrono::Utc;
+    use tempfile::TempDir;
+
+    use super::{load_git_changes, merge_git_signals, parse_period};
+
+    fn run_git(workspace: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(workspace)
+            .args([
+                "-c",
+                "user.name=Bob",
+                "-c",
+                "user.email=bob@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn git_changes_keep_commits_whose_subject_contains_pipe() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path();
+        run_git(workspace, &["init", "--quiet"]);
+        fs::create_dir_all(workspace.join("docs")).expect("create docs");
+        fs::write(workspace.join("docs/notes.md"), "notes\n").expect("write notes");
+        run_git(workspace, &["add", "."]);
+        run_git(workspace, &["commit", "--quiet", "-m", "fix: a | b"]);
+
+        let period = parse_period(Some("24h"));
+        let changes = load_git_changes(workspace, &period).expect("load git changes");
+        assert_eq!(changes.len(), 1, "changes: {changes:?}");
+        let change = &changes[0];
+        assert_eq!(change.status, 'A');
+        assert_eq!(change.file_path, "docs/notes.md");
+        assert_eq!(change.message, "fix: a | b");
+        assert_eq!(change.author, "Bob");
+        assert!(
+            change.timestamp_ms > 0,
+            "timestamp_ms: {}",
+            change.timestamp_ms
+        );
+
+        let cutoff_ms = Utc::now().timestamp_millis() - period.duration_secs * 1000;
+        let mut by_file = HashMap::new();
+        merge_git_signals(workspace, &period, cutoff_ms, &mut by_file);
+        let acc = by_file
+            .get("docs/notes.md")
+            .expect("commit with '|' in its subject must reach the changes feed");
+        assert_eq!(acc.git_message.as_deref(), Some("fix: a | b"));
+        assert_eq!(acc.git_author.as_deref(), Some("Bob"));
+        assert_eq!(acc.git_status, Some('A'));
+    }
+
+    #[test]
+    fn git_changes_keep_commits_whose_subject_contains_tab() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path();
+        run_git(workspace, &["init", "--quiet"]);
+        fs::write(workspace.join("notes.md"), "notes\n").expect("write notes");
+        run_git(workspace, &["add", "."]);
+        run_git(workspace, &["commit", "--quiet", "-m", "docs:\tnotes"]);
+
+        let changes = load_git_changes(workspace, &parse_period(Some("24h"))).expect("load");
+        assert_eq!(changes.len(), 1, "changes: {changes:?}");
+        assert_eq!(changes[0].file_path, "notes.md");
+        assert_eq!(changes[0].message, "docs:\tnotes");
+        assert_eq!(changes[0].author, "Bob");
+        assert!(changes[0].timestamp_ms > 0);
+    }
 }
