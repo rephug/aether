@@ -188,6 +188,130 @@ async fn ask_api_returns_envelope_and_summary() {
     assert!(json["data"]["summary"].is_string());
 }
 
+fn symbol_access_state(workspace: &std::path::Path, symbol_id: &str) -> (i64, Option<i64>) {
+    let conn = Connection::open_with_flags(
+        workspace.join(".aether/meta.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    conn.query_row(
+        "SELECT access_count, last_accessed_at FROM symbols WHERE id = ?1",
+        params![symbol_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn ask_api_does_not_record_symbol_access() {
+    let (tmp, app, ids) = seeded_app().await;
+    let before = symbol_access_state(tmp.path(), ids.primary.as_str());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/ask")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"question":"run"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    let results = json["data"]["results"].as_array().unwrap();
+    assert!(
+        results.iter().any(|r| r["id"] == ids.primary),
+        "ask should return the seeded symbol: {json}"
+    );
+
+    // The dashboard is read-only: answering a question must not bump the
+    // access counters that feed recall ranking.
+    let after = symbol_access_state(tmp.path(), ids.primary.as_str());
+    assert_eq!(after, before);
+}
+
+fn sir_json_column(workspace: &std::path::Path, symbol_id: &str) -> Option<String> {
+    let conn = Connection::open_with_flags(
+        workspace.join(".aether/meta.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    conn.query_row(
+        "SELECT sir_json FROM sir WHERE id = ?1",
+        params![symbol_id],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn ask_api_answers_from_a_legacy_sir_mirror_on_the_read_only_store() {
+    let temp = TempDir::new().unwrap();
+    seed_workspace(temp.path());
+    // A symbol from the file-mirror era: its SIR row holds no JSON and the
+    // blob lives only in .aether/sir/<id>.json.
+    let legacy_id = "sym-demo-helper";
+    {
+        let store = SqliteStore::open(temp.path()).unwrap();
+        store
+            .upsert_sir_meta(SirMetaRecord {
+                id: legacy_id.to_owned(),
+                sir_hash: "hash-demo-helper".to_owned(),
+                sir_version: 1,
+                provider: "mock".to_owned(),
+                model: "mock-model".to_owned(),
+                generation_pass: "scan".to_owned(),
+                reasoning_trace: None,
+                prompt_hash: None,
+                staleness_score: None,
+                updated_at: 1_700_000_100,
+                sir_status: "ready".to_owned(),
+                last_error: None,
+                last_attempt_at: 1_700_000_100,
+            })
+            .unwrap();
+    }
+    fs::write(
+        temp.path().join(format!(".aether/sir/{legacy_id}.json")),
+        r#"{"intent":"Help from the mirror","dependencies":["ctx"]}"#,
+    )
+    .unwrap();
+    assert_eq!(sir_json_column(temp.path(), legacy_id), None);
+
+    let state = Arc::new(SharedState::open_readonly_async(temp.path()).await.unwrap());
+    let app = dashboard_router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/ask")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"question":"helper"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, StatusCode::OK, "ask failed: {json}");
+
+    let results = json["data"]["results"].as_array().unwrap();
+    let legacy = results
+        .iter()
+        .find(|r| r["id"] == legacy_id)
+        .unwrap_or_else(|| panic!("ask should return the legacy symbol: {json}"));
+    assert_eq!(legacy["snippet"], "Help from the mirror");
+    assert_eq!(legacy["sir_intent"], "Help from the mirror");
+
+    // The read-only dashboard serves the mirror without backfilling the row.
+    assert_eq!(sir_json_column(temp.path(), legacy_id), None);
+}
+
 #[tokio::test]
 async fn enhance_api_rejects_empty_prompt() {
     let (_tmp, app, _ids) = seeded_app().await;
