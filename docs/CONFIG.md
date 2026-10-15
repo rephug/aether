@@ -13,6 +13,7 @@ provider = "auto" # auto | tiered | gemini | qwen3_local | openai_compat | omp |
 # endpoint = "..."
 api_key_env = "GEMINI_API_KEY"
 concurrency = 2
+# thinking = "medium"
 # timeout_secs = 90
 ```
 
@@ -33,6 +34,11 @@ concurrency = 2
 - `api_key_env`
   - Env var name for Gemini or OpenAI-compatible providers.
   - Default: `GEMINI_API_KEY`
+- `thinking`
+  - Optional reasoning level.
+  - Gemini reads `minimal`, `low`, `medium` or `high` as its thinking level.
+  - `openai_compat` and `omp` forward `minimal`, `low`, `medium`, `high`, `xhigh` or `max` as the request's `reasoning_effort`.
+  - Any other value, or none, leaves the model's default.
 - `concurrency`
   - Default config value is `2`.
   - When `provider = "gemini"` and concurrency is left at the default value, AETHER normalizes it to `16`.
@@ -41,7 +47,8 @@ concurrency = 2
 - `timeout_secs`
   - How long one SIR generation attempt may take during scans and watcher updates before it is abandoned (each symbol gets three attempts). Unset means 90 seconds.
   - Raise it for local models on slow hardware. A CPU-only Ollama model can need several minutes for a large function, and with 90 seconds those symbols fail as `attempt 3/3 timed out after 90s`.
-  - With `qwen3_local` it also lifts the Ollama request timeout, normally 120 seconds, to match. Other providers keep their 120-second request timeout.
+  - Raise it for cloud models at high reasoning effort as well, since one SIR can take minutes there too.
+  - With `qwen3_local`, `openai_compat` and `omp` it also lifts the request timeout, normally 120 seconds, to match. Gemini keeps its 120-second request timeout.
   - Triage and deep passes keep using `[sir_quality] triage_timeout_secs` and `deep_timeout_secs`.
 
 ## Oh My Pi models and batch pricing

@@ -55,6 +55,10 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `inference.provider = "openai_compat"` now sends `[inference] thinking` as
+  `reasoning_effort`, as `omp` already did. `[inference] timeout_secs` now lifts the
+  request timeout of `openai_compat` and `omp` as well as `qwen3_local`, so a model that
+  thinks for more than 120 seconds on one SIR is no longer cut off by the HTTP client.
 - `aether_sir_inject` refreshes the symbol's embedding after the write, so semantic
   search reflects injected SIRs immediately (#151).
 - `aether_sir_inject` responses round confidence to four decimal places (#151).
