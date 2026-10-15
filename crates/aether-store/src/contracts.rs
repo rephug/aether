@@ -81,6 +81,65 @@ impl SqliteStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Insert a contract unless the symbol already has one (active or not)
+    /// with exactly the same clause text. Returns the new row id, or `None`
+    /// when an existing row blocked the insert.
+    pub fn insert_intent_contract_if_absent(
+        &self,
+        symbol_id: &str,
+        clause_type: &str,
+        clause_text: &str,
+        clause_embedding_json: Option<&str>,
+        created_by: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            r#"
+            INSERT INTO intent_contracts
+                (symbol_id, clause_type, clause_text, clause_embedding_json,
+                 created_at, created_by, active, violation_streak)
+            SELECT ?1, ?2, ?3, ?4, ?5, ?6, 1, 0
+            WHERE NOT EXISTS (
+                SELECT 1 FROM intent_contracts WHERE symbol_id = ?1 AND clause_text = ?3
+            )
+            "#,
+            params![
+                symbol_id,
+                clause_type,
+                clause_text,
+                clause_embedding_json,
+                unix_now(),
+                created_by,
+            ],
+        )?;
+        if changed == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(conn.last_insert_rowid()))
+        }
+    }
+
+    /// List a symbol's contracts ordered by id, optionally including
+    /// deactivated rows.
+    pub fn list_intent_contracts_for_symbol(
+        &self,
+        symbol_id: &str,
+        include_inactive: bool,
+    ) -> Result<Vec<IntentContractRecord>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, symbol_id, clause_type, clause_text, clause_embedding_json,
+                   created_at, created_by, active, violation_streak
+            FROM intent_contracts
+            WHERE symbol_id = ?1 AND (?2 = 1 OR active = 1)
+            ORDER BY id
+            "#,
+        )?;
+        let rows = stmt.query_map(params![symbol_id, include_inactive], map_contract_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn list_all_active_contracts(&self) -> Result<Vec<IntentContractRecord>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -525,5 +584,99 @@ mod tests {
         assert_eq!(violations.len(), 2);
         // Most recent first
         assert!(violations[0].detected_at >= violations[1].detected_at);
+    }
+
+    #[test]
+    fn list_intent_contracts_for_symbol_respects_inactive_flag() {
+        let (store, _dir) = open_test_store();
+        let first = store
+            .insert_intent_contract("sym_a", "must", "clause one", None, "human")
+            .unwrap();
+        let second = store
+            .insert_intent_contract("sym_a", "must", "clause two", None, "inferred")
+            .unwrap();
+        store
+            .insert_intent_contract("sym_b", "must", "other symbol", None, "human")
+            .unwrap();
+        store.deactivate_contract(first).unwrap();
+
+        let active_only = store
+            .list_intent_contracts_for_symbol("sym_a", false)
+            .unwrap();
+        assert_eq!(active_only.len(), 1);
+        assert_eq!(active_only[0].id, second);
+
+        let all = store
+            .list_intent_contracts_for_symbol("sym_a", true)
+            .unwrap();
+        assert_eq!(
+            all.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert!(!all[0].active);
+        assert!(all.iter().all(|c| c.symbol_id == "sym_a"));
+    }
+
+    #[test]
+    fn insert_intent_contract_if_absent_dedupes_on_exact_text() {
+        let (store, _dir) = open_test_store();
+        let id = store
+            .insert_intent_contract_if_absent(
+                "sym_a",
+                "must",
+                "Rejects zero amounts.",
+                Some("[1.0,0.0]"),
+                "inferred",
+            )
+            .unwrap()
+            .expect("first insert should create a row");
+
+        let row = store.get_intent_contract(id).unwrap().unwrap();
+        assert!(row.active);
+        assert_eq!(row.violation_streak, 0);
+        assert_eq!(row.created_by, "inferred");
+        assert_eq!(row.clause_type, "must");
+        assert_eq!(row.clause_embedding_json.as_deref(), Some("[1.0,0.0]"));
+
+        let again = store
+            .insert_intent_contract_if_absent(
+                "sym_a",
+                "must",
+                "Rejects zero amounts.",
+                None,
+                "inferred",
+            )
+            .unwrap();
+        assert_eq!(again, None);
+
+        store.deactivate_contract(id).unwrap();
+        let after_deactivate = store
+            .insert_intent_contract_if_absent(
+                "sym_a",
+                "must",
+                "Rejects zero amounts.",
+                None,
+                "inferred",
+            )
+            .unwrap();
+        assert_eq!(after_deactivate, None);
+
+        let other_symbol = store
+            .insert_intent_contract_if_absent(
+                "sym_b",
+                "must",
+                "Rejects zero amounts.",
+                None,
+                "inferred",
+            )
+            .unwrap();
+        assert!(other_symbol.is_some());
+        assert_eq!(
+            store
+                .list_intent_contracts_for_symbol("sym_a", true)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

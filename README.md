@@ -484,9 +484,14 @@ aetherd --workspace . contract check
 
 # List active contracts
 aetherd --workspace . contract list
+
+# Infer contracts from SIR history (needs implicit_inference_enabled = true)
+aetherd --workspace . contract infer payments::validate_amount --dry-run
 ```
 
 Two-stage verification: embedding cosine pre-filter resolves ~90% of checks in microseconds, LLM judge handles the ambiguous middle band. Leaky bucket means the first violation is silent (LLM phrasing jitter). Second consecutive violation triggers the alert. Dismissed false positives become negative few-shot examples that improve accuracy over time.
+
+`contract infer` reads a symbol's SIR history, splits each version into sentence-level claims, embeds every unique claim in one embedding pass with your configured embedding provider, and clusters them (DBSCAN on cosine distance, eps 0.12 by default, `--eps` to tune). A claim that shows up in at least `implicit_persistence_threshold` of the versions, and is still stated by the newest one, is promoted as a `must` contract with `created_by = "inferred"` (shown as `[inferred]` in `contract list`). At most five are created per run, existing contracts (including removed ones) are never duplicated, and `--dry-run` shows the decisions without writing anything. The embedding pass covers up to 40 claims from each considered version plus the existing clause texts; Gemini sends them in requests of up to 100 texts, while `openai_compat` and `qwen3_local` send one request per text, and `--dry-run` makes the same calls.
 
 Contract clauses from callers automatically propagate into downstream symbols' SIR prompts. If `validate_amount` has a contract and calls `check_limit`, AETHER injects the contract context so the LLM naturally addresses it.
 
@@ -763,6 +768,7 @@ CONTRACTS
   contract list          List active contracts
   contract remove        Deactivate a contract clause
   contract check         Force-run verification
+  contract infer         Infer contracts from SIR history (opt-in)
 
 SEISMOGRAPH
   seismograph status     Semantic velocity, unstable communities, cascades
@@ -857,6 +863,9 @@ enabled = false
 embedding_pass_threshold = 0.88
 embedding_fail_threshold = 0.50
 streak_threshold = 2
+implicit_inference_enabled = false    # opt in to `contract infer`
+implicit_min_versions = 10            # usable SIR versions required (3-50)
+implicit_persistence_threshold = 0.80 # share of versions that must state a claim (0.5-1.0)
 
 [planner]
 semantic_rescue_threshold = 0.90
