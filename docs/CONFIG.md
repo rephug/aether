@@ -13,6 +13,7 @@ provider = "auto" # auto | tiered | gemini | qwen3_local | openai_compat | omp |
 # endpoint = "..."
 api_key_env = "GEMINI_API_KEY"
 concurrency = 2
+# timeout_secs = 90
 ```
 
 - `provider`
@@ -37,6 +38,11 @@ concurrency = 2
   - When `provider = "gemini"` and concurrency is left at the default value, AETHER normalizes it to `16`.
   - For `gemini-3.1-flash-lite-preview`, `concurrency = 16` is safe under the 4000 RPM limit.
   - For local Ollama on consumer hardware, `concurrency = 2` is appropriate.
+- `timeout_secs`
+  - How long one SIR generation attempt may take during scans and watcher updates before it is abandoned (each symbol gets three attempts). Unset means 90 seconds.
+  - Raise it for local models on slow hardware. A CPU-only Ollama model can need several minutes for a large function, and with 90 seconds those symbols fail as `attempt 3/3 timed out after 90s`.
+  - With `qwen3_local` it also lifts the Ollama request timeout, normally 120 seconds, to match. Other providers keep their 120-second request timeout.
+  - Triage and deep passes keep using `[sir_quality] triage_timeout_secs` and `deep_timeout_secs`.
 
 ## Oh My Pi models and batch pricing
 
