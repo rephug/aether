@@ -8,6 +8,7 @@ use aether_core::normalize_path;
 use aether_store::{SqliteStore, SurrealGraphStore};
 
 use crate::coupling::AnalysisError;
+use crate::test_intents::is_csharp_test_path;
 
 /// Whether a symbol is test code, judged from its name and path alone (no per-symbol
 /// store lookups, so it stays cheap on large workspaces):
@@ -18,7 +19,8 @@ use crate::coupling::AnalysisError;
 ///   directory, or is a `tests.rs` module file;
 /// - the file name follows a common test convention: `test_*.py`, `*_test.py`,
 ///   `*_test.go`, or contains `.test.` / `.spec.` (the JavaScript and TypeScript
-///   conventions, applied to any language).
+///   conventions, applied to any language);
+/// - a C# file is named `*Tests.cs` / `*Test.cs` or sits in a `*.Tests`-style project.
 ///
 /// Being name-based, it misses test modules with other names (`mod parser_tests`) and
 /// takes production functions named `test_*` for tests, as the planner's rule does.
@@ -35,7 +37,11 @@ pub fn is_test_symbol(qualified_name: &str, file_path: &str) -> bool {
         return true;
     }
 
-    let path = normalize_path(file_path).to_ascii_lowercase();
+    let path = normalize_path(file_path);
+    if is_csharp_test_path(&path) {
+        return true;
+    }
+    let path = path.to_ascii_lowercase();
     let in_test_dir =
         |dir: &str| path.starts_with(&format!("{dir}/")) || path.contains(&format!("/{dir}/"));
     if in_test_dir("tests") || in_test_dir("__tests__") || in_test_dir("src/test") {
@@ -100,6 +106,15 @@ mod tests {
                 "billing/src/test/java/com/acme/PaymentServiceTest.java",
             ),
             ("Fixtures::order", "src/test/java/com/acme/Fixtures.java"),
+            (
+                "LoggerTests::WritesEvent",
+                "test/Serilog.Tests/Core/LoggerTests.cs",
+            ),
+            (
+                "PaymentTests::Charges",
+                "Acme.Billing.Tests/PaymentTests.cs",
+            ),
+            ("Fixture::Build", "src/Acme.Billing.UnitTests/Fixture.cs"),
         ] {
             assert!(
                 is_test_symbol(qualified_name, file_path),
@@ -121,6 +136,9 @@ mod tests {
             ("load", "pkg/testing.py"),
             ("render", "web/src/latest.ts"),
             ("Contest::score", "src/main/java/com/acme/test/Contest.java"),
+            ("Contest::Score", "src/Acme/Contest.cs"),
+            ("Support::Load", "src/Acme.Tests.Support/Support.cs"),
+            ("load", "src/Acme.Tests/loader.py"),
         ] {
             assert!(
                 !is_test_symbol(qualified_name, file_path),

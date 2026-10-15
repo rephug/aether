@@ -796,6 +796,7 @@ fn parse_language(raw: &str) -> Result<Language> {
         "python" => Ok(Language::Python),
         "go" => Ok(Language::Go),
         "java" => Ok(Language::Java),
+        "csharp" => Ok(Language::CSharp),
         other => Err(anyhow!("unsupported symbol language '{other}'")),
     }
 }
@@ -830,7 +831,7 @@ mod language_tests {
 
     #[test]
     fn reads_every_stored_language_spelling() {
-        let mut listed = [false; 8];
+        let mut listed = [false; 9];
         for language in [
             Language::Rust,
             Language::TypeScript,
@@ -840,6 +841,7 @@ mod language_tests {
             Language::Python,
             Language::Go,
             Language::Java,
+            Language::CSharp,
         ] {
             listed[variant_index(language)] = true;
             assert_eq!(
@@ -865,6 +867,7 @@ mod language_tests {
             Language::Python => 5,
             Language::Go => 6,
             Language::Java => 7,
+            Language::CSharp => 8,
         }
     }
 }

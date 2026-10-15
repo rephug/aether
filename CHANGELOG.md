@@ -14,6 +14,9 @@ and this project follows [Semantic Versioning](https://semver.org/).
 - Java parsing: classes, interfaces, enums, records, methods and constructors
   (`Outer::Inner::method`); call, import, type-reference and `extends`/`implements`
   edges; JUnit `@Test` test intents (with `@DisplayName`).
+- C# parsing: classes, structs, records, interfaces, enums, delegates, methods and
+  constructors (`Outer::Inner::Method`, namespaces left out); call, `using`,
+  type-reference and base-list edges; xUnit, NUnit and MSTest test intents.
 - `inference.provider = "omp"`: run SIR generation through the Oh My Pi auth gateway
   (`omp auth-gateway serve`) so models are addressed as omp routes (`provider/model`)
   and billed on the omp credential (subscription logins included). The gateway token is

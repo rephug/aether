@@ -269,6 +269,12 @@ impl TestIntentAnalyzer {
             candidates.insert(existing);
         }
 
+        for candidate in csharp_sources_for_test(normalized.as_str()) {
+            if let Some(existing) = self.ensure_existing_repo_file(candidate.as_str()) {
+                candidates.insert(existing);
+            }
+        }
+
         if normalized.contains("/__tests__/") {
             let candidate = normalized.replace("/__tests__/", "/");
             if let Some(existing) = self.ensure_existing_repo_file(candidate.as_str()) {
@@ -546,6 +552,76 @@ fn java_main_source_for_test(path: &str) -> Option<String> {
     Some(format!("{root}src/main/java/{base}.java"))
 }
 
+/// Suffixes .NET solutions give the project that tests another one.
+const CSHARP_TEST_PROJECT_SUFFIXES: [&str; 4] =
+    [".UnitTests", ".IntegrationTests", ".Tests", ".Test"];
+
+/// Whether a normalized `.cs` path follows .NET test naming: a `*Tests.cs` or `*Test.cs` file,
+/// or a file in a `*.Tests`, `*.Test`, `*.UnitTests` or `*.IntegrationTests` project. C# names
+/// test classes and projects in PascalCase, so these checks keep their case.
+pub(crate) fn is_csharp_test_path(path: &str) -> bool {
+    path.ends_with(".cs")
+        && (path.ends_with("Tests.cs")
+            || path.ends_with("Test.cs")
+            || path.split('/').any(|segment| {
+                CSHARP_TEST_PROJECT_SUFFIXES
+                    .iter()
+                    .any(|suffix| segment.len() > suffix.len() && segment.ends_with(suffix))
+            }))
+}
+
+/// .NET solutions keep tests in a sibling project: `Acme.Billing.Tests/PaymentTests.cs`
+/// tests `Acme.Billing/Payment.cs`, often under `tests/` and `src/` roots.
+fn csharp_sources_for_test(path: &str) -> Vec<String> {
+    let Some(base) = path
+        .strip_suffix(".cs")
+        .and_then(|stem| {
+            ["Tests", "Test"]
+                .iter()
+                .find_map(|suffix| stem.strip_suffix(suffix))
+        })
+        .filter(|base| !base.is_empty() && !base.ends_with('/'))
+    else {
+        return Vec::new();
+    };
+
+    let mut renamed_project = false;
+    let segments = base
+        .split('/')
+        .map(|segment| {
+            let project = CSHARP_TEST_PROJECT_SUFFIXES
+                .iter()
+                .find_map(|suffix| segment.strip_suffix(suffix))
+                .filter(|project| !renamed_project && !project.is_empty());
+            match project {
+                Some(project) => {
+                    renamed_project = true;
+                    project
+                }
+                None => segment,
+            }
+        })
+        .collect::<Vec<_>>();
+    if !renamed_project {
+        return Vec::new();
+    }
+
+    let source = format!("{}.cs", segments.join("/"));
+    let mut candidates = Vec::new();
+    // Tests usually sit under a `tests/` or `test/` root beside `src/`.
+    for test_root in ["tests/", "test/"] {
+        if let Some(rest) = source.strip_prefix(test_root) {
+            candidates.push(format!("src/{rest}"));
+        }
+        if let Some(index) = source.find(&format!("/{test_root}")) {
+            let (head, tail) = source.split_at(index + 1);
+            candidates.push(format!("{head}src/{}", &tail[test_root.len()..]));
+        }
+    }
+    candidates.push(source);
+    candidates
+}
+
 fn normalize_repo_path(path: &str) -> String {
     normalize_path(path.trim())
 }
@@ -557,6 +633,9 @@ fn is_probably_test_file(path: &str) -> bool {
         || normalized.starts_with("src/test/")
         || normalized.contains("/src/test/")
     {
+        return true;
+    }
+    if is_csharp_test_path(&normalized) {
         return true;
     }
 
@@ -721,6 +800,63 @@ mod tests {
             Some("src/main/java/a/Widget.java")
         );
         assert_eq!(java_main_source_for_test("src/test/java/a/Test.java"), None);
+    }
+
+    #[test]
+    fn infers_csharp_target_file_from_test_project_layout() {
+        let temp = tempdir().expect("tempdir");
+        let source_dir = temp.path().join("src/Acme.Billing/Services");
+        let test_dir = temp.path().join("tests/Acme.Billing.Tests/Services");
+        fs::create_dir_all(&source_dir).expect("create source dir");
+        fs::create_dir_all(&test_dir).expect("create test dir");
+        fs::write(
+            source_dir.join("Payment.cs"),
+            "namespace Acme.Billing;\n\npublic class Payment {}\n",
+        )
+        .expect("write source");
+        fs::write(
+            test_dir.join("PaymentTests.cs"),
+            "namespace Acme.Billing.Tests;\n\npublic class PaymentTests {}\n",
+        )
+        .expect("write test");
+
+        let test_file = "tests/Acme.Billing.Tests/Services/PaymentTests.cs";
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        store
+            .replace_test_intents_for_file(
+                test_file,
+                &[test_intent(test_file, "ChargesCard", "charges card")],
+            )
+            .expect("write intents");
+
+        let analyzer = TestIntentAnalyzer::new(temp.path()).expect("create analyzer");
+        let links = analyzer
+            .refresh_for_test_file(test_file)
+            .expect("refresh links");
+        assert!(
+            links.iter().any(|link| {
+                link.target_file == "src/Acme.Billing/Services/Payment.cs"
+                    && link.inference_method == "naming_convention"
+                    && (link.confidence - 0.9).abs() < 1e-6
+            }),
+            "expected naming-convention link to Payment.cs, got {links:?}"
+        );
+        assert!(is_probably_test_file(test_file));
+        assert!(is_probably_test_file("Acme.Billing.Tests/Helpers.cs"));
+        assert!(!is_probably_test_file("src/Acme.Billing/Contest.cs"));
+        assert_eq!(
+            csharp_sources_for_test("Acme.Billing.Tests/PaymentTest.cs"),
+            vec!["Acme.Billing/Payment.cs".to_owned()]
+        );
+        assert!(csharp_sources_for_test("src/Acme.Billing/PaymentTests.cs").is_empty());
+        assert!(
+            csharp_sources_for_test("test/Serilog.Tests/Core/LoggerTests.cs")
+                .contains(&"src/Serilog/Core/Logger.cs".to_owned())
+        );
+        assert!(
+            csharp_sources_for_test("libs/Foo/tests/Foo.Tests/BarTests.cs")
+                .contains(&"libs/Foo/src/Foo/Bar.cs".to_owned())
+        );
     }
 
     #[test]

@@ -444,6 +444,7 @@ fn parse_language(raw: &str) -> Language {
         "python" => Language::Python,
         "go" => Language::Go,
         "java" => Language::Java,
+        "csharp" => Language::CSharp,
         _ => Language::Rust,
     }
 }
@@ -605,7 +606,7 @@ mod language_tests {
 
     #[test]
     fn reads_every_stored_language_spelling() {
-        let mut listed = [false; 8];
+        let mut listed = [false; 9];
         for language in [
             Language::Rust,
             Language::TypeScript,
@@ -615,6 +616,7 @@ mod language_tests {
             Language::Python,
             Language::Go,
             Language::Java,
+            Language::CSharp,
         ] {
             listed[variant_index(language)] = true;
             assert_eq!(parse_language(language.as_str()), language);
@@ -637,6 +639,7 @@ mod language_tests {
             Language::Python => 5,
             Language::Go => 6,
             Language::Java => 7,
+            Language::CSharp => 8,
         }
     }
 }
