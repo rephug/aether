@@ -31,7 +31,7 @@ use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use crate::batch::hash::compute_prompt_hash;
 use crate::batch::write_fingerprint_row;
 use crate::continuous::cosine_distance_from_embeddings;
-use crate::observer::{DebounceQueue, ObserverState, is_ignored_path};
+use crate::observer::{DebounceQueue, ObserverState, is_ignored_path, relative_workspace_path};
 use crate::priority_queue::{
     SirPriorityQueue, compute_priority_score, kind_priority_score, size_inverse_score,
 };
@@ -633,7 +633,11 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
             continue;
         }
 
-        for path in debounce_queue.drain_due(now, debounce_window) {
+        let due = debounce_queue.drain_due(now, debounce_window);
+        if due.is_empty() {
+            continue;
+        }
+        for path in due {
             if let Err(err) = process_reindex_path(
                 &config,
                 &mut observer,
@@ -645,6 +649,7 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
                 tracing::error!(path = %path.display(), error = %err, "process error");
             }
         }
+        structural.reindex_stale_files(store.as_ref());
     }
 }
 

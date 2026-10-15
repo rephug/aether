@@ -198,10 +198,11 @@ pub(super) fn process_reindex_paths(
     queue_state: &SharedQueueState,
     paths: Vec<PathBuf>,
 ) -> Result<()> {
-    for path in paths {
-        process_reindex_path(config, observer, structural, store, queue_state, &path)?;
-    }
-    Ok(())
+    let processed = paths.iter().try_for_each(|path| {
+        process_reindex_path(config, observer, structural, store, queue_state, path)
+    });
+    structural.reindex_stale_files(store);
+    processed
 }
 
 pub(super) fn process_reindex_path(
@@ -212,6 +213,12 @@ pub(super) fn process_reindex_path(
     queue_state: &SharedQueueState,
     path: &Path,
 ) -> Result<()> {
+    // Python call targets elsewhere may have been resolved through this path, symbols or
+    // not (a package's `__init__.py` that only re-exports has none). The files they are in
+    // are re-extracted once the batch is done (`StructuralIndexer::reindex_stale_files`).
+    structural.refresh_file(&normalize_path(
+        &relative_workspace_path(&config.workspace, path).to_string_lossy(),
+    ));
     match observer.process_path(path) {
         Ok(Some(event)) => {
             if config.print_events {
@@ -545,5 +552,90 @@ mod tests {
         let mut dirty = git_state.take_dirty_paths().into_iter().collect::<Vec<_>>();
         dirty.sort();
         assert_eq!(dirty, vec![source_a, source_b]);
+    }
+
+    #[test]
+    fn a_reexport_change_reextracts_the_python_callers_resolved_through_it() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        crate::indexer::tests::write_default_config(workspace);
+        for (path, source) in [
+            ("pkg/__init__.py", "from .old import f\n"),
+            ("pkg/old.py", "def f():\n    return 1\n"),
+            ("pkg/new.py", "def f():\n    return 2\n"),
+            (
+                "tests/test_pkg.py",
+                "from pkg import f\n\n\ndef test_f():\n    f()\n",
+            ),
+        ] {
+            let full_path = workspace.join(path);
+            fs::create_dir_all(full_path.parent().expect("parent")).expect("create dirs");
+            fs::write(full_path, source).expect("write source");
+        }
+        let config = IndexerConfig {
+            workspace: workspace.to_path_buf(),
+            debounce_ms: 300,
+            print_events: false,
+            print_sir: false,
+            embeddings_only: false,
+            force: false,
+            full: false,
+            deep: false,
+            turbo_concurrency: None,
+            dry_run: false,
+            sir_concurrency: 1,
+            lifecycle_logs: false,
+            inference_provider: None,
+            inference_model: None,
+            inference_endpoint: None,
+            inference_api_key_env: None,
+            pause_flag: None,
+        };
+        let mut observer = ObserverState::new(workspace.to_path_buf()).expect("observer");
+        observer.seed_from_disk().expect("seed observer");
+        let store = SqliteStore::open(workspace).expect("open store");
+        let mut structural =
+            StructuralIndexer::new(workspace.to_path_buf()).expect("structural indexer");
+        for event in observer.initial_symbol_events() {
+            structural
+                .process_event(&store, &event)
+                .expect("index file");
+        }
+        let queue_state = SharedQueueState::new(HashMap::new());
+
+        let id = |file: &str, qualified_name: &str| {
+            store
+                .list_symbols_for_file(file)
+                .expect("list symbols")
+                .into_iter()
+                .find(|symbol| symbol.qualified_name == qualified_name)
+                .unwrap_or_else(|| panic!("missing symbol {qualified_name}"))
+                .id
+        };
+        let test_f = id("tests/test_pkg.py", "tests.test_pkg::test_f");
+        let callees = || {
+            store
+                .list_graph_dependency_edges()
+                .expect("list edges")
+                .into_iter()
+                .filter(|edge| edge.edge_kind == "calls" && edge.source_symbol_id == test_f)
+                .map(|edge| edge.target_symbol_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(callees(), vec![id("pkg/old.py", "pkg.old::f")]);
+
+        // The package re-exports `f` from another module. Its `__init__.py` has no symbols,
+        // so the edit is no symbol change, and the test file itself is unchanged.
+        fs::write(workspace.join("pkg/__init__.py"), "from .new import f\n").expect("edit");
+        process_reindex_paths(
+            &config,
+            &mut observer,
+            &mut structural,
+            &store,
+            &queue_state,
+            vec![workspace.join("pkg/__init__.py")],
+        )
+        .expect("reindex the package");
+        assert_eq!(callees(), vec![id("pkg/new.py", "pkg.new::f")]);
     }
 }

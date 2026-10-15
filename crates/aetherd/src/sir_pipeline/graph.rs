@@ -140,7 +140,9 @@ impl SirPipeline {
         };
 
         if let Some(source) = source {
-            let mut extractor = SymbolExtractor::new().context("failed to initialize parser")?;
+            let mut extractor = SymbolExtractor::new()
+                .context("failed to initialize parser")?
+                .with_workspace_root(self.workspace_root.clone());
             let extracted = extractor
                 .extract_with_edges_from_path(Path::new(&event.file_path), &source)
                 .with_context(|| format!("failed to extract edges from {}", event.file_path))?;
