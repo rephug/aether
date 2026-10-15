@@ -13,6 +13,7 @@ use aether_sir::{FileSir, synthetic_file_sir_id};
 use aether_store::{SirStateStore, SqliteStore, SymbolCatalogStore};
 use tempfile::tempdir;
 
+use super::reconciliation::SnapshotScope;
 use super::snapshot::sync_snapshot;
 use super::structural::StructuralIndexer;
 use super::{IndexerConfig, ObserverState, collect_initial_snapshot, run_initial_index_once};
@@ -66,6 +67,16 @@ def edited(value):
 
 pub(super) const GONE_V1: &str = "def vanish():
     return None
+";
+
+/// What a daemon indexes while a run's older snapshot is in flight: `keep` gets a new
+/// body, `edited` a new signature, and `removed` is deleted.
+const MODULE_EDITED_BY_DAEMON: &str = "def keep(value):
+    return value + 2
+
+
+def edited(value, limit=2):
+    return value > limit
 ";
 
 pub(super) fn write_workspace(workspace: &Path) {
@@ -443,9 +454,9 @@ fn rollups_of_pruned_files_stay_invalidated_when_the_structural_pass_fails() {
         workspace,
         &store,
         &mut structural,
+        &SnapshotScope::of(&observer),
         &events,
         &symbols_by_id,
-        &[],
         |_| Ok(()),
     );
     assert!(synced.is_err(), "the structural pass must fail");
@@ -518,4 +529,53 @@ fn index_once_keeps_the_symbols_of_a_file_it_could_not_read() {
         assert!(leaf(&store, &vanish.id).is_some());
         assert!(rollup(&store, GONE).is_some());
     }
+}
+
+#[test]
+fn a_snapshot_never_undoes_what_was_indexed_after_it_began() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    write_workspace(workspace);
+    index_once(workspace, true);
+
+    // A run reads the workspace...
+    let mut observer = ObserverState::new(workspace.to_path_buf()).expect("observer");
+    observer.seed_from_disk().expect("seed observer");
+    let (events, symbols_by_id, _) = collect_initial_snapshot(&observer);
+    // (the daemon's writes below land after the snapshot began, in a later second)
+    let scope = SnapshotScope {
+        taken_at: observer.seeded_at() - 1,
+        ..SnapshotScope::of(&observer)
+    };
+
+    // ...while a daemon indexes edits made in the meantime.
+    fs::write(workspace.join(MODULE), MODULE_EDITED_BY_DAEMON).expect("edit module");
+    index_once(workspace, true);
+    let daemon_keep = named(&parse(workspace, MODULE), "keep");
+    let daemon_edited = named(&parse(workspace, MODULE), "edited");
+
+    let store = SqliteStore::open(workspace).expect("open store");
+    let mut structural = StructuralIndexer::new(workspace.to_path_buf()).expect("structural");
+    sync_snapshot(
+        workspace,
+        &store,
+        &mut structural,
+        &scope,
+        &events,
+        &symbols_by_id,
+        |_| Ok(()),
+    )
+    .expect("sync the older snapshot");
+
+    let edited = leaf(&store, &daemon_edited.id).expect("the daemon's SIR for edited");
+    assert_eq!(
+        edited.source_hash.as_deref(),
+        Some(daemon_edited.content_hash.as_str()),
+        "the newer symbol must not be migrated back onto its old id"
+    );
+    let keep = leaf(&store, &daemon_keep.id).expect("the daemon's SIR for keep");
+    assert_eq!(
+        keep.status, "fresh",
+        "a SIR written for the newer body must not be marked stale by an older snapshot"
+    );
 }

@@ -53,32 +53,52 @@ impl ReconciliationPlan {
             .map(|entry| entry.symbol.id.clone())
             .collect()
     }
+}
 
-    /// Drop the prunes of symbols in files the snapshot could not read (`unread_paths`:
-    /// files, or directories whose walk failed; `""` is the whole workspace). Missing from
-    /// the snapshot, those symbols would otherwise be pruned as deleted although their
-    /// files may hold them unchanged. Returns how many prunes were dropped.
-    pub(super) fn spare_unread_files(&mut self, unread_paths: &[String]) -> usize {
-        let unread = |file_path: &str| {
-            unread_paths.iter().any(|path| {
-                path.is_empty()
-                    || file_path == path
-                    || file_path
-                        .strip_prefix(path.as_str())
-                        .is_some_and(|rest| rest.starts_with('/'))
-            })
-        };
-        let before = self.prunes.len();
-        self.prunes.retain(|entry| !unread(&entry.symbol.file_path));
-        let spared = before - self.prunes.len();
-        if spared > 0 {
-            let removed = self
-                .removed_symbols()
-                .map(|symbol| symbol.id.clone())
-                .collect::<BTreeSet<_>>();
-            self.cleanup_ids.retain(|id| removed.contains(id));
+/// What a structural snapshot can speak for. A stored symbol missing from the snapshot
+/// is gone only if the snapshot read its file and the row predates the snapshot: a file
+/// the snapshot could not read may still hold it, and a row written after the snapshot
+/// began (a daemon indexing an edit meanwhile) describes newer text than the snapshot
+/// saw, so pruning it, or migrating it onto an older id, would undo that newer work.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SnapshotScope<'a> {
+    /// See `ObserverState::unread_paths`: files, or directories whose walk failed; `""`
+    /// is the whole workspace.
+    pub(super) unread_paths: &'a [String],
+    /// When the snapshot started reading the workspace (unix seconds).
+    pub(super) taken_at: i64,
+}
+
+impl<'a> SnapshotScope<'a> {
+    pub(super) fn of(observer: &'a ObserverState) -> Self {
+        Self {
+            unread_paths: observer.unread_paths(),
+            taken_at: observer.seeded_at(),
         }
-        spared
+    }
+
+    /// A snapshot that read everything, after every row was written.
+    #[cfg(test)]
+    pub(super) fn everything() -> Self {
+        Self {
+            unread_paths: &[],
+            taken_at: i64::MAX,
+        }
+    }
+
+    fn read_file(&self, file_path: &str) -> bool {
+        !self.unread_paths.iter().any(|path| {
+            path.is_empty()
+                || file_path == path
+                || file_path
+                    .strip_prefix(path.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    }
+
+    /// Whether the snapshot's silence about `symbol` means the symbol is gone.
+    fn covers(&self, symbol: &SymbolRecord) -> bool {
+        symbol.last_seen_at <= self.taken_at && self.read_file(&symbol.file_path)
     }
 }
 
@@ -105,8 +125,8 @@ fn stale_symbol_updated_at(store: &SqliteStore, symbol_id: &str) -> Result<i64> 
         .unwrap_or(0))
 }
 
-/// Plans how stale symbol ids (in the store, not in the snapshot) are reconciled with the
-/// snapshot. `pre_existing_ids` are the ids the store held before the snapshot was written:
+/// Plans how stale symbol ids (in the store, not in the snapshot, and within `scope`) are
+/// reconciled with the snapshot. `pre_existing_ids` are the ids the store held before the snapshot was written:
 /// a current symbol among them is unchanged, so it can't be the new identity of a stale one.
 /// Java and C# overloads share `(file, qualified_name, kind)`; without this, deleting one
 /// overload would move its SIR and contracts onto the overload that remains.
@@ -114,11 +134,21 @@ pub(super) fn plan_symbol_reconciliation(
     store: &SqliteStore,
     symbols_by_id: &HashMap<String, Symbol>,
     pre_existing_ids: &HashSet<String>,
+    scope: &SnapshotScope<'_>,
 ) -> Result<ReconciliationPlan> {
     let snapshot_ids = symbols_by_id.keys().cloned().collect::<HashSet<_>>();
-    let stale_symbols = store
+    let (stale_symbols, kept): (Vec<_>, Vec<_>) = store
         .list_stale_symbols(&snapshot_ids)
-        .context("failed to list stale symbols for reconciliation")?;
+        .context("failed to list stale symbols for reconciliation")?
+        .into_iter()
+        .partition(|symbol| scope.covers(symbol));
+    if !kept.is_empty() {
+        tracing::warn!(
+            kept = kept.len(),
+            "Kept {} stored symbols the snapshot cannot speak for (their file was not read, or they were written after the snapshot began)",
+            kept.len()
+        );
+    }
     if stale_symbols.is_empty() {
         return Ok(ReconciliationPlan::default());
     }
@@ -441,8 +471,13 @@ mod tests {
         );
 
         let symbols_by_id = HashMap::from_iter([(new_symbol.id.clone(), new_symbol.clone())]);
-        let plan = plan_symbol_reconciliation(&store, &symbols_by_id, &HashSet::new())
-            .expect("plan reconcile");
+        let plan = plan_symbol_reconciliation(
+            &store,
+            &symbols_by_id,
+            &HashSet::new(),
+            &SnapshotScope::everything(),
+        )
+        .expect("plan reconcile");
 
         assert_eq!(plan.migrations.len(), 1);
         assert_eq!(plan.migrations[0].old_symbol.id, old_b.id);
@@ -473,8 +508,13 @@ mod tests {
             .count_symbols_with_sir()
             .expect("count symbols before dry run");
         let symbols_by_id = HashMap::from_iter([(new_symbol.id.clone(), new_symbol.clone())]);
-        let plan = plan_symbol_reconciliation(&store, &symbols_by_id, &HashSet::new())
-            .expect("plan reconcile");
+        let plan = plan_symbol_reconciliation(
+            &store,
+            &symbols_by_id,
+            &HashSet::new(),
+            &SnapshotScope::everything(),
+        )
+        .expect("plan reconcile");
 
         let mut output = Vec::<u8>::new();
         print_reconciliation_dry_run(&plan, &mut output).expect("print dry run report");
@@ -518,8 +558,13 @@ mod tests {
         );
 
         let symbols_by_id = HashMap::from_iter([(new_symbol.id.clone(), new_symbol.clone())]);
-        let plan = plan_symbol_reconciliation(&store, &symbols_by_id, &HashSet::new())
-            .expect("plan reconcile");
+        let plan = plan_symbol_reconciliation(
+            &store,
+            &symbols_by_id,
+            &HashSet::new(),
+            &SnapshotScope::everything(),
+        )
+        .expect("plan reconcile");
         let (migrated, pruned) = execute_symbol_reconciliation(
             temp.path(),
             &store,
@@ -557,8 +602,13 @@ mod tests {
         );
 
         let symbols_by_id = HashMap::from_iter([(new_symbol.id.clone(), new_symbol.clone())]);
-        let first_plan = plan_symbol_reconciliation(&store, &symbols_by_id, &HashSet::new())
-            .expect("first plan");
+        let first_plan = plan_symbol_reconciliation(
+            &store,
+            &symbols_by_id,
+            &HashSet::new(),
+            &SnapshotScope::everything(),
+        )
+        .expect("first plan");
         execute_symbol_reconciliation(
             temp.path(),
             &store,
@@ -569,8 +619,13 @@ mod tests {
         )
         .expect("first reconcile");
 
-        let second_plan = plan_symbol_reconciliation(&store, &symbols_by_id, &HashSet::new())
-            .expect("second plan");
+        let second_plan = plan_symbol_reconciliation(
+            &store,
+            &symbols_by_id,
+            &HashSet::new(),
+            &SnapshotScope::everything(),
+        )
+        .expect("second plan");
         assert!(second_plan.is_empty());
         let (migrated, pruned) = execute_symbol_reconciliation(
             temp.path(),
@@ -618,8 +673,13 @@ mod tests {
 
         let pre_existing_ids = HashSet::from([removed.id.clone(), sibling.id.clone()]);
         let symbols_by_id = HashMap::from_iter([(sibling.id.clone(), sibling.clone())]);
-        let plan = plan_symbol_reconciliation(&store, &symbols_by_id, &pre_existing_ids)
-            .expect("plan reconcile");
+        let plan = plan_symbol_reconciliation(
+            &store,
+            &symbols_by_id,
+            &pre_existing_ids,
+            &SnapshotScope::everything(),
+        )
+        .expect("plan reconcile");
         assert!(plan.migrations.is_empty());
         assert_eq!(plan.prunes.len(), 1);
         assert_eq!(plan.prunes[0].symbol.id, removed.id);
@@ -676,11 +736,54 @@ mod tests {
             (sibling.id.clone(), sibling.clone()),
             (renewed.id.clone(), renewed.clone()),
         ]);
-        let plan = plan_symbol_reconciliation(&store, &symbols_by_id, &pre_existing_ids)
-            .expect("plan reconcile");
+        let plan = plan_symbol_reconciliation(
+            &store,
+            &symbols_by_id,
+            &pre_existing_ids,
+            &SnapshotScope::everything(),
+        )
+        .expect("plan reconcile");
         assert!(plan.migrations.is_empty());
         assert_eq!(plan.prunes.len(), 1);
         assert_eq!(plan.prunes[0].symbol.id, old.id);
         assert_eq!(plan.prunes[0].reason, RECONCILE_AMBIGUOUS_CURRENT_REASON);
+    }
+
+    #[test]
+    fn a_snapshot_spares_rows_it_cannot_speak_for() {
+        let temp = tempdir().expect("tempdir");
+        write_default_config(temp.path());
+        let store = SqliteStore::open(temp.path()).expect("open store");
+
+        let gone = test_symbol("sym-gone", "sig-gone");
+        let newer = Symbol {
+            qualified_name: "demo::newer".to_owned(),
+            ..test_symbol("sym-newer", "sig-newer")
+        };
+        let unread = Symbol {
+            file_path: "src/unread/mod.rs".to_owned(),
+            qualified_name: "demo::unread".to_owned(),
+            ..test_symbol("sym-unread", "sig-unread")
+        };
+        upsert_symbol_snapshot(&store, &gone, 100);
+        upsert_symbol_snapshot(&store, &newer, 300);
+        upsert_symbol_snapshot(&store, &unread, 100);
+
+        // The snapshot began at 200 and could not read `src/unread`; it found none of
+        // the three symbols.
+        let unread_paths = vec!["src/unread".to_owned()];
+        let scope = SnapshotScope {
+            unread_paths: &unread_paths,
+            taken_at: 200,
+        };
+        let plan = plan_symbol_reconciliation(&store, &HashMap::new(), &HashSet::new(), &scope)
+            .expect("plan reconcile");
+        let pruned = plan
+            .prunes
+            .iter()
+            .map(|entry| entry.symbol.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(pruned, vec!["sym-gone"]);
+        assert!(plan.migrations.is_empty());
     }
 }
