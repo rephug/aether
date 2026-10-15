@@ -237,6 +237,10 @@ fn spells_python_call_targets_like_python_qualified_names() {
                 // A class-body helper used as a decorator is not a method; the methods it
                 // decorates are.
                 ("~Registry::run", "~Registry::setup"),
+                // An instance attribute shadows only the method it is named after, and a
+                // function-local class is still a class.
+                ("~Button::press", "~Button::render"),
+                ("~make_noop_handler", "~make_noop_handler::Handler"),
                 // Recursion, also from a comprehension's first iterable, which is evaluated
                 // outside the comprehension.
                 ("~recurse", "~recurse"),
@@ -328,6 +332,20 @@ fn python_calls_without_a_static_target_have_no_edge() {
             "calls_later",
             "a walrus in a default value rebinds the name in the enclosing scope",
         ),
+        (
+            "Handler::run",
+            "a method's name is shared with a method of a class declared in a function, \
+             which the symbol mapper names the same",
+        ),
+        (
+            "Toggle::flip",
+            "a method the module replaces with `Class.name = …` may no longer be the def",
+        ),
+        (
+            "walrus_comment",
+            "a walrus binds its target even with a comment before `:=`",
+        ),
+        ("walrus_continuation", "or a line continuation"),
     ] {
         assert!(
             calls_from(&extracted, &format!("{module}::{source}")).is_empty(),

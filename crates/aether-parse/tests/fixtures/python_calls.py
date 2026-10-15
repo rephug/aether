@@ -288,6 +288,64 @@ def stdlib_calls():
     OrderedDict.fromkeys([])
 
 
+class Handler:
+    def handle(self, event):
+        return event
+
+    def run(self, event):
+        return self.handle(event)
+
+
+def make_noop_handler():
+    class Handler:
+        def handle(self, event):
+            return None
+
+    return Handler()
+
+
+class Button:
+    def __init__(self, on_click):
+        self.on_click = on_click
+
+    def on_click(self):
+        return None
+
+    def press(self):
+        self.on_click()
+        return self.render()
+
+    def render(self):
+        return None
+
+
+class Toggle:
+    def flip(self):
+        return self.state()
+
+    def state(self):
+        return None
+
+
+Toggle.state = lambda self: None
+
+
+def lookup_hook():
+    return None
+
+
+def walrus_comment(data):
+    if (lookup_hook  # cached
+            := data):
+        return lookup_hook()
+
+
+def walrus_continuation(data):
+    if (lookup_hook \
+            := data):
+        return lookup_hook()
+
+
 if __name__ == "__main__":
     process(None)
     later()

@@ -785,22 +785,14 @@ const STATEMENT_CONTAINERS: &[&str] = &[
 
 impl<'tree> ScopeIndex<'tree> {
     /// Indexes the statements of `body`. Nested functions and classes have scopes of their
-    /// own, so only their names count. Expressions are not walked; assignment expressions
-    /// (`:=`) are found by scanning the scope's text outside the bodies of nested functions
-    /// and classes, which may also count one in a lambda or a string, so it errs towards
-    /// treating a name as a local.
+    /// own, so only their names count. Assignment expressions (`:=`) are collected from the
+    /// scope's expressions separately.
     fn build(body: Node<'tree>, source: &[u8], file: &FileContext<'_>) -> Self {
         let mut index = Self::default();
-        let mut nested = Vec::new();
         let mut stack = vec![body];
         while let Some(node) = stack.pop() {
             match node.kind() {
                 "function_definition" | "class_definition" => {
-                    // Its header (default values, base classes) runs in this scope; its body
-                    // doesn't.
-                    if let Some(nested_body) = node.child_by_field_name("body") {
-                        nested.push((nested_body.start_byte(), nested_body.end_byte()));
-                    }
                     if let Some(name) = node.child_by_field_name("name") {
                         index.add(
                             name,
@@ -897,12 +889,8 @@ impl<'tree> ScopeIndex<'tree> {
             let mut cursor = node.walk();
             stack.extend(node.named_children(&mut cursor));
         }
-        for (name, complete_at) in walrus_targets(body, source, &nested) {
-            index
-                .names
-                .entry(name)
-                .or_default()
-                .push((complete_at, BindingEvent::Assigned));
+        for (name, complete_at) in walrus_targets(body) {
+            index.add(name, source, complete_at, BindingEvent::Assigned);
         }
         index
     }
@@ -1055,6 +1043,21 @@ fn import_edges(node: Node<'_>, source: &[u8], file_path: &str) -> Vec<SymbolEdg
         .collect()
 }
 
+/// What one walk of the whole file learns that a scope's own statements don't show.
+#[derive(Default)]
+struct FileAssignments {
+    /// The qualified names the symbol mapper gives methods of classes declared inside a
+    /// function. It leaves the function out (`def f(): class C: def m` is `C::m`), so such a
+    /// name may also be that of an unrelated method, and a target spelled with it may reach
+    /// either.
+    shared_method_names: HashSet<String>,
+    /// Attributes assigned through a method's first parameter (`self.name = …`), by the
+    /// method's class. An instance attribute hides the class's method of that name.
+    instance_attributes: HashMap<usize, HashSet<String>>,
+    /// Attributes assigned through a name (`Class.name = …`), by that name.
+    named_attributes: HashMap<String, HashSet<String>>,
+}
+
 /// Resolves the calls of one file, keeping what it learns about the file's scopes.
 struct Resolver<'a, 'tree> {
     file: FileContext<'a>,
@@ -1064,6 +1067,7 @@ struct Resolver<'a, 'tree> {
     scopes: RefCell<HashMap<usize, Rc<ScopeIndex<'tree>>>>,
     /// Names a function rebinds in an enclosing scope, by that scope's body.
     rebound: OnceCell<HashMap<usize, HashSet<String>>>,
+    assignments: OnceCell<FileAssignments>,
     /// The names a class body calls while it runs, by the class body.
     class_body_calls: RefCell<HashMap<usize, Rc<HashSet<String>>>>,
     qualified_names: RefCell<HashMap<usize, Option<String>>>,
@@ -1087,6 +1091,7 @@ impl<'a, 'tree> Resolver<'a, 'tree> {
             functions,
             scopes: RefCell::default(),
             rebound: OnceCell::new(),
+            assignments: OnceCell::new(),
             class_body_calls: RefCell::default(),
             qualified_names: RefCell::default(),
         }
@@ -1129,10 +1134,11 @@ impl<'a, 'tree> Resolver<'a, 'tree> {
     /// parameter, a local, anything the file doesn't define or import, a method on a value
     /// of unknown type, and a call of an expression that isn't a name. A bare method name
     /// can't name a Python symbol, but the store resolves targets across languages, where it
-    /// could name an unrelated function.
+    /// could name an unrelated function. Neither does a target that a method of a class
+    /// declared inside a function is also named (see `FileAssignments`).
     fn call_target(&self, call: Node<'tree>, enclosing: Enclosing<'_, 'tree>) -> Option<String> {
         let callee = call.child_by_field_name("function")?;
-        match callee.kind() {
+        let target = match callee.kind() {
             "identifier" => {
                 let name = node_text(callee, self.source);
                 match self.resolve_name(call, enclosing, &name)? {
@@ -1143,11 +1149,17 @@ impl<'a, 'tree> Resolver<'a, 'tree> {
             }
             "attribute" => self.member_call_target(call, callee, enclosing),
             _ => None,
-        }
+        }?;
+        let shared = &self
+            .assignments(*enclosing.nodes.first()?)
+            .shared_method_names;
+        (!shared.contains(&target)).then_some(target)
     }
 
     /// The qualified target of `receiver.member()` when the receiver is a dotted name whose
-    /// first segment the file binds to a class or a module.
+    /// first segment the file binds to a class or a module. A class's member has none when
+    /// the file also assigns it as an attribute (`self.member = …`, `Class.member = …`), which
+    /// replaces or hides the class's own definition.
     fn member_call_target(
         &self,
         call: Node<'tree>,
@@ -1161,11 +1173,27 @@ impl<'a, 'tree> Resolver<'a, 'tree> {
             Binding::Definition(class) | Binding::Receiver(class)
                 if class.kind() == "class_definition" =>
             {
+                let assignments = self.assignments(*enclosing.nodes.first()?);
+                let assigned = |class: Node<'tree>, name: &str| {
+                    assignments
+                        .instance_attributes
+                        .get(&class.id())
+                        .is_some_and(|names| names.contains(name))
+                        || named_child_text(class, "name", self.source)
+                            .and_then(|class_name| assignments.named_attributes.get(&class_name))
+                            .is_some_and(|names| names.contains(name))
+                };
                 let mut class = class;
                 for segment in rest {
+                    if assigned(class, segment) {
+                        return None;
+                    }
                     class = self
                         .class_member(class, segment)
                         .filter(|nested| nested.kind() == "class_definition")?;
+                }
+                if assigned(class, &member) {
+                    return None;
                 }
                 let definition = self.class_member(class, &member)?;
                 self.definition_qualified_name(definition)
@@ -1396,6 +1424,112 @@ impl<'a, 'tree> Resolver<'a, 'tree> {
         })
     }
 
+    /// The whole-file facts in `FileAssignments`, gathered on first use.
+    fn assignments(&self, root: Node<'tree>) -> &FileAssignments {
+        self.assignments.get_or_init(|| {
+            let mut found = FileAssignments::default();
+            let mut ancestors = Vec::new();
+            let mut cursor = root.walk();
+            loop {
+                let node = cursor.node();
+                match node.kind() {
+                    "function_definition" => {
+                        if enclosing_class(&ancestors).is_some()
+                            && ancestors.iter().any(|ancestor: &Node<'tree>| {
+                                ancestor.kind() == "function_definition"
+                            })
+                            && let Some(name) = named_child_text(node, "name", self.source)
+                        {
+                            found.shared_method_names.insert(function_qualified_name(
+                                node,
+                                &name,
+                                self.source,
+                                self.file.file_path,
+                            ));
+                        }
+                    }
+                    "assignment" | "augmented_assignment" | "for_statement" => {
+                        if let Some(left) = node.child_by_field_name("left") {
+                            self.add_attribute_targets(left, &ancestors, &mut found);
+                        }
+                    }
+                    "as_pattern" => {
+                        if let Some(alias) = node.child_by_field_name("alias") {
+                            self.add_attribute_targets(alias, &ancestors, &mut found);
+                        }
+                    }
+                    _ => {}
+                }
+                if cursor.goto_first_child() {
+                    ancestors.push(node);
+                    continue;
+                }
+                while !cursor.goto_next_sibling() {
+                    if !cursor.goto_parent() {
+                        return found;
+                    }
+                    ancestors.pop();
+                }
+            }
+        })
+    }
+
+    /// Records the `name.attribute` targets of an assignment whose enclosing nodes are
+    /// `enclosing`. When `name` is the first parameter of the innermost enclosing function
+    /// that has it as a parameter, and that function is a method, the attribute is also
+    /// recorded as an instance attribute of the method's class.
+    fn add_attribute_targets(
+        &self,
+        pattern: Node<'tree>,
+        enclosing: &[Node<'tree>],
+        found: &mut FileAssignments,
+    ) {
+        let mut stack = vec![pattern];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "attribute" => {
+                    let (Some(object), Some(attribute)) = (
+                        node.child_by_field_name("object")
+                            .filter(|object| object.kind() == "identifier"),
+                        node.child_by_field_name("attribute"),
+                    ) else {
+                        continue;
+                    };
+                    let object = node_text(object, self.source);
+                    let attribute = node_text(attribute, self.source);
+                    let receiver = enclosing
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .filter(|(_, ancestor)| ancestor.kind() == "function_definition")
+                        .find_map(|(index, function)| {
+                            parameter_role(*function, &object, self.source)
+                                .map(|receives| (index, receives))
+                        });
+                    if let Some((index, true)) = receiver
+                        && let Some(class) = enclosing_class(&enclosing[..index])
+                    {
+                        found
+                            .instance_attributes
+                            .entry(class.id())
+                            .or_default()
+                            .insert(attribute.clone());
+                    }
+                    found
+                        .named_attributes
+                        .entry(object)
+                        .or_default()
+                        .insert(attribute);
+                }
+                "subscript" => {}
+                _ => {
+                    let mut cursor = node.walk();
+                    stack.extend(node.named_children(&mut cursor));
+                }
+            }
+        }
+    }
+
     /// What a function's parameter list binds `name` to: the receiver for the first
     /// parameter of a method, a plain value for any other parameter. `enclosing` holds the
     /// function's enclosing nodes.
@@ -1405,29 +1539,13 @@ impl<'a, 'tree> Resolver<'a, 'tree> {
         enclosing: &[Node<'tree>],
         name: &str,
     ) -> Option<Binding<'tree>> {
-        let parameters = function.child_by_field_name("parameters")?;
-        let mut cursor = parameters.walk();
-        let entries = parameters
-            .named_children(&mut cursor)
-            .filter(|entry| entry.kind() != "comment")
-            .collect::<Vec<_>>();
-        let position = entries.iter().position(|entry| {
-            parameter_pattern(*entry).is_some_and(|pattern| {
-                pattern_names(pattern)
-                    .into_iter()
-                    .any(|bound| text_is(bound, self.source, name))
-            })
-        })?;
-        // `def m(*, store)` has no receiver: a separator comes first.
-        if position == 0
-            && entries[0].kind() != "list_splat_pattern"
-            && entries[0].kind() != "dictionary_splat_pattern"
-            && parameter_pattern(entries[0]).is_some_and(|pattern| pattern.kind() == "identifier")
-            && let Some(class) = self.receiver_class(function, enclosing)
-        {
-            return Some(Binding::Receiver(class));
-        }
-        Some(Binding::Value)
+        let receives = parameter_role(function, name, self.source)?;
+        Some(
+            receives
+                .then(|| self.receiver_class(function, enclosing))
+                .flatten()
+                .map_or(Binding::Value, Binding::Receiver),
+        )
     }
 
     /// The class whose instance, or whose class object in a `@classmethod`, a method's first
@@ -1440,13 +1558,7 @@ impl<'a, 'tree> Resolver<'a, 'tree> {
         function: Node<'tree>,
         enclosing: &[Node<'tree>],
     ) -> Option<Node<'tree>> {
-        // The nearest enclosing class, unless a function comes first, as
-        // `is_method_definition` decides.
-        let class = enclosing.iter().rev().find_map(|node| match node.kind() {
-            "class_definition" => Some(Some(*node)),
-            "function_definition" => Some(None),
-            _ => None,
-        })??;
+        let class = enclosing_class(enclosing)?;
         let is_static = enclosing
             .last()
             .filter(|parent| parent.kind() == "decorated_definition")
@@ -1604,44 +1716,30 @@ fn module_member(
     Some(format!("{}::{}", modules.join("."), classes.join("::")))
 }
 
-/// The names bound by `name :=` in the text of `scope`, with the offset where each binding
-/// is complete, leaving out the `nested` byte ranges.
-fn walrus_targets(
-    scope: Node<'_>,
-    source: &[u8],
-    nested: &[(usize, usize)],
-) -> Vec<(String, usize)> {
-    let start = scope.start_byte();
-    let Some(text) = source.get(start..scope.end_byte().min(source.len())) else {
-        return Vec::new();
-    };
-    let is_identifier = |byte: u8| byte == b'_' || byte.is_ascii_alphanumeric() || byte >= 0x80;
+/// The targets of the assignment expressions (`name := value`) that bind in `scope`, with
+/// the offset where each binding is complete. Those in the bodies of nested functions,
+/// classes and lambdas bind there; those in their headers (default values, base classes)
+/// and in comprehensions bind here.
+fn walrus_targets(scope: Node<'_>) -> Vec<(Node<'_>, usize)> {
     let mut targets = Vec::new();
-    for index in 1..text.len() {
-        if text[index - 1] != b':' || text[index] != b'=' {
-            continue;
-        }
-        let offset = start + index;
-        if nested
-            .iter()
-            .any(|(nested_start, nested_end)| (*nested_start..*nested_end).contains(&offset))
+    let mut stack = vec![scope];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "named_expression"
+            && let Some(name) = node.child_by_field_name("name")
         {
-            continue;
+            targets.push((name, node.end_byte()));
         }
-        let mut stop = index - 1;
-        while stop > 0 && text[stop - 1].is_ascii_whitespace() {
-            stop -= 1;
-        }
-        let mut begin = stop;
-        while begin > 0 && is_identifier(text[begin - 1]) {
-            begin -= 1;
-        }
-        if begin < stop {
-            targets.push((
-                String::from_utf8_lossy(&text[begin..stop]).into_owned(),
-                offset + 1,
-            ));
-        }
+        let body = matches!(
+            node.kind(),
+            "function_definition" | "class_definition" | "lambda"
+        )
+        .then(|| node.child_by_field_name("body"))
+        .flatten();
+        let mut cursor = node.walk();
+        stack.extend(
+            node.named_children(&mut cursor)
+                .filter(|child| Some(*child) != body),
+        );
     }
     targets
 }
@@ -1717,6 +1815,43 @@ fn parameters_bind(parameters: Node<'_>, name: &str, source: &[u8]) -> bool {
         .filter_map(parameter_pattern)
         .flat_map(pattern_names)
         .any(|bound| text_is(bound, source, name))
+}
+
+/// The class a `def` whose enclosing nodes are `enclosing` is a method of: the nearest
+/// enclosing class, unless a function comes first, as `is_method_definition` decides.
+fn enclosing_class<'tree>(enclosing: &[Node<'tree>]) -> Option<Node<'tree>> {
+    enclosing.iter().rev().find_map(|node| match node.kind() {
+        "class_definition" => Some(Some(*node)),
+        "function_definition" => Some(None),
+        _ => None,
+    })?
+}
+
+/// How a function's parameters bind `name`: `Some(true)` for a plain first parameter, which
+/// receives the instance in a method, `Some(false)` for any other parameter, and `None` when
+/// no parameter binds it. `def m(*, store)` and `def m(*args)` have no plain first parameter.
+fn parameter_role(function: Node<'_>, name: &str, source: &[u8]) -> Option<bool> {
+    let parameters = function.child_by_field_name("parameters")?;
+    let mut cursor = parameters.walk();
+    let entries = parameters
+        .named_children(&mut cursor)
+        .filter(|entry| entry.kind() != "comment")
+        .collect::<Vec<_>>();
+    let position = entries.iter().position(|entry| {
+        parameter_pattern(*entry).is_some_and(|pattern| {
+            pattern_names(pattern)
+                .into_iter()
+                .any(|bound| text_is(bound, source, name))
+        })
+    })?;
+    Some(
+        position == 0
+            && !matches!(
+                entries[0].kind(),
+                "list_splat_pattern" | "dictionary_splat_pattern"
+            )
+            && parameter_pattern(entries[0]).is_some_and(|pattern| pattern.kind() == "identifier"),
+    )
 }
 
 /// The part of a parameter that names it, without its type annotation or default value.
