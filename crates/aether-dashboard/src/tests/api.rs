@@ -812,3 +812,184 @@ async fn context_build_clamps_oversized_budget() {
     );
     assert!(context_build_content(&body).contains("### Source"));
 }
+
+const INFERENCE_FORM: &str = "provider=openai_compat&endpoint=https%3A%2F%2Fattacker.example%2Fv1&model=x&api_key_env=GEMINI_API_KEY&concurrency=4";
+
+fn settings_post(uri: &str, headers: &[(&str, &str)], body: &'static str) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/x-www-form-urlencoded");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    builder.body(Body::from(body)).unwrap()
+}
+
+#[tokio::test]
+async fn cross_origin_writes_are_rejected_and_leave_config_unchanged() {
+    let (tmp, app) = empty_app().await;
+    let config_path = aether_config::config_path(tmp.path());
+    let before = fs::read_to_string(&config_path).unwrap();
+
+    let cases: &[(&str, &[(&str, &str)])] = &[
+        // Cross-site form post from an arbitrary web page.
+        (
+            "/api/v1/settings/inference",
+            &[
+                ("host", "127.0.0.1:9730"),
+                ("origin", "https://evil.example"),
+                ("sec-fetch-site", "cross-site"),
+            ],
+        ),
+        // Same check without fetch metadata (older browsers).
+        (
+            "/api/v1/settings/inference",
+            &[
+                ("host", "127.0.0.1:9730"),
+                ("origin", "https://evil.example"),
+            ],
+        ),
+        // Fetch metadata alone is enough to reject.
+        (
+            "/api/v1/settings/inference",
+            &[("host", "127.0.0.1:9730"), ("sec-fetch-site", "cross-site")],
+        ),
+        // Another local server on a different port is a different origin.
+        // Without fetch metadata (older browsers) only the Origin/Host port
+        // comparison rejects these.
+        (
+            "/api/v1/settings/inference",
+            &[
+                ("host", "127.0.0.1:9730"),
+                ("origin", "http://127.0.0.1:3000"),
+            ],
+        ),
+        (
+            "/api/v1/settings/inference",
+            &[
+                ("host", "localhost:9730"),
+                ("origin", "http://localhost:3000"),
+            ],
+        ),
+        // The same request from a browser that sends fetch metadata, which
+        // labels another port on the same host as same-site.
+        (
+            "/api/v1/settings/inference",
+            &[
+                ("host", "localhost:9730"),
+                ("origin", "http://localhost:3000"),
+                ("sec-fetch-site", "same-site"),
+            ],
+        ),
+        // Opaque origin (sandboxed iframe, file:// page).
+        (
+            "/api/v1/settings/inference",
+            &[("host", "127.0.0.1:9730"), ("origin", "null")],
+        ),
+        // DNS rebinding: Origin matches Host but is not a loopback name.
+        (
+            "/api/v1/settings/inference",
+            &[
+                ("host", "evil.example:9730"),
+                ("origin", "http://evil.example:9730"),
+                ("sec-fetch-site", "same-origin"),
+            ],
+        ),
+        // Body-less reset endpoint.
+        (
+            "/api/v1/settings/inference/reset",
+            &[
+                ("host", "127.0.0.1:9730"),
+                ("origin", "https://evil.example"),
+            ],
+        ),
+        // Ask fragment is form-based too.
+        (
+            "/dashboard/frag/ask",
+            &[
+                ("host", "127.0.0.1:9730"),
+                ("origin", "https://evil.example"),
+            ],
+        ),
+    ];
+
+    for (uri, headers) in cases {
+        let body = if uri.ends_with("/ask") {
+            "question=demo"
+        } else {
+            INFERENCE_FORM
+        };
+        let response = app
+            .clone()
+            .oneshot(settings_post(uri, headers, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "expected 403 for POST {uri} with {headers:?}"
+        );
+    }
+
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), before);
+}
+
+#[tokio::test]
+async fn same_origin_and_non_browser_writes_are_allowed() {
+    let (tmp, app) = empty_app().await;
+    let config_path = aether_config::config_path(tmp.path());
+
+    let cases: &[&[(&str, &str)]] = &[
+        // htmx request from the dashboard page served on 127.0.0.1.
+        &[
+            ("host", "127.0.0.1:9730"),
+            ("origin", "http://127.0.0.1:9730"),
+            ("sec-fetch-site", "same-origin"),
+        ],
+        // Same page opened as localhost, on any port the server is bound to.
+        &[
+            ("host", "localhost:41234"),
+            ("origin", "http://localhost:41234"),
+        ],
+        // curl, the VS Code extension and other non-browser clients.
+        &[],
+    ];
+
+    for headers in cases {
+        let response = app
+            .clone()
+            .oneshot(settings_post(
+                "/api/v1/settings/inference",
+                headers,
+                INFERENCE_FORM,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "expected 200 for {headers:?}"
+        );
+    }
+    assert!(
+        fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("attacker.example")
+    );
+
+    // Reads stay open to any origin; the browser keeps cross-origin pages
+    // from reading the response.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/settings/inference")
+                .header("host", "127.0.0.1:9730")
+                .header("origin", "https://evil.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
