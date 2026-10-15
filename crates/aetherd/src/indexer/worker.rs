@@ -1,7 +1,10 @@
 //! The semantic worker of the indexing loop: the shared priority queue, the worker
-//! thread that drains it through the SIR pipeline, and the enqueueing of changed and
-//! SIR-less symbols.
+//! thread that drains it through the SIR pipeline, and the enqueueing of changed,
+//! SIR-less and stale symbols.
 
+use aether_core::Language;
+
+use super::snapshot::{outdated_rollups, symbols_with_stale_source};
 use super::*;
 
 #[derive(Clone)]
@@ -9,6 +12,10 @@ pub(super) struct SharedQueueState {
     pub(super) queue: Arc<Mutex<SirPriorityQueue>>,
     pub(super) symbol_index: Arc<Mutex<HashMap<String, Symbol>>>,
     pub(super) in_progress: Arc<Mutex<HashSet<String>>>,
+    /// Files whose rollup was outdated when the daemon started and none of whose
+    /// symbols is queued (processing a queued leaf rebuilds its file's rollup). The
+    /// workers rebuild them a few at a time between symbol tasks.
+    pub(super) pending_rollups: Arc<Mutex<BTreeMap<String, Language>>>,
 }
 
 impl SharedQueueState {
@@ -17,6 +24,7 @@ impl SharedQueueState {
             queue: Arc::new(Mutex::new(SirPriorityQueue::default())),
             symbol_index: Arc::new(Mutex::new(symbol_index)),
             in_progress: Arc::new(Mutex::new(HashSet::new())),
+            pending_rollups: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -44,6 +52,36 @@ impl SharedQueueState {
 
     pub(super) fn lock_in_progress(&self) -> MutexGuard<'_, HashSet<String>> {
         Self::lock_or_recover(&self.in_progress, "in_progress")
+    }
+
+    pub(super) fn lock_pending_rollups(&self) -> MutexGuard<'_, BTreeMap<String, Language>> {
+        Self::lock_or_recover(&self.pending_rollups, "pending_rollups")
+    }
+
+    pub(super) fn add_pending_rollups(&self, files: BTreeMap<String, Language>) {
+        self.lock_pending_rollups().extend(files);
+    }
+
+    /// Up to `max` pending rollups, taken off the set (`None` once it is empty). Taken a
+    /// few at a time, so a worker serves symbol tasks and SIR requests between chunks
+    /// and a chunk that fails costs only its own files.
+    pub(super) fn take_pending_rollup_chunk(
+        &self,
+        max: usize,
+    ) -> Option<BTreeMap<String, Language>> {
+        let mut pending = self.lock_pending_rollups();
+        if pending.is_empty() {
+            return None;
+        }
+        let keys = pending.keys().take(max.max(1)).cloned().collect::<Vec<_>>();
+        Some(
+            keys.into_iter()
+                .filter_map(|file_path| {
+                    let language = pending.remove(&file_path)?;
+                    Some((file_path, language))
+                })
+                .collect(),
+        )
     }
 
     pub(super) fn requeue(&self, symbol_id: String, score: f64) {
@@ -136,8 +174,34 @@ pub(super) fn spawn_semantic_worker(
                     }
                 }
 
+                // One chunk of the rollups left outdated at startup per turn, between
+                // symbol tasks.
+                let rebuilt_rollups = match queue_state
+                    .take_pending_rollup_chunk(PENDING_ROLLUP_CHUNK)
+                {
+                    Some(files) => {
+                        let file_count = files.len();
+                        if let Err(err) = refresh_pending_rollups(
+                            &pipeline,
+                            store.as_ref(),
+                            files,
+                            generation_pass,
+                        ) {
+                            tracing::warn!(
+                                file_count,
+                                error = %err,
+                                "failed to rebuild file rollups left outdated at startup; they stay stale until a full index run"
+                            );
+                        }
+                        true
+                    }
+                    None => false,
+                };
+
                 let Some((score, symbol)) = queue_state.pop_task() else {
-                    std::thread::sleep(Duration::from_millis(WORKER_IDLE_SLEEP_MS));
+                    if !rebuilt_rollups {
+                        std::thread::sleep(Duration::from_millis(WORKER_IDLE_SLEEP_MS));
+                    }
                     continue;
                 };
 
@@ -279,28 +343,51 @@ pub(super) fn finalize_watcher_generation(
     .with_context(|| format!("failed to write watcher fingerprint row for {}", symbol.id))
 }
 
-pub(super) fn enqueue_symbols_missing_sir(
+/// Rebuild those of `files` whose rollup is still outdated (stale, or missing while the
+/// file has leaf SIRs); a leaf processed since the files were set aside, after a live
+/// edit say, has rebuilt its file's rollup already. Returns how many were rebuilt.
+pub(super) fn refresh_pending_rollups(
+    pipeline: &SirPipeline,
+    store: &SqliteStore,
+    files: BTreeMap<String, Language>,
+    generation_pass: &str,
+) -> Result<usize> {
+    let outdated = outdated_rollups(store, files)?;
+    let count = outdated.len();
+    if count > 0 {
+        tracing::info!(
+            file_count = count,
+            "Rebuilding {count} file rollups left outdated at startup"
+        );
+        let mut sink = std::io::sink();
+        pipeline.refresh_file_rollups(store, outdated, generation_pass, false, &mut sink)?;
+    }
+    Ok(count)
+}
+
+/// Queue the symbols of `symbols` that need a SIR: those without one, and those whose
+/// SIR is stale because it was written for a body they no longer have (see
+/// `snapshot::symbols_with_stale_source`; a leaf left stale by a failed attempt on an
+/// unchanged body keeps its SIR).
+pub(super) fn enqueue_symbols_needing_sir(
     workspace: &Path,
     store: &SqliteStore,
     queue_state: &SharedQueueState,
-    symbols: &[Symbol],
+    symbols_by_id: &HashMap<String, Symbol>,
 ) -> Result<usize> {
-    let missing = store.list_symbol_ids_without_sir()?;
+    let mut missing = store.list_symbol_ids_without_sir()?;
+    missing.extend(symbols_with_stale_source(store, symbols_by_id)?);
+    missing.sort();
+    missing.dedup();
     if missing.is_empty() {
         return Ok(0);
     }
 
-    let by_id = symbols
+    let missing_symbols = missing
         .iter()
+        .filter_map(|symbol_id| symbols_by_id.get(symbol_id))
         .cloned()
-        .map(|symbol| (symbol.id.clone(), symbol))
-        .collect::<HashMap<_, _>>();
-    let mut missing_symbols = Vec::new();
-    for symbol_id in missing {
-        if let Some(symbol) = by_id.get(&symbol_id) {
-            missing_symbols.push(symbol.clone());
-        }
-    }
+        .collect::<Vec<_>>();
     enqueue_changed_symbols(workspace, store, queue_state, &missing_symbols)
 }
 
@@ -358,5 +445,36 @@ mod tests {
         assert!(bumped);
         assert!(logs.contains("SharedQueueState mutex poisoned; recovering"));
         assert!(logs.contains("queue"));
+    }
+
+    #[test]
+    fn pending_rollups_are_taken_a_chunk_at_a_time_whatever_the_queue_holds() {
+        let symbol = test_symbol("sym-queued", "sig-queued");
+        let queue_state =
+            SharedQueueState::new(HashMap::from_iter([(symbol.id.clone(), symbol.clone())]));
+        // A symbol that keeps failing and being requeued must not hold the rollups back.
+        let _ = queue_state.lock_queue().push(symbol.id.clone(), 0.5);
+        queue_state.add_pending_rollups(BTreeMap::from([
+            ("src/a.rs".to_owned(), Language::Rust),
+            ("src/b.rs".to_owned(), Language::Rust),
+            ("src/c.rs".to_owned(), Language::Rust),
+        ]));
+
+        let first = queue_state
+            .take_pending_rollup_chunk(2)
+            .expect("first chunk");
+        assert_eq!(
+            first.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["src/a.rs", "src/b.rs"]
+        );
+        let second = queue_state
+            .take_pending_rollup_chunk(2)
+            .expect("second chunk");
+        assert_eq!(
+            second.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["src/c.rs"]
+        );
+        assert!(queue_state.take_pending_rollup_chunk(2).is_none());
+        assert!(queue_state.lock_queue().contains(&symbol.id));
     }
 }

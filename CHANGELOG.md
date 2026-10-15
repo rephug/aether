@@ -68,6 +68,12 @@ and this project follows [Semantic Versioning](https://semver.org/).
   not read (permissions, non-UTF-8 content) are kept instead of being pruned as deleted,
   by `--index-once` and `--full` alike. Nor are rows a daemon wrote after the snapshot
   began: a snapshot never prunes, migrates or marks stale what it cannot have seen.
+- The watching daemon catches edits made while it was stopped. Its startup syncs the
+  store like `--index-once` does: removed symbols are pruned, and changed ones are
+  marked stale. It then queues the leaves whose source changed alongside SIR-less ones,
+  and rebuilds the remaining outdated file rollups a few at a time between symbol tasks.
+  `aetherd batch extract` and the continuous monitor's structural refresh sync the same
+  way.
 - `inference.provider = "openai_compat"` now sends `[inference] thinking` as
   `reasoning_effort`, as `omp` already did. `[inference] timeout_secs` now lifts the
   request timeout of `openai_compat` and `omp` as well as `qwen3_local`, so a model that
