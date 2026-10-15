@@ -242,6 +242,15 @@ fn extract_edges(
             symbols,
         );
     }
+    if language == Language::Python && config.id == "python" {
+        return crate::languages::python::extract_python_edges(
+            file_path,
+            source,
+            root,
+            &config.edge_query,
+            symbols,
+        );
+    }
 
     let mut cursor = QueryCursor::new();
     let mut edges = Vec::new();
