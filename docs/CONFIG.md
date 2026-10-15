@@ -45,9 +45,9 @@ concurrency = 2
   - With `qwen3_local` it also lifts the Ollama request timeout, normally 120 seconds, to match. Other providers keep their 120-second request timeout.
   - Triage and deep passes keep using `[sir_quality] triage_timeout_secs` and `deep_timeout_secs`.
 - `max_output_tokens`
-  - With `qwen3_local`, the most tokens one SIR reply may generate, sent to Ollama as `num_predict`. Unset or `0` means 2048.
+  - With `qwen3_local`, the most tokens one SIR reply may generate, sent to Ollama as `num_predict`. Unset or `0` means 2048. It also caps the local fallback of `provider = "tiered"`, and other providers ignore it (config validation warns). Values below 1024 get a warning, because they can cut off normal replies.
   - Without a cap, a small model in JSON mode can keep generating for many minutes on a CPU, and the attempt ends as `timed out`. Normal replies are far shorter: the longest SIR phi4-mini wrote for python-slugify is about 400 tokens, and the longest function SIR any model wrote for AETHER's own code is about 1,200.
-  - A reply that reaches the cap is logged as a warning and retried like any other reply that does not parse.
+  - A reply that reaches the cap fails that attempt, and the next attempt starts again from the original prompt. The cut-off reply is not quoted back to the model, which would overflow the request's 4096-token context.
   - Deep-mode replies, which include the model's reasoning, keep their own cap of 8192 tokens.
 
 ## Oh My Pi models and batch pricing

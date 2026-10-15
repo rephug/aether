@@ -36,6 +36,22 @@ pub(crate) fn parse_deep_response(raw: &str) -> DeepCandidate {
     }
 }
 
+/// Ollama reports `done_reason: "length"` when a reply stopped at `num_predict`. Its JSON is
+/// cut off, so the request fails instead: the next attempt starts again from the original
+/// prompt, rather than a feedback retry that quotes the whole cut-off reply and overflows the
+/// request's context.
+fn reject_reply_cut_at_token_cap(
+    response_value: &Value,
+    max_output_tokens: u32,
+) -> Result<(), InferError> {
+    if response_value.get("done_reason").and_then(Value::as_str) == Some("length") {
+        return Err(InferError::InvalidResponse(format!(
+            "local SIR reply stopped at the {max_output_tokens}-token output cap"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct Qwen3LocalProvider {
     client: reqwest::Client,
@@ -62,10 +78,12 @@ impl Qwen3LocalProvider {
         self
     }
 
-    /// Cap each SIR reply at this many generated tokens instead of the default 2048, as set
-    /// by `[inference] max_output_tokens`. Deep-mode replies keep their own cap.
-    pub fn with_max_output_tokens(mut self, max_output_tokens: u32) -> Self {
-        self.max_output_tokens = max_output_tokens.max(1);
+    /// Cap each SIR reply at `[inference] max_output_tokens` generated tokens. `None` or 0
+    /// keeps the default 2048. Deep-mode replies keep their own cap.
+    pub fn with_max_output_tokens(mut self, max_output_tokens: Option<u32>) -> Self {
+        if let Some(tokens) = max_output_tokens.filter(|tokens| *tokens > 0) {
+            self.max_output_tokens = tokens;
+        }
         self
     }
 
@@ -90,20 +108,8 @@ impl Qwen3LocalProvider {
             .json()
             .await?;
 
-        self.warn_if_reply_hit_token_cap(&response_value, self.max_output_tokens);
+        reject_reply_cut_at_token_cap(&response_value, self.max_output_tokens)?;
         extract_local_text_part(&response_value)
-    }
-
-    /// Ollama reports `done_reason: "length"` when a reply stopped at `num_predict`. Its JSON
-    /// is then almost certainly cut off, and this explains the parse retry that follows.
-    fn warn_if_reply_hit_token_cap(&self, response_value: &Value, max_output_tokens: u32) {
-        if response_value.get("done_reason").and_then(Value::as_str) == Some("length") {
-            tracing::warn!(
-                model = %self.model,
-                max_output_tokens,
-                "local SIR reply stopped at the output token cap"
-            );
-        }
     }
 
     async fn request_deep_candidate_with_prompt(
@@ -122,7 +128,7 @@ impl Qwen3LocalProvider {
             .json()
             .await?;
 
-        self.warn_if_reply_hit_token_cap(&response_value, OLLAMA_DEEP_SIR_NUM_PREDICT);
+        reject_reply_cut_at_token_cap(&response_value, OLLAMA_DEEP_SIR_NUM_PREDICT)?;
         let raw = extract_local_text_part(&response_value)?;
         Ok(parse_deep_response(raw.as_str()))
     }
@@ -318,7 +324,7 @@ mod request_body_tests {
 
     use super::Qwen3LocalProvider;
     use crate::sir_prompt;
-    use crate::types::{InferenceProvider, SirContext};
+    use crate::types::{InferError, InferenceProvider, SirContext};
 
     const SIR_REPLY: &str = r#"{"intent":"Adds two numbers","inputs":["a","b"],"outputs":["sum"],"side_effects":[],"dependencies":[],"error_modes":[],"confidence":0.8}"#;
     const SYMBOL_TEXT: &str = "def add(a, b):\n    return a + b\n";
@@ -338,6 +344,12 @@ mod request_body_tests {
     /// A stand-in Ollama that answers one `/api/generate` request with a valid SIR and
     /// returns the JSON body it received.
     fn serve_one_generate_request() -> (String, JoinHandle<Value>) {
+        serve_one_generate_reply("stop")
+    }
+
+    /// Like [`serve_one_generate_request`], with the reply's `done_reason`. Only one request
+    /// is accepted, so a second one fails to connect.
+    fn serve_one_generate_reply(done_reason: &'static str) -> (String, JoinHandle<Value>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test ollama listener");
         let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
         let server = std::thread::spawn(move || {
@@ -360,8 +372,8 @@ mod request_body_tests {
             let mut body = vec![0_u8; content_length];
             reader.read_exact(&mut body).expect("read request body");
 
-            let reply =
-                json!({"response": SIR_REPLY, "done": true, "done_reason": "stop"}).to_string();
+            let reply = json!({"response": SIR_REPLY, "done": true, "done_reason": done_reason})
+                .to_string();
             let mut stream = reader.into_inner();
             write!(
                 stream,
@@ -400,7 +412,7 @@ mod request_body_tests {
     async fn configured_cap_reaches_the_sir_request() {
         let (endpoint, server) = serve_one_generate_request();
         let provider = Qwen3LocalProvider::new(Some(endpoint), Some("phi4-mini".to_owned()))
-            .with_max_output_tokens(1024);
+            .with_max_output_tokens(Some(1024));
 
         provider
             .generate_sir_from_prompt("return strict json", &context(), false)
@@ -416,7 +428,7 @@ mod request_body_tests {
     async fn deep_request_uses_the_deep_cap() {
         let (endpoint, server) = serve_one_generate_request();
         let provider = Qwen3LocalProvider::new(Some(endpoint), Some("qwen3.5:4b".to_owned()))
-            .with_max_output_tokens(1024);
+            .with_max_output_tokens(Some(1024));
 
         provider
             .generate_sir_from_prompt_with_meta("analyze deeply", &context(), true)
@@ -430,5 +442,25 @@ mod request_body_tests {
         );
         assert_eq!(body.pointer("/options/num_ctx"), Some(&json!(8192)));
         assert_eq!(body.pointer("/format"), None);
+    }
+
+    #[tokio::test]
+    async fn reply_cut_at_the_cap_fails_without_a_feedback_retry() {
+        // The cut-off reply must not be quoted back in a retry prompt: the request fails,
+        // and the stand-in accepts no second request.
+        let (endpoint, server) = serve_one_generate_reply("length");
+        let provider = Qwen3LocalProvider::new(Some(endpoint), Some("phi4-mini".to_owned()))
+            .with_max_output_tokens(Some(512));
+
+        let err = provider
+            .generate_sir(SYMBOL_TEXT, &context())
+            .await
+            .expect_err("a reply cut at the cap is not a SIR");
+        server.join().expect("join test ollama");
+
+        assert!(
+            matches!(&err, InferError::InvalidResponse(message) if message.contains("512-token output cap")),
+            "{err:?}"
+        );
     }
 }

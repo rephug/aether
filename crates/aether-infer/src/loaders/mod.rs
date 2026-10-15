@@ -113,6 +113,7 @@ pub fn load_inference_provider_from_config(
                 selected_endpoint,
                 selected_api_key_env,
                 selected_thinking,
+                max_output_tokens,
             )
         }
         InferenceProviderKind::Gemini => {
@@ -270,8 +271,7 @@ fn omp_gateway_token_path() -> Option<PathBuf> {
 
 /// A local Ollama provider whose requests may run as long as `[inference] timeout_secs`
 /// lets one attempt run, plus a margin so the attempt timeout fires first. It never lowers
-/// the default request timeout. `[inference] max_output_tokens`, when set above 0, replaces
-/// the default cap on SIR reply length.
+/// the default request timeout. `[inference] max_output_tokens` caps its SIR replies.
 fn local_provider(
     endpoint: Option<String>,
     model: Option<String>,
@@ -285,10 +285,7 @@ fn local_provider(
         }
         _ => provider,
     };
-    match max_output_tokens.filter(|tokens| *tokens > 0) {
-        Some(tokens) => provider.with_max_output_tokens(tokens),
-        None => provider,
-    }
+    provider.with_max_output_tokens(max_output_tokens)
 }
 
 pub fn load_provider_from_env_or_mock(
@@ -598,6 +595,7 @@ fn load_tiered_provider(
     selected_endpoint: Option<String>,
     selected_api_key_env: String,
     selected_thinking: Option<String>,
+    max_output_tokens: Option<u32>,
 ) -> Result<LoadedProvider, InferError> {
     let primary_kind = tiered.primary.trim().to_ascii_lowercase();
     let primary_model = first_non_empty(selected_model, tiered.primary_model.clone());
@@ -668,7 +666,8 @@ fn load_tiered_provider(
     let fallback = Qwen3LocalProvider::new(
         tiered.fallback_endpoint.clone(),
         tiered.fallback_model.clone(),
-    );
+    )
+    .with_max_output_tokens(max_output_tokens);
     let fallback_model_name = fallback.model_name();
     let threshold = if tiered.primary_threshold.is_finite() {
         tiered.primary_threshold.clamp(0.0, 1.0)
