@@ -49,7 +49,7 @@ pub(crate) fn render(params: &HashMap<String, String>) -> Markup {
                         hx-get="/dashboard/frag/wizard/detect"
                         hx-trigger="load"
                         hx-target="#detection-results"
-                        hx-vals={ "{\"workspace_path\":\"" (workspace) "\"}" }
+                        hx-vals=(serde_json::json!({ "workspace_path": workspace }).to_string())
                     {
                         div class="text-xs text-text-muted dark:text-slate-400 py-2" {
                             "Scanning..."
