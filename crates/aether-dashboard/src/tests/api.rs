@@ -874,17 +874,10 @@ async fn causal_chain_api_lookback_select_values_are_day_windows() {
 
     let graph_records = [target.clone(), recent.clone(), older.clone()];
     block_on_store_future(async move {
-        // The first SurrealKV open has a 5 s timeout, which a heavily loaded test machine
-        // can hit. Later opens reuse the cached handle, so only this one needs a retry.
-        let mut attempts_left = 3;
-        let graph = loop {
-            attempts_left -= 1;
-            match SurrealGraphStore::open(&workspace).await {
-                Ok(graph) => break graph,
-                Err(err) if attempts_left == 0 => panic!("open Surreal graph store: {err}"),
-                Err(_) => continue,
-            }
-        };
+        // The open waits out a slow first SurrealKV open on a loaded test machine.
+        let graph = SurrealGraphStore::open(&workspace)
+            .await
+            .expect("open Surreal graph store");
         for record in &graph_records {
             graph.upsert_symbol_node(record).await.unwrap();
         }

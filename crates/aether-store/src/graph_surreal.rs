@@ -60,8 +60,26 @@ pub struct SurrealGraphStore {
 }
 
 impl SurrealGraphStore {
+    /// Opens the workspace's graph store, waiting up to `[storage] graph_open_timeout_secs`
+    /// (60 s by default) when this process has no handle to it yet.
     pub async fn open(workspace_root: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let workspace_root = workspace_root.as_ref().to_path_buf();
+        Self::open_within(workspace_root.as_ref(), None).await
+    }
+
+    /// Like [`Self::open`], but waits at most `open_timeout` for a new handle, for callers
+    /// that must answer within a budget of their own.
+    pub async fn open_with_timeout(
+        workspace_root: impl AsRef<Path>,
+        open_timeout: Duration,
+    ) -> Result<Self, StoreError> {
+        Self::open_within(workspace_root.as_ref(), Some(open_timeout)).await
+    }
+
+    async fn open_within(
+        workspace_root: &Path,
+        open_timeout: Option<Duration>,
+    ) -> Result<Self, StoreError> {
+        let workspace_root = workspace_root.to_path_buf();
         let graph_dir = workspace_root.join(".aether").join("graph");
         fs::create_dir_all(&graph_dir)?;
         // A process shares one handle per store, so `.` and an absolute spelling of the
@@ -71,7 +89,7 @@ impl SurrealGraphStore {
         let db = if let Some(existing) = cached_surreal_handle(&graph_dir)? {
             existing
         } else {
-            let open_timeout = graph_open_timeout(&workspace_root);
+            let open_timeout = open_timeout.unwrap_or_else(|| graph_open_timeout(&workspace_root));
             let mut open_error = None;
             let mut db_opt = None;
             for attempt in 0..10 {

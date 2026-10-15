@@ -19,6 +19,9 @@ use crate::state::SharedState;
 pub(crate) const STALE_WARN_AFTER_MINUTES: u64 = 30;
 pub(crate) const SIR_EXCERPT_MAX_LEN: usize = 160;
 pub(crate) const GRAPH_QUERY_TIMEOUT_SECS: u64 = 10;
+/// A graph store opened inside a request must finish within the request's budget, so a slow
+/// open degrades to the "Surreal graph unavailable" note instead of timing out the request.
+pub(crate) const LAZY_GRAPH_OPEN_TIMEOUT_SECS: u64 = GRAPH_QUERY_TIMEOUT_SECS - 2;
 pub(crate) const GRAPH_QUERY_TIMEOUT_MESSAGE: &str = "This analysis is taking too long. Try reducing the graph scope or run `aetherd health` from the CLI for faster results.";
 const TIMEOUT_ERROR_PREFIX: &str = "__aether_dashboard_timeout__:";
 
