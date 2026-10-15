@@ -436,6 +436,109 @@ fn search_symbols_respects_empty_query_and_limit() {
 }
 
 #[test]
+fn search_symbols_by_terms_ranks_by_matched_terms_over_the_whole_table() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+
+    let upsert = |id: &str, qualified_name: &str, file_path: &str| {
+        let mut record = symbol_record();
+        record.id = id.to_owned();
+        record.qualified_name = qualified_name.to_owned();
+        record.file_path = file_path.to_owned();
+        store.upsert_symbol(record).expect("upsert symbol");
+    };
+    // 40 symbols match only "store" (through the file path) and 40 match
+    // only "search"; all of them sort before the one symbol matching both.
+    for index in 0..40 {
+        upsert(
+            &format!("sym-alpha-{index:02}"),
+            &format!("Alpha{index:02}::new"),
+            &format!("crates/store/src/alpha{index:02}.rs"),
+        );
+        upsert(
+            &format!("sym-beta-{index:02}"),
+            &format!("Beta{index:02}::search_x"),
+            &format!("src/beta{index:02}.rs"),
+        );
+    }
+    upsert(
+        "sym-both",
+        "SqliteStore::search_symbols",
+        "crates/store/src/symbols.rs",
+    );
+
+    let terms = ["store".to_owned(), "search".to_owned()];
+    let hits = store
+        .search_symbols_by_terms(&terms, 5)
+        .expect("search by terms");
+    assert_eq!(hits.len(), 5);
+    assert_eq!(hits[0].symbol_id, "sym-both");
+
+    assert!(
+        store
+            .search_symbols_by_terms(&[], 5)
+            .expect("search without terms")
+            .is_empty()
+    );
+    assert!(
+        store
+            .search_symbols_by_terms(&["  ".to_owned()], 5)
+            .expect("search blank term")
+            .is_empty()
+    );
+}
+
+#[test]
+fn search_symbols_by_terms_matches_names_and_paths_only() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+
+    let upsert = |id: &str, qualified_name: &str, file_path: &str| {
+        let mut record = symbol_record();
+        record.id = id.to_owned();
+        record.qualified_name = qualified_name.to_owned();
+        record.file_path = file_path.to_owned();
+        store.upsert_symbol(record).expect("upsert symbol");
+    };
+    // Hash-like id containing "db"; kind "function", language "rust".
+    upsert(
+        "00db7f3a9c0e11d2b4a6c8e0f2a4c6e8a0b2c4d6e8f0a2c4e6a8c0e2a4c6e8f0",
+        "mod01::item1",
+        "src/mod01.rs",
+    );
+    upsert("sym-open", "Connection::open", "src/connection.rs");
+    upsert("sym-retry", "aaa::retry", "src/connection.rs");
+    upsert("sym-axb", "axb::run", "src/axb.rs");
+    upsert("sym-a-b", "a_b::run", "src/a_b.rs");
+
+    for term in ["db", "function", "rust", "7f3a9c"] {
+        let hits = store
+            .search_symbols_by_terms(&[term.to_owned()], 20)
+            .expect("search by terms");
+        assert!(hits.is_empty(), "term {term:?} matched {hits:?}");
+    }
+
+    // Both symbols in src/connection.rs match; the one whose name matches
+    // ranks first even though "aaa::retry" sorts before it.
+    let ids = store
+        .search_symbols_by_terms(&["CONNECTION".to_owned()], 20)
+        .expect("search by terms")
+        .into_iter()
+        .map(|hit| hit.symbol_id)
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["sym-open".to_owned(), "sym-retry".to_owned()]);
+
+    // `_` is matched literally, not as a LIKE wildcard.
+    let ids = store
+        .search_symbols_by_terms(&["a_b".to_owned()], 20)
+        .expect("search by terms")
+        .into_iter()
+        .map(|hit| hit.symbol_id)
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["sym-a-b".to_owned()]);
+}
+
+#[test]
 fn increment_symbol_access_updates_count_and_timestamp() {
     let temp = tempdir().expect("tempdir");
     let store = SqliteStore::open(temp.path()).expect("open store");
