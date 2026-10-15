@@ -28,6 +28,32 @@ pub type CrossCommunityEdge = (String, String, String, i64, i64);
 /// After this long an open is logged as slow. It keeps running until the open timeout.
 const SURREAL_OPEN_SLOW_AFTER: Duration = Duration::from_secs(5);
 
+/// Fixed SurrealKV sizes for AETHER's small graph stores. Without them, SurrealDB sizes the
+/// block cache (half the machine's RAM) and the value-log files from two full `sysinfo` scans
+/// of every process on the machine, the first time a process opens a store. On a busy machine
+/// those scans take seconds. Values under 4 KiB never reach the value log, and 512 MiB of
+/// block cache holds even AETHER's own graph store.
+pub const SURREALKV_SIZING_ENV: [(&str, &str); 2] = [
+    ("SURREAL_SURREALKV_BLOCK_CACHE_CAPACITY", "512MiB"),
+    ("SURREAL_SURREALKV_VLOG_MAX_FILE_SIZE", "256MiB"),
+];
+
+/// Sets each [`SURREALKV_SIZING_ENV`] variable that is not already set, so a user's own value
+/// still wins. SurrealDB reads them once, at the first open in the process.
+///
+/// # Safety
+///
+/// Same contract as [`std::env::set_var`]: call it before the process starts other threads,
+/// or while no other thread can read or write the environment.
+pub unsafe fn set_surrealkv_sizing_env() {
+    for (key, value) in SURREALKV_SIZING_ENV {
+        if std::env::var_os(key).is_none() {
+            // SAFETY: upheld by the caller, as documented above.
+            unsafe { std::env::set_var(key, value) };
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SurrealGraphStore {
     db: Surreal<Db>,
