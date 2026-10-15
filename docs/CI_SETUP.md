@@ -2,7 +2,7 @@
 
 `aetherd init-agent --platform claude` or `--platform all` (the default, so a bare `aetherd init-agent` too) writes `.github/workflows/aether-review.yml` into the target repository. On every pull request it builds a structural AETHER index of the PR's merge result and posts one comment, updated in place on later pushes. When the analysis finishes, the report also goes to the job summary, which is where pull requests from forks find it. It contains:
 
-- **Usually changed together, but not in this PR:** for each changed source file (up to 15), the files that git history says change with it at medium risk or above (`aetherd blast-radius`, after `aetherd mine-coupling`), when the PR doesn't touch them (deleting or renaming a file counts as touching it).
+- **Usually changed together, but not in this PR:** for each changed source file (one whose extension an AETHER parser handles; up to 15), the files that git history says change with it at medium risk or above (`aetherd blast-radius`, after `aetherd mine-coupling`), when the PR doesn't touch them (deleting or renaming a file counts as touching it).
 - **Risky symbols in changed files:** symbols from the workspace's 200 most critical, bottleneck and risk-hotspot symbols in the dependency graph (`aetherd health`) that live in the changed files, and any dependency cycle through them. In CI every symbol's risk score carries the same offset for having no SIRs and no access history, so compare the scores with each other rather than with an indexed workstation's.
 - **Crate health** (Cargo workspaces with a `[workspace]` table only): `aetherd health-score` for the crates the PR touches, or the five lowest-scoring crates.
 
