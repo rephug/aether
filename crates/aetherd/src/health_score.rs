@@ -1112,11 +1112,16 @@ fn build_split_suggestion_entry(
         planner_config,
     );
     if assignments.is_empty() {
+        let message = if file_symbols.iter().all(|symbol| symbol.is_test) {
+            "the file holds only test code"
+        } else {
+            "all non-test symbols were loners after rescue passes"
+        };
         return split_entry(
             crate_name.to_owned(),
             crate_score,
             "no_split",
-            Some("all non-test symbols were loners after rescue passes".to_owned()),
+            Some(message.to_owned()),
             None,
             Some(diagnostics),
         );
@@ -1372,6 +1377,8 @@ fn symbol_leaf_name(qualified_name: &str) -> &str {
         .unwrap_or(qualified_name)
 }
 
+/// Whether the split planner treats a symbol as test code: a test intent names it, or the
+/// shared name and path rule ([`aether_core::is_test_symbol`]) says so.
 fn symbol_is_test(store: &SqliteStore, record: &SymbolRecord) -> bool {
     if store
         .list_test_intents_for_symbol(record.id.as_str())
@@ -1381,13 +1388,7 @@ fn symbol_is_test(store: &SqliteStore, record: &SymbolRecord) -> bool {
         return true;
     }
 
-    let leaf_name = symbol_leaf_name(record.qualified_name.as_str()).to_ascii_lowercase();
-    if leaf_name.starts_with("test_") {
-        return true;
-    }
-
-    let normalized_path = normalize_path(record.file_path.as_str()).to_ascii_lowercase();
-    normalized_path.starts_with("tests/") || normalized_path.contains("/tests/")
+    aether_core::is_test_symbol(&record.qualified_name, &record.file_path)
 }
 
 fn load_semantic_input(
@@ -1466,17 +1467,7 @@ fn load_semantic_input(
                     })
             })
             .count();
-        let mut community_freq = HashMap::new();
-        for symbol in &symbols {
-            if let Some(community_id) = community_by_symbol.get(symbol.id.as_str()).copied() {
-                *community_freq.entry(community_id).or_insert(0usize) += 1;
-            }
-        }
-        let threshold = 3_usize.max((symbols.len() as f64 * 0.2).ceil() as usize);
-        let community_count = community_freq
-            .values()
-            .filter(|&&count| count >= threshold)
-            .count();
+        let community_count = aether_analysis::file_community_count(&symbols, &community_by_symbol);
         let has_test_coverage = symbols.iter().any(|symbol| {
             store
                 .list_test_intents_for_symbol(symbol.id.as_str())

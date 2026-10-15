@@ -46,6 +46,16 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- One test-code rule (`aether_core::test_code`) for global communities, test intents, the
+  split planner, ablation and the dashboard's Tests layer.
+  - **Now recognized:** pytest's `conftest.py`, a top-level `test/` directory, Django's
+    `tests.py`, `*_tests.py` and Gradle's test source sets.
+  - **Now production:** Go `package test` code, `test`/`tests` packages under `src/main/`,
+    and `TEST_*` names.
+  - **Health scores step down once after upgrading.** The per-file community count takes
+    its 20% threshold over production symbols only, so boundary leakage can rise. On
+    AETHER's own index the score went from 72 to 71. Review `health-score --fail-below`
+    thresholds.
 - CI now runs explicit required jobs for `fmt`, `clippy`, and workspace tests.
 - Release workflow now supports both semver tag pushes (`v*.*.*`) and manual
   dispatch with a required `tag` input.

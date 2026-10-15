@@ -365,9 +365,9 @@ fn role_in_file(
         return "Primary public interface".to_owned();
     }
 
-    let kind = symbol.kind.to_ascii_lowercase();
-    let name = symbol.name.to_ascii_lowercase();
-    if kind.contains("test") || name.contains("test") || symbol.layer_name == "Tests" {
+    if symbol.layer_name == "Tests"
+        || aether_core::is_test_symbol(&symbol.qualified_name, &symbol.file_path)
+    {
         return format!("Test for {}", primary.name);
     }
 
