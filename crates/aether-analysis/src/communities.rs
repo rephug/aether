@@ -2,60 +2,12 @@
 //! test symbols left out and the planner's resolution, so that files are judged by
 //! how production code clusters (decision #89.1).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use aether_core::normalize_path;
-use aether_store::{SqliteStore, SurrealGraphStore};
+pub use aether_core::is_test_symbol;
+use aether_store::{SqliteStore, SurrealGraphStore, SymbolRecord};
 
 use crate::coupling::AnalysisError;
-use crate::test_intents::is_csharp_test_path;
-
-/// Whether a symbol is test code, judged from its name and path alone (no per-symbol
-/// store lookups, so it stays cheap on large workspaces):
-/// - the leaf name starts with `test_`;
-/// - a module segment of the qualified name is `tests` or `test`, which covers Rust's
-///   inline `#[cfg(test)] mod tests` (qualified names are file-relative, `tests::…`);
-/// - the file sits under a `tests/`, `__tests__/` or `src/test/` (Maven and Gradle)
-///   directory, or is a `tests.rs` module file;
-/// - the file name follows a common test convention: `test_*.py`, `*_test.py`,
-///   `*_test.go`, or contains `.test.` / `.spec.` (the JavaScript and TypeScript
-///   conventions, applied to any language);
-/// - a C# file is named `*Tests.cs` / `*Test.cs` or sits in a `*.Tests`-style project.
-///
-/// Being name-based, it misses test modules with other names (`mod parser_tests`) and
-/// takes production functions named `test_*` for tests, as the planner's rule does.
-pub fn is_test_symbol(qualified_name: &str, file_path: &str) -> bool {
-    let mut segments = qualified_name.split("::").collect::<Vec<_>>();
-    let leaf = segments.pop().unwrap_or(qualified_name);
-    if leaf.to_ascii_lowercase().starts_with("test_") {
-        return true;
-    }
-    if segments
-        .iter()
-        .any(|segment| matches!(*segment, "tests" | "test"))
-    {
-        return true;
-    }
-
-    let path = normalize_path(file_path);
-    if is_csharp_test_path(&path) {
-        return true;
-    }
-    let path = path.to_ascii_lowercase();
-    let in_test_dir =
-        |dir: &str| path.starts_with(&format!("{dir}/")) || path.contains(&format!("/{dir}/"));
-    if in_test_dir("tests") || in_test_dir("__tests__") || in_test_dir("src/test") {
-        return true;
-    }
-    let file_name = path.rsplit('/').next().unwrap_or(path.as_str());
-    file_name == "tests.rs"
-        || (file_name.starts_with("test_") && file_name.ends_with(".py"))
-        || file_name.ends_with("_test.py")
-        || file_name.ends_with("_test.go")
-        || [".test.", ".spec."]
-            .iter()
-            .any(|marker| file_name.contains(marker))
-}
 
 /// Ids of every indexed symbol that [`is_test_symbol`] classifies as test code.
 pub fn test_symbol_ids(store: &SqliteStore) -> Result<HashSet<String>, AnalysisError> {
@@ -80,70 +32,72 @@ pub async fn production_community_assignments(
         .await?)
 }
 
+/// How many production communities a file's symbols are split across: those holding at
+/// least three of its symbols and at least a fifth of its production symbols. Test
+/// symbols belong to no community, so they count toward neither.
+pub fn file_community_count(
+    symbols: &[SymbolRecord],
+    community_by_symbol: &HashMap<String, i64>,
+) -> usize {
+    let production_count = symbols
+        .iter()
+        .filter(|symbol| !is_test_symbol(&symbol.qualified_name, &symbol.file_path))
+        .count();
+    let threshold = 3_usize.max((production_count as f64 * 0.2).ceil() as usize);
+    let mut sizes = HashMap::<i64, usize>::new();
+    for symbol in symbols {
+        if let Some(community) = community_by_symbol.get(symbol.id.as_str()) {
+            *sizes.entry(*community).or_default() += 1;
+        }
+    }
+    sizes.values().filter(|&&size| size >= threshold).count()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_test_symbol;
+    use std::collections::HashMap;
 
-    #[test]
-    fn recognizes_test_symbols_by_name_and_path() {
-        for (qualified_name, file_path) in [
-            ("test_parses_config", "src/config.rs"),
-            ("tests::rejects_empty_input", "crates/a/src/lib.rs"),
-            ("parser::tests::helpers::fixture", "crates/a/src/parser.rs"),
-            ("module::test::case", "src/lib.rs"),
-            ("builds_index", "crates/a/tests/integration.rs"),
-            ("builds_index", "tests/integration.rs"),
-            ("empty_app", "crates/dashboard/src/tests.rs"),
-            ("check_totals", "pkg/test_billing.py"),
-            ("check_totals", "pkg/billing_test.py"),
-            ("TestTotals", "pkg/billing_test.go"),
-            ("renders", "web/src/App.test.tsx"),
-            ("renders", "web/src/App.spec.ts"),
-            ("renders", "web/src/__tests__/App.tsx"),
-            ("renders", "Web\\Src\\__Tests__\\App.tsx"),
-            (
-                "PaymentServiceTest::chargesCard",
-                "billing/src/test/java/com/acme/PaymentServiceTest.java",
-            ),
-            ("Fixtures::order", "src/test/java/com/acme/Fixtures.java"),
-            (
-                "LoggerTests::WritesEvent",
-                "test/Serilog.Tests/Core/LoggerTests.cs",
-            ),
-            (
-                "PaymentTests::Charges",
-                "Acme.Billing.Tests/PaymentTests.cs",
-            ),
-            ("Fixture::Build", "src/Acme.Billing.UnitTests/Fixture.cs"),
-        ] {
-            assert!(
-                is_test_symbol(qualified_name, file_path),
-                "{qualified_name} in {file_path}"
-            );
+    use aether_store::SymbolRecord;
+
+    use super::file_community_count;
+
+    fn symbol(id: &str, qualified_name: &str) -> SymbolRecord {
+        SymbolRecord {
+            id: id.to_owned(),
+            file_path: "crates/a/src/parser.rs".to_owned(),
+            language: "rust".to_owned(),
+            kind: "function".to_owned(),
+            qualified_name: qualified_name.to_owned(),
+            signature_fingerprint: String::new(),
+            last_seen_at: 0,
         }
     }
 
     #[test]
-    fn leaves_production_symbols_alone() {
-        for (qualified_name, file_path) in [
-            ("parse_config", "src/config.rs"),
-            ("Config::testing_mode", "src/config.rs"),
-            ("testing::Harness::run", "src/testing.rs"),
-            ("contest::score", "src/contest.rs"),
-            ("latest_tests_summary", "src/report.rs"),
-            ("attestation::verify", "src/attestation.rs"),
-            ("load", "src/tests_support.rs"),
-            ("load", "pkg/testing.py"),
-            ("render", "web/src/latest.ts"),
-            ("Contest::score", "src/main/java/com/acme/test/Contest.java"),
-            ("Contest::Score", "src/Acme/Contest.cs"),
-            ("Support::Load", "src/Acme.Tests.Support/Support.cs"),
-            ("load", "src/Acme.Tests/loader.py"),
-        ] {
-            assert!(
-                !is_test_symbol(qualified_name, file_path),
-                "{qualified_name} in {file_path}"
-            );
+    fn test_symbols_dont_raise_the_per_file_community_threshold() {
+        // Ten production functions in two communities of five, beside thirty test functions
+        // of an inline `mod tests`, which global communities leave out. Counting the tests,
+        // a community would need a fifth of 40 symbols (8) to count; it needs a fifth of
+        // the 10 production ones, or 3.
+        let mut symbols = Vec::new();
+        let mut community_by_symbol = HashMap::new();
+        for index in 0..10 {
+            let id = format!("p{index}");
+            community_by_symbol.insert(id.clone(), i64::from(index % 2));
+            symbols.push(symbol(&id, &format!("parse_{index}")));
         }
+        for index in 0..30 {
+            symbols.push(symbol(
+                &format!("t{index}"),
+                &format!("tests::case_{index}"),
+            ));
+        }
+        assert_eq!(file_community_count(&symbols, &community_by_symbol), 2);
+
+        // Communities of one or two production symbols are below the floor of three.
+        community_by_symbol.insert("p0".to_owned(), 7);
+        community_by_symbol.insert("p2".to_owned(), 7);
+        community_by_symbol.insert("p4".to_owned(), 8);
+        assert_eq!(file_community_count(&symbols, &community_by_symbol), 1);
     }
 }

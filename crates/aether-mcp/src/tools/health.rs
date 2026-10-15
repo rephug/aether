@@ -423,17 +423,8 @@ impl AetherMcpServer {
                         })
                 })
                 .count();
-            let mut community_freq = HashMap::new();
-            for symbol in &symbols {
-                if let Some(community_id) = community_by_symbol.get(symbol.id.as_str()).copied() {
-                    *community_freq.entry(community_id).or_insert(0usize) += 1;
-                }
-            }
-            let threshold = 3_usize.max((symbols.len() as f64 * 0.2).ceil() as usize);
-            let community_count = community_freq
-                .values()
-                .filter(|&&count| count >= threshold)
-                .count();
+            let community_count =
+                aether_analysis::file_community_count(&symbols, &community_by_symbol);
             let has_test_coverage = symbols.iter().any(|symbol| {
                 self.state
                     .store
@@ -626,9 +617,14 @@ impl AetherMcpServer {
             &planner_config,
         );
         if assignments.is_empty() {
+            let message = if file_symbols.iter().all(|symbol| symbol.is_test) {
+                "the file holds only test code"
+            } else {
+                "all non-test symbols were loners after rescue passes"
+            };
             return HealthExplainSplitOutcome {
                 status: "no_split".to_owned(),
-                message: Some("all non-test symbols were loners after rescue passes".to_owned()),
+                message: Some(message.to_owned()),
                 suggestion: None,
                 diagnostics: Some(diagnostics),
             };
@@ -685,6 +681,8 @@ impl AetherMcpServer {
         }
     }
 
+    /// Whether the split planner treats a symbol as test code: a test intent names it, or
+    /// the shared name and path rule ([`aether_core::is_test_symbol`]) says so.
     fn symbol_is_test(&self, record: &SymbolRecord) -> bool {
         if self
             .state
@@ -696,14 +694,7 @@ impl AetherMcpServer {
             return true;
         }
 
-        let leaf_name = symbol_leaf_name(record.qualified_name.as_str()).to_ascii_lowercase();
-        if leaf_name.starts_with("test_") {
-            return true;
-        }
-
-        let normalized_path =
-            aether_core::normalize_path(record.file_path.as_str()).to_ascii_lowercase();
-        normalized_path.starts_with("tests/") || normalized_path.contains("/tests/")
+        aether_core::is_test_symbol(&record.qualified_name, &record.file_path)
     }
 }
 
