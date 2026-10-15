@@ -25,7 +25,7 @@ serde.workspace = true
 serde_json.workspace = true
 surrealdb.workspace = true
 thiserror.workspace = true
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
 tracing.workspace = true
 
 [dev-dependencies]
