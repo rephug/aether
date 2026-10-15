@@ -33,6 +33,9 @@ impl SurrealGraphStore {
         let workspace_root = workspace_root.as_ref().to_path_buf();
         let graph_dir = workspace_root.join(".aether").join("graph");
         fs::create_dir_all(&graph_dir)?;
+        // A process shares one handle per store, so `.` and an absolute spelling of the
+        // same workspace must find the same cache entry.
+        let graph_dir = fs::canonicalize(&graph_dir).unwrap_or(graph_dir);
 
         let db = if let Some(existing) = cached_surreal_handle(&graph_dir)? {
             existing
@@ -53,6 +56,14 @@ impl SurrealGraphStore {
                     Ok(Err(err)) => {
                         let message = err.to_string();
                         if message.contains("LOCK is already locked") && attempt < 9 {
+                            // Another thread of this process may have opened the store
+                            // since the cache check (aetherd's dashboard and indexer open
+                            // it concurrently). Reuse that handle instead of waiting on a
+                            // lock this process already holds.
+                            if let Some(existing) = cached_surreal_handle(&graph_dir)? {
+                                db_opt = Some(existing);
+                                break;
+                            }
                             tokio::time::sleep(Duration::from_millis(500)).await;
                             continue;
                         }
@@ -1433,6 +1444,48 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_opens_in_one_process_share_one_handle() {
+        // aetherd opens the store from its dashboard thread and its indexer at the same
+        // time; the second open must reuse the first handle, not fail on its own lock.
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path().join("ws");
+        fs::create_dir_all(&workspace).expect("create workspace");
+
+        let (first, second) = tokio::join!(
+            SurrealGraphStore::open(&workspace),
+            SurrealGraphStore::open(&workspace)
+        );
+        let first = first.expect("first open");
+        let second = second.expect("second open");
+
+        first
+            .upsert_symbol_node(&symbol("sym-a", "a", "src/lib.rs"))
+            .await
+            .expect("write through the first handle");
+        assert_eq!(
+            second
+                .list_all_symbol_ids()
+                .await
+                .expect("read through the second handle"),
+            vec!["sym-a".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn another_spelling_of_the_workspace_reuses_the_open_handle() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path().join("ws");
+        fs::create_dir_all(workspace.join("sub")).expect("create workspace");
+
+        let _first = SurrealGraphStore::open(&workspace)
+            .await
+            .expect("open by plain path");
+        SurrealGraphStore::open(workspace.join("sub").join(".."))
+            .await
+            .expect("open the same store through another spelling");
+    }
 
     fn symbol(id: &str, qualified_name: &str, file_path: &str) -> SymbolRecord {
         SymbolRecord {
