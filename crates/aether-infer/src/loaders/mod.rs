@@ -1,4 +1,3 @@
-use std::env;
 use std::path::{Path, PathBuf};
 
 use aether_config::{
@@ -796,8 +795,7 @@ fn resolve_inference_api_key_env(
 }
 
 fn read_env_non_empty(name: &str) -> Option<String> {
-    env::var(name)
-        .ok()
+    crate::env_vars::var(name)
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
 }

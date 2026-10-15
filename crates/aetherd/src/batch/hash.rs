@@ -7,14 +7,29 @@ pub fn compute_source_hash_segment(source: &str) -> String {
     hex[..16].to_owned()
 }
 
+/// Hashes the sorted neighbor intents. The original encoding ends each intent with a
+/// newline, which is ambiguous once an intent itself contains one (`["a\nb"]` and
+/// `["a", "b"]` hash alike), so such lists use a separate, length-prefixed encoding
+/// under its own BLAKE3 key. Lists without a newline in any intent keep the original
+/// bytes, so their stored prompt hashes still match.
 pub fn compute_neighbor_hash_segment(neighbor_intents: &[&str]) -> String {
     let mut sorted = neighbor_intents.to_vec();
     sorted.sort();
-    let mut h = Hasher::new();
-    for intent in sorted {
-        h.update(intent.as_bytes());
-        h.update(b"\n");
-    }
+    let h = if sorted.iter().any(|intent| intent.contains('\n')) {
+        let mut h = Hasher::new_derive_key("aether prompt hash neighbor intents v2");
+        for intent in &sorted {
+            h.update(&(intent.len() as u64).to_le_bytes());
+            h.update(intent.as_bytes());
+        }
+        h
+    } else {
+        let mut h = Hasher::new();
+        for intent in &sorted {
+            h.update(intent.as_bytes());
+            h.update(b"\n");
+        }
+        h
+    };
     let hex = h.finalize().to_hex().to_string();
     hex[..16].to_owned()
 }
@@ -111,6 +126,34 @@ mod tests {
         assert_eq!(
             compute_prompt_hash("fn run() {}", &["intent a", "intent b"], "model:low:10000"),
             format!("{source_hash}|{neighbor_hash}|{config_hash}")
+        );
+    }
+
+    #[test]
+    fn neighbor_segment_keeps_the_original_bytes_without_embedded_newlines() {
+        // The original encoding, spelled out: stored hashes must keep matching.
+        let mut legacy = blake3::Hasher::new();
+        for intent in ["intent a", "intent b"] {
+            legacy.update(intent.as_bytes());
+            legacy.update(b"\n");
+        }
+        let legacy = legacy.finalize().to_hex().to_string()[..16].to_owned();
+        assert_eq!(
+            compute_neighbor_hash_segment(&["intent b", "intent a"]),
+            legacy
+        );
+    }
+
+    #[test]
+    fn neighbor_segment_distinguishes_an_embedded_newline_from_two_intents() {
+        assert_ne!(
+            compute_neighbor_hash_segment(&["a\nb"]),
+            compute_neighbor_hash_segment(&["a", "b"])
+        );
+        // Both lists encoded to "x\ny\nz\n" before.
+        assert_ne!(
+            compute_neighbor_hash_segment(&["x\ny", "z"]),
+            compute_neighbor_hash_segment(&["x", "y\nz"])
         );
     }
 }

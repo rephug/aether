@@ -25,8 +25,7 @@ fn build_job_records_the_hash_of_the_text_it_read_for_the_prompt() {
     edited_symbol.range.end_byte = Some(edited_source.len());
     edited_symbol.range.end.column = edited_source.trim_end().len() + 1;
     let err = build_job(workspace, edited_symbol, None, Some(8))
-        .err()
-        .expect("a symbol whose text changed since indexing must be refused");
+        .expect_err("a symbol whose text changed since indexing must be refused");
     assert!(
         format!("{err:#}").contains("changed since it was indexed"),
         "unexpected error: {err:#}"

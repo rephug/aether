@@ -1,6 +1,7 @@
 use super::*;
 use crate::sir_history::record_sir_version_if_changed_tx;
 use crate::write_intents::update_intent_status_tx;
+use std::path::Component;
 
 /// The identity of one stored SIR write: its content hash, the history version the
 /// store assigned to it, and the row's write generation. A hash alone does not identify
@@ -279,8 +280,20 @@ impl SqliteStore {
         Ok(blobs)
     }
 
-    pub(crate) fn sir_blob_path(&self, symbol_id: &str) -> PathBuf {
-        self.sir_dir.join(format!("{symbol_id}.json"))
+    /// The mirror file of `symbol_id`'s SIR JSON, or `None` when the ID can't be a file
+    /// name inside the SIR directory. Symbol and rollup IDs are hex digests; an ID with a
+    /// path separator, a drive prefix, or a `.`/`..` component would name a file
+    /// elsewhere, so it has no mirror (its SQLite copy is unaffected).
+    pub(crate) fn sir_blob_path(&self, symbol_id: &str) -> Option<PathBuf> {
+        let file_name = format!("{symbol_id}.json");
+        let mut components = Path::new(&file_name).components();
+        let single_normal =
+            matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+        let plain = !symbol_id.is_empty()
+            && symbol_id != "."
+            && symbol_id != ".."
+            && !symbol_id.contains(['/', '\\', ':', '\0']);
+        (single_normal && plain).then(|| self.sir_dir.join(file_name))
     }
     fn upsert_sir_json_only(
         &self,
@@ -432,15 +445,15 @@ impl SqliteStore {
     ) -> Result<(), StoreError> {
         self.upsert_sir_json_only(symbol_id, sir_json_string)?;
 
-        if self.mirror_sir_files {
-            let path = self.sir_blob_path(symbol_id);
-            if let Err(err) = fs::write(path, sir_json_string) {
-                tracing::warn!(
-                    symbol_id = %symbol_id,
-                    error = %err,
-                    "aether-store mirror write failed"
-                );
-            }
+        if self.mirror_sir_files
+            && let Some(path) = self.sir_blob_path(symbol_id)
+            && let Err(err) = fs::write(path, sir_json_string)
+        {
+            tracing::warn!(
+                symbol_id = %symbol_id,
+                error = %err,
+                "aether-store mirror write failed"
+            );
         }
 
         Ok(())
@@ -465,7 +478,9 @@ impl SqliteStore {
     /// read). Any other failure names the mirror path and the symbol, so a caller can
     /// tell which file of which symbol could not be read.
     fn read_legacy_mirror(&self, symbol_id: &str) -> Result<Option<String>, StoreError> {
-        let path = self.sir_blob_path(symbol_id);
+        let Some(path) = self.sir_blob_path(symbol_id) else {
+            return Ok(None);
+        };
         match fs::read_to_string(&path) {
             Ok(content) => Ok(Some(content)),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -555,15 +570,16 @@ impl SqliteStore {
         }
         tx.commit()?;
 
-        if should_write_json && self.mirror_sir_files {
-            let path = self.sir_blob_path(record.id.as_str());
-            if let Err(err) = fs::write(path, sir_json_string) {
-                tracing::warn!(
-                    symbol_id = %record.id,
-                    error = %err,
-                    "aether-store mirror write failed"
-                );
-            }
+        if should_write_json
+            && self.mirror_sir_files
+            && let Some(path) = self.sir_blob_path(record.id.as_str())
+            && let Err(err) = fs::write(path, sir_json_string)
+        {
+            tracing::warn!(
+                symbol_id = %record.id,
+                error = %err,
+                "aether-store mirror write failed"
+            );
         }
 
         Ok(write_result)

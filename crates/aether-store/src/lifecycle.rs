@@ -76,6 +76,23 @@ fn delete_symbol_fully(tx: &Transaction<'_>, symbol_id: &str) -> Result<(), Stor
 
     Ok(())
 }
+/// Re-points intent contracts and their violation history from `old_id` to `new_id`
+/// so they survive a symbol id migration instead of being deleted with the old id.
+fn move_intent_contract_records(
+    tx: &Transaction<'_>,
+    old_id: &str,
+    new_id: &str,
+) -> Result<(usize, usize), StoreError> {
+    let contracts = tx.execute(
+        "UPDATE intent_contracts SET symbol_id = ?2 WHERE symbol_id = ?1",
+        params![old_id, new_id],
+    )?;
+    let violations = tx.execute(
+        "UPDATE intent_violations SET symbol_id = ?2 WHERE symbol_id = ?1",
+        params![old_id, new_id],
+    )?;
+    Ok((contracts, violations))
+}
 fn delete_symbol_records_for_ids(
     tx: &Transaction<'_>,
     symbol_ids: &[String],
@@ -228,6 +245,17 @@ impl SqliteStore {
 
                 let merged_access = merge_symbol_access_state(new_access, old_access);
                 update_symbol_access_state(&tx, new_id, &merged_access)?;
+                let (moved_contracts, moved_violations) =
+                    move_intent_contract_records(&tx, old_id, new_id)?;
+                if moved_contracts > 0 || moved_violations > 0 {
+                    tracing::info!(
+                        old_id = %old_id,
+                        new_id = %new_id,
+                        contracts = moved_contracts,
+                        violations = moved_violations,
+                        "reconciliation moved intent contracts to new symbol ID"
+                    );
+                }
                 delete_symbol_records_for_ids(&tx, std::slice::from_ref(old_id))?;
                 mirror_deletes.push(old_id.clone());
                 migrated_count += 1;
@@ -247,7 +275,10 @@ impl SqliteStore {
             if !deleted.insert(symbol_id.clone()) {
                 continue;
             }
-            match fs::remove_file(self.sir_blob_path(symbol_id.as_str())) {
+            let Some(path) = self.sir_blob_path(symbol_id.as_str()) else {
+                continue;
+            };
+            match fs::remove_file(path) {
                 Ok(()) => {}
                 Err(err) if err.kind() == ErrorKind::NotFound => {}
                 Err(err) => {
@@ -266,7 +297,10 @@ impl SqliteStore {
                 if !written.insert(symbol_id.clone()) {
                     continue;
                 }
-                if let Err(err) = fs::write(self.sir_blob_path(symbol_id.as_str()), sir_json) {
+                let Some(path) = self.sir_blob_path(symbol_id.as_str()) else {
+                    continue;
+                };
+                if let Err(err) = fs::write(path, sir_json) {
                     tracing::warn!(
                         symbol_id = %symbol_id,
                         error = %err,
@@ -290,11 +324,12 @@ impl SqliteStore {
             tx.commit()?;
         }
 
-        let path = self.sir_blob_path(symbol_id);
-        match fs::remove_file(path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
+        if let Some(path) = self.sir_blob_path(symbol_id) {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
         }
 
         Ok(())

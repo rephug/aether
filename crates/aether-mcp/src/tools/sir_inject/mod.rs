@@ -2,7 +2,7 @@ use aether_sir::{
     SirAnnotation, canonicalize_sir_json, normalize_complexity_label, normalize_optional_text,
     sir_hash, validate_sir,
 };
-use aether_store::{SirMetaRecord, SirStateStore, SymbolCatalogStore, SymbolRecord};
+use aether_store::{SirMetaRecord, SirStateStore, SymbolRecord};
 
 use aether_parse::language_for_path;
 use aetherd::sir_pipeline::{
@@ -13,7 +13,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use super::{AetherMcpServer, LiveSymbolSources, current_unix_timestamp};
+use super::{
+    AetherMcpServer, LiveSymbolSources, SYMBOL_SELECTOR_LABEL, current_unix_timestamp,
+    resolve_symbol_selector,
+};
 use crate::AetherMcpError;
 
 const FORCE_CONFIDENCE_THRESHOLD: f32 = 0.5;
@@ -188,84 +191,6 @@ fn normalize_optional_complexity(
     }
 }
 
-fn resolve_symbol_selector(
-    store: &aether_store::SqliteStore,
-    selector: &str,
-) -> Result<SymbolRecord, AetherMcpError> {
-    let selector = selector.trim();
-    if selector.is_empty() {
-        return Err(AetherMcpError::Message(
-            "symbol selector must not be empty".to_owned(),
-        ));
-    }
-
-    if let Some(record) = store.get_symbol_record(selector)? {
-        return Ok(record);
-    }
-
-    let exact_matches = store.find_symbol_search_results_by_qualified_name(selector)?;
-    match exact_matches.as_slice() {
-        [only] => {
-            return store
-                .get_symbol_record(only.symbol_id.as_str())?
-                .ok_or_else(|| {
-                    AetherMcpError::Message(format!(
-                        "symbol search returned missing record: {}",
-                        only.symbol_id
-                    ))
-                });
-        }
-        [] => {}
-        many => {
-            let candidates = many
-                .iter()
-                .map(|candidate| {
-                    format!(
-                        "{} [{}]",
-                        candidate.qualified_name.trim(),
-                        candidate.file_path.trim()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n  - ");
-            return Err(AetherMcpError::Message(format!(
-                "ambiguous symbol selector '{selector}'. Candidates:\n  - {candidates}"
-            )));
-        }
-    }
-
-    let matches = store.search_symbols(selector, 10)?;
-    match matches.as_slice() {
-        [] => Err(AetherMcpError::Message(format!(
-            "symbol not found: {selector}"
-        ))),
-        [only] => store
-            .get_symbol_record(only.symbol_id.as_str())?
-            .ok_or_else(|| {
-                AetherMcpError::Message(format!(
-                    "symbol search returned missing record: {}",
-                    only.symbol_id
-                ))
-            }),
-        many => {
-            let candidates = many
-                .iter()
-                .map(|candidate| {
-                    format!(
-                        "{} [{}]",
-                        candidate.qualified_name.trim(),
-                        candidate.file_path.trim()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n  - ");
-            Err(AetherMcpError::Message(format!(
-                "ambiguous symbol selector '{selector}'. Candidates:\n  - {candidates}"
-            )))
-        }
-    }
-}
-
 impl AetherMcpServer {
     pub fn aether_sir_inject_logic(
         &self,
@@ -274,7 +199,8 @@ impl AetherMcpServer {
         self.state.require_writable()?;
 
         let store = self.state.store.as_ref();
-        let symbol = resolve_symbol_selector(store, request.symbol.as_str())?;
+        let symbol =
+            resolve_symbol_selector(store, SYMBOL_SELECTOR_LABEL, request.symbol.as_str())?;
         let symbol_id = symbol.id.clone();
         let qualified_name = symbol.qualified_name.clone();
         // Read the prior state, apply the confidence guard, merge, write the leaf and

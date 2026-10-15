@@ -935,12 +935,15 @@ fn run_contract_subcommand(
 }
 
 fn init_tracing_subscriber(log_format: LogFormat, configured_log_level: &str) -> Result<()> {
+    // Logs go to stderr: in `--lsp` mode stdout carries only LSP protocol frames.
     let init_result = match log_format {
         LogFormat::Human => tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
             .with_env_filter(build_env_filter(configured_log_level))
             .with_target(false)
             .try_init(),
         LogFormat::Json => tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
             .json()
             .with_env_filter(build_env_filter(configured_log_level))
             .with_target(false)

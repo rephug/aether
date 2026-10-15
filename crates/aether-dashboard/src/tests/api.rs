@@ -584,3 +584,141 @@ async fn contracts_api_returns_ok() {
     assert!(json["data"].get("recent_violations").is_some());
     assert!(json["data"]["recent_violations"].is_array());
 }
+
+const CONTEXT_BUILD_OUTSIDE_MARKER: &str = "CONTEXT_BUILD_OUTSIDE_MARKER";
+
+async fn post_context_build(app: axum::Router, body: Value) -> (StatusCode, String) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/context/build")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+fn context_build_content(body: &str) -> String {
+    let json: Value = serde_json::from_str(body).unwrap();
+    json["data"]["content"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn context_build_rejects_targets_outside_workspace() {
+    let (_tmp, app, _ids) = seeded_app().await;
+    let outside = TempDir::new().unwrap();
+    let secret = outside.path().join("outside_secret.txt");
+    fs::write(&secret, format!("{CONTEXT_BUILD_OUTSIDE_MARKER}\n")).unwrap();
+    let outside_name = outside.path().file_name().unwrap().to_str().unwrap();
+
+    for target in [
+        secret.to_string_lossy().into_owned(),
+        format!("../{outside_name}/outside_secret.txt"),
+    ] {
+        let (status, body) = post_context_build(
+            app.clone(),
+            serde_json::json!({ "targets": [target.as_str()] }),
+        )
+        .await;
+        assert!(
+            !body.contains(CONTEXT_BUILD_OUTSIDE_MARKER),
+            "target {target} leaked a file outside the workspace: {body}"
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST, "target {target}: {body}");
+        let json: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["error"], "bad_request");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn context_build_does_not_follow_symlinks_out_of_workspace() {
+    let (tmp, app, _ids) = seeded_app().await;
+    let outside = TempDir::new().unwrap();
+    let secret = outside.path().join("outside_secret.txt");
+    fs::write(&secret, format!("{CONTEXT_BUILD_OUTSIDE_MARKER}\n")).unwrap();
+    std::os::unix::fs::symlink(&secret, tmp.path().join("src/escape.txt")).unwrap();
+
+    let (status, body) =
+        post_context_build(app, serde_json::json!({ "targets": ["src/escape.txt"] })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !body.contains(CONTEXT_BUILD_OUTSIDE_MARKER),
+        "symlinked target leaked a file outside the workspace: {body}"
+    );
+}
+
+#[tokio::test]
+async fn context_build_truncates_multibyte_source_on_char_boundary() {
+    let (tmp, app, _ids) = seeded_app().await;
+    // One ASCII byte followed by 3-byte characters puts char boundaries at 1 + 3k.
+    // Budget 100 gives the source layer 30 tokens, a 105-byte cut that lands
+    // inside a character.
+    fs::write(
+        tmp.path().join("src/wide.txt"),
+        format!("a{}", "─".repeat(200)),
+    )
+    .unwrap();
+
+    let (status, body) = post_context_build(
+        app,
+        serde_json::json!({ "targets": ["src/wide.txt"], "budget": 100 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let content = context_build_content(&body);
+    assert!(content.contains("### Source"), "{content}");
+    assert!(content.contains("... (truncated)"), "{content}");
+}
+
+#[tokio::test]
+async fn context_build_summarizes_multibyte_neighbor_intent_on_char_boundary() {
+    let temp = TempDir::new().unwrap();
+    seed_workspace(temp.path());
+    // The caller of demo::helper gets an intent whose byte 77 sits inside an em dash.
+    let intent = format!("{}— and more text past the summary limit", "a".repeat(76));
+    let store = SqliteStore::open(temp.path()).unwrap();
+    store
+        .write_sir_blob(
+            "sym-demo-run",
+            &serde_json::json!({ "intent": intent }).to_string(),
+        )
+        .unwrap();
+    drop(store);
+    let state = Arc::new(SharedState::open_readonly_async(temp.path()).await.unwrap());
+    let app = dashboard_router(state);
+
+    let (status, body) =
+        post_context_build(app, serde_json::json!({ "targets": ["src/lib.rs"] })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let content = context_build_content(&body);
+    assert!(content.contains("### Dependencies & Callers"), "{content}");
+    assert!(
+        content.contains(&format!("{}—...", "a".repeat(76))),
+        "{content}"
+    );
+}
+
+#[tokio::test]
+async fn context_build_clamps_oversized_budget() {
+    let (_tmp, app, _ids) = seeded_app().await;
+
+    let (status, body) = post_context_build(
+        app,
+        serde_json::json!({ "targets": ["src/lib.rs"], "budget": u64::MAX }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        json["data"]["budget_usage"]["total"].as_u64(),
+        Some(1_000_000)
+    );
+    assert!(context_build_content(&body).contains("### Source"));
+}
