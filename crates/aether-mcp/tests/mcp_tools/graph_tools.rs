@@ -774,6 +774,65 @@ fn mcp_suggest_trait_split_falls_back_to_same_file_implementor_methods() -> Resu
 }
 
 #[test]
+fn mcp_usage_matrix_ignores_bare_name_calls_for_java_classes() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    write_test_config(workspace);
+
+    let package_dir = workspace.join("src/main/java/com/acme");
+    fs::create_dir_all(&package_dir)?;
+    fs::write(
+        package_dir.join("Order.java"),
+        "package com.acme;\n\npublic class Order {\n    public int getId() { return 1; }\n    public String getName() { return \"order\"; }\n}\n",
+    )?;
+    fs::write(
+        package_dir.join("Report.java"),
+        "package com.acme;\n\npublic class Report {\n    private Order order;\n\n    public int id() { return order.getId(); }\n}\n",
+    )?;
+    // `c` has no declared type, so the call is spelled by its bare name.
+    fs::write(
+        package_dir.join("Names.java"),
+        "package com.acme;\n\nimport java.util.List;\n\npublic class Names {\n    public long count(List<Customer> customers) {\n        return customers.stream().map(c -> c.getName()).count();\n    }\n}\n",
+    )?;
+
+    run_index_and_seed_sir(workspace)?;
+
+    let store = SqliteStore::open(workspace)?;
+    assert_eq!(store.get_callers("getName")?.len(), 1);
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+    let response = rt
+        .block_on(
+            server.aether_usage_matrix(Parameters(AetherUsageMatrixRequest {
+                symbol: "Order".to_owned(),
+                symbol_id: None,
+                file: Some("src/main/java/com/acme/Order.java".to_owned()),
+                kind: None,
+            })),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .0;
+
+    assert_eq!(response.method_count, 2);
+    assert_eq!(response.consumer_count, 1);
+    assert_eq!(response.uncalled_methods, vec!["getName".to_owned()]);
+    let consumers = response
+        .matrix
+        .iter()
+        .map(|row| (row.consumer_file.clone(), row.methods_used.clone()))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        consumers,
+        BTreeMap::from([(
+            "src/main/java/com/acme/Report.java".to_owned(),
+            vec!["getId".to_owned()]
+        )])
+    );
+    Ok(())
+}
+
+#[test]
 fn mcp_usage_matrix_resolves_exact_qualified_name_before_fuzzy_search_limit() -> Result<()> {
     let temp = tempdir()?;
     let workspace = temp.path();

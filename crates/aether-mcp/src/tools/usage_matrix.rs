@@ -201,7 +201,12 @@ impl AetherMcpServer {
                 edges.push((edge.source_id, edge.file_path));
             }
 
-            if method_name != method.qualified_name {
+            // Java and C# spell every call whose receiver type is known `Type::method`, so a
+            // bare name there is a call on a value of unknown type (`c -> c.getName()`), not
+            // evidence that this type's method is used.
+            if method_name != method.qualified_name
+                && !matches!(method.language.as_str(), "java" | "csharp")
+            {
                 for edge in store.get_callers(method_name.as_str())? {
                     if !seen_source_ids.insert(edge.source_id.clone()) {
                         continue;
