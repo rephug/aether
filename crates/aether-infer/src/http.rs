@@ -6,8 +6,11 @@ use crate::types::{InferError, OllamaPullProgress};
 pub(crate) const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 const OLLAMA_PULL_SUCCESS_STATUS: &str = "success";
 
+/// Seconds an inference request may take unless a provider is configured otherwise.
+pub(crate) const DEFAULT_INFERENCE_REQUEST_TIMEOUT_SECS: u64 = 120;
+
 pub(crate) fn inference_http_client() -> reqwest::Client {
-    inference_http_client_with_timeout(120)
+    inference_http_client_with_timeout(DEFAULT_INFERENCE_REQUEST_TIMEOUT_SECS)
 }
 
 pub(crate) fn inference_http_client_with_timeout(timeout_secs: u64) -> reqwest::Client {

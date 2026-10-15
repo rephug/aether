@@ -575,18 +575,18 @@ fn omp_gateway_token_falls_back_to_token_file() {
 }
 
 #[test]
-fn omp_reasoning_effort_maps_known_levels_only() {
+fn reasoning_effort_for_thinking_maps_known_levels_only() {
     assert_eq!(
-        omp_reasoning_effort(Some(" High ")),
+        reasoning_effort_for_thinking(Some(" High ")),
         Some("high".to_owned())
     );
     assert_eq!(
-        omp_reasoning_effort(Some("xhigh")),
+        reasoning_effort_for_thinking(Some("xhigh")),
         Some("xhigh".to_owned())
     );
-    assert_eq!(omp_reasoning_effort(Some("dynamic")), None);
-    assert_eq!(omp_reasoning_effort(Some("off")), None);
-    assert_eq!(omp_reasoning_effort(None), None);
+    assert_eq!(reasoning_effort_for_thinking(Some("dynamic")), None);
+    assert_eq!(reasoning_effort_for_thinking(Some("off")), None);
+    assert_eq!(reasoning_effort_for_thinking(None), None);
 }
 
 #[test]
@@ -671,6 +671,119 @@ fn load_provider_openai_compat_requires_model() {
         Err(InferError::MissingModel) => {}
         _ => panic!("expected missing model"),
     }
+}
+
+#[test]
+fn openai_compat_provider_follows_thinking_and_attempt_timeout() {
+    let build = |thinking: Option<&str>, attempt_timeout_secs: Option<u64>| {
+        openai_compat_provider(
+            Secret::new("test-key".to_owned()),
+            "http://127.0.0.1:9/v1".to_owned(),
+            "gpt-6-luna".to_owned(),
+            thinking,
+            attempt_timeout_secs,
+        )
+    };
+
+    let lifted = build(Some("max"), Some(400));
+    assert_eq!(lifted.reasoning_effort(), Some("max"));
+    assert_eq!(lifted.request_timeout_secs(), 410);
+
+    let default = build(None, None);
+    assert_eq!(default.reasoning_effort(), None);
+    assert_eq!(default.request_timeout_secs(), 120);
+    // A short attempt limit never lowers the request timeout.
+    assert_eq!(build(Some("low"), Some(30)).request_timeout_secs(), 120);
+}
+
+#[test]
+fn load_provider_openai_compat_sends_configured_thinking_as_reasoning_effort() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    ensure_workspace_config(workspace).expect("ensure config");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake endpoint");
+    let endpoint = format!("http://{}/v1", listener.local_addr().expect("local addr"));
+    let env_name = "AETHER_TEST_OPENAI_COMPAT_THINKING_KEY_ZZZZZ";
+    let _env = crate::env_vars::overrides::set(env_name, "test-key");
+    std::fs::write(
+        workspace.join(".aether/config.toml"),
+        format!(
+            "[inference]\nprovider = \"openai_compat\"\nmodel = \"gpt-6-luna\"\n\
+             endpoint = \"{endpoint}\"\napi_key_env = \"{env_name}\"\nthinking = \"max\"\n"
+        ),
+    )
+    .expect("write config");
+
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept request");
+        let body = read_http_request_body(&mut stream);
+        let sir = r#"{"intent":"Run the demo","inputs":[],"outputs":[],"side_effects":[],"dependencies":[],"error_modes":[],"confidence":0.9}"#;
+        let reply = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": sir}}]
+        })
+        .to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+            reply.len()
+        )
+        .expect("write response");
+        body
+    });
+
+    let loaded = load_provider_from_env_or_mock(workspace, ProviderOverrides::default())
+        .expect("openai_compat provider should load");
+    let context = crate::types::SirContext {
+        language: "rust".to_owned(),
+        file_path: "src/lib.rs".to_owned(),
+        qualified_name: "demo::run".to_owned(),
+        priority_score: None,
+        kind: "function".to_owned(),
+        is_public: false,
+        line_count: 1,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let sir = runtime
+        .block_on(loaded.provider.generate_sir("fn run() {}", &context))
+        .expect("generate sir");
+    assert_eq!(sir.intent, "Run the demo");
+
+    let body: serde_json::Value =
+        serde_json::from_slice(&server.join().expect("join fake endpoint")).expect("json body");
+    assert_eq!(body["model"], "gpt-6-luna");
+    assert_eq!(body["reasoning_effort"], "max");
+}
+
+/// Read one HTTP/1.1 request from `stream` and return its body.
+fn read_http_request_body(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let header_end = loop {
+        let read = stream.read(&mut buffer).expect("read request");
+        assert!(
+            read > 0,
+            "connection closed before the request headers ended"
+        );
+        request.extend_from_slice(&buffer[..read]);
+        if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
+    };
+    let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+    let content_length = headers
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length:"))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .expect("content-length header");
+    while request.len() < header_end + content_length {
+        let read = stream.read(&mut buffer).expect("read request body");
+        assert!(read > 0, "connection closed before the request body ended");
+        request.extend_from_slice(&buffer[..read]);
+    }
+    request[header_end..header_end + content_length].to_vec()
 }
 
 #[test]

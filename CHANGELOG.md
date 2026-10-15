@@ -55,6 +55,10 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `inference.provider = "openai_compat"` now sends `[inference] thinking` as
+  `reasoning_effort`, as `omp` already did. `[inference] timeout_secs` now lifts the
+  request timeout of `openai_compat` and `omp` as well as `qwen3_local`, so a model that
+  thinks for more than 120 seconds on one SIR is no longer cut off by the HTTP client.
 - Python call edges follow package re-exports and `src/` layouts: `from pkg import f`,
   where `pkg/__init__.py` re-exports `f` from a submodule, now reaches the defining
   module's symbol, and tests outside `src/` reach `src.pkg…` symbols. Targets Python could

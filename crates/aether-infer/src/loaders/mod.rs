@@ -12,7 +12,9 @@ use crate::embedding::Qwen3LocalEmbeddingProvider;
 use crate::embedding::candle::CandleEmbeddingProvider;
 use crate::embedding::gemini_native::GeminiNativeEmbeddingProvider;
 use crate::embedding::openai_compat::OpenAiCompatEmbeddingProvider;
-use crate::http::{is_ollama_reachable, is_ollama_reachable_blocking};
+use crate::http::{
+    DEFAULT_INFERENCE_REQUEST_TIMEOUT_SECS, is_ollama_reachable, is_ollama_reachable_blocking,
+};
 use crate::providers::gemini::{request_gemini_summary, resolve_gemini_model};
 use crate::providers::qwen_local::request_qwen_summary;
 use crate::providers::{
@@ -138,7 +140,13 @@ pub fn load_inference_provider_from_config(
                 .ok_or_else(|| InferError::MissingApiKey(selected_api_key_env.clone()))?;
             let api_base = selected_endpoint.ok_or(InferError::MissingEndpoint)?;
             let model = selected_model.ok_or(InferError::MissingModel)?;
-            let provider = OpenAiCompatProvider::new(Secret::new(api_key), api_base, model.clone());
+            let provider = openai_compat_provider(
+                Secret::new(api_key),
+                api_base,
+                model.clone(),
+                selected_thinking.as_deref(),
+                attempt_timeout_secs,
+            );
             Ok(LoadedProvider {
                 model_name: model,
                 provider: Box::new(provider),
@@ -151,6 +159,7 @@ pub fn load_inference_provider_from_config(
                 selected_endpoint,
                 selected_model,
                 selected_thinking,
+                attempt_timeout_secs,
             )?;
             Ok(LoadedProvider {
                 model_name: provider.model_name(),
@@ -179,6 +188,7 @@ fn build_omp_provider(
     endpoint: Option<String>,
     model: Option<String>,
     thinking: Option<String>,
+    attempt_timeout_secs: Option<u64>,
 ) -> Result<OpenAiCompatProvider, InferError> {
     let token = resolve_omp_gateway_token(api_key_env)?;
     let api_base =
@@ -199,21 +209,45 @@ fn build_omp_provider(
     tracing::info!(
         endpoint = %api_base,
         model = %model,
-        reasoning_effort = ?omp_reasoning_effort(thinking.as_deref()),
+        reasoning_effort = ?reasoning_effort_for_thinking(thinking.as_deref()),
         "omp provider selected (Oh My Pi auth gateway)"
     );
-    Ok(
-        OpenAiCompatProvider::new(Secret::new(token), api_base, model)
-            .with_provider_name(InferenceProviderKind::Omp.as_str())
-            .with_reasoning_effort(omp_reasoning_effort(thinking.as_deref())),
+    Ok(openai_compat_provider(
+        Secret::new(token),
+        api_base,
+        model,
+        thinking.as_deref(),
+        attempt_timeout_secs,
     )
+    .with_provider_name(InferenceProviderKind::Omp.as_str()))
 }
 
-/// Map `[inference].thinking` onto the gateway's `reasoning_effort` vocabulary.
+/// An OpenAI-compatible provider (`openai_compat`, or `omp` through its gateway) that sends
+/// `[inference] thinking` as `reasoning_effort`. Its requests may run as long as
+/// `[inference] timeout_secs` lets one attempt run, plus a margin so the attempt timeout
+/// fires first; it never lowers the default request timeout.
+fn openai_compat_provider(
+    api_key: Secret,
+    api_base: String,
+    model: String,
+    thinking: Option<&str>,
+    attempt_timeout_secs: Option<u64>,
+) -> OpenAiCompatProvider {
+    let provider = OpenAiCompatProvider::new(api_key, api_base, model)
+        .with_reasoning_effort(reasoning_effort_for_thinking(thinking));
+    match attempt_timeout_secs.map(|secs| secs.saturating_add(10)) {
+        Some(request_secs) if request_secs > DEFAULT_INFERENCE_REQUEST_TIMEOUT_SECS => {
+            provider.with_request_timeout_secs(request_secs)
+        }
+        _ => provider,
+    }
+}
+
+/// Map `[inference].thinking` onto the OpenAI `reasoning_effort` vocabulary.
 ///
-/// Unknown values (including `dynamic`, `off`, `none`) omit the field so the gateway applies
+/// Unknown values (including `dynamic`, `off`, `none`) omit the field so the endpoint applies
 /// the model's own default.
-fn omp_reasoning_effort(thinking: Option<&str>) -> Option<String> {
+fn reasoning_effort_for_thinking(thinking: Option<&str>) -> Option<String> {
     let value = thinking?.trim().to_ascii_lowercase();
     match value.as_str() {
         "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => Some(value),
@@ -404,6 +438,7 @@ pub async fn summarize_text_with_config(
                 selected_endpoint,
                 selected_model,
                 config.inference.thinking,
+                config.inference.timeout_secs,
             )?;
             let summary = provider.request_summary(system_prompt, user_prompt).await?;
             Ok(clean_summary(summary))
@@ -637,6 +672,7 @@ fn load_tiered_provider(
                 primary_endpoint,
                 primary_model,
                 selected_thinking,
+                None,
             )?;
             let model_name = provider.model_name();
             (
