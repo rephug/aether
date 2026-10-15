@@ -64,6 +64,11 @@ and this project follows [Semantic Versioning](https://semver.org/).
   File rollups of changed files are marked `stale` (or removed when no leaf SIR is
   left), and `--full` rebuilds stale and missing rollups. Pruning now runs before the
   graph sync, so stale ids are no longer written to the graph first.
+- The watching daemon catches edits made while it was stopped. Its startup syncs the
+  store like `--index-once` does: removed symbols are pruned, and changed ones are
+  marked stale. It then queues stale leaves alongside SIR-less ones, and rebuilds
+  outdated file rollups once the queue drains. `aetherd batch extract` and the
+  continuous monitor's structural refresh sync the same way.
 - `inference.provider = "openai_compat"` now sends `[inference] thinking` as
   `reasoning_effort`, as `omp` already did. `[inference] timeout_secs` now lifts the
   request timeout of `openai_compat` and `omp` as well as `qwen3_local`, so a model that

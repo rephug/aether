@@ -1,6 +1,6 @@
-//! Bringing the store in line with the structural snapshot of a one-shot index run.
-//! The store may have been indexed before the workspace changed, and nothing watched
-//! the change: symbols that no longer exist are pruned (or their SIR migrated to the
+//! Bringing the store in line with a structural snapshot taken without having watched
+//! the workspace change: a one-shot index run, or the daemon's startup. The store may
+//! have been indexed before the workspace changed, so symbols that no longer exist are pruned (or their SIR migrated to the
 //! symbol's new id), every SIR that describes a body its symbol no longer has is marked
 //! stale, and the rollups of the files that changed are flagged or removed.
 
@@ -107,36 +107,46 @@ where
     Ok(())
 }
 
-/// The files of `symbols_by_id` whose rollup a full run must rebuild after its scan:
-/// those whose rollup is not `fresh` (the snapshot sync flagged it, say), and those
-/// with leaf SIRs but no rollup at all. Files the scan regenerated a leaf of had their
-/// rollup rebuilt by it and are `fresh` again.
+/// The files of `symbols_by_id` whose rollup must be rebuilt (see `outdated_rollups`).
+/// A full run rebuilds them after its scan; the files the scan regenerated a leaf of
+/// had their rollup rebuilt by it and are `fresh` again.
 pub(super) fn files_with_outdated_rollups(
     store: &SqliteStore,
     symbols_by_id: &HashMap<String, Symbol>,
+) -> Result<BTreeMap<String, Language>> {
+    let files = symbols_by_id
+        .values()
+        .map(|symbol| (symbol.file_path.clone(), symbol.language))
+        .collect::<BTreeMap<_, _>>();
+    outdated_rollups(store, files)
+}
+
+/// The files among `files` whose rollup must be rebuilt: those whose rollup is not
+/// `fresh` (the snapshot sync flagged it, say), and those with leaf SIRs but no rollup
+/// at all.
+pub(super) fn outdated_rollups(
+    store: &SqliteStore,
+    files: BTreeMap<String, Language>,
 ) -> Result<BTreeMap<String, Language>> {
     let with_sir = store
         .list_symbol_ids_with_sir()
         .context("failed to list symbols with SIR")?
         .into_iter()
         .collect::<HashSet<_>>();
-    let mut files = BTreeMap::<String, (Language, bool)>::new();
-    for symbol in symbols_by_id.values() {
-        let entry = files
-            .entry(symbol.file_path.clone())
-            .or_insert((symbol.language, false));
-        entry.1 |= with_sir.contains(symbol.id.as_str());
-    }
 
     let mut outdated = BTreeMap::new();
-    for (file_path, (language, has_leaves)) in files {
+    for (file_path, language) in files {
         let rollup_id = synthetic_file_sir_id(language.as_str(), &file_path);
         let rollup = store
             .get_sir_meta(&rollup_id)
             .with_context(|| format!("failed to read the rollup of {file_path}"))?;
         let rebuild = match rollup {
             Some(meta) => !meta.sir_status.trim().eq_ignore_ascii_case("fresh"),
-            None => has_leaves,
+            None => store
+                .list_symbols_for_file(&file_path)
+                .with_context(|| format!("failed to list symbols for {file_path}"))?
+                .iter()
+                .any(|symbol| with_sir.contains(symbol.id.as_str())),
         };
         if rebuild {
             outdated.insert(file_path, language);
@@ -145,9 +155,10 @@ pub(super) fn files_with_outdated_rollups(
     Ok(outdated)
 }
 
-/// Vector cleanup for a run without a SIR pipeline (the structural `--index-once`): the
-/// configured vector store is opened only when there is something to delete, and the
-/// deletion holds each symbol's embedding lock as the pipeline's does.
+/// Vector cleanup for a sync without a SIR pipeline (the structural `--index-once`, the
+/// daemon's startup): the configured vector store is opened only when there is
+/// something to delete, and the deletion holds each symbol's embedding lock as the
+/// pipeline's does.
 pub(super) fn delete_vector_embeddings(workspace: &Path, symbol_ids: &[String]) -> Result<()> {
     if symbol_ids.is_empty() {
         return Ok(());
