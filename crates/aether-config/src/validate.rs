@@ -522,6 +522,7 @@ mod tests {
             storage: StorageConfig {
                 mirror_sir_files: true,
                 graph_backend: GraphBackend::Cozo,
+                graph_open_timeout_secs: None,
             },
             embeddings: EmbeddingsConfig {
                 enabled: false,

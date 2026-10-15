@@ -182,7 +182,10 @@ impl AetherMcpServer {
 
 pub async fn run_stdio_server(workspace: impl AsRef<Path>, verbose: bool) -> Result<()> {
     let server = AetherMcpServer::init(workspace, verbose).await?;
+    let state = Arc::clone(&server.state);
     let service = server.serve(stdio()).await?;
+    // Only after the handshake: a SurrealDB open can outlast a client's startup timeout.
+    state.warm_surreal_graph();
     service.waiting().await?;
     Ok(())
 }

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aether_config::{AetherConfig, EmbeddingVectorBackend, GraphBackend, load_workspace_config};
 use aether_health::ScoreReport;
@@ -76,7 +76,13 @@ impl SharedState {
             }
         }
 
-        let graph = Arc::new(SurrealGraphStore::open_readonly(&self.workspace).await?);
+        let graph = Arc::new(
+            SurrealGraphStore::open_with_timeout(
+                &self.workspace,
+                Duration::from_secs(crate::support::LAZY_GRAPH_OPEN_TIMEOUT_SECS),
+            )
+            .await?,
+        );
 
         let mut guard = self
             .surreal_graph
