@@ -635,3 +635,34 @@ async fn causal_fragment_contains_search_and_animate_button() {
     assert!(body.contains("id=\"causal-animate\""));
     assert!(body.contains("id=\"causal-graph\""));
 }
+
+#[tokio::test]
+async fn settings_inference_fragment_renders_tiered_defaults_when_unset() {
+    let (_tmp, app) = empty_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/settings/inference?provider=tiered")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    // With no [inference.tiered] stored, the form must still carry the tiered
+    // inputs (at their defaults) so saving does not read them as 0.0 / false.
+    assert!(body.contains("name=\"tiered.primary_threshold\" value=\"0.80\""));
+    let retry_input = body
+        .split("id=\"tiered.retry_with_fallback\"")
+        .nth(1)
+        .and_then(|rest| rest.split('>').next())
+        .unwrap_or_default();
+    assert!(retry_input.contains(" checked"), "{retry_input}");
+}
