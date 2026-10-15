@@ -65,7 +65,9 @@ use self::worker::{SharedQueueState, enqueue_symbols_needing_sir, spawn_semantic
 
 use self::quality::{run_deep_pass, run_triage_pass};
 use self::reconciliation::{plan_symbol_reconciliation, print_reconciliation_dry_run};
-use self::snapshot::{delete_vector_embeddings, files_with_outdated_rollups, sync_snapshot};
+use self::snapshot::{
+    delete_vector_embeddings, files_with_outdated_rollups, symbols_with_stale_source, sync_snapshot,
+};
 
 const REQUEST_POLL_BATCH: usize = 128;
 const WORKER_IDLE_SLEEP_MS: u64 = 200;
@@ -231,7 +233,8 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
 
         // A dry run writes nothing, so every id in the store predates the snapshot.
         let pre_existing_ids = store.list_all_symbol_ids()?.into_iter().collect();
-        let plan = plan_symbol_reconciliation(&store, &symbols_by_id, &pre_existing_ids)?;
+        let mut plan = plan_symbol_reconciliation(&store, &symbols_by_id, &pre_existing_ids)?;
+        plan.spare_unread_files(observer.unread_paths());
         let mut stdout = std::io::stdout();
         print_reconciliation_dry_run(&plan, &mut stdout)?;
         return Ok(());
@@ -248,6 +251,7 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
         &mut structural,
         &initial_events,
         &symbols_by_id,
+        observer.unread_paths(),
         |symbol_ids| sir_pipeline.delete_embeddings(symbol_ids),
     )?;
 
@@ -262,10 +266,10 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
     let candidate_symbol_ids = if config.force {
         store.list_all_symbol_ids()?
     } else {
-        // Symbols without a SIR, and symbols whose SIR is stale: written for a body the
-        // symbol no longer has (the snapshot sync marked it), or left by a failed attempt.
+        // Symbols without a SIR, and symbols whose SIR the snapshot sync marked stale
+        // because it was written for a body the symbol no longer has.
         let mut ids = store.list_symbol_ids_without_sir()?;
-        ids.extend(store.list_symbol_ids_with_stale_sir()?);
+        ids.extend(symbols_with_stale_source(&store, &symbols_by_id)?);
         ids.sort();
         ids.dedup();
         ids
@@ -449,6 +453,7 @@ fn run_initial_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> 
         &mut structural,
         &initial_events,
         &symbols_by_id,
+        observer.unread_paths(),
         |symbol_ids| delete_vector_embeddings(&config.workspace, symbol_ids),
     )?;
 
@@ -484,6 +489,7 @@ pub(crate) fn run_structural_index_once(
         &mut structural,
         &initial_events,
         &symbols_by_id,
+        observer.unread_paths(),
         |symbol_ids| delete_vector_embeddings(workspace, symbol_ids),
     )?;
     Ok((store, symbols_by_id, symbol_count))
@@ -661,8 +667,9 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
 /// and the queue the semantic workers start from. Nothing watched the workspace while
 /// the daemon was down, so the startup snapshot is synced as `--index-once` syncs it
 /// (removed symbols pruned, changed ones marked stale, changed files' rollups flagged).
-/// The queue holds every symbol without a SIR or with a stale one; the rollups still
-/// outdated after that are set aside for the workers to rebuild once it drains.
+/// The queue holds every symbol without a SIR, or with one written for a body it no
+/// longer has; the rollups still outdated after that are set aside for the workers to
+/// rebuild once it drains.
 fn start_from_snapshot(
     workspace: &Path,
     observer: &ObserverState,
@@ -676,6 +683,7 @@ fn start_from_snapshot(
         structural,
         &initial_events,
         &symbols_by_id,
+        observer.unread_paths(),
         |symbol_ids| delete_vector_embeddings(workspace, symbol_ids),
     )?;
     tracing::info!(
@@ -684,10 +692,9 @@ fn start_from_snapshot(
         symbol_count
     );
 
-    let initial_symbols = symbols_by_id.values().cloned().collect::<Vec<_>>();
     let outdated_rollups = files_with_outdated_rollups(store, &symbols_by_id)?;
-    let queue_state = SharedQueueState::new(symbols_by_id);
-    let queued = enqueue_symbols_needing_sir(workspace, store, &queue_state, &initial_symbols)?;
+    let queue_state = SharedQueueState::new(symbols_by_id.clone());
+    let queued = enqueue_symbols_needing_sir(workspace, store, &queue_state, &symbols_by_id)?;
     tracing::info!(
         queued,
         "Scan pass queued: {} symbols for SIR generation",

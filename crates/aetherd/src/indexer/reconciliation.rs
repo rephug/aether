@@ -44,6 +44,42 @@ impl ReconciliationPlan {
             .map(|entry| &entry.old_symbol)
             .chain(self.prunes.iter().map(|entry| &entry.symbol))
     }
+
+    /// The ids the plan prunes outright (a migration's old id keeps its SIR, under the
+    /// new id in the same file).
+    pub(super) fn pruned_ids(&self) -> HashSet<String> {
+        self.prunes
+            .iter()
+            .map(|entry| entry.symbol.id.clone())
+            .collect()
+    }
+
+    /// Drop the prunes of symbols in files the snapshot could not read (`unread_paths`:
+    /// files, or directories whose walk failed; `""` is the whole workspace). Missing from
+    /// the snapshot, those symbols would otherwise be pruned as deleted although their
+    /// files may hold them unchanged. Returns how many prunes were dropped.
+    pub(super) fn spare_unread_files(&mut self, unread_paths: &[String]) -> usize {
+        let unread = |file_path: &str| {
+            unread_paths.iter().any(|path| {
+                path.is_empty()
+                    || file_path == path
+                    || file_path
+                        .strip_prefix(path.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+        };
+        let before = self.prunes.len();
+        self.prunes.retain(|entry| !unread(&entry.symbol.file_path));
+        let spared = before - self.prunes.len();
+        if spared > 0 {
+            let removed = self
+                .removed_symbols()
+                .map(|symbol| symbol.id.clone())
+                .collect::<BTreeSet<_>>();
+            self.cleanup_ids.retain(|id| removed.contains(id));
+        }
+        spared
+    }
 }
 
 fn symbol_reconciliation_key(symbol: &Symbol) -> ReconciliationKey {
@@ -249,14 +285,19 @@ pub(super) fn print_reconciliation_dry_run(
     Ok(())
 }
 
-pub(super) fn execute_symbol_reconciliation<GraphCleanup, VectorCleanup>(
+/// Execute `plan`. `before_prune` runs under the same inject-lock hold as the SQLite
+/// reconciliation and right before it, for work that must be recorded before the prune
+/// commits (a run interrupted after the prune finds nothing left to plan next time).
+pub(super) fn execute_symbol_reconciliation<BeforePrune, GraphCleanup, VectorCleanup>(
     workspace: &Path,
     store: &SqliteStore,
     plan: &ReconciliationPlan,
+    before_prune: BeforePrune,
     graph_cleanup: GraphCleanup,
     vector_cleanup: VectorCleanup,
 ) -> Result<(usize, usize)>
 where
+    BeforePrune: FnOnce() -> Result<()>,
     GraphCleanup: FnOnce(&[String]) -> Result<()>,
     VectorCleanup: FnOnce(&[String]) -> Result<()>,
 {
@@ -280,6 +321,7 @@ where
     // injection and generated-SIR persist in the workspace for the cleanup's duration.
     let (migrated, pruned) = {
         let _inject_guard = acquire_inject_write_lock(workspace)?;
+        before_prune()?;
         store
             .reconcile_and_prune(&migrations, &prunes)
             .context("failed to reconcile stale symbols")?
@@ -478,9 +520,15 @@ mod tests {
         let symbols_by_id = HashMap::from_iter([(new_symbol.id.clone(), new_symbol.clone())]);
         let plan = plan_symbol_reconciliation(&store, &symbols_by_id, &HashSet::new())
             .expect("plan reconcile");
-        let (migrated, pruned) =
-            execute_symbol_reconciliation(temp.path(), &store, &plan, |_| Ok(()), |_| Ok(()))
-                .expect("execute reconcile");
+        let (migrated, pruned) = execute_symbol_reconciliation(
+            temp.path(),
+            &store,
+            &plan,
+            || Ok(()),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .expect("execute reconcile");
         assert_eq!((migrated, pruned), (1, 0));
 
         let (total_symbols, symbols_with_sir) = store
@@ -511,8 +559,15 @@ mod tests {
         let symbols_by_id = HashMap::from_iter([(new_symbol.id.clone(), new_symbol.clone())]);
         let first_plan = plan_symbol_reconciliation(&store, &symbols_by_id, &HashSet::new())
             .expect("first plan");
-        execute_symbol_reconciliation(temp.path(), &store, &first_plan, |_| Ok(()), |_| Ok(()))
-            .expect("first reconcile");
+        execute_symbol_reconciliation(
+            temp.path(),
+            &store,
+            &first_plan,
+            || Ok(()),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .expect("first reconcile");
 
         let second_plan = plan_symbol_reconciliation(&store, &symbols_by_id, &HashSet::new())
             .expect("second plan");
@@ -521,6 +576,7 @@ mod tests {
             temp.path(),
             &store,
             &second_plan,
+            || Ok(()),
             |_| Ok(()),
             |_| Ok(()),
         )
@@ -569,9 +625,15 @@ mod tests {
         assert_eq!(plan.prunes[0].symbol.id, removed.id);
         assert_eq!(plan.prunes[0].reason, RECONCILE_UNCHANGED_SIBLING_REASON);
 
-        let (migrated, pruned) =
-            execute_symbol_reconciliation(temp.path(), &store, &plan, |_| Ok(()), |_| Ok(()))
-                .expect("execute reconcile");
+        let (migrated, pruned) = execute_symbol_reconciliation(
+            temp.path(),
+            &store,
+            &plan,
+            || Ok(()),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .expect("execute reconcile");
         assert_eq!((migrated, pruned), (0, 1));
         assert_eq!(
             store

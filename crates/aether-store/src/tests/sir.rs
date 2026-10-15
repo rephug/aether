@@ -902,9 +902,16 @@ fn marking_stale_by_source_moves_only_fresh_leaves_whose_recorded_source_changed
         Some("source-old".to_owned()),
         "marking stale keeps the record of what the SIR describes"
     );
+    // The listing compares sources, whatever the status: the pending leaf's source
+    // changed too, the unknown one cannot be compared.
     assert_eq!(
-        store.list_symbol_ids_with_stale_sir().expect("list stale"),
-        vec!["sym-changed".to_owned()]
+        store
+            .list_sir_source_changes(&current)
+            .expect("list source changes"),
+        vec![
+            ("sym-changed".to_owned(), "stale".to_owned()),
+            ("sym-pending".to_owned(), "rollup_pending".to_owned()),
+        ]
     );
     assert!(
         store
@@ -912,6 +919,75 @@ fn marking_stale_by_source_moves_only_fresh_leaves_whose_recorded_source_changed
             .expect("mark again")
             .is_empty(),
         "an already stale leaf is not marked twice"
+    );
+}
+
+#[test]
+fn a_leaf_left_stale_by_a_failed_attempt_on_an_unchanged_body_is_no_source_change() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    store
+        .persist_sir_state_atomically_with_source(
+            SirMetaRecord {
+                id: "sym-failed".to_owned(),
+                generation_pass: "deep".to_owned(),
+                ..sir_meta_record()
+            },
+            r#"{"intent":"deep","confidence":0.9}"#,
+            None,
+            None,
+            Some("source-same"),
+        )
+        .expect("persist leaf");
+    let mut failed = store
+        .get_sir_meta("sym-failed")
+        .expect("meta")
+        .expect("exists");
+    failed.sir_status = "stale".to_owned();
+    failed.last_error = Some("provider timeout".to_owned());
+    store.upsert_sir_meta(failed).expect("record failure");
+
+    let current = [("sym-failed".to_owned(), "source-same".to_owned())];
+    assert!(
+        store
+            .list_sir_source_changes(&current)
+            .expect("list source changes")
+            .is_empty()
+    );
+}
+
+#[test]
+fn upsert_symbols_writes_every_row_and_updates_existing_ones() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    store.upsert_symbol(symbol_record()).expect("seed symbol");
+    store
+        .upsert_symbols(&[
+            SymbolRecord {
+                last_seen_at: 1_800_000_000,
+                ..symbol_record()
+            },
+            SymbolRecord {
+                id: "sym-batch".to_owned(),
+                qualified_name: "demo::batch".to_owned(),
+                ..symbol_record()
+            },
+        ])
+        .expect("upsert batch");
+
+    assert_eq!(
+        store
+            .get_symbol_record("sym-1")
+            .expect("read")
+            .expect("exists")
+            .last_seen_at,
+        1_800_000_000
+    );
+    assert!(
+        store
+            .get_symbol_record("sym-batch")
+            .expect("read")
+            .is_some()
     );
 }
 

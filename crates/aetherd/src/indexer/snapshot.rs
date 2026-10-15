@@ -1,8 +1,9 @@
 //! Bringing the store in line with a structural snapshot taken without having watched
 //! the workspace change: a one-shot index run, or the daemon's startup. The store may
-//! have been indexed before the workspace changed, so symbols that no longer exist are pruned (or their SIR migrated to the
-//! symbol's new id), every SIR that describes a body its symbol no longer has is marked
-//! stale, and the rollups of the files that changed are flagged or removed.
+//! have been indexed before the workspace changed, so symbols that no longer exist are
+//! pruned (or their SIR migrated to the symbol's new id), every SIR that describes a
+//! body its symbol no longer has is marked stale, and the rollups of the files that
+//! changed are flagged or removed.
 
 use aether_core::Language;
 use aether_store::open_vector_store;
@@ -10,26 +11,40 @@ use aether_store::open_vector_store;
 use super::reconciliation::{execute_symbol_reconciliation, plan_symbol_reconciliation};
 use super::structural::{StructuralIndexer, to_symbol_record};
 use super::*;
-use crate::sir_pipeline::{acquire_embed_write_locks, invalidate_file_rollups};
+use crate::sir_pipeline::{
+    acquire_embed_write_locks, invalidate_file_rollups, invalidate_file_rollups_locked,
+};
 
 /// Sync the store to `events`, the workspace's structural snapshot (`symbols_by_id` is
-/// the same snapshot keyed by id). `vector_cleanup` deletes the embeddings of pruned
-/// and migrated ids.
+/// the same snapshot keyed by id). `unread_paths` are the files and directories the
+/// snapshot could not read (see `ObserverState::unread_paths`): symbols stored for them
+/// are kept. `vector_cleanup` deletes the embeddings of pruned and migrated ids.
 ///
-/// The order matters. Every current symbol row is registered first, so reconciliation
-/// can migrate a re-identified symbol's SIR onto the row of its new id. Reconciliation
-/// then prunes the rows of symbols that are gone before the structural pass syncs each
-/// file to the graph: that sync writes the file's symbol rows as graph nodes and
-/// resolves edges against them by name, so a stale row still present would be written
-/// and resolved to, only for reconciliation to delete it afterwards. Staleness is
-/// decided last, against the rows as reconciliation left them, so a SIR migrated onto
-/// a new id is compared with the new body too.
+/// The order matters, and every step is recorded before the next one can lose track of
+/// it, so a run interrupted anywhere (a cancelled index, an error in the structural
+/// pass) leaves nothing the next run cannot find again:
+///
+/// 1. Everything that changed is found while the store still shows it: the symbols to
+///    prune or migrate, the symbols that are new, and the leaves whose recorded source
+///    differs from the current body.
+/// 2. Every current symbol row is registered, so reconciliation can migrate a
+///    re-identified symbol's SIR onto the row of its new id.
+/// 3. The rollups of the changed files are flagged (or removed, for a file about to lose
+///    its last leaf) in the same inject-lock hold as the prune and before it commits: a
+///    run that stopped after the prune would find nothing left to prune next time, and
+///    would never revisit those files.
+/// 4. Leaves whose source changed are marked stale, migrated ones included (their
+///    recorded hash is the old body's). Stopped before this, they are still `fresh` with
+///    an outdated source hash, which step 1 finds again.
+/// 5. The structural pass syncs each file's edges and graph nodes last, after the prune,
+///    so ids about to be pruned are never written to the graph or resolved to.
 pub(super) fn sync_snapshot<VectorCleanup>(
     workspace: &Path,
     store: &SqliteStore,
     structural: &mut StructuralIndexer,
     events: &[SymbolChangeEvent],
     symbols_by_id: &HashMap<String, Symbol>,
+    unread_paths: &[String],
     vector_cleanup: VectorCleanup,
 ) -> Result<()>
 where
@@ -43,41 +58,72 @@ where
         .context("failed to list indexed symbols before the snapshot sync")?
         .into_iter()
         .collect::<HashSet<_>>();
+    let current = current_sources(symbols_by_id);
 
-    let now_ts = unix_timestamp_secs();
-    for symbol in symbols_by_id.values() {
-        store
-            .upsert_symbol(to_symbol_record(symbol, now_ts))
-            .with_context(|| format!("failed to upsert symbol {}", symbol.id))?;
+    let mut plan = plan_symbol_reconciliation(store, symbols_by_id, &pre_existing_ids)?;
+    let spared = plan.spare_unread_files(unread_paths);
+    if spared > 0 {
+        tracing::warn!(
+            spared,
+            "Kept {spared} stored symbols of files the snapshot could not read"
+        );
     }
-
-    let plan = plan_symbol_reconciliation(store, symbols_by_id, &pre_existing_ids)?;
+    let changed_sources = store
+        .list_sir_source_changes(&current)
+        .context("failed to compare stored SIR sources with the snapshot")?
+        .into_iter()
+        .map(|(symbol_id, _)| symbol_id)
+        .collect::<HashSet<_>>();
     // File path to language name, for the rollup ids of the files that changed.
     let mut changed_files = plan
         .removed_symbols()
         .map(|symbol| (symbol.file_path.clone(), symbol.language.clone()))
         .collect::<BTreeMap<_, _>>();
+    for symbol in symbols_by_id.values() {
+        if !pre_existing_ids.contains(symbol.id.as_str())
+            || changed_sources.contains(symbol.id.as_str())
+        {
+            changed_files
+                .entry(symbol.file_path.clone())
+                .or_insert_with(|| symbol.language.as_str().to_owned());
+        }
+    }
+    let pruned_ids = plan.pruned_ids();
+
+    let now_ts = unix_timestamp_secs();
+    let records = symbols_by_id
+        .values()
+        .map(|symbol| to_symbol_record(symbol, now_ts))
+        .collect::<Vec<_>>();
+    store
+        .upsert_symbols(&records)
+        .context("failed to register the snapshot's symbols")?;
+
     execute_symbol_reconciliation(
         workspace,
         store,
         &plan,
+        || {
+            let (flagged, removed) =
+                invalidate_file_rollups_locked(store, &changed_files, &pruned_ids)
+                    .context("failed to invalidate the rollups of changed files")?;
+            if flagged + removed > 0 {
+                tracing::info!(
+                    changed_files = changed_files.len(),
+                    flagged,
+                    removed,
+                    "Invalidated file rollups of changed files: {flagged} marked stale, {removed} removed"
+                );
+            }
+            Ok(())
+        },
         |symbol_ids| structural.delete_symbols_batch(symbol_ids),
         vector_cleanup,
     )?;
 
-    for event in events {
-        structural.process_event(store, event)?;
-    }
-
-    let current_sources = symbols_by_id
-        .values()
-        .map(|symbol| (symbol.id.clone(), symbol.content_hash.clone()))
-        .collect::<Vec<_>>();
     let stale_ids = store
-        .mark_sir_stale_for_changed_sources(&current_sources)
-        .context("failed to mark the SIR of changed symbols stale")?
-        .into_iter()
-        .collect::<HashSet<_>>();
+        .mark_sir_stale_for_changed_sources(&current)
+        .context("failed to mark the SIR of changed symbols stale")?;
     if !stale_ids.is_empty() {
         tracing::info!(
             stale = stale_ids.len(),
@@ -85,26 +131,53 @@ where
             stale_ids.len()
         );
     }
-
-    for symbol in symbols_by_id.values() {
-        if !pre_existing_ids.contains(symbol.id.as_str()) || stale_ids.contains(&symbol.id) {
-            changed_files
-                .entry(symbol.file_path.clone())
-                .or_insert_with(|| symbol.language.as_str().to_owned());
-        }
-    }
-    let (flagged, removed) = invalidate_file_rollups(workspace, store, &changed_files)
+    // Only a leaf another writer replaced since step 1 can be marked without its file
+    // being among the changed ones (a migrated leaf stays in its file); flag those too.
+    let late_files = stale_ids
+        .iter()
+        .filter_map(|symbol_id| symbols_by_id.get(symbol_id))
+        .filter(|symbol| !changed_files.contains_key(&symbol.file_path))
+        .map(|symbol| {
+            (
+                symbol.file_path.clone(),
+                symbol.language.as_str().to_owned(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    invalidate_file_rollups(workspace, store, &late_files)
         .context("failed to invalidate the rollups of changed files")?;
-    if flagged + removed > 0 {
-        tracing::info!(
-            changed_files = changed_files.len(),
-            flagged,
-            removed,
-            "Invalidated file rollups of changed files: {flagged} marked stale, {removed} removed"
-        );
+
+    for event in events {
+        structural.process_event(store, event)?;
     }
 
     Ok(())
+}
+
+/// Each symbol of the snapshot with the content hash of its body as parsed now.
+fn current_sources(symbols_by_id: &HashMap<String, Symbol>) -> Vec<(String, String)> {
+    symbols_by_id
+        .values()
+        .map(|symbol| (symbol.id.clone(), symbol.content_hash.clone()))
+        .collect()
+}
+
+/// The symbols of `symbols_by_id` whose SIR must be regenerated although they have one:
+/// those marked `stale` because their body changed since it was written. A leaf left
+/// `stale` by a failed attempt on an unchanged body is not among them: regenerating it
+/// at scan level would overwrite a better SIR (an injected or deep one) and spend a call
+/// on every run while its own pass keeps failing.
+pub(super) fn symbols_with_stale_source(
+    store: &SqliteStore,
+    symbols_by_id: &HashMap<String, Symbol>,
+) -> Result<Vec<String>> {
+    Ok(store
+        .list_sir_source_changes(&current_sources(symbols_by_id))
+        .context("failed to list leaves whose source changed")?
+        .into_iter()
+        .filter(|(_, status)| status == "stale")
+        .map(|(symbol_id, _)| symbol_id)
+        .collect())
 }
 
 /// The files of `symbols_by_id` whose rollup must be rebuilt (see `outdated_rollups`).

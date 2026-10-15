@@ -1,6 +1,8 @@
 //! File-level rollup SIRs: computed from the leaf SIRs under the inject lock and
 //! persisted only while those leaves are unchanged.
 
+use std::collections::HashSet;
+
 use super::*;
 
 impl SirPipeline {
@@ -370,8 +372,8 @@ impl SirPipeline {
 /// in a run that does not rebuild those rollups itself: a rollup whose file has no leaf
 /// SIR left is removed, any other is marked `stale`, so a reader can tell it describes
 /// the file as it was and the next full run rebuilds it. Files without a rollup are
-/// skipped. Runs under the workspace inject lock, like every rollup write, so a rollup
-/// an injection is rebuilding is never removed underneath it. Returns how many rollups
+/// skipped. Takes the workspace inject lock, like every rollup write, so a rollup an
+/// injection is rebuilding is never removed underneath it. Returns how many rollups
 /// were marked stale and how many were removed.
 pub(crate) fn invalidate_file_rollups(
     workspace_root: &Path,
@@ -381,8 +383,18 @@ pub(crate) fn invalidate_file_rollups(
     if files.is_empty() {
         return Ok((0, 0));
     }
-
     let _inject_guard = acquire_inject_write_lock(workspace_root)?;
+    invalidate_file_rollups_locked(store, files, &HashSet::new())
+}
+
+/// `invalidate_file_rollups` for a caller that holds the inject lock, ahead of a prune
+/// of `pruned_ids`: their leaves do not count as left in their files, so the rollup of a
+/// file that is about to lose its last leaf is removed rather than flagged.
+pub(crate) fn invalidate_file_rollups_locked(
+    store: &SqliteStore,
+    files: &BTreeMap<String, String>,
+    pruned_ids: &HashSet<String>,
+) -> Result<(usize, usize)> {
     let mut outdated = Vec::new();
     let mut removed = 0usize;
     for (file_path, language) in files {
@@ -394,7 +406,7 @@ pub(crate) fn invalidate_file_rollups(
         {
             continue;
         }
-        if load_file_leaf_sirs(store, file_path)?.is_empty() {
+        if load_file_leaf_sirs_excluding(store, file_path, pruned_ids)?.is_empty() {
             store
                 .mark_removed(&rollup_id)
                 .with_context(|| format!("failed to remove stale file rollup {rollup_id}"))?;
@@ -424,12 +436,24 @@ pub(super) fn load_file_leaf_sirs(
     store: &SqliteStore,
     file_path: &str,
 ) -> Result<Vec<FileLeafSir>> {
+    load_file_leaf_sirs_excluding(store, file_path, &HashSet::new())
+}
+
+/// `load_file_leaf_sirs` without the leaves of `excluded` symbols.
+fn load_file_leaf_sirs_excluding(
+    store: &SqliteStore,
+    file_path: &str,
+    excluded: &HashSet<String>,
+) -> Result<Vec<FileLeafSir>> {
     let symbols = store
         .list_symbols_for_file(file_path)
         .with_context(|| format!("failed to list symbols for file {file_path}"))?;
     let mut leaf_sirs = Vec::new();
 
     for symbol in symbols {
+        if excluded.contains(symbol.id.as_str()) {
+            continue;
+        }
         let Some(blob) = store
             .read_sir_blob(&symbol.id)
             .with_context(|| format!("failed to read SIR blob for symbol {}", symbol.id))?

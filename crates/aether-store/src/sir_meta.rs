@@ -692,21 +692,50 @@ impl SqliteStore {
         Ok(marked)
     }
 
-    /// Ids of indexed symbols whose leaf SIR is marked `stale`: its source changed since
-    /// it was written, or the last attempt to regenerate it failed.
-    pub fn list_symbol_ids_with_stale_sir(&self) -> Result<Vec<String>, StoreError> {
+    /// The leaves among `current` (each symbol id with the content hash of its body as
+    /// parsed now) whose recorded source hash differs from the current one, each with its
+    /// `sir_status`, sorted by id. A leaf that never recorded its source is not listed: it
+    /// cannot be compared. Unlike the status alone, this tells a leaf written for an older
+    /// body from one left `stale` by a failed attempt to regenerate an unchanged body.
+    pub fn list_sir_source_changes(
+        &self,
+        current: &[(String, String)],
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        if current.is_empty() {
+            return Ok(Vec::new());
+        }
+        let current = current
+            .iter()
+            .map(|(symbol_id, source_hash)| (symbol_id.trim(), source_hash.trim()))
+            .collect::<HashMap<_, _>>();
+
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"
-            SELECT s.id
-            FROM symbols s
-            JOIN sir r ON r.id = s.id
-            WHERE LOWER(TRIM(r.sir_status)) = 'stale'
-            ORDER BY s.id ASC
+            SELECT id, source_hash, sir_status
+            FROM sir
+            WHERE COALESCE(TRIM(source_hash), '') <> ''
+            ORDER BY id ASC
             "#,
         )?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            ))
+        })?;
+        let mut changed = Vec::new();
+        for row in rows {
+            let (symbol_id, recorded, status) = row?;
+            if current
+                .get(symbol_id.as_str())
+                .is_some_and(|source_hash| *source_hash != recorded.trim())
+            {
+                changed.push((symbol_id, status.trim().to_ascii_lowercase()));
+            }
+        }
+        Ok(changed)
     }
 
     pub(crate) fn store_get_sir_meta(

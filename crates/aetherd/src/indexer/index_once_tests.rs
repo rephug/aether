@@ -7,13 +7,15 @@ use std::fs;
 use std::path::Path;
 
 use aether_config::InferenceProviderKind;
-use aether_core::Symbol;
+use aether_core::{Language, Symbol, SymbolChangeEvent};
 use aether_parse::SymbolExtractor;
 use aether_sir::{FileSir, synthetic_file_sir_id};
 use aether_store::{SirStateStore, SqliteStore, SymbolCatalogStore};
 use tempfile::tempdir;
 
-use super::{IndexerConfig, run_initial_index_once};
+use super::snapshot::sync_snapshot;
+use super::structural::StructuralIndexer;
+use super::{IndexerConfig, ObserverState, collect_initial_snapshot, run_initial_index_once};
 
 pub(super) const MODULE: &str = "pkg/mod.py";
 pub(super) const GONE: &str = "pkg/gone.py";
@@ -404,4 +406,116 @@ fn full_index_once_rebuilds_a_missing_rollup() {
         rollup(&store, MODULE).expect("rebuilt rollup").symbol_count,
         3
     );
+}
+
+fn rollup_status(store: &SqliteStore, file_path: &str) -> Option<String> {
+    store
+        .get_sir_meta(&rollup_id(file_path))
+        .expect("read rollup meta")
+        .map(|meta| meta.sir_status)
+}
+
+#[test]
+fn rollups_of_pruned_files_stay_invalidated_when_the_structural_pass_fails() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    write_workspace(workspace);
+    index_once(workspace, true);
+    let removed = named(&parse(workspace, MODULE), "removed");
+
+    fs::write(workspace.join(MODULE), MODULE_WITHOUT_REMOVED).expect("remove a function");
+    fs::remove_file(workspace.join(GONE)).expect("delete second module");
+    let mut observer = ObserverState::new(workspace.to_path_buf()).expect("observer");
+    observer.seed_from_disk().expect("seed observer");
+    let (mut events, symbols_by_id, _) = collect_initial_snapshot(&observer);
+    // The structural pass fails after the prune has committed (as a cancelled run
+    // stops): `pkg` is a directory, which the pass cannot read as source.
+    events.push(SymbolChangeEvent {
+        file_path: "pkg".to_owned(),
+        language: Language::Python,
+        added: Vec::new(),
+        removed: Vec::new(),
+        updated: Vec::new(),
+    });
+    let store = SqliteStore::open(workspace).expect("open store");
+    let mut structural = StructuralIndexer::new(workspace.to_path_buf()).expect("structural");
+    let synced = sync_snapshot(
+        workspace,
+        &store,
+        &mut structural,
+        &events,
+        &symbols_by_id,
+        &[],
+        |_| Ok(()),
+    );
+    assert!(synced.is_err(), "the structural pass must fail");
+    assert!(leaf(&store, &removed.id).is_none(), "the prune committed");
+    assert_eq!(rollup_status(&store, MODULE).as_deref(), Some("stale"));
+    assert_eq!(rollup_status(&store, GONE), None);
+    drop(store);
+
+    // The next run finds nothing left to prune, and must not need to.
+    index_once(workspace, false);
+    let store = SqliteStore::open(workspace).expect("open store");
+    assert_eq!(rollup_status(&store, MODULE).as_deref(), Some("stale"));
+    assert_eq!(rollup_status(&store, GONE), None);
+}
+
+#[test]
+fn full_index_once_leaves_a_leaf_that_failed_on_an_unchanged_body_alone() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    write_workspace(workspace);
+    index_once(workspace, true);
+    let keep = named(&parse(workspace, MODULE), "keep");
+    {
+        // A deep SIR whose last regeneration failed: `stale`, the body unchanged.
+        let store = SqliteStore::open(workspace).expect("open store");
+        let mut meta = store
+            .get_sir_meta(&keep.id)
+            .expect("meta")
+            .expect("keep SIR");
+        meta.sir_status = "stale".to_owned();
+        meta.generation_pass = "deep".to_owned();
+        meta.last_error = Some("provider timeout".to_owned());
+        store.upsert_sir_meta(meta).expect("record the failure");
+    }
+
+    index_once(workspace, true);
+
+    let store = SqliteStore::open(workspace).expect("open store");
+    let meta = store
+        .get_sir_meta(&keep.id)
+        .expect("meta")
+        .expect("keep SIR");
+    assert_eq!(
+        meta.generation_pass, "deep",
+        "a scan pass must not overwrite the deep SIR of an unchanged body"
+    );
+    assert_eq!(meta.sir_status, "stale");
+}
+
+#[test]
+fn index_once_keeps_the_symbols_of_a_file_it_could_not_read() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    write_workspace(workspace);
+    index_once(workspace, true);
+    let vanish = named(&parse(workspace, GONE), "vanish");
+
+    // Still there, but no longer readable as text.
+    let mut bytes = GONE_V1.as_bytes().to_vec();
+    bytes.extend_from_slice(b"# \xff\n");
+    fs::write(workspace.join(GONE), bytes).expect("corrupt second module");
+
+    for full in [false, true] {
+        index_once(workspace, full);
+        let store = SqliteStore::open(workspace).expect("open store");
+        assert!(
+            stored_symbol_ids(&store).contains(&vanish.id),
+            "a symbol of an unreadable file must not be pruned (full: {full})"
+        );
+        assert!(leaf(&store, &vanish.id).is_some());
+        assert!(rollup(&store, GONE).is_some());
+    }
 }

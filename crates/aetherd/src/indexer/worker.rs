@@ -4,7 +4,7 @@
 
 use aether_core::Language;
 
-use super::snapshot::outdated_rollups;
+use super::snapshot::{outdated_rollups, symbols_with_stale_source};
 use super::*;
 
 #[derive(Clone)]
@@ -344,32 +344,28 @@ pub(super) fn refresh_pending_rollups(
 }
 
 /// Queue the symbols of `symbols` that need a SIR: those without one, and those whose
-/// SIR is stale (written for a body they no longer have, or left by a failed attempt).
+/// SIR is stale because it was written for a body they no longer have (see
+/// `snapshot::symbols_with_stale_source`; a leaf left stale by a failed attempt on an
+/// unchanged body keeps its SIR).
 pub(super) fn enqueue_symbols_needing_sir(
     workspace: &Path,
     store: &SqliteStore,
     queue_state: &SharedQueueState,
-    symbols: &[Symbol],
+    symbols_by_id: &HashMap<String, Symbol>,
 ) -> Result<usize> {
     let mut missing = store.list_symbol_ids_without_sir()?;
-    missing.extend(store.list_symbol_ids_with_stale_sir()?);
+    missing.extend(symbols_with_stale_source(store, symbols_by_id)?);
     missing.sort();
     missing.dedup();
     if missing.is_empty() {
         return Ok(0);
     }
 
-    let by_id = symbols
+    let missing_symbols = missing
         .iter()
+        .filter_map(|symbol_id| symbols_by_id.get(symbol_id))
         .cloned()
-        .map(|symbol| (symbol.id.clone(), symbol))
-        .collect::<HashMap<_, _>>();
-    let mut missing_symbols = Vec::new();
-    for symbol_id in missing {
-        if let Some(symbol) = by_id.get(&symbol_id) {
-            missing_symbols.push(symbol.clone());
-        }
-    }
+        .collect::<Vec<_>>();
     enqueue_changed_symbols(workspace, store, queue_state, &missing_symbols)
 }
 

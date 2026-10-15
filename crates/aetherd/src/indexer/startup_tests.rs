@@ -40,6 +40,18 @@ fn daemon_startup_queues_symbols_edited_while_it_was_down() {
     index_once(workspace, true);
     let keep = named(&parse(workspace, MODULE), "keep");
     let vanished = named(&parse(workspace, GONE), "vanish");
+    {
+        // `keep` is unchanged but its last regeneration failed: it stays `stale` and
+        // keeps its SIR rather than being queued for a scan-level replacement.
+        let store = SqliteStore::open(workspace).expect("open store");
+        let mut meta = store
+            .get_sir_meta(&keep.id)
+            .expect("meta")
+            .expect("keep SIR");
+        meta.sir_status = "stale".to_owned();
+        meta.last_error = Some("provider timeout".to_owned());
+        store.upsert_sir_meta(meta).expect("record the failure");
+    }
 
     fs::write(workspace.join(MODULE), MODULE_BODY_EDIT).expect("edit body");
     fs::remove_file(workspace.join(GONE)).expect("delete second module");
@@ -54,7 +66,7 @@ fn daemon_startup_queues_symbols_edited_while_it_was_down() {
     );
     assert!(
         !queue.contains(&keep.id),
-        "an unchanged symbol is not queued"
+        "an unchanged symbol is not queued, even one a failed attempt left stale"
     );
     drop(queue);
     assert_eq!(leaf(&store, &edited.id).expect("SIR").status, "stale");
