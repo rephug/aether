@@ -120,24 +120,14 @@ impl SqliteStore {
     }
 
     /// List a symbol's contracts ordered by id, optionally including
-    /// deactivated rows.
+    /// deactivated rows. Same as [`Self::list_contracts_for_symbol`], which
+    /// keeps the active-only case on the partial index.
     pub fn list_intent_contracts_for_symbol(
         &self,
         symbol_id: &str,
         include_inactive: bool,
     ) -> Result<Vec<IntentContractRecord>, StoreError> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT id, symbol_id, clause_type, clause_text, clause_embedding_json,
-                   created_at, created_by, active, violation_streak
-            FROM intent_contracts
-            WHERE symbol_id = ?1 AND (?2 = 1 OR active = 1)
-            ORDER BY id
-            "#,
-        )?;
-        let rows = stmt.query_map(params![symbol_id, include_inactive], map_contract_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        self.list_contracts_for_symbol(symbol_id, include_inactive)
     }
 
     pub fn list_all_active_contracts(&self) -> Result<Vec<IntentContractRecord>, StoreError> {
