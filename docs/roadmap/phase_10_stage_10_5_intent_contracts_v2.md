@@ -118,6 +118,24 @@ Analyze SIR history to detect stable semantic properties:
 
 **Deferred to 10.5b:** Build explicit contracts first. Add implicit inference once enough SIR history exists and the explicit contract pipeline is proven stable.
 
+##### Implementation notes
+
+Built as `aetherd contract infer <symbol> [--dry-run] [--eps X]` (code in `crates/aetherd/src/contracts/infer/`). It needs no schema change.
+
+- **Opt-in.** The command refuses to run unless `[contracts] implicit_inference_enabled = true`, and it checks this before the store is opened. It does not require `[contracts] enabled`. When verification is off, the output notes that inferred contracts are stored but not verified. The config keys are normalized: `implicit_min_versions` 0 maps to 10, other values are clamped to 3–50, and `implicit_persistence_threshold` is clamped to 0.5–1.0.
+- **History.** Reads `sir_history` through `SirHistoryStore::list_sir_history`. Rows are parsed leniently as JSON values, not as full `SirAnnotation`. Mock rows and rows without an `intent` are skipped. Consecutive versions with identical claim sets are collapsed, keeping the newest. At most the newest `min(2 × implicit_min_versions, 50)` versions are considered. If the newest row is a mock, or fewer than `implicit_min_versions` usable versions remain, the command explains this and exits without loading an embedding provider.
+- **Claims.** Sentences come from `intent`, `behavior`, `error_modes`, `side_effects` and `edge_cases`, in that order. `inputs`, `outputs` and `dependencies` are excluded. Sentence splitting is hand-written and keeps decimals, paths and common abbreviations together. Fragments under three words, placeholders ("None", "N/A", "No side effects") and duplicates within a version are dropped. Each version keeps at most 40 claims.
+- **Embedding.** All unique claim texts, plus the texts of the symbol's existing contracts, go to the configured embedding provider in one embedding pass with document purpose. That is up to window × 40 claim texts plus the clause texts. The provider decides the request count: Gemini sends requests of up to 100 texts, while `openai_compat` and `qwen3_local` send one request per text. `--dry-run` makes the same calls and only skips the writes; the command prints the number of texts before it calls the provider. Vectors are validated: one per text, one shared dimension, finite values. A failed or malformed embed writes nothing.
+- **Clustering.** DBSCAN on cosine distance with eps = 0.12 (similarity ≥ 0.88) by default; `--eps` overrides it within (0, 0.5]. Points are claim instances (one claim in one version). `required = max(2, ceil(threshold × V))`, where V is the number of considered versions. A point is core when its eps-neighborhood spans at least `max(2, ceil(required / 2))` distinct versions, so one verbose version cannot form a cluster on its own. Before clustering, an anisotropy guard aborts when at least 10 distinct within-version claim pairs exist and more than half of them fall within eps. That pattern means the provider's similarity floor is too high for this eps.
+- **Promotion.** The medoid is the member closest to a version-balanced centroid. Ties go to the newer version, then the shorter text. A cluster is promoted only if all of these hold:
+  - it covers at least `required` versions;
+  - the medoid's own eps-neighborhood spans at least `required` versions, which rejects chained clusters;
+  - the newest considered version still states the claim;
+  - the claim would not already fail verification against the symbol's current SIR embedding, read from the configured vector store (LanceDB or SQLite) under the provider and model recorded with it, as the SIR pipeline reads it. Without a stored vector of the same dimension the guard is skipped and the output says so.
+
+  Candidates are then deduplicated against every existing contract for the symbol, active or inactive, by normalized text and by embedding distance. They are also deduplicated against each other, and at most 5 are created per run. The medoid sentence is stored verbatim as a `must` clause with `created_by = "inferred"` and its embedding, using an insert-if-absent statement, so re-runs are idempotent. Removed inferred contracts are never re-created. `contract list` tags these clauses `[inferred]`.
+- **Tuning.** The output lists each cluster's decision with coverage, support and cohesion. For clusters that fail the support check it also prints the `--eps` value that would have passed. Provenance (coverage, support, eps) is printed but not persisted.
+
 #### Cross-symbol contract propagation — semantic foreign keys (Deep Think finding B3)
 
 When symbol A has a contract and calls symbol B, inject the contract context into B's SIR generation prompt:

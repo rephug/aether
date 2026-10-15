@@ -88,11 +88,15 @@ pub(crate) async fn presets_fragment(State(state): State<Arc<DashboardState>>) -
                                     "Use preset"
                                 }
                                 @if !preset.is_builtin {
+                                    // hx-confirm only applies to htmx-issued requests, so this
+                                    // plain fetch asks via confirm(). The prompt text is read from
+                                    // a data attribute so it is never quoted into JS; the URL
+                                    // segment is percent-encoded.
                                     button
                                         class="text-xs text-red-500 hover:underline"
-                                        hx-confirm=(format!("Delete preset '{}'?", preset.name))
+                                        data-confirm=(format!("Delete preset '{}'?", preset.name))
                                         onclick=(format!(
-                                            "fetch('/api/v1/presets/{}', {{method:'DELETE'}}).then(function(){{htmx.ajax('GET','/dashboard/frag/presets','#main-content')}})",
+                                            "if(!confirm(this.dataset.confirm))return;fetch('/api/v1/presets/{}', {{method:'DELETE'}}).then(function(){{htmx.ajax('GET','/dashboard/frag/presets','#main-content')}})",
                                             support::percent_encode(&preset.name)
                                         )) {
                                         "Delete"

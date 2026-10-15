@@ -1,3 +1,4 @@
+import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 
@@ -138,7 +139,14 @@ async function getEnhancementResult(
   deps: EnhancePromptDependencies
 ): Promise<EnhanceResult> {
   try {
-    return await requestEnhancementFromDaemon(promptText, port, budget, rewrite, token);
+    return await requestEnhancementFromDaemon(
+      promptText,
+      workspacePath,
+      port,
+      budget,
+      rewrite,
+      token
+    );
   } catch (error) {
     if (isCancelledError(error)) {
       throw error;
@@ -160,6 +168,7 @@ async function getEnhancementResult(
 
 async function requestEnhancementFromDaemon(
   promptText: string,
+  workspacePath: string,
   port: number,
   budget: number,
   rewrite: boolean,
@@ -178,6 +187,10 @@ async function requestEnhancementFromDaemon(
   }, ENHANCE_TIMEOUT_MS);
 
   try {
+    // The daemon enhances against its own workspace, so only use it when it
+    // serves the folder open in this window.
+    await ensureDaemonServesWorkspace(port, workspacePath, controller.signal);
+
     const response = await fetch(`http://127.0.0.1:${port}/api/enhance`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -206,6 +219,37 @@ async function requestEnhancementFromDaemon(
   } finally {
     clearTimeout(timeout);
     cancelDisposable.dispose();
+  }
+}
+
+async function ensureDaemonServesWorkspace(
+  port: number,
+  workspacePath: string,
+  signal: AbortSignal
+): Promise<void> {
+  const response = await fetch(`http://127.0.0.1:${port}/api/v1/daemon-status`, { signal });
+  const body = await response.text();
+  if (!response.ok) {
+    throw new Error(parseErrorBody(body, `daemon status returned ${response.status}`));
+  }
+
+  let status: { workspace?: unknown } | null = null;
+  try {
+    status = JSON.parse(body) as { workspace?: unknown } | null;
+  } catch {
+    // handled below
+  }
+  const remoteWorkspace = status?.workspace;
+  if (typeof remoteWorkspace !== 'string' || remoteWorkspace.length === 0) {
+    throw new Error('daemon status did not report a workspace');
+  }
+
+  const local = await fs.promises.realpath(workspacePath);
+  const remote = await fs.promises.realpath(remoteWorkspace).catch(() => undefined);
+  if (remote !== local) {
+    throw new Error(
+      `daemon is serving a different workspace: local=${local} remote=${remoteWorkspace}`
+    );
   }
 }
 

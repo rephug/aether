@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
@@ -105,8 +106,10 @@ pub(crate) async fn fingerprint_history_handler(
     let symbol_id = match query.symbol_id {
         Some(id) if !id.trim().is_empty() => id,
         _ => {
-            return support::json_internal_error(
-                "symbol_id query parameter is required".to_owned(),
+            return support::json_error(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "symbol_id query parameter is required",
             );
         }
     };

@@ -176,6 +176,9 @@ pub struct CommunitiesResult {
 pub struct DriftAnalyzer {
     workspace: PathBuf,
     config: DriftConfig,
+    /// `planner.community_resolution`: the γ of the global Louvain run behind boundary
+    /// violations, the same one the file-scoped planner uses.
+    community_resolution: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +204,7 @@ impl DriftAnalyzer {
         Ok(Self {
             workspace,
             config: config.drift,
+            community_resolution: config.planner.community_resolution,
         })
     }
 
@@ -856,7 +860,13 @@ impl DriftAnalyzer {
         window: &ResolvedWindow,
         detected_at: i64,
     ) -> Result<BoundaryComputation, AnalysisError> {
-        let assignments = block_on_store_future(graph.list_louvain_communities())??;
+        // Test symbols are left out so files are judged by how production code clusters,
+        // and the snapshot stored below then holds production symbols only.
+        let assignments = block_on_store_future(crate::production_community_assignments(
+            store,
+            graph,
+            self.community_resolution,
+        ))??;
         let current_snapshot = assignments
             .iter()
             .map(|(symbol_id, community_id)| CommunitySnapshotRecord {

@@ -244,6 +244,9 @@ fn parse_language(raw: &str) -> Result<Language> {
         "javascript" => Ok(Language::JavaScript),
         "jsx" => Ok(Language::Jsx),
         "python" => Ok(Language::Python),
+        "go" => Ok(Language::Go),
+        "java" => Ok(Language::Java),
+        "csharp" => Ok(Language::CSharp),
         other => Err(anyhow!("unsupported symbol language '{other}'")),
     }
 }
@@ -384,5 +387,54 @@ mod tests {
         .expect("load fresh symbol");
 
         assert!(fresh.symbol_source.contains("pub fn alpha() -> i32"));
+    }
+}
+
+#[cfg(test)]
+mod language_tests {
+    use aether_core::Language;
+
+    use super::parse_language;
+
+    #[test]
+    fn reads_every_stored_language_spelling() {
+        let mut listed = [false; 9];
+        for language in [
+            Language::Rust,
+            Language::TypeScript,
+            Language::Tsx,
+            Language::JavaScript,
+            Language::Jsx,
+            Language::Python,
+            Language::Go,
+            Language::Java,
+            Language::CSharp,
+        ] {
+            listed[variant_index(language)] = true;
+            assert_eq!(
+                parse_language(language.as_str()).expect("known language"),
+                language
+            );
+        }
+        assert!(
+            listed.iter().all(|listed| *listed),
+            "a variant is missing from the list"
+        );
+    }
+
+    /// Numbers every variant. A new variant stops this from compiling, and a variant left
+    /// out of the list above fails the test.
+    fn variant_index(language: Language) -> usize {
+        match language {
+            Language::Rust => 0,
+            Language::TypeScript => 1,
+            Language::Tsx => 2,
+            Language::JavaScript => 3,
+            Language::Jsx => 4,
+            Language::Python => 5,
+            Language::Go => 6,
+            Language::Java => 7,
+            Language::CSharp => 8,
+        }
     }
 }

@@ -9,6 +9,7 @@ use crate::{
         DEFAULT_OPENAI_COMPAT_API_KEY_ENV, GEMINI_DEFAULT_CONCURRENCY, MAX_SEARCH_THRESHOLD,
         MIN_SEARCH_THRESHOLD,
     },
+    contracts::ContractsConfig,
     embeddings::EmbeddingProviderKind,
     health::{
         HealthConfig, HealthScoreConfig, RiskWeights, default_health_drift_weight,
@@ -129,6 +130,11 @@ fn normalize_provider_concurrency(provider: InferenceProviderKind, concurrency: 
     } else {
         concurrency.max(1)
     }
+}
+
+fn normalize_contracts_config(config: &mut ContractsConfig) {
+    config.implicit_min_versions = config.effective_implicit_min_versions();
+    config.implicit_persistence_threshold = config.effective_implicit_persistence_threshold();
 }
 
 fn normalize_sir_quality_config(config: &mut SirQualityConfig) {
@@ -445,6 +451,9 @@ pub(crate) fn normalize_config(mut config: AetherConfig) -> AetherConfig {
             .or_else(default_tiered_fallback_endpoint);
     }
     normalize_sir_quality_config(&mut config.sir_quality);
+    if let Some(contracts) = config.contracts.as_mut() {
+        normalize_contracts_config(contracts);
+    }
     config.embeddings.model = normalize_optional(config.embeddings.model.take());
     config.embeddings.endpoint = normalize_optional(config.embeddings.endpoint.take());
     config.embeddings.api_key_env = normalize_optional(config.embeddings.api_key_env.take());
@@ -859,5 +868,80 @@ typescript = 0.67
         );
         assert_eq!(config.search.calibrated_thresholds.typescript, Some(0.67));
         assert_eq!(config.search.calibrated_thresholds.python, None);
+    }
+
+    #[test]
+    fn contracts_implicit_keys_default_when_absent() {
+        let config = normalize(
+            r#"
+[contracts]
+enabled = true
+"#,
+        );
+
+        let contracts = config.contracts.expect("contracts section");
+        assert!(contracts.enabled);
+        assert!(!contracts.implicit_inference_enabled);
+        assert_eq!(contracts.implicit_min_versions, 10);
+        assert_eq!(contracts.implicit_persistence_threshold, 0.80);
+    }
+
+    #[test]
+    fn contracts_implicit_keys_parse_when_explicit() {
+        let config = normalize(
+            r#"
+[contracts]
+implicit_inference_enabled = true
+implicit_min_versions = 12
+implicit_persistence_threshold = 0.9
+"#,
+        );
+
+        let contracts = config.contracts.expect("contracts section");
+        assert!(!contracts.enabled);
+        assert!(contracts.implicit_inference_enabled);
+        assert_eq!(contracts.implicit_min_versions, 12);
+        assert_eq!(contracts.implicit_persistence_threshold, 0.9);
+    }
+
+    #[test]
+    fn contracts_implicit_keys_normalize_out_of_range_values() {
+        let cases = [(0_u32, 10_u32), (1, 3), (500, 50)];
+        for (raw, expected) in cases {
+            let config = normalize(&format!(
+                "[contracts]\nimplicit_min_versions = {raw}\nimplicit_persistence_threshold = 0.8\n"
+            ));
+            assert_eq!(
+                config.contracts.expect("contracts").implicit_min_versions,
+                expected,
+                "implicit_min_versions = {raw}"
+            );
+        }
+
+        let high = normalize("[contracts]\nimplicit_persistence_threshold = 1.5\n");
+        assert_eq!(
+            high.contracts
+                .expect("contracts")
+                .implicit_persistence_threshold,
+            1.0
+        );
+        let low = normalize("[contracts]\nimplicit_persistence_threshold = 0.2\n");
+        assert_eq!(
+            low.contracts
+                .expect("contracts")
+                .implicit_persistence_threshold,
+            0.5
+        );
+    }
+
+    #[test]
+    fn contracts_section_absent_stays_none() {
+        let config = normalize(
+            r#"
+[general]
+log_level = "info"
+"#,
+        );
+        assert!(config.contracts.is_none());
     }
 }

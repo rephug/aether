@@ -4,14 +4,16 @@
 /// (must/must_not/preserves clauses), which are verified on every
 /// SIR regeneration using a two-stage cascade: embedding cosine
 /// pre-filter followed by LLM judge for ambiguous cases.
+mod infer;
 mod judge;
 mod verify;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use aether_config::AetherConfig;
 use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
-use aether_store::{SirStateStore, SqliteStore};
+use aether_store::{SirStateStore, SqliteStore, VectorStore, open_vector_store};
 use anyhow::{Context, Result, anyhow};
 
 pub use verify::{ClauseResult, ClauseStatus, ContractVerifier, VerificationResult};
@@ -29,6 +31,7 @@ pub fn run_contract_command(
         ContractCommand::List(list_args) => run_list(workspace, list_args.symbol.as_deref()),
         ContractCommand::Remove(remove_args) => run_remove(workspace, remove_args.contract_id),
         ContractCommand::Check(check_args) => run_check(workspace, config, &check_args),
+        ContractCommand::Infer(infer_args) => infer::run_infer(workspace, config, &infer_args),
     }
 }
 
@@ -377,8 +380,13 @@ fn run_list(workspace: &Path, symbol: Option<&str>) -> Result<()> {
         } else {
             ""
         };
+        let inferred = if contract.created_by == infer::INFERRED_CREATED_BY {
+            " [inferred]"
+        } else {
+            ""
+        };
         println!(
-            "  #{} {}: \"{}\"{embedded}{streak_indicator}",
+            "  #{} {}: \"{}\"{embedded}{inferred}{streak_indicator}",
             contract.id, contract.clause_type, contract.clause_text
         );
     }
@@ -437,6 +445,7 @@ fn run_check(workspace: &Path, config: &AetherConfig, args: &ContractCheckArgs) 
     let mut total_passed = 0_usize;
     let mut total_failed = 0_usize;
     let mut total_ambiguous = 0_usize;
+    let sir_embeddings = SirEmbeddingReader::open(workspace)?;
 
     for symbol_id in &symbol_ids {
         // Load SIR JSON
@@ -445,8 +454,7 @@ fn run_check(workspace: &Path, config: &AetherConfig, args: &ContractCheckArgs) 
             .with_context(|| format!("failed to read SIR for {symbol_id}"))?
             .unwrap_or_default();
 
-        // Load SIR embedding
-        let embedding: Option<Vec<f32>> = load_sir_embedding(&store, symbol_id, config)?;
+        let embedding = sir_embeddings.load(symbol_id)?;
 
         let result = verify_symbol_contracts(
             &store,
@@ -507,33 +515,129 @@ fn resolve_symbol_id(store: &SqliteStore, selector: &str) -> Result<String> {
     ))
 }
 
-/// Load the SIR embedding for a symbol from the store's embedding table.
-fn load_sir_embedding(
-    store: &SqliteStore,
-    symbol_id: &str,
-    config: &AetherConfig,
-) -> Result<Option<Vec<f32>>> {
-    let provider = config.embeddings.provider.as_str();
-    let model = config
-        .embeddings
-        .model
-        .as_deref()
-        .unwrap_or("gemini-embedding-2-preview");
-    let records = store
-        .list_symbol_embeddings_for_ids(provider, model, &[symbol_id.to_owned()])
-        .context("failed to load symbol embeddings")?;
-    Ok(records.into_iter().next().map(|r| r.embedding))
+/// Reads symbols' current SIR embeddings from the configured vector store
+/// (LanceDB or the SQLite table, per `[embeddings] vector_backend`), the way
+/// the SIR pipeline loads them before verifying contracts: the vector is read
+/// under the provider and model recorded with it.
+struct SirEmbeddingReader {
+    // Declared before `runtime` so it is dropped while the runtime still exists.
+    vectors: Arc<dyn VectorStore>,
+    runtime: tokio::runtime::Runtime,
+}
+
+impl SirEmbeddingReader {
+    fn open(workspace: &Path) -> Result<Self> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create vector store runtime")?;
+        let vectors = runtime
+            .block_on(open_vector_store(workspace))
+            .context("failed to open vector store")?;
+        Ok(Self { vectors, runtime })
+    }
+
+    fn load(&self, symbol_id: &str) -> Result<Option<Vec<f32>>> {
+        let Some(meta) = self
+            .runtime
+            .block_on(self.vectors.get_embedding_meta(symbol_id))
+            .with_context(|| format!("failed to read embedding metadata for {symbol_id}"))?
+        else {
+            return Ok(None);
+        };
+        let records = self
+            .runtime
+            .block_on(self.vectors.list_embeddings_for_symbols(
+                meta.provider.as_str(),
+                meta.model.as_str(),
+                &[symbol_id.to_owned()],
+            ))
+            .with_context(|| format!("failed to read embedding vector for {symbol_id}"))?;
+        Ok(records
+            .into_iter()
+            .find(|record| record.symbol_id == symbol_id)
+            .map(|record| record.embedding))
+    }
+}
+
+/// The symbol's current SIR embedding from the configured vector store.
+fn load_current_sir_embedding(workspace: &Path, symbol_id: &str) -> Result<Option<Vec<f32>>> {
+    SirEmbeddingReader::open(workspace)?.load(symbol_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aether_config::{EmbeddingVectorBackend, save_workspace_config};
+    use aether_store::{SemanticIndexStore, SymbolEmbeddingRecord};
     use tempfile::tempdir;
 
     fn open_test_store() -> (SqliteStore, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let store = SqliteStore::open(dir.path()).unwrap();
         (store, dir)
+    }
+
+    /// A vector under an identity other than the configured provider's, so
+    /// only a read through the recorded provider and model can find it.
+    fn embedding_record(symbol_id: &str, embedding: Vec<f32>) -> SymbolEmbeddingRecord {
+        SymbolEmbeddingRecord {
+            symbol_id: symbol_id.to_owned(),
+            sir_hash: "hash-current".to_owned(),
+            provider: "test-embedding".to_owned(),
+            model: "test-model".to_owned(),
+            embedding,
+            updated_at: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn sir_embedding_reader_reads_lancedb_by_default() {
+        let (store, dir) = open_test_store();
+        assert_eq!(
+            load_current_sir_embedding(dir.path(), "sym_a").unwrap(),
+            None
+        );
+
+        // A row left in the SQLite table (as after a migration to LanceDB)
+        // must not be read: the vector store holds the current vector.
+        store
+            .upsert_symbol_embedding(embedding_record("sym_a", vec![1.0, 0.0]))
+            .unwrap();
+        let reader = SirEmbeddingReader::open(dir.path()).unwrap();
+        reader
+            .runtime
+            .block_on(
+                reader
+                    .vectors
+                    .upsert_embedding(embedding_record("sym_a", vec![0.0, 1.0])),
+            )
+            .unwrap();
+
+        assert_eq!(reader.load("sym_a").unwrap(), Some(vec![0.0, 1.0]));
+        assert_eq!(reader.load("sym_b").unwrap(), None);
+        assert_eq!(
+            load_current_sir_embedding(dir.path(), "sym_a").unwrap(),
+            Some(vec![0.0, 1.0])
+        );
+    }
+
+    #[test]
+    fn sir_embedding_reader_reads_the_sqlite_backend_when_configured() {
+        let dir = tempdir().unwrap();
+        let mut config = AetherConfig::default();
+        config.embeddings.vector_backend = EmbeddingVectorBackend::Sqlite;
+        save_workspace_config(dir.path(), &config).unwrap();
+        let store = SqliteStore::open(dir.path()).unwrap();
+        store
+            .upsert_symbol_embedding(embedding_record("sym_a", vec![0.6, 0.8]))
+            .unwrap();
+
+        assert_eq!(
+            load_current_sir_embedding(dir.path(), "sym_a").unwrap(),
+            Some(vec![0.6, 0.8])
+        );
+        assert!(!dir.path().join(".aether/vectors").exists());
     }
 
     #[test]

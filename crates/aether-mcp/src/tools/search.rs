@@ -19,9 +19,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::callers::CallerAttribution;
 use super::{
     AetherMcpServer, LiveSymbolSources, child_method_symbols, effective_limit, is_type_symbol_kind,
-    symbol_leaf_name,
 };
 use crate::state::semantic_search_unavailability;
 use crate::{AetherMcpError, SearchMode};
@@ -87,7 +87,12 @@ pub struct AetherDependenciesRequest {
 pub struct AetherDependenciesResponse {
     pub symbol_id: String,
     pub found: bool,
+    /// Whether the symbol is a type (struct, trait, enum, type alias, class or interface)
+    /// whose callers and dependencies are rolled up: the callers of the type itself and of
+    /// each of its methods, and what those methods call.
     pub aggregated: bool,
+    /// How many methods the aggregated type declares, each overload counted; 0 when not
+    /// aggregated.
     pub child_method_count: u32,
     pub caller_count: u32,
     pub dependency_count: u32,
@@ -103,6 +108,9 @@ pub struct AetherDependencyCaller {
     pub language: String,
     pub kind: String,
     pub semantic_score: Option<f32>,
+    /// For an aggregated type, how many of its methods this caller calls, overloads of one
+    /// name counted once. 0 when the caller only names the type itself, as a constructor
+    /// call does.
     pub methods_called: Option<u32>,
 }
 
@@ -114,6 +122,8 @@ pub struct AetherDependencyTarget {
     pub language: String,
     pub kind: String,
     pub semantic_score: Option<f32>,
+    /// For an aggregated type, how many of its methods call this target, each overload
+    /// counted.
     pub referencing_methods: Option<u32>,
 }
 
@@ -319,10 +329,10 @@ impl AetherMcpServer {
         };
 
         let graph_store = self.state.graph.as_ref();
+        let mut attribution = CallerAttribution::new(store, self.workspace());
         if !is_type_symbol_kind(symbol.kind.as_str()) {
-            let callers = graph_store
-                .get_callers(&symbol.qualified_name)
-                .await?
+            let callers = attribution
+                .callers_of(&symbol)?
                 .into_iter()
                 .map(AetherDependencyCaller::from)
                 .collect::<Vec<_>>();
@@ -348,37 +358,26 @@ impl AetherMcpServer {
         let child_methods = child_method_symbols(store, &symbol)?;
         let child_method_count = child_methods.len() as u32;
 
-        let mut callers_by_id = HashMap::<String, (SymbolRecord, HashSet<String>)>::new();
+        // A call that names the type itself, such as a constructor call (`new Order()` in
+        // Java or TypeScript, `Point(1, 2)` for a Rust tuple struct), makes its caller a
+        // caller of the type; only calls to methods add to `methods_called`.
+        let mut callers_by_id = attribution
+            .callers_of(&symbol)?
+            .into_iter()
+            .map(|caller| (caller.id.clone(), (caller, HashSet::<String>::new())))
+            .collect::<HashMap<_, _>>();
         let mut dependencies_by_id = HashMap::<String, (SymbolRecord, HashSet<String>)>::new();
 
         for child_method in &child_methods {
             let child_key = child_method.id.clone();
-            let mut seen_caller_ids = HashSet::<String>::new();
 
-            for caller in graph_store
-                .get_callers(child_method.qualified_name.as_str())
-                .await?
-            {
-                if !seen_caller_ids.insert(caller.id.clone()) {
-                    continue;
-                }
+            // A call to an overloaded name is attributed to every overload, so callers
+            // count the methods they call by name.
+            for caller in attribution.callers_of(child_method)? {
                 let entry = callers_by_id
                     .entry(caller.id.clone())
                     .or_insert_with(|| (caller, HashSet::new()));
-                entry.1.insert(child_key.clone());
-            }
-
-            let method_name = symbol_leaf_name(child_method.qualified_name.as_str());
-            if method_name != child_method.qualified_name {
-                for caller in graph_store.get_callers(method_name).await? {
-                    if !seen_caller_ids.insert(caller.id.clone()) {
-                        continue;
-                    }
-                    let entry = callers_by_id
-                        .entry(caller.id.clone())
-                        .or_insert_with(|| (caller, HashSet::new()));
-                    entry.1.insert(child_key.clone());
-                }
+                entry.1.insert(child_method.qualified_name.clone());
             }
 
             for dependency in graph_store

@@ -692,6 +692,9 @@ fn parse_language_field(language: Option<&str>) -> Result<Language, AetherMcpErr
         "javascript" => Ok(Language::JavaScript),
         "jsx" => Ok(Language::Jsx),
         "python" => Ok(Language::Python),
+        "go" => Ok(Language::Go),
+        "java" => Ok(Language::Java),
+        "csharp" => Ok(Language::CSharp),
         _ => Err(AetherMcpError::Message(format!(
             "unsupported language: {value}"
         ))),
@@ -830,4 +833,53 @@ fn meta_status_fields(
     let last_attempt_at = (meta.last_attempt_at > 0).then_some(meta.last_attempt_at);
 
     (sir_status, last_error, last_attempt_at)
+}
+
+#[cfg(test)]
+mod language_tests {
+    use aether_core::Language;
+
+    use super::parse_language_field;
+
+    #[test]
+    fn reads_every_stored_language_spelling() {
+        let mut listed = [false; 9];
+        for language in [
+            Language::Rust,
+            Language::TypeScript,
+            Language::Tsx,
+            Language::JavaScript,
+            Language::Jsx,
+            Language::Python,
+            Language::Go,
+            Language::Java,
+            Language::CSharp,
+        ] {
+            listed[variant_index(language)] = true;
+            assert_eq!(
+                parse_language_field(Some(language.as_str())).expect("known language"),
+                language
+            );
+        }
+        assert!(
+            listed.iter().all(|listed| *listed),
+            "a variant is missing from the list"
+        );
+    }
+
+    /// Numbers every variant. A new variant stops this from compiling, and a variant left
+    /// out of the list above fails the test.
+    fn variant_index(language: Language) -> usize {
+        match language {
+            Language::Rust => 0,
+            Language::TypeScript => 1,
+            Language::Tsx => 2,
+            Language::JavaScript => 3,
+            Language::Jsx => 4,
+            Language::Python => 5,
+            Language::Go => 6,
+            Language::Java => 7,
+            Language::CSharp => 8,
+        }
+    }
 }

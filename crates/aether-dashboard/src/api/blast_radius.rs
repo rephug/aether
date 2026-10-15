@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use aether_analysis::GraphAlgorithmEdge;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -150,6 +151,7 @@ pub(crate) async fn load_blast_radius_data(
         .iter()
         .map(|row| (row.id.clone(), row.clone()))
         .collect::<HashMap<_, _>>();
+    let callers_by_target = callers_by_target(&edges, &symbol_lookup);
 
     let mut parent_by_symbol = HashMap::<String, String>::new();
     let mut depth_by_symbol = HashMap::<String, u32>::new();
@@ -164,19 +166,20 @@ pub(crate) async fn load_blast_radius_data(
             continue;
         }
 
-        let deps = shared
-            .graph
-            .get_dependencies(current_id.as_str())
-            .await
+        // Walk callers: a change to the current symbol affects the symbols that
+        // call it, which matches the symbol deep dive's blast radius.
+        let callers = callers_by_target
+            .get(current_id.as_str())
+            .map(Vec::as_slice)
             .unwrap_or_default();
 
         let mut inserted_at_level = 0usize;
-        for dep in deps {
+        for caller_id in callers {
             let next_depth = current_depth + 1;
             if next_depth > depth {
                 continue;
             }
-            if depth_by_symbol.contains_key(dep.id.as_str()) {
+            if depth_by_symbol.contains_key(caller_id.as_str()) {
                 continue;
             }
 
@@ -188,9 +191,9 @@ pub(crate) async fn load_blast_radius_data(
                 continue;
             }
 
-            depth_by_symbol.insert(dep.id.clone(), next_depth);
-            parent_by_symbol.insert(dep.id.clone(), current_id.clone());
-            queue.push_back(dep.id);
+            depth_by_symbol.insert(caller_id.clone(), next_depth);
+            parent_by_symbol.insert(caller_id.clone(), current_id.clone());
+            queue.push_back(caller_id.clone());
             inserted_at_level += 1;
         }
     }
@@ -273,6 +276,46 @@ pub(crate) async fn load_blast_radius_data(
         rings,
         total_impacted,
     }))
+}
+
+/// Reverse call adjacency (callee id -> caller ids), built once per request
+/// from the resolved edges the handler has already loaded, so each BFS step is
+/// a map lookup rather than a graph-store query per node. The symbol deep dive
+/// builds its dependents from the same edges.
+///
+/// Only `calls` edges whose caller is a known symbol are kept. Each caller list
+/// is deduplicated and ordered by qualified name then id, the order
+/// `GraphStore::get_callers` uses, so the per-level cap keeps the same nodes.
+fn callers_by_target(
+    edges: &[GraphAlgorithmEdge],
+    symbol_lookup: &HashMap<String, common::SymbolInfo>,
+) -> HashMap<String, Vec<String>> {
+    let mut callers = HashMap::<String, Vec<String>>::new();
+    for edge in edges {
+        if edge.edge_kind != "calls" || !symbol_lookup.contains_key(edge.source_id.as_str()) {
+            continue;
+        }
+        callers
+            .entry(edge.target_id.clone())
+            .or_default()
+            .push(edge.source_id.clone());
+    }
+
+    let qualified_name = |id: &str| {
+        symbol_lookup
+            .get(id)
+            .map(|symbol| symbol.qualified_name.as_str())
+            .unwrap_or_default()
+    };
+    for ids in callers.values_mut() {
+        ids.sort_by(|left, right| {
+            qualified_name(left)
+                .cmp(qualified_name(right))
+                .then_with(|| left.cmp(right))
+        });
+        ids.dedup();
+    }
+    callers
 }
 
 #[allow(clippy::too_many_arguments)]

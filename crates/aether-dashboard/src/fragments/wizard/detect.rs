@@ -96,6 +96,11 @@ fn scan_workspace_quick(workspace: &std::path::Path) -> (Vec<(String, usize)>, u
         .max_depth(8)
         .into_iter()
         .filter_entry(|e| {
+            // Always scan the chosen root, even if its own name starts with
+            // '.' (e.g. `.` or a dotfile dir); exclusions apply only below it.
+            if e.depth() == 0 {
+                return true;
+            }
             let name = e.file_name().to_string_lossy();
             if e.file_type().is_dir() {
                 return !name.starts_with('.')

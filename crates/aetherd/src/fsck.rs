@@ -442,6 +442,9 @@ fn parse_language(raw: &str) -> Language {
         "javascript" => Language::JavaScript,
         "jsx" => Language::Jsx,
         "python" => Language::Python,
+        "go" => Language::Go,
+        "java" => Language::Java,
+        "csharp" => Language::CSharp,
         _ => Language::Rust,
     }
 }
@@ -591,6 +594,52 @@ mod tests {
             qualified_name: qualified_name.to_owned(),
             signature_fingerprint: format!("sig-{id}"),
             last_seen_at: 1_700_000_000,
+        }
+    }
+}
+
+#[cfg(test)]
+mod language_tests {
+    use aether_core::Language;
+
+    use super::parse_language;
+
+    #[test]
+    fn reads_every_stored_language_spelling() {
+        let mut listed = [false; 9];
+        for language in [
+            Language::Rust,
+            Language::TypeScript,
+            Language::Tsx,
+            Language::JavaScript,
+            Language::Jsx,
+            Language::Python,
+            Language::Go,
+            Language::Java,
+            Language::CSharp,
+        ] {
+            listed[variant_index(language)] = true;
+            assert_eq!(parse_language(language.as_str()), language);
+        }
+        assert!(
+            listed.iter().all(|listed| *listed),
+            "a variant is missing from the list"
+        );
+    }
+
+    /// Numbers every variant. A new variant stops this from compiling, and a variant left
+    /// out of the list above fails the test.
+    fn variant_index(language: Language) -> usize {
+        match language {
+            Language::Rust => 0,
+            Language::TypeScript => 1,
+            Language::Tsx => 2,
+            Language::JavaScript => 3,
+            Language::Jsx => 4,
+            Language::Python => 5,
+            Language::Go => 6,
+            Language::Java => 7,
+            Language::CSharp => 8,
         }
     }
 }

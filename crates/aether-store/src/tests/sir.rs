@@ -122,6 +122,51 @@ fn read_sir_blob_backfills_sqlite_from_mirror_without_overwriting_meta() {
 }
 
 #[test]
+fn read_sir_blob_on_a_read_only_store_serves_the_mirror_without_backfilling() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    let store = SqliteStore::open(workspace).expect("open store");
+    store
+        .upsert_sir_meta(sir_meta_record())
+        .expect("upsert legacy metadata");
+    fs::write(
+        workspace.join(".aether/sir/sym-1.json"),
+        "{\"intent\":\"from-mirror\"}",
+    )
+    .expect("write mirror");
+    let stored_json = |store: &SqliteStore| -> Option<String> {
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT sir_json FROM sir WHERE id = ?1",
+                params!["sym-1"],
+                |row| row.get(0),
+            )
+            .expect("sir row")
+    };
+
+    let readonly = SqliteStore::open_readonly(workspace).expect("open readonly store");
+    let loaded = readonly
+        .read_sir_blob("sym-1")
+        .expect("a read-only read of a mirror-only SIR succeeds");
+    assert_eq!(loaded.as_deref(), Some("{\"intent\":\"from-mirror\"}"));
+    assert_eq!(
+        stored_json(&readonly),
+        None,
+        "read-only read must not backfill"
+    );
+
+    // A read-write handle still backfills the row from the mirror.
+    store.read_sir_blob("sym-1").expect("read-write read");
+    assert_eq!(
+        stored_json(&store).as_deref(),
+        Some("{\"intent\":\"from-mirror\"}")
+    );
+}
+
+#[test]
 fn get_sir_meta_defaults_generation_pass_to_scan_when_null() {
     let temp = tempdir().expect("tempdir");
     let workspace = temp.path();
@@ -729,4 +774,49 @@ fn a_leaf_write_records_the_source_hash_it_was_given_and_clears_it_otherwise() {
         )
         .expect("persist without source");
     assert_eq!(store.get_sir_source_hash("sym-source").expect("read"), None);
+}
+
+#[test]
+fn sir_mirror_paths_stay_inside_the_sir_directory() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    let store = SqliteStore::open(workspace).expect("open store");
+    let outside = workspace.join(".aether/outside.json");
+    fs::write(&outside, "{\"intent\":\"outside\"}").expect("write outside file");
+    let absolute = workspace.join("absolute");
+    fs::write(workspace.join("absolute.json"), "{\"intent\":\"absolute\"}")
+        .expect("write absolute file");
+
+    // IDs that would name a file outside `.aether/sir/` are never mirror file names.
+    let absolute_id = absolute.to_string_lossy().into_owned();
+    for symbol_id in [
+        "../outside",
+        absolute_id.as_str(),
+        "nested/../../outside",
+        "..",
+        ".",
+        "a\\b",
+    ] {
+        assert_eq!(
+            store.read_sir_blob(symbol_id).expect("read"),
+            None,
+            "{symbol_id:?} must not read a file outside the SIR directory"
+        );
+    }
+
+    store
+        .write_sir_blob("../escaped", "{\"intent\":\"escaped\"}")
+        .expect("write blob");
+    assert!(!workspace.join(".aether/escaped.json").exists());
+    assert_eq!(
+        store.read_sir_blob("../escaped").expect("read back"),
+        Some("{\"intent\":\"escaped\"}".to_owned()),
+        "the SQLite copy is still keyed by the ID"
+    );
+
+    store.mark_removed("../outside").expect("mark removed");
+    assert!(
+        outside.exists(),
+        "removing a symbol must not delete outside files"
+    );
 }

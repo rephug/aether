@@ -108,6 +108,9 @@ pub enum ConfigError {
     TomlEdit(#[from] toml_edit::TomlError),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    /// A section save was refused because the merged config would not load.
+    #[error("config would not load with these values: {0}")]
+    Invalid(#[source] toml::de::Error),
 }
 
 pub fn aether_dir(workspace_root: impl AsRef<Path>) -> PathBuf {
@@ -162,40 +165,59 @@ pub fn save_workspace_config(
 
 /// Save a single config section while preserving TOML comments and formatting.
 ///
-/// Uses `toml_edit` to parse the existing file, merge the given JSON values into
-/// the specified section, and write back. Falls back to `save_workspace_config()`
-/// if the config file does not yet exist.
+/// See [`save_workspace_config_sections_preserving_comments`].
 pub fn save_workspace_config_preserving_comments(
     workspace_root: impl AsRef<Path>,
     section: &str,
     values: &serde_json::Value,
 ) -> Result<(), ConfigError> {
+    save_workspace_config_sections_preserving_comments(workspace_root, &[(section, values)])
+}
+
+/// Save config sections while preserving TOML comments and formatting.
+///
+/// Uses `toml_edit` to parse the existing file (or the default config if the
+/// file does not yet exist) and merge the given JSON values into each section.
+/// The merged document is written in one go, and only if it still loads as an
+/// [`AetherConfig`]; otherwise the file is left untouched and
+/// [`ConfigError::Invalid`] is returned.
+pub fn save_workspace_config_sections_preserving_comments(
+    workspace_root: impl AsRef<Path>,
+    sections: &[(&str, &serde_json::Value)],
+) -> Result<(), ConfigError> {
     let workspace_root = workspace_root.as_ref();
     let path = config_path(workspace_root);
 
-    if !path.exists() {
-        // No existing file — create one via the standard path, then merge.
-        fs::create_dir_all(aether_dir(workspace_root))?;
-        let config = AetherConfig::default();
-        save_workspace_config(workspace_root, &config)?;
-    }
-
-    let raw = fs::read_to_string(&path)?;
+    let raw = if path.exists() {
+        fs::read_to_string(&path)?
+    } else {
+        toml::to_string_pretty(&normalize_config(AetherConfig::default()))?
+    };
     let mut doc: toml_edit::DocumentMut = raw.parse()?;
 
-    // Get or create the target section table.
-    if doc.get(section).is_none() {
-        doc[section] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-    let table = doc[section].as_table_mut().ok_or_else(|| {
-        std::io::Error::other(format!("config section '{section}' is not a table"))
-    })?;
+    for &(section, values) in sections {
+        // Get or create the target section table.
+        if doc.get(section).is_none() {
+            doc[section] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        let table = doc[section].as_table_mut().ok_or_else(|| {
+            std::io::Error::other(format!("config section '{section}' is not a table"))
+        })?;
 
-    if let serde_json::Value::Object(map) = values {
-        merge_json_into_toml_table(table, map);
+        if let serde_json::Value::Object(map) = values {
+            merge_json_into_toml_table(table, map);
+        }
     }
 
-    fs::write(&path, doc.to_string())?;
+    let merged = doc.to_string();
+    match parse_workspace_config_str(&merged) {
+        Ok(_) => {}
+        Err(ConfigError::TomlParse(err)) => return Err(ConfigError::Invalid(err)),
+        Err(err) => return Err(err),
+    }
+
+    fs::create_dir_all(aether_dir(workspace_root))?;
+    fs::write(&path, merged)?;
     Ok(())
 }
 

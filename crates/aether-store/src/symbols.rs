@@ -33,6 +33,20 @@ pub(crate) struct SymbolAccessState {
     pub(crate) access_count: i64,
     pub(crate) last_accessed_at: Option<i64>,
 }
+/// Upper bound on the terms one `search_symbols_by_terms` call scores.
+const SYMBOL_TERM_SEARCH_MAX_TERMS: usize = 16;
+
+/// Escapes `\`, `%` and `_` for a `LIKE ... ESCAPE '\'` pattern.
+fn escape_like_pattern(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
 fn infer_symbol_is_public(path: &Path, qualified_name: &str) -> bool {
     let Ok(source) = fs::read_to_string(path) else {
         return false;
@@ -198,6 +212,92 @@ impl SqliteStore {
 
         Ok(records)
     }
+    /// Symbols whose qualified name or file path contains at least one of
+    /// `terms` (case-insensitive substring match).
+    ///
+    /// Matched terms are counted in SQL over the whole table, so a symbol
+    /// matching more terms always ranks above one matching fewer, however
+    /// many symbols match a single term. Ties prefer terms found in the
+    /// qualified name over terms found only in the file path, then fall back
+    /// to `qualified_name` and `id`. Unlike `search_symbols`, this does not
+    /// look at `id`, `language` or `kind`, so a short word cannot match a
+    /// symbol through its hash id or its kind.
+    pub fn search_symbols_by_terms(
+        &self,
+        terms: &[String],
+        limit: u32,
+    ) -> Result<Vec<SymbolSearchResult>, StoreError> {
+        let mut patterns = Vec::<String>::new();
+        for term in terms {
+            let term = term.trim().to_lowercase();
+            if term.is_empty() {
+                continue;
+            }
+            let pattern = format!("%{}%", escape_like_pattern(term.as_str()));
+            if !patterns.contains(&pattern) {
+                patterns.push(pattern);
+            }
+            if patterns.len() >= SYMBOL_TERM_SEARCH_MAX_TERMS {
+                break;
+            }
+        }
+        if patterns.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let name_match = |index: usize| format!("LOWER(qualified_name) LIKE ?{index} ESCAPE '\\'");
+        let path_match = |index: usize| format!("LOWER(file_path) LIKE ?{index} ESCAPE '\\'");
+        let matched_terms = (1..=patterns.len())
+            .map(|index| {
+                format!(
+                    "CASE WHEN {} OR {} THEN 1 ELSE 0 END",
+                    name_match(index),
+                    path_match(index)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let name_terms = (1..=patterns.len())
+            .map(|index| format!("CASE WHEN {} THEN 1 ELSE 0 END", name_match(index)))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let limit_index = patterns.len() + 1;
+        let sql = format!(
+            r#"
+            SELECT id, qualified_name, file_path, language, kind, access_count, last_accessed_at
+            FROM (
+                SELECT id, qualified_name, file_path, language, kind, access_count,
+                       last_accessed_at,
+                       {matched_terms} AS matched_terms,
+                       {name_terms} AS name_terms
+                FROM symbols
+            )
+            WHERE matched_terms > 0
+            ORDER BY matched_terms DESC, name_terms DESC, qualified_name ASC, id ASC
+            LIMIT ?{limit_index}
+            "#
+        );
+
+        let mut params_vec = patterns.into_iter().map(SqlValue::Text).collect::<Vec<_>>();
+        params_vec.push(SqlValue::Integer(i64::from(limit.clamp(1, 100))));
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(sql.as_str())?;
+        let rows = stmt.query_map(params_from_iter(params_vec), |row| {
+            Ok(SymbolSearchResult {
+                symbol_id: row.get(0)?,
+                qualified_name: row.get(1)?,
+                file_path: row.get(2)?,
+                language: row.get(3)?,
+                kind: row.get(4)?,
+                access_count: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0),
+                last_accessed_at: row.get(6)?,
+            })
+        })?;
+
+        let records = rows.collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
     pub fn get_symbol_record(&self, symbol_id: &str) -> Result<Option<SymbolRecord>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -291,6 +391,59 @@ impl SqliteStore {
             })
         })?;
 
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+    /// Every symbol a call target could name: an exact qualified-name match and, when
+    /// the target is a bare name (no `::`), each symbol whose qualified name ends in
+    /// `::<target>`, since method calls are recorded by their bare method name.
+    pub fn list_symbols_for_call_target(
+        &self,
+        target: &str,
+    ) -> Result<Vec<SymbolRecord>, StoreError> {
+        let target = target.trim();
+        if target.is_empty() {
+            return Ok(Vec::new());
+        }
+        let member_suffix = (!target.contains("::")).then(|| format!("::{target}"));
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, file_path, language, kind, qualified_name, signature_fingerprint, last_seen_at
+            FROM symbols
+            WHERE qualified_name = ?1
+               OR (?2 IS NOT NULL
+                   AND length(qualified_name) > length(?2)
+                   AND substr(qualified_name, -length(?2)) = ?2)
+            ORDER BY file_path ASC, qualified_name ASC, id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![target, member_suffix], |row| {
+            Ok(SymbolRecord {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                language: row.get(2)?,
+                kind: row.get(3)?,
+                qualified_name: row.get(4)?,
+                signature_fingerprint: row.get(5)?,
+                last_seen_at: row.get(6)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Every indexed symbol's `(id, qualified_name, file_path)`, ordered by id, for
+    /// passes that classify the whole workspace (such as finding test symbols).
+    pub fn list_symbol_names_and_paths(&self) -> Result<Vec<(String, String, String)>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, qualified_name, file_path
+            FROM symbols
+            ORDER BY id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
     pub fn list_all_symbol_ids(&self) -> Result<Vec<String>, StoreError> {

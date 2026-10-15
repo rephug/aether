@@ -13,7 +13,7 @@ pub use secret::Secret;
 pub type SymbolId = String;
 pub const NO_SIR_MESSAGE: &str =
     "AETHER: No SIR yet for this symbol. Run aetherd indexing and try again.";
-pub const AETHER_AGENT_SCHEMA_VERSION: u32 = 4;
+pub const AETHER_AGENT_SCHEMA_VERSION: u32 = 6;
 
 pub const SIR_STATUS_STALE: &str = "stale";
 pub const SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED: &str = "local store not initialized";
@@ -170,6 +170,11 @@ pub enum Language {
     JavaScript,
     Jsx,
     Python,
+    Go,
+    Java,
+    // Spelled like `as_str`, which is what the store and symbol ids use.
+    #[serde(rename = "csharp")]
+    CSharp,
 }
 
 impl Language {
@@ -181,6 +186,9 @@ impl Language {
             Self::JavaScript => "javascript",
             Self::Jsx => "jsx",
             Self::Python => "python",
+            Self::Go => "go",
+            Self::Java => "java",
+            Self::CSharp => "csharp",
         }
     }
 }

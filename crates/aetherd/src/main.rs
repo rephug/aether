@@ -535,8 +535,8 @@ struct RegenerateCandidate {
     confidence: f32,
     priority: f64,
     baseline_sir: SirAnnotation,
-    /// Identity of `baseline_sir`'s row, read together with it; the deep job persists
-    /// only while the store still holds exactly that SIR.
+    /// Identity of `baseline_sir`'s row, read together with it; the regenerated job
+    /// (deep or not) persists only while the store still holds exactly that SIR.
     baseline_sir_identity: aetherd::sir_pipeline::SirIdentity,
 }
 
@@ -568,7 +568,7 @@ fn run_regenerate_command(workspace: &Path, args: RegenerateArgs) -> Result<()> 
         }
 
         // Metadata, identity and blob from one row read, so the enrichment built from
-        // this SIR and the identity the deep job is bound to describe the same write.
+        // this SIR and the identity the regenerated job is bound to describe the same write.
         let Some(snapshot) = store.get_sir_meta_with_blob(symbol.id.as_str())? else {
             continue;
         };
@@ -726,7 +726,13 @@ fn run_regenerate_command(workspace: &Path, args: RegenerateArgs) -> Result<()> 
                 &deep_specs,
             )
         } else {
-            main_pipeline.process_event_with_priority_and_pass(
+            // Bound to the SIR read when this symbol was selected: one written since
+            // (a manual injection while earlier candidates ran) stands.
+            let planned_against = HashMap::from([(
+                candidate.symbol.id.clone(),
+                candidate.baseline_sir_identity.clone(),
+            )]);
+            main_pipeline.process_event_planned_against(
                 &store,
                 &event,
                 true,
@@ -734,6 +740,7 @@ fn run_regenerate_command(workspace: &Path, args: RegenerateArgs) -> Result<()> 
                 &mut stdout,
                 Some(candidate.priority),
                 SIR_GENERATION_PASS_REGENERATED,
+                &planned_against,
             )
         };
 
@@ -928,12 +935,15 @@ fn run_contract_subcommand(
 }
 
 fn init_tracing_subscriber(log_format: LogFormat, configured_log_level: &str) -> Result<()> {
+    // Logs go to stderr: in `--lsp` mode stdout carries only LSP protocol frames.
     let init_result = match log_format {
         LogFormat::Human => tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
             .with_env_filter(build_env_filter(configured_log_level))
             .with_target(false)
             .try_init(),
         LogFormat::Json => tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
             .json()
             .with_env_filter(build_env_filter(configured_log_level))
             .with_target(false)

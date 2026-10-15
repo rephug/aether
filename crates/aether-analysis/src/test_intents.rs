@@ -255,6 +255,26 @@ impl TestIntentAnalyzer {
             }
         }
 
+        // Go keeps `foo_test.go` in the same package directory as `foo.go`.
+        if let Some(base) = normalized.strip_suffix("_test.go") {
+            let candidate = format!("{base}.go");
+            if let Some(existing) = self.ensure_existing_repo_file(candidate.as_str()) {
+                candidates.insert(existing);
+            }
+        }
+
+        if let Some(candidate) = java_main_source_for_test(normalized.as_str())
+            && let Some(existing) = self.ensure_existing_repo_file(candidate.as_str())
+        {
+            candidates.insert(existing);
+        }
+
+        for candidate in csharp_sources_for_test(normalized.as_str()) {
+            if let Some(existing) = self.ensure_existing_repo_file(candidate.as_str()) {
+                candidates.insert(existing);
+            }
+        }
+
         if normalized.contains("/__tests__/") {
             let candidate = normalized.replace("/__tests__/", "/");
             if let Some(existing) = self.ensure_existing_repo_file(candidate.as_str()) {
@@ -514,13 +534,108 @@ fn split_tests_dir(path: &str) -> Option<(String, String)> {
     Some((prefix.to_owned(), rest.to_owned()))
 }
 
+/// Maven and Gradle keep `src/test/java/<package>/FooTest.java` (or `FooTests`, or the
+/// integration-test `FooIT`) beside `src/main/java/<package>/Foo.java`.
+fn java_main_source_for_test(path: &str) -> Option<String> {
+    let (root, tail) = match path.strip_prefix("src/test/java/") {
+        Some(tail) => ("", tail),
+        None => {
+            let index = path.find("/src/test/java/")?;
+            (&path[..=index], &path[index + "/src/test/java/".len()..])
+        }
+    };
+    let stem = tail.strip_suffix(".java")?;
+    let base = ["Tests", "Test", "IT"]
+        .iter()
+        .find_map(|suffix| stem.strip_suffix(suffix))
+        .filter(|base| !base.is_empty() && !base.ends_with('/'))?;
+    Some(format!("{root}src/main/java/{base}.java"))
+}
+
+/// Suffixes .NET solutions give the project that tests another one.
+const CSHARP_TEST_PROJECT_SUFFIXES: [&str; 4] =
+    [".UnitTests", ".IntegrationTests", ".Tests", ".Test"];
+
+/// Whether a normalized `.cs` path follows .NET test naming: a `*Tests.cs` or `*Test.cs` file,
+/// or a file in a `*.Tests`, `*.Test`, `*.UnitTests` or `*.IntegrationTests` project. C# names
+/// test classes and projects in PascalCase, so these checks keep their case.
+pub(crate) fn is_csharp_test_path(path: &str) -> bool {
+    path.ends_with(".cs")
+        && (path.ends_with("Tests.cs")
+            || path.ends_with("Test.cs")
+            || path.split('/').any(|segment| {
+                CSHARP_TEST_PROJECT_SUFFIXES
+                    .iter()
+                    .any(|suffix| segment.len() > suffix.len() && segment.ends_with(suffix))
+            }))
+}
+
+/// .NET solutions keep tests in a sibling project: `Acme.Billing.Tests/PaymentTests.cs`
+/// tests `Acme.Billing/Payment.cs`, often under `tests/` and `src/` roots.
+fn csharp_sources_for_test(path: &str) -> Vec<String> {
+    let Some(base) = path
+        .strip_suffix(".cs")
+        .and_then(|stem| {
+            ["Tests", "Test"]
+                .iter()
+                .find_map(|suffix| stem.strip_suffix(suffix))
+        })
+        .filter(|base| !base.is_empty() && !base.ends_with('/'))
+    else {
+        return Vec::new();
+    };
+
+    let mut renamed_project = false;
+    let segments = base
+        .split('/')
+        .map(|segment| {
+            let project = CSHARP_TEST_PROJECT_SUFFIXES
+                .iter()
+                .find_map(|suffix| segment.strip_suffix(suffix))
+                .filter(|project| !renamed_project && !project.is_empty());
+            match project {
+                Some(project) => {
+                    renamed_project = true;
+                    project
+                }
+                None => segment,
+            }
+        })
+        .collect::<Vec<_>>();
+    if !renamed_project {
+        return Vec::new();
+    }
+
+    let source = format!("{}.cs", segments.join("/"));
+    let mut candidates = Vec::new();
+    // Tests usually sit under a `tests/` or `test/` root beside `src/`.
+    for test_root in ["tests/", "test/"] {
+        if let Some(rest) = source.strip_prefix(test_root) {
+            candidates.push(format!("src/{rest}"));
+        }
+        if let Some(index) = source.find(&format!("/{test_root}")) {
+            let (head, tail) = source.split_at(index + 1);
+            candidates.push(format!("{head}src/{}", &tail[test_root.len()..]));
+        }
+    }
+    candidates.push(source);
+    candidates
+}
+
 fn normalize_repo_path(path: &str) -> String {
     normalize_path(path.trim())
 }
 
 fn is_probably_test_file(path: &str) -> bool {
     let normalized = normalize_repo_path(path);
-    if normalized.contains("/tests/") || normalized.contains("/__tests__/") {
+    if normalized.contains("/tests/")
+        || normalized.contains("/__tests__/")
+        || normalized.starts_with("src/test/")
+        || normalized.contains("/src/test/")
+    {
+        return true;
+    }
+    if is_csharp_test_path(&normalized) {
         return true;
     }
 
@@ -532,6 +647,7 @@ fn is_probably_test_file(path: &str) -> bool {
     file_name.starts_with("test_")
         || file_name.ends_with("_test.rs")
         || file_name.ends_with("_tests.rs")
+        || file_name.ends_with("_test.go")
         || file_name.contains(".test.")
         || file_name.contains(".spec.")
 }
@@ -593,6 +709,153 @@ mod tests {
                     && (link.confidence - 0.9).abs() < 1e-6
             }),
             "expected naming-convention link to src/payment.rs"
+        );
+    }
+
+    #[test]
+    fn infers_go_target_file_from_same_directory_test_file() {
+        let temp = tempdir().expect("tempdir");
+        fs::create_dir_all(temp.path().join("store")).expect("create package dir");
+        fs::write(
+            temp.path().join("store/payment.go"),
+            "package store\n\nfunc Charge() {}\n",
+        )
+        .expect("write source");
+        fs::write(
+            temp.path().join("store/payment_test.go"),
+            "package store\n\nimport \"testing\"\n\nfunc TestCharge(t *testing.T) {}\n",
+        )
+        .expect("write test");
+
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        store
+            .replace_test_intents_for_file(
+                "store/payment_test.go",
+                &[test_intent(
+                    "store/payment_test.go",
+                    "TestCharge",
+                    "charges correctly",
+                )],
+            )
+            .expect("write intents");
+
+        let analyzer = TestIntentAnalyzer::new(temp.path()).expect("create analyzer");
+        let links = analyzer
+            .refresh_for_test_file("store/payment_test.go")
+            .expect("refresh links");
+        assert!(
+            links.iter().any(|link| {
+                link.target_file == "store/payment.go"
+                    && link.inference_method == "naming_convention"
+                    && (link.confidence - 0.9).abs() < 1e-6
+            }),
+            "expected naming-convention link to store/payment.go, got {links:?}"
+        );
+        assert!(is_probably_test_file("store/payment_test.go"));
+        assert!(!is_probably_test_file("store/payment.go"));
+    }
+
+    #[test]
+    fn infers_java_target_file_from_maven_test_layout() {
+        let temp = tempdir().expect("tempdir");
+        let main_dir = temp.path().join("billing/src/main/java/com/acme");
+        let test_dir = temp.path().join("billing/src/test/java/com/acme");
+        fs::create_dir_all(&main_dir).expect("create main dir");
+        fs::create_dir_all(&test_dir).expect("create test dir");
+        fs::write(
+            main_dir.join("Payment.java"),
+            "package com.acme;\n\nclass Payment {}\n",
+        )
+        .expect("write source");
+        fs::write(
+            test_dir.join("PaymentTest.java"),
+            "package com.acme;\n\nclass PaymentTest {}\n",
+        )
+        .expect("write test");
+
+        let test_file = "billing/src/test/java/com/acme/PaymentTest.java";
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        store
+            .replace_test_intents_for_file(
+                test_file,
+                &[test_intent(test_file, "chargesCard", "charges card")],
+            )
+            .expect("write intents");
+
+        let analyzer = TestIntentAnalyzer::new(temp.path()).expect("create analyzer");
+        let links = analyzer
+            .refresh_for_test_file(test_file)
+            .expect("refresh links");
+        assert!(
+            links.iter().any(|link| {
+                link.target_file == "billing/src/main/java/com/acme/Payment.java"
+                    && link.inference_method == "naming_convention"
+                    && (link.confidence - 0.9).abs() < 1e-6
+            }),
+            "expected naming-convention link to Payment.java, got {links:?}"
+        );
+        assert!(is_probably_test_file(test_file));
+        assert_eq!(
+            java_main_source_for_test("src/test/java/a/WidgetIT.java").as_deref(),
+            Some("src/main/java/a/Widget.java")
+        );
+        assert_eq!(java_main_source_for_test("src/test/java/a/Test.java"), None);
+    }
+
+    #[test]
+    fn infers_csharp_target_file_from_test_project_layout() {
+        let temp = tempdir().expect("tempdir");
+        let source_dir = temp.path().join("src/Acme.Billing/Services");
+        let test_dir = temp.path().join("tests/Acme.Billing.Tests/Services");
+        fs::create_dir_all(&source_dir).expect("create source dir");
+        fs::create_dir_all(&test_dir).expect("create test dir");
+        fs::write(
+            source_dir.join("Payment.cs"),
+            "namespace Acme.Billing;\n\npublic class Payment {}\n",
+        )
+        .expect("write source");
+        fs::write(
+            test_dir.join("PaymentTests.cs"),
+            "namespace Acme.Billing.Tests;\n\npublic class PaymentTests {}\n",
+        )
+        .expect("write test");
+
+        let test_file = "tests/Acme.Billing.Tests/Services/PaymentTests.cs";
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        store
+            .replace_test_intents_for_file(
+                test_file,
+                &[test_intent(test_file, "ChargesCard", "charges card")],
+            )
+            .expect("write intents");
+
+        let analyzer = TestIntentAnalyzer::new(temp.path()).expect("create analyzer");
+        let links = analyzer
+            .refresh_for_test_file(test_file)
+            .expect("refresh links");
+        assert!(
+            links.iter().any(|link| {
+                link.target_file == "src/Acme.Billing/Services/Payment.cs"
+                    && link.inference_method == "naming_convention"
+                    && (link.confidence - 0.9).abs() < 1e-6
+            }),
+            "expected naming-convention link to Payment.cs, got {links:?}"
+        );
+        assert!(is_probably_test_file(test_file));
+        assert!(is_probably_test_file("Acme.Billing.Tests/Helpers.cs"));
+        assert!(!is_probably_test_file("src/Acme.Billing/Contest.cs"));
+        assert_eq!(
+            csharp_sources_for_test("Acme.Billing.Tests/PaymentTest.cs"),
+            vec!["Acme.Billing/Payment.cs".to_owned()]
+        );
+        assert!(csharp_sources_for_test("src/Acme.Billing/PaymentTests.cs").is_empty());
+        assert!(
+            csharp_sources_for_test("test/Serilog.Tests/Core/LoggerTests.cs")
+                .contains(&"src/Serilog/Core/Logger.cs".to_owned())
+        );
+        assert!(
+            csharp_sources_for_test("libs/Foo/tests/Foo.Tests/BarTests.cs")
+                .contains(&"libs/Foo/src/Foo/Bar.cs".to_owned())
         );
     }
 

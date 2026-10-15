@@ -1,5 +1,6 @@
+use std::ffi::OsStr;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +19,9 @@ const DEFAULT_BUDGET: usize = 8_000;
 const ENHANCE_TIMEOUT_SECS: u64 = 30;
 const ENHANCE_TIMEOUT_MESSAGE: &str =
     "Prompt enhancement timed out. Try disabling rewrite or lowering the budget.";
+const AETHERD_BINARY_NAME: &str = "aetherd";
+const AETHERD_UNAVAILABLE_MESSAGE: &str = "Prompt enhancement requires the aetherd binary, \
+     which was not found next to this executable or on PATH.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct EnhanceApiRequest {
@@ -66,10 +70,17 @@ pub(crate) async fn enhance_handler(
         rewrite: payload.rewrite,
     };
 
+    let current_exe = std::env::current_exe().ok();
+    let path_var = std::env::var_os("PATH");
+    let Some(executable) = resolve_aetherd_executable(current_exe.as_deref(), path_var.as_deref())
+    else {
+        return json_service_unavailable(AETHERD_UNAVAILABLE_MESSAGE);
+    };
+
     match run_enhance_request(
         state.shared.workspace.clone(),
         request,
-        execute_enhance_subprocess,
+        move |workspace, request| execute_enhance_subprocess(executable, workspace, request),
     )
     .await
     {
@@ -97,20 +108,41 @@ where
     .map_err(EnhanceApiError::Internal)
 }
 
-async fn execute_enhance_subprocess(
-    workspace: PathBuf,
-    request: EnhanceApiRequest,
-) -> Result<EnhanceApiResponse, String> {
-    let executable = std::env::current_exe()
-        .map_err(|err| format!("failed to locate current executable: {err}"))?;
+/// Finds the `aetherd` binary that runs `enhance`. The dashboard is also served by
+/// other hosts (for example the desktop app), so the current executable is only
+/// reused when it is `aetherd` itself; otherwise a sibling `aetherd`, then PATH.
+fn resolve_aetherd_executable(
+    current_exe: Option<&Path>,
+    path_var: Option<&OsStr>,
+) -> Option<PathBuf> {
+    if let Some(current) = current_exe
+        && current.file_stem() == Some(OsStr::new(AETHERD_BINARY_NAME))
+    {
+        return Some(current.to_path_buf());
+    }
+    let file_name = format!("{AETHERD_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX);
+    let sibling_dir = current_exe.and_then(Path::parent).map(Path::to_path_buf);
+    let path_dirs = path_var.into_iter().flat_map(std::env::split_paths);
+    sibling_dir
+        .into_iter()
+        .chain(path_dirs)
+        .map(|dir| dir.join(&file_name))
+        .find(|candidate| candidate.is_file())
+}
 
-    let mut command = Command::new(&executable);
+fn build_enhance_command(
+    executable: &Path,
+    workspace: &Path,
+    request: &EnhanceApiRequest,
+) -> Command {
+    let mut command = Command::new(executable);
     command
         .kill_on_drop(true)
+        // stdout must carry only the JSON document.
+        .env("RUST_LOG", "off")
         .arg("--workspace")
-        .arg(&workspace)
+        .arg(workspace)
         .arg("enhance")
-        .arg(&request.prompt)
         .arg("--output")
         .arg("json")
         .arg("--budget")
@@ -120,6 +152,17 @@ async fn execute_enhance_subprocess(
     if request.rewrite {
         command.arg("--rewrite");
     }
+    // `--` keeps prompts that start with '-' from being parsed as flags.
+    command.arg("--").arg(&request.prompt);
+    command
+}
+
+async fn execute_enhance_subprocess(
+    executable: PathBuf,
+    workspace: PathBuf,
+    request: EnhanceApiRequest,
+) -> Result<EnhanceApiResponse, String> {
+    let mut command = build_enhance_command(&executable, &workspace, &request);
 
     let child = command
         .spawn()
@@ -157,9 +200,21 @@ async fn execute_enhance_subprocess(
     parse_enhance_response(stdout.as_str())
 }
 
+/// Parses the enhance JSON, tolerating stray non-JSON lines (such as log output)
+/// before or after the document.
 fn parse_enhance_response(stdout: &str) -> Result<EnhanceApiResponse, String> {
-    serde_json::from_str(stdout.trim())
-        .map_err(|err| format!("failed to parse enhance JSON output: {err}"))
+    let trimmed = stdout.trim();
+    serde_json::from_str(trimmed).or_else(|err| {
+        trimmed
+            .match_indices('{')
+            .find_map(|(start, _)| {
+                serde_json::Deserializer::from_str(&trimmed[start..])
+                    .into_iter::<EnhanceApiResponse>()
+                    .next()
+                    .and_then(Result::ok)
+            })
+            .ok_or_else(|| format!("failed to parse enhance JSON output: {err}"))
+    })
 }
 
 fn json_bad_request(message: impl Into<String>) -> Response {
@@ -173,13 +228,26 @@ fn json_bad_request(message: impl Into<String>) -> Response {
         .into_response()
 }
 
+fn json_service_unavailable(message: impl Into<String>) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "service_unavailable",
+            "message": message.into(),
+        })),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ENHANCE_TIMEOUT_MESSAGE, ENHANCE_TIMEOUT_SECS, EnhanceApiError, EnhanceApiRequest,
-        EnhanceApiResponse, parse_enhance_response, run_enhance_request,
+        EnhanceApiResponse, build_enhance_command, parse_enhance_response,
+        resolve_aetherd_executable, run_enhance_request,
     };
-    use std::path::PathBuf;
+    use std::ffi::{OsStr, OsString};
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
@@ -217,6 +285,103 @@ mod tests {
     fn parse_enhance_response_rejects_invalid_json() {
         let err = parse_enhance_response("not json").expect_err("parse should fail");
         assert!(err.contains("failed to parse enhance JSON output"));
+    }
+
+    #[test]
+    fn parse_enhance_response_skips_log_lines_around_json() {
+        let stdout = "\u{1b}[2m2026-01-01T00:00:00Z\u{1b}[0m \u{1b}[33m WARN\u{1b}[0m failed to parse SIR blob {symbol_id=\"abc\"}\n\
+             {\n  \"enhanced_prompt\": \"fix {auth}\",\n  \"resolved_symbols\": [\"login\"],\n  \
+             \"referenced_files\": [\"src/lib.rs\"],\n  \"rewrite_used\": false,\n  \
+             \"token_count\": 7,\n  \"warnings\": []\n}\n\
+             INFO trailing log line\n";
+
+        let response = parse_enhance_response(stdout).expect("log lines should be skipped");
+
+        assert_eq!(response.enhanced_prompt, "fix {auth}");
+        assert_eq!(response.resolved_symbols, vec!["login".to_owned()]);
+        assert_eq!(response.token_count, 7);
+    }
+
+    #[test]
+    fn enhance_command_passes_hyphen_prompt_after_separator_with_logging_off() {
+        let request = EnhanceApiRequest {
+            prompt: "--help me fix the -x flag".to_owned(),
+            budget: 9_000,
+            rewrite: true,
+        };
+
+        let command = build_enhance_command(
+            Path::new("/opt/aether/aetherd"),
+            Path::new("/tmp/workspace"),
+            &request,
+        );
+        let command = command.as_std();
+
+        let args: Vec<&OsStr> = command.get_args().collect();
+        let expected: Vec<&OsStr> = [
+            "--workspace",
+            "/tmp/workspace",
+            "enhance",
+            "--output",
+            "json",
+            "--budget",
+            "9000",
+            "--rewrite",
+            "--",
+            "--help me fix the -x flag",
+        ]
+        .into_iter()
+        .map(OsStr::new)
+        .collect();
+        assert_eq!(args, expected);
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == "RUST_LOG" && value == Some(OsStr::new("off")))
+        );
+    }
+
+    #[test]
+    fn resolve_aetherd_never_reexecutes_a_non_aetherd_host() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let host_dir = temp.path().join("host");
+        let path_dir = temp.path().join("bin");
+        std::fs::create_dir_all(&host_dir).expect("create host dir");
+        std::fs::create_dir_all(&path_dir).expect("create path dir");
+        let aetherd_name = format!("aetherd{}", std::env::consts::EXE_SUFFIX);
+        let desktop = host_dir.join("aether-desktop");
+        std::fs::write(&desktop, b"").expect("write host binary");
+        let path_var: OsString =
+            std::env::join_paths([path_dir.as_path()]).expect("join PATH entries");
+
+        // A host that is not aetherd, with no aetherd anywhere, resolves to nothing.
+        assert_eq!(
+            resolve_aetherd_executable(Some(&desktop), Some(&path_var)),
+            None
+        );
+
+        // aetherd on PATH is used.
+        let on_path = path_dir.join(&aetherd_name);
+        std::fs::write(&on_path, b"").expect("write PATH aetherd");
+        assert_eq!(
+            resolve_aetherd_executable(Some(&desktop), Some(&path_var)),
+            Some(on_path)
+        );
+
+        // A sibling aetherd wins over PATH.
+        let sibling = host_dir.join(&aetherd_name);
+        std::fs::write(&sibling, b"").expect("write sibling aetherd");
+        assert_eq!(
+            resolve_aetherd_executable(Some(&desktop), Some(&path_var)),
+            Some(sibling)
+        );
+
+        // When the host is aetherd itself, it is reused.
+        let aetherd_host = temp.path().join("elsewhere").join(&aetherd_name);
+        assert_eq!(
+            resolve_aetherd_executable(Some(&aetherd_host), None),
+            Some(aetherd_host.clone())
+        );
     }
 
     #[tokio::test]

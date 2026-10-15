@@ -139,6 +139,82 @@ fn reconcile_migrates_sir_to_new_id() {
 }
 
 #[test]
+fn reconcile_moves_intent_contracts_and_violations_to_new_id() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+
+    let mut old_symbol = symbol_record();
+    old_symbol.id = "sym-contract-old".to_owned();
+    old_symbol.signature_fingerprint = "sig-contract-old".to_owned();
+    let mut new_symbol = old_symbol.clone();
+    new_symbol.id = "sym-contract-new".to_owned();
+    new_symbol.signature_fingerprint = "sig-contract-new".to_owned();
+
+    store.upsert_symbol(old_symbol.clone()).expect("upsert old");
+    store.upsert_symbol(new_symbol.clone()).expect("upsert new");
+
+    let contract_id = store
+        .insert_intent_contract(
+            old_symbol.id.as_str(),
+            "must",
+            "reject negative amounts",
+            None,
+            "test",
+        )
+        .expect("insert contract");
+    let violation_id = store
+        .insert_intent_violation(
+            contract_id,
+            old_symbol.id.as_str(),
+            1,
+            "semantic_drift",
+            Some(0.8),
+            Some("drifted"),
+        )
+        .expect("insert violation");
+
+    let (migrated, pruned) = store
+        .reconcile_and_prune(&[(old_symbol.id.clone(), new_symbol.id.clone())], &[])
+        .expect("reconcile old -> new");
+    assert_eq!((migrated, pruned), (1, 0));
+
+    let contracts = store
+        .list_active_contracts_for_symbol(new_symbol.id.as_str())
+        .expect("list contracts for new id");
+    assert_eq!(
+        contracts.iter().map(|c| c.id).collect::<Vec<_>>(),
+        vec![contract_id],
+        "the contract follows the symbol to its new id"
+    );
+    assert_eq!(contracts[0].clause_text, "reject negative amounts");
+
+    let violations = store
+        .list_violations_for_symbol(new_symbol.id.as_str(), 10)
+        .expect("list violations for new id");
+    assert_eq!(
+        violations
+            .iter()
+            .map(|v| (v.id, v.contract_id))
+            .collect::<Vec<_>>(),
+        vec![(violation_id, contract_id)],
+        "the violation history follows the symbol to its new id"
+    );
+
+    assert!(
+        store
+            .list_active_contracts_for_symbol(old_symbol.id.as_str())
+            .expect("list contracts for old id")
+            .is_empty()
+    );
+    assert!(
+        store
+            .list_violations_for_symbol(old_symbol.id.as_str(), 10)
+            .expect("list violations for old id")
+            .is_empty()
+    );
+}
+
+#[test]
 fn prune_removes_orphans_not_in_snapshot() {
     let temp = tempdir().expect("tempdir");
     let store = SqliteStore::open(temp.path()).expect("open store");

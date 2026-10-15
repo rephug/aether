@@ -1227,11 +1227,9 @@ vector_backend = "sqlite"
         let snapshot_id = snapshot.snapshot_id.clone();
         store.create_snapshot(&snapshot).expect("persist snapshot");
 
-        let changed = format!(
-            "{{\"confidence\":0.1,\"dependencies\":[\"sqlx\"],\"error_modes\":[\"panic\"],\"inputs\":[\"db\"],\"intent\":\"mutates persistent state with retries and failure handling\",\"outputs\":[\"result\"],\"side_effects\":[\"database\"]}}"
-        );
+        let changed = r#"{"confidence":0.1,"dependencies":["sqlx"],"error_modes":["panic"],"inputs":["db"],"intent":"mutates persistent state with retries and failure handling","outputs":["result"],"side_effects":["database"]}"#;
         store
-            .write_sir_blob(symbols[0].id.as_str(), &changed)
+            .write_sir_blob(symbols[0].id.as_str(), changed)
             .expect("rewrite sir");
 
         let report = verify_intent_snapshot(temp.path(), &store, snapshot_id.as_str(), 0.95)

@@ -100,6 +100,9 @@ impl SqliteStore {
                 "#,
             )?;
 
+            // Two tests in one file can share a name and text (overloads, for one), which
+            // would give them the same id; keep the first instead of failing the whole file.
+            let mut written = HashSet::new();
             for intent in intents {
                 let test_name = intent.test_name.trim();
                 let intent_text = intent.intent_text.trim();
@@ -112,6 +115,9 @@ impl SqliteStore {
                 } else {
                     intent.intent_id.trim().to_owned()
                 };
+                if !written.insert(record_id.clone()) {
+                    continue;
+                }
 
                 stmt.execute(params![
                     record_id,

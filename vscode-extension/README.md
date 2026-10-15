@@ -2,6 +2,11 @@
 
 This extension starts the AETHER LSP server over stdio and adds command/status UX for indexing and symbol search in Rust/TypeScript/JavaScript workspaces.
 
+In a multi-root workspace the extension starts one AETHER language server per folder,
+and each answers hovers only for files its folder owns (with nested folders, the
+innermost one). Adding or removing a folder starts or stops just that folder's server.
+The index and search commands still act on the first folder.
+
 ## What It Is Useful For
 
 - Quick symbol understanding while reading unfamiliar code.
@@ -16,6 +21,15 @@ From repo root, build `aetherd`:
 ```bash
 cargo build -p aetherd
 ```
+
+The extension uses the first `aetherd` it finds:
+
+1. the `aether.aetherdPath` setting, when set (user settings only);
+2. `$CARGO_TARGET_DIR/debug/aetherd`, when `CARGO_TARGET_DIR` is set;
+3. `<repo>/target/debug/aetherd`;
+4. `aetherd` on `PATH`.
+
+If none exists, it runs `cargo build -p aetherd` in the repo root and looks again.
 
 ## Run in Extension Development Host
 
@@ -69,6 +83,7 @@ Available settings:
 - `aether.inferenceEndpoint`: local endpoint for `qwen3_local` (default `http://127.0.0.1:11434`)
 - `aether.geminiApiKeyEnv`: env var name for Gemini key (default `GEMINI_API_KEY`)
 - `aether.searchMode`: `lexical | semantic | hybrid` (default `lexical`)
+- `aether.aetherdPath`: absolute path of the `aetherd` binary (default empty: search as described under Prerequisites)
 
 ## Provider Notes
 
@@ -88,4 +103,7 @@ Run extension verification scripts:
 ```bash
 npm run build
 npm run smoke
+npm test
 ```
+
+`npm run verify` runs all three.

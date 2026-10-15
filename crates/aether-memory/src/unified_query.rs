@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -14,6 +14,52 @@ use aether_store::{
 };
 
 const SYMBOL_COUPLING_SEED_LIMIT: usize = 10;
+const ASK_MAX_TERMS: usize = 8;
+const ASK_STOPWORDS: &[&str] = &[
+    "about", "an", "and", "any", "are", "as", "at", "be", "by", "can", "could", "did", "do",
+    "does", "for", "from", "has", "have", "how", "if", "in", "into", "is", "it", "its", "me", "my",
+    "of", "on", "or", "our", "should", "so", "that", "the", "their", "them", "there", "these",
+    "they", "this", "those", "to", "was", "we", "were", "what", "when", "where", "which", "who",
+    "why", "will", "with", "would", "you", "your",
+];
+/// Words that say what kind of symbol a question is about, not which one.
+/// The term search only looks at qualified names and file paths, where these
+/// would match by accident (every `.rs` path contains `rs`), so they are not
+/// searched as terms.
+const ASK_GENERIC_TERMS: &[&str] = &[
+    "class",
+    "classes",
+    "code",
+    "crate",
+    "crates",
+    "enum",
+    "enums",
+    "file",
+    "files",
+    "fn",
+    "function",
+    "functions",
+    "impl",
+    "js",
+    "jsx",
+    "method",
+    "methods",
+    "module",
+    "modules",
+    "py",
+    "python",
+    "rs",
+    "rust",
+    "src",
+    "struct",
+    "structs",
+    "symbol",
+    "symbols",
+    "trait",
+    "traits",
+    "ts",
+    "tsx",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -120,6 +166,11 @@ impl ProjectMemoryService {
 
         let query_owned = query.to_owned();
         let store = self.open_store()?;
+        // Splitting the question into terms is the lexical stand-in for
+        // semantic search. With a semantic query it only runs when neither
+        // the phrase search nor the semantic search found a symbol, so term
+        // matches never crowd semantic matches out of the fused ranking.
+        let expand_symbol_terms = request.semantic.is_none();
 
         let symbol_task = {
             let store = Arc::clone(&store);
@@ -131,9 +182,12 @@ impl ProjectMemoryService {
 
                 tokio::task::spawn_blocking(
                     move || -> Result<Vec<aether_store::SymbolSearchResult>, MemoryError> {
-                        store
-                            .search_symbols(query.as_str(), candidate_limit)
-                            .map_err(Into::into)
+                        search_symbols_lexical(
+                            &store,
+                            query.as_str(),
+                            candidate_limit,
+                            expand_symbol_terms,
+                        )
                     },
                 )
                 .await
@@ -197,7 +251,7 @@ impl ProjectMemoryService {
         let (symbol_result, note_result, test_result) =
             tokio::join!(symbol_task, note_task, test_task);
 
-        let symbol_lexical = match symbol_result {
+        let mut symbol_lexical = match symbol_result {
             Ok(results) => results,
             Err(err) => {
                 tracing::warn!("symbol search failed in ask(): {err}");
@@ -260,6 +314,29 @@ impl ProjectMemoryService {
                     }
                     note_semantic.push(note);
                 }
+            }
+        }
+
+        if fetch_symbols
+            && !expand_symbol_terms
+            && symbol_lexical.is_empty()
+            && symbol_semantic.is_empty()
+        {
+            let store = Arc::clone(&store);
+            let query = query_owned.clone();
+            let term_result = match tokio::task::spawn_blocking(move || {
+                search_symbol_terms(&store, query.as_str(), candidate_limit)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(err) => Err(MemoryError::InvalidInput(format!(
+                    "symbol term search task join failure: {err}"
+                ))),
+            };
+            match term_result {
+                Ok(results) => symbol_lexical = results,
+                Err(err) => tracing::warn!("symbol term search failed in ask(): {err}"),
             }
         }
 
@@ -326,6 +403,74 @@ fn normalize_include(include: Vec<AskInclude>) -> BTreeSet<AskInclude> {
         return AskInclude::all().into_iter().collect();
     }
     include.into_iter().collect()
+}
+
+/// Lowercased search terms of an Ask question, without stopwords, generic
+/// code words or one-character tokens. `::`, `.`, `/`, `-` and `_` stay
+/// inside a term so qualified names and file paths survive as one term.
+fn ask_symbol_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::<String>::new();
+    for token in query.split(|ch: char| {
+        !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '/' | '.' | ':'))
+    }) {
+        let token = token
+            .trim_matches(|ch: char| matches!(ch, '-' | '/' | '.' | ':'))
+            .to_ascii_lowercase();
+        if token.len() < 2
+            || ASK_STOPWORDS.contains(&token.as_str())
+            || ASK_GENERIC_TERMS.contains(&token.as_str())
+            || terms.contains(&token)
+        {
+            continue;
+        }
+        terms.push(token);
+        if terms.len() >= ASK_MAX_TERMS {
+            break;
+        }
+    }
+    terms
+}
+
+/// Lexical symbol search for Ask. The whole question is tried as one phrase
+/// first. With `expand_terms`, the symbols matching the question's terms
+/// follow the phrase hits, so a natural-language question still finds
+/// symbols when no embeddings are available.
+fn search_symbols_lexical(
+    store: &SqliteStore,
+    query: &str,
+    candidate_limit: u32,
+    expand_terms: bool,
+) -> Result<Vec<aether_store::SymbolSearchResult>, MemoryError> {
+    let phrase_hits = store.search_symbols(query, candidate_limit)?;
+    if !expand_terms {
+        return Ok(phrase_hits);
+    }
+    let term_hits = search_symbol_terms(store, query, candidate_limit)?;
+
+    let mut seen = HashSet::<String>::new();
+    Ok(phrase_hits
+        .into_iter()
+        .chain(term_hits)
+        .filter(|row| seen.insert(row.symbol_id.clone()))
+        .take(candidate_limit as usize)
+        .collect())
+}
+
+/// Symbols matching the terms of an Ask question, those matching more terms
+/// first (the store counts matches over the whole table). Empty when the
+/// question is a single term on its own, which the phrase search covers.
+fn search_symbol_terms(
+    store: &SqliteStore,
+    query: &str,
+    candidate_limit: u32,
+) -> Result<Vec<aether_store::SymbolSearchResult>, MemoryError> {
+    let terms = ask_symbol_terms(query);
+    if terms.iter().all(|term| term.eq_ignore_ascii_case(query)) {
+        return Ok(Vec::new());
+    }
+    store
+        .search_symbols_by_terms(terms.as_slice(), candidate_limit)
+        .map_err(Into::into)
 }
 
 fn rank_symbol_candidates(
@@ -749,12 +894,19 @@ fn increment_access_from_results(
 #[allow(deprecated)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use aether_store::{CouplingEdgeRecord, CozoGraphStore}; // test
+    use aether_store::{
+        CouplingEdgeRecord, CozoGraphStore, SqliteStore, SqliteVectorStore, SymbolCatalogStore,
+        SymbolRecord, VectorRecord, VectorStore,
+    }; // test
 
-    use super::{AskResultItem, AskResultKind, RankedCandidate, merge_candidates};
+    use super::{
+        AskInclude, AskQueryRequest, AskResultItem, AskResultKind, ProjectMemoryService,
+        RankedCandidate, SemanticQuery, merge_candidates,
+    };
 
     fn test_workspace(name: &str) -> PathBuf {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -998,5 +1150,201 @@ mod tests {
         assert_eq!(coupling.len(), 1);
         assert_eq!(coupling[0].item.kind, AskResultKind::CoupledFile);
         assert_eq!(coupling[0].item.title.as_deref(), Some("src/b.rs"));
+    }
+
+    fn seed_symbols(workspace: &Path, symbols: &[(String, String, String)]) {
+        let store = SqliteStore::open(workspace).expect("open store");
+        for (id, qualified_name, file_path) in symbols {
+            store
+                .upsert_symbol(SymbolRecord {
+                    id: id.clone(),
+                    file_path: file_path.clone(),
+                    language: "rust".to_owned(),
+                    kind: "function".to_owned(),
+                    qualified_name: qualified_name.clone(),
+                    signature_fingerprint: format!("sig-{id}"),
+                    last_seen_at: 1_700_000_000,
+                })
+                .expect("upsert symbol");
+        }
+    }
+
+    fn symbol(id: &str, qualified_name: &str, file_path: &str) -> (String, String, String) {
+        (
+            id.to_owned(),
+            qualified_name.to_owned(),
+            file_path.to_owned(),
+        )
+    }
+
+    async fn ask_symbol_ids_with(
+        service: &ProjectMemoryService,
+        question: &str,
+        semantic: Option<SemanticQuery>,
+    ) -> Vec<String> {
+        service
+            .ask(AskQueryRequest {
+                query: question.to_owned(),
+                limit: 10,
+                include: vec![AskInclude::Symbols],
+                now_ms: Some(1_700_000_000_000),
+                semantic,
+            })
+            .await
+            .expect("ask")
+            .results
+            .into_iter()
+            .filter(|item| item.kind == AskResultKind::Symbol)
+            .filter_map(|item| item.id)
+            .collect()
+    }
+
+    async fn ask_symbol_ids(service: &ProjectMemoryService, question: &str) -> Vec<String> {
+        ask_symbol_ids_with(service, question, None).await
+    }
+
+    #[tokio::test]
+    async fn lexical_ask_matches_multi_word_questions_by_term() {
+        let workspace = test_workspace("multi-word");
+        seed_symbols(
+            &workspace,
+            &[
+                symbol("sym-alpha-run", "alpha::run", "src/alpha.rs"),
+                symbol("sym-demo-run", "demo::run", "src/demo.rs"),
+                symbol("sym-util-parse", "util::parse", "src/util.rs"),
+            ],
+        );
+
+        // No semantic query: this is the embeddings-disabled path.
+        let service = ProjectMemoryService::new(&workspace);
+
+        // A natural-language question finds symbols through its terms, and
+        // stopwords such as "what" / "does" / "do" do not pull in noise.
+        let ids = ask_symbol_ids(&service, "what does run do").await;
+        assert!(ids.contains(&"sym-demo-run".to_owned()), "got {ids:?}");
+        assert!(ids.contains(&"sym-alpha-run".to_owned()), "got {ids:?}");
+        assert!(!ids.contains(&"sym-util-parse".to_owned()), "got {ids:?}");
+
+        // A symbol matching more terms ranks above one matching fewer, even
+        // though alpha::run sorts first alphabetically.
+        let ids = ask_symbol_ids(&service, "demo run").await;
+        assert_eq!(
+            ids.first().map(String::as_str),
+            Some("sym-demo-run"),
+            "got {ids:?}"
+        );
+
+        // Exact single-token and qualified-name lookups keep working.
+        let ids = ask_symbol_ids(&service, "demo::run").await;
+        assert_eq!(ids, vec!["sym-demo-run".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn lexical_ask_counts_matched_terms_beyond_the_candidate_limit() {
+        let workspace = test_workspace("many-matches");
+        // Each term alone matches more symbols than the candidate limit (30),
+        // and all of them sort before the only symbol matching both terms.
+        let mut symbols = Vec::new();
+        for index in 0..40 {
+            symbols.push(symbol(
+                &format!("sym-alpha-{index:02}"),
+                &format!("Alpha{index:02}::new"),
+                &format!("crates/store/src/alpha{index:02}.rs"),
+            ));
+            symbols.push(symbol(
+                &format!("sym-beta-{index:02}"),
+                &format!("Beta{index:02}::search_x"),
+                &format!("src/beta{index:02}.rs"),
+            ));
+        }
+        symbols.push(symbol(
+            "sym-both",
+            "SqliteStore::search_symbols",
+            "crates/store/src/symbols.rs",
+        ));
+        seed_symbols(&workspace, &symbols);
+
+        let service = ProjectMemoryService::new(&workspace);
+        let ids = ask_symbol_ids(&service, "store search").await;
+        assert_eq!(
+            ids.first().map(String::as_str),
+            Some("sym-both"),
+            "got {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_ask_ignores_hash_ids_and_generic_code_words() {
+        let workspace = test_workspace("hash-ids");
+        // Real symbol ids are 64-character hex hashes; these all contain "db".
+        let mut symbols = (0..50)
+            .map(|index| {
+                symbol(
+                    &format!("{index:030x}db{index:032x}"),
+                    &format!("mod{index:02}::item{index}"),
+                    &format!("src/mod{index:02}.rs"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let target = format!("{}c0ff", "c0ffee".repeat(10));
+        symbols.push(symbol(&target, "Connection::open", "src/connection.rs"));
+        seed_symbols(&workspace, &symbols);
+
+        let service = ProjectMemoryService::new(&workspace);
+        for question in [
+            "where is the db connection opened",
+            "which function opens the db connection",
+        ] {
+            let ids = ask_symbol_ids(&service, question).await;
+            assert_eq!(ids, vec![target.clone()], "question {question:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_ask_uses_term_matches_only_when_nothing_else_matched() {
+        let workspace = test_workspace("semantic");
+        seed_symbols(
+            &workspace,
+            &[
+                symbol("sym-alpha-run", "alpha::run", "src/alpha.rs"),
+                symbol("sym-demo-run", "demo::run", "src/demo.rs"),
+                symbol("sym-util-parse", "util::parse", "src/util.rs"),
+            ],
+        );
+        let vector_store = SqliteVectorStore::new(&workspace).expect("open vector store");
+        vector_store
+            .upsert_embedding(VectorRecord {
+                symbol_id: "sym-util-parse".to_owned(),
+                sir_hash: "hash-util-parse".to_owned(),
+                provider: "mock".to_owned(),
+                model: "mock-2d".to_owned(),
+                embedding: vec![1.0, 0.0],
+                updated_at: 1_700_000_000,
+            })
+            .await
+            .expect("upsert embedding");
+        let service = ProjectMemoryService::with_shared(
+            &workspace,
+            Arc::new(SqliteStore::open(&workspace).expect("open store")),
+            Some(Arc::new(vector_store)),
+        );
+        let semantic = |model: &str| SemanticQuery {
+            provider: "mock".to_owned(),
+            model: model.to_owned(),
+            embedding: vec![1.0, 0.0],
+        };
+
+        // With semantic matches, the ranking stays semantic: the question's
+        // terms do not add lexical-only symbols next to them.
+        let ids = ask_symbol_ids_with(&service, "demo run", Some(semantic("mock-2d"))).await;
+        assert_eq!(ids, vec!["sym-util-parse".to_owned()]);
+
+        // With no semantic and no phrase match, the terms are searched.
+        let ids = ask_symbol_ids_with(&service, "demo run", Some(semantic("unindexed"))).await;
+        assert_eq!(
+            ids.first().map(String::as_str),
+            Some("sym-demo-run"),
+            "got {ids:?}"
+        );
     }
 }

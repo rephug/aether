@@ -122,7 +122,13 @@ pub(crate) async fn load_ask_data(
     }
 
     let semantic = build_semantic_query(shared.workspace.as_path(), trimmed).await;
-    let service = ProjectMemoryService::new(shared.workspace.as_path());
+    // Reuse the dashboard's read-only store so ask() cannot open its own
+    // read-write connection and bump symbol/note access counters.
+    let service = ProjectMemoryService::with_shared(
+        shared.workspace.as_path(),
+        Arc::clone(&shared.store),
+        shared.vector_store.clone(),
+    );
     let raw = service
         .ask(AskQueryRequest {
             query: trimmed.to_owned(),

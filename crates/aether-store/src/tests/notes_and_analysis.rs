@@ -267,6 +267,39 @@ fn test_intents_round_trip_and_symbol_lookup_work() {
 }
 
 #[test]
+fn test_intents_with_the_same_id_keep_the_first_instead_of_failing() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+
+    // Overloaded test methods share a name and, without display names, their text.
+    store
+        .replace_test_intents_for_file(
+            "src/test/java/ParserTest.java",
+            &[
+                test_intent_record(
+                    "src/test/java/ParserTest.java",
+                    "parses",
+                    "parses",
+                    Some("sym-parses-plain"),
+                ),
+                test_intent_record(
+                    "src/test/java/ParserTest.java",
+                    "parses",
+                    "parses",
+                    Some("sym-parses-with-input"),
+                ),
+            ],
+        )
+        .expect("duplicate intents are not an error");
+
+    let intents = store
+        .list_test_intents_for_file("src/test/java/ParserTest.java")
+        .expect("list intents by file");
+    assert_eq!(intents.len(), 1);
+    assert_eq!(intents[0].symbol_id.as_deref(), Some("sym-parses-plain"));
+}
+
+#[test]
 fn search_test_intents_lexical_matches_names_text_and_paths() {
     let temp = tempdir().expect("tempdir");
     let store = SqliteStore::open(temp.path()).expect("open store");

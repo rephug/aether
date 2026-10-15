@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use maud::{Markup, html};
 
-use super::{back_button, next_button};
+use super::{back_button, next_button, script_string_literal};
 
 /// Step 3: Environment check results.
 ///
@@ -138,7 +138,7 @@ pub(crate) fn render(params: &HashMap<String, String>) -> Markup {
         return row;
     }}
 }})();
-"#, workspace_json = serde_json::to_string(&workspace).unwrap_or_else(|_| "null".to_owned()))))
+"#, workspace_json = script_string_literal(&workspace))))
         }
     }
 }

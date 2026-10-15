@@ -469,6 +469,7 @@ fn implements_edge(source_id: &str, target: &str, file_path: &str) -> SymbolEdge
 
 mod audit;
 mod basic;
+mod migrations;
 mod neighbors;
 mod notes_and_analysis;
 mod reconcile;

@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aether_config::{
-    load_workspace_config, reset_section_to_defaults, save_workspace_config_preserving_comments,
+    ConfigError, TieredConfig, config_path, load_workspace_config, reset_section_to_defaults,
+    save_workspace_config_sections_preserving_comments,
 };
 use axum::extract::{Form, Path, State};
 use axum::http::StatusCode;
@@ -113,7 +114,9 @@ pub(crate) async fn save_section_handler(
     Path(section): Path<String>,
     Form(form): Form<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let sections = match build_section_json(&form, &section) {
+    let stored_has_tiered =
+        section == "inference" && stored_inference_has_tiered(&state.shared.workspace);
+    let sections = match build_section_json(&form, &section, stored_has_tiered) {
         Ok(s) => s,
         Err(errors) => {
             return (
@@ -126,19 +129,25 @@ pub(crate) async fn save_section_handler(
         }
     };
 
-    // Save each TOML section
-    for (toml_key, values) in &sections {
-        if let Err(err) =
-            save_workspace_config_preserving_comments(&state.shared.workspace, toml_key, values)
-        {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                support::html_markup_response(crate::fragments::settings::helpers::error_banner(
-                    &[format!("Failed to save [{toml_key}]: {err}")],
-                )),
-            )
-                .into_response();
-        }
+    // Save all TOML sections in one write, refused if the result would not load.
+    let section_values: Vec<(&str, &Value)> = sections
+        .iter()
+        .map(|(toml_key, values)| (toml_key.as_str(), values))
+        .collect();
+    if let Err(err) =
+        save_workspace_config_sections_preserving_comments(&state.shared.workspace, &section_values)
+    {
+        let status = match err {
+            ConfigError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        return (
+            status,
+            support::html_markup_response(crate::fragments::settings::helpers::error_banner(&[
+                format!("Settings not saved: {err}"),
+            ])),
+        )
+            .into_response();
     }
 
     // Detect restart-required fields
@@ -362,15 +371,30 @@ fn parse_u64_min(form: &HashMap<String, String>, key: &str, min: u64) -> Result<
 // Section-specific JSON builders
 // ---------------------------------------------------------------------------
 
+/// Whether config.toml already has an `[inference.tiered]` table. Reads the raw
+/// TOML that the save merges into, so the answer does not depend on the rest of
+/// the file loading. A missing or unparsable file counts as no table.
+fn stored_inference_has_tiered(workspace: &std::path::Path) -> bool {
+    std::fs::read_to_string(config_path(workspace))
+        .ok()
+        .and_then(|raw| raw.parse::<toml::Table>().ok())
+        .is_some_and(|root| {
+            root.get("inference")
+                .and_then(|inference| inference.get("tiered"))
+                .is_some()
+        })
+}
+
 fn build_section_json(
     form: &HashMap<String, String>,
     section: &str,
+    stored_has_tiered: bool,
 ) -> Result<HashMap<String, Value>, Vec<String>> {
     let mut sections: HashMap<String, Value> = HashMap::new();
     let mut errors = Vec::new();
 
     match section {
-        "inference" => build_inference(form, &mut sections, &mut errors),
+        "inference" => build_inference(form, stored_has_tiered, &mut sections, &mut errors),
         "embeddings" => build_embeddings(form, &mut sections, &mut errors),
         "search" => build_search(form, &mut sections, &mut errors),
         "indexing" => build_indexing(form, &mut sections, &mut errors),
@@ -397,6 +421,7 @@ fn build_section_json(
 
 fn build_inference(
     form: &HashMap<String, String>,
+    stored_has_tiered: bool,
     sections: &mut HashMap<String, Value>,
     errors: &mut Vec<String>,
 ) {
@@ -413,8 +438,20 @@ fn build_inference(
         Err(e) => errors.push(e),
     }
 
-    // Tiered sub-config
-    if form_str(form, "provider") == "tiered" {
+    // Tiered sub-config. When the form carried no tiered.* fields, do not read each
+    // missing field as empty, 0.0 or false: leave an existing [inference.tiered]
+    // table untouched, and initialize the section with its defaults only when
+    // there is none yet.
+    let provider_is_tiered = form_str(form, "provider") == "tiered";
+    let tiered_submitted = form.keys().any(|key| key.starts_with("tiered."));
+    if provider_is_tiered && !tiered_submitted && !stored_has_tiered {
+        match serde_json::to_value(TieredConfig::default()) {
+            Ok(defaults) => {
+                obj.insert("tiered".into(), defaults);
+            }
+            Err(err) => errors.push(format!("tiered: {err}")),
+        }
+    } else if provider_is_tiered && tiered_submitted {
         let mut tiered = Map::new();
         tiered.insert("primary".into(), json_str(form, "tiered.primary"));
         insert_opt_str_prefixed(&mut tiered, form, "tiered.primary_model", "primary_model");
