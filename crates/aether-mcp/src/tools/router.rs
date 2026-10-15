@@ -1,6 +1,11 @@
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
-use rmcp::{ErrorData as McpError, Json, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, Implementation, ListToolsResult, PaginatedRequestParams,
+    ServerCapabilities, ServerInfo,
+};
+use rmcp::service::RequestContext;
+use rmcp::{ErrorData as McpError, Json, RoleServer, ServerHandler, tool, tool_router};
 
 use super::{
     AetherAcknowledgeDriftRequest, AetherAcknowledgeDriftResponse, AetherAskRequest,
@@ -713,8 +718,36 @@ impl AetherMcpServer {
     }
 }
 
-#[tool_handler(router = self.tool_router)]
+// `call_tool` and `list_tools` are what `#[tool_handler]` would generate, except that a
+// call to a tool outside the active profile gets an error naming the profile, and the
+// list is sorted by name so it is the same on every start.
 impl ServerHandler for AetherMcpServer {
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Some(err) = self.tool_outside_profile_error(request.name.as_ref()) {
+            return Err(err);
+        }
+        let call = ToolCallContext::new(self, request, context);
+        self.tool_router.call(call).await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let mut tools = self.tool_router.list_all();
+        tools.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(ListToolsResult {
+            tools,
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             capabilities: ServerCapabilities::builder().enable_tools().build(),

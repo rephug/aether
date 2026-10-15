@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use aether_analysis::RiskLevel as CouplingRiskLevel;
-use aether_config::{InferenceProviderKind, OLLAMA_DEFAULT_ENDPOINT, VerifyMode};
+use aether_config::{InferenceProviderKind, McpToolProfile, OLLAMA_DEFAULT_ENDPOINT, VerifyMode};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::init_agent::AgentPlatform;
@@ -51,6 +51,13 @@ pub struct InitAgentArgs {
 
     #[arg(long, help = "Overwrite existing files")]
     pub force: bool,
+
+    #[arg(
+        long,
+        value_name = "full|compact",
+        help = "AETHER MCP tool profile to set up (default: [mcp] tools in .aether/config.toml). compact registers aether-mcp with --tools compact and writes short guidance for its six tools; the slash commands, scan script, skill and review workflow need the full profile and are not written"
+    )]
+    pub mcp_tools: Option<McpToolProfile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Args)]

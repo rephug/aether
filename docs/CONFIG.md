@@ -229,6 +229,41 @@ vector_backend = "lancedb" # lancedb | sqlite
 - `provider = "qwen3_local"` uses a local HTTP embedding endpoint.
 - `provider = "candle"` uses the bundled local model path under `[embeddings.candle]`.
 
+## MCP Tool Profile
+
+```toml
+[mcp]
+tools = "full" # full | compact
+```
+
+An MCP client sends the name, description and input schema of every tool `aether-mcp` lists to the model on each request, whether or not the model calls it. The full profile lists every tool (39 in the default build). The compact profile lists the six that coding agents used most, with shorter descriptions and input schemas: about 2.2 KB of tool definitions instead of 26 KB. (The whole `tools/list` response, output schemas included, shrinks from about 80 KB to 2.2 KB.) The compact tools:
+
+- `aether_symbol_lookup` and `aether_search`: a symbol's `symbol_id`, by name or file path, or by meaning.
+- `aether_dependencies` and `aether_call_chain`: its resolved callers and callees, and what it reaches through calls.
+- `aether_sir_context`: what it does, with its callers, callees and related tests.
+- `aether_test_intents`: what the tests in a file assert.
+
+Notes:
+
+- The compact schemas advertise only the parameters a coding agent needs; the others keep their defaults. For example, compact `aether_symbol_lookup` leaves out `symbol_ids` and `include_source`, which `/scan` uses. Compact tools list no output schema; their results are the same as in the full profile.
+- A call to a tool outside the profile fails with an error that names the profile and how to switch.
+- `aether-mcp --tools compact|full` overrides `[mcp] tools`, so one client can attach the compact profile while others keep the full one:
+
+  ```bash
+  claude mcp add --transport stdio --scope project aether -- aether-mcp --workspace . --tools compact
+  ```
+
+  ```toml
+  # ~/.codex/config.toml
+  [mcp_servers.aether]
+  command = "aether-mcp"
+  args = ["--workspace", "/path/to/project", "--tools", "compact"]
+  ```
+
+- `aetherd init-agent --mcp-tools compact` (default: `[mcp] tools`) writes a compact setup: `.mcp.json` registers `aether-mcp --workspace . --tools compact`, and `CLAUDE.md`, `AGENTS.md`, `.codex-instructions` and `.cursor/rules` get short guidance for the six tools. It doesn't write the slash commands, `scripts/scan_all.sh`, the `aether-context` skill or the review workflow, because they call tools outside the compact profile.
+- Keep the full profile wherever `/scan`, `/enrich`, `/audit` or the other generated slash commands run: setting `tools = "compact"` here also changes what `scripts/scan_all.sh` and an `.mcp.json` without `--tools` get.
+- `aether-query` serves the profile `[mcp] tools` selects on its MCP endpoint.
+
 ## Environment Variables
 
 - `GEMINI_API_KEY` for Gemini, unless `api_key_env` overrides it.
@@ -252,6 +287,8 @@ No API key is required for `qwen3_local`.
 ```
 
 Override precedence is CLI > config file > built-in defaults.
+
+`aether-mcp --tools <full|compact>` overrides `[mcp] tools` the same way (see [MCP Tool Profile](#mcp-tool-profile)).
 
 ## Validation and Normalization
 
