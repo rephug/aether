@@ -5,8 +5,9 @@ use aether_core::Secret;
 use async_trait::async_trait;
 
 use crate::http::{
-    build_openai_chat_completion_body, extract_openai_chat_content_from_body,
-    extract_openai_error_message, inference_http_client, normalize_openai_api_base,
+    DEFAULT_INFERENCE_REQUEST_TIMEOUT_SECS, build_openai_chat_completion_body,
+    extract_openai_chat_content_from_body, extract_openai_error_message, inference_http_client,
+    inference_http_client_with_timeout, normalize_openai_api_base,
     response_indicates_unsupported_json_mode,
 };
 use crate::providers::PARSE_VALIDATION_RETRIES;
@@ -29,6 +30,8 @@ pub struct OpenAiCompatProvider {
     provider_name: String,
     /// OpenAI `reasoning_effort` to send (`low`, `medium`, `high`, ...). `None` omits it.
     reasoning_effort: Option<String>,
+    /// Seconds one request may take before the HTTP client gives up.
+    request_timeout_secs: u64,
     json_mode_supported: AtomicBool,
 }
 
@@ -41,6 +44,7 @@ impl std::fmt::Debug for OpenAiCompatProvider {
             .field("model", &self.model)
             .field("provider_name", &self.provider_name)
             .field("reasoning_effort", &self.reasoning_effort)
+            .field("request_timeout_secs", &self.request_timeout_secs)
             .field(
                 "json_mode_supported",
                 &self.json_mode_supported.load(Ordering::Relaxed),
@@ -58,6 +62,7 @@ impl Clone for OpenAiCompatProvider {
             model: self.model.clone(),
             provider_name: self.provider_name.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
+            request_timeout_secs: self.request_timeout_secs,
             json_mode_supported: AtomicBool::new(self.json_mode_supported.load(Ordering::Relaxed)),
         }
     }
@@ -72,6 +77,7 @@ impl OpenAiCompatProvider {
             model,
             provider_name: InferenceProviderKind::OpenAiCompat.as_str().to_owned(),
             reasoning_effort: None,
+            request_timeout_secs: DEFAULT_INFERENCE_REQUEST_TIMEOUT_SECS,
             json_mode_supported: AtomicBool::new(true),
         }
     }
@@ -88,6 +94,24 @@ impl OpenAiCompatProvider {
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
         self
+    }
+
+    /// Let each request run for `timeout_secs` instead of the default limit, for models
+    /// that think longer than that on one SIR.
+    pub fn with_request_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.client = inference_http_client_with_timeout(timeout_secs);
+        self.request_timeout_secs = timeout_secs;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reasoning_effort(&self) -> Option<&str> {
+        self.reasoning_effort.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request_timeout_secs(&self) -> u64 {
+        self.request_timeout_secs
     }
 
     fn endpoint_url(&self) -> String {
