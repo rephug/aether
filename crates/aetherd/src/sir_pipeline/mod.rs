@@ -61,6 +61,7 @@ mod persist;
 mod rollup;
 
 pub use self::file_rollups::refresh_local_file_rollup;
+pub(crate) use self::file_rollups::{invalidate_file_rollups, invalidate_file_rollups_locked};
 
 pub use locks::{
     WriteGuard, acquire_embed_write_lock, acquire_embed_write_locks, acquire_inject_write_lock,

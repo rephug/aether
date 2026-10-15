@@ -820,3 +820,271 @@ fn sir_mirror_paths_stay_inside_the_sir_directory() {
         "removing a symbol must not delete outside files"
     );
 }
+
+#[test]
+fn marking_stale_by_source_moves_only_fresh_leaves_whose_recorded_source_changed() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    let meta = |id: &str| SirMetaRecord {
+        id: id.to_owned(),
+        sir_hash: format!("hash-{id}"),
+        sir_version: 1,
+        provider: "manual".to_owned(),
+        model: "manual".to_owned(),
+        generation_pass: "scan".to_owned(),
+        reasoning_trace: None,
+        prompt_hash: None,
+        staleness_score: None,
+        updated_at: 1_700_000_000,
+        sir_status: "fresh".to_owned(),
+        last_error: None,
+        last_attempt_at: 1_700_000_000,
+    };
+    let persist = |id: &str, source_hash: Option<&str>| {
+        store
+            .upsert_symbol(SymbolRecord {
+                id: id.to_owned(),
+                qualified_name: format!("demo::{id}"),
+                ..symbol_record()
+            })
+            .expect("upsert symbol");
+        store
+            .persist_sir_state_atomically_with_source(
+                meta(id),
+                r#"{"intent":"leaf","confidence":0.9}"#,
+                None,
+                None,
+                source_hash,
+            )
+            .expect("persist leaf");
+    };
+    persist("sym-changed", Some("source-old"));
+    persist("sym-same", Some("source-same"));
+    persist("sym-unknown", None);
+    persist("sym-pending", Some("source-old"));
+    let mut pending = store
+        .get_sir_meta("sym-pending")
+        .expect("meta")
+        .expect("exists");
+    pending.sir_status = "rollup_pending".to_owned();
+    store.upsert_sir_meta(pending).expect("mark pending");
+
+    let current = [
+        ("sym-changed", "source-new"),
+        ("sym-same", "source-same"),
+        ("sym-unknown", "source-new"),
+        ("sym-pending", "source-new"),
+        ("sym-no-row", "source-new"),
+    ]
+    .map(|(id, hash)| (id.to_owned(), hash.to_owned()));
+    let marked = store
+        .mark_sir_stale_for_changed_sources(&current, i64::MAX)
+        .expect("mark stale");
+    assert_eq!(marked, vec!["sym-changed".to_owned()]);
+
+    let status = |id: &str| {
+        store
+            .get_sir_meta(id)
+            .expect("meta")
+            .expect("exists")
+            .sir_status
+    };
+    assert_eq!(status("sym-changed"), "stale");
+    assert_eq!(status("sym-same"), "fresh");
+    assert_eq!(
+        status("sym-unknown"),
+        "fresh",
+        "no recorded source, no verdict"
+    );
+    assert_eq!(status("sym-pending"), "rollup_pending");
+    assert_eq!(
+        store.get_sir_source_hash("sym-changed").expect("source"),
+        Some("source-old".to_owned()),
+        "marking stale keeps the record of what the SIR describes"
+    );
+    // The listing compares sources, whatever the status: the pending leaf's source
+    // changed too, the unknown one cannot be compared.
+    assert_eq!(
+        store
+            .list_sir_source_changes(&current, i64::MAX)
+            .expect("list source changes"),
+        vec![
+            ("sym-changed".to_owned(), "stale".to_owned()),
+            ("sym-pending".to_owned(), "rollup_pending".to_owned()),
+        ]
+    );
+    assert!(
+        store
+            .mark_sir_stale_for_changed_sources(&current, i64::MAX)
+            .expect("mark again")
+            .is_empty(),
+        "an already stale leaf is not marked twice"
+    );
+}
+
+#[test]
+fn a_leaf_left_stale_by_a_failed_attempt_on_an_unchanged_body_is_no_source_change() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    store
+        .persist_sir_state_atomically_with_source(
+            SirMetaRecord {
+                id: "sym-failed".to_owned(),
+                generation_pass: "deep".to_owned(),
+                ..sir_meta_record()
+            },
+            r#"{"intent":"deep","confidence":0.9}"#,
+            None,
+            None,
+            Some("source-same"),
+        )
+        .expect("persist leaf");
+    let mut failed = store
+        .get_sir_meta("sym-failed")
+        .expect("meta")
+        .expect("exists");
+    failed.sir_status = "stale".to_owned();
+    failed.last_error = Some("provider timeout".to_owned());
+    store.upsert_sir_meta(failed).expect("record failure");
+
+    let current = [("sym-failed".to_owned(), "source-same".to_owned())];
+    assert!(
+        store
+            .list_sir_source_changes(&current, i64::MAX)
+            .expect("list source changes")
+            .is_empty()
+    );
+}
+
+#[test]
+fn upsert_symbols_writes_every_row_and_updates_existing_ones() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    store.upsert_symbol(symbol_record()).expect("seed symbol");
+    store
+        .upsert_symbols(&[
+            SymbolRecord {
+                last_seen_at: 1_800_000_000,
+                ..symbol_record()
+            },
+            SymbolRecord {
+                id: "sym-batch".to_owned(),
+                qualified_name: "demo::batch".to_owned(),
+                ..symbol_record()
+            },
+        ])
+        .expect("upsert batch");
+
+    assert_eq!(
+        store
+            .get_symbol_record("sym-1")
+            .expect("read")
+            .expect("exists")
+            .last_seen_at,
+        1_800_000_000
+    );
+    assert!(
+        store
+            .get_symbol_record("sym-batch")
+            .expect("read")
+            .is_some()
+    );
+}
+
+#[test]
+fn a_leaf_written_after_the_snapshot_is_not_compared_with_it() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    store
+        .persist_sir_state_atomically_with_source(
+            SirMetaRecord {
+                id: "sym-newer".to_owned(),
+                updated_at: 1_700_000_500,
+                ..sir_meta_record()
+            },
+            r#"{"intent":"newer","confidence":0.9}"#,
+            None,
+            None,
+            Some("source-newer"),
+        )
+        .expect("persist leaf");
+    let written_at = store
+        .get_sir_meta("sym-newer")
+        .expect("meta")
+        .expect("exists")
+        .updated_at;
+
+    // The snapshot read the file before this leaf was written for a newer body.
+    let snapshot = [("sym-newer".to_owned(), "source-older".to_owned())];
+    let taken_at = written_at - 1;
+    assert!(
+        store
+            .list_sir_source_changes(&snapshot, taken_at)
+            .expect("list")
+            .is_empty()
+    );
+    assert!(
+        store
+            .mark_sir_stale_for_changed_sources(&snapshot, taken_at)
+            .expect("mark")
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .get_sir_meta("sym-newer")
+            .expect("meta")
+            .expect("exists")
+            .sir_status,
+        "fresh"
+    );
+    // A snapshot taken after the write does compare it.
+    assert_eq!(
+        store
+            .mark_sir_stale_for_changed_sources(&snapshot, written_at)
+            .expect("mark"),
+        vec!["sym-newer".to_owned()]
+    );
+}
+
+#[test]
+fn mark_sir_stale_moves_only_fresh_rows() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    store
+        .upsert_sir_meta(SirMetaRecord {
+            id: "rollup-fresh".to_owned(),
+            ..sir_meta_record()
+        })
+        .expect("fresh row");
+    store
+        .upsert_sir_meta(SirMetaRecord {
+            id: "rollup-failed".to_owned(),
+            sir_status: "rollup_failed".to_owned(),
+            ..sir_meta_record()
+        })
+        .expect("failed row");
+
+    let marked = store
+        .mark_sir_stale(&[
+            "rollup-fresh".to_owned(),
+            "rollup-failed".to_owned(),
+            "rollup-missing".to_owned(),
+        ])
+        .expect("mark stale");
+    assert_eq!(marked, 1);
+    let status = |id: &str| {
+        store
+            .get_sir_meta(id)
+            .expect("meta")
+            .expect("exists")
+            .sir_status
+    };
+    assert_eq!(status("rollup-fresh"), "stale");
+    assert_eq!(status("rollup-failed"), "rollup_failed");
+    assert!(
+        store
+            .get_sir_meta("rollup-missing")
+            .expect("meta")
+            .is_none()
+    );
+}
