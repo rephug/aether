@@ -90,6 +90,11 @@ impl SurrealGraphStore {
             cache_surreal_handle(graph_dir.clone(), db.clone())?;
             db
         };
+        // Opens that share a handle (aetherd's dashboard and indexer) must not set up a new
+        // store's namespace and schema at the same time: SurrealKV rejects the overlapping
+        // writes with a transaction conflict. One open sets them up; the others wait.
+        let setup_lock = store_setup_lock(&graph_dir)?;
+        let _setup = setup_lock.lock().await;
         db.use_ns("aether")
             .use_db("graph")
             .await
@@ -907,6 +912,19 @@ fn cache_surreal_handle(graph_dir: std::path::PathBuf, db: Surreal<Db>) -> Resul
     Ok(())
 }
 
+fn store_setup_lock(
+    graph_dir: &std::path::Path,
+) -> Result<std::sync::Arc<tokio::sync::Mutex<()>>, StoreError> {
+    static LOCKS: OnceLock<
+        Mutex<HashMap<std::path::PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    > = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| StoreError::Graph("SurrealDB setup lock map poisoned".to_owned()))?;
+    Ok(locks.entry(graph_dir.to_path_buf()).or_default().clone())
+}
+
 fn is_schema_initialized(graph_dir: &std::path::Path) -> Result<bool, StoreError> {
     let cache = schema_init_cache()
         .lock()
@@ -1471,6 +1489,41 @@ mod tests {
                 .expect("read through the second handle"),
             vec!["sym-a".to_owned()]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn opens_sharing_a_new_handle_define_the_schema_once() {
+        // aetherd's dashboard and indexer can both get the cached handle of a new store
+        // before either has defined the schema. Defining it from both at once made
+        // SurrealKV reject one with a write conflict. Build that state directly (a cached
+        // handle, no schema yet) on fresh stores, so slow first opens don't interfere.
+        for round in 0..10 {
+            let temp = tempdir().expect("tempdir");
+            let graph_dir = temp
+                .path()
+                .join(format!("ws-{round}"))
+                .join(".aether")
+                .join("graph");
+            fs::create_dir_all(&graph_dir).expect("create graph dir");
+            let graph_dir = fs::canonicalize(&graph_dir).expect("canonical graph dir");
+            let db = Surreal::new::<SurrealKv>(graph_dir.clone())
+                .await
+                .expect("open SurrealKV");
+            cache_surreal_handle(graph_dir.clone(), db).expect("cache handle");
+
+            let workspace = graph_dir
+                .parent()
+                .and_then(Path::parent)
+                .expect("workspace")
+                .to_path_buf();
+            let opens = (0..4).map(|_| {
+                let workspace = workspace.clone();
+                tokio::spawn(async move { SurrealGraphStore::open(&workspace).await })
+            });
+            for open in futures::future::join_all(opens).await {
+                open.expect("open task").expect("open sharing a new handle");
+            }
+        }
     }
 
     #[tokio::test]
