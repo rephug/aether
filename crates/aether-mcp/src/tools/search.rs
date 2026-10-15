@@ -354,11 +354,13 @@ impl AetherMcpServer {
         for child_method in &child_methods {
             let child_key = child_method.id.clone();
 
+            // A call to an overloaded name is attributed to every overload, so callers
+            // count the methods they call by name.
             for caller in attribution.callers_of(child_method)? {
                 let entry = callers_by_id
                     .entry(caller.id.clone())
                     .or_insert_with(|| (caller, HashSet::new()));
-                entry.1.insert(child_key.clone());
+                entry.1.insert(child_method.qualified_name.clone());
             }
 
             for dependency in graph_store
