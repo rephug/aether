@@ -263,6 +263,12 @@ impl TestIntentAnalyzer {
             }
         }
 
+        if let Some(candidate) = java_main_source_for_test(normalized.as_str())
+            && let Some(existing) = self.ensure_existing_repo_file(candidate.as_str())
+        {
+            candidates.insert(existing);
+        }
+
         if normalized.contains("/__tests__/") {
             let candidate = normalized.replace("/__tests__/", "/");
             if let Some(existing) = self.ensure_existing_repo_file(candidate.as_str()) {
@@ -522,13 +528,35 @@ fn split_tests_dir(path: &str) -> Option<(String, String)> {
     Some((prefix.to_owned(), rest.to_owned()))
 }
 
+/// Maven and Gradle keep `src/test/java/<package>/FooTest.java` (or `FooTests`, or the
+/// integration-test `FooIT`) beside `src/main/java/<package>/Foo.java`.
+fn java_main_source_for_test(path: &str) -> Option<String> {
+    let (root, tail) = match path.strip_prefix("src/test/java/") {
+        Some(tail) => ("", tail),
+        None => {
+            let index = path.find("/src/test/java/")?;
+            (&path[..=index], &path[index + "/src/test/java/".len()..])
+        }
+    };
+    let stem = tail.strip_suffix(".java")?;
+    let base = ["Tests", "Test", "IT"]
+        .iter()
+        .find_map(|suffix| stem.strip_suffix(suffix))
+        .filter(|base| !base.is_empty() && !base.ends_with('/'))?;
+    Some(format!("{root}src/main/java/{base}.java"))
+}
+
 fn normalize_repo_path(path: &str) -> String {
     normalize_path(path.trim())
 }
 
 fn is_probably_test_file(path: &str) -> bool {
     let normalized = normalize_repo_path(path);
-    if normalized.contains("/tests/") || normalized.contains("/__tests__/") {
+    if normalized.contains("/tests/")
+        || normalized.contains("/__tests__/")
+        || normalized.starts_with("src/test/")
+        || normalized.contains("/src/test/")
+    {
         return true;
     }
 
@@ -646,6 +674,53 @@ mod tests {
         );
         assert!(is_probably_test_file("store/payment_test.go"));
         assert!(!is_probably_test_file("store/payment.go"));
+    }
+
+    #[test]
+    fn infers_java_target_file_from_maven_test_layout() {
+        let temp = tempdir().expect("tempdir");
+        let main_dir = temp.path().join("billing/src/main/java/com/acme");
+        let test_dir = temp.path().join("billing/src/test/java/com/acme");
+        fs::create_dir_all(&main_dir).expect("create main dir");
+        fs::create_dir_all(&test_dir).expect("create test dir");
+        fs::write(
+            main_dir.join("Payment.java"),
+            "package com.acme;\n\nclass Payment {}\n",
+        )
+        .expect("write source");
+        fs::write(
+            test_dir.join("PaymentTest.java"),
+            "package com.acme;\n\nclass PaymentTest {}\n",
+        )
+        .expect("write test");
+
+        let test_file = "billing/src/test/java/com/acme/PaymentTest.java";
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        store
+            .replace_test_intents_for_file(
+                test_file,
+                &[test_intent(test_file, "chargesCard", "charges card")],
+            )
+            .expect("write intents");
+
+        let analyzer = TestIntentAnalyzer::new(temp.path()).expect("create analyzer");
+        let links = analyzer
+            .refresh_for_test_file(test_file)
+            .expect("refresh links");
+        assert!(
+            links.iter().any(|link| {
+                link.target_file == "billing/src/main/java/com/acme/Payment.java"
+                    && link.inference_method == "naming_convention"
+                    && (link.confidence - 0.9).abs() < 1e-6
+            }),
+            "expected naming-convention link to Payment.java, got {links:?}"
+        );
+        assert!(is_probably_test_file(test_file));
+        assert_eq!(
+            java_main_source_for_test("src/test/java/a/WidgetIT.java").as_deref(),
+            Some("src/main/java/a/Widget.java")
+        );
+        assert_eq!(java_main_source_for_test("src/test/java/a/Test.java"), None);
     }
 
     #[test]

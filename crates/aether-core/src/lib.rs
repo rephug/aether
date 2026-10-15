@@ -171,6 +171,7 @@ pub enum Language {
     Jsx,
     Python,
     Go,
+    Java,
 }
 
 impl Language {
@@ -183,6 +184,7 @@ impl Language {
             Self::Jsx => "jsx",
             Self::Python => "python",
             Self::Go => "go",
+            Self::Java => "java",
         }
     }
 }

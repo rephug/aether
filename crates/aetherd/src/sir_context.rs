@@ -2257,6 +2257,7 @@ fn language_for_path(path: &Path) -> Option<Language> {
         Some("jsx") => Some(Language::Jsx),
         Some("py") => Some(Language::Python),
         Some("go") => Some(Language::Go),
+        Some("java") => Some(Language::Java),
         _ => None,
     }
 }
