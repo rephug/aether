@@ -120,7 +120,7 @@ pub(crate) fn load_causal_chain_data(
     let analyzer = CausalAnalyzer::new(shared.workspace.as_path()).map_err(|e| e.to_string())?;
     let result = match analyzer.trace_cause(TraceCauseRequest {
         target_symbol_id: symbol_id.to_owned(),
-        lookback: Some(common::parse_lookback_to_analyzer_input(lookback)),
+        lookback: Some(lookback.to_owned()),
         max_depth: Some(depth),
         limit: Some(50),
     }) {
@@ -158,7 +158,7 @@ pub(crate) fn load_causal_chain_data(
             CausalChainRow {
                 symbol_id: entry.symbol_id.clone(),
                 qualified_name: entry.symbol_name,
-                timestamp: parse_rfc3339_to_millis(entry.change.date.as_str())
+                timestamp: change_date_to_millis(entry.change.date.as_str())
                     .unwrap_or_else(|| support::current_unix_timestamp() * 1000),
                 drift_score: drift_by_symbol
                     .get(entry.symbol_id.as_str())
@@ -241,12 +241,56 @@ fn summarize_sir_diff(
     String::new()
 }
 
-fn parse_rfc3339_to_millis(input: &str) -> Option<i64> {
+/// Converts a causal change date to epoch milliseconds.
+///
+/// Changes matched to a commit carry an RFC 3339 commit date. Changes without commit
+/// metadata, such as those found by a day window, carry the SIR history `created_at` as
+/// a bare epoch number, which is in seconds or milliseconds depending on the writer.
+/// Values below the millisecond range are read as seconds, the same rule the dashboard
+/// uses elsewhere to normalize mixed timestamps.
+fn change_date_to_millis(input: &str) -> Option<i64> {
     let raw = input.trim();
     if raw.is_empty() {
         return None;
     }
-    DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .map(|value| value.with_timezone(&Utc).timestamp_millis())
+    if let Ok(value) = DateTime::parse_from_rfc3339(raw) {
+        return Some(value.with_timezone(&Utc).timestamp_millis());
+    }
+    let epoch = raw.parse::<i64>().ok().filter(|value| *value > 0)?;
+    if epoch < 1_000_000_000_000 {
+        Some(epoch.saturating_mul(1000))
+    } else {
+        Some(epoch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::change_date_to_millis;
+
+    #[test]
+    fn change_date_to_millis_reads_rfc3339_and_epoch_dates() {
+        assert_eq!(
+            change_date_to_millis("2023-11-14T22:13:20+00:00"),
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(
+            change_date_to_millis("2023-11-15T00:13:20+02:00"),
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(change_date_to_millis("1700000000"), Some(1_700_000_000_000));
+        assert_eq!(
+            change_date_to_millis(" 1700000000123 "),
+            Some(1_700_000_000_123)
+        );
+    }
+
+    #[test]
+    fn change_date_to_millis_rejects_unusable_dates() {
+        assert_eq!(change_date_to_millis(""), None);
+        assert_eq!(change_date_to_millis("   "), None);
+        assert_eq!(change_date_to_millis("0"), None);
+        assert_eq!(change_date_to_millis("-5"), None);
+        assert_eq!(change_date_to_millis("yesterday"), None);
+    }
 }

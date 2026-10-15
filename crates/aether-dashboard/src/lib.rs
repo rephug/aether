@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
-use axum::extract::Path;
-use axum::http::StatusCode;
+use axum::extract::{Path, Request};
+use axum::http::{Method, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Router, extract::State};
@@ -28,7 +29,58 @@ pub fn dashboard_router(state: Arc<SharedState>) -> Router {
         .merge(fragments::fragment_router())
         .merge(api::api_router())
         .route("/dashboard/{*path}", get(dashboard_shell_fallback))
+        .layer(middleware::from_fn(reject_cross_origin_writes))
         .with_state(app_state)
+}
+
+/// Rejects state-changing requests that a browser sent from another origin.
+///
+/// The dashboard has no authentication, and a form POST is a CORS "simple"
+/// request that browsers send cross-origin without a preflight, so without
+/// this check any web page could rewrite `.aether/config.toml`. Only the
+/// dashboard's own pages (`http://127.0.0.1:<port>` or
+/// `http://localhost:<port>`, which is also what the desktop webview loads)
+/// may write. Requests without `Origin`/`Sec-Fetch-Site` come from non-browser
+/// clients such as curl or the VS Code extension and are allowed.
+async fn reject_cross_origin_writes(request: Request, next: Next) -> Response {
+    if matches!(*request.method(), Method::GET | Method::HEAD) || is_same_origin(&request) {
+        return next.run(request).await;
+    }
+    (StatusCode::FORBIDDEN, "cross-origin request rejected").into_response()
+}
+
+fn is_same_origin(request: &Request) -> bool {
+    let headers = request.headers();
+    if let Some(site) = headers.get("sec-fetch-site")
+        && !matches!(site.as_bytes(), b"same-origin" | b"none")
+    {
+        return false;
+    }
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return true;
+    };
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            request
+                .uri()
+                .authority()
+                .map(|authority| authority.as_str())
+        });
+    let (Ok(origin), Some(host)) = (origin.to_str(), host) else {
+        return false;
+    };
+    let Some(origin_authority) = origin.strip_prefix("http://") else {
+        return false;
+    };
+    // Require a loopback name so a DNS-rebound hostname cannot pass as the
+    // dashboard, and the Host port so other local servers cannot either.
+    let origin_name = origin_authority
+        .rsplit_once(':')
+        .map_or(origin_authority, |(name, _port)| name);
+    (origin_name == "127.0.0.1" || origin_name.eq_ignore_ascii_case("localhost"))
+        && origin_authority.eq_ignore_ascii_case(host)
 }
 
 /// Stateless wizard-only router — serves the setup wizard UI without

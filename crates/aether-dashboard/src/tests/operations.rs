@@ -406,6 +406,37 @@ async fn presets_api_returns_builtin_presets() {
 }
 
 #[tokio::test]
+async fn presets_api_maps_client_errors_to_4xx() {
+    let (_tmp, app, _ids) = seeded_app().await;
+
+    let (status, json) =
+        send_json(&app, "POST", "/api/v1/presets", Some(r#"{"name":"   "}"#)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["error"], "bad_request");
+
+    let (status, json) =
+        send_json(&app, "POST", "/api/v1/presets", Some(r#"{"name":"quick"}"#)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json["error"], "conflict");
+
+    let (status, json) = send_json(&app, "DELETE", "/api/v1/presets/quick", None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json["error"], "conflict");
+
+    let (status, json) = send_json(&app, "DELETE", "/api/v1/presets/nope", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(json["error"], "not_found");
+
+    // A custom preset can still be created and deleted; deleting it twice is a 404.
+    let (status, _) = send_json(&app, "POST", "/api/v1/presets", Some(r#"{"name":"mine"}"#)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send_json(&app, "DELETE", "/api/v1/presets/mine", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send_json(&app, "DELETE", "/api/v1/presets/mine", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn presets_fragment_renders_preset_cards() {
     let (_tmp, app, _ids) = seeded_app().await;
 
@@ -430,6 +461,67 @@ async fn presets_fragment_renders_preset_cards() {
     assert!(body.contains("quick"));
     assert!(body.contains("built-in"));
     assert!(body.contains("Create Preset"));
+}
+
+#[tokio::test]
+async fn presets_fragment_delete_button_confirms_before_deleting() {
+    let (tmp, app, _ids) = seeded_app().await;
+    let presets_dir = tmp.path().join(".aether/presets");
+    fs::create_dir_all(&presets_dir).unwrap();
+    fs::write(
+        presets_dir.join("team-review.toml"),
+        "[preset]\nname = \"team-review\"\ndescription = \"Custom preset\"\n\n[context]\nbudget = 8000\n",
+    )
+    .unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/presets")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+
+    // Pull the onclick handler of the custom preset's Delete button out of the markup.
+    let fetch_at = body
+        .find("fetch('/api/v1/presets/team-review'")
+        .expect("custom preset should render a Delete button");
+    let onclick_start = body[..fetch_at]
+        .rfind("onclick=\"")
+        .expect("delete request should be sent from an onclick handler")
+        + "onclick=\"".len();
+    let onclick_end = onclick_start + body[onclick_start..].find('"').unwrap();
+    let onclick = &body[onclick_start..onclick_end];
+
+    // The DELETE removes a user file, so the handler must ask first and stop
+    // before the request when the dialog is cancelled.
+    assert!(
+        onclick.starts_with("if(!confirm(this.dataset.confirm))return;"),
+        "Delete must return before sending DELETE unless the user confirms; onclick was: {onclick}"
+    );
+
+    // The handler reads the prompt from data-confirm, so that attribute on the
+    // same button must carry the message.
+    let tag_start = body[..onclick_start]
+        .rfind("<button")
+        .expect("onclick should belong to a button");
+    let tag_end = onclick_end + body[onclick_end..].find('>').unwrap();
+    let button_tag = &body[tag_start..tag_end];
+    assert!(
+        button_tag.contains("data-confirm=\"Delete preset 'team-review'?\""),
+        "Delete button must carry the prompt in data-confirm; tag was: {button_tag}"
+    );
 }
 
 #[tokio::test]
@@ -496,6 +588,20 @@ async fn fingerprint_history_api_returns_timeline() {
     assert_eq!(json["data"]["symbol_id"].as_str().unwrap(), "sym-demo-run");
     assert!(json["data"]["entries"].is_array());
     assert_eq!(json["data"]["entries"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn fingerprint_history_api_without_symbol_id_returns_400() {
+    let (_tmp, app, _ids) = seeded_app().await;
+
+    for uri in [
+        "/api/v1/fingerprint-history",
+        "/api/v1/fingerprint-history?symbol_id=%20",
+    ] {
+        let (status, json) = send_json(&app, "GET", uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(json["error"], "bad_request", "{uri}");
+    }
 }
 
 #[tokio::test]

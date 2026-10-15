@@ -586,13 +586,21 @@ impl AetherMcpServer {
             .unwrap_or(DEFAULT_VIOLATION_LIMIT)
             .clamp(1, MAX_VIOLATION_LIMIT) as usize;
 
-        let violations = if let Some(symbol) = request.symbol.as_deref() {
-            let symbol = resolve_symbol_selector(store, SYMBOL_SELECTOR_LABEL, symbol)?;
-            store.list_violations_for_symbol(symbol.id.as_str(), limit)?
-        } else if let Some(contract_id) = request.contract_id {
-            store.list_violations_for_contract(contract_id, limit)?
-        } else {
-            store.list_recent_violations(limit)?
+        let violations = match (request.symbol.as_deref(), request.contract_id) {
+            (Some(symbol), Some(contract_id)) => {
+                let symbol = resolve_symbol_selector(store, SYMBOL_SELECTOR_LABEL, symbol)?;
+                store.list_violations_for_symbol_and_contract(
+                    symbol.id.as_str(),
+                    contract_id,
+                    limit,
+                )?
+            }
+            (Some(symbol), None) => {
+                let symbol = resolve_symbol_selector(store, SYMBOL_SELECTOR_LABEL, symbol)?;
+                store.list_violations_for_symbol(symbol.id.as_str(), limit)?
+            }
+            (None, Some(contract_id)) => store.list_violations_for_contract(contract_id, limit)?,
+            (None, None) => store.list_recent_violations(limit)?,
         };
 
         let symbol_ids = violations
@@ -1004,6 +1012,74 @@ model = "{embedding_model}"
         );
         assert_eq!(response.violations[0].violation_type, "embedding_fail");
         assert_eq!(response.violations[0].confidence, Some(0.42));
+    }
+
+    #[test]
+    fn contract_violations_applies_symbol_and_contract_filters_together() {
+        let temp = tempdir().expect("tempdir");
+        write_test_config(temp.path(), false, "mock-64d");
+        seed_symbol(temp.path(), "sym-violation", "crate::violations::run");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        let first_contract = store
+            .insert_intent_contract(
+                "sym-violation",
+                "must",
+                "reject zero amounts",
+                None,
+                "tester",
+            )
+            .expect("insert first contract");
+        let second_contract = store
+            .insert_intent_contract(
+                "sym-violation",
+                "must_not",
+                "panic on bad input",
+                None,
+                "tester",
+            )
+            .expect("insert second contract");
+        let first_violation = store
+            .insert_intent_violation(
+                first_contract,
+                "sym-violation",
+                2,
+                "embedding_fail",
+                Some(0.42),
+                None,
+            )
+            .expect("insert first violation");
+        store
+            .insert_intent_violation(
+                second_contract,
+                "sym-violation",
+                3,
+                "embedding_fail",
+                Some(0.31),
+                None,
+            )
+            .expect("insert second violation");
+        let server = AetherMcpServer::new(temp.path(), false).expect("server");
+
+        let response = server
+            .aether_contract_violations_logic(AetherContractViolationsRequest {
+                symbol: Some("crate::violations::run".to_owned()),
+                contract_id: Some(first_contract),
+                limit: Some(10),
+            })
+            .expect("list violations by symbol and contract");
+        assert_eq!(response.total, 1);
+        assert_eq!(response.violations[0].id, first_violation);
+        assert_eq!(response.violations[0].contract_id, first_contract);
+
+        let response = server
+            .aether_contract_violations_logic(AetherContractViolationsRequest {
+                symbol: Some("crate::violations::run".to_owned()),
+                contract_id: Some(9999),
+                limit: Some(10),
+            })
+            .expect("list violations for unknown contract");
+        assert_eq!(response.total, 0);
+        assert!(response.violations.is_empty());
     }
 
     #[test]

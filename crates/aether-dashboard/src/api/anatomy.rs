@@ -149,6 +149,13 @@ struct SirData {
     is_async: bool,
 }
 
+/// One file's symbols gathered across every layer they were classified into.
+struct FileDetailParts<'a> {
+    source_path: String,
+    layer_names: Vec<String>,
+    symbols: Vec<&'a RawSymbol>,
+}
+
 pub(crate) async fn anatomy_handler(State(state): State<Arc<DashboardState>>) -> impl IntoResponse {
     let shared = state.shared.clone();
     match support::run_blocking_with_timeout(move || load_anatomy_build(shared.as_ref())).await {
@@ -215,7 +222,7 @@ pub(crate) fn load_anatomy_build(shared: &SharedState) -> Result<AnatomyBuild, S
 
     let mut layers = Vec::<AnatomyLayer>::new();
     let mut layers_by_name = HashMap::<String, LayerDetail>::new();
-    let mut files_by_path = HashMap::<String, FileDetail>::new();
+    let mut file_parts = BTreeMap::<String, FileDetailParts<'_>>::new();
 
     for layer_name in layer_order {
         let Some(symbols_for_layer) = by_layer.get(layer_name.as_str()) else {
@@ -269,26 +276,19 @@ pub(crate) fn load_anatomy_build(shared: &SharedState) -> Result<AnatomyBuild, S
                 symbols: symbol_names,
             });
 
-            let mut file_detail_symbols = file_symbols
-                .iter()
-                .map(|symbol| FileSymbolDetail {
-                    name: symbol.name.clone(),
-                    qualified_name: symbol.qualified_name.clone(),
-                    kind: symbol.kind.clone(),
-                    sir_intent: common::first_sentence(symbol.sir.intent.as_str()),
-                })
-                .collect::<Vec<_>>();
-            file_detail_symbols.sort_by(|left, right| left.name.cmp(&right.name));
-
-            files_by_path.insert(
-                normalized_path.clone(),
-                FileDetail {
-                    path: normalized_path,
-                    layer_name: layer.name.clone(),
-                    summary: summary_text,
-                    symbols: file_detail_symbols,
-                },
-            );
+            // Layers are assigned per symbol, so one file can show up under several
+            // layers. Collect its symbols from every layer before building the detail.
+            let parts = file_parts
+                .entry(normalized_path)
+                .or_insert_with(|| FileDetailParts {
+                    source_path: file_path.clone(),
+                    layer_names: Vec::new(),
+                    symbols: Vec::new(),
+                });
+            if parts.layer_names.last() != Some(&layer.name) {
+                parts.layer_names.push(layer.name.clone());
+            }
+            parts.symbols.extend(file_symbols.iter().copied());
 
             symbols_for_narrative.extend(file_symbol_infos);
         }
@@ -321,6 +321,14 @@ pub(crate) fn load_anatomy_build(shared: &SharedState) -> Result<AnatomyBuild, S
         layers.push(layer_entry);
     }
 
+    let files_by_path = file_parts
+        .into_iter()
+        .map(|(path, parts)| {
+            let detail = build_file_detail(path.clone(), parts, &assignments.symbol_to_layer);
+            (path, detail)
+        })
+        .collect::<HashMap<_, _>>();
+
     let key_actors = build_key_actors(
         shared,
         raw_symbols.as_slice(),
@@ -344,6 +352,38 @@ pub(crate) fn load_anatomy_build(shared: &SharedState) -> Result<AnatomyBuild, S
         layers_by_name,
         files_by_path,
     })
+}
+
+fn build_file_detail(
+    path: String,
+    parts: FileDetailParts<'_>,
+    assignments: &HashMap<String, String>,
+) -> FileDetail {
+    let mut symbol_infos = parts
+        .symbols
+        .iter()
+        .map(|symbol| to_narrative_symbol(symbol, assignments))
+        .collect::<Vec<_>>();
+    symbol_infos.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let mut symbols = parts
+        .symbols
+        .iter()
+        .map(|symbol| FileSymbolDetail {
+            name: symbol.name.clone(),
+            qualified_name: symbol.qualified_name.clone(),
+            kind: symbol.kind.clone(),
+            sir_intent: common::first_sentence(symbol.sir.intent.as_str()),
+        })
+        .collect::<Vec<_>>();
+    symbols.sort_by(|left, right| left.name.cmp(&right.name));
+
+    FileDetail {
+        path,
+        layer_name: parts.layer_names.join(", "),
+        summary: compose_file_summary(parts.source_path.as_str(), symbol_infos.as_slice()),
+        symbols,
+    }
 }
 
 fn cached_project_summary(

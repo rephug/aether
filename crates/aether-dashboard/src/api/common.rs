@@ -365,16 +365,6 @@ pub(crate) async fn co_change_between_files(
     })
 }
 
-pub(crate) fn parse_lookback_to_analyzer_input(raw: &str) -> String {
-    let trimmed = raw.trim().to_ascii_lowercase();
-    match trimmed.as_str() {
-        "7d" => "7 days".to_owned(),
-        "30d" => "30 days".to_owned(),
-        "90d" => "90 days".to_owned(),
-        _ => trimmed,
-    }
-}
-
 pub(crate) fn sparkline_placeholder(value: f64, points: usize) -> Vec<f64> {
     let mut out = Vec::with_capacity(points);
     for idx in 0..points {

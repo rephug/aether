@@ -469,8 +469,20 @@ impl SqliteStore {
         let Some(content) = self.read_legacy_mirror(symbol_id)? else {
             return Ok(None);
         };
-        self.upsert_sir_json_only(symbol_id, &content)?;
+        // The backfill into SQLite is a write. A read-only handle (the dashboard)
+        // serves the mirror as is rather than failing the read on it.
+        if !self.is_read_only() {
+            self.upsert_sir_json_only(symbol_id, &content)?;
+        }
         Ok(Some(content))
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.conn
+            .lock()
+            .unwrap()
+            .is_readonly(rusqlite::DatabaseName::Main)
+            .unwrap_or(false)
     }
 
     /// The legacy file mirror of a symbol's SIR JSON, if one exists (`Ok(None)` when the

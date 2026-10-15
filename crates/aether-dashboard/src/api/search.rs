@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
@@ -21,6 +21,23 @@ pub(crate) struct SearchQuery {
     pub risk: Option<String>,
     pub drift: Option<String>,
     pub has_tests: Option<bool>,
+}
+
+/// Rows read from the store when a filter is set. Filters run after the store
+/// query, so a filtered search reads the store's maximum window (100 rows) and
+/// stops once `limit` rows have passed the filters.
+pub(crate) const FILTERED_SEARCH_WINDOW: u32 = 100;
+
+impl SearchQuery {
+    /// True when any lang/risk/drift/has_tests filter is set.
+    pub(crate) fn has_filters(&self) -> bool {
+        let is_set = |value: &Option<String>| {
+            value
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        };
+        is_set(&self.lang) || is_set(&self.risk) || is_set(&self.drift) || self.has_tests.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -73,10 +90,20 @@ pub(crate) async fn search_handler(
     }
 }
 
+/// Ids of the symbols `/api/v1/search` returns for `query`.
+pub(crate) async fn matching_symbol_ids(
+    shared: Arc<SharedState>,
+    query: SearchQuery,
+) -> Result<HashSet<String>, String> {
+    let data = load_search_data(shared, query).await?;
+    Ok(data.results.into_iter().map(|row| row.symbol_id).collect())
+}
+
 async fn load_search_data(
     shared: Arc<SharedState>,
     query: SearchQuery,
 ) -> Result<SearchApiData, String> {
+    let has_filters = query.has_filters();
     let q = query.q.unwrap_or_default();
     let requested_mode = query
         .mode
@@ -89,6 +116,11 @@ async fn load_search_data(
     };
 
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
+    let store_limit = if has_filters {
+        FILTERED_SEARCH_WINDOW
+    } else {
+        limit
+    };
 
     // Lexical fallback for all modes at this stage.
     let mode_not_computed = mode != "lexical";
@@ -99,7 +131,7 @@ async fn load_search_data(
             let shared_sync = shared_sync.as_ref();
             let results = shared_sync
                 .store
-                .search_symbols(&q_sync, limit)
+                .search_symbols(&q_sync, store_limit)
                 .map_err(|err| err.to_string())?;
             let edges = common::load_dependency_algo_edges(shared_sync)?;
             let drift_map = common::latest_drift_score_by_symbol(shared_sync).unwrap_or_default();
@@ -129,6 +161,10 @@ async fn load_search_data(
 
     let mut mapped = Vec::new();
     for row in results {
+        if mapped.len() >= limit as usize {
+            break;
+        }
+
         if let Some(lang) = query.lang.as_deref().map(str::trim)
             && !lang.is_empty()
             && !row.language.eq_ignore_ascii_case(lang)
