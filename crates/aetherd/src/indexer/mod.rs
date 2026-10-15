@@ -63,7 +63,9 @@ use self::worker::{SharedQueueState, enqueue_symbols_missing_sir, spawn_semantic
 
 use self::quality::{run_deep_pass, run_triage_pass};
 use self::reconciliation::{plan_symbol_reconciliation, print_reconciliation_dry_run};
-use self::snapshot::{delete_vector_embeddings, files_with_outdated_rollups, sync_snapshot};
+use self::snapshot::{
+    delete_vector_embeddings, files_with_outdated_rollups, symbols_with_stale_source, sync_snapshot,
+};
 
 const REQUEST_POLL_BATCH: usize = 128;
 const WORKER_IDLE_SLEEP_MS: u64 = 200;
@@ -229,7 +231,8 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
 
         // A dry run writes nothing, so every id in the store predates the snapshot.
         let pre_existing_ids = store.list_all_symbol_ids()?.into_iter().collect();
-        let plan = plan_symbol_reconciliation(&store, &symbols_by_id, &pre_existing_ids)?;
+        let mut plan = plan_symbol_reconciliation(&store, &symbols_by_id, &pre_existing_ids)?;
+        plan.spare_unread_files(observer.unread_paths());
         let mut stdout = std::io::stdout();
         print_reconciliation_dry_run(&plan, &mut stdout)?;
         return Ok(());
@@ -246,6 +249,7 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
         &mut structural,
         &initial_events,
         &symbols_by_id,
+        observer.unread_paths(),
         |symbol_ids| sir_pipeline.delete_embeddings(symbol_ids),
     )?;
 
@@ -260,10 +264,10 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
     let candidate_symbol_ids = if config.force {
         store.list_all_symbol_ids()?
     } else {
-        // Symbols without a SIR, and symbols whose SIR is stale: written for a body the
-        // symbol no longer has (the snapshot sync marked it), or left by a failed attempt.
+        // Symbols without a SIR, and symbols whose SIR the snapshot sync marked stale
+        // because it was written for a body the symbol no longer has.
         let mut ids = store.list_symbol_ids_without_sir()?;
-        ids.extend(store.list_symbol_ids_with_stale_sir()?);
+        ids.extend(symbols_with_stale_source(&store, &symbols_by_id)?);
         ids.sort();
         ids.dedup();
         ids
@@ -447,6 +451,7 @@ fn run_initial_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> 
         &mut structural,
         &initial_events,
         &symbols_by_id,
+        observer.unread_paths(),
         |symbol_ids| delete_vector_embeddings(&config.workspace, symbol_ids),
     )?;
 
