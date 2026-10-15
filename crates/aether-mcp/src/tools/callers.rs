@@ -24,7 +24,7 @@ use std::path::Path;
 use aether_parse::ModuleRoots;
 use aether_store::{
     NameSite, SqliteStore, SymbolRecord, SymbolRelationStore, call_target_candidates,
-    call_targets_of, narrow_name_candidates,
+    call_targets_of, narrow_call_edge_candidates, narrow_name_candidates,
 };
 
 use crate::AetherMcpError;
@@ -32,17 +32,33 @@ use crate::AetherMcpError;
 pub(crate) struct CallerAttribution<'a> {
     store: &'a SqliteStore,
     modules: ModuleRoots,
+    /// Whether a Rust bare-name call reaches only methods in the caller's own file
+    /// ([`narrow_call_edge_candidates`]), as context views resolve call edges.
+    member_calls_within_file: bool,
     candidates_by_target: HashMap<String, Vec<SymbolRecord>>,
     records_by_id: HashMap<String, Option<SymbolRecord>>,
 }
 
 impl<'a> CallerAttribution<'a> {
+    /// Attribution for `aether_dependencies`: a Rust bare-name call can reach a method
+    /// anywhere in the caller's module.
     pub(crate) fn new(store: &'a SqliteStore, workspace_root: &Path) -> Self {
         Self {
             store,
             modules: ModuleRoots::new(workspace_root),
+            member_calls_within_file: false,
             candidates_by_target: HashMap::new(),
             records_by_id: HashMap::new(),
+        }
+    }
+
+    /// Attribution for context views, which resolve call edges the same way in both
+    /// directions: a Rust bare-name call reaches a method only in the caller's own
+    /// file, so calls such as `v.len()` don't crowd a method's callers.
+    pub(crate) fn for_context(store: &'a SqliteStore, workspace_root: &Path) -> Self {
+        Self {
+            member_calls_within_file: true,
+            ..Self::new(store, workspace_root)
         }
     }
 
@@ -88,15 +104,21 @@ impl<'a> CallerAttribution<'a> {
         target: &str,
         symbol: &SymbolRecord,
     ) -> Result<bool, AetherMcpError> {
-        let candidates =
-            call_target_candidates(self.candidates(target)?, target, caller.language.as_str());
+        self.candidates(target)?;
+        let candidates = &self.candidates_by_target[target];
         let modules = &mut self.modules;
-        Ok(
-            narrow_name_candidates(candidates, Some(NameSite::of(caller)), &mut |file_path| {
-                modules.module_of(file_path)
-            })
-            .reaches(symbol),
-        )
+        let mut module_of = |file_path: &str| modules.module_of(file_path);
+        let site = NameSite::of(caller);
+        let resolution = if self.member_calls_within_file {
+            narrow_call_edge_candidates(candidates, target, site, &mut module_of)
+        } else {
+            narrow_name_candidates(
+                call_target_candidates(candidates, target, caller.language.as_str()),
+                Some(site),
+                &mut module_of,
+            )
+        };
+        Ok(resolution.reaches(symbol))
     }
 
     fn candidates(&mut self, target: &str) -> Result<&Vec<SymbolRecord>, AetherMcpError> {

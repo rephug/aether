@@ -4,7 +4,7 @@ use std::path::Path;
 
 use aether_analysis::{HealthAnalyzer, HealthInclude, HealthRequest};
 use aether_config::GraphBackend;
-use aether_core::{EdgeKind, Position, SourceRange};
+use aether_core::{EdgeKind, Position, SourceRange, SymbolEdge};
 use aether_parse::{ModuleRoots, SymbolExtractor, language_for_path};
 use aether_sir::SirAnnotation;
 use aether_store::{
@@ -460,7 +460,7 @@ fn collect_test_intents(
     );
     // Test intents usually point at the test function, not the code under test, so
     // look at who calls this symbol.
-    for caller in CallerAttribution::new(store, workspace).callers_of(record)? {
+    for caller in CallerAttribution::for_context(store, workspace).callers_of(record)? {
         append(
             store.list_test_intents_for_symbol(caller.id.as_str())?,
             "direct test caller",
@@ -528,6 +528,25 @@ fn ambiguous_graph_entry(
     }
 }
 
+/// What the target of `edge`, written by `source`, names: a call by the rule for call
+/// edges ([`narrow_call_edge_candidates`](aether_store::narrow_call_edge_candidates)),
+/// any other edge by its exact qualified name.
+fn resolve_dependency(
+    store: &aether_store::SqliteStore,
+    edge: &SymbolEdge,
+    source: &SymbolRecord,
+    modules: &mut ModuleRoots,
+) -> Result<NameResolution, AetherMcpError> {
+    let target = edge.target_qualified_name.as_str();
+    let site = NameSite::of(source);
+    let mut module_of = |file_path: &str| modules.module_of(file_path);
+    Ok(if edge.edge_kind == EdgeKind::Calls {
+        store.resolve_call_edge(target, site, &mut module_of)?
+    } else {
+        store.resolve_qualified_name(target, Some(site), &mut module_of)?
+    })
+}
+
 /// The callers of `record`, its dependencies and, from depth 2, their dependencies.
 ///
 /// A dependency's name resolves from the file of the symbol that wrote it (see
@@ -544,7 +563,7 @@ fn build_graph_entries(
     let mut seen = HashSet::<String>::new();
     let mut modules = ModuleRoots::new(workspace);
 
-    for caller in CallerAttribution::new(store, workspace).callers_of(record)? {
+    for caller in CallerAttribution::for_context(store, workspace).callers_of(record)? {
         if !seen.insert(format!("caller::{}", caller.id)) {
             continue;
         }
@@ -565,11 +584,7 @@ fn build_graph_entries(
         store.list_symbol_edges_for_source_and_kinds(record.id.as_str(), &DEPENDENCY_EDGE_KINDS)?;
     let mut frontier = Vec::<SymbolRecord>::new();
     for edge in direct_dependencies {
-        let target = match store.resolve_qualified_name(
-            edge.target_qualified_name.as_str(),
-            Some(NameSite::of(record)),
-            &mut |file_path| modules.module_of(file_path),
-        )? {
+        let target = match resolve_dependency(store, &edge, record, &mut modules)? {
             NameResolution::Found(mut overloads) => overloads.swap_remove(0),
             NameResolution::NotFound => continue,
             NameResolution::Ambiguous(candidates) => {
@@ -620,11 +635,7 @@ fn build_graph_entries(
                 source.id.as_str(),
                 &DEPENDENCY_EDGE_KINDS,
             )? {
-                let target = match store.resolve_qualified_name(
-                    edge.target_qualified_name.as_str(),
-                    Some(NameSite::of(&source)),
-                    &mut |file_path| modules.module_of(file_path),
-                )? {
+                let target = match resolve_dependency(store, &edge, &source, &mut modules)? {
                     NameResolution::Found(mut overloads) => overloads.swap_remove(0),
                     NameResolution::NotFound => continue,
                     NameResolution::Ambiguous(candidates) => {
@@ -1325,6 +1336,59 @@ vector_backend = "sqlite"
             .map(|entry| entry.qualified_name.as_str())
             .collect::<Vec<_>>();
         assert_eq!(callers, vec!["Job::run"]);
+    }
+
+    #[test]
+    fn graph_context_resolves_rust_method_calls_within_the_callers_file() {
+        // `S::run` calls `self.helper()`, recorded as the bare name `helper`. `S::helper`
+        // is in the same file, so that is the callee; the free `helper` in another file
+        // of the crate is not, and `main`'s `v.len()` doesn't reach `Buf::len`.
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let store = SqliteStore::open(workspace).expect("open store");
+        let rust = |id: &str, file_path: &str, kind: &str, qualified_name: &str| SymbolRecord {
+            id: id.to_owned(),
+            file_path: file_path.to_owned(),
+            language: "rust".to_owned(),
+            kind: kind.to_owned(),
+            qualified_name: qualified_name.to_owned(),
+            signature_fingerprint: format!("sig-{id}"),
+            last_seen_at: 1_700_000_000,
+        };
+        let run = rust("run", "src/s.rs", "method", "S::run");
+        let method_helper = rust("s-helper", "src/s.rs", "method", "S::helper");
+        let free_helper = rust("free-helper", "src/util.rs", "function", "helper");
+        let buf_len = rust("buf-len", "src/buf.rs", "method", "Buf::len");
+        let main = rust("main", "src/main.rs", "function", "main");
+        for record in [&run, &method_helper, &free_helper, &buf_len, &main] {
+            store.upsert_symbol(record.clone()).expect("upsert symbol");
+        }
+        let call = |source: &SymbolRecord, target: &str| SymbolEdge {
+            source_id: source.id.clone(),
+            target_qualified_name: target.to_owned(),
+            edge_kind: EdgeKind::Calls,
+            file_path: source.file_path.clone(),
+        };
+        store
+            .upsert_edges(&[call(&run, "helper"), call(&main, "len")])
+            .expect("upsert edges");
+
+        let section = |record: &SymbolRecord, section: &str| {
+            super::build_graph_entries(&store, workspace, record, 1)
+                .expect("graph entries")
+                .into_iter()
+                .filter(|entry| entry.section == section)
+                .map(|entry| entry.qualified_name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(section(&run, "callees"), vec!["S::helper".to_owned()]);
+        assert_eq!(
+            section(&method_helper, "callers"),
+            vec!["S::run".to_owned()]
+        );
+        assert!(section(&free_helper, "callers").is_empty());
+        assert!(section(&main, "callees").is_empty());
+        assert!(section(&buf_len, "callers").is_empty());
     }
 
     #[test]

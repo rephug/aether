@@ -77,7 +77,7 @@ pub use language_family::{
 };
 pub use name_resolution::{
     NameResolution, NameSite, ambiguity_label, ambiguity_note, call_target_candidates,
-    call_targets_of, narrow_name_candidates,
+    call_targets_of, narrow_call_edge_candidates, narrow_name_candidates,
 };
 pub use project_notes::{
     ProjectEntityRefRecord, ProjectNoteEmbeddingRecord, ProjectNoteRecord,

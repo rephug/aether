@@ -11,7 +11,7 @@ use aether_store::{
     CouplingEdgeRecord, DriftStore, NameResolution, NameSite, ProjectNoteStore, SirStateStore,
     SqliteStore, SurrealGraphStore, SymbolCatalogStore, SymbolRecord, SymbolRelationStore,
     TaskContextHistoryRecord, TestIntentStore, ambiguity_label, ambiguity_note,
-    block_on_store_future, call_target_candidates, call_targets_of, narrow_name_candidates,
+    block_on_store_future, call_targets_of, narrow_call_edge_candidates, narrow_name_candidates,
     open_surreal_graph_store_readonly,
 };
 use anyhow::{Context, Result, anyhow};
@@ -2619,9 +2619,9 @@ impl<'a> NameResolver<'a> {
     }
 
     /// The callers whose call edges resolve to `symbol` or one of its overloads, each
-    /// once, attributed the way MCP `aether_dependencies` attributes them: an edge to
-    /// the symbol's qualified name or, for a Rust method, its bare name counts when it
-    /// resolves from the caller's file to `symbol`.
+    /// once: an edge to the symbol's qualified name or, for a Rust method, its bare name
+    /// counts when it resolves from the caller to `symbol` by the rule for call edges
+    /// ([`narrow_call_edge_candidates`]), as MCP context views do.
     fn callers_of(&mut self, symbol: &SymbolRecord) -> Result<Vec<SymbolRecord>> {
         let mut seen = HashSet::new();
         let mut callers = Vec::new();
@@ -2660,15 +2660,11 @@ impl<'a> NameResolver<'a> {
             self.call_candidates_by_target
                 .insert(target.to_owned(), candidates);
         }
-        let candidates = call_target_candidates(
+        let modules = &mut self.modules;
+        Ok(narrow_call_edge_candidates(
             &self.call_candidates_by_target[target],
             target,
-            site.language.as_str(),
-        );
-        let modules = &mut self.modules;
-        Ok(narrow_name_candidates(
-            candidates,
-            Some(NameSite::of(site)),
+            NameSite::of(site),
             &mut |file_path| modules.module_of(file_path),
         ))
     }

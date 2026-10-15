@@ -177,6 +177,44 @@ pub fn call_target_candidates(
         .collect()
 }
 
+/// Narrows the symbols a call edge's target can name when `site` writes it, for context
+/// views. The Rust parser records a method call by the method name alone
+/// (`self.alpha()` → `alpha`), so for a Rust site a bare target names the symbols with
+/// that name declared in the site's own file, `Type::alpha` included, when there are
+/// any. Otherwise, and in other languages, it names exactly the symbols with that
+/// qualified name. Unlike [`call_target_candidates`], which `aether_dependencies` uses,
+/// a bare target never reaches a method in another file, so a call such as `v.len()`
+/// on a library type doesn't count for a workspace `MyBuf::len`.
+///
+/// `candidates` come from [`SqliteStore::list_symbols_for_call_target`].
+pub fn narrow_call_edge_candidates(
+    candidates: &[SymbolRecord],
+    target: &str,
+    site: NameSite<'_>,
+    module_of: &mut dyn FnMut(&str) -> Option<PathBuf>,
+) -> NameResolution {
+    let target = target.trim();
+    if site.language == "rust" && !target.contains("::") {
+        let in_file = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.file_path == site.file_path
+                    && same_language_family(candidate.language.as_str(), site.language)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !in_file.is_empty() {
+            return narrow_name_candidates(in_file, Some(site), module_of);
+        }
+    }
+    let exact = candidates
+        .iter()
+        .filter(|candidate| candidate.qualified_name == target)
+        .cloned()
+        .collect();
+    narrow_name_candidates(exact, Some(site), module_of)
+}
+
 impl SqliteStore {
     /// Every symbol with exactly this qualified name, ordered by file and ID.
     pub fn list_symbols_by_qualified_name(
@@ -209,6 +247,23 @@ impl SqliteStore {
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Resolves the target of a call edge written at `site`, for context views (see
+    /// [`narrow_call_edge_candidates`]).
+    pub fn resolve_call_edge(
+        &self,
+        target: &str,
+        site: NameSite<'_>,
+        module_of: &mut dyn FnMut(&str) -> Option<PathBuf>,
+    ) -> Result<NameResolution, StoreError> {
+        let candidates = self.list_symbols_for_call_target(target)?;
+        Ok(narrow_call_edge_candidates(
+            &candidates,
+            target,
+            site,
+            module_of,
+        ))
     }
 
     /// Resolves `qualified_name` as written at `site` (see [`narrow_name_candidates`]).
@@ -334,6 +389,73 @@ mod tests {
         assert_eq!(
             narrow_name_candidates(Vec::new(), None, &mut first_segment),
             NameResolution::NotFound
+        );
+    }
+
+    #[test]
+    fn rust_bare_call_targets_reach_methods_in_the_callers_file_only() {
+        let rust = |id: &str, file_path: &str, qualified_name: &str| {
+            symbol(id, file_path, "rust", qualified_name)
+        };
+        // `list_symbols_for_call_target("helper")`: the exact name and every `::helper`.
+        let helpers = vec![
+            rust("s-helper", "core/src/lib.rs", "S::helper"),
+            rust("free-helper", "core/src/util.rs", "helper"),
+        ];
+        let at = |file_path, language| NameSite {
+            file_path,
+            language,
+        };
+
+        // `self.helper()` inside `S`'s file reaches `S::helper`, not the free function.
+        let in_impl = narrow_call_edge_candidates(
+            &helpers,
+            "helper",
+            at("core/src/lib.rs", "rust"),
+            &mut first_segment,
+        );
+        assert_eq!(
+            in_impl.found().map(|found| found.id.as_str()),
+            Some("s-helper")
+        );
+        // Elsewhere a bare `helper()` names the free function only.
+        let elsewhere = narrow_call_edge_candidates(
+            &helpers,
+            "helper",
+            at("core/src/main.rs", "rust"),
+            &mut first_segment,
+        );
+        assert_eq!(
+            elsewhere.found().map(|found| found.id.as_str()),
+            Some("free-helper")
+        );
+
+        // `v.len()` outside `MyBuf`'s file doesn't count for `MyBuf::len`.
+        let lens = vec![rust("buf-len", "core/src/buf.rs", "MyBuf::len")];
+        assert_eq!(
+            narrow_call_edge_candidates(
+                &lens,
+                "len",
+                at("core/src/main.rs", "rust"),
+                &mut first_segment
+            ),
+            NameResolution::NotFound
+        );
+        // Other languages record calls by qualified name, so only exact names count.
+        let java = vec![
+            symbol("get", "billing/Users.java", "java", "Users::get"),
+            symbol("other", "billing/Users.java", "java", "Other::get"),
+        ];
+        assert_eq!(
+            narrow_call_edge_candidates(
+                &java,
+                "Users::get",
+                at("billing/App.java", "java"),
+                &mut first_segment
+            )
+            .found()
+            .map(|found| found.id.as_str()),
+            Some("get")
         );
     }
 

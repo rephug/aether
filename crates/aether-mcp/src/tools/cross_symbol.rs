@@ -355,7 +355,7 @@ impl AetherMcpServer {
         let mut callee_count = 0u32;
         let mut max_discovered_depth = 0u32;
         let mut modules = ModuleRoots::new(self.workspace());
-        let mut attribution = CallerAttribution::new(store, self.workspace());
+        let mut attribution = CallerAttribution::for_context(store, self.workspace());
         // Callee names that several symbols share and the caller's file and module
         // don't narrow to one; they aren't followed.
         let mut ambiguous_callees = Vec::<String>::new();
@@ -401,9 +401,9 @@ impl AetherMcpServer {
                     record.id.as_str(),
                     &[EdgeKind::Calls],
                 )? {
-                    let target = match store.resolve_qualified_name(
+                    let target = match store.resolve_call_edge(
                         edge.target_qualified_name.as_str(),
-                        Some(NameSite::of(&record)),
+                        NameSite::of(&record),
                         &mut |file_path| modules.module_of(file_path),
                     )? {
                         NameResolution::Found(mut overloads) => overloads.swap_remove(0),

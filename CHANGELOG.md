@@ -55,6 +55,16 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Name resolution across languages and modules (#214). Edges resolve only to symbols of
+  the source's language family (TypeScript and JavaScript count as one), so a Java call
+  no longer reaches a same-named TypeScript method. Callers of Java and C# classes are
+  narrowed to their Maven or Gradle module or .NET project. Context views resolve a
+  shared qualified name from the referring file, then its module, and list the name as
+  ambiguous instead of picking one. Selecting a name several symbols share, overloads
+  included, now fails with the candidates' IDs instead of returning the lowest ID.
+  Because cross-language edges drop out of neighbor context, the next `aetherd batch
+  run` regenerates symbols whose callers or callees change. This is expected and
+  happens once.
 - `inference.provider = "openai_compat"` now sends `[inference] thinking` as
   `reasoning_effort`, as `omp` already did. `[inference] timeout_secs` now lifts the
   request timeout of `openai_compat` and `omp` as well as `qwen3_local`, so a model that
