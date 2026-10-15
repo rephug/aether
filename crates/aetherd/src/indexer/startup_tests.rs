@@ -69,6 +69,10 @@ fn daemon_startup_queues_symbols_edited_while_it_was_down() {
         "an unchanged symbol is not queued, even one a failed attempt left stale"
     );
     drop(queue);
+    assert!(
+        queue_state.take_pending_rollup_chunk(usize::MAX).is_none(),
+        "the module's rollup is rebuilt with its queued leaf, not set aside"
+    );
     assert_eq!(leaf(&store, &edited.id).expect("SIR").status, "stale");
     assert!(
         !stored_symbol_ids(&store).contains(&vanished.id),
@@ -95,9 +99,9 @@ fn daemon_startup_rebuilds_outdated_rollups_once_the_queue_drains() {
         "stale"
     );
 
-    // Nothing is queued (no leaf changed), so a worker takes the rollups straight away.
+    // No leaf of the file changed, so nothing rebuilds its rollup but the workers.
     let pending = queue_state
-        .take_pending_rollups_when_idle()
+        .take_pending_rollup_chunk(usize::MAX)
         .expect("the rollup of the file that lost a symbol is set aside");
     assert!(pending.contains_key(MODULE));
     let pipeline = SirPipeline::new(
@@ -121,7 +125,7 @@ fn daemon_startup_rebuilds_outdated_rollups_once_the_queue_drains() {
             .sir_status,
         "fresh"
     );
-    assert!(queue_state.take_pending_rollups_when_idle().is_none());
+    assert!(queue_state.take_pending_rollup_chunk(usize::MAX).is_none());
 }
 
 #[test]

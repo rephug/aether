@@ -72,6 +72,8 @@ use self::snapshot::{
 };
 
 const REQUEST_POLL_BATCH: usize = 128;
+/// File rollups a worker rebuilds per turn from those left outdated at startup.
+const PENDING_ROLLUP_CHUNK: usize = 4;
 const WORKER_IDLE_SLEEP_MS: u64 = 200;
 #[derive(Debug, Clone)]
 pub struct IndexerConfig {
@@ -674,8 +676,9 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
 /// the daemon was down, so the startup snapshot is synced as `--index-once` syncs it
 /// (removed symbols pruned, changed ones marked stale, changed files' rollups flagged).
 /// The queue holds every symbol without a SIR, or with one written for a body it no
-/// longer has; the rollups still outdated after that are set aside for the workers to
-/// rebuild once it drains.
+/// longer has. The rollups still outdated after the sync are set aside for the workers
+/// to rebuild a few at a time between symbol tasks, except those of files with a queued
+/// symbol, which processing that symbol rebuilds.
 fn start_from_snapshot(
     workspace: &Path,
     observer: &ObserverState,
@@ -698,9 +701,19 @@ fn start_from_snapshot(
         symbol_count
     );
 
-    let outdated_rollups = files_with_outdated_rollups(store, &symbols_by_id)?;
+    let mut outdated_rollups = files_with_outdated_rollups(store, &symbols_by_id)?;
     let queue_state = SharedQueueState::new(symbols_by_id.clone());
     let queued = enqueue_symbols_needing_sir(workspace, store, &queue_state, &symbols_by_id)?;
+    // A queued leaf's processing rebuilds its file's rollup (also when generation fails),
+    // so only the files without one are set aside.
+    {
+        let queue = queue_state.lock_queue();
+        for symbol in symbols_by_id.values() {
+            if queue.contains(&symbol.id) {
+                outdated_rollups.remove(&symbol.file_path);
+            }
+        }
+    }
     tracing::info!(
         queued,
         "Scan pass queued: {} symbols for SIR generation",
@@ -709,7 +722,7 @@ fn start_from_snapshot(
     if !outdated_rollups.is_empty() {
         tracing::info!(
             file_count = outdated_rollups.len(),
-            "{} stale or missing file rollups will be rebuilt once the queue drains",
+            "{} stale or missing file rollups will be rebuilt between symbol tasks",
             outdated_rollups.len()
         );
         queue_state.add_pending_rollups(outdated_rollups);

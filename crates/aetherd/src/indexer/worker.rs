@@ -12,8 +12,9 @@ pub(super) struct SharedQueueState {
     pub(super) queue: Arc<Mutex<SirPriorityQueue>>,
     pub(super) symbol_index: Arc<Mutex<HashMap<String, Symbol>>>,
     pub(super) in_progress: Arc<Mutex<HashSet<String>>>,
-    /// Files whose rollup was outdated when the daemon started, rebuilt once the queue
-    /// has drained: the leaves regenerated first rebuild their own files' rollups.
+    /// Files whose rollup was outdated when the daemon started and none of whose
+    /// symbols is queued (processing a queued leaf rebuilds its file's rollup). The
+    /// workers rebuild them a few at a time between symbol tasks.
     pub(super) pending_rollups: Arc<Mutex<BTreeMap<String, Language>>>,
 }
 
@@ -61,17 +62,26 @@ impl SharedQueueState {
         self.lock_pending_rollups().extend(files);
     }
 
-    /// The pending rollups, taken (all of them, by one worker) only while no symbol is
-    /// queued or in progress, so they are rebuilt after the leaves queued ahead of them.
-    pub(super) fn take_pending_rollups_when_idle(&self) -> Option<BTreeMap<String, Language>> {
-        // One lock at a time: `enqueue_changed_symbols` takes `in_progress` before `queue`.
-        let queue_empty = self.lock_queue().is_empty();
-        let none_in_progress = self.lock_in_progress().is_empty();
-        if !queue_empty || !none_in_progress {
+    /// Up to `max` pending rollups, taken off the set (`None` once it is empty). Taken a
+    /// few at a time, so a worker serves symbol tasks and SIR requests between chunks
+    /// and a chunk that fails costs only its own files.
+    pub(super) fn take_pending_rollup_chunk(
+        &self,
+        max: usize,
+    ) -> Option<BTreeMap<String, Language>> {
+        let mut pending = self.lock_pending_rollups();
+        if pending.is_empty() {
             return None;
         }
-        let mut pending = self.lock_pending_rollups();
-        (!pending.is_empty()).then(|| std::mem::take(&mut *pending))
+        let keys = pending.keys().take(max.max(1)).cloned().collect::<Vec<_>>();
+        Some(
+            keys.into_iter()
+                .filter_map(|file_path| {
+                    let language = pending.remove(&file_path)?;
+                    Some((file_path, language))
+                })
+                .collect(),
+        )
     }
 
     pub(super) fn requeue(&self, symbol_id: String, score: f64) {
@@ -164,8 +174,13 @@ pub(super) fn spawn_semantic_worker(
                     }
                 }
 
-                let Some((score, symbol)) = queue_state.pop_task() else {
-                    if let Some(files) = queue_state.take_pending_rollups_when_idle() {
+                // One chunk of the rollups left outdated at startup per turn, between
+                // symbol tasks.
+                let rebuilt_rollups = match queue_state
+                    .take_pending_rollup_chunk(PENDING_ROLLUP_CHUNK)
+                {
+                    Some(files) => {
+                        let file_count = files.len();
                         if let Err(err) = refresh_pending_rollups(
                             &pipeline,
                             store.as_ref(),
@@ -173,13 +188,20 @@ pub(super) fn spawn_semantic_worker(
                             generation_pass,
                         ) {
                             tracing::warn!(
+                                file_count,
                                 error = %err,
-                                "failed to rebuild file rollups left outdated at startup"
+                                "failed to rebuild file rollups left outdated at startup; they stay stale until a full index run"
                             );
                         }
-                        continue;
+                        true
                     }
-                    std::thread::sleep(Duration::from_millis(WORKER_IDLE_SLEEP_MS));
+                    None => false,
+                };
+
+                let Some((score, symbol)) = queue_state.pop_task() else {
+                    if !rebuilt_rollups {
+                        std::thread::sleep(Duration::from_millis(WORKER_IDLE_SLEEP_MS));
+                    }
                     continue;
                 };
 
@@ -322,8 +344,8 @@ pub(super) fn finalize_watcher_generation(
 }
 
 /// Rebuild those of `files` whose rollup is still outdated (stale, or missing while the
-/// file has leaf SIRs); a leaf regenerated since the files were set aside has rebuilt
-/// its file's rollup already. Returns how many rollups were rebuilt.
+/// file has leaf SIRs); a leaf processed since the files were set aside, after a live
+/// edit say, has rebuilt its file's rollup already. Returns how many were rebuilt.
 pub(super) fn refresh_pending_rollups(
     pipeline: &SirPipeline,
     store: &SqliteStore,
@@ -426,32 +448,33 @@ mod tests {
     }
 
     #[test]
-    fn pending_rollups_wait_until_no_symbol_is_queued_or_in_progress() {
+    fn pending_rollups_are_taken_a_chunk_at_a_time_whatever_the_queue_holds() {
         let symbol = test_symbol("sym-queued", "sig-queued");
         let queue_state =
             SharedQueueState::new(HashMap::from_iter([(symbol.id.clone(), symbol.clone())]));
-        queue_state
-            .add_pending_rollups(BTreeMap::from([("src/lib.rs".to_owned(), Language::Rust)]));
+        // A symbol that keeps failing and being requeued must not hold the rollups back.
         let _ = queue_state.lock_queue().push(symbol.id.clone(), 0.5);
+        queue_state.add_pending_rollups(BTreeMap::from([
+            ("src/a.rs".to_owned(), Language::Rust),
+            ("src/b.rs".to_owned(), Language::Rust),
+            ("src/c.rs".to_owned(), Language::Rust),
+        ]));
 
-        assert!(
-            queue_state.take_pending_rollups_when_idle().is_none(),
-            "a queued symbol goes first"
+        let first = queue_state
+            .take_pending_rollup_chunk(2)
+            .expect("first chunk");
+        assert_eq!(
+            first.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["src/a.rs", "src/b.rs"]
         );
-        let (_, popped) = queue_state.pop_task().expect("pop queued symbol");
-        assert!(
-            queue_state.take_pending_rollups_when_idle().is_none(),
-            "a symbol in progress goes first"
+        let second = queue_state
+            .take_pending_rollup_chunk(2)
+            .expect("second chunk");
+        assert_eq!(
+            second.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["src/c.rs"]
         );
-        queue_state.complete_task(popped.id.as_str());
-
-        let pending = queue_state
-            .take_pending_rollups_when_idle()
-            .expect("pending rollups once idle");
-        assert!(pending.contains_key("src/lib.rs"));
-        assert!(
-            queue_state.take_pending_rollups_when_idle().is_none(),
-            "taken once"
-        );
+        assert!(queue_state.take_pending_rollup_chunk(2).is_none());
+        assert!(queue_state.lock_queue().contains(&symbol.id));
     }
 }
