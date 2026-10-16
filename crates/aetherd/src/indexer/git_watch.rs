@@ -324,6 +324,7 @@ pub(super) fn write_persisted_head_state(workspace: &Path, head_state: &HeadStat
         aether_dir.join("last_indexed_head_ref"),
         head_state.marker.as_deref(),
     )?;
+    crate::freshness::write_index_synced_at(workspace, crate::time::current_unix_timestamp_secs())?;
     Ok(())
 }
 

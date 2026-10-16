@@ -610,3 +610,105 @@ fn mcp_health_explain_tool() -> Result<()> {
 
     Ok(())
 }
+
+/// An edit made after the index, with no daemon watching, must show in `aether_status`
+/// rather than leave it reporting full coverage.
+#[test]
+fn aether_status_reports_staleness_for_an_out_of_date_store() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    fs::create_dir_all(workspace.join(".aether"))?;
+    fs::write(
+        workspace.join(".aether/config.toml"),
+        r#"[inference]
+provider = "mock"
+
+[storage]
+graph_backend = "sqlite"
+
+[embeddings]
+enabled = false
+vector_backend = "sqlite"
+"#,
+    )?;
+    fs::create_dir_all(workspace.join("src"))?;
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "fn alpha() -> i32 { 1 }\nfn beta() -> i32 { 2 }\n",
+    )?;
+    fs::write(workspace.join("src/other.rs"), "fn gamma() -> i32 { 3 }\n")?;
+    run_index_and_seed_sir(workspace)?;
+
+    let server = AetherMcpServer::new(workspace, false)?;
+    let rt = Runtime::new()?;
+    let status = |server: &AetherMcpServer| -> Result<_> {
+        Ok(rt
+            .block_on(server.aether_status())
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?
+            .0)
+    };
+
+    let fresh = status(&server)?.freshness;
+    assert_eq!(fresh.verdict, "fresh", "{fresh:?}");
+    assert!(fresh.last_sync_at.is_some());
+    assert_eq!(fresh.indexed_files, 2);
+    assert!(!fresh.daemon_running);
+    // Seeded SIRs record no source hash, and status says so.
+    assert_eq!(fresh.sirs_without_source_hash, 3);
+    assert!(
+        fresh
+            .notes
+            .iter()
+            .any(|note| note.starts_with("3 of 3 SIRs have no recorded source hash"))
+    );
+
+    // Edit one file after the index (two minutes ahead, so it can't share the sync's
+    // second), delete the other and add a new one.
+    let edited = workspace.join("src/lib.rs");
+    fs::write(
+        &edited,
+        "fn alpha() -> i32 { 10 }\nfn beta() -> i32 { 2 }\n",
+    )?;
+    fs::File::options()
+        .write(true)
+        .open(&edited)?
+        .set_modified(SystemTime::now() + std::time::Duration::from_secs(120))?;
+    fs::remove_file(workspace.join("src/other.rs"))?;
+    let added = workspace.join("src/added.rs");
+    fs::write(&added, "fn delta() -> i32 { 4 }\n")?;
+    fs::File::options()
+        .write(true)
+        .open(&added)?
+        .set_modified(SystemTime::now() + std::time::Duration::from_secs(120))?;
+
+    let response = status(&server)?;
+    // Counts alone still look complete...
+    assert_eq!(response.sir_coverage.symbols_with_sir, 3);
+    // ...but the freshness block shows the drift.
+    let stale = response.freshness;
+    assert_eq!(stale.verdict, "stale", "{stale:?}");
+    assert_eq!(
+        (stale.modified_files, stale.deleted_files, stale.new_files),
+        (1, 1, 1)
+    );
+    assert_eq!(
+        stale.changed_file_samples,
+        ["M src/lib.rs", "D src/other.rs", "A src/added.rs"]
+    );
+    assert_eq!(stale.sirs_in_changed_files, 3);
+    assert!(
+        stale.summary.starts_with("Index STALE: last synced "),
+        "{}",
+        stale.summary
+    );
+    assert!(
+        stale
+            .notes
+            .iter()
+            .any(|note| note.contains("aetherd --workspace . --index-once")),
+        "{:?}",
+        stale.notes
+    );
+
+    Ok(())
+}

@@ -23,6 +23,7 @@ mod audit;
 mod contracts;
 mod embeddings;
 mod fingerprint_history;
+mod freshness;
 mod graph;
 mod language_family;
 mod lexical;
@@ -67,6 +68,7 @@ pub use audit::{AuditFinding, AuditFindingFilters, AuditSeverityCounts, NewAudit
 pub use contracts::{IntentContractRecord, IntentViolationRecord};
 pub use embeddings::{SemanticSearchResult, SymbolEmbeddingMetaRecord, SymbolEmbeddingRecord};
 pub use fingerprint_history::SirFingerprintHistoryRecord;
+pub use freshness::{IndexedFileRecord, SirFreshnessCounts};
 pub use graph::{
     CouplingEdgeRecord, GraphDependencyEdgeRecord, GraphSyncStats, ResolvedEdge,
     SymbolNeighborRecord, TestedByRecord, UpstreamDependencyEdgeRecord,

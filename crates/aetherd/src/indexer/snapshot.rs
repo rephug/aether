@@ -53,6 +53,11 @@ pub(super) fn sync_snapshot<VectorCleanup>(
 where
     VectorCleanup: FnOnce(&[String]) -> Result<()>,
 {
+    // The HEAD the workspace was at when the sync started, recorded with the sync time
+    // once the store holds the snapshot (see `crate::freshness`).
+    let head_at_start =
+        git_watch::read_current_head_state(workspace, resolve_git_watch_dir(workspace).as_deref());
+
     // The ids the store held before this snapshot: reconciliation must not take an
     // unchanged symbol for the new identity of a stale one, and a current symbol not
     // among them is new.
@@ -145,6 +150,17 @@ where
 
     for event in events {
         structural.process_event(store, event)?;
+    }
+
+    // Without the marker, status reports the HEAD as unrecorded and keeps comparing file
+    // times, so a failure here only loses precision.
+    match head_at_start {
+        Ok(head) => {
+            if let Err(err) = git_watch::write_persisted_head_state(workspace, &head) {
+                tracing::warn!(error = %err, "failed to record the index sync marker");
+            }
+        }
+        Err(err) => tracing::warn!(error = %err, "failed to read HEAD for the index sync marker"),
     }
 
     Ok(())

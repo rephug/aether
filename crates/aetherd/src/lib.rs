@@ -15,6 +15,7 @@ pub mod doctor;
 pub mod drift;
 pub mod enhance;
 pub mod enhance_templates;
+pub mod freshness;
 pub mod fsck;
 pub mod health;
 pub mod health_score;

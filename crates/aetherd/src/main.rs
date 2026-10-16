@@ -836,6 +836,12 @@ fn run_status_subcommand(workspace: &Path) -> Result<()> {
         "SIR Coverage: {} / {} ({coverage_pct:.1}%)",
         symbols_with_sir, total_symbols
     );
+    let freshness = aetherd::freshness::assess_index_freshness(workspace, &store)
+        .context("failed to assess index freshness")?;
+    println!("{}", freshness.summary);
+    for note in &freshness.notes {
+        println!("  - {note}");
+    }
     Ok(())
 }
 

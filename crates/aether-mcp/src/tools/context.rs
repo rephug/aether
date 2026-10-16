@@ -11,6 +11,7 @@ use aether_store::{
     NameResolution, NameSite, SirStateStore, SymbolRecord, TestIntentRecord, TestIntentStore,
     ambiguity_label, ambiguity_note,
 };
+use aetherd::freshness::symbol_freshness_note;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -64,6 +65,10 @@ pub struct AetherSirContextResponse {
     pub symbol_id: String,
     pub qualified_name: String,
     pub file_path: String,
+    /// One line on how far the symbol's file, its SIR and the index can be trusted: whether
+    /// the file changed since it was indexed, the SIR's status, the indexed vs workspace
+    /// HEAD, and whether a daemon is watching. Also the first line of `context`.
+    pub freshness: String,
     /// Assembled context document (markdown or JSON depending on format)
     pub context: String,
     /// Individual layers with their token estimates
@@ -840,8 +845,12 @@ fn markdown_title(record: &SymbolRecord) -> String {
     format!("# Context: {}\n", record.qualified_name)
 }
 
-fn render_markdown_context(record: &SymbolRecord, layers: &[SirContextLayer]) -> String {
-    let mut parts = vec![markdown_title(record)];
+fn render_markdown_context(
+    record: &SymbolRecord,
+    freshness: &str,
+    layers: &[SirContextLayer],
+) -> String {
+    let mut parts = vec![markdown_title(record), format!("> {freshness}\n")];
     for layer in layers {
         let title = match layer.name.as_str() {
             "source" => "Source",
@@ -865,6 +874,7 @@ fn render_markdown_context(record: &SymbolRecord, layers: &[SirContextLayer]) ->
 
 fn render_json_context(
     record: &SymbolRecord,
+    freshness: &str,
     layers: &[SirContextLayer],
     total_tokens: usize,
     budget_remaining: usize,
@@ -879,6 +889,7 @@ fn render_json_context(
         "file_path".to_owned(),
         Value::String(record.file_path.clone()),
     );
+    object.insert("freshness".to_owned(), Value::String(freshness.to_owned()));
     object.insert("total_tokens".to_owned(), json!(total_tokens));
     object.insert("budget_remaining".to_owned(), json!(budget_remaining));
     for layer in layers {
@@ -929,10 +940,11 @@ impl AetherMcpServer {
             .map(|layer| layer.token_estimate)
             .sum::<usize>();
         let budget_remaining = max_tokens.saturating_sub(total_tokens);
+        let freshness = symbol_freshness_note(self.workspace(), store, &record);
         let context = match format {
-            ContextFormat::Markdown => render_markdown_context(&record, &layers),
+            ContextFormat::Markdown => render_markdown_context(&record, &freshness, &layers),
             ContextFormat::Json => {
-                render_json_context(&record, &layers, total_tokens, budget_remaining)?
+                render_json_context(&record, &freshness, &layers, total_tokens, budget_remaining)?
             }
         };
 
@@ -940,6 +952,7 @@ impl AetherMcpServer {
             symbol_id: record.id,
             qualified_name: record.qualified_name,
             file_path: record.file_path,
+            freshness,
             context,
             layers,
             total_tokens,
@@ -1551,6 +1564,13 @@ vector_backend = "sqlite"
 
         assert_eq!(response.symbol_id, target.id);
         assert!(response.context.contains("# Context:"));
+        // The freshness line comes right after the title.
+        assert!(response.freshness.starts_with("Freshness: file "));
+        assert!(
+            response
+                .context
+                .contains(&format!("\n> {}\n", response.freshness))
+        );
         assert!(response.context.contains("## Source"));
         assert!(response.context.contains("pub fn target()"));
         assert!(response.context.contains("## SIR Annotation"));
@@ -1659,6 +1679,7 @@ vector_backend = "sqlite"
 
         let value: Value = serde_json::from_str(&response.context).expect("parse json context");
         assert_eq!(value["symbol_id"], target.id);
+        assert_eq!(value["freshness"], response.freshness.as_str());
         assert!(value["source"].as_str().is_some());
         assert!(value["sir"].as_str().is_some());
         assert!(response.context.contains("\"qualified_name\""));

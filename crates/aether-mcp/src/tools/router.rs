@@ -40,7 +40,10 @@ fn to_mcp_error(err: AetherMcpError) -> McpError {
 
 #[tool_router(router = tool_router, vis = "pub(crate)")]
 impl AetherMcpServer {
-    #[tool(name = "aether_status", description = "Get AETHER local store status")]
+    #[tool(
+        name = "aether_status",
+        description = "Get AETHER index status: symbol and SIR counts, and freshness against the workspace (last sync, indexed vs workspace HEAD, files changed since, stale SIRs, whether a daemon watches)"
+    )]
     pub async fn aether_status(&self) -> Result<Json<AetherStatusResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_status");
         let server = self.clone();

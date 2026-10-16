@@ -651,7 +651,7 @@ Register AETHER with any MCP-compatible agent (Claude Code, Codex, etc.) and it 
 
 | Tool | What It Does |
 |:-----|:------------|
-| `aether_status` | Workspace health — symbol count, SIR coverage, store paths |
+| `aether_status` | Workspace health — symbol count, SIR coverage, store paths, and freshness: last sync, indexed vs workspace HEAD, files changed since, stale SIRs, whether a daemon watches |
 | `aether_search` | Semantic / lexical / hybrid symbol search |
 | `aether_symbol_lookup` | Find symbols by qualified name or file path |
 | `aether_get_sir` | Full SIR annotation for any symbol |
