@@ -266,7 +266,7 @@ fn process_reindex_path(
     queue_state: &SharedQueueState,
     path: &Path,
 ) -> Result<()> {
-    match observer.process_path(path) {
+    let read = match observer.process_path(path) {
         Ok(Some(event)) => {
             if config.print_events {
                 let line = serde_json::to_string(&event)
@@ -292,11 +292,49 @@ fn process_reindex_path(
                     "failed to enqueue changed symbols"
                 );
             }
+            true
         }
-        Ok(None) => {}
+        // An edit that changes no symbol (a comment, blank lines, an import) still changes
+        // the file and maybe its edges. Re-extract them, or status would report the file
+        // as modified until the next full sync. A file the index read since it last
+        // changed, as a branch switch leaves most, is skipped.
+        Ok(None) => match observer.symbols_of(path) {
+            Some((file_path, language, _))
+                if crate::freshness::file_changed_since_read(
+                    &config.workspace,
+                    store,
+                    &file_path,
+                )? =>
+            {
+                structural.process_event(
+                    store,
+                    &SymbolChangeEvent {
+                        file_path,
+                        language,
+                        added: Vec::new(),
+                        removed: Vec::new(),
+                        updated: Vec::new(),
+                    },
+                )?;
+                true
+            }
+            _ => false,
+        },
         Err(err) => {
             return Err(err).with_context(|| format!("failed to process {}", path.display()));
         }
+    };
+
+    // Every symbol the file still declares now matches its row, the unchanged ones too, so
+    // the whole file counts as read; only changed symbols were rewritten above.
+    if read && let Some((_, _, symbols)) = observer.symbols_of(path) {
+        let symbol_ids = symbols
+            .iter()
+            .map(|symbol| symbol.id.clone())
+            .collect::<Vec<_>>();
+        store
+            .mark_symbols_read(&symbol_ids, unix_timestamp_secs())
+            .with_context(|| format!("failed to record reading {}", path.display()))?;
     }
 
     Ok(())
@@ -709,6 +747,118 @@ mod tests {
             vec![workspace.join("pkg/__init__.py")],
         );
         assert_eq!(callees(), vec![id("pkg/old.py", "pkg.old::f")]);
+    }
+
+    /// A watched edit that changes no symbol (a comment, an import) must not leave the
+    /// file "modified" until the next full sync, and an edit to one symbol must not leave
+    /// its unchanged neighbours looking stale.
+    #[test]
+    fn a_watched_edit_that_changes_no_symbol_leaves_the_index_fresh() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
+        fs::write(
+            workspace.join(".aether/config.toml"),
+            "[inference]\nprovider = \"mock\"\n\n[storage]\ngraph_backend = \"sqlite\"\n\n[embeddings]\nenabled = false\nvector_backend = \"sqlite\"\n",
+        )
+        .expect("write config");
+        fs::create_dir_all(workspace.join("pkg")).expect("create pkg");
+        fs::write(
+            workspace.join("pkg/a.py"),
+            "def alpha(x):\n    return x + 1\n",
+        )
+        .expect("write a");
+        fs::write(
+            workspace.join("pkg/b.py"),
+            "def beta(x):\n    return x\n\n\ndef gamma(x):\n    return x\n",
+        )
+        .expect("write b");
+        let config = mock_config(workspace);
+        run_initial_index_once(&config).expect("index once");
+
+        // Held as the daemon that runs the debounce path holds it.
+        let _watcher_lock = crate::freshness::take_watcher_lock(workspace).expect("watcher lock");
+        let mut observer = ObserverState::new(workspace.to_path_buf()).expect("observer");
+        observer.seed_from_disk().expect("seed observer");
+        let mut structural =
+            StructuralIndexer::new(workspace.to_path_buf()).expect("structural indexer");
+        let store = SqliteStore::open(workspace).expect("open store");
+        let queue_state = SharedQueueState::new(HashMap::new());
+
+        // The index read both files two minutes ago, so edits made now come after it.
+        for file in ["pkg/a.py", "pkg/b.py"] {
+            for record in store.list_symbols_for_file(file).expect("list symbols") {
+                store
+                    .upsert_symbol(SymbolRecord {
+                        last_seen_at: record.last_seen_at - 120,
+                        ..record
+                    })
+                    .expect("backdate symbol");
+            }
+        }
+        let alpha_before = store.list_symbols_for_file("pkg/a.py").expect("list a");
+
+        fs::write(
+            workspace.join("pkg/a.py"),
+            "import os\n\n# A note that changes no symbol.\ndef alpha(x):\n    return x + 1\n",
+        )
+        .expect("edit a");
+        fs::write(
+            workspace.join("pkg/b.py"),
+            "def beta(x):\n    return x\n\n\ndef gamma(x):\n    return x * 2\n",
+        )
+        .expect("edit b");
+        let before =
+            crate::freshness::assess_index_freshness(workspace, &store).expect("assess before");
+        assert_eq!(
+            before.verdict,
+            crate::freshness::FreshnessVerdict::Stale,
+            "{before:?}"
+        );
+        assert_eq!(before.modified_files, 2, "{before:?}");
+
+        process_debounced_paths(
+            &config,
+            &mut observer,
+            &mut structural,
+            &store,
+            &queue_state,
+            vec![workspace.join("pkg/a.py"), workspace.join("pkg/b.py")],
+        );
+
+        // No symbol of a.py changed, and its ids are the ones indexed before.
+        let alpha_after = store.list_symbols_for_file("pkg/a.py").expect("list a");
+        assert_eq!(
+            alpha_after
+                .iter()
+                .map(|symbol| &symbol.id)
+                .collect::<Vec<_>>(),
+            alpha_before
+                .iter()
+                .map(|symbol| &symbol.id)
+                .collect::<Vec<_>>()
+        );
+        let after =
+            crate::freshness::assess_index_freshness(workspace, &store).expect("assess after");
+        assert_eq!(
+            after.verdict,
+            crate::freshness::FreshnessVerdict::Fresh,
+            "{after:?}"
+        );
+        assert_eq!(after.modified_files, 0, "{after:?}");
+
+        // beta didn't change, but the watcher read its file and found it as stored.
+        let beta = store
+            .list_symbols_for_file("pkg/b.py")
+            .expect("list b")
+            .into_iter()
+            .find(|symbol| symbol.qualified_name.ends_with("beta"))
+            .expect("beta");
+        let note = crate::freshness::symbol_freshness_note(workspace, &store, &beta);
+        assert!(
+            note.starts_with("Freshness: file unchanged since indexed "),
+            "{note}"
+        );
     }
 
     fn run_git(workspace: &Path, args: &[&str]) {

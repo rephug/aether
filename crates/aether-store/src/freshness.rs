@@ -71,6 +71,35 @@ impl SqliteStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// When the indexer last read `file_path`: the latest `last_seen_at` of its symbols.
+    /// `None` when it has none.
+    pub fn file_last_read_at(&self, file_path: &str) -> Result<Option<i64>, StoreError> {
+        let conn = self.lock_connection()?;
+        conn.query_row(
+            "SELECT MAX(last_seen_at) FROM symbols WHERE file_path = ?1",
+            params![file_path],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .map_err(Into::into)
+    }
+
+    /// Records that the indexer read the file declaring `symbol_ids` at `read_at` (unix
+    /// seconds) and found each of them as stored. Only the symbols the file still declares
+    /// are passed, so rows a full sync's reconciliation should remove keep their old time.
+    pub fn mark_symbols_read(&self, symbol_ids: &[String], read_at: i64) -> Result<(), StoreError> {
+        let mut conn = self.lock_connection()?;
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx
+                .prepare("UPDATE symbols SET last_seen_at = MAX(last_seen_at, ?2) WHERE id = ?1")?;
+            for symbol_id in symbol_ids {
+                stmt.execute(params![symbol_id, read_at])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn sir_freshness_counts(&self) -> Result<SirFreshnessCounts, StoreError> {
         let conn = self.lock_connection()?;
         let (leaf_rows, stale_leaves, leaves_without_source_hash) = conn.query_row(
@@ -148,6 +177,14 @@ mod tests {
         ));
         assert!(matches!(
             store.sir_freshness_counts(),
+            Err(StoreError::LockPoisoned(_))
+        ));
+        assert!(matches!(
+            store.file_last_read_at("src/lib.rs"),
+            Err(StoreError::LockPoisoned(_))
+        ));
+        assert!(matches!(
+            store.mark_symbols_read(&["caller".to_owned()], 1),
             Err(StoreError::LockPoisoned(_))
         ));
         assert!(matches!(

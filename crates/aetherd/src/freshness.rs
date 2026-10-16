@@ -344,6 +344,26 @@ pub fn assess_index_freshness(workspace: &Path, store: &SqliteStore) -> Result<I
     Ok(freshness)
 }
 
+/// Whether `file_path` may have changed since the index last read it: it was written in a
+/// later second, or in the same second, where the order of the write and the read is
+/// unknown (symbols record whole seconds). False when the store holds no symbols for it.
+pub(crate) fn file_changed_since_read(
+    workspace: &Path,
+    store: &SqliteStore,
+    file_path: &str,
+) -> Result<bool> {
+    let Some(read_at) = store
+        .file_last_read_at(file_path)
+        .with_context(|| format!("failed to read when {file_path} was last indexed"))?
+    else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        file_time(&workspace.join(file_path)),
+        FileTime::Modified(mtime_ms) if mtime_ms.div_euclid(1000) >= read_at
+    ))
+}
+
 enum FileTime {
     /// Last modified at these unix milliseconds.
     Modified(i64),

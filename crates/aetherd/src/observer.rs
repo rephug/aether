@@ -252,6 +252,18 @@ impl ObserverState {
         }
     }
 
+    /// The symbols last read from `path`, with its workspace-relative path and language;
+    /// `None` when the snapshot holds none for it.
+    pub fn symbols_of(&self, path: &Path) -> Option<(String, Language, &[Symbol])> {
+        let relative = relative_workspace_path(&self.workspace, path);
+        let snapshot = self.snapshots.get(&relative)?;
+        Some((
+            normalize_path(&relative.to_string_lossy()),
+            snapshot.language,
+            snapshot.symbols.as_slice(),
+        ))
+    }
+
     pub fn initial_symbol_events(&self) -> Vec<SymbolChangeEvent> {
         let mut events = Vec::new();
 
