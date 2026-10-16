@@ -101,6 +101,7 @@ pub fn run_doctor(workspace: &Path, config: &AetherConfig) -> Result<DoctorRepor
     let mut roles = Vec::new();
     collect_inference_role(workspace, config, &mut roles, &mut report);
     collect_quality_roles(workspace, config, &mut roles, &mut report);
+    collect_watcher_role(workspace, config, &mut roles, &mut report);
     collect_embedding_role(workspace, config, &mut roles, &mut report);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -216,6 +217,52 @@ fn collect_quality_roles(
             report,
         );
     }
+}
+
+/// `[watcher].realtime_model` replaces the inference model for SIRs the watcher writes,
+/// with `realtime_provider` (or the inference provider) and the inference endpoint and key,
+/// as the daemon loads it.
+fn collect_watcher_role(
+    workspace: &Path,
+    config: &AetherConfig,
+    roles: &mut Vec<RoleModels>,
+    report: &mut DoctorReport,
+) {
+    let Some(watcher) = &config.watcher else {
+        return;
+    };
+    let model = watcher.realtime_model.trim();
+    if model.is_empty() {
+        return;
+    }
+    let role = "watcher.realtime";
+    let provider = match watcher.realtime_provider.trim() {
+        "" => None,
+        name => match name.parse::<InferenceProviderKind>() {
+            Ok(provider) => Some(provider),
+            Err(err) => {
+                report.push(role, CheckStatus::Fail, format!("invalid provider: {err}"));
+                return;
+            }
+        },
+    };
+    if provider.unwrap_or(config.inference.provider) == InferenceProviderKind::Mock {
+        report.push(role, CheckStatus::Skip, "provider mock calls no model");
+        return;
+    }
+    load_inference_role(
+        workspace,
+        role,
+        ProviderOverrides {
+            provider,
+            model: Some(model.to_owned()),
+            endpoint: None,
+            api_key_env: None,
+            thinking: None,
+        },
+        roles,
+        report,
+    );
 }
 
 fn load_inference_role(
@@ -442,6 +489,64 @@ endpoint = "{endpoint}/api/embeddings"
                 .contains("'qwen3-embedding:4b' is not listed")
         );
         assert!(embeddings.detail.contains("similar: qwen3-embedding:0.6b"));
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    /// The watcher's realtime model is a model the daemon calls, so doctor checks it too.
+    #[test]
+    fn doctor_checks_the_watcher_realtime_model() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer).expect("read request");
+            let body = r#"{"models":[{"name":"qwen3.5:4b"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write response");
+        });
+
+        let temp = tempdir().expect("tempdir");
+        write_config(
+            temp.path(),
+            &format!(
+                r#"
+[inference]
+provider = "qwen3_local"
+model = "qwen3.5:4b"
+endpoint = "{endpoint}"
+
+[watcher]
+realtime_model = "qwen3.5:9b"
+"#
+            ),
+        );
+        let config = ensure_workspace_config(temp.path()).expect("config");
+
+        let report = run_doctor(temp.path(), &config).expect("doctor");
+        server.join().expect("server");
+        let statuses = report
+            .checks
+            .iter()
+            .map(|check| (check.subject.as_str(), check.status))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            [
+                ("inference", CheckStatus::Ok),
+                ("watcher.realtime", CheckStatus::Fail),
+            ],
+            "{report:?}"
+        );
+        assert!(
+            report.checks[1]
+                .detail
+                .contains("'qwen3.5:9b' is not listed")
+        );
         assert_eq!(report.exit_code(), 1);
     }
 
