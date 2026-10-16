@@ -13,13 +13,14 @@ use aether_infer::{
     load_reranker_provider_from_config,
 };
 use aether_store::{
-    SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord, SymbolSearchResult,
+    CallEdgeCoverage, SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord,
+    SymbolSearchResult,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::callers::CallerAttribution;
+use super::callers::{CallerAttribution, CallerCoverage};
 use super::{
     AetherMcpServer, LiveSymbolSources, ambiguous_selector, child_method_symbols, effective_limit,
     is_type_symbol_kind,
@@ -99,6 +100,127 @@ pub struct AetherDependenciesResponse {
     pub dependency_count: u32,
     pub callers: Vec<AetherDependencyCaller>,
     pub dependencies: Vec<AetherDependencyTarget>,
+    /// How the recorded calls naming this symbol resolved, so an empty `callers` list
+    /// can be told from callers the index couldn't attribute.
+    pub caller_coverage: AetherCallerCoverage,
+    /// How this symbol's recorded outgoing calls resolved (for an aggregated type, those
+    /// of the type and its methods), so an empty `dependencies` list can be told from
+    /// calls the graph couldn't resolve.
+    pub dependency_coverage: AetherCallEdgeCoverage,
+    /// One sentence on what both lists leave out.
+    pub coverage_note: String,
+}
+
+/// How a set of recorded call edges resolved. A call's target text matches workspace
+/// symbols by exact qualified name in the caller's language family, as the stored graph
+/// links them.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AetherCallEdgeCoverage {
+    pub call_edges: u64,
+    /// Calls whose target names exactly one symbol.
+    pub resolved: u64,
+    /// Calls whose target names several symbols; every candidate is listed.
+    pub ambiguous: u64,
+    /// Calls whose target names no workspace symbol: external or standard-library calls,
+    /// or calls recorded by a name no symbol carries (Rust method calls are recorded by
+    /// their bare method name). Not listed.
+    pub unresolved: u64,
+}
+
+impl From<CallEdgeCoverage> for AetherCallEdgeCoverage {
+    fn from(coverage: CallEdgeCoverage) -> Self {
+        Self {
+            call_edges: coverage.call_edges,
+            resolved: coverage.resolved,
+            ambiguous: coverage.ambiguous,
+            unresolved: coverage.unresolved,
+        }
+    }
+}
+
+/// How the recorded calls naming a symbol (for an aggregated type, it or one of its
+/// methods) resolved, each caller counted once per callee.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AetherCallerCoverage {
+    pub name_matches: u32,
+    /// Listed in `callers`.
+    pub attributed: u32,
+    /// The name also fits other symbols that the caller's file and module don't rule
+    /// out, so the call isn't attributed: the symbol may have more callers than listed.
+    pub ambiguous: u32,
+    /// The caller's file or module resolves the name to another symbol.
+    pub resolved_elsewhere: u32,
+}
+
+impl From<CallerCoverage> for AetherCallerCoverage {
+    fn from(coverage: CallerCoverage) -> Self {
+        Self {
+            name_matches: coverage.name_matches,
+            attributed: coverage.attributed,
+            ambiguous: coverage.ambiguous,
+            resolved_elsewhere: coverage.resolved_elsewhere,
+        }
+    }
+}
+
+/// What a dependency list leaves out, in one clause per kind of gap.
+fn dependency_coverage_clauses(coverage: &AetherCallEdgeCoverage) -> String {
+    if coverage.call_edges == 0 {
+        return "no outgoing calls are recorded".to_owned();
+    }
+    let mut clauses = vec![format!(
+        "{} of {} recorded outgoing calls resolve to one symbol",
+        coverage.resolved, coverage.call_edges
+    )];
+    if coverage.ambiguous > 0 {
+        clauses.push(format!(
+            "{} name several symbols and list every candidate",
+            coverage.ambiguous
+        ));
+    }
+    if coverage.unresolved > 0 {
+        clauses.push(format!(
+            "{} name no workspace symbol (external or standard-library calls, or Rust \
+             method calls recorded by bare name) and are not listed",
+            coverage.unresolved
+        ));
+    }
+    clauses.join("; ")
+}
+
+fn dependencies_coverage_note(
+    callers: &AetherCallerCoverage,
+    dependencies: &AetherCallEdgeCoverage,
+) -> String {
+    let callers = if callers.name_matches == 0 {
+        "No recorded call names this symbol".to_owned()
+    } else if callers.ambiguous > 0 {
+        format!(
+            "{} of {} callers naming this symbol are attributed; {} more could be calling it \
+             but the name also fits other symbols, so they are not listed",
+            callers.attributed, callers.name_matches, callers.ambiguous
+        )
+    } else {
+        format!(
+            "{} of {} callers naming this symbol are attributed",
+            callers.attributed, callers.name_matches
+        )
+    };
+    format!(
+        "Callers: {callers}. Dependencies: {}.",
+        dependency_coverage_clauses(dependencies)
+    )
+}
+
+fn call_chain_coverage_note(levels_empty: bool, coverage: &AetherCallEdgeCoverage) -> String {
+    let mut note = format!(
+        "Callees only (use aether_dependencies for callers): {}.",
+        dependency_coverage_clauses(coverage)
+    );
+    if levels_empty && coverage.call_edges > 0 {
+        note.push_str(" None of the recorded calls reach a workspace symbol.");
+    }
+    note
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -143,6 +265,12 @@ pub struct AetherCallChainResponse {
     pub max_depth: u32,
     pub depth_count: u32,
     pub levels: Vec<Vec<AetherSymbolLookupMatch>>,
+    /// How the recorded calls out of every symbol the chain expanded (the start and each
+    /// level short of `max_depth`) resolved, so empty `levels` can be told from calls
+    /// the graph couldn't resolve.
+    pub coverage: AetherCallEdgeCoverage,
+    /// One sentence on what `levels` leaves out.
+    pub coverage_note: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -343,6 +471,10 @@ impl AetherMcpServer {
                 .into_iter()
                 .map(AetherDependencyTarget::from)
                 .collect::<Vec<_>>();
+            let caller_coverage = AetherCallerCoverage::from(attribution.coverage());
+            let dependency_coverage = AetherCallEdgeCoverage::from(
+                store.call_edge_coverage_for_sources(std::slice::from_ref(&symbol.id))?,
+            );
 
             return Ok(AetherDependenciesResponse {
                 symbol_id: symbol_id.to_owned(),
@@ -353,6 +485,9 @@ impl AetherMcpServer {
                 dependency_count: dependencies.len() as u32,
                 callers,
                 dependencies,
+                coverage_note: dependencies_coverage_note(&caller_coverage, &dependency_coverage),
+                caller_coverage,
+                dependency_coverage,
             });
         }
 
@@ -422,6 +557,13 @@ impl AetherMcpServer {
                 .then_with(|| left.symbol_id.cmp(&right.symbol_id))
         });
 
+        let caller_coverage = AetherCallerCoverage::from(attribution.coverage());
+        let source_ids = std::iter::once(symbol.id.clone())
+            .chain(child_methods.iter().map(|method| method.id.clone()))
+            .collect::<Vec<_>>();
+        let dependency_coverage =
+            AetherCallEdgeCoverage::from(store.call_edge_coverage_for_sources(&source_ids)?);
+
         Ok(AetherDependenciesResponse {
             symbol_id: symbol_id.to_owned(),
             found: true,
@@ -431,6 +573,9 @@ impl AetherMcpServer {
             dependency_count: dependencies.len() as u32,
             callers,
             dependencies,
+            coverage_note: dependencies_coverage_note(&caller_coverage, &dependency_coverage),
+            caller_coverage,
+            dependency_coverage,
         })
     }
 
@@ -455,6 +600,8 @@ impl AetherMcpServer {
                 max_depth,
                 depth_count: 0,
                 levels: Vec::new(),
+                coverage: AetherCallEdgeCoverage::default(),
+                coverage_note: "No symbol_id or qualified_name given.".to_owned(),
             });
         }
 
@@ -466,6 +613,8 @@ impl AetherMcpServer {
                 max_depth,
                 depth_count: 0,
                 levels: Vec::new(),
+                coverage: AetherCallEdgeCoverage::default(),
+                coverage_note: "No index: run `aetherd --workspace . --index-once`.".to_owned(),
             });
         }
 
@@ -491,6 +640,8 @@ impl AetherMcpServer {
                 max_depth,
                 depth_count: 0,
                 levels: Vec::new(),
+                coverage: AetherCallEdgeCoverage::default(),
+                coverage_note: "Symbol not found in the index.".to_owned(),
             });
         };
 
@@ -506,12 +657,27 @@ impl AetherMcpServer {
             })
             .collect::<Vec<_>>();
 
+        // Symbols at `max_depth` were reached but not expanded.
+        let expanded = std::iter::once(start_symbol.id.clone())
+            .chain(
+                levels
+                    .iter()
+                    .take(max_depth.saturating_sub(1) as usize)
+                    .flatten()
+                    .map(|entry| entry.symbol_id.clone()),
+            )
+            .collect::<Vec<_>>();
+        let coverage =
+            AetherCallEdgeCoverage::from(store.call_edge_coverage_for_sources(&expanded)?);
+
         Ok(AetherCallChainResponse {
             found: true,
             symbol_id: start_symbol.id,
             qualified_name: start_symbol.qualified_name,
             max_depth,
             depth_count: levels.len() as u32,
+            coverage_note: call_chain_coverage_note(levels.is_empty(), &coverage),
+            coverage,
             levels,
         })
     }
@@ -970,6 +1136,9 @@ fn empty_dependencies_response(symbol_id: String) -> AetherDependenciesResponse 
         dependency_count: 0,
         callers: Vec::new(),
         dependencies: Vec::new(),
+        caller_coverage: AetherCallerCoverage::default(),
+        dependency_coverage: AetherCallEdgeCoverage::default(),
+        coverage_note: "Symbol not found in the index.".to_owned(),
     }
 }
 

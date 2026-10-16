@@ -1,4 +1,5 @@
 use aether_core::normalize_path;
+use aether_store::LanguageCallEdgeCoverage;
 use aetherd::freshness::{FreshnessVerdict, IndexFreshness, assess_index_freshness};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,54 @@ pub struct AetherStatusResponse {
     /// How far the index has drifted from the workspace. Read `freshness.summary` before
     /// trusting any other tool's output.
     pub freshness: AetherIndexFreshness,
+    /// How many recorded call edges the dependency graph resolves, by language.
+    pub call_graph: AetherCallGraphCoverage,
+}
+
+/// How call edges are matched to symbols, and the counts per language.
+pub const CALL_GRAPH_RULE: &str = "A call's target text matches workspace symbols by exact \
+qualified name in the caller's language family, as the stored graph links them. resolved: \
+one match. ambiguous: several, and the graph links every one. unresolved: none, so the graph \
+drops the edge; these are external or standard-library calls, or calls recorded by a name no \
+symbol carries (Rust method calls are recorded by bare method name). file_level_calls come \
+from top-level code and are never attributed to a caller.";
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherCallGraphCoverage {
+    /// How call edges are matched to symbols, and what each count means.
+    pub rule: String,
+    pub languages: Vec<AetherLanguageCallCoverage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherLanguageCallCoverage {
+    /// `unknown` for edges of files without indexed symbols.
+    pub language: String,
+    /// Calls whose caller is an indexed symbol: what aether_dependencies and
+    /// aether_call_chain walk.
+    pub call_edges: u64,
+    pub resolved: u64,
+    pub ambiguous: u64,
+    pub unresolved: u64,
+    /// Calls from top-level code, attributed to no caller.
+    pub file_level_calls: u64,
+}
+
+impl From<LanguageCallEdgeCoverage> for AetherLanguageCallCoverage {
+    fn from(entry: LanguageCallEdgeCoverage) -> Self {
+        Self {
+            language: if entry.language.is_empty() {
+                "unknown".to_owned()
+            } else {
+                entry.language
+            },
+            call_edges: entry.symbol_calls.call_edges,
+            resolved: entry.symbol_calls.resolved,
+            ambiguous: entry.symbol_calls.ambiguous,
+            unresolved: entry.symbol_calls.unresolved,
+            file_level_calls: entry.file_level_calls,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -159,6 +208,21 @@ impl AetherMcpServer {
             )
         };
 
+        let languages = if store_present {
+            self.state
+                .store
+                .call_edge_coverage_by_language()?
+                .into_iter()
+                .map(AetherLanguageCallCoverage::from)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let call_graph = AetherCallGraphCoverage {
+            rule: CALL_GRAPH_RULE.to_owned(),
+            languages,
+        };
+
         let freshness = if store_present {
             assess_index_freshness(self.workspace(), self.state.store.as_ref())
                 .map_err(|err| AetherMcpError::Message(format!("index freshness: {err:#}")))?
@@ -178,6 +242,7 @@ impl AetherMcpServer {
             sir_count,
             sir_coverage,
             freshness,
+            call_graph,
         })
     }
 }

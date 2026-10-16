@@ -25,6 +25,7 @@ mod embeddings;
 mod fingerprint_history;
 mod freshness;
 mod graph;
+mod graph_coverage;
 mod language_family;
 mod lexical;
 mod lifecycle;
@@ -74,6 +75,7 @@ pub use graph::{
     SymbolNeighborRecord, TestedByRecord, UpstreamDependencyEdgeRecord,
     UpstreamDependencyNodeRecord, UpstreamDependencyTraversal,
 };
+pub use graph_coverage::{CallEdgeCoverage, LanguageCallEdgeCoverage};
 pub use language_family::{
     EDGE_FILE_LANGUAGE_CTE, edge_source_family_matches_sql, same_language_family_sql,
 };

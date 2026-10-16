@@ -42,7 +42,7 @@ fn to_mcp_error(err: AetherMcpError) -> McpError {
 impl AetherMcpServer {
     #[tool(
         name = "aether_status",
-        description = "Get AETHER index status: symbol and SIR counts, and freshness against the workspace (last sync, indexed vs workspace HEAD, files changed since, stale SIRs, whether a daemon watches)"
+        description = "Get AETHER index status: symbol and SIR counts, freshness against the workspace (last sync, indexed vs workspace HEAD, files changed since, stale SIRs, whether a daemon watches) and how many call edges the graph resolves per language"
     )]
     pub async fn aether_status(&self) -> Result<Json<AetherStatusResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_status");
@@ -73,7 +73,7 @@ impl AetherMcpServer {
 
     #[tool(
         name = "aether_dependencies",
-        description = "Get resolved callers and call dependencies for a symbol"
+        description = "Get resolved callers and call dependencies for a symbol, with coverage counts for the calls the graph could not resolve or attribute"
     )]
     pub async fn aether_dependencies(
         &self,
@@ -139,7 +139,7 @@ impl AetherMcpServer {
 
     #[tool(
         name = "aether_call_chain",
-        description = "Get transitive call-chain levels for a symbol"
+        description = "Get transitive callee levels for a symbol, with coverage counts for the calls the graph could not resolve"
     )]
     pub async fn aether_call_chain(
         &self,
