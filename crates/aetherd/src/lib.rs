@@ -11,6 +11,7 @@ pub mod contracts;
 pub mod coupling;
 pub mod daemon_client;
 pub mod daemon_detect;
+pub mod doctor;
 pub mod drift;
 pub mod enhance;
 pub mod enhance_templates;

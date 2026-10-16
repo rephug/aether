@@ -1141,6 +1141,8 @@ pub enum Commands {
     SetupLocal(SetupLocalArgs),
     /// Show local index health and SIR coverage
     Status,
+    /// Check that the configured inference and embedding model ids exist (lists models only)
+    Doctor,
     /// Store a project memory note
     Remember(RememberArgs),
     /// Search project memory notes
@@ -1728,6 +1730,13 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn doctor_subcommand_parses() {
+        let cli =
+            Cli::try_parse_from(["aetherd", "--workspace", ".", "doctor"]).expect("doctor parse");
+        assert!(matches!(cli.command, Some(Commands::Doctor)));
     }
 
     #[test]

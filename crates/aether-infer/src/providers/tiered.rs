@@ -1,6 +1,7 @@
 use aether_config::InferenceProviderKind;
 use async_trait::async_trait;
 
+use crate::model_check::ModelListing;
 use crate::types::{InferError, InferSirResult, InferenceProvider, SirContext};
 
 pub struct TieredProvider {
@@ -41,6 +42,12 @@ impl InferenceProvider for TieredProvider {
             self.primary.model_name(),
             self.fallback.model_name()
         )
+    }
+
+    fn model_listings(&self) -> Vec<ModelListing> {
+        let mut listings = self.primary.model_listings();
+        listings.extend(self.fallback.model_listings());
+        listings
     }
 
     async fn generate_sir(

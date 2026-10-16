@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use crate::http::{
     GEMINI_API_BASE, extract_gemini_parts, extract_gemini_text_part, inference_http_client,
 };
+use crate::model_check::{ModelCatalog, ModelListing};
 use crate::providers::PARSE_VALIDATION_RETRIES;
 use crate::sir_parsing::parse_and_validate_sir;
 use crate::sir_prompt;
@@ -152,6 +153,16 @@ impl InferenceProvider for GeminiProvider {
 
     fn model_name(&self) -> String {
         self.model.clone()
+    }
+
+    fn model_listings(&self) -> Vec<ModelListing> {
+        vec![ModelListing::new(
+            self.model.clone(),
+            ModelCatalog::Gemini {
+                api_base: self.api_base.clone(),
+                api_key: self.api_key.clone(),
+            },
+        )]
     }
 
     async fn generate_sir(

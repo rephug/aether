@@ -10,6 +10,7 @@ use crate::http::{
     extract_embedding_vector, extract_openai_error_message, inference_http_client,
     normalize_openai_api_base,
 };
+use crate::model_check::{ModelCatalog, ModelListing};
 use crate::types::{EmbeddingProvider, InferError};
 
 #[derive(Debug, Clone)]
@@ -114,6 +115,16 @@ impl OpenAiCompatEmbeddingProvider {
 impl EmbeddingProvider for OpenAiCompatEmbeddingProvider {
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>, InferError> {
         self.request_embedding(text).await
+    }
+
+    fn model_listings(&self) -> Vec<ModelListing> {
+        vec![ModelListing::new(
+            self.model.clone(),
+            ModelCatalog::OpenAiCompat {
+                api_base: self.endpoint.clone(),
+                api_key: self.api_key.clone(),
+            },
+        )]
     }
 }
 

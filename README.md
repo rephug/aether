@@ -789,6 +789,7 @@ MAINTENANCE
   refactor-prep          Deep-scan risky symbols before refactoring
   verify-intent          Compare against saved refactor snapshot
   fsck                   Cross-store consistency check
+  doctor                 Check configured model ids exist (lists models, generates nothing)
   setup-local            Configure local Ollama inference
   init-agent             Generate agent config files
   omp up|down|status     Start/stop/inspect the Oh My Pi broker + gateway (inference.provider=omp)

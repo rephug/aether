@@ -2,6 +2,7 @@ mod embedding;
 mod env_vars;
 mod http;
 mod loaders;
+mod model_check;
 mod providers;
 mod reranker;
 mod sir_parsing;
@@ -18,6 +19,7 @@ pub use loaders::{
     load_embedding_provider_from_config, load_inference_provider_from_config,
     load_provider_from_env_or_mock, load_reranker_provider_from_config, summarize_text_with_config,
 };
+pub use model_check::{ModelCatalog, ModelListing};
 pub use providers::{GeminiProvider, OpenAiCompatProvider, Qwen3LocalProvider, TieredProvider};
 pub use reranker::{MockRerankerProvider, RerankCandidate, RerankResult, RerankerProvider};
 pub use sir_prompt::PromptTier;
