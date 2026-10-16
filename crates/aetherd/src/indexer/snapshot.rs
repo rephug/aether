@@ -53,11 +53,6 @@ pub(super) fn sync_snapshot<VectorCleanup>(
 where
     VectorCleanup: FnOnce(&[String]) -> Result<()>,
 {
-    // The HEAD (and ref) the watcher diffs its next HEAD change against once the store
-    // holds this snapshot.
-    let head_at_start =
-        git_watch::read_current_head_state(workspace, resolve_git_watch_dir(workspace).as_deref());
-
     // The ids the store held before this snapshot: reconciliation must not take an
     // unchanged symbol for the new identity of a stale one, and a current symbol not
     // among them is new.
@@ -152,13 +147,22 @@ where
         structural.process_event(store, event)?;
     }
 
-    match head_at_start {
-        Ok(head) => {
+    // The watcher diffs its next HEAD change against the HEAD from before the walk, not
+    // HEAD now: a checkout during the walk happens before the watches exist, so only that
+    // diff can still cover it.
+    match scope.head {
+        Some(head) => {
+            let head = git_watch::HeadState {
+                sha: head.commit.clone(),
+                marker: head.git_ref.clone(),
+            };
             if let Err(err) = git_watch::write_persisted_head_state(workspace, &head) {
                 tracing::warn!(error = %err, "failed to record the watcher's HEAD");
             }
         }
-        Err(err) => tracing::warn!(error = %err, "failed to read HEAD for the watcher"),
+        None => tracing::warn!(
+            "HEAD could not be read before the walk; the watcher keeps its previous base"
+        ),
     }
 
     // Every file the snapshot read was read at some moment after its walk started; that
@@ -179,7 +183,7 @@ where
     if scope.unread_paths.is_empty() {
         if let Err(err) = crate::freshness::record_full_sync(
             workspace,
-            scope.head,
+            scope.head_commit(),
             scope.taken_at,
             scope.taken_at_millis,
         ) {

@@ -396,6 +396,12 @@ pub(super) fn write_persisted_head_state(workspace: &Path, head_state: &HeadStat
     Ok(())
 }
 
+/// HEAD now, as the watcher reads it: the commit and what `.git/HEAD` says.
+pub(crate) fn current_head(workspace: &Path) -> Result<(Option<String>, Option<String>)> {
+    let head = read_current_head_state(workspace, resolve_git_watch_dir(workspace).as_deref())?;
+    Ok((head.sha, head.marker))
+}
+
 pub(super) fn read_current_head_state(
     workspace: &Path,
     git_watch_dir: Option<&Path>,
@@ -1210,6 +1216,60 @@ mod tests {
             after.verdict,
             crate::freshness::FreshnessVerdict::Fresh,
             "{after:?}"
+        );
+    }
+
+    /// A checkout while a daemon's startup walk runs lands before the watches exist, so
+    /// no event reports it. The sync must keep the HEAD from before the walk as the
+    /// watcher's base, so that the next git trigger diffs from it and indexes the switch.
+    #[test]
+    fn a_head_change_during_the_startup_walk_is_covered_by_the_next_trigger() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let mut repo = WatchedRepo::new(workspace, "trigger_on_branch_switch = true");
+
+        // A daemon starts: its walk reads `main`, then HEAD moves to `feature` before the
+        // snapshot is synced.
+        let mut observer = ObserverState::new(workspace.to_path_buf()).expect("observer");
+        observer.seed_from_disk().expect("seed observer");
+        run_git(workspace, &["checkout", "-q", "feature"]);
+        let (events, symbols_by_id, _) = collect_initial_snapshot(&observer);
+        sync_snapshot(
+            workspace,
+            &repo.store,
+            &mut repo.structural,
+            &SnapshotScope::of(&observer),
+            &events,
+            &symbols_by_id,
+            |_| Ok(()),
+        )
+        .expect("sync snapshot");
+
+        assert_eq!(
+            read_persisted_head_state(workspace)
+                .expect("watcher base")
+                .sha
+                .as_deref(),
+            Some(repo.main.as_str()),
+            "the watcher's base is the commit the walk read"
+        );
+        assert_eq!(
+            crate::freshness::read_index_sync_marker(workspace)
+                .head
+                .as_deref(),
+            Some(repo.main.as_str())
+        );
+        assert!(!repo.indexes("pkg/added.py"));
+
+        // The first git event after the watches exist covers the missed switch.
+        repo.observer = observer;
+        repo.fire_git_trigger();
+        assert!(repo.indexes("pkg/added.py"));
+        assert_eq!(
+            crate::freshness::read_index_sync_marker(workspace)
+                .head
+                .as_deref(),
+            Some(repo.feature.as_str())
         );
     }
 }

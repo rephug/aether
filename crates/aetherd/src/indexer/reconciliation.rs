@@ -69,8 +69,8 @@ pub(super) struct SnapshotScope<'a> {
     pub(super) taken_at: i64,
     /// The same moment in milliseconds.
     pub(super) taken_at_millis: i64,
-    /// The commit HEAD pointed at just before the snapshot read the workspace.
-    pub(super) head: Option<&'a str>,
+    /// HEAD just before the snapshot read the workspace; `None` when it could not be read.
+    pub(super) head: Option<&'a SeededHead>,
 }
 
 impl<'a> SnapshotScope<'a> {
@@ -92,6 +92,11 @@ impl<'a> SnapshotScope<'a> {
             taken_at_millis: i64::MAX,
             head: None,
         }
+    }
+
+    /// The commit HEAD pointed at before the walk, if known.
+    pub(super) fn head_commit(&self) -> Option<&'a str> {
+        self.head.and_then(|head| head.commit.as_deref())
     }
 
     fn read_file(&self, file_path: &str) -> bool {

@@ -31,7 +31,9 @@ use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use crate::batch::hash::compute_prompt_hash;
 use crate::batch::write_fingerprint_row;
 use crate::continuous::cosine_distance_from_embeddings;
-use crate::observer::{DebounceQueue, ObserverState, is_ignored_path, relative_workspace_path};
+use crate::observer::{
+    DebounceQueue, ObserverState, SeededHead, is_ignored_path, relative_workspace_path,
+};
 use crate::priority_queue::{
     SirPriorityQueue, compute_priority_score, kind_priority_score, size_inverse_score,
 };
@@ -55,6 +57,7 @@ mod structural;
 mod worker;
 
 pub use self::enrichment::build_enrichment_context;
+pub(crate) use self::git_watch::current_head;
 use self::git_watch::{
     GitDebounceState, handle_watch_result, process_debounced_paths, process_git_trigger,
     resolve_git_watch_dir,

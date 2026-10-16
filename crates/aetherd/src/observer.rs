@@ -52,9 +52,17 @@ pub struct ObserverState {
     /// The same moment in milliseconds, to tell a file written just before the walk from
     /// one written during or after it.
     seeded_at_millis: i64,
-    /// The commit HEAD pointed at just before that walk, if the workspace is in git: the
-    /// newest commit the snapshot can speak for.
-    seeded_head: Option<String>,
+    /// HEAD just before that walk: the newest commit the snapshot can speak for. `None`
+    /// when it could not be read.
+    seeded_head: Option<SeededHead>,
+}
+
+/// HEAD as it was before a walk: the commit and what `.git/HEAD` said (a ref, or a commit
+/// when detached). Both are `None` outside git.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeededHead {
+    pub commit: Option<String>,
+    pub git_ref: Option<String>,
 }
 
 impl ObserverState {
@@ -81,8 +89,8 @@ impl ObserverState {
     }
 
     /// See `ObserverState::seeded_head`.
-    pub fn seeded_head(&self) -> Option<&str> {
-        self.seeded_head.as_deref()
+    pub fn seeded_head(&self) -> Option<&SeededHead> {
+        self.seeded_head.as_ref()
     }
 
     /// See `ObserverState::unread_paths`: what the snapshot is missing because it could
@@ -92,7 +100,15 @@ impl ObserverState {
     }
 
     pub fn seed_from_disk(&mut self) -> Result<()> {
-        self.seeded_head = crate::freshness::workspace_head(&self.workspace);
+        // Read before the walk: a checkout during it leaves this older than some files read,
+        // so the next HEAD change is diffed from here and covers it.
+        self.seeded_head = match crate::indexer::current_head(&self.workspace) {
+            Ok((commit, git_ref)) => Some(SeededHead { commit, git_ref }),
+            Err(err) => {
+                tracing::warn!(error = %err, "could not read HEAD before the workspace walk");
+                None
+            }
+        };
         self.seeded_at_millis = crate::time::current_unix_timestamp_millis();
         self.seeded_at = self.seeded_at_millis.div_euclid(1000);
         self.unread_paths.clear();
