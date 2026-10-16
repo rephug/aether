@@ -291,6 +291,17 @@ fn listing_result(
     }
 
     let mut detail = format!("{provider} model '{model}' is not listed by {source}");
+    // Requests add their own `models/` segment, so the prefixed form is a different id.
+    if let ModelCatalog::Gemini { .. } = listing.catalog
+        && let Some(bare) = model.strip_prefix("models/")
+        && listing.catalog.lists(bare, &ids)
+    {
+        detail.push_str(&format!(
+            "; requests would address 'models/{model}', so configure '{bare}' without the \
+             'models/' prefix"
+        ));
+        return (CheckStatus::Fail, detail);
+    }
     // Google's notices only fit a model Google serves.
     let gemini_api = matches!(listing.catalog, ModelCatalog::Gemini { .. });
     if let Some(notice) = model_id_notice_for(model, gemini_api) {
@@ -360,7 +371,9 @@ mod tests {
     use aether_config::ensure_workspace_config;
     use tempfile::tempdir;
 
-    use super::{CheckStatus, run_doctor, similar_ids};
+    use aether_infer::{ModelCatalog, ModelListing};
+
+    use super::{CheckStatus, listing_result, run_doctor, similar_ids};
 
     fn write_config(workspace: &std::path::Path, config: &str) {
         std::fs::create_dir_all(workspace.join(".aether")).expect("aether dir");
@@ -536,6 +549,37 @@ endpoint = "{endpoint}"
             .collect::<Vec<_>>();
         assert_eq!(statuses, [("inference", CheckStatus::Ok)], "{report:?}");
         assert_eq!(report.exit_code(), 0);
+    }
+
+    /// Requests add their own `models/` segment, so a configured `models/<id>` would be
+    /// requested as `models/models/<id>`: doctor must fail it, naming the id to configure.
+    #[test]
+    fn a_models_prefixed_gemini_id_fails_with_the_id_to_configure() {
+        let listing = ModelListing::new(
+            "models/gemini-3.1-flash-lite",
+            ModelCatalog::Gemini {
+                api_base: "https://generativelanguage.example/v1beta".to_owned(),
+                api_key: aether_core::Secret::new("test-key".to_owned()),
+            },
+        );
+        let (status, detail) = listing_result(
+            "gemini",
+            &listing,
+            Ok(vec!["gemini-3.1-flash-lite".to_owned()]),
+        );
+        assert_eq!(status, CheckStatus::Fail);
+        assert!(
+            detail.contains("configure 'gemini-3.1-flash-lite' without the 'models/' prefix"),
+            "{detail}"
+        );
+
+        let bare = ModelListing::new("gemini-3.1-flash-lite", listing.catalog.clone());
+        let (status, _) = listing_result(
+            "gemini",
+            &bare,
+            Ok(vec!["gemini-3.1-flash-lite".to_owned()]),
+        );
+        assert_eq!(status, CheckStatus::Ok);
     }
 
     #[test]

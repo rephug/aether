@@ -111,13 +111,11 @@ impl ModelCatalog {
     }
 
     /// Whether `ids`, as [`Self::list_model_ids`] returned them, include `model`. Ollama
-    /// reads a name without a tag as `:latest`.
+    /// reads a name without a tag as `:latest`. A Gemini id must match exactly: requests
+    /// put the configured id after their own `/models/`, so `models/<id>` would address
+    /// `/models/models/<id>`.
     pub fn lists(&self, model: &str, ids: &[String]) -> bool {
         let model = model.trim();
-        let model = match self {
-            Self::Gemini { .. } => model.strip_prefix("models/").unwrap_or(model),
-            Self::Ollama { .. } | Self::OpenAiCompat { .. } => model,
-        };
         let tagged = match self {
             Self::Ollama { .. } if !model.contains(':') => Some(format!("{model}:latest")),
             _ => None,
@@ -204,7 +202,8 @@ mod tests {
             .expect("list models");
         assert_eq!(ids, ["gemini-3.1-flash-lite", "gemini-embedding-2"]);
         assert!(catalog.lists("gemini-3.1-flash-lite", &ids));
-        assert!(catalog.lists("models/gemini-embedding-2", &ids));
+        // Requests would address `/models/models/...` for this form.
+        assert!(!catalog.lists("models/gemini-embedding-2", &ids));
         assert!(!catalog.lists("gemini-3.1-flash-lite-preview", &ids));
 
         let requests = server.join().expect("server");
