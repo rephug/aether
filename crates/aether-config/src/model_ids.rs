@@ -177,8 +177,10 @@ pub fn configured_model_ids(config: &AetherConfig) -> Vec<ConfiguredModel> {
         );
     }
     if let Some(batch) = &config.batch {
-        // `auto` follows the omp route in the model id, which `google/` already marks.
-        let gemini_batch = batch.provider.trim().eq_ignore_ascii_case("gemini");
+        // As batch runs resolve it: `auto` follows the omp route in `[inference].model`.
+        let gemini_batch = batch
+            .resolve_provider(None, config.inference.model.as_deref())
+            .is_ok_and(|provider| provider.eq_ignore_ascii_case("gemini"));
         push(
             "batch.scan_model",
             Some(batch.scan_model.as_str()),
@@ -298,6 +300,48 @@ deep_model = "deep-model"
                 gemini_api,
             })
         );
+    }
+
+    /// `batch.provider = "auto"` sends batches where the inference route points, so a flat
+    /// batch model behind a `google/` route goes to Gemini and gets Google's notices.
+    #[test]
+    fn auto_batches_behind_a_google_route_count_as_gemini() {
+        let config = parse_workspace_config_str(
+            r#"
+[inference]
+provider = "omp"
+model = "google/gemini-3.1-flash-lite"
+
+[batch]
+provider = "auto"
+scan_model = "gemini-3.1-flash-lite-preview"
+"#,
+        )
+        .expect("parse config");
+        let scan = configured_model_ids(&config)
+            .into_iter()
+            .find(|model| model.setting == "batch.scan_model")
+            .expect("batch scan model");
+        assert!(scan.gemini_api, "{scan:?}");
+        assert!(scan.notice().is_some());
+
+        let config = parse_workspace_config_str(
+            r#"
+[inference]
+provider = "omp"
+model = "anthropic/claude-fable-5"
+
+[batch]
+provider = "auto"
+scan_model = "gemini-3.1-flash-lite-preview"
+"#,
+        )
+        .expect("parse config");
+        let scan = configured_model_ids(&config)
+            .into_iter()
+            .find(|model| model.setting == "batch.scan_model")
+            .expect("batch scan model");
+        assert!(!scan.gemini_api, "{scan:?}");
     }
 
     /// Google's notices are about Google's models: the same name served by another
