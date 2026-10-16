@@ -661,6 +661,21 @@ vector_backend = "sqlite"
             .iter()
             .any(|note| note.starts_with("3 of 3 SIRs have no recorded source hash"))
     );
+    // ...so the summary vouches for the structure only.
+    assert!(
+        fresh
+            .summary
+            .starts_with("Structural index fresh: last synced "),
+        "{}",
+        fresh.summary
+    );
+    assert!(
+        fresh
+            .summary
+            .ends_with("SIR staleness unverifiable for 3 SIRs with no source hash."),
+        "{}",
+        fresh.summary
+    );
 
     // Edit one file after the index (two minutes ahead, so it can't share the sync's
     // second), delete the other and add a new one.

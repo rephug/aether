@@ -91,7 +91,10 @@ pub struct SirCoverageStats {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherIndexFreshness {
-    /// `fresh`, `stale` (files or HEAD changed since the index) or `empty`.
+    /// `fresh` (no file or HEAD change since the index, so symbols and edges are current),
+    /// `stale` (files or HEAD changed since the index) or `empty`. `fresh` says nothing
+    /// about the `sirs_without_source_hash` SIRs, whose staleness can't be checked; the
+    /// summary then reads "Structural index fresh" and names how many there are.
     pub verdict: String,
     /// One line on how fresh the index is.
     pub summary: String,

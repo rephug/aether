@@ -181,7 +181,9 @@ pub fn watcher_running(workspace: &Path) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FreshnessVerdict {
-    /// Nothing changed since the index, as far as file times and HEAD tell.
+    /// Nothing changed since the index, as far as file times and HEAD tell: symbols and
+    /// edges are current. A SIR without a source hash may still be out of date, so the
+    /// summary then says the structural index is fresh and SIR staleness unverifiable.
     Fresh,
     /// Files or HEAD changed since the index.
     Stale,
@@ -447,6 +449,11 @@ fn summary_line(freshness: &IndexFreshness, now: i64) -> String {
     };
     match freshness.verdict {
         FreshnessVerdict::Empty => "Index empty: no symbols are indexed.".to_owned(),
+        FreshnessVerdict::Fresh if freshness.sir.leaves_without_source_hash > 0 => format!(
+            "Structural index fresh: {synced} {head}; no source file changed since. SIR \
+             staleness unverifiable for {} SIRs with no source hash.",
+            freshness.sir.leaves_without_source_hash
+        ),
         FreshnessVerdict::Fresh => {
             format!("Index fresh: {synced} {head}; no source file changed since.")
         }
@@ -652,8 +659,8 @@ mod tests {
 
     use super::{
         FreshnessVerdict, WatcherLock, assess_index_freshness, describe_age,
-        read_index_sync_marker, symbol_freshness_note, take_watcher_lock, watcher_running,
-        workspace_head,
+        read_index_sync_marker, summary_line, symbol_freshness_note, take_watcher_lock,
+        watcher_running, workspace_head,
     };
     use crate::indexer::{IndexerConfig, run_initial_index_once};
 
@@ -796,6 +803,36 @@ mod tests {
         let resynced = assess_index_freshness(workspace, &store).expect("assess");
         assert_eq!(resynced.deleted_files, 0, "{resynced:?}");
         assert_eq!(resynced.new_files, 0, "{resynced:?}");
+    }
+
+    /// Without a source hash a SIR's staleness can't be checked, so a fresh verdict then
+    /// vouches only for symbols and edges, and the summary says so.
+    #[test]
+    fn fresh_summary_vouches_only_for_the_structure_when_sirs_have_no_hash() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_workspace(workspace);
+        index_once(workspace);
+        let store = SqliteStore::open(workspace).expect("open store");
+        let mut fresh = assess_index_freshness(workspace, &store).expect("assess");
+        assert_eq!(fresh.verdict, FreshnessVerdict::Fresh, "{fresh:?}");
+
+        fresh.sir.leaves_without_source_hash = 0;
+        let hashed = summary_line(&fresh, 0);
+        assert!(hashed.starts_with("Index fresh: "), "{hashed}");
+
+        fresh.sir.leaves_without_source_hash = 2;
+        let hashless = summary_line(&fresh, 0);
+        assert!(
+            hashless.starts_with("Structural index fresh: "),
+            "{hashless}"
+        );
+        assert!(
+            hashless.ends_with(
+                "no source file changed since. SIR staleness unverifiable for 2 SIRs with no source hash."
+            ),
+            "{hashless}"
+        );
     }
 
     #[test]
