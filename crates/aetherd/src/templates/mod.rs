@@ -100,12 +100,11 @@ pub(crate) fn search_modes_line(context: &TemplateContext) -> String {
     }
 }
 
-/// What the generated files make mandatory: only steps every installation can carry out.
+/// What the generated files make mandatory: only steps every installation can carry out,
+/// and no tool call that writes to the store every session shares, so a session meant to
+/// be read-only can follow them. With nothing mandatory, one line says so.
 pub(crate) fn required_actions(context: &TemplateContext) -> Vec<String> {
-    let mut actions = vec![
-        "Always call `aether_get_sir` before reverting, deleting, or refactoring symbols."
-            .to_owned(),
-    ];
+    let mut actions = Vec::new();
     if context.verification_tool {
         actions.push("Always call `aether_verify` after modifying code.".to_owned());
         actions.push("If `aether_verify` fails, fix the issue before proceeding.".to_owned());
@@ -115,8 +114,18 @@ pub(crate) fn required_actions(context: &TemplateContext) -> Vec<String> {
                 .to_owned(),
         );
     }
+    if actions.is_empty() {
+        actions.push(NOTHING_REQUIRED.to_owned());
+    }
     actions
 }
+
+/// The required-actions line when no verification step applies.
+pub(crate) const NOTHING_REQUIRED: &str =
+    "None: every AETHER tool call is advice, not a requirement.";
+
+/// `aether_get_sir` as advice, with what a call writes.
+pub(crate) const GET_SIR_GUIDANCE: &str = "Before reverting, deleting, or refactoring a symbol, consider `aether_get_sir` for its recorded intent, side effects and error modes. It is not read-only: each call records an access to the symbol (access recency feeds health scores) and, for a symbol with no SIR, queues one for generation.";
 
 pub(crate) fn recommended_actions(context: &TemplateContext) -> Vec<String> {
     let search_guidance = if context.embeddings_enabled {
@@ -127,6 +136,7 @@ pub(crate) fn recommended_actions(context: &TemplateContext) -> Vec<String> {
 
     vec![
         STATUS_GUIDANCE.to_owned(),
+        GET_SIR_GUIDANCE.to_owned(),
         search_guidance.to_owned(),
         "Consider `aether_sir_context` for a symbol's source, SIR, neighbors and tests in one call; its first line says whether the file changed since it was indexed.".to_owned(),
         "Consider `aether_symbol_timeline` when reviewing recent changes.".to_owned(),
@@ -137,7 +147,7 @@ pub(crate) fn recommended_actions(context: &TemplateContext) -> Vec<String> {
 }
 
 /// How to read `aether_status`'s freshness fields before trusting other tools.
-pub(crate) const STATUS_GUIDANCE: &str = "Call `aether_status` at task start and read `freshness.summary`. When `freshness.verdict` is `stale` (files or HEAD changed since the last sync), treat symbols, edges and SIRs of the files in `freshness.changed_file_samples` as out of date, or run `aetherd --workspace . --index-once` first. `freshness.daemon_running` says whether edits reach the index as you make them.";
+pub(crate) const STATUS_GUIDANCE: &str = "Call `aether_status` at task start and read `freshness.summary`. When `freshness.verdict` is `stale` (files or HEAD changed since the last sync), treat symbols, edges and SIRs of the files in `freshness.changed_file_samples` as out of date, or run `aetherd --workspace . --index-once` first. A `fresh` verdict covers symbols and edges; `freshness.sirs_without_source_hash` counts SIRs whose staleness can't be checked. `freshness.daemon_running` says whether edits reach the index as you make them.";
 
 /// Stands in for the tool list: the MCP server sends every tool's name and description.
 pub(crate) const TOOLS_NOTE: &str = "The AETHER MCP server lists its tools with their descriptions; this file does not repeat them.";
@@ -148,8 +158,8 @@ mod tests {
         AuditChangesCommandTemplate, AuditCommandTemplate, AuditReportCommandTemplate,
         ClaudeTemplate, CodexInstructionsTemplate, ContextCommandTemplate, CursorRulesTemplate,
         EnrichCommandTemplate, ExplainAreaCommandTemplate, GithubReviewWorkflowTemplate,
-        HealthCheckCommandTemplate, ImpactCommandTemplate, McpJsonTemplate, NextCommandTemplate,
-        OmpAgentsTemplate, PreFlightCommandTemplate, RefactorCommandTemplate,
+        HealthCheckCommandTemplate, ImpactCommandTemplate, McpJsonTemplate, NOTHING_REQUIRED,
+        NextCommandTemplate, OmpAgentsTemplate, PreFlightCommandTemplate, RefactorCommandTemplate,
         RefactorDeepCommandTemplate, ReviewCommandTemplate, ScanAllScriptTemplate,
         ScanCommandTemplate, SkillTemplate, TemplateContext, required_actions,
     };
@@ -206,8 +216,13 @@ mod tests {
             .expect("required section");
         assert_eq!(
             required,
-            "- Always call `aether_get_sir` before reverting, deleting, or refactoring symbols.\n- After modifying code, run the verify commands listed below and fix failures before proceeding."
+            "- After modifying code, run the verify commands listed below and fix failures before proceeding."
         );
+        // `aether_get_sir` writes access counts and queues SIR requests, so it is advice,
+        // with that said, rather than a mandate a read-only session can't follow.
+        assert!(claude.contains("consider `aether_get_sir`"));
+        assert!(claude.contains("It is not read-only"));
+        assert!(claude.contains("`freshness.sirs_without_source_hash`"));
         assert!(claude.contains("`freshness.verdict` is `stale`"));
         assert!(claude.contains("`freshness.daemon_running` is false"));
         assert!(!claude.contains("to confirm index freshness"));
@@ -227,6 +242,14 @@ mod tests {
             assert!(!rendered.contains("aether_verify`"), "{rendered}");
             assert!(!rendered.contains("aether_verify "), "{rendered}");
             assert!(!rendered.contains("call aether_sir_inject"), "{rendered}");
+            assert!(
+                !rendered.contains("Always call `aether_get_sir`"),
+                "{rendered}"
+            );
+            assert!(
+                !rendered.contains("Always call aether_get_sir"),
+                "{rendered}"
+            );
             assert!(
                 !rendered.contains("call `aether_why_changed`"),
                 "{rendered}"
@@ -249,8 +272,11 @@ mod tests {
             verify_commands: Vec::new(),
             ..sample_context()
         };
-        let required = required_actions(&bare);
-        assert_eq!(required.len(), 1, "{required:?}");
+        assert_eq!(required_actions(&bare), [NOTHING_REQUIRED]);
+        assert!(
+            ClaudeTemplate::render(&bare)
+                .contains("## Required Actions (mandatory)\n- None: every AETHER tool call")
+        );
     }
 
     #[test]
@@ -500,8 +526,12 @@ mod tests {
     fn cursor_template_uses_numbered_directives() {
         let rendered = CursorRulesTemplate::render(&sample_context());
 
-        assert!(rendered.contains("## Mandatory directives\n1. Always call `aether_get_sir`"));
-        assert!(rendered.contains("2. After modifying code, run the verify commands"));
+        assert!(
+            rendered.contains(
+                "## Mandatory directives\n1. After modifying code, run the verify commands"
+            )
+        );
+        assert!(rendered.contains("consider `aether_get_sir`"));
         assert!(rendered.contains("Agent schema version: 7"));
         assert!(!rendered.contains("aether_verify "));
         assert!(rendered.contains("run aetherd --workspace . --index-once"));

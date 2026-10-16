@@ -864,6 +864,7 @@ mod tests {
                 !required.contains("aether_sir_inject"),
                 "{file}: {required}"
             );
+            assert!(!required.contains("aether_get_sir"), "{file}: {required}");
             assert!(rendered.contains("`freshness.verdict`"), "{file}");
             assert!(!rendered.contains("to confirm index freshness"), "{file}");
             // The 40-tool list is gone.
