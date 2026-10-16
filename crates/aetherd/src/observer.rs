@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -55,6 +55,9 @@ pub struct ObserverState {
     /// HEAD just before that walk: the newest commit the snapshot can speak for. `None`
     /// when it could not be read.
     seeded_head: Option<SeededHead>,
+    /// Workspace-relative paths the last `process_path` of each skipped for exceeding the
+    /// parse size limit: not read, so their stored symbols may describe older text.
+    oversized: HashSet<PathBuf>,
 }
 
 /// HEAD as it was before a walk: the commit and what `.git/HEAD` said (a ref, or a commit
@@ -75,6 +78,7 @@ impl ObserverState {
             seeded_at: 0,
             seeded_at_millis: 0,
             seeded_head: None,
+            oversized: HashSet::new(),
         })
     }
 
@@ -86,6 +90,13 @@ impl ObserverState {
     /// See `ObserverState::seeded_at_millis`.
     pub fn seeded_at_millis(&self) -> i64 {
         self.seeded_at_millis
+    }
+
+    /// Whether the last `process_path` of `path` skipped it for its size, so it read
+    /// nothing.
+    pub fn skipped_as_oversized(&self, path: &Path) -> bool {
+        self.oversized
+            .contains(&relative_workspace_path(&self.workspace, path))
     }
 
     /// See `ObserverState::seeded_head`.
@@ -220,9 +231,11 @@ impl ObserverState {
                         limit = MAX_PARSE_FILE_SIZE,
                         "skipping oversized changed file"
                     );
+                    self.oversized.insert(relative);
                     return Ok(None);
                 }
             }
+            self.oversized.remove(&relative);
 
             match fs::read_to_string(path) {
                 Ok(source) => self

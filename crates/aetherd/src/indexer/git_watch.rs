@@ -296,6 +296,9 @@ fn process_reindex_path(
             }
             true
         }
+        // A file skipped for its size was not read: its stored symbols may describe older
+        // text, so nothing may count it as read.
+        Ok(None) if observer.skipped_as_oversized(path) => false,
         // An edit that changes no symbol (a comment, blank lines, an import) still changes
         // the file and maybe its edges. Re-extract them, or status would report the file
         // as modified until the next full sync. A file the index read since it last
@@ -339,7 +342,7 @@ fn process_reindex_path(
             .with_context(|| format!("failed to record reading {}", path.display()))?;
     }
 
-    if path.is_file() && language_for_path(path).is_some() {
+    if path.is_file() && language_for_path(path).is_some() && !observer.skipped_as_oversized(path) {
         let file_path =
             normalize_path(&relative_workspace_path(&config.workspace, path).to_string_lossy());
         if let Err(err) = store.record_file_reads(&[file_path], read_started_ms) {
@@ -1270,6 +1273,67 @@ mod tests {
                 .head
                 .as_deref(),
             Some(repo.feature.as_str())
+        );
+    }
+
+    /// An indexed file that grows past the parse size limit is skipped, not read, so its
+    /// stored symbols may describe older text. The watcher must not count it as read.
+    #[test]
+    fn a_watched_file_skipped_for_its_size_still_reads_as_modified() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
+        fs::write(
+            workspace.join(".aether/config.toml"),
+            "[inference]\nprovider = \"mock\"\n\n[storage]\ngraph_backend = \"sqlite\"\n\n[embeddings]\nenabled = false\nvector_backend = \"sqlite\"\n",
+        )
+        .expect("write config");
+        fs::create_dir_all(workspace.join("pkg")).expect("create pkg");
+        fs::write(
+            workspace.join("pkg/a.py"),
+            "def alpha(x):\n    return x + 1\n",
+        )
+        .expect("write a");
+        let config = mock_config(workspace);
+        crate::freshness::let_writes_settle();
+        run_initial_index_once(&config).expect("index once");
+        let _watcher_lock = crate::freshness::take_watcher_lock(workspace).expect("watcher lock");
+        let mut observer = ObserverState::new(workspace.to_path_buf()).expect("observer");
+        observer.seed_from_disk().expect("seed observer");
+        let mut structural =
+            StructuralIndexer::new(workspace.to_path_buf()).expect("structural indexer");
+        let store = SqliteStore::open(workspace).expect("open store");
+        let queue_state = SharedQueueState::new(HashMap::new());
+        let read_before = store.file_read_at_ms("pkg/a.py").expect("read time");
+
+        // Past the 2 MiB parse limit: a new body, then enough comment lines.
+        let mut grown = String::from("def alpha(x):\n    return x * 2\n");
+        while grown.len() <= 2 * 1024 * 1024 {
+            grown.push_str("# padding that pushes the file past the parse size limit\n");
+        }
+        fs::write(workspace.join("pkg/a.py"), grown).expect("grow a");
+        crate::freshness::let_writes_settle();
+        process_debounced_paths(
+            &config,
+            &mut observer,
+            &mut structural,
+            &store,
+            &queue_state,
+            vec![workspace.join("pkg/a.py")],
+        );
+
+        assert!(observer.skipped_as_oversized(&workspace.join("pkg/a.py")));
+        assert_eq!(
+            store.file_read_at_ms("pkg/a.py").expect("read time"),
+            read_before,
+            "a skipped file was not read"
+        );
+        let freshness =
+            crate::freshness::assess_index_freshness(workspace, &store).expect("assess");
+        assert_eq!(
+            freshness.changed_file_samples,
+            ["M pkg/a.py"],
+            "{freshness:?}"
         );
     }
 }
