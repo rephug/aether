@@ -996,3 +996,68 @@ fn a_deletion_in_an_index_of_symbol_free_files_alone_reads_as_stale() {
     );
     assert_eq!(freshness.changed_file_samples, ["D src/main.ts"]);
 }
+
+/// An index of symbol-free files alone has no symbols, yet holds their edges: editing one
+/// while nothing watches must read as modified, not leave the index looking empty.
+#[test]
+fn an_unwatched_edit_in_an_index_of_symbol_free_files_alone_reads_as_modified() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
+    fs::write(
+        workspace.join(".aether/config.toml"),
+        "[inference]\nprovider = \"mock\"\n\n[storage]\ngraph_backend = \"sqlite\"\n\n[embeddings]\nenabled = false\nvector_backend = \"sqlite\"\n",
+    )
+    .expect("write config");
+    let config = mock_config(workspace);
+    run_initial_index_once(&config).expect("index once");
+    let mut observer = ObserverState::new(workspace.to_path_buf()).expect("observer");
+    observer.seed_from_disk().expect("seed observer");
+    let mut structural =
+        StructuralIndexer::new(workspace.to_path_buf()).expect("structural indexer");
+    let store = SqliteStore::open(workspace).expect("open store");
+    let queue_state = SharedQueueState::new(HashMap::new());
+
+    fs::create_dir_all(workspace.join("src")).expect("create src");
+    fs::write(
+        workspace.join("src/main.ts"),
+        "import { alpha } from \"./a\";\n\nalpha();\n",
+    )
+    .expect("write main");
+    crate::freshness::let_writes_settle();
+    process_debounced_paths(
+        &config,
+        &mut observer,
+        &mut structural,
+        &store,
+        &queue_state,
+        vec![workspace.join("src/main.ts")],
+    );
+    assert!(
+        store
+            .list_indexed_files()
+            .expect("indexed files")
+            .is_empty()
+    );
+    let read = crate::freshness::assess_index_freshness(workspace, &store).expect("assess");
+    assert_eq!(
+        read.verdict,
+        crate::freshness::FreshnessVerdict::Empty,
+        "{read:?}"
+    );
+
+    // Edited after the watcher stopped: the stored edges are of the old text.
+    crate::freshness::let_writes_settle();
+    fs::write(
+        workspace.join("src/main.ts"),
+        "import { beta } from \"./b\";\n\nbeta();\n",
+    )
+    .expect("edit main");
+    let freshness = crate::freshness::assess_index_freshness(workspace, &store).expect("assess");
+    assert_eq!(
+        freshness.verdict,
+        crate::freshness::FreshnessVerdict::Stale,
+        "{freshness:?}"
+    );
+    assert_eq!(freshness.changed_file_samples, ["M src/main.ts"]);
+}

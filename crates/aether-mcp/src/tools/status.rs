@@ -118,8 +118,9 @@ pub struct AetherIndexFreshness {
     /// Null when either HEAD is unknown.
     pub head_matches: Option<bool>,
     pub indexed_files: u64,
-    /// Indexed files modified after the indexer last read them, by modification time: a
-    /// file touched or checked out again without a content change counts too.
+    /// Indexed files, and symbol-free files the watcher read, modified after the indexer
+    /// last read them, by modification time: a file touched or checked out again without a
+    /// content change counts too.
     pub modified_files: u64,
     /// Indexed files that no longer exist, symbol-free ones the index read included.
     pub deleted_files: u64,

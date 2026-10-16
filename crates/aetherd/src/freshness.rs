@@ -243,8 +243,9 @@ pub struct IndexFreshness {
     /// `None` when either HEAD is unknown.
     pub head_matches: Option<bool>,
     pub indexed_files: u64,
-    /// Indexed files modified after they were last read, by modification time: a file
-    /// touched or checked out again without a content change counts too.
+    /// Indexed files, and symbol-free files the watcher read, modified after they were last
+    /// read, by modification time: a file touched or checked out again without a content
+    /// change counts too.
     pub modified_files: u64,
     /// Indexed files that no longer exist, symbol-free ones the index read included.
     pub deleted_files: u64,
@@ -305,54 +306,56 @@ pub fn assess_index_freshness(workspace: &Path, store: &SqliteStore) -> Result<I
         .full_sync_at_ms
         .or_else(|| marker.full_sync_at.map(|secs| secs.saturating_mul(1000)))
         .or_else(|| last_symbol_update_at.map(|secs| secs.saturating_mul(1000) + 999));
-    // A file the watcher read after its last write is not new either, symbols or not.
-    let new_files = match reference_ms {
-        Some(reference) if !indexed.is_empty() => {
-            let indexed_paths = indexed
-                .iter()
-                .map(|file| file.file_path.as_str())
-                .collect::<std::collections::HashSet<_>>();
-            let reads = store
-                .list_file_reads()
-                .context("failed to list file read times")?;
-            let walk = source_files(workspace);
-            unreadable.extend(walk.unreadable);
-            walk.files
-                .into_iter()
-                .filter(|(path, mtime)| {
-                    written_after(*mtime, reference)
-                        && !indexed_paths.contains(path.as_str())
-                        && reads
-                            .get(path)
-                            .is_none_or(|read_at_ms| written_after(*mtime, *read_at_ms))
-                })
-                .map(|(path, _)| path)
-                .collect::<Vec<_>>()
+    // Source files the store holds no symbols for. One the watcher read (it has a
+    // `file_reads` time) and that changed since counts as modified: its stored edges and
+    // test intents are out of date. One the index never read counts as new once it changed
+    // after the last full sync started. The walk runs even when no symbols are indexed,
+    // since an index of symbol-free files alone still holds their edges.
+    let indexed_paths = indexed
+        .iter()
+        .map(|file| file.file_path.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let reads = store
+        .list_file_reads()
+        .context("failed to list file read times")?;
+    let mut new_files = Vec::new();
+    if reference_ms.is_some() || !reads.is_empty() {
+        let walk = source_files(workspace);
+        unreadable.extend(walk.unreadable);
+        for (path, mtime) in walk.files {
+            if indexed_paths.contains(path.as_str()) {
+                continue;
+            }
+            match reads.get(&path) {
+                Some(read_at_ms) => {
+                    if written_after(mtime, *read_at_ms) {
+                        modified.push(path);
+                    }
+                }
+                None => {
+                    if reference_ms.is_some_and(|reference| written_after(mtime, reference)) {
+                        new_files.push(path);
+                    }
+                }
+            }
         }
-        _ => Vec::new(),
-    };
+    }
+    modified.sort();
     unreadable.sort();
     unreadable.dedup();
 
     // A file the index read that is gone, with no symbols for the loop above to find, can
     // still have edges and test intents stored until a reindex or full sync clears them.
-    let indexed_paths = indexed
-        .iter()
-        .map(|file| file.file_path.as_str())
-        .collect::<std::collections::HashSet<_>>();
-    let mut gone_without_symbols = store
-        .list_file_reads()
-        .context("failed to list file read times")?
-        .into_keys()
+    let mut gone_without_symbols = reads
+        .keys()
         .filter(|path| {
             !indexed_paths.contains(path.as_str())
                 && matches!(file_time(&workspace.join(path)), FileTime::Missing)
         })
+        .cloned()
         .collect::<Vec<_>>();
     gone_without_symbols.sort();
-    for path in gone_without_symbols {
-        deleted.push(path);
-    }
+    deleted.extend(gone_without_symbols);
 
     let head_matches = match (marker.head.as_deref(), workspace_head.as_deref()) {
         (Some(indexed), Some(current)) => Some(indexed.eq_ignore_ascii_case(current)),
