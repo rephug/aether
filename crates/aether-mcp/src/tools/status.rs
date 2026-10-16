@@ -28,10 +28,12 @@ pub struct AetherStatusResponse {
 /// How call edges are matched to symbols, and the counts per language.
 pub const CALL_GRAPH_RULE: &str = "A call's target text matches workspace symbols by exact \
 qualified name in the caller's language family, as the stored graph links them. resolved: \
-one match. ambiguous: several, and the graph links every one. unresolved: none, so the graph \
-drops the edge; these are external or standard-library calls, or calls recorded by a name no \
-symbol carries (Rust method calls are recorded by bare method name). file_level_calls come \
-from top-level code and are never attributed to a caller.";
+one match. ambiguous: several, and the graph links every one. unresolved: no exact match, so \
+the graph drops the edge; many are external or standard-library calls, but they may be \
+internal, since Rust method calls are recorded by bare method name and a call through a path \
+or alias doesn't spell the qualified name. file_level_calls come from top-level code and are \
+never attributed to a caller. Rust calls written inside macro arguments (format!, assert!, \
+vec!, ...) are not recorded, so no count includes them.";
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherCallGraphCoverage {

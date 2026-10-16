@@ -21,6 +21,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use aether_core::same_language_family;
 use aether_parse::ModuleRoots;
 use aether_store::{
     NameResolution, NameSite, SqliteStore, SymbolRecord, SymbolRelationStore,
@@ -37,6 +38,8 @@ pub(crate) struct CallerCoverage {
     pub(crate) name_matches: u32,
     /// Those attributed to it.
     pub(crate) attributed: u32,
+    /// Of those, the ones [`heuristic_attribution`] matched by a guess.
+    pub(crate) heuristic: u32,
     /// Those whose call also fits other symbols the caller's file and module don't rule
     /// out: not attributed, so the symbol may have more callers than listed.
     pub(crate) ambiguous: u32,
@@ -95,6 +98,7 @@ impl<'a> CallerAttribution<'a> {
         // Callers left out, by why; a caller attributed through another edge is not.
         let mut ambiguous = HashSet::<String>::new();
         let mut elsewhere = HashSet::<String>::new();
+        let mut heuristic = 0;
         for target in &call_targets_of(symbol) {
             for edge in SymbolRelationStore::get_callers(self.store, target)? {
                 if callers.contains_key(&edge.source_id) {
@@ -107,6 +111,14 @@ impl<'a> CallerAttribution<'a> {
                 if resolution.reaches(symbol) {
                     ambiguous.remove(&caller.id);
                     elsewhere.remove(&caller.id);
+                    if heuristic_attribution(
+                        &self.candidates_by_target[edge.target_qualified_name.as_str()],
+                        &caller,
+                        edge.target_qualified_name.as_str(),
+                        symbol,
+                    ) {
+                        heuristic += 1;
+                    }
                     callers.insert(caller.id.clone(), caller);
                 } else if matches!(
                     &resolution,
@@ -122,6 +134,7 @@ impl<'a> CallerAttribution<'a> {
         }
         let count = |len: usize| u32::try_from(len).unwrap_or(u32::MAX);
         self.coverage.attributed += count(callers.len());
+        self.coverage.heuristic += heuristic;
         self.coverage.ambiguous += count(ambiguous.len());
         self.coverage.resolved_elsewhere += count(elsewhere.len());
         self.coverage.name_matches += count(callers.len() + ambiguous.len() + elsewhere.len());
@@ -180,4 +193,28 @@ impl<'a> CallerAttribution<'a> {
             .insert(symbol_id.to_owned(), record.clone());
         Ok(record)
     }
+}
+
+/// Whether attributing `caller`'s call on `target` to `symbol` rested on a guess rather than
+/// an exact name only `symbol` (or its overloads) carries: a Rust call recorded by bare
+/// method name, which any type's method of that name could answer, a standard-library one
+/// included; or a name other symbols in the caller's language family also carry, which
+/// the caller's file or module narrowed to `symbol`.
+fn heuristic_attribution(
+    candidates: &[SymbolRecord],
+    caller: &SymbolRecord,
+    target: &str,
+    symbol: &SymbolRecord,
+) -> bool {
+    target != symbol.qualified_name
+        || call_target_candidates(candidates, target, caller.language.as_str())
+            .iter()
+            .filter(|candidate| {
+                same_language_family(candidate.language.as_str(), caller.language.as_str())
+            })
+            .any(|candidate| {
+                candidate.qualified_name != symbol.qualified_name
+                    || candidate.language != symbol.language
+                    || candidate.file_path != symbol.file_path
+            })
 }

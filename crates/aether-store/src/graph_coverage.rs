@@ -19,9 +19,10 @@ pub struct CallEdgeCoverage {
     pub resolved: u64,
     /// The target names several symbols; the graph links every one of them.
     pub ambiguous: u64,
-    /// No workspace symbol has the target's name: an external or standard-library call,
-    /// or a call recorded by a name no symbol carries (the Rust parser records method
-    /// calls by their bare method name). The graph drops these edges.
+    /// No workspace symbol has the target's exact qualified name, so the graph drops the
+    /// edge. Many are external or standard-library calls, but they may be internal: the
+    /// Rust parser records method calls by their bare method name, and a call through a
+    /// path or alias doesn't spell the qualified name.
     pub unresolved: u64,
 }
 

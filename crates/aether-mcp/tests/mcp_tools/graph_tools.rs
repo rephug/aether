@@ -153,6 +153,11 @@ vector_backend = "sqlite"
     )?;
     fs::write(workspace.join("src/a.rs"), "fn dup() -> i32 { 1 }\n")?;
     fs::write(workspace.join("src/b.rs"), "fn dup() -> i32 { 2 }\n")?;
+    // `s.area()` is recorded by its bare method name, so attributing it is a guess.
+    fs::write(
+        workspace.join("src/shape.rs"),
+        "struct Square;\nimpl Square {\n    fn area(&self) -> i32 { 4 }\n}\nfn measure(s: Square) -> i32 { s.area() }\n",
+    )?;
     run_initial_index_once(&IndexerConfig {
         workspace: workspace.to_path_buf(),
         debounce_ms: 300,
@@ -203,7 +208,19 @@ vector_backend = "sqlite"
         "{}",
         leaf.coverage_note
     );
-    assert_eq!(leaf.caller_coverage.attributed, 1);
+    // `uses` calls it by its exact, unique name: no guess involved.
+    assert_eq!(
+        (
+            leaf.caller_coverage.attributed,
+            leaf.caller_coverage.heuristic
+        ),
+        (1, 0)
+    );
+    assert!(
+        !leaf.coverage_note.contains("by heuristic"),
+        "{}",
+        leaf.coverage_note
+    );
 
     // Calls only something outside the workspace: the empty list is not "calls nothing".
     let external = dependencies(id_of("src/lib.rs", "external")?)?;
@@ -215,12 +232,44 @@ vector_backend = "sqlite"
         ),
         (1, 1)
     );
+    // Unresolved is not the same as external.
+    for wording in [
+        "1 match no qualified name exactly",
+        "may be internal",
+        "Calls written inside macro arguments",
+    ] {
+        assert!(
+            external.coverage_note.contains(wording),
+            "{wording}: {}",
+            external.coverage_note
+        );
+    }
     assert!(
-        external
-            .coverage_note
-            .contains("1 name no workspace symbol"),
+        !external.coverage_note.contains("name no workspace symbol"),
         "{}",
         external.coverage_note
+    );
+
+    // A caller found through a bare method name is listed, and labelled a heuristic match.
+    let area = dependencies(id_of("src/shape.rs", "Square::area")?)?;
+    assert_eq!(
+        area.callers
+            .iter()
+            .map(|caller| caller.qualified_name.as_str())
+            .collect::<Vec<_>>(),
+        ["measure"]
+    );
+    assert_eq!(
+        (
+            area.caller_coverage.attributed,
+            area.caller_coverage.heuristic
+        ),
+        (1, 1)
+    );
+    assert!(
+        area.coverage_note.contains("1 of those by heuristic"),
+        "{}",
+        area.coverage_note
     );
 
     let uses = dependencies(id_of("src/lib.rs", "uses")?)?;
@@ -273,7 +322,7 @@ vector_backend = "sqlite"
     assert!(
         external_chain
             .coverage_note
-            .ends_with("None of the recorded calls reach a workspace symbol."),
+            .contains("None of the recorded calls reach a workspace symbol."),
         "{}",
         external_chain.coverage_note
     );
@@ -295,9 +344,11 @@ vector_backend = "sqlite"
             rust.ambiguous,
             rust.unresolved
         ),
-        (4, 2, 1, 1)
+        (5, 2, 1, 2)
     );
     assert!(status.call_graph.rule.contains("exact qualified name"));
+    assert!(status.call_graph.rule.contains("may be internal"));
+    assert!(status.call_graph.rule.contains("macro arguments"));
 
     Ok(())
 }

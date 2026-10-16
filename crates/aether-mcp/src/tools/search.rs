@@ -113,7 +113,8 @@ pub struct AetherDependenciesResponse {
 
 /// How a set of recorded call edges resolved. A call's target text matches workspace
 /// symbols by exact qualified name in the caller's language family, as the stored graph
-/// links them.
+/// links them. Rust calls written inside macro arguments (`format!`, `assert!`, ...) are
+/// not recorded, so no count includes them.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
 pub struct AetherCallEdgeCoverage {
     pub call_edges: u64,
@@ -121,9 +122,10 @@ pub struct AetherCallEdgeCoverage {
     pub resolved: u64,
     /// Calls whose target names several symbols; every candidate is listed.
     pub ambiguous: u64,
-    /// Calls whose target names no workspace symbol: external or standard-library calls,
-    /// or calls recorded by a name no symbol carries (Rust method calls are recorded by
-    /// their bare method name). Not listed.
+    /// Calls whose target matches no workspace symbol's qualified name exactly. Not
+    /// listed. Many are external or standard-library calls, but they may be internal:
+    /// Rust method calls are recorded by their bare method name, and a call through a
+    /// module path or alias doesn't spell the qualified name.
     pub unresolved: u64,
 }
 
@@ -145,6 +147,11 @@ pub struct AetherCallerCoverage {
     pub name_matches: u32,
     /// Listed in `callers`.
     pub attributed: u32,
+    /// Of `attributed`, callers matched by a heuristic rather than an exact, unique name:
+    /// a Rust call recorded by bare method name (`x.alpha()` may call another type's
+    /// `alpha`, a standard-library one included), or a name other symbols also carry that
+    /// the caller's file or module narrowed to this one. They may not really call it.
+    pub heuristic: u32,
     /// The name also fits other symbols that the caller's file and module don't rule
     /// out, so the call isn't attributed: the symbol may have more callers than listed.
     pub ambiguous: u32,
@@ -157,6 +164,7 @@ impl From<CallerCoverage> for AetherCallerCoverage {
         Self {
             name_matches: coverage.name_matches,
             attributed: coverage.attributed,
+            heuristic: coverage.heuristic,
             ambiguous: coverage.ambiguous,
             resolved_elsewhere: coverage.resolved_elsewhere,
         }
@@ -180,8 +188,9 @@ fn dependency_coverage_clauses(coverage: &AetherCallEdgeCoverage) -> String {
     }
     if coverage.unresolved > 0 {
         clauses.push(format!(
-            "{} name no workspace symbol (external or standard-library calls, or Rust \
-             method calls recorded by bare name) and are not listed",
+            "{} match no qualified name exactly and are not listed; many are external or \
+             standard-library calls, but they may be internal (Rust method calls are \
+             recorded by bare name)",
             coverage.unresolved
         ));
     }
@@ -189,30 +198,45 @@ fn dependency_coverage_clauses(coverage: &AetherCallEdgeCoverage) -> String {
 }
 
 fn dependencies_coverage_note(
+    language: &str,
     callers: &AetherCallerCoverage,
     dependencies: &AetherCallEdgeCoverage,
 ) -> String {
-    let callers = if callers.name_matches == 0 {
-        "No recorded call names this symbol".to_owned()
-    } else if callers.ambiguous > 0 {
-        format!(
-            "{} of {} callers naming this symbol are attributed; {} more could be calling it \
-             but the name also fits other symbols, so they are not listed",
-            callers.attributed, callers.name_matches, callers.ambiguous
-        )
+    let mut caller_clauses = if callers.name_matches == 0 {
+        vec!["No recorded call names this symbol".to_owned()]
     } else {
-        format!(
+        vec![format!(
             "{} of {} callers naming this symbol are attributed",
             callers.attributed, callers.name_matches
-        )
+        )]
     };
+    if callers.heuristic > 0 {
+        caller_clauses.push(format!(
+            "{} of those by heuristic (a bare method name, or a shared name narrowed by the \
+             caller's file or module), so they may not really call it",
+            callers.heuristic
+        ));
+    }
+    if callers.ambiguous > 0 {
+        caller_clauses.push(format!(
+            "{} more could be calling it but the name also fits other symbols, so they are \
+             not listed",
+            callers.ambiguous
+        ));
+    }
     format!(
-        "Callers: {callers}. Dependencies: {}.",
-        dependency_coverage_clauses(dependencies)
+        "Callers: {}. Dependencies: {}.{}",
+        caller_clauses.join("; "),
+        dependency_coverage_clauses(dependencies),
+        macro_calls_caveat(language)
     )
 }
 
-fn call_chain_coverage_note(levels_empty: bool, coverage: &AetherCallEdgeCoverage) -> String {
+fn call_chain_coverage_note(
+    language: &str,
+    levels_empty: bool,
+    coverage: &AetherCallEdgeCoverage,
+) -> String {
     let mut note = format!(
         "Callees only (use aether_dependencies for callers): {}.",
         dependency_coverage_clauses(coverage)
@@ -220,7 +244,17 @@ fn call_chain_coverage_note(levels_empty: bool, coverage: &AetherCallEdgeCoverag
     if levels_empty && coverage.call_edges > 0 {
         note.push_str(" None of the recorded calls reach a workspace symbol.");
     }
+    note.push_str(macro_calls_caveat(language));
     note
+}
+
+/// Rust calls written inside macro arguments parse as token trees and make no call edge.
+fn macro_calls_caveat(language: &str) -> &'static str {
+    if language == "rust" {
+        " Calls written inside macro arguments (format!, assert!, ...) are not recorded."
+    } else {
+        ""
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -498,7 +532,11 @@ impl AetherMcpServer {
                 dependency_count: dependencies.len() as u32,
                 callers,
                 dependencies,
-                coverage_note: dependencies_coverage_note(&caller_coverage, &dependency_coverage),
+                coverage_note: dependencies_coverage_note(
+                    &symbol.language,
+                    &caller_coverage,
+                    &dependency_coverage,
+                ),
                 caller_coverage,
                 dependency_coverage,
             });
@@ -585,7 +623,11 @@ impl AetherMcpServer {
             dependency_count: dependencies.len() as u32,
             callers,
             dependencies,
-            coverage_note: dependencies_coverage_note(&caller_coverage, &dependency_coverage),
+            coverage_note: dependencies_coverage_note(
+                &symbol.language,
+                &caller_coverage,
+                &dependency_coverage,
+            ),
             caller_coverage,
             dependency_coverage,
         })
@@ -687,7 +729,11 @@ impl AetherMcpServer {
             qualified_name: start_symbol.qualified_name,
             max_depth,
             depth_count: levels.len() as u32,
-            coverage_note: call_chain_coverage_note(levels.is_empty(), &coverage),
+            coverage_note: call_chain_coverage_note(
+                &start_symbol.language,
+                levels.is_empty(),
+                &coverage,
+            ),
             coverage,
             levels,
         })
