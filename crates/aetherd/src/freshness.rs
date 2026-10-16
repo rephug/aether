@@ -1,13 +1,18 @@
 //! How far the index has drifted from the workspace, for `aether_status`, `aetherd status`
 //! and the freshness line of `aether_sir_context`.
 //!
-//! The index records when it last synced and at which git HEAD (`.aether/last_indexed_at`
-//! and `.aether/last_indexed_head`, written by every full sync and every git-triggered
-//! reindex), and each symbol records when its file was last read (`last_seen_at`). A
-//! file whose modification time is later than that, an indexed file that is gone, and a
-//! source file the index has never seen that appeared after the last sync have all
-//! changed since the index. A daemon that watches the workspace holds
-//! `.aether/watcher.lock` while it runs.
+//! `.aether/index_sync.json` records the commit the index reflects and when it caught up
+//! with it. A full sync writes it, but only when it read every path. A git-triggered
+//! reindex moves it only when it reindexed every change since the commit the marker names.
+//! A skipped or failed reindex leaves it alone, so status keeps reporting the gap. The
+//! watcher's own `.aether/last_indexed_head`, the base it diffs the next HEAD change
+//! against, advances even when a trigger is skipped, so it can't stand in for this
+//! marker.
+//!
+//! Each symbol also records when its file was last read (`last_seen_at`). An indexed file
+//! modified after that, an indexed file that is gone, and a source file the index lacks
+//! that changed since the last full sync have all changed since the index. A daemon that
+//! watches the workspace holds `.aether/watcher.lock` while it runs.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
@@ -17,14 +22,14 @@ use std::time::UNIX_EPOCH;
 use aether_core::{GitContext, normalize_path};
 use aether_parse::language_for_path;
 use aether_store::{SirFreshnessCounts, SqliteStore, SymbolRecord};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use fs2::FileExt;
 use ignore::WalkBuilder;
+use serde::{Deserialize, Serialize};
 
 use crate::observer::{is_ignored_path, relative_workspace_path};
 
-pub const LAST_INDEXED_AT_FILE: &str = "last_indexed_at";
-pub const LAST_INDEXED_HEAD_FILE: &str = "last_indexed_head";
+pub const INDEX_SYNC_FILE: &str = "index_sync.json";
 pub const WATCHER_LOCK_FILE: &str = "watcher.lock";
 
 /// Most changed paths a freshness report names.
@@ -33,33 +38,76 @@ const MAX_CHANGED_FILE_SAMPLES: usize = 10;
 /// Files larger than this are never parsed (see the observer), so they are not "new".
 const MAX_INDEXED_FILE_SIZE: u64 = 2 * 1024 * 1024;
 
-/// When the index last synced with the workspace, and at which HEAD.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// The commit the index reflects, and when it caught up with it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexSyncMarker {
-    /// Unix seconds of the last full sync or git-triggered reindex.
-    pub synced_at: Option<i64>,
-    /// The commit HEAD pointed at when that sync started.
+    /// Every change committed up to this commit is indexed. `None` outside git.
     pub head: Option<String>,
+    /// When the index caught up with `head` (unix seconds), by a full sync or a
+    /// git-triggered reindex.
+    pub synced_at: Option<i64>,
+    /// When a full sync last read every path of the workspace (unix seconds, taken when
+    /// its walk started).
+    pub full_sync_at: Option<i64>,
+    /// The same moment in milliseconds. A source file the index lacks that changed after
+    /// it is new; a file written earlier in the same second is not.
+    #[serde(default)]
+    pub full_sync_at_ms: Option<i64>,
 }
 
+/// The recorded marker; empty when none was written or it can't be read.
 pub fn read_index_sync_marker(workspace: &Path) -> IndexSyncMarker {
-    let aether_dir = workspace.join(".aether");
-    let read = |name: &str| {
-        fs::read_to_string(aether_dir.join(name))
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-    };
-    IndexSyncMarker {
-        synced_at: read(LAST_INDEXED_AT_FILE).and_then(|value| value.parse().ok()),
-        head: read(LAST_INDEXED_HEAD_FILE),
-    }
+    fs::read_to_string(workspace.join(".aether").join(INDEX_SYNC_FILE))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
 }
 
-pub(crate) fn write_index_synced_at(workspace: &Path, synced_at: i64) -> Result<()> {
-    let path = workspace.join(".aether").join(LAST_INDEXED_AT_FILE);
-    fs::write(&path, format!("{synced_at}\n"))
-        .with_context(|| format!("failed to write index sync time {}", path.display()))
+fn write_index_sync_marker(workspace: &Path, marker: &IndexSyncMarker) -> Result<()> {
+    let aether_dir = workspace.join(".aether");
+    fs::create_dir_all(&aether_dir)
+        .with_context(|| format!("failed to create {}", aether_dir.display()))?;
+    let path = aether_dir.join(INDEX_SYNC_FILE);
+    // Written beside the marker and renamed over it, so a reader never sees half of it.
+    let staged = aether_dir.join(format!("{INDEX_SYNC_FILE}.tmp"));
+    let body = serde_json::to_string_pretty(marker).context("failed to encode the sync marker")?;
+    fs::write(&staged, format!("{body}\n"))
+        .with_context(|| format!("failed to write {}", staged.display()))?;
+    fs::rename(&staged, &path).with_context(|| format!("failed to replace {}", path.display()))
+}
+
+/// A full sync read every path of the workspace, as it was when its walk started
+/// (`walk_started_at` seconds, `walk_started_at_ms` milliseconds), when HEAD was `head`.
+pub(crate) fn record_full_sync(
+    workspace: &Path,
+    head: Option<&str>,
+    walk_started_at: i64,
+    walk_started_at_ms: i64,
+) -> Result<()> {
+    write_index_sync_marker(
+        workspace,
+        &IndexSyncMarker {
+            head: head.map(str::to_owned),
+            synced_at: Some(walk_started_at),
+            full_sync_at: Some(walk_started_at),
+            full_sync_at_ms: Some(walk_started_at_ms),
+        },
+    )
+}
+
+/// A git-triggered reindex that started at `started_at` indexed every change between the
+/// marker's commit and `head`. Files outside git history keep the last full sync's time.
+pub(crate) fn record_head_caught_up(workspace: &Path, head: &str, started_at: i64) -> Result<()> {
+    let previous = read_index_sync_marker(workspace);
+    write_index_sync_marker(
+        workspace,
+        &IndexSyncMarker {
+            head: Some(head.to_owned()),
+            synced_at: Some(started_at),
+            full_sync_at: previous.full_sync_at,
+            full_sync_at_ms: previous.full_sync_at_ms,
+        },
+    )
 }
 
 /// The commit HEAD points at, if the workspace is in a git repository.
@@ -94,6 +142,25 @@ impl WatcherLock {
             .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(Some(Self { _file: file }))
     }
+}
+
+/// The lock a daemon must hold to watch `workspace`. A second watcher is refused rather
+/// than run unlocked: once the first exits, status would read the free lock as "nothing
+/// watching" while the second still indexes.
+pub fn take_watcher_lock(workspace: &Path) -> Result<WatcherLock> {
+    WatcherLock::acquire(workspace)
+        .context("failed to take the watcher lock")?
+        .ok_or_else(|| {
+            let holder = fs::read_to_string(workspace.join(".aether").join(WATCHER_LOCK_FILE))
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u32>().ok())
+                .map(|pid| format!(" (pid {pid})"))
+                .unwrap_or_default();
+            anyhow!(
+                "another aetherd{holder} is already watching {}; stop it before starting another",
+                workspace.display()
+            )
+        })
 }
 
 /// Whether a daemon holds the watcher lock. A probe takes a shared lock for an instant,
@@ -139,7 +206,10 @@ pub struct IndexFreshness {
     pub summary: String,
     /// What makes it stale or uncertain, one sentence each.
     pub notes: Vec<String>,
+    /// When the index last caught up with `indexed_head` (see [`IndexSyncMarker`]).
     pub last_sync_at: Option<i64>,
+    /// When a full sync last read every path of the workspace.
+    pub last_full_sync_at: Option<i64>,
     /// The latest time any symbol was written.
     pub last_symbol_update_at: Option<i64>,
     pub last_sir_update_at: Option<i64>,
@@ -153,7 +223,8 @@ pub struct IndexFreshness {
     pub modified_files: u64,
     /// Indexed files that no longer exist.
     pub deleted_files: u64,
-    /// Source files without indexed symbols that appeared or changed after the last sync.
+    /// Source files without indexed symbols that appeared or changed since the last full
+    /// sync started.
     pub new_files: u64,
     /// Up to ten changed paths, each prefixed `M `, `D ` or `A `.
     pub changed_file_samples: Vec<String>,
@@ -194,8 +265,14 @@ pub fn assess_index_freshness(workspace: &Path, store: &SqliteStore) -> Result<I
     }
 
     // A source file with no symbols may simply declare none (an empty `__init__.py`),
-    // so only one that changed after the last sync counts as new.
-    let new_files = match marker.synced_at.or(last_symbol_update_at) {
+    // so only one that changed since the last full sync started counts as new. Only a full
+    // sync walks every path; a git-triggered reindex reads the files of the commits.
+    // Without a marker, the newest symbol write stands in, to the end of its second.
+    let reference_ms = marker
+        .full_sync_at_ms
+        .or_else(|| marker.full_sync_at.map(|secs| secs.saturating_mul(1000)))
+        .or_else(|| last_symbol_update_at.map(|secs| secs.saturating_mul(1000) + 999));
+    let new_files = match reference_ms {
         Some(reference) if !indexed.is_empty() => {
             let indexed_paths = indexed
                 .iter()
@@ -238,6 +315,7 @@ pub fn assess_index_freshness(workspace: &Path, store: &SqliteStore) -> Result<I
         summary: String::new(),
         notes: Vec::new(),
         last_sync_at: marker.synced_at,
+        last_full_sync_at: marker.full_sync_at,
         last_symbol_update_at,
         last_sir_update_at: sir.last_sir_update_at,
         indexed_head: marker.head,
@@ -279,8 +357,14 @@ fn metadata_mtime(metadata: &fs::Metadata) -> Option<i64> {
     i64::try_from(secs).ok()
 }
 
+fn metadata_mtime_millis(metadata: &fs::Metadata) -> Option<i64> {
+    let modified = metadata.modified().ok()?;
+    let millis = modified.duration_since(UNIX_EPOCH).ok()?.as_millis();
+    i64::try_from(millis).ok()
+}
+
 /// Every file the indexer would read, as a workspace-relative path with its
-/// modification time.
+/// modification time in milliseconds.
 fn source_files(workspace: &Path) -> Vec<(String, i64)> {
     let mut files = Vec::new();
     for entry in WalkBuilder::new(workspace)
@@ -301,7 +385,7 @@ fn source_files(workspace: &Path) -> Vec<(String, i64)> {
         if metadata.len() > MAX_INDEXED_FILE_SIZE {
             continue;
         }
-        let Some(mtime) = metadata_mtime(&metadata) else {
+        let Some(mtime) = metadata_mtime_millis(&metadata) else {
             continue;
         };
         let relative = normalize_path(&relative_workspace_path(workspace, path).to_string_lossy());
@@ -375,7 +459,16 @@ fn notes(freshness: &IndexFreshness) -> Vec<String> {
     }
     if freshness.indexed_head.is_none() && freshness.workspace_head.is_some() {
         notes.push(
-            "The HEAD this index was built at is not recorded; the next sync records it."
+            "The commit this index reflects is not recorded; the next full sync that reads \
+             every path records it."
+                .to_owned(),
+        );
+    }
+    if freshness.head_matches == Some(false) {
+        notes.push(
+            "HEAD moved since the index caught up with it, and no reindex has covered the \
+             change: a daemon may still be on it, or skipped it because its [watcher] trigger \
+             is off, or the reindex failed."
                 .to_owned(),
         );
     }
@@ -530,7 +623,8 @@ mod tests {
 
     use super::{
         FreshnessVerdict, WatcherLock, assess_index_freshness, describe_age,
-        read_index_sync_marker, symbol_freshness_note, watcher_running, workspace_head,
+        read_index_sync_marker, symbol_freshness_note, take_watcher_lock, watcher_running,
+        workspace_head,
     };
     use crate::indexer::{IndexerConfig, run_initial_index_once};
 
@@ -775,6 +869,19 @@ mod tests {
             !running
         });
         assert!(released, "the lock outlived its holder");
+    }
+
+    #[test]
+    fn a_second_watcher_is_refused_and_told_who_holds_the_lock() {
+        let temp = tempdir().expect("tempdir");
+        let _first = take_watcher_lock(temp.path()).expect("first watcher");
+        let err = take_watcher_lock(temp.path()).expect_err("a second watcher must not start");
+        let message = format!("{err:#}");
+        assert!(message.contains("is already watching"), "{message}");
+        assert!(
+            message.contains(&format!("(pid {})", std::process::id())),
+            "{message}"
+        );
     }
 
     #[test]

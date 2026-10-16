@@ -513,18 +513,8 @@ pub fn run_initial_index_once_for_cli(config: &IndexerConfig) -> Result<()> {
 
 pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
     // Held for as long as this loop watches, so status can tell a watched workspace from
-    // one nothing keeps in sync.
-    let _watcher_lock = match crate::freshness::WatcherLock::acquire(&config.workspace) {
-        Ok(Some(lock)) => Some(lock),
-        Ok(None) => {
-            tracing::warn!("another aetherd already watches this workspace");
-            None
-        }
-        Err(err) => {
-            tracing::warn!(error = %err, "failed to take the watcher lock");
-            None
-        }
-    };
+    // one nothing keeps in sync. A second watcher stops here instead of running unlocked.
+    let _watcher_lock = crate::freshness::take_watcher_lock(&config.workspace)?;
     let (mut observer, store) = initialize_observer_and_store(&config)?;
     let watcher_runtime = WatcherRuntimeConfig::from_workspace(&config)?;
     let mut structural = StructuralIndexer::new(config.workspace.clone())?;

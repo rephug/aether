@@ -53,8 +53,8 @@ pub(super) fn sync_snapshot<VectorCleanup>(
 where
     VectorCleanup: FnOnce(&[String]) -> Result<()>,
 {
-    // The HEAD the workspace was at when the sync started, recorded with the sync time
-    // once the store holds the snapshot (see `crate::freshness`).
+    // The HEAD (and ref) the watcher diffs its next HEAD change against once the store
+    // holds this snapshot.
     let head_at_start =
         git_watch::read_current_head_state(workspace, resolve_git_watch_dir(workspace).as_deref());
 
@@ -152,15 +152,33 @@ where
         structural.process_event(store, event)?;
     }
 
-    // Without the marker, status reports the HEAD as unrecorded and keeps comparing file
-    // times, so a failure here only loses precision.
     match head_at_start {
         Ok(head) => {
             if let Err(err) = git_watch::write_persisted_head_state(workspace, &head) {
-                tracing::warn!(error = %err, "failed to record the index sync marker");
+                tracing::warn!(error = %err, "failed to record the watcher's HEAD");
             }
         }
-        Err(err) => tracing::warn!(error = %err, "failed to read HEAD for the index sync marker"),
+        Err(err) => tracing::warn!(error = %err, "failed to read HEAD for the watcher"),
+    }
+
+    // Freshness may count this snapshot as a full sync only when it read every path: a
+    // marker that claimed one it couldn't read would hide that path's changes. Without a
+    // new marker, status keeps the previous commit and time, so it errs toward stale.
+    if scope.unread_paths.is_empty() {
+        if let Err(err) = crate::freshness::record_full_sync(
+            workspace,
+            scope.head,
+            scope.taken_at,
+            scope.taken_at_millis,
+        ) {
+            tracing::warn!(error = %err, "failed to record the index sync marker");
+        }
+    } else {
+        tracing::warn!(
+            unread_paths = scope.unread_paths.len(),
+            "the snapshot could not read every path; the index sync marker keeps its previous \
+             commit and time"
+        );
     }
 
     Ok(())

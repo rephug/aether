@@ -138,6 +138,9 @@ pub enum StoreError {
     LanceDb(String),
     #[error("schema compatibility error: {0}")]
     Compatibility(String),
+    /// A panic in another store operation poisoned the connection lock.
+    #[error("store connection lock poisoned: {0}")]
+    LockPoisoned(String),
 }
 
 pub trait SymbolCatalogStore {

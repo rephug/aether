@@ -140,23 +140,34 @@ pub(super) fn process_git_trigger(
     queue_state: &SharedQueueState,
     dirty_paths: HashSet<PathBuf>,
 ) -> Result<()> {
+    let started_at = crate::time::current_unix_timestamp_secs();
     let previous_head = read_persisted_head_state(config.workspace.as_path())?;
     let current_head = read_current_head_state(config.workspace.as_path(), git_watch_dir)?;
+    let indexed_commit = crate::freshness::read_index_sync_marker(config.workspace.as_path()).head;
     let mut paths = dirty_paths.into_iter().collect::<BTreeSet<_>>();
+    // Whether this reindex covers every change between the commit the freshness marker
+    // names and the new HEAD. The watcher's own base advances even past a skipped
+    // trigger, so a diff from it covers the marker's commit only when the two agree.
+    let mut catches_up = false;
 
     if previous_head.sha != current_head.sha {
         let trigger_kind =
             classify_git_trigger_kind(config.workspace.as_path(), &previous_head, &current_head);
         if trigger_kind.is_some_and(|kind| git_trigger_enabled(&watcher_runtime.watcher, kind)) {
-            let git_paths = if !watcher_runtime.watcher.git_trigger_changed_files_only
+            let (git_paths, covers_indexed_commit) = if !watcher_runtime
+                .watcher
+                .git_trigger_changed_files_only
                 || previous_head.sha.is_none()
             {
-                collect_full_reindex_paths(config.workspace.as_path(), observer)
+                (
+                    collect_full_reindex_paths(config.workspace.as_path(), observer),
+                    true,
+                )
             } else if let (Some(old_sha), Some(new_sha)) =
                 (previous_head.sha.as_deref(), current_head.sha.as_deref())
             {
                 match changed_paths_between_heads(config.workspace.as_path(), old_sha, new_sha) {
-                    Ok(paths) => paths,
+                    Ok(paths) => (paths, indexed_commit.as_deref() == Some(old_sha)),
                     Err(err) => {
                         tracing::warn!(
                             old_sha,
@@ -164,12 +175,19 @@ pub(super) fn process_git_trigger(
                             error = %err,
                             "failed to diff git heads; falling back to full reindex"
                         );
-                        collect_full_reindex_paths(config.workspace.as_path(), observer)
+                        (
+                            collect_full_reindex_paths(config.workspace.as_path(), observer),
+                            true,
+                        )
                     }
                 }
             } else {
-                collect_full_reindex_paths(config.workspace.as_path(), observer)
+                (
+                    collect_full_reindex_paths(config.workspace.as_path(), observer),
+                    true,
+                )
             };
+            catches_up = covers_indexed_commit;
             paths.extend(git_paths);
         }
     }
@@ -187,6 +205,15 @@ pub(super) fn process_git_trigger(
     }
 
     write_persisted_head_state(config.workspace.as_path(), &current_head)?;
+    // A skipped trigger, a diff from a base the marker doesn't name, or a failed reindex
+    // (returned above) leaves the freshness marker on the commit it already names.
+    if catches_up
+        && let Some(head) = current_head.sha.as_deref()
+        && let Err(err) =
+            crate::freshness::record_head_caught_up(config.workspace.as_path(), head, started_at)
+    {
+        tracing::warn!(error = %err, "failed to record the index sync marker");
+    }
     Ok(())
 }
 
@@ -324,7 +351,6 @@ pub(super) fn write_persisted_head_state(workspace: &Path, head_state: &HeadStat
         aether_dir.join("last_indexed_head_ref"),
         head_state.marker.as_deref(),
     )?;
-    crate::freshness::write_index_synced_at(workspace, crate::time::current_unix_timestamp_secs())?;
     Ok(())
 }
 
@@ -679,5 +705,232 @@ mod tests {
             vec![workspace.join("pkg/__init__.py")],
         );
         assert_eq!(callees(), vec![id("pkg/old.py", "pkg.old::f")]);
+    }
+
+    fn run_git(workspace: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(workspace)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    fn mock_config(workspace: &Path) -> IndexerConfig {
+        IndexerConfig {
+            workspace: workspace.to_path_buf(),
+            debounce_ms: 300,
+            print_events: false,
+            print_sir: false,
+            embeddings_only: false,
+            force: false,
+            full: false,
+            deep: false,
+            turbo_concurrency: None,
+            dry_run: false,
+            sir_concurrency: 1,
+            lifecycle_logs: false,
+            inference_provider: Some(InferenceProviderKind::Mock),
+            inference_model: None,
+            inference_endpoint: None,
+            inference_api_key_env: None,
+            pause_flag: None,
+        }
+    }
+
+    /// The watcher's state for one git workspace: indexed on `main`, while a `feature`
+    /// branch adds `pkg/added.py`. Returns the two commits.
+    struct WatchedRepo {
+        config: IndexerConfig,
+        runtime: WatcherRuntimeConfig,
+        observer: ObserverState,
+        structural: StructuralIndexer,
+        store: SqliteStore,
+        queue_state: SharedQueueState,
+        main: String,
+        feature: String,
+    }
+
+    impl WatchedRepo {
+        fn new(workspace: &Path, watcher_toml: &str) -> Self {
+            fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
+            fs::write(
+                workspace.join(".aether/config.toml"),
+                format!(
+                    "[inference]\nprovider = \"mock\"\n\n[storage]\ngraph_backend = \"sqlite\"\n\n[embeddings]\nenabled = false\nvector_backend = \"sqlite\"\n\n[watcher]\n{watcher_toml}\n"
+                ),
+            )
+            .expect("write config");
+            fs::create_dir_all(workspace.join("pkg")).expect("create pkg");
+            fs::write(
+                workspace.join("pkg/a.py"),
+                "def alpha(x):\n    return x + 1\n",
+            )
+            .expect("write a");
+            run_git(workspace, &["init", "-q", "-b", "main"]);
+            run_git(workspace, &["config", "user.email", "test@example.com"]);
+            run_git(workspace, &["config", "user.name", "Test"]);
+            run_git(workspace, &["add", "pkg"]);
+            run_git(workspace, &["commit", "-q", "-m", "init"]);
+            let main = crate::freshness::workspace_head(workspace).expect("main head");
+            run_git(workspace, &["checkout", "-q", "-b", "feature"]);
+            fs::write(
+                workspace.join("pkg/added.py"),
+                "def added(x):\n    return x\n",
+            )
+            .expect("write added");
+            run_git(workspace, &["add", "pkg"]);
+            run_git(workspace, &["commit", "-q", "-m", "add a module"]);
+            let feature = crate::freshness::workspace_head(workspace).expect("feature head");
+            run_git(workspace, &["checkout", "-q", "main"]);
+            assert!(!workspace.join("pkg/added.py").exists());
+
+            let config = mock_config(workspace);
+            run_initial_index_once(&config).expect("index once on main");
+            // The daemon's state from before the branch switch.
+            let runtime = WatcherRuntimeConfig::from_workspace(&config).expect("watcher runtime");
+            let mut observer = ObserverState::new(workspace.to_path_buf()).expect("observer");
+            observer.seed_from_disk().expect("seed observer");
+            Self {
+                runtime,
+                observer,
+                structural: StructuralIndexer::new(workspace.to_path_buf())
+                    .expect("structural indexer"),
+                store: SqliteStore::open(workspace).expect("open store"),
+                queue_state: SharedQueueState::new(HashMap::new()),
+                config,
+                main,
+                feature,
+            }
+        }
+
+        /// What the loop does once a git event settles. No file event is passed along, as
+        /// when the new file lands in a directory the watcher doesn't see.
+        fn fire_git_trigger(&mut self) {
+            let workspace = self.config.workspace.clone();
+            process_git_trigger(
+                &self.config,
+                &self.runtime,
+                resolve_git_watch_dir(&workspace).as_deref(),
+                &mut self.observer,
+                &mut self.structural,
+                &self.store,
+                &self.queue_state,
+                HashSet::new(),
+            )
+            .expect("git trigger");
+        }
+
+        fn indexes(&self, file_path: &str) -> bool {
+            !self
+                .store
+                .list_symbols_for_file(file_path)
+                .expect("list symbols")
+                .is_empty()
+        }
+    }
+
+    /// A branch switch the watcher is configured to skip indexes nothing, so the freshness
+    /// marker must keep the commit it named: status reports the switch and the file it
+    /// brought instead of calling the index fresh.
+    #[test]
+    fn a_skipped_branch_switch_leaves_the_index_sync_marker_unchanged() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let mut repo = WatchedRepo::new(workspace, "trigger_on_branch_switch = false");
+        let before = crate::freshness::read_index_sync_marker(workspace);
+        assert_eq!(before.head.as_deref(), Some(repo.main.as_str()));
+
+        run_git(workspace, &["checkout", "-q", "feature"]);
+        repo.fire_git_trigger();
+
+        assert!(!repo.indexes("pkg/added.py"), "the switch was skipped");
+        assert_eq!(crate::freshness::read_index_sync_marker(workspace), before);
+        let freshness =
+            crate::freshness::assess_index_freshness(workspace, &repo.store).expect("assess");
+        assert_eq!(
+            freshness.verdict,
+            crate::freshness::FreshnessVerdict::Stale,
+            "{freshness:?}"
+        );
+        assert_eq!(freshness.head_matches, Some(false));
+        assert_eq!(
+            freshness.workspace_head.as_deref(),
+            Some(repo.feature.as_str())
+        );
+        assert_eq!(freshness.new_files, 1, "{freshness:?}");
+        assert_eq!(freshness.changed_file_samples, ["A pkg/added.py"]);
+    }
+
+    /// An enabled branch switch that brings a new source file indexes it, and only then
+    /// moves the marker to the new commit.
+    #[test]
+    fn a_branch_switch_that_adds_a_source_file_indexes_it_before_the_marker_moves() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let mut repo = WatchedRepo::new(workspace, "trigger_on_branch_switch = true");
+        let full_sync_at = crate::freshness::read_index_sync_marker(workspace).full_sync_at;
+
+        run_git(workspace, &["checkout", "-q", "feature"]);
+        repo.fire_git_trigger();
+
+        assert!(repo.indexes("pkg/added.py"));
+        let marker = crate::freshness::read_index_sync_marker(workspace);
+        assert_eq!(marker.head.as_deref(), Some(repo.feature.as_str()));
+        // Only a full sync walks every path, so its time stays.
+        assert_eq!(marker.full_sync_at, full_sync_at);
+        let freshness =
+            crate::freshness::assess_index_freshness(workspace, &repo.store).expect("assess");
+        assert_eq!(
+            freshness.verdict,
+            crate::freshness::FreshnessVerdict::Fresh,
+            "{freshness:?}"
+        );
+        assert_eq!(freshness.head_matches, Some(true));
+    }
+
+    /// After a skipped switch the watcher's own base moves on, so a later reindex diffs
+    /// from it and misses the skipped change: the marker must not claim that reindex.
+    #[test]
+    fn a_reindex_after_a_skipped_switch_does_not_claim_the_skipped_change() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let mut repo = WatchedRepo::new(workspace, "trigger_on_branch_switch = false");
+        run_git(workspace, &["checkout", "-q", "feature"]);
+        repo.fire_git_trigger();
+
+        // A commit on the same branch is a pull-style advance, which is enabled.
+        fs::write(
+            workspace.join("pkg/more.py"),
+            "def more(x):\n    return x\n",
+        )
+        .expect("write more");
+        run_git(workspace, &["add", "pkg"]);
+        run_git(workspace, &["commit", "-q", "-m", "more"]);
+        repo.fire_git_trigger();
+
+        assert!(
+            repo.indexes("pkg/more.py"),
+            "the diff from the watcher's base ran"
+        );
+        assert!(
+            !repo.indexes("pkg/added.py"),
+            "the skipped change stays unindexed"
+        );
+        let marker = crate::freshness::read_index_sync_marker(workspace);
+        assert_eq!(marker.head.as_deref(), Some(repo.main.as_str()));
+        let freshness =
+            crate::freshness::assess_index_freshness(workspace, &repo.store).expect("assess");
+        assert_eq!(freshness.head_matches, Some(false));
+        assert!(
+            freshness
+                .changed_file_samples
+                .contains(&"A pkg/added.py".to_owned()),
+            "{freshness:?}"
+        );
     }
 }

@@ -71,6 +71,15 @@ impl From<LanguageCallEdgeCoverage> for AetherLanguageCallCoverage {
     }
 }
 
+/// See [`AetherMcpServer::aether_store_counts_logic`].
+#[derive(Debug, Clone)]
+pub struct AetherStoreCounts {
+    pub store_present: bool,
+    pub symbol_count: i64,
+    pub sir_count: i64,
+    pub sir_coverage: SirCoverageStats,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SirCoverageStats {
     pub total_symbols: u64,
@@ -86,14 +95,19 @@ pub struct AetherIndexFreshness {
     pub summary: String,
     /// What makes the index stale or uncertain, one sentence each.
     pub notes: Vec<String>,
-    /// Unix seconds of the last full sync or git-triggered reindex; null when no sync has
-    /// recorded one.
+    /// Unix seconds when the index last caught up with `indexed_head`: a full sync that
+    /// read every path, or a git-triggered reindex that covered every change since the
+    /// previous indexed commit. A skipped or failed reindex doesn't move it. Null when
+    /// nothing recorded one.
     pub last_sync_at: Option<i64>,
+    /// Unix seconds when a full sync (index-once or daemon start) last read every path.
+    pub last_full_sync_at: Option<i64>,
     /// Unix seconds of the latest symbol write.
     pub last_symbol_update_at: Option<i64>,
     /// Unix seconds of the latest SIR write.
     pub last_sir_update_at: Option<i64>,
-    /// The commit HEAD pointed at when the index last synced; null when not recorded.
+    /// The commit the index reflects: every change committed up to it is indexed. Null
+    /// when not recorded.
     pub indexed_head: Option<String>,
     pub workspace_head: Option<String>,
     /// Null when either HEAD is unknown.
@@ -104,7 +118,8 @@ pub struct AetherIndexFreshness {
     pub modified_files: u64,
     /// Indexed files that no longer exist.
     pub deleted_files: u64,
-    /// Source files without indexed symbols that appeared or changed after the last sync.
+    /// Source files without indexed symbols that appeared or changed since the last full
+    /// sync started.
     pub new_files: u64,
     /// Up to ten changed paths, prefixed `M ` (modified), `D ` (deleted) or `A ` (new).
     pub changed_file_samples: Vec<String>,
@@ -129,6 +144,7 @@ impl From<IndexFreshness> for AetherIndexFreshness {
             summary: freshness.summary,
             notes: freshness.notes,
             last_sync_at: freshness.last_sync_at,
+            last_full_sync_at: freshness.last_full_sync_at,
             last_symbol_update_at: freshness.last_symbol_update_at,
             last_sir_update_at: freshness.last_sir_update_at,
             indexed_head: freshness.indexed_head,
@@ -155,6 +171,7 @@ impl AetherIndexFreshness {
             summary: "No index: run `aetherd --workspace . --index-once` to build one.".to_owned(),
             notes: Vec::new(),
             last_sync_at: None,
+            last_full_sync_at: None,
             last_symbol_update_at: None,
             last_sir_update_at: None,
             indexed_head: None,
@@ -175,11 +192,10 @@ impl AetherIndexFreshness {
 }
 
 impl AetherMcpServer {
-    pub fn aether_status_logic(&self) -> Result<AetherStatusResponse, AetherMcpError> {
-        let sqlite_path = self.sqlite_path();
-        let sir_dir = self.sir_dir();
-        let store_present = sqlite_path.exists() && sir_dir.is_dir();
-
+    /// Whether a store is present, and its symbol and SIR counts: the cheap part of
+    /// `aether_status`, without the workspace walk and coverage queries.
+    pub fn aether_store_counts_logic(&self) -> Result<AetherStoreCounts, AetherMcpError> {
+        let store_present = self.sqlite_path().exists() && self.sir_dir().is_dir();
         let (symbol_count, sir_count, sir_coverage) = if store_present {
             let (total_symbols, symbols_with_sir) = self.state.store.count_symbols_with_sir()?;
             let percentage = if total_symbols > 0 {
@@ -207,6 +223,23 @@ impl AetherMcpServer {
                 },
             )
         };
+        Ok(AetherStoreCounts {
+            store_present,
+            symbol_count,
+            sir_count,
+            sir_coverage,
+        })
+    }
+
+    pub fn aether_status_logic(&self) -> Result<AetherStatusResponse, AetherMcpError> {
+        let sqlite_path = self.sqlite_path();
+        let sir_dir = self.sir_dir();
+        let AetherStoreCounts {
+            store_present,
+            symbol_count,
+            sir_count,
+            sir_coverage,
+        } = self.aether_store_counts_logic()?;
 
         let languages = if store_present {
             self.state

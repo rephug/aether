@@ -439,6 +439,21 @@ impl AetherMcpServer {
         ))
     }
 
+    /// How the call edges out of `source_ids` resolve. The query holds the store's
+    /// connection lock while it reads, so it runs on the blocking pool rather than on the
+    /// async worker serving the request.
+    async fn call_edge_coverage(
+        &self,
+        source_ids: Vec<String>,
+    ) -> Result<AetherCallEdgeCoverage, AetherMcpError> {
+        let store = Arc::clone(&self.state.store);
+        let coverage =
+            tokio::task::spawn_blocking(move || store.call_edge_coverage_for_sources(&source_ids))
+                .await
+                .map_err(|err| AetherMcpError::Message(format!("call coverage join: {err}")))??;
+        Ok(coverage.into())
+    }
+
     pub async fn aether_dependencies_logic(
         &self,
         request: AetherDependenciesRequest,
@@ -472,9 +487,7 @@ impl AetherMcpServer {
                 .map(AetherDependencyTarget::from)
                 .collect::<Vec<_>>();
             let caller_coverage = AetherCallerCoverage::from(attribution.coverage());
-            let dependency_coverage = AetherCallEdgeCoverage::from(
-                store.call_edge_coverage_for_sources(std::slice::from_ref(&symbol.id))?,
-            );
+            let dependency_coverage = self.call_edge_coverage(vec![symbol.id.clone()]).await?;
 
             return Ok(AetherDependenciesResponse {
                 symbol_id: symbol_id.to_owned(),
@@ -561,8 +574,7 @@ impl AetherMcpServer {
         let source_ids = std::iter::once(symbol.id.clone())
             .chain(child_methods.iter().map(|method| method.id.clone()))
             .collect::<Vec<_>>();
-        let dependency_coverage =
-            AetherCallEdgeCoverage::from(store.call_edge_coverage_for_sources(&source_ids)?);
+        let dependency_coverage = self.call_edge_coverage(source_ids).await?;
 
         Ok(AetherDependenciesResponse {
             symbol_id: symbol_id.to_owned(),
@@ -667,8 +679,7 @@ impl AetherMcpServer {
                     .map(|entry| entry.symbol_id.clone()),
             )
             .collect::<Vec<_>>();
-        let coverage =
-            AetherCallEdgeCoverage::from(store.call_edge_coverage_for_sources(&expanded)?);
+        let coverage = self.call_edge_coverage(expanded).await?;
 
         Ok(AetherCallChainResponse {
             found: true,

@@ -84,6 +84,44 @@ fn coverage_sql(filter: &str) -> String {
     )
 }
 
+/// The call edges out of the sources bound as `?1..?n`, as one row in the same shape as
+/// [`coverage_sql`]'s. Only the target names those edges use are counted, so the cost
+/// follows the edges selected, not the size of the index.
+fn source_coverage_sql(placeholders: &str) -> String {
+    let family = same_language_family_sql("selected.language", "nc.language");
+    format!(
+        r#"
+        WITH selected AS MATERIALIZED (
+            SELECT e.rowid AS edge_id, e.target_qualified_name, src.language
+            FROM symbol_edges e
+            JOIN symbols src ON src.id = e.source_id
+            WHERE e.edge_kind = 'calls' AND e.source_id IN ({placeholders})
+        ),
+        name_counts AS MATERIALIZED (
+            SELECT qualified_name, language, COUNT(*) AS n
+            FROM symbols
+            WHERE qualified_name IN (SELECT target_qualified_name FROM selected)
+            GROUP BY qualified_name, language
+        ),
+        edges AS (
+            SELECT
+                selected.edge_id,
+                COALESCE(SUM(CASE WHEN {family} THEN nc.n ELSE 0 END), 0) AS candidates
+            FROM selected
+            LEFT JOIN name_counts nc ON nc.qualified_name = selected.target_qualified_name
+            GROUP BY selected.edge_id
+        )
+        SELECT
+            '',
+            1,
+            SUM(CASE WHEN candidates = 1 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN candidates > 1 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN candidates = 0 THEN 1 ELSE 0 END)
+        FROM edges
+        "#
+    )
+}
+
 type CoverageRow = (String, bool, u64, u64, u64);
 
 fn coverage_rows(
@@ -112,7 +150,7 @@ impl SqliteStore {
     pub fn call_edge_coverage_by_language(
         &self,
     ) -> Result<Vec<LanguageCallEdgeCoverage>, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection()?;
         let mut by_language = Vec::<LanguageCallEdgeCoverage>::new();
         for (language, from_symbol, resolved, ambiguous, unresolved) in
             coverage_rows(&conn, &coverage_sql(""), &[])?
@@ -154,14 +192,14 @@ impl SqliteStore {
         source_ids.sort_unstable();
         source_ids.dedup();
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection()?;
         let mut coverage = CallEdgeCoverage::default();
         for chunk in source_ids.chunks(SOURCE_ID_CHUNK) {
             let placeholders = (1..=chunk.len())
                 .map(|index| format!("?{index}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let sql = coverage_sql(&format!("AND e.source_id IN ({placeholders})"));
+            let sql = source_coverage_sql(&placeholders);
             let params = chunk
                 .iter()
                 .map(|id| id as &dyn rusqlite::ToSql)

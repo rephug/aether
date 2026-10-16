@@ -1,6 +1,8 @@
 //! What the store can say about its own freshness: when each file was last indexed and
 //! which SIR rows are stale or can't be checked for staleness.
 
+use std::sync::MutexGuard;
+
 use super::*;
 
 /// One indexed file: when its symbols were last written, and how many it has.
@@ -32,9 +34,19 @@ pub struct SirFreshnessCounts {
 }
 
 impl SqliteStore {
+    /// The connection, or [`StoreError::LockPoisoned`] when an operation panicked while
+    /// holding it, so a diagnostic read reports the earlier failure instead of panicking.
+    pub(crate) fn lock_connection(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
+        self.conn.lock().map_err(|_| {
+            StoreError::LockPoisoned(
+                "an earlier store operation panicked while holding the connection".to_owned(),
+            )
+        })
+    }
+
     /// Every file with indexed symbols, ordered by path.
     pub fn list_indexed_files(&self) -> Result<Vec<IndexedFileRecord>, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection()?;
         let mut stmt = conn.prepare(
             r#"
             SELECT
@@ -60,7 +72,7 @@ impl SqliteStore {
     }
 
     pub fn sir_freshness_counts(&self) -> Result<SirFreshnessCounts, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection()?;
         let (leaf_rows, stale_leaves, leaves_without_source_hash) = conn.query_row(
             r#"
             SELECT
@@ -107,5 +119,44 @@ impl SqliteStore {
             stale_rollups: count(stale_rollups),
             last_sir_update_at,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use tempfile::tempdir;
+
+    use crate::{SqliteStore, StoreError};
+
+    /// A panic while another operation holds the connection must not turn every later
+    /// status read into a panic too.
+    #[test]
+    fn freshness_and_coverage_reads_report_a_poisoned_lock_as_an_error() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = store.conn.lock().expect("first lock");
+            panic!("poison the connection lock");
+        }));
+        assert!(poisoned.is_err());
+
+        assert!(matches!(
+            store.list_indexed_files(),
+            Err(StoreError::LockPoisoned(_))
+        ));
+        assert!(matches!(
+            store.sir_freshness_counts(),
+            Err(StoreError::LockPoisoned(_))
+        ));
+        assert!(matches!(
+            store.call_edge_coverage_by_language(),
+            Err(StoreError::LockPoisoned(_))
+        ));
+        assert!(matches!(
+            store.call_edge_coverage_for_sources(&["caller".to_owned()]),
+            Err(StoreError::LockPoisoned(_))
+        ));
     }
 }

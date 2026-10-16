@@ -49,6 +49,12 @@ pub struct ObserverState {
     /// When the last `seed_from_disk` started reading the workspace (unix seconds; 0
     /// before any). The snapshot cannot speak for a store row written after it.
     seeded_at: i64,
+    /// The same moment in milliseconds, to tell a file written just before the walk from
+    /// one written during or after it.
+    seeded_at_millis: i64,
+    /// The commit HEAD pointed at just before that walk, if the workspace is in git: the
+    /// newest commit the snapshot can speak for.
+    seeded_head: Option<String>,
 }
 
 impl ObserverState {
@@ -59,12 +65,24 @@ impl ObserverState {
             snapshots: HashMap::new(),
             unread_paths: Vec::new(),
             seeded_at: 0,
+            seeded_at_millis: 0,
+            seeded_head: None,
         })
     }
 
     /// See `ObserverState::seeded_at`.
     pub fn seeded_at(&self) -> i64 {
         self.seeded_at
+    }
+
+    /// See `ObserverState::seeded_at_millis`.
+    pub fn seeded_at_millis(&self) -> i64 {
+        self.seeded_at_millis
+    }
+
+    /// See `ObserverState::seeded_head`.
+    pub fn seeded_head(&self) -> Option<&str> {
+        self.seeded_head.as_deref()
     }
 
     /// See `ObserverState::unread_paths`: what the snapshot is missing because it could
@@ -74,7 +92,9 @@ impl ObserverState {
     }
 
     pub fn seed_from_disk(&mut self) -> Result<()> {
-        self.seeded_at = crate::time::current_unix_timestamp_secs();
+        self.seeded_head = crate::freshness::workspace_head(&self.workspace);
+        self.seeded_at_millis = crate::time::current_unix_timestamp_millis();
+        self.seeded_at = self.seeded_at_millis.div_euclid(1000);
         self.unread_paths.clear();
         for entry in WalkBuilder::new(&self.workspace)
             .standard_filters(true)
