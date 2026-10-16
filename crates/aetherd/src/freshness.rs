@@ -249,9 +249,13 @@ pub struct IndexFreshness {
     /// Indexed files that no longer exist.
     pub deleted_files: u64,
     /// Source files without indexed symbols that appeared or changed since the last full
-    /// sync started.
+    /// sync started and that no reindex has read since.
     pub new_files: u64,
-    /// Up to ten changed paths, each prefixed `M `, `D ` or `A `.
+    /// Indexed files, and paths of the workspace walk, whose metadata couldn't be read
+    /// (permissions, a filesystem error): they may have changed, so the index can't be
+    /// called fresh while they are.
+    pub unreadable_files: u64,
+    /// Up to ten changed paths, each prefixed `M `, `D `, `A ` or `? ` (unreadable).
     pub changed_file_samples: Vec<String>,
     /// SIR leaves of modified or deleted files: they may describe code that is gone.
     pub sirs_in_changed_files: u64,
@@ -274,6 +278,7 @@ pub fn assess_index_freshness(workspace: &Path, store: &SqliteStore) -> Result<I
 
     let mut modified = Vec::new();
     let mut deleted = Vec::new();
+    let mut unreadable = Vec::new();
     let mut sirs_in_changed_files = 0u64;
     for file in &indexed {
         match file_time(&workspace.join(&file.file_path)) {
@@ -283,7 +288,8 @@ pub fn assess_index_freshness(workspace: &Path, store: &SqliteStore) -> Result<I
                 modified.push(file.file_path.clone());
                 sirs_in_changed_files += file.symbols_with_sir;
             }
-            FileTime::Modified(_) | FileTime::Unreadable => {}
+            FileTime::Modified(_) => {}
+            FileTime::Unreadable => unreadable.push(file.file_path.clone()),
             FileTime::Missing => {
                 deleted.push(file.file_path.clone());
                 sirs_in_changed_files += file.symbols_with_sir;
@@ -299,28 +305,38 @@ pub fn assess_index_freshness(workspace: &Path, store: &SqliteStore) -> Result<I
         .full_sync_at_ms
         .or_else(|| marker.full_sync_at.map(|secs| secs.saturating_mul(1000)))
         .or_else(|| last_symbol_update_at.map(|secs| secs.saturating_mul(1000) + 999));
+    // A file the watcher read after its last write is not new either, symbols or not.
     let new_files = match reference_ms {
         Some(reference) if !indexed.is_empty() => {
             let indexed_paths = indexed
                 .iter()
                 .map(|file| file.file_path.as_str())
                 .collect::<std::collections::HashSet<_>>();
-            source_files(workspace)
+            let reads = store
+                .list_file_reads()
+                .context("failed to list file read times")?;
+            let walk = source_files(workspace);
+            unreadable.extend(walk.unreadable);
+            walk.files
                 .into_iter()
                 .filter(|(path, mtime)| {
-                    *mtime > reference && !indexed_paths.contains(path.as_str())
+                    *mtime > reference
+                        && !indexed_paths.contains(path.as_str())
+                        && reads.get(path).is_none_or(|read_at_ms| mtime > read_at_ms)
                 })
                 .map(|(path, _)| path)
                 .collect::<Vec<_>>()
         }
         _ => Vec::new(),
     };
+    unreadable.sort();
+    unreadable.dedup();
 
     let head_matches = match (marker.head.as_deref(), workspace_head.as_deref()) {
         (Some(indexed), Some(current)) => Some(indexed.eq_ignore_ascii_case(current)),
         _ => None,
     };
-    let changed = modified.len() + deleted.len() + new_files.len();
+    let changed = modified.len() + deleted.len() + new_files.len() + unreadable.len();
     let verdict = if indexed.is_empty() {
         FreshnessVerdict::Empty
     } else if changed > 0 || head_matches == Some(false) {
@@ -334,6 +350,7 @@ pub fn assess_index_freshness(workspace: &Path, store: &SqliteStore) -> Result<I
         .map(|path| format!("M {path}"))
         .chain(deleted.iter().map(|path| format!("D {path}")))
         .chain(new_files.iter().map(|path| format!("A {path}")))
+        .chain(unreadable.iter().map(|path| format!("? {path}")))
         .take(MAX_CHANGED_FILE_SAMPLES)
         .collect::<Vec<_>>();
 
@@ -352,6 +369,7 @@ pub fn assess_index_freshness(workspace: &Path, store: &SqliteStore) -> Result<I
         modified_files: modified.len() as u64,
         deleted_files: deleted.len() as u64,
         new_files: new_files.len() as u64,
+        unreadable_files: unreadable.len() as u64,
         changed_file_samples,
         sirs_in_changed_files,
         sir,
@@ -422,15 +440,35 @@ fn metadata_mtime_millis(metadata: &fs::Metadata) -> Option<i64> {
     i64::try_from(millis).ok()
 }
 
-/// Every file the indexer would read, as a workspace-relative path with its
-/// modification time in milliseconds.
-fn source_files(workspace: &Path) -> Vec<(String, i64)> {
-    let mut files = Vec::new();
-    for entry in WalkBuilder::new(workspace)
-        .standard_filters(true)
-        .build()
-        .filter_map(|entry| entry.ok())
-    {
+/// What a walk of the workspace found.
+struct SourceWalk {
+    /// Every file the indexer would read, as a workspace-relative path with its
+    /// modification time in milliseconds.
+    files: Vec<(String, i64)>,
+    /// Paths the walk, or a file's metadata, couldn't be read for; `.` when the error
+    /// names no path.
+    unreadable: Vec<String>,
+}
+
+fn source_files(workspace: &Path) -> SourceWalk {
+    let relative =
+        |path: &Path| normalize_path(&relative_workspace_path(workspace, path).to_string_lossy());
+    let mut walk = SourceWalk {
+        files: Vec::new(),
+        unreadable: Vec::new(),
+    };
+    for entry in WalkBuilder::new(workspace).standard_filters(true).build() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                walk.unreadable.push(
+                    walk_error_path(&err)
+                        .map(relative)
+                        .unwrap_or_else(|| ".".to_owned()),
+                );
+                continue;
+            }
+        };
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
@@ -438,19 +476,32 @@ fn source_files(workspace: &Path) -> Vec<(String, i64)> {
         if is_ignored_path(path) || language_for_path(path).is_none() {
             continue;
         }
-        let Ok(metadata) = entry.metadata() else {
+        let Some(metadata) = entry.metadata().ok() else {
+            walk.unreadable.push(relative(path));
             continue;
         };
         if metadata.len() > MAX_INDEXED_FILE_SIZE {
             continue;
         }
         let Some(mtime) = metadata_mtime_millis(&metadata) else {
+            walk.unreadable.push(relative(path));
             continue;
         };
-        let relative = normalize_path(&relative_workspace_path(workspace, path).to_string_lossy());
-        files.push((relative, mtime));
+        walk.files.push((relative(path), mtime));
     }
-    files
+    walk
+}
+
+/// The path a walk error is about, if it names one.
+fn walk_error_path(err: &ignore::Error) -> Option<&Path> {
+    match err {
+        ignore::Error::WithPath { path, .. } => Some(path),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            walk_error_path(err)
+        }
+        ignore::Error::Partial(errs) => errs.iter().find_map(walk_error_path),
+        _ => None,
+    }
 }
 
 fn summary_line(freshness: &IndexFreshness, now: i64) -> String {
@@ -489,8 +540,14 @@ fn summary_line(freshness: &IndexFreshness, now: i64) -> String {
             format!("Index fresh: {synced} {head}; no source file changed since.")
         }
         FreshnessVerdict::Stale => format!(
-            "Index STALE: {synced} {head}; since then {} modified, {} deleted, {} new source files.",
-            freshness.modified_files, freshness.deleted_files, freshness.new_files
+            "Index STALE: {synced} {head}; since then {} modified, {} deleted, {} new source files{}.",
+            freshness.modified_files,
+            freshness.deleted_files,
+            freshness.new_files,
+            match freshness.unreadable_files {
+                0 => String::new(),
+                count => format!(", and {count} paths that could not be checked"),
+            }
         ),
     }
 }
@@ -502,16 +559,26 @@ fn notes(freshness: &IndexFreshness) -> Vec<String> {
         return notes;
     }
     if !freshness.changed_file_samples.is_empty() {
-        let changed = freshness.modified_files + freshness.deleted_files + freshness.new_files;
+        let changed = freshness.modified_files
+            + freshness.deleted_files
+            + freshness.new_files
+            + freshness.unreadable_files;
         let more = changed.saturating_sub(freshness.changed_file_samples.len() as u64);
         notes.push(format!(
-            "Changed since the index (M modified, D deleted, A new): {}{}.",
+            "Changed since the index (M modified, D deleted, A new, ? unreadable): {}{}.",
             freshness.changed_file_samples.join(", "),
             if more > 0 {
                 format!(" and {more} more")
             } else {
                 String::new()
             }
+        ));
+    }
+    if freshness.unreadable_files > 0 {
+        notes.push(format!(
+            "{} paths could not be checked (permissions or a filesystem error), so they may \
+             have changed; the index can't be called fresh until they can be read.",
+            freshness.unreadable_files
         ));
     }
     if freshness.sirs_in_changed_files > 0 {
@@ -1042,6 +1109,54 @@ mod tests {
             .expect("move last_seen_at later");
         set_modified_millis(&path, walk_ms + 1);
         assert_eq!(modified(), 1);
+    }
+
+    /// An indexed file whose metadata can't be read may have changed, so the index can't
+    /// be called fresh while it can't be checked.
+    #[cfg(unix)]
+    #[test]
+    fn an_indexed_file_that_cannot_be_checked_keeps_the_index_from_reading_fresh() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_workspace(workspace);
+        let locked = workspace.join("pkg/locked");
+        fs::create_dir_all(&locked).expect("create locked dir");
+        fs::write(locked.join("x.py"), "def hidden(x):\n    return x\n").expect("write x");
+        index_once(workspace);
+        let store = SqliteStore::open(workspace).expect("open store");
+        assert_eq!(
+            assess_index_freshness(workspace, &store)
+                .expect("assess")
+                .verdict,
+            FreshnessVerdict::Fresh
+        );
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("lock dir");
+        if fs::metadata(locked.join("x.py")).is_ok() {
+            // Running as root: permissions can't hide the file here.
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("unlock");
+            return;
+        }
+        let freshness = assess_index_freshness(workspace, &store).expect("assess");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("unlock dir");
+
+        assert_eq!(freshness.verdict, FreshnessVerdict::Stale, "{freshness:?}");
+        assert!(freshness.unreadable_files >= 1, "{freshness:?}");
+        assert!(
+            freshness
+                .changed_file_samples
+                .contains(&"? pkg/locked/x.py".to_owned()),
+            "{freshness:?}"
+        );
+        assert!(
+            freshness
+                .summary
+                .contains("paths that could not be checked"),
+            "{}",
+            freshness.summary
+        );
     }
 
     #[test]

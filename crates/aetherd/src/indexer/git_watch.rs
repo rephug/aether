@@ -1136,4 +1136,71 @@ mod tests {
         );
         assert_eq!(crate::freshness::read_index_sync_marker(workspace), before);
     }
+
+    /// A source file without symbols (a comment-only module, an empty `__init__.py`) has
+    /// no row whose time a read could advance. Once the watcher has read it, it must stop
+    /// counting as new.
+    #[test]
+    fn a_watched_source_file_without_symbols_stops_counting_as_new_once_read() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
+        fs::write(
+            workspace.join(".aether/config.toml"),
+            "[inference]\nprovider = \"mock\"\n\n[storage]\ngraph_backend = \"sqlite\"\n\n[embeddings]\nenabled = false\nvector_backend = \"sqlite\"\n",
+        )
+        .expect("write config");
+        fs::create_dir_all(workspace.join("pkg")).expect("create pkg");
+        fs::write(
+            workspace.join("pkg/a.py"),
+            "def alpha(x):\n    return x + 1\n",
+        )
+        .expect("write a");
+        let config = mock_config(workspace);
+        run_initial_index_once(&config).expect("index once");
+        let _watcher_lock = crate::freshness::take_watcher_lock(workspace).expect("watcher lock");
+        let mut observer = ObserverState::new(workspace.to_path_buf()).expect("observer");
+        observer.seed_from_disk().expect("seed observer");
+        let mut structural =
+            StructuralIndexer::new(workspace.to_path_buf()).expect("structural indexer");
+        let store = SqliteStore::open(workspace).expect("open store");
+        let queue_state = SharedQueueState::new(HashMap::new());
+
+        fs::write(
+            workspace.join("pkg/notes.py"),
+            "# Only a comment: no symbols.\n",
+        )
+        .expect("write notes");
+        let before =
+            crate::freshness::assess_index_freshness(workspace, &store).expect("assess before");
+        assert_eq!(
+            before.changed_file_samples,
+            ["A pkg/notes.py"],
+            "{before:?}"
+        );
+
+        process_debounced_paths(
+            &config,
+            &mut observer,
+            &mut structural,
+            &store,
+            &queue_state,
+            vec![workspace.join("pkg/notes.py")],
+        );
+
+        assert!(
+            store
+                .list_symbols_for_file("pkg/notes.py")
+                .expect("list symbols")
+                .is_empty()
+        );
+        let after =
+            crate::freshness::assess_index_freshness(workspace, &store).expect("assess after");
+        assert_eq!(after.new_files, 0, "{after:?}");
+        assert_eq!(
+            after.verdict,
+            crate::freshness::FreshnessVerdict::Fresh,
+            "{after:?}"
+        );
+    }
 }

@@ -124,9 +124,14 @@ pub struct AetherIndexFreshness {
     /// Indexed files that no longer exist.
     pub deleted_files: u64,
     /// Source files without indexed symbols that appeared or changed since the last full
-    /// sync started.
+    /// sync started and that no reindex has read since.
     pub new_files: u64,
-    /// Up to ten changed paths, prefixed `M ` (modified), `D ` (deleted) or `A ` (new).
+    /// Indexed files, and paths of the workspace walk, whose metadata couldn't be read
+    /// (permissions, a filesystem error). They may have changed, so while any remain the
+    /// verdict is `stale`.
+    pub unreadable_files: u64,
+    /// Up to ten changed paths, prefixed `M ` (modified), `D ` (deleted), `A ` (new) or
+    /// `? ` (couldn't be checked).
     pub changed_file_samples: Vec<String>,
     /// SIRs of modified or deleted files: they may describe code that is gone.
     pub sirs_in_changed_files: u64,
@@ -159,6 +164,7 @@ impl From<IndexFreshness> for AetherIndexFreshness {
             modified_files: freshness.modified_files,
             deleted_files: freshness.deleted_files,
             new_files: freshness.new_files,
+            unreadable_files: freshness.unreadable_files,
             changed_file_samples: freshness.changed_file_samples,
             sirs_in_changed_files: freshness.sirs_in_changed_files,
             stale_sirs: freshness.sir.stale_leaves,
@@ -186,6 +192,7 @@ impl AetherIndexFreshness {
             modified_files: 0,
             deleted_files: 0,
             new_files: 0,
+            unreadable_files: 0,
             changed_file_samples: Vec::new(),
             sirs_in_changed_files: 0,
             stale_sirs: 0,

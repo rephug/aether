@@ -139,6 +139,19 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Every recorded read start (unix milliseconds) by file path, symbol-free files
+    /// included; empty when the store predates the table.
+    pub fn list_file_reads(&self) -> Result<HashMap<String, i64>, StoreError> {
+        let conn = self.lock_connection()?;
+        if !file_reads_table_exists(&conn)? {
+            return Ok(HashMap::new());
+        }
+        let mut stmt = conn.prepare("SELECT file_path, read_at_ms FROM file_reads")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(Into::into)
+    }
+
     /// When the indexer last started reading `file_path` (unix milliseconds), if recorded.
     pub fn file_read_at_ms(&self, file_path: &str) -> Result<Option<i64>, StoreError> {
         let conn = self.lock_connection()?;
@@ -307,6 +320,13 @@ mod tests {
             Some(9_000)
         );
         assert_eq!(store.file_read_at_ms("src/other.rs").expect("read"), None);
+        // A file without symbols is listed too.
+        store
+            .record_file_reads(&["src/empty.rs".to_owned()], 9_500)
+            .expect("record a symbol-free read");
+        let reads = store.list_file_reads().expect("list reads");
+        assert_eq!(reads.get("src/empty.rs"), Some(&9_500));
+        assert_eq!(reads.get("src/lib.rs"), Some(&9_000));
     }
 
     /// A store last migrated by a binary that predates `file_reads` and opened read-only
@@ -337,5 +357,6 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].read_at_ms, None);
         assert_eq!(store.file_read_at_ms("src/lib.rs").expect("read"), None);
+        assert!(store.list_file_reads().expect("list reads").is_empty());
     }
 }
