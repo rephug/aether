@@ -20,7 +20,10 @@ pub use loaders::{
     load_provider_from_env_or_mock, load_reranker_provider_from_config, summarize_text_with_config,
 };
 pub use model_check::{ModelCatalog, ModelListing};
-pub use providers::{GeminiProvider, OpenAiCompatProvider, Qwen3LocalProvider, TieredProvider};
+pub use providers::{
+    GeminiProvider, OpenAiCompatProvider, Qwen3LocalProvider, TieredProvider,
+    gemini_accepts_temperature,
+};
 pub use reranker::{MockRerankerProvider, RerankCandidate, RerankResult, RerankerProvider};
 pub use sir_prompt::PromptTier;
 pub use types::{
