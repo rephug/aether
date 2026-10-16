@@ -139,6 +139,26 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Forgets the read times of `file_paths`, for files that are gone.
+    pub fn forget_file_reads(&self, file_paths: &[String]) -> Result<(), StoreError> {
+        if file_paths.is_empty() {
+            return Ok(());
+        }
+        let conn = self.lock_connection()?;
+        if !file_reads_table_exists(&conn)? {
+            return Ok(());
+        }
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        {
+            let mut delete = tx.prepare("DELETE FROM file_reads WHERE file_path = ?1")?;
+            for file_path in file_paths {
+                delete.execute(params![file_path])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Every recorded read start (unix milliseconds) by file path, symbol-free files
     /// included; empty when the store predates the table.
     pub fn list_file_reads(&self) -> Result<HashMap<String, i64>, StoreError> {
@@ -327,6 +347,14 @@ mod tests {
         let reads = store.list_file_reads().expect("list reads");
         assert_eq!(reads.get("src/empty.rs"), Some(&9_500));
         assert_eq!(reads.get("src/lib.rs"), Some(&9_000));
+        store
+            .forget_file_reads(&["src/empty.rs".to_owned()])
+            .expect("forget a read");
+        assert_eq!(store.file_read_at_ms("src/empty.rs").expect("read"), None);
+        assert_eq!(
+            store.file_read_at_ms("src/lib.rs").expect("read"),
+            Some(9_000)
+        );
     }
 
     /// A store last migrated by a binary that predates `file_reads` and opened read-only

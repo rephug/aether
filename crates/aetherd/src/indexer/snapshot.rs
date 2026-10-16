@@ -165,6 +165,38 @@ where
         ),
     }
 
+    // A file the index read before that is gone now has nothing left to describe. A
+    // symbol-free one leaves edges and test intents that no symbol removal clears, so an
+    // empty event clears them, and its read time is forgotten either way.
+    match store.list_file_reads() {
+        Ok(reads) => {
+            let gone = reads
+                .into_keys()
+                .filter(|file_path| {
+                    scope.read_file(file_path) && !workspace.join(file_path).exists()
+                })
+                .collect::<Vec<_>>();
+            for file_path in &gone {
+                if let Some(language) = language_for_path(Path::new(file_path)) {
+                    structural.process_event(
+                        store,
+                        &SymbolChangeEvent {
+                            file_path: file_path.clone(),
+                            language,
+                            added: Vec::new(),
+                            removed: Vec::new(),
+                            updated: Vec::new(),
+                        },
+                    )?;
+                }
+            }
+            if let Err(err) = store.forget_file_reads(&gone) {
+                tracing::warn!(error = %err, "failed to forget the reads of removed files");
+            }
+        }
+        Err(err) => tracing::warn!(error = %err, "failed to list the files the index read"),
+    }
+
     // Every file the snapshot read was read at some moment after its walk started; that
     // moment is the latest an edit can have reached it, so a later edit reads as a change.
     let read_files = symbols_by_id

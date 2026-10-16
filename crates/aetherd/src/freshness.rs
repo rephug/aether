@@ -246,7 +246,7 @@ pub struct IndexFreshness {
     /// Indexed files modified after they were last read, by modification time: a file
     /// touched or checked out again without a content change counts too.
     pub modified_files: u64,
-    /// Indexed files that no longer exist.
+    /// Indexed files that no longer exist, symbol-free ones the index read included.
     pub deleted_files: u64,
     /// Source files without indexed symbols that appeared or changed since the last full
     /// sync started and that no reindex has read since.
@@ -333,6 +333,26 @@ pub fn assess_index_freshness(workspace: &Path, store: &SqliteStore) -> Result<I
     };
     unreadable.sort();
     unreadable.dedup();
+
+    // A file the index read that is gone, with no symbols for the loop above to find, can
+    // still have edges and test intents stored until a reindex or full sync clears them.
+    let indexed_paths = indexed
+        .iter()
+        .map(|file| file.file_path.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut gone_without_symbols = store
+        .list_file_reads()
+        .context("failed to list file read times")?
+        .into_keys()
+        .filter(|path| {
+            !indexed_paths.contains(path.as_str())
+                && matches!(file_time(&workspace.join(path)), FileTime::Missing)
+        })
+        .collect::<Vec<_>>();
+    gone_without_symbols.sort();
+    for path in gone_without_symbols {
+        deleted.push(path);
+    }
 
     let head_matches = match (marker.head.as_deref(), workspace_head.as_deref()) {
         (Some(indexed), Some(current)) => Some(indexed.eq_ignore_ascii_case(current)),

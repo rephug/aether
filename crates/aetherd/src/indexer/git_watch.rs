@@ -314,6 +314,25 @@ fn process_reindex_path(
         // A file skipped for its size was not read: its stored symbols may describe older
         // text, so nothing may count it as read.
         Ok(None) if observer.skipped_as_oversized(path) => false,
+        // A source file that is gone and had no symbols (so no event removes any) can still
+        // have edges and test intents stored. An empty event clears them.
+        Ok(None) if !path.exists() => {
+            if let Some(language) = language_for_path(path) {
+                structural.process_event(
+                    store,
+                    &SymbolChangeEvent {
+                        file_path: normalize_path(
+                            &relative_workspace_path(&config.workspace, path).to_string_lossy(),
+                        ),
+                        language,
+                        added: Vec::new(),
+                        removed: Vec::new(),
+                        updated: Vec::new(),
+                    },
+                )?;
+            }
+            false
+        }
         // An edit that changes no symbol (a comment, blank lines, an import) still changes
         // the file and maybe its edges. Re-extract them, or status would report the file
         // as modified until the next full sync. A source file without symbols (imports
@@ -362,9 +381,9 @@ fn process_reindex_path(
             .with_context(|| format!("failed to record reading {}", path.display()))?;
     }
 
+    let file_path =
+        normalize_path(&relative_workspace_path(&config.workspace, path).to_string_lossy());
     if path.is_file() && language_for_path(path).is_some() && !observer.skipped_as_oversized(path) {
-        let file_path =
-            normalize_path(&relative_workspace_path(&config.workspace, path).to_string_lossy());
         if let Err(err) = store.record_file_reads(&[file_path], read_started_ms) {
             tracing::warn!(
                 path = %path.display(),
@@ -372,6 +391,14 @@ fn process_reindex_path(
                 "failed to record when the file was read"
             );
         }
+    } else if !path.exists()
+        && let Err(err) = store.forget_file_reads(&[file_path])
+    {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "failed to forget the read of a removed file"
+        );
     }
     Ok(())
 }
@@ -1422,5 +1449,146 @@ mod tests {
         let freshness =
             crate::freshness::assess_index_freshness(workspace, &store).expect("assess");
         assert_eq!(freshness.new_files, 0, "{freshness:?}");
+    }
+
+    /// A workspace whose watcher has indexed `src/main.ts`, a source file with imports and
+    /// a top-level call but no symbols.
+    struct SymbolFreeFile {
+        config: IndexerConfig,
+        observer: ObserverState,
+        structural: StructuralIndexer,
+        store: SqliteStore,
+        queue_state: SharedQueueState,
+        _watcher_lock: crate::freshness::WatcherLock,
+    }
+
+    impl SymbolFreeFile {
+        fn new(workspace: &Path) -> Self {
+            fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
+            fs::write(
+                workspace.join(".aether/config.toml"),
+                "[inference]\nprovider = \"mock\"\n\n[storage]\ngraph_backend = \"sqlite\"\n\n[embeddings]\nenabled = false\nvector_backend = \"sqlite\"\n",
+            )
+            .expect("write config");
+            fs::create_dir_all(workspace.join("src")).expect("create src");
+            fs::write(
+                workspace.join("src/a.ts"),
+                "export function alpha(): number {\n  return 1;\n}\n",
+            )
+            .expect("write a");
+            let config = mock_config(workspace);
+            crate::freshness::let_writes_settle();
+            run_initial_index_once(&config).expect("index once");
+            let mut repo = Self {
+                _watcher_lock: crate::freshness::take_watcher_lock(workspace)
+                    .expect("watcher lock"),
+                observer: {
+                    let mut observer =
+                        ObserverState::new(workspace.to_path_buf()).expect("observer");
+                    observer.seed_from_disk().expect("seed observer");
+                    observer
+                },
+                structural: StructuralIndexer::new(workspace.to_path_buf())
+                    .expect("structural indexer"),
+                store: SqliteStore::open(workspace).expect("open store"),
+                queue_state: SharedQueueState::new(HashMap::new()),
+                config,
+            };
+            fs::write(
+                workspace.join("src/main.ts"),
+                "import { alpha } from \"./a\";\n\nalpha();\n",
+            )
+            .expect("write main");
+            repo.watch("src/main.ts");
+            assert!(repo.edges("src/main.ts") > 0);
+            repo
+        }
+
+        fn watch(&mut self, file_path: &str) {
+            crate::freshness::let_writes_settle();
+            let path = self.config.workspace.join(file_path);
+            process_debounced_paths(
+                &self.config,
+                &mut self.observer,
+                &mut self.structural,
+                &self.store,
+                &self.queue_state,
+                vec![path],
+            );
+        }
+
+        fn edges(&self, file_path: &str) -> i64 {
+            rusqlite::Connection::open(self.config.workspace.join(".aether/meta.sqlite"))
+                .and_then(|conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM symbol_edges WHERE file_path = ?1",
+                        [file_path],
+                        |row| row.get(0),
+                    )
+                })
+                .expect("count edges")
+        }
+    }
+
+    /// Deleting a symbol-free file removes no symbol, so no symbol event clears what it
+    /// left: the watcher must clear its edges itself and forget its read.
+    #[test]
+    fn a_watched_deletion_of_a_symbol_free_file_clears_its_edges() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let mut repo = SymbolFreeFile::new(workspace);
+
+        fs::remove_file(workspace.join("src/main.ts")).expect("delete main");
+        repo.watch("src/main.ts");
+
+        assert_eq!(repo.edges("src/main.ts"), 0);
+        assert_eq!(
+            repo.store.file_read_at_ms("src/main.ts").expect("read"),
+            None
+        );
+        let freshness =
+            crate::freshness::assess_index_freshness(workspace, &repo.store).expect("assess");
+        assert_eq!(
+            freshness.verdict,
+            crate::freshness::FreshnessVerdict::Fresh,
+            "{freshness:?}"
+        );
+    }
+
+    /// Deleted while nothing watched, the file's edges stay stored, so status must call the
+    /// index stale until a full sync clears them.
+    #[test]
+    fn an_unwatched_deletion_of_a_symbol_free_file_is_stale_until_a_full_sync() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let repo = SymbolFreeFile::new(workspace);
+
+        fs::remove_file(workspace.join("src/main.ts")).expect("delete main");
+        let stale =
+            crate::freshness::assess_index_freshness(workspace, &repo.store).expect("assess");
+        assert_eq!(stale.changed_file_samples, ["D src/main.ts"], "{stale:?}");
+        assert_eq!(stale.verdict, crate::freshness::FreshnessVerdict::Stale);
+
+        let SymbolFreeFile {
+            config,
+            store,
+            _watcher_lock,
+            ..
+        } = repo;
+        drop(_watcher_lock);
+        run_initial_index_once(&config).expect("full sync");
+        let edges = rusqlite::Connection::open(workspace.join(".aether/meta.sqlite"))
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM symbol_edges WHERE file_path = 'src/main.ts'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .expect("count edges");
+        assert_eq!(edges, 0, "the full sync cleared the deleted file's edges");
+        assert_eq!(store.file_read_at_ms("src/main.ts").expect("read"), None);
+        let fresh = crate::freshness::assess_index_freshness(workspace, &store).expect("assess");
+        assert_eq!(fresh.deleted_files, 0, "{fresh:?}");
     }
 }

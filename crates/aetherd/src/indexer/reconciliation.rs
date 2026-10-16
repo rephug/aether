@@ -99,7 +99,7 @@ impl<'a> SnapshotScope<'a> {
         self.head.and_then(|head| head.commit.as_deref())
     }
 
-    fn read_file(&self, file_path: &str) -> bool {
+    pub(super) fn read_file(&self, file_path: &str) -> bool {
         !self.unread_paths.iter().any(|path| {
             path.is_empty()
                 || file_path == path

@@ -121,7 +121,7 @@ pub struct AetherIndexFreshness {
     /// Indexed files modified after the indexer last read them, by modification time: a
     /// file touched or checked out again without a content change counts too.
     pub modified_files: u64,
-    /// Indexed files that no longer exist.
+    /// Indexed files that no longer exist, symbol-free ones the index read included.
     pub deleted_files: u64,
     /// Source files without indexed symbols that appeared or changed since the last full
     /// sync started and that no reindex has read since.
