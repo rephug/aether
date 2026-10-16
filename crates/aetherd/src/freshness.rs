@@ -359,10 +359,12 @@ pub fn assess_index_freshness(workspace: &Path, store: &SqliteStore) -> Result<I
         _ => None,
     };
     let changed = modified.len() + deleted.len() + new_files.len() + unreadable.len();
-    let verdict = if indexed.is_empty() {
-        FreshnessVerdict::Empty
-    } else if changed > 0 || head_matches == Some(false) {
+    // Detected changes come first: an index without symbols can still hold the edges of
+    // symbol-free files, and a deletion of one leaves them stale.
+    let verdict = if changed > 0 || head_matches == Some(false) {
         FreshnessVerdict::Stale
+    } else if indexed.is_empty() {
+        FreshnessVerdict::Empty
     } else {
         FreshnessVerdict::Fresh
     };

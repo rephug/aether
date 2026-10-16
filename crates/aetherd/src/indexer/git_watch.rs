@@ -1591,4 +1591,64 @@ mod tests {
         let fresh = crate::freshness::assess_index_freshness(workspace, &store).expect("assess");
         assert_eq!(fresh.deleted_files, 0, "{fresh:?}");
     }
+
+    /// An index of symbol-free files alone has no symbols, yet holds their edges: deleting
+    /// one while nothing watches must read as stale, not as an empty index.
+    #[test]
+    fn a_deletion_in_an_index_of_symbol_free_files_alone_reads_as_stale() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
+        fs::write(
+            workspace.join(".aether/config.toml"),
+            "[inference]\nprovider = \"mock\"\n\n[storage]\ngraph_backend = \"sqlite\"\n\n[embeddings]\nenabled = false\nvector_backend = \"sqlite\"\n",
+        )
+        .expect("write config");
+        let config = mock_config(workspace);
+        run_initial_index_once(&config).expect("index once");
+        let mut observer = ObserverState::new(workspace.to_path_buf()).expect("observer");
+        observer.seed_from_disk().expect("seed observer");
+        let mut structural =
+            StructuralIndexer::new(workspace.to_path_buf()).expect("structural indexer");
+        let store = SqliteStore::open(workspace).expect("open store");
+        let queue_state = SharedQueueState::new(HashMap::new());
+
+        fs::create_dir_all(workspace.join("src")).expect("create src");
+        fs::write(
+            workspace.join("src/main.ts"),
+            "import { alpha } from \"./a\";\n\nalpha();\n",
+        )
+        .expect("write main");
+        crate::freshness::let_writes_settle();
+        process_debounced_paths(
+            &config,
+            &mut observer,
+            &mut structural,
+            &store,
+            &queue_state,
+            vec![workspace.join("src/main.ts")],
+        );
+        assert!(
+            store
+                .file_read_at_ms("src/main.ts")
+                .expect("read")
+                .is_some()
+        );
+        assert!(
+            store
+                .list_indexed_files()
+                .expect("indexed files")
+                .is_empty()
+        );
+
+        fs::remove_file(workspace.join("src/main.ts")).expect("delete main");
+        let freshness =
+            crate::freshness::assess_index_freshness(workspace, &store).expect("assess");
+        assert_eq!(
+            freshness.verdict,
+            crate::freshness::FreshnessVerdict::Stale,
+            "{freshness:?}"
+        );
+        assert_eq!(freshness.changed_file_samples, ["D src/main.ts"]);
+    }
 }
