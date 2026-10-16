@@ -9,7 +9,7 @@ use std::fmt;
 use std::path::Path;
 
 use aether_config::{
-    AetherConfig, EmbeddingProviderKind, InferenceProviderKind, ModelIdStatus, model_id_notice,
+    AetherConfig, EmbeddingProviderKind, InferenceProviderKind, ModelIdStatus, model_id_notice_for,
     validate_config,
 };
 use aether_infer::{
@@ -291,7 +291,9 @@ fn listing_result(
     }
 
     let mut detail = format!("{provider} model '{model}' is not listed by {source}");
-    if let Some(notice) = model_id_notice(model) {
+    // Google's notices only fit a model Google serves.
+    let gemini_api = matches!(listing.catalog, ModelCatalog::Gemini { .. });
+    if let Some(notice) = model_id_notice_for(model, gemini_api) {
         let state = match notice.status {
             ModelIdStatus::ShutDown => "shut down",
             ModelIdStatus::Retiring => "may be retired",
@@ -431,7 +433,46 @@ endpoint = "{endpoint}/api/embeddings"
     }
 
     #[test]
-    fn doctor_fails_a_shut_down_id_without_any_request() {
+    fn doctor_fails_a_shut_down_gemini_id_without_any_request() {
+        let temp = tempdir().expect("tempdir");
+        write_config(
+            temp.path(),
+            r#"
+[inference]
+provider = "gemini"
+model = "gemini-3.1-flash-lite-preview"
+api_key_env = "AETHER_DOCTOR_TEST_KEY_THAT_IS_NEVER_SET"
+"#,
+        );
+        let config = ensure_workspace_config(temp.path()).expect("config");
+
+        let report = run_doctor(temp.path(), &config).expect("doctor");
+        let statuses = report
+            .checks
+            .iter()
+            .map(|check| (check.subject.as_str(), check.status))
+            .collect::<Vec<_>>();
+        // The shut-down id fails from the config alone; without a key nothing is listed.
+        assert_eq!(
+            statuses,
+            [
+                ("inference.model", CheckStatus::Fail),
+                ("inference", CheckStatus::Fail),
+            ]
+        );
+        assert!(
+            report.checks[0]
+                .detail
+                .contains("use 'gemini-3.1-flash-lite'")
+        );
+        assert!(report.checks[1].detail.starts_with("cannot check: "));
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    /// Google's notices are about Google's models: a provider that calls no Gemini model
+    /// gets none for a name that matches one.
+    #[test]
+    fn doctor_gives_no_google_notice_where_google_serves_nothing() {
         let temp = tempdir().expect("tempdir");
         write_config(
             temp.path(),
@@ -449,19 +490,52 @@ model = "gemini-3.1-flash-lite-preview"
             .iter()
             .map(|check| (check.subject.as_str(), check.status))
             .collect::<Vec<_>>();
-        assert_eq!(
-            statuses,
-            [
-                ("inference.model", CheckStatus::Fail),
-                ("inference", CheckStatus::Skip),
-            ]
+        assert_eq!(statuses, [("inference", CheckStatus::Skip)]);
+        assert_eq!(report.exit_code(), 0);
+    }
+
+    /// An Ollama model that happens to carry a retired Gemini id is listed by its own
+    /// catalog, and that is all doctor reports.
+    #[test]
+    fn doctor_trusts_a_non_google_catalog_for_a_gemini_named_model() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer).expect("read request");
+            let body = r#"{"models":[{"name":"gemini-3.1-flash-lite-preview:latest"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write response");
+        });
+
+        let temp = tempdir().expect("tempdir");
+        write_config(
+            temp.path(),
+            &format!(
+                r#"
+[inference]
+provider = "qwen3_local"
+model = "gemini-3.1-flash-lite-preview"
+endpoint = "{endpoint}"
+"#
+            ),
         );
-        assert!(
-            report.checks[0]
-                .detail
-                .contains("use 'gemini-3.1-flash-lite'")
-        );
-        assert_eq!(report.exit_code(), 1);
+        let config = ensure_workspace_config(temp.path()).expect("config");
+
+        let report = run_doctor(temp.path(), &config).expect("doctor");
+        server.join().expect("server");
+        let statuses = report
+            .checks
+            .iter()
+            .map(|check| (check.subject.as_str(), check.status))
+            .collect::<Vec<_>>();
+        assert_eq!(statuses, [("inference", CheckStatus::Ok)], "{report:?}");
+        assert_eq!(report.exit_code(), 0);
     }
 
     #[test]

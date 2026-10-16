@@ -3,7 +3,7 @@ use crate::{
     constants::{DEFAULT_COHERE_API_KEY_ENV, DEFAULT_GEMINI_API_KEY_ENV},
     embeddings::EmbeddingProviderKind,
     inference::{InferenceProviderKind, TieredConfig},
-    model_ids::{ModelIdStatus, configured_model_ids, model_id_notice},
+    model_ids::{ModelIdStatus, configured_model_ids},
     omp::{batch_pricing_providers_list, batch_target_for_omp_route, split_omp_route},
     root::AetherConfig,
     search::SearchRerankerKind,
@@ -405,10 +405,11 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
         });
     }
 
-    for (setting, model) in configured_model_ids(config) {
-        let Some(notice) = model_id_notice(&model) else {
+    for configured in configured_model_ids(config) {
+        let Some(notice) = configured.notice() else {
             continue;
         };
+        let (setting, model) = (configured.setting, configured.model);
         let (code, state) = match notice.status {
             ModelIdStatus::ShutDown => ("model_id_shut_down", "is shut down"),
             ModelIdStatus::Retiring => ("model_id_retiring", "may be retired"),
