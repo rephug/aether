@@ -147,6 +147,88 @@ where
         structural.process_event(store, event)?;
     }
 
+    // The watcher diffs its next HEAD change against the HEAD from before the walk, not
+    // HEAD now: a checkout during the walk happens before the watches exist, so only that
+    // diff can still cover it.
+    match scope.head {
+        Some(head) => {
+            let head = git_watch::HeadState {
+                sha: head.commit.clone(),
+                marker: head.git_ref.clone(),
+            };
+            if let Err(err) = git_watch::write_persisted_head_state(workspace, &head) {
+                tracing::warn!(error = %err, "failed to record the watcher's HEAD");
+            }
+        }
+        None => tracing::warn!(
+            "HEAD could not be read before the walk; the watcher keeps its previous base"
+        ),
+    }
+
+    // A file the index read before that is gone now has nothing left to describe. A
+    // symbol-free one leaves edges and test intents that no symbol removal clears, so an
+    // empty event clears them, and its read time is forgotten either way.
+    match store.list_file_reads() {
+        Ok(reads) => {
+            let gone = reads
+                .into_keys()
+                .filter(|file_path| {
+                    scope.read_file(file_path) && !workspace.join(file_path).exists()
+                })
+                .collect::<Vec<_>>();
+            for file_path in &gone {
+                if let Some(language) = language_for_path(Path::new(file_path)) {
+                    structural.process_event(
+                        store,
+                        &SymbolChangeEvent {
+                            file_path: file_path.clone(),
+                            language,
+                            added: Vec::new(),
+                            removed: Vec::new(),
+                            updated: Vec::new(),
+                        },
+                    )?;
+                }
+            }
+            if let Err(err) = store.forget_file_reads(&gone) {
+                tracing::warn!(error = %err, "failed to forget the reads of removed files");
+            }
+        }
+        Err(err) => tracing::warn!(error = %err, "failed to list the files the index read"),
+    }
+
+    // Every file the snapshot read was read at some moment after its walk started; that
+    // moment is the latest an edit can have reached it, so a later edit reads as a change.
+    let read_files = symbols_by_id
+        .values()
+        .map(|symbol| symbol.file_path.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if let Err(err) = store.record_file_reads(&read_files, scope.taken_at_millis) {
+        tracing::warn!(error = %err, "failed to record when the snapshot read its files");
+    }
+
+    // Freshness may count this snapshot as a full sync only when it read every path: a
+    // marker that claimed one it couldn't read would hide that path's changes. Without a
+    // new marker, status keeps the previous commit and time, so it errs toward stale.
+    if scope.unread_paths.is_empty() {
+        if let Err(err) = crate::freshness::record_full_sync(
+            workspace,
+            scope.head_commit(),
+            scope.taken_at,
+            scope.taken_at_millis,
+        ) {
+            tracing::warn!(error = %err, "failed to record the index sync marker");
+        }
+    } else {
+        tracing::warn!(
+            unread_paths = scope.unread_paths.len(),
+            "the snapshot could not read every path; the index sync marker keeps its previous \
+             commit and time"
+        );
+    }
+
     Ok(())
 }
 

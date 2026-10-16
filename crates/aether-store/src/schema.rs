@@ -726,6 +726,19 @@ pub(crate) fn apply_migrations(tx: &Transaction<'_>, version: i32) -> Result<(),
         );
         "#,
     )?;
+    // When the indexer last started reading each file (unix milliseconds), so freshness
+    // can tell an edit made after that read from one made before it; `symbols.last_seen_at`
+    // has whole seconds and, after a full sync, the time the sync wrote rather than read.
+    // Only ever added to and read by freshness reports, so it needs no version step:
+    // binaries that predate it ignore it, and the store stays openable by them.
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS file_reads (
+            file_path TEXT PRIMARY KEY,
+            read_at_ms INTEGER NOT NULL
+        );
+        "#,
+    )?;
     let current_user_version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     conn.execute(
         r#"

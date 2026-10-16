@@ -28,7 +28,7 @@ concurrency = 2
   - `mock`: no model at all. Every symbol gets a `[MOCK]` placeholder SIR at confidence 0.1 from tree-sitter facts, so `aether_audit_candidates` ranks it first for `/scan` (zero-key onboarding, Decision #121).
 - `model`
   - Optional provider-specific override.
-  - Gemini default: `gemini-3.1-flash-lite-preview`
+  - Gemini default: `gemini-3.1-flash-lite`
 - `endpoint`
   - Optional provider-specific endpoint override.
   - `qwen3_local` default: `http://127.0.0.1:11434`
@@ -43,7 +43,7 @@ concurrency = 2
 - `concurrency`
   - Default config value is `2`.
   - When `provider = "gemini"` and concurrency is left at the default value, AETHER normalizes it to `16`.
-  - For `gemini-3.1-flash-lite-preview`, `concurrency = 16` is safe under the 4000 RPM limit.
+  - For `gemini-3.1-flash-lite`, `concurrency = 16` is safe under the 4000 RPM limit.
   - For local Ollama on consumer hardware, `concurrency = 2` is appropriate.
 - `timeout_secs`
   - How long one SIR generation attempt may take during scans and watcher updates before it is abandoned (each symbol gets three attempts). Unset means 90 seconds.
@@ -161,7 +161,7 @@ too.
 # Pass 2 — triage: enriched context, self-improvement, all or filtered symbols
 triage_pass = true
 triage_provider = "gemini"
-triage_model = "gemini-3.1-flash-lite-preview"
+triage_model = "gemini-3.1-flash-lite"
 triage_api_key_env = "GEMINI_API_KEY"
 triage_priority_threshold = 0.0
 triage_confidence_threshold = 1.0
@@ -228,6 +228,7 @@ vector_backend = "lancedb" # lancedb | sqlite
 - `enabled = false` keeps search lexical-only.
 - `provider = "qwen3_local"` uses a local HTTP embedding endpoint.
 - `provider = "candle"` uses the bundled local model path under `[embeddings.candle]`.
+- `provider = "gemini_native"` calls Gemini's embedding API. Google's deprecations page lists the preview id `gemini-embedding-2-preview` (as `embedding-2-preview`) with 2026-08-10 as the earliest possible date on which it might be retired, and names `gemini-embedding-2` as its replacement. AETHER warns at startup (`model_id_retiring`) but keeps using the configured id. Switching takes more than the id: `gemini-embedding-2` doesn't take the `taskType` field this provider sends, so it needs the task written into the text instead (`task: code retrieval | query: ...` for queries, `title: none | text: ...` for documents), and switching models re-embeds every symbol.
 
 ## Environment Variables
 
@@ -255,6 +256,8 @@ Override precedence is CLI > config file > built-in defaults.
 
 ## Validation and Normalization
 
+- A model id that its provider has shut down or listed for retirement gets a startup warning (`model_id_shut_down` or `model_id_retiring`) naming the setting, the replacement id and anything besides the id that switching needs. Requests still use the configured id. Google's notices apply only where Google serves the model: through the Gemini API (provider `gemini`, `auto`, a tiered primary of `gemini`, `gemini_native` embeddings, Gemini batches) or as a `google/` route through a gateway. The same name served by Ollama or another OpenAI-compatible endpoint gets no warning.
+- `aetherd --workspace . doctor` resolves the inference provider, any quality pass with its own provider or model, the watcher's `realtime_model`, and the embedding provider the way indexing does, then asks each service (Gemini, Ollama, an OpenAI-compatible endpoint or the omp gateway) to list its models and reports any configured id it doesn't list. It only lists models: nothing is generated or embedded. It exits with status 1 when a model is missing, shut down or can't be checked.
 - Optional strings are trimmed and empty strings are discarded.
 - Probability thresholds are clamped into valid ranges.
 - `triage_timeout_secs` and `deep_timeout_secs` default to `180`.

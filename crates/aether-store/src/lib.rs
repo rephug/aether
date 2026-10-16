@@ -23,7 +23,9 @@ mod audit;
 mod contracts;
 mod embeddings;
 mod fingerprint_history;
+mod freshness;
 mod graph;
+mod graph_coverage;
 mod language_family;
 mod lexical;
 mod lifecycle;
@@ -67,11 +69,13 @@ pub use audit::{AuditFinding, AuditFindingFilters, AuditSeverityCounts, NewAudit
 pub use contracts::{IntentContractRecord, IntentViolationRecord};
 pub use embeddings::{SemanticSearchResult, SymbolEmbeddingMetaRecord, SymbolEmbeddingRecord};
 pub use fingerprint_history::SirFingerprintHistoryRecord;
+pub use freshness::{IndexedFileRecord, SirFreshnessCounts};
 pub use graph::{
     CouplingEdgeRecord, GraphDependencyEdgeRecord, GraphSyncStats, ResolvedEdge,
     SymbolNeighborRecord, TestedByRecord, UpstreamDependencyEdgeRecord,
     UpstreamDependencyNodeRecord, UpstreamDependencyTraversal,
 };
+pub use graph_coverage::{CallEdgeCoverage, LanguageCallEdgeCoverage};
 pub use language_family::{
     EDGE_FILE_LANGUAGE_CTE, edge_source_family_matches_sql, same_language_family_sql,
 };
@@ -134,6 +138,9 @@ pub enum StoreError {
     LanceDb(String),
     #[error("schema compatibility error: {0}")]
     Compatibility(String),
+    /// A panic in another store operation poisoned the connection lock.
+    #[error("store connection lock poisoned: {0}")]
+    LockPoisoned(String),
 }
 
 pub trait SymbolCatalogStore {

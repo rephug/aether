@@ -347,6 +347,7 @@ fn run_subcommand(workspace: &Path, config: &AetherConfig, command: Commands) ->
         Commands::ComputeQuality(args) => run_compute_quality_subcommand(workspace, args),
         Commands::SetupLocal(args) => run_setup_local_command(workspace, args),
         Commands::Status => run_status_subcommand(workspace),
+        Commands::Doctor => run_doctor_subcommand(workspace, config),
         Commands::Remember(args) => run_remember_note_command(workspace, args),
         Commands::Recall(args) => run_recall_note_command(workspace, args),
         Commands::Ask(args) => run_ask_subcommand(workspace, args),
@@ -835,6 +836,21 @@ fn run_status_subcommand(workspace: &Path) -> Result<()> {
         "SIR Coverage: {} / {} ({coverage_pct:.1}%)",
         symbols_with_sir, total_symbols
     );
+    let freshness = aetherd::freshness::assess_index_freshness(workspace, &store)
+        .context("failed to assess index freshness")?;
+    println!("{}", freshness.summary);
+    for note in &freshness.notes {
+        println!("  - {note}");
+    }
+    Ok(())
+}
+
+fn run_doctor_subcommand(workspace: &Path, config: &AetherConfig) -> Result<()> {
+    let report = aetherd::doctor::run_doctor(workspace, config)?;
+    aetherd::doctor::print_doctor_report(&report);
+    if report.exit_code() != 0 {
+        std::process::exit(report.exit_code());
+    }
     Ok(())
 }
 

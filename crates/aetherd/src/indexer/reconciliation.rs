@@ -67,6 +67,10 @@ pub(super) struct SnapshotScope<'a> {
     pub(super) unread_paths: &'a [String],
     /// When the snapshot started reading the workspace (unix seconds).
     pub(super) taken_at: i64,
+    /// The same moment in milliseconds.
+    pub(super) taken_at_millis: i64,
+    /// HEAD just before the snapshot read the workspace; `None` when it could not be read.
+    pub(super) head: Option<&'a SeededHead>,
 }
 
 impl<'a> SnapshotScope<'a> {
@@ -74,6 +78,8 @@ impl<'a> SnapshotScope<'a> {
         Self {
             unread_paths: observer.unread_paths(),
             taken_at: observer.seeded_at(),
+            taken_at_millis: observer.seeded_at_millis(),
+            head: observer.seeded_head(),
         }
     }
 
@@ -83,10 +89,17 @@ impl<'a> SnapshotScope<'a> {
         Self {
             unread_paths: &[],
             taken_at: i64::MAX,
+            taken_at_millis: i64::MAX,
+            head: None,
         }
     }
 
-    fn read_file(&self, file_path: &str) -> bool {
+    /// The commit HEAD pointed at before the walk, if known.
+    pub(super) fn head_commit(&self) -> Option<&'a str> {
+        self.head.and_then(|head| head.commit.as_deref())
+    }
+
+    pub(super) fn read_file(&self, file_path: &str) -> bool {
         !self.unread_paths.iter().any(|path| {
             path.is_empty()
                 || file_path == path
@@ -775,6 +788,8 @@ mod tests {
         let scope = SnapshotScope {
             unread_paths: &unread_paths,
             taken_at: 200,
+            taken_at_millis: 200_000,
+            head: None,
         };
         let plan = plan_symbol_reconciliation(&store, &HashMap::new(), &HashSet::new(), &scope)
             .expect("plan reconcile");

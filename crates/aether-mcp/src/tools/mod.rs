@@ -12,6 +12,8 @@ use rmcp::transport::stdio;
 use crate::AetherMcpError;
 use crate::state::SharedState;
 
+#[cfg(test)]
+mod agent_files_tests;
 mod audit;
 mod callers;
 mod common;

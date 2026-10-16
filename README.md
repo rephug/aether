@@ -530,7 +530,7 @@ The Gemini Batch API costs half as much as real-time API calls. AETHER generates
 
 ```bash
 # Generate JSONL for scan pass
-aetherd --workspace . batch build --pass scan --model gemini-3.1-flash-lite-preview
+aetherd --workspace . batch build --pass scan --model gemini-3.1-flash-lite
 
 # Full pipeline: extract → build → submit → poll → ingest for all three passes
 aetherd --workspace . batch run --passes scan,triage,deep
@@ -651,7 +651,7 @@ Register AETHER with any MCP-compatible agent (Claude Code, Codex, etc.) and it 
 
 | Tool | What It Does |
 |:-----|:------------|
-| `aether_status` | Workspace health — symbol count, SIR coverage, store paths |
+| `aether_status` | Workspace health — symbol count, SIR coverage, store paths, and freshness: last sync, indexed vs workspace HEAD, files changed since, stale SIRs, whether a daemon watches |
 | `aether_search` | Semantic / lexical / hybrid symbol search |
 | `aether_symbol_lookup` | Find symbols by qualified name or file path |
 | `aether_get_sir` | Full SIR annotation for any symbol |
@@ -789,6 +789,7 @@ MAINTENANCE
   refactor-prep          Deep-scan risky symbols before refactoring
   verify-intent          Compare against saved refactor snapshot
   fsck                   Cross-store consistency check
+  doctor                 Check configured model ids exist (lists models, generates nothing)
   setup-local            Configure local Ollama inference
   init-agent             Generate agent config files
   omp up|down|status     Start/stop/inspect the Oh My Pi broker + gateway (inference.provider=omp)
@@ -819,7 +820,7 @@ Everything lives in `.aether/config.toml`, auto-created on first run. Or use the
 ```toml
 [inference]
 provider = "gemini"
-model = "gemini-3.1-flash-lite-preview"
+model = "gemini-3.1-flash-lite"
 api_key_env = "GEMINI_API_KEY"
 concurrency = 12
 
@@ -832,8 +833,8 @@ vector_backend = "lancedb"
 
 [batch]
 provider = "gemini"               # gemini | openai | anthropic | auto (follow the omp route in [inference].model)
-scan_model = "gemini-3.1-flash-lite-preview"
-triage_model = "gemini-3.1-flash-lite-preview"
+scan_model = "gemini-3.1-flash-lite"
+triage_model = "gemini-3.1-flash-lite"
 deep_model = "gemini-3.1-pro"
 scan_thinking = "low"
 triage_thinking = "medium"

@@ -8,6 +8,9 @@ authors.workspace = true
 [features]
 default = []
 dashboard = ["dep:aether-dashboard"]
+# Set by aether-mcp's `verification` feature, which registers `aether_verify`: the agent
+# files init-agent writes mandate that tool only when this build has it.
+verification = []
 
 [[bin]]
 name = "aetherd"

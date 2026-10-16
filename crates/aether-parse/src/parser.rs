@@ -1503,6 +1503,30 @@ fn foo(value: Input) {
         assert_eq!(call_targets, vec!["helper".to_owned()]);
     }
 
+    /// Macro arguments parse as token trees, so a call written inside one makes no edge.
+    /// The coverage counts in `aether_status` and `aether_dependencies` say so; if this
+    /// starts recording them, update that wording.
+    #[test]
+    fn rust_calls_inside_macro_arguments_make_no_call_edge() {
+        let source = r#"
+fn helper() -> i32 { 1 }
+fn other() -> i32 { 2 }
+
+fn foo() {
+    helper();
+    println!("{}", other());
+    assert_eq!(other(), 2);
+}
+"#;
+
+        let call_targets = edge_targets_for_source(
+            &extract_with_edges(Language::Rust, "src/lib.rs", source),
+            "foo",
+            EdgeKind::Calls,
+        );
+        assert_eq!(call_targets, vec!["helper".to_owned()]);
+    }
+
     #[test]
     fn implements_extracted_from_impl_trait() {
         let source = r#"

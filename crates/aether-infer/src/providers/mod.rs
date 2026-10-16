@@ -4,7 +4,7 @@ pub(crate) mod openai_compat;
 pub(crate) mod qwen_local;
 pub(crate) mod tiered;
 
-pub use gemini::GeminiProvider;
+pub use gemini::{GeminiProvider, gemini_accepts_temperature};
 pub use mock::MockInferenceProvider;
 pub use openai_compat::OpenAiCompatProvider;
 pub use qwen_local::Qwen3LocalProvider;

@@ -7,12 +7,41 @@ use serde_json::{Value, json};
 use crate::http::{
     GEMINI_API_BASE, extract_gemini_parts, extract_gemini_text_part, inference_http_client,
 };
+use crate::model_check::{ModelCatalog, ModelListing};
 use crate::providers::PARSE_VALIDATION_RETRIES;
 use crate::sir_parsing::parse_and_validate_sir;
 use crate::sir_prompt;
 use crate::types::{InferError, InferSirResult, InferenceProvider, SirContext, normalize_optional};
 
-pub(crate) const GEMINI_DEFAULT_MODEL: &str = "gemini-3.1-flash-lite-preview";
+pub(crate) const GEMINI_DEFAULT_MODEL: &str = "gemini-3.1-flash-lite";
+
+/// Whether a Gemini request for `model` may carry `temperature`. Google's Gemini 3.6 notes
+/// (last updated 2026-10-13): "Starting with Gemini 3.6 Flash and Gemini 3.5 Flash-Lite",
+/// for "these models and all future Gemini model releases", `temperature`, `top_p` and
+/// `top_k` "are deprecated and ignored", and "in future model generations, supplying these
+/// parameters returns an HTTP 400 error". So only an id older than Gemini 3.5 gets one. A
+/// later id, an alias such as `gemini-flash-latest` and an id this can't read go without:
+/// for them sampling would be ignored at best and a failed request at worst.
+pub fn gemini_accepts_temperature(model: &str) -> bool {
+    let model = model.trim();
+    let bare = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    let Some(rest) = bare.strip_prefix("gemini-") else {
+        return false;
+    };
+    let version = rest.split('-').next().unwrap_or_default();
+    let mut numbers = version.split('.').map(str::parse::<u32>);
+    let (Some(Ok(major)), minor) = (numbers.next(), numbers.next().unwrap_or(Ok(0))) else {
+        return false;
+    };
+    let Ok(minor) = minor else {
+        return false;
+    };
+    numbers.next().is_none() && (major, minor) < (3, 5)
+}
 
 #[derive(Debug, Clone)]
 pub struct GeminiProvider {
@@ -56,8 +85,10 @@ impl GeminiProvider {
     fn generation_config(&self) -> Value {
         let mut gen_config = json!({
             "responseMimeType": "application/json",
-            "temperature": 0.0
         });
+        if gemini_accepts_temperature(&self.model) {
+            gen_config["temperature"] = json!(0.0);
+        }
 
         if let Some(level) = parse_gemini_thinking_level(self.thinking.as_deref()) {
             gen_config["thinkingConfig"] = json!({
@@ -154,6 +185,16 @@ impl InferenceProvider for GeminiProvider {
         self.model.clone()
     }
 
+    fn model_listings(&self) -> Vec<ModelListing> {
+        vec![ModelListing::new(
+            self.model.clone(),
+            ModelCatalog::Gemini {
+                api_base: self.api_base.clone(),
+                api_key: self.api_key.clone(),
+            },
+        )]
+    }
+
     async fn generate_sir(
         &self,
         symbol_text: &str,
@@ -202,19 +243,7 @@ pub(crate) async fn request_gemini_summary(
     user_prompt: &str,
 ) -> Result<String, InferError> {
     let endpoint = format!("{GEMINI_API_BASE}/models/{model}:generateContent");
-    let body = json!({
-        "systemInstruction": {
-            "parts": [{"text": system_prompt}]
-        },
-        "contents": [
-            {
-                "parts": [{"text": user_prompt}]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.1
-        }
-    });
+    let body = build_summary_body(model, system_prompt, user_prompt);
     let response_value: Value = inference_http_client()
         .post(endpoint)
         .header("x-goog-api-key", api_key.expose())
@@ -225,6 +254,23 @@ pub(crate) async fn request_gemini_summary(
         .json()
         .await?;
     Ok(extract_gemini_text_part(&response_value)?.to_owned())
+}
+
+fn build_summary_body(model: &str, system_prompt: &str, user_prompt: &str) -> Value {
+    let mut body = json!({
+        "systemInstruction": {
+            "parts": [{"text": system_prompt}]
+        },
+        "contents": [
+            {
+                "parts": [{"text": user_prompt}]
+            }
+        ]
+    });
+    if gemini_accepts_temperature(model) {
+        body["generationConfig"] = json!({ "temperature": 0.1 });
+    }
+    body
 }
 
 pub(crate) fn resolve_gemini_model(model: Option<String>) -> String {
@@ -238,10 +284,26 @@ pub(crate) fn resolve_gemini_model(model: Option<String>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use aether_config::{GeminiThinkingLevel, parse_gemini_thinking_level};
+    use aether_config::{GeminiThinkingLevel, model_id_notice, parse_gemini_thinking_level};
     use aether_core::Secret;
 
-    use super::GeminiProvider;
+    use super::{
+        GEMINI_DEFAULT_MODEL, GeminiProvider, build_summary_body, gemini_accepts_temperature,
+        resolve_gemini_model,
+    };
+
+    /// The default must be a GA id Google still serves: the preview it replaced was shut
+    /// down on 2026-05-25, and every request naming it failed.
+    #[test]
+    fn default_model_is_the_ga_flash_lite_id() {
+        assert_eq!(GEMINI_DEFAULT_MODEL, "gemini-3.1-flash-lite");
+        assert_eq!(resolve_gemini_model(None), "gemini-3.1-flash-lite");
+        assert_eq!(
+            resolve_gemini_model(Some("  ".to_owned())),
+            "gemini-3.1-flash-lite"
+        );
+        assert!(model_id_notice(GEMINI_DEFAULT_MODEL).is_none());
+    }
 
     #[test]
     fn gemini_thinking_level_maps_supported_values() {
@@ -302,5 +364,84 @@ mod tests {
         let body = provider.build_generate_content_body("analyze this");
 
         assert!(body["generationConfig"].get("thinkingConfig").is_none());
+    }
+
+    fn provider(model: &str) -> GeminiProvider {
+        GeminiProvider::new(Secret::new("test-key".to_owned()), model.to_owned(), None)
+    }
+
+    /// Before Gemini 3.5 a request keeps `temperature`; from Gemini 3.6 Flash and 3.5
+    /// Flash-Lite on, Google ignores it now and will reject it later, so it is left out,
+    /// as it is for aliases and ids this can't place.
+    #[test]
+    fn requests_carry_temperature_only_for_models_that_accept_it() {
+        for model in [
+            "gemini-1.5-pro-002",
+            "gemini-2.0-flash",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-2.5-pro",
+            "gemini-3-flash-preview",
+            "gemini-3.1-pro-preview",
+            GEMINI_DEFAULT_MODEL,
+            "models/gemini-3.1-flash-lite",
+        ] {
+            assert!(gemini_accepts_temperature(model), "{model}");
+            let body = provider(model).build_generate_content_body("analyze this");
+            assert_eq!(body["generationConfig"]["temperature"], 0.0, "{model}");
+            assert_eq!(
+                body["generationConfig"]["responseMimeType"], "application/json",
+                "{model}"
+            );
+            let summary = build_summary_body(model, "system", "user");
+            assert_eq!(summary["generationConfig"]["temperature"], 0.1, "{model}");
+        }
+
+        for model in [
+            "gemini-3.5-flash-lite",
+            "gemini-3.5-flash",
+            "gemini-3.6-flash",
+            "gemini-3.8-flash",
+            "gemini-4-argon",
+            "gemini-flash-latest",
+            "gemini-exp-1206",
+            "gemini-3.6.1-flash",
+            "",
+        ] {
+            assert!(!gemini_accepts_temperature(model), "{model}");
+            let body = provider(model).build_generate_content_body("analyze this");
+            assert!(
+                body["generationConfig"].get("temperature").is_none(),
+                "{model}: {body}"
+            );
+            assert_eq!(
+                body["generationConfig"]["responseMimeType"], "application/json",
+                "{model}"
+            );
+            let summary = build_summary_body(model, "system", "user");
+            assert!(
+                summary.get("generationConfig").is_none(),
+                "{model}: {summary}"
+            );
+            assert_eq!(
+                summary["contents"][0]["parts"][0]["text"], "user",
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_config_survives_without_temperature() {
+        let provider = GeminiProvider::new(
+            Secret::new("test-key".to_owned()),
+            "gemini-3.6-flash".to_owned(),
+            Some("high".to_owned()),
+        );
+        let body = provider.build_generate_content_body("analyze this");
+        assert!(body["generationConfig"].get("temperature").is_none());
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "HIGH"
+        );
     }
 }

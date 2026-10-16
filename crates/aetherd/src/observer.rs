@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -49,6 +49,23 @@ pub struct ObserverState {
     /// When the last `seed_from_disk` started reading the workspace (unix seconds; 0
     /// before any). The snapshot cannot speak for a store row written after it.
     seeded_at: i64,
+    /// The same moment in milliseconds, to tell a file written just before the walk from
+    /// one written during or after it.
+    seeded_at_millis: i64,
+    /// HEAD just before that walk: the newest commit the snapshot can speak for. `None`
+    /// when it could not be read.
+    seeded_head: Option<SeededHead>,
+    /// Workspace-relative paths the last `process_path` of each skipped for exceeding the
+    /// parse size limit: not read, so their stored symbols may describe older text.
+    oversized: HashSet<PathBuf>,
+}
+
+/// HEAD as it was before a walk: the commit and what `.git/HEAD` said (a ref, or a commit
+/// when detached). Both are `None` outside git.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeededHead {
+    pub commit: Option<String>,
+    pub git_ref: Option<String>,
 }
 
 impl ObserverState {
@@ -59,12 +76,32 @@ impl ObserverState {
             snapshots: HashMap::new(),
             unread_paths: Vec::new(),
             seeded_at: 0,
+            seeded_at_millis: 0,
+            seeded_head: None,
+            oversized: HashSet::new(),
         })
     }
 
     /// See `ObserverState::seeded_at`.
     pub fn seeded_at(&self) -> i64 {
         self.seeded_at
+    }
+
+    /// See `ObserverState::seeded_at_millis`.
+    pub fn seeded_at_millis(&self) -> i64 {
+        self.seeded_at_millis
+    }
+
+    /// Whether the last `process_path` of `path` skipped it for its size, so it read
+    /// nothing.
+    pub fn skipped_as_oversized(&self, path: &Path) -> bool {
+        self.oversized
+            .contains(&relative_workspace_path(&self.workspace, path))
+    }
+
+    /// See `ObserverState::seeded_head`.
+    pub fn seeded_head(&self) -> Option<&SeededHead> {
+        self.seeded_head.as_ref()
     }
 
     /// See `ObserverState::unread_paths`: what the snapshot is missing because it could
@@ -74,7 +111,17 @@ impl ObserverState {
     }
 
     pub fn seed_from_disk(&mut self) -> Result<()> {
-        self.seeded_at = crate::time::current_unix_timestamp_secs();
+        // Read before the walk: a checkout during it leaves this older than some files read,
+        // so the next HEAD change is diffed from here and covers it.
+        self.seeded_head = match crate::indexer::current_head(&self.workspace) {
+            Ok((commit, git_ref)) => Some(SeededHead { commit, git_ref }),
+            Err(err) => {
+                tracing::warn!(error = %err, "could not read HEAD before the workspace walk");
+                None
+            }
+        };
+        self.seeded_at_millis = crate::time::current_unix_timestamp_millis();
+        self.seeded_at = self.seeded_at_millis.div_euclid(1000);
         self.unread_paths.clear();
         for entry in WalkBuilder::new(&self.workspace)
             .standard_filters(true)
@@ -166,6 +213,8 @@ impl ObserverState {
             return Ok(None);
         };
 
+        // Set again below if this read skips the file; a deleted file was not skipped.
+        self.oversized.remove(&relative);
         let current_symbols = if path.exists() && path.is_file() {
             if let Some(metadata) = match fs::metadata(path) {
                 Ok(metadata) => Some(metadata),
@@ -184,6 +233,7 @@ impl ObserverState {
                         limit = MAX_PARSE_FILE_SIZE,
                         "skipping oversized changed file"
                     );
+                    self.oversized.insert(relative);
                     return Ok(None);
                 }
             }
@@ -230,6 +280,18 @@ impl ObserverState {
         } else {
             Ok(Some(event))
         }
+    }
+
+    /// The symbols last read from `path`, with its workspace-relative path and language;
+    /// `None` when the snapshot holds none for it.
+    pub fn symbols_of(&self, path: &Path) -> Option<(String, Language, &[Symbol])> {
+        let relative = relative_workspace_path(&self.workspace, path);
+        let snapshot = self.snapshots.get(&relative)?;
+        Some((
+            normalize_path(&relative.to_string_lossy()),
+            snapshot.language,
+            snapshot.symbols.as_slice(),
+        ))
     }
 
     pub fn initial_symbol_events(&self) -> Vec<SymbolChangeEvent> {
