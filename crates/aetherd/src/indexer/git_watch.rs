@@ -159,10 +159,7 @@ pub(super) fn process_git_trigger(
                 .git_trigger_changed_files_only
                 || previous_head.sha.is_none()
             {
-                (
-                    collect_full_reindex_paths(config.workspace.as_path(), observer),
-                    true,
-                )
+                collect_full_reindex_paths(config.workspace.as_path(), observer)
             } else if let (Some(old_sha), Some(new_sha)) =
                 (previous_head.sha.as_deref(), current_head.sha.as_deref())
             {
@@ -175,17 +172,11 @@ pub(super) fn process_git_trigger(
                             error = %err,
                             "failed to diff git heads; falling back to full reindex"
                         );
-                        (
-                            collect_full_reindex_paths(config.workspace.as_path(), observer),
-                            true,
-                        )
+                        collect_full_reindex_paths(config.workspace.as_path(), observer)
                     }
                 }
             } else {
-                (
-                    collect_full_reindex_paths(config.workspace.as_path(), observer),
-                    true,
-                )
+                collect_full_reindex_paths(config.workspace.as_path(), observer)
             };
             catches_up = covers_indexed_commit;
             paths.extend(git_paths);
@@ -507,17 +498,30 @@ pub(super) fn normalize_git_rename_path(path: &str) -> String {
     value.to_owned()
 }
 
+/// Every path a full reindex reads: those the observer tracks and every source file on
+/// disk. The flag says whether the walk read the whole workspace; a path it couldn't read
+/// is logged and left out, so a reindex of the rest doesn't cover the workspace.
 pub(super) fn collect_full_reindex_paths(
     workspace: &Path,
     observer: &ObserverState,
-) -> Vec<PathBuf> {
+) -> (Vec<PathBuf>, bool) {
     let mut paths = observer
         .tracked_paths()
         .into_iter()
         .collect::<BTreeSet<_>>();
+    let mut complete = true;
     for entry in WalkBuilder::new(workspace).standard_filters(true).build() {
-        let Ok(entry) = entry else {
-            continue;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                complete = false;
+                tracing::warn!(
+                    workspace = %workspace.display(),
+                    error = %err,
+                    "full reindex could not read a path; it is left out"
+                );
+                continue;
+            }
         };
         if !entry
             .file_type()
@@ -531,7 +535,7 @@ pub(super) fn collect_full_reindex_paths(
         }
         paths.insert(entry.path().to_path_buf());
     }
-    paths.into_iter().collect()
+    (paths.into_iter().collect(), complete)
 }
 
 #[cfg(test)]
@@ -745,6 +749,8 @@ mod tests {
     /// The watcher's state for one git workspace: indexed on `main`, while a `feature`
     /// branch adds `pkg/added.py`. Returns the two commits.
     struct WatchedRepo {
+        /// Held as the daemon that runs these triggers holds it.
+        _watcher_lock: crate::freshness::WatcherLock,
         config: IndexerConfig,
         runtime: WatcherRuntimeConfig,
         observer: ObserverState,
@@ -796,6 +802,8 @@ mod tests {
             let mut observer = ObserverState::new(workspace.to_path_buf()).expect("observer");
             observer.seed_from_disk().expect("seed observer");
             Self {
+                _watcher_lock: crate::freshness::take_watcher_lock(workspace)
+                    .expect("watcher lock"),
                 runtime,
                 observer,
                 structural: StructuralIndexer::new(workspace.to_path_buf())
@@ -932,5 +940,37 @@ mod tests {
                 .contains(&"A pkg/added.py".to_owned()),
             "{freshness:?}"
         );
+    }
+
+    /// A full reindex whose walk can't read part of the workspace hasn't covered it, so the
+    /// marker must keep its commit even though every path it did read succeeded.
+    #[cfg(unix)]
+    #[test]
+    fn a_full_reindex_that_could_not_walk_everything_leaves_the_marker_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let mut repo = WatchedRepo::new(workspace, "git_trigger_changed_files_only = false");
+        let before = crate::freshness::read_index_sync_marker(workspace);
+        let locked = workspace.join("pkg/locked");
+        fs::create_dir_all(&locked).expect("create locked dir");
+        fs::write(locked.join("hidden.py"), "def hidden():\n    return 0\n").expect("write");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("lock dir");
+        if fs::read_dir(&locked).is_ok() {
+            // Running as root: permissions can't make the walk fail here.
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("unlock");
+            return;
+        }
+
+        run_git(workspace, &["checkout", "-q", "feature"]);
+        repo.fire_git_trigger();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("unlock dir");
+
+        assert!(
+            repo.indexes("pkg/added.py"),
+            "the readable paths were reindexed"
+        );
+        assert_eq!(crate::freshness::read_index_sync_marker(workspace), before);
     }
 }

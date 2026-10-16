@@ -252,7 +252,14 @@ pub fn assess_index_freshness(workspace: &Path, store: &SqliteStore) -> Result<I
     let mut sirs_in_changed_files = 0u64;
     for file in &indexed {
         match file_time(&workspace.join(&file.file_path)) {
-            FileTime::Modified(mtime) if mtime > file.last_indexed_at => {
+            FileTime::Modified(mtime_ms)
+                if modified_since_read(
+                    mtime_ms,
+                    file.last_indexed_at,
+                    &marker,
+                    watcher_running,
+                ) =>
+            {
                 modified.push(file.file_path.clone());
                 sirs_in_changed_files += file.symbols_with_sir;
             }
@@ -336,7 +343,7 @@ pub fn assess_index_freshness(workspace: &Path, store: &SqliteStore) -> Result<I
 }
 
 enum FileTime {
-    /// Last modified at these unix seconds.
+    /// Last modified at these unix milliseconds.
     Modified(i64),
     Missing,
     /// It exists, but its modification time can't be read.
@@ -345,16 +352,35 @@ enum FileTime {
 
 fn file_time(path: &Path) -> FileTime {
     match fs::metadata(path) {
-        Ok(metadata) => metadata_mtime(&metadata).map_or(FileTime::Unreadable, FileTime::Modified),
+        Ok(metadata) => {
+            metadata_mtime_millis(&metadata).map_or(FileTime::Unreadable, FileTime::Modified)
+        }
         Err(err) if err.kind() == ErrorKind::NotFound => FileTime::Missing,
         Err(_) => FileTime::Unreadable,
     }
 }
 
-fn metadata_mtime(metadata: &fs::Metadata) -> Option<i64> {
-    let modified = metadata.modified().ok()?;
-    let secs = modified.duration_since(UNIX_EPOCH).ok()?.as_secs();
-    i64::try_from(secs).ok()
+/// Whether a file last modified at `mtime_ms` changed after the indexer last read it,
+/// somewhere within the second `read_at` (symbols record whole seconds). A later second
+/// is a change. Within that same second the order is unknown. The write came first only
+/// if it predates the walk of the full sync the read belongs to, or a later one. Any
+/// other same-second write counts as a change, unless a daemon is watching: it reads a
+/// file only once its writes settle, and rereads it after any later write.
+fn modified_since_read(
+    mtime_ms: i64,
+    read_at: i64,
+    marker: &IndexSyncMarker,
+    watcher_running: bool,
+) -> bool {
+    let mtime_secs = mtime_ms.div_euclid(1000);
+    if mtime_secs != read_at {
+        return mtime_secs > read_at;
+    }
+    let before_walk = matches!(
+        (marker.full_sync_at, marker.full_sync_at_ms),
+        (Some(walk_secs), Some(walk_ms)) if walk_secs <= read_at && mtime_ms <= walk_ms
+    );
+    !before_walk && !watcher_running
 }
 
 fn metadata_mtime_millis(metadata: &fs::Metadata) -> Option<i64> {
@@ -517,10 +543,14 @@ pub fn symbol_freshness_note(
     use aether_store::SirStateStore;
 
     let now = crate::time::current_unix_timestamp_secs();
+    let marker = read_index_sync_marker(workspace);
+    let watching = watcher_running(workspace);
     let indexed = describe_time(record.last_seen_at, now);
     let file = match file_time(&workspace.join(&record.file_path)) {
         FileTime::Missing => format!("file missing from the workspace (indexed {indexed})"),
-        FileTime::Modified(mtime) if mtime > record.last_seen_at => {
+        FileTime::Modified(mtime_ms)
+            if modified_since_read(mtime_ms, record.last_seen_at, &marker, watching) =>
+        {
             format!("file modified after it was indexed ({indexed})")
         }
         FileTime::Modified(_) => format!("file unchanged since indexed {indexed}"),
@@ -553,7 +583,6 @@ pub fn symbol_freshness_note(
         (Err(err), _) | (_, Err(err)) => format!("SIR state unreadable: {err}"),
     };
 
-    let marker = read_index_sync_marker(workspace);
     let index = match (marker.head.as_deref(), workspace_head(workspace).as_deref()) {
         (Some(indexed), Some(current)) if indexed.eq_ignore_ascii_case(current) => {
             format!("index at workspace HEAD {}", short_sha(current))
@@ -570,7 +599,7 @@ pub fn symbol_freshness_note(
         (Some(indexed), None) => format!("index at HEAD {}", short_sha(indexed)),
         (None, None) => "no git HEAD".to_owned(),
     };
-    let daemon = if watcher_running(workspace) {
+    let daemon = if watching {
         "daemon watching"
     } else {
         "no daemon watching"
@@ -869,6 +898,61 @@ mod tests {
             !running
         });
         assert!(released, "the lock outlived its holder");
+    }
+
+    fn set_modified_millis(path: &Path, millis: i64) {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_millis(millis as u64);
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_modified(at))
+            .expect("set modified time");
+    }
+
+    /// Symbols record whole seconds, so an edit in the second its file was indexed is
+    /// ambiguous. Only a write that predates the full sync's walk is known to be read; any
+    /// other counts as a change unless a daemon watches.
+    #[test]
+    fn an_edit_in_the_second_its_file_was_indexed_still_reads_as_modified() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_workspace(workspace);
+        index_once(workspace);
+        let store = SqliteStore::open(workspace).expect("open store");
+        let record = store
+            .list_symbols_for_file("pkg/a.py")
+            .expect("list symbols")
+            .into_iter()
+            .next()
+            .expect("alpha");
+        let walk_ms = read_index_sync_marker(workspace)
+            .full_sync_at_ms
+            .expect("walk start");
+        let path = workspace.join("pkg/a.py");
+        let modified = || {
+            assess_index_freshness(workspace, &store)
+                .expect("assess")
+                .modified_files
+        };
+
+        // Written before the walk started: the sync read it.
+        set_modified_millis(&path, walk_ms - 1);
+        assert_eq!(modified(), 0);
+
+        // Written at the end of the second the file was indexed, after the walk began.
+        set_modified_millis(&path, record.last_seen_at * 1000 + 999);
+        assert_eq!(modified(), 1);
+        let note = symbol_freshness_note(workspace, &store, &record);
+        assert!(
+            note.starts_with("Freshness: file modified after it was indexed ("),
+            "{note}"
+        );
+
+        // A watching daemon rereads a file after its writes settle.
+        let _lock = WatcherLock::acquire(workspace)
+            .expect("lock")
+            .expect("free");
+        assert_eq!(modified(), 0);
     }
 
     #[test]
