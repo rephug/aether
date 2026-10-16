@@ -103,21 +103,40 @@ pub(crate) fn search_modes_line(context: &TemplateContext) -> String {
 /// What the generated files make mandatory: only steps every installation can carry out,
 /// and no tool call that writes to the store every session shares, so a session meant to
 /// be read-only can follow them. With nothing mandatory, one line says so.
+/// How the generated files tell an agent to verify its changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerificationStep {
+    /// Through `aether_verify`, which runs the configured verify commands.
+    Tool,
+    /// By running the configured verify commands directly.
+    Commands,
+    /// No verify commands are configured, so there is nothing to run: `aether_verify`
+    /// itself refuses an empty `[verify] commands` list.
+    None,
+}
+
+pub(crate) fn verification_step(context: &TemplateContext) -> VerificationStep {
+    if context.verify_commands.is_empty() {
+        VerificationStep::None
+    } else if context.verification_tool {
+        VerificationStep::Tool
+    } else {
+        VerificationStep::Commands
+    }
+}
+
 pub(crate) fn required_actions(context: &TemplateContext) -> Vec<String> {
-    let mut actions = Vec::new();
-    if context.verification_tool {
-        actions.push("Always call `aether_verify` after modifying code.".to_owned());
-        actions.push("If `aether_verify` fails, fix the issue before proceeding.".to_owned());
-    } else if !context.verify_commands.is_empty() {
-        actions.push(
+    match verification_step(context) {
+        VerificationStep::Tool => vec![
+            "Always call `aether_verify` after modifying code.".to_owned(),
+            "If `aether_verify` fails, fix the issue before proceeding.".to_owned(),
+        ],
+        VerificationStep::Commands => vec![
             "After modifying code, run the verify commands listed below and fix failures before proceeding."
                 .to_owned(),
-        );
+        ],
+        VerificationStep::None => vec![NOTHING_REQUIRED.to_owned()],
     }
-    if actions.is_empty() {
-        actions.push(NOTHING_REQUIRED.to_owned());
-    }
-    actions
 }
 
 /// The required-actions line when no verification step applies.
@@ -277,6 +296,46 @@ mod tests {
             ClaudeTemplate::render(&bare)
                 .contains("## Required Actions (mandatory)\n- None: every AETHER tool call")
         );
+    }
+
+    /// With no verify commands there is nothing to run, with or without `aether_verify`
+    /// (which refuses an empty list), so no generated file asks for a verification step.
+    #[test]
+    fn no_verify_commands_means_no_verification_step() {
+        for verification_tool in [false, true] {
+            let context = TemplateContext {
+                verify_commands: Vec::new(),
+                verification_tool,
+                ..sample_context()
+            };
+            assert_eq!(required_actions(&context), [NOTHING_REQUIRED]);
+
+            let skill = SkillTemplate::render(&context);
+            assert!(
+                skill.contains("No verify commands are configured"),
+                "{skill}"
+            );
+            for absent in [
+                "Run the project's verify commands",
+                "Run `aether_verify`",
+                "Do not skip verification",
+            ] {
+                assert!(!skill.contains(absent), "{absent}: {skill}");
+            }
+            for rendered in [
+                ClaudeTemplate::render(&context),
+                CodexInstructionsTemplate::render(&context),
+                CursorRulesTemplate::render(&context),
+            ] {
+                assert!(!rendered.contains("aether_verify`"), "{rendered}");
+                assert!(!rendered.contains("run the verify commands"), "{rendered}");
+            }
+        }
+
+        // With commands, the step comes back, through the tool when the build has it.
+        let skill = SkillTemplate::render(&sample_context());
+        assert!(skill.contains("- Run the project's verify commands before completing the task:\n- `cargo fmt --all --check`"));
+        assert!(skill.contains("- Do not skip verification on modified code paths."));
     }
 
     #[test]
