@@ -12,7 +12,7 @@ use crate::sir_parsing::parse_and_validate_sir;
 use crate::sir_prompt;
 use crate::types::{InferError, InferSirResult, InferenceProvider, SirContext, normalize_optional};
 
-pub(crate) const GEMINI_DEFAULT_MODEL: &str = "gemini-3.1-flash-lite-preview";
+pub(crate) const GEMINI_DEFAULT_MODEL: &str = "gemini-3.1-flash-lite";
 
 #[derive(Debug, Clone)]
 pub struct GeminiProvider {
@@ -238,10 +238,23 @@ pub(crate) fn resolve_gemini_model(model: Option<String>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use aether_config::{GeminiThinkingLevel, parse_gemini_thinking_level};
+    use aether_config::{GeminiThinkingLevel, model_id_notice, parse_gemini_thinking_level};
     use aether_core::Secret;
 
-    use super::GeminiProvider;
+    use super::{GEMINI_DEFAULT_MODEL, GeminiProvider, resolve_gemini_model};
+
+    /// The default must be a GA id Google still serves: the preview it replaced was shut
+    /// down on 2026-05-25, and every request naming it failed.
+    #[test]
+    fn default_model_is_the_ga_flash_lite_id() {
+        assert_eq!(GEMINI_DEFAULT_MODEL, "gemini-3.1-flash-lite");
+        assert_eq!(resolve_gemini_model(None), "gemini-3.1-flash-lite");
+        assert_eq!(
+            resolve_gemini_model(Some("  ".to_owned())),
+            "gemini-3.1-flash-lite"
+        );
+        assert!(model_id_notice(GEMINI_DEFAULT_MODEL).is_none());
+    }
 
     #[test]
     fn gemini_thinking_level_maps_supported_values() {

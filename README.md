@@ -530,7 +530,7 @@ The Gemini Batch API costs half as much as real-time API calls. AETHER generates
 
 ```bash
 # Generate JSONL for scan pass
-aetherd --workspace . batch build --pass scan --model gemini-3.1-flash-lite-preview
+aetherd --workspace . batch build --pass scan --model gemini-3.1-flash-lite
 
 # Full pipeline: extract → build → submit → poll → ingest for all three passes
 aetherd --workspace . batch run --passes scan,triage,deep
@@ -819,7 +819,7 @@ Everything lives in `.aether/config.toml`, auto-created on first run. Or use the
 ```toml
 [inference]
 provider = "gemini"
-model = "gemini-3.1-flash-lite-preview"
+model = "gemini-3.1-flash-lite"
 api_key_env = "GEMINI_API_KEY"
 concurrency = 12
 
@@ -832,8 +832,8 @@ vector_backend = "lancedb"
 
 [batch]
 provider = "gemini"               # gemini | openai | anthropic | auto (follow the omp route in [inference].model)
-scan_model = "gemini-3.1-flash-lite-preview"
-triage_model = "gemini-3.1-flash-lite-preview"
+scan_model = "gemini-3.1-flash-lite"
+triage_model = "gemini-3.1-flash-lite"
 deep_model = "gemini-3.1-pro"
 scan_thinking = "low"
 triage_thinking = "medium"

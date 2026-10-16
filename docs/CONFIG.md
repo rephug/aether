@@ -28,7 +28,7 @@ concurrency = 2
   - `mock`: no model at all. Every symbol gets a `[MOCK]` placeholder SIR at confidence 0.1 from tree-sitter facts, so `aether_audit_candidates` ranks it first for `/scan` (zero-key onboarding, Decision #121).
 - `model`
   - Optional provider-specific override.
-  - Gemini default: `gemini-3.1-flash-lite-preview`
+  - Gemini default: `gemini-3.1-flash-lite`
 - `endpoint`
   - Optional provider-specific endpoint override.
   - `qwen3_local` default: `http://127.0.0.1:11434`
@@ -43,7 +43,7 @@ concurrency = 2
 - `concurrency`
   - Default config value is `2`.
   - When `provider = "gemini"` and concurrency is left at the default value, AETHER normalizes it to `16`.
-  - For `gemini-3.1-flash-lite-preview`, `concurrency = 16` is safe under the 4000 RPM limit.
+  - For `gemini-3.1-flash-lite`, `concurrency = 16` is safe under the 4000 RPM limit.
   - For local Ollama on consumer hardware, `concurrency = 2` is appropriate.
 - `timeout_secs`
   - How long one SIR generation attempt may take during scans and watcher updates before it is abandoned (each symbol gets three attempts). Unset means 90 seconds.
@@ -161,7 +161,7 @@ too.
 # Pass 2 — triage: enriched context, self-improvement, all or filtered symbols
 triage_pass = true
 triage_provider = "gemini"
-triage_model = "gemini-3.1-flash-lite-preview"
+triage_model = "gemini-3.1-flash-lite"
 triage_api_key_env = "GEMINI_API_KEY"
 triage_priority_threshold = 0.0
 triage_confidence_threshold = 1.0
@@ -228,6 +228,7 @@ vector_backend = "lancedb" # lancedb | sqlite
 - `enabled = false` keeps search lexical-only.
 - `provider = "qwen3_local"` uses a local HTTP embedding endpoint.
 - `provider = "candle"` uses the bundled local model path under `[embeddings.candle]`.
+- `provider = "gemini_native"` calls Gemini's embedding API. Its preview id `gemini-embedding-2-preview` is deprecated in favour of the GA `gemini-embedding-2`. AETHER warns at startup (`model_id_deprecated`) but keeps using the configured id, because switching models re-embeds every symbol.
 
 ## Environment Variables
 
@@ -255,6 +256,7 @@ Override precedence is CLI > config file > built-in defaults.
 
 ## Validation and Normalization
 
+- A model id that its provider has shut down or deprecated gets a startup warning (`model_id_shut_down` or `model_id_deprecated`) naming the setting and the replacement id. Requests still use the configured id.
 - Optional strings are trimmed and empty strings are discarded.
 - Probability thresholds are clamped into valid ranges.
 - `triage_timeout_secs` and `deep_timeout_secs` default to `180`.

@@ -3,6 +3,7 @@ use crate::{
     constants::{DEFAULT_COHERE_API_KEY_ENV, DEFAULT_GEMINI_API_KEY_ENV},
     embeddings::EmbeddingProviderKind,
     inference::{InferenceProviderKind, TieredConfig},
+    model_ids::{ModelIdStatus, configured_model_ids, model_id_notice},
     omp::{batch_pricing_providers_list, batch_target_for_omp_route, split_omp_route},
     root::AetherConfig,
     search::SearchRerankerKind,
@@ -404,6 +405,23 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
         });
     }
 
+    for (setting, model) in configured_model_ids(config) {
+        let Some(notice) = model_id_notice(&model) else {
+            continue;
+        };
+        let (code, state) = match notice.status {
+            ModelIdStatus::ShutDown => ("model_id_shut_down", "is shut down"),
+            ModelIdStatus::Deprecated => ("model_id_deprecated", "is deprecated"),
+        };
+        warnings.push(ConfigWarning {
+            code,
+            message: format!(
+                "{setting}='{model}' {state}: {}; use '{}'",
+                notice.detail, notice.replacement
+            ),
+        });
+    }
+
     if let Some(continuous) = &config.continuous {
         let schedule = continuous.schedule.trim().to_ascii_lowercase();
         if !matches!(schedule.as_str(), "hourly" | "nightly") {
@@ -708,6 +726,49 @@ task_type = "RETRIEVAL_DOCUMENT"
         let codes = warning_codes(&validate_config(&config));
         assert!(codes.contains(&"embeddings_endpoint_unused_for_gemini_native"));
         assert!(codes.contains(&"embeddings_task_type_unused_for_gemini_native"));
+    }
+
+    #[test]
+    fn validate_config_names_shut_down_and_deprecated_model_ids() {
+        let config = parse_workspace_config_str(
+            r#"
+[inference]
+provider = "gemini"
+model = "gemini-3.1-flash-lite-preview"
+
+[sir_quality]
+triage_model = "gemini-3.1-flash-lite"
+
+[embeddings]
+enabled = true
+provider = "gemini_native"
+model = "gemini-embedding-2-preview"
+"#,
+        )
+        .expect("parse config");
+
+        let warnings = validate_config(&config);
+        let shut_down = warnings
+            .iter()
+            .filter(|warning| warning.code == "model_id_shut_down")
+            .collect::<Vec<_>>();
+        assert_eq!(shut_down.len(), 1, "{warnings:?}");
+        assert!(
+            shut_down[0]
+                .message
+                .starts_with("inference.model='gemini-3.1-flash-lite-preview' is shut down")
+        );
+        assert!(
+            shut_down[0]
+                .message
+                .ends_with("use 'gemini-3.1-flash-lite'")
+        );
+        let deprecated = warnings
+            .iter()
+            .filter(|warning| warning.code == "model_id_deprecated")
+            .collect::<Vec<_>>();
+        assert_eq!(deprecated.len(), 1, "{warnings:?}");
+        assert!(deprecated[0].message.contains("use 'gemini-embedding-2'"));
     }
 
     #[test]
