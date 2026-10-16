@@ -787,6 +787,7 @@ mod tests {
         )
         .expect("write b");
         let config = mock_config(workspace);
+        crate::freshness::let_writes_settle();
         run_initial_index_once(&config).expect("index once");
 
         // Held as the daemon that runs the debounce path holds it.
@@ -830,6 +831,8 @@ mod tests {
         );
         assert_eq!(before.modified_files, 2, "{before:?}");
 
+        // The watcher's debounce lets writes settle before it reads.
+        crate::freshness::let_writes_settle();
         process_debounced_paths(
             &config,
             &mut observer,
@@ -959,6 +962,7 @@ mod tests {
             assert!(!workspace.join("pkg/added.py").exists());
 
             let config = mock_config(workspace);
+            crate::freshness::let_writes_settle();
             run_initial_index_once(&config).expect("index once on main");
             // The daemon's state from before the branch switch.
             let runtime = WatcherRuntimeConfig::from_workspace(&config).expect("watcher runtime");
@@ -982,6 +986,8 @@ mod tests {
         /// What the loop does once a git event settles. No file event is passed along, as
         /// when the new file lands in a directory the watcher doesn't see.
         fn fire_git_trigger(&mut self) {
+            // The loop fires only once the git event settles.
+            crate::freshness::let_writes_settle();
             let workspace = self.config.workspace.clone();
             process_git_trigger(
                 &self.config,
@@ -1157,6 +1163,7 @@ mod tests {
         )
         .expect("write a");
         let config = mock_config(workspace);
+        crate::freshness::let_writes_settle();
         run_initial_index_once(&config).expect("index once");
         let _watcher_lock = crate::freshness::take_watcher_lock(workspace).expect("watcher lock");
         let mut observer = ObserverState::new(workspace.to_path_buf()).expect("observer");
@@ -1179,6 +1186,8 @@ mod tests {
             "{before:?}"
         );
 
+        // The watcher's debounce lets writes settle before it reads.
+        crate::freshness::let_writes_settle();
         process_debounced_paths(
             &config,
             &mut observer,

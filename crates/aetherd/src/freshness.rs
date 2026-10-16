@@ -320,9 +320,11 @@ pub fn assess_index_freshness(workspace: &Path, store: &SqliteStore) -> Result<I
             walk.files
                 .into_iter()
                 .filter(|(path, mtime)| {
-                    *mtime > reference
+                    written_after(*mtime, reference)
                         && !indexed_paths.contains(path.as_str())
-                        && reads.get(path).is_none_or(|read_at_ms| mtime > read_at_ms)
+                        && reads
+                            .get(path)
+                            .is_none_or(|read_at_ms| written_after(*mtime, *read_at_ms))
                 })
                 .map(|(path, _)| path)
                 .collect::<Vec<_>>()
@@ -421,15 +423,40 @@ fn file_time(path: &Path) -> FileTime {
     }
 }
 
+/// How much earlier than the moment of a write its modification time can read. Linux
+/// stamps writes from a coarse clock that runs up to a tick (1 ms at HZ=1000, 10 ms at
+/// HZ=100) behind the fine clock the indexer takes its read times from: on a 6.8 kernel
+/// at HZ=1000, 1,999 of 2,000 writes read up to 1.3 ms earlier than a clock reading taken
+/// before them. The margin is twice the slowest common tick.
+const FILE_CLOCK_MARGIN_MS: i64 = 20;
+
+/// Whether a write whose modification time reads `mtime_ms` may have come after `at_ms`,
+/// a moment read from the system clock: an equal time, or one up to the clock margin
+/// earlier, may still be a later write.
+fn written_after(mtime_ms: i64, at_ms: i64) -> bool {
+    mtime_ms >= at_ms.saturating_sub(FILE_CLOCK_MARGIN_MS)
+}
+
+/// Waits long enough after writing files that a read starting now is unambiguously later
+/// than those writes, as the watcher's debounce (300 ms by default) guarantees in use.
+/// Tests that write a file and expect the next read to see it unchanged call this first.
+#[cfg(test)]
+pub(crate) fn let_writes_settle() {
+    std::thread::sleep(std::time::Duration::from_millis(
+        (FILE_CLOCK_MARGIN_MS * 2 + 10) as u64,
+    ));
+}
+
 /// Whether a file last modified at `mtime_ms` changed after the indexer last read it.
 /// With its recorded read start (`read_at_ms`: the walk start for a full sync, the moment
-/// before the read for a reindex), any later write is a change, including one made while
-/// a long walk was still running. A file read only by a binary that didn't record that
-/// time has `last_seen_at`, whole seconds written after the read, so a write in that same
-/// second may have come after the read and counts as a change too.
+/// before the read for a reindex), any write that may be later ([`written_after`]) is a
+/// change, including one made while a long walk was still running. A file read only by a
+/// binary that didn't record that time has `last_seen_at`, whole seconds written after the
+/// read, so a write in that same second may have come after the read and counts as a
+/// change too.
 fn modified_since_read(mtime_ms: i64, read_at_ms: Option<i64>, last_seen_at: i64) -> bool {
     match read_at_ms {
-        Some(read_at_ms) => mtime_ms > read_at_ms,
+        Some(read_at_ms) => written_after(mtime_ms, read_at_ms),
         None => mtime_ms.div_euclid(1000) >= last_seen_at,
     }
 }
@@ -787,6 +814,7 @@ mod tests {
     }
 
     fn index_once(workspace: &Path) {
+        super::let_writes_settle();
         run_initial_index_once(&IndexerConfig {
             workspace: workspace.to_path_buf(),
             debounce_ms: 300,
@@ -1077,9 +1105,16 @@ mod tests {
                 .modified_files
         };
 
-        // Written before the walk started: the sync read it.
-        set_modified_millis(&path, walk_ms - 1);
+        // Written well before the walk started: the sync read it.
+        set_modified_millis(&path, walk_ms - 1_000);
         assert_eq!(modified(), 0);
+
+        // A write stamped at the read start's own millisecond, or a little before it, may
+        // still have come after: file times come from a coarser clock.
+        set_modified_millis(&path, walk_ms);
+        assert_eq!(modified(), 1);
+        set_modified_millis(&path, walk_ms - 5);
+        assert_eq!(modified(), 1);
 
         // Written just after the walk started, in the second the file was indexed.
         set_modified_millis(&path, record.last_seen_at * 1000 + 999);

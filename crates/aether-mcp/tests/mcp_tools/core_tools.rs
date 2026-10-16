@@ -637,6 +637,9 @@ vector_backend = "sqlite"
         "fn alpha() -> i32 { 1 }\nfn beta() -> i32 { 2 }\n",
     )?;
     fs::write(workspace.join("src/other.rs"), "fn gamma() -> i32 { 3 }\n")?;
+    // File times come from a clock up to a tick behind the indexer's, so let the writes
+    // settle before the index reads them, as the watcher's debounce does in use.
+    std::thread::sleep(std::time::Duration::from_millis(50));
     run_index_and_seed_sir(workspace)?;
 
     let server = AetherMcpServer::new(workspace, false)?;
