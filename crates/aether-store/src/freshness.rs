@@ -15,6 +15,9 @@ pub struct IndexedFileRecord {
     pub symbol_count: u64,
     /// Symbols of the file with a non-empty SIR.
     pub symbols_with_sir: u64,
+    /// When the indexer last started reading the file (unix milliseconds), if a binary
+    /// that records it did.
+    pub read_at_ms: Option<i64>,
 }
 
 /// Counts of SIR rows by freshness. Leaves are the SIRs of indexed symbols; the other
@@ -47,25 +50,33 @@ impl SqliteStore {
     /// Every file with indexed symbols, ordered by path.
     pub fn list_indexed_files(&self) -> Result<Vec<IndexedFileRecord>, StoreError> {
         let conn = self.lock_connection()?;
-        let mut stmt = conn.prepare(
+        // A store opened read-only is not migrated, so the table may predate this binary.
+        let read_at = if file_reads_table_exists(&conn)? {
+            "(SELECT fr.read_at_ms FROM file_reads fr WHERE fr.file_path = s.file_path)"
+        } else {
+            "NULL"
+        };
+        let mut stmt = conn.prepare(&format!(
             r#"
             SELECT
                 s.file_path,
                 MAX(s.last_seen_at),
                 COUNT(*),
-                SUM(CASE WHEN COALESCE(TRIM(r.sir_json), '') <> '' THEN 1 ELSE 0 END)
+                SUM(CASE WHEN COALESCE(TRIM(r.sir_json), '') <> '' THEN 1 ELSE 0 END),
+                {read_at}
             FROM symbols s
             LEFT JOIN sir r ON r.id = s.id
             GROUP BY s.file_path
             ORDER BY s.file_path ASC
-            "#,
-        )?;
+            "#
+        ))?;
         let rows = stmt.query_map([], |row| {
             Ok(IndexedFileRecord {
                 file_path: row.get(0)?,
                 last_indexed_at: row.get(1)?,
                 symbol_count: row.get::<_, i64>(2)?.max(0) as u64,
                 symbols_with_sir: row.get::<_, Option<i64>>(3)?.unwrap_or(0).max(0) as u64,
+                read_at_ms: row.get(4)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -98,6 +109,49 @@ impl SqliteStore {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Records that the indexer started reading each of `file_paths` at `read_at_ms` (unix
+    /// milliseconds), replacing any earlier time.
+    pub fn record_file_reads(
+        &self,
+        file_paths: &[String],
+        read_at_ms: i64,
+    ) -> Result<(), StoreError> {
+        if file_paths.is_empty() {
+            return Ok(());
+        }
+        let conn = self.lock_connection()?;
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        {
+            let mut upsert = tx.prepare(
+                r#"
+                INSERT INTO file_reads (file_path, read_at_ms)
+                VALUES (?1, ?2)
+                ON CONFLICT(file_path) DO UPDATE SET read_at_ms = excluded.read_at_ms
+                "#,
+            )?;
+            for file_path in file_paths {
+                upsert.execute(params![file_path, read_at_ms])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// When the indexer last started reading `file_path` (unix milliseconds), if recorded.
+    pub fn file_read_at_ms(&self, file_path: &str) -> Result<Option<i64>, StoreError> {
+        let conn = self.lock_connection()?;
+        if !file_reads_table_exists(&conn)? {
+            return Ok(None);
+        }
+        conn.query_row(
+            "SELECT read_at_ms FROM file_reads WHERE file_path = ?1",
+            params![file_path],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     pub fn sir_freshness_counts(&self) -> Result<SirFreshnessCounts, StoreError> {
@@ -151,13 +205,24 @@ impl SqliteStore {
     }
 }
 
+fn file_reads_table_exists(conn: &Connection) -> Result<bool, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'file_reads'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use tempfile::tempdir;
 
-    use crate::{SqliteStore, StoreError};
+    use crate::{SqliteStore, StoreError, SymbolCatalogStore, SymbolRecord};
 
     /// A panic while another operation holds the connection must not turn every later
     /// status read into a panic too.
@@ -195,5 +260,82 @@ mod tests {
             store.call_edge_coverage_for_sources(&["caller".to_owned()]),
             Err(StoreError::LockPoisoned(_))
         ));
+        assert!(matches!(
+            store.record_file_reads(&["src/lib.rs".to_owned()], 1),
+            Err(StoreError::LockPoisoned(_))
+        ));
+        assert!(matches!(
+            store.file_read_at_ms("src/lib.rs"),
+            Err(StoreError::LockPoisoned(_))
+        ));
+    }
+
+    #[test]
+    fn file_read_times_are_recorded_listed_and_replaced() {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        store
+            .upsert_symbol(SymbolRecord {
+                id: "alpha".to_owned(),
+                file_path: "src/lib.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "alpha".to_owned(),
+                signature_fingerprint: "sig".to_owned(),
+                last_seen_at: 7,
+            })
+            .expect("upsert symbol");
+        let listed = || {
+            store
+                .list_indexed_files()
+                .expect("list indexed files")
+                .into_iter()
+                .map(|file| file.read_at_ms)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(listed(), [None]);
+
+        store
+            .record_file_reads(&["src/lib.rs".to_owned()], 7_250)
+            .expect("record read");
+        assert_eq!(listed(), [Some(7_250)]);
+        store
+            .record_file_reads(&["src/lib.rs".to_owned()], 9_000)
+            .expect("record a later read");
+        assert_eq!(
+            store.file_read_at_ms("src/lib.rs").expect("read"),
+            Some(9_000)
+        );
+        assert_eq!(store.file_read_at_ms("src/other.rs").expect("read"), None);
+    }
+
+    /// A store last migrated by a binary that predates `file_reads` and opened read-only
+    /// (so not migrated now) still lists its files, without read times.
+    #[test]
+    fn a_store_without_the_file_reads_table_lists_files_without_read_times() {
+        let temp = tempdir().expect("tempdir");
+        {
+            let store = SqliteStore::open(temp.path()).expect("open store");
+            store
+                .upsert_symbol(SymbolRecord {
+                    id: "alpha".to_owned(),
+                    file_path: "src/lib.rs".to_owned(),
+                    language: "rust".to_owned(),
+                    kind: "function".to_owned(),
+                    qualified_name: "alpha".to_owned(),
+                    signature_fingerprint: "sig".to_owned(),
+                    last_seen_at: 7,
+                })
+                .expect("upsert symbol");
+        }
+        rusqlite::Connection::open(temp.path().join(".aether/meta.sqlite"))
+            .and_then(|conn| conn.execute("DROP TABLE file_reads", []))
+            .expect("drop table");
+
+        let store = SqliteStore::open_readonly(temp.path()).expect("open read-only");
+        let files = store.list_indexed_files().expect("list indexed files");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].read_at_ms, None);
+        assert_eq!(store.file_read_at_ms("src/lib.rs").expect("read"), None);
     }
 }

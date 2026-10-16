@@ -266,6 +266,8 @@ fn process_reindex_path(
     queue_state: &SharedQueueState,
     path: &Path,
 ) -> Result<()> {
+    // Taken before the read, so an edit landing while the file is read counts as newer.
+    let read_started_ms = crate::time::current_unix_timestamp_millis();
     let read = match observer.process_path(path) {
         Ok(Some(event)) => {
             if config.print_events {
@@ -337,6 +339,17 @@ fn process_reindex_path(
             .with_context(|| format!("failed to record reading {}", path.display()))?;
     }
 
+    if path.is_file() && language_for_path(path).is_some() {
+        let file_path =
+            normalize_path(&relative_workspace_path(&config.workspace, path).to_string_lossy());
+        if let Err(err) = store.record_file_reads(&[file_path], read_started_ms) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "failed to record when the file was read"
+            );
+        }
+    }
     Ok(())
 }
 

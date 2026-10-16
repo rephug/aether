@@ -161,6 +161,18 @@ where
         Err(err) => tracing::warn!(error = %err, "failed to read HEAD for the watcher"),
     }
 
+    // Every file the snapshot read was read at some moment after its walk started; that
+    // moment is the latest an edit can have reached it, so a later edit reads as a change.
+    let read_files = symbols_by_id
+        .values()
+        .map(|symbol| symbol.file_path.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if let Err(err) = store.record_file_reads(&read_files, scope.taken_at_millis) {
+        tracing::warn!(error = %err, "failed to record when the snapshot read its files");
+    }
+
     // Freshness may count this snapshot as a full sync only when it read every path: a
     // marker that claimed one it couldn't read would hide that path's changes. Without a
     // new marker, status keeps the previous commit and time, so it errs toward stale.

@@ -122,7 +122,8 @@ pub struct WatcherLock {
 }
 
 impl WatcherLock {
-    /// `None` when another process already holds the lock.
+    /// `None` when another process already holds the lock. Any other failure to lock (a
+    /// filesystem without advisory locks, say) is an error, not a running daemon.
     pub fn acquire(workspace: &Path) -> Result<Option<Self>> {
         let aether_dir = workspace.join(".aether");
         fs::create_dir_all(&aether_dir)
@@ -134,8 +135,12 @@ impl WatcherLock {
             .write(true)
             .open(&path)
             .with_context(|| format!("failed to open {}", path.display()))?;
-        if file.try_lock_exclusive().is_err() {
-            return Ok(None);
+        match FileExt::try_lock_exclusive(&file) {
+            Ok(()) => {}
+            Err(err) if lock_contended(&err) => return Ok(None),
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to lock {}", path.display()));
+            }
         }
         file.set_len(0)
             .and_then(|()| writeln!(file, "{}", std::process::id()))
@@ -163,19 +168,37 @@ pub fn take_watcher_lock(workspace: &Path) -> Result<WatcherLock> {
         })
 }
 
+/// Whether a lock attempt failed because another holder has the lock, rather than
+/// because locking itself failed.
+fn lock_contended(err: &std::io::Error) -> bool {
+    let contended = fs2::lock_contended_error();
+    err.kind() == ErrorKind::WouldBlock
+        || (err.raw_os_error().is_some() && err.raw_os_error() == contended.raw_os_error())
+}
+
 /// Whether a daemon holds the watcher lock. A probe takes a shared lock for an instant,
-/// so it never blocks a daemon that holds or wants the exclusive one for long.
+/// so it never blocks a daemon that holds or wants the exclusive one for long. A probe
+/// that can't lock at all says nothing about a daemon; it is logged and read as "not
+/// watching", which errs toward telling the user to resync.
 pub fn watcher_running(workspace: &Path) -> bool {
     let path = workspace.join(".aether").join(WATCHER_LOCK_FILE);
     let Ok(file) = File::open(&path) else {
         return false;
     };
-    match file.try_lock_shared() {
+    match FileExt::try_lock_shared(&file) {
         Ok(()) => {
             let _ = FileExt::unlock(&file);
             false
         }
-        Err(_) => true,
+        Err(err) if lock_contended(&err) => true,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "could not probe the watcher lock"
+            );
+            false
+        }
     }
 }
 
@@ -255,12 +278,7 @@ pub fn assess_index_freshness(workspace: &Path, store: &SqliteStore) -> Result<I
     for file in &indexed {
         match file_time(&workspace.join(&file.file_path)) {
             FileTime::Modified(mtime_ms)
-                if modified_since_read(
-                    mtime_ms,
-                    file.last_indexed_at,
-                    &marker,
-                    watcher_running,
-                ) =>
+                if modified_since_read(mtime_ms, file.read_at_ms, file.last_indexed_at) =>
             {
                 modified.push(file.file_path.clone());
                 sirs_in_changed_files += file.symbols_with_sir;
@@ -344,23 +362,26 @@ pub fn assess_index_freshness(workspace: &Path, store: &SqliteStore) -> Result<I
     Ok(freshness)
 }
 
-/// Whether `file_path` may have changed since the index last read it: it was written in a
-/// later second, or in the same second, where the order of the write and the read is
-/// unknown (symbols record whole seconds). False when the store holds no symbols for it.
+/// Whether `file_path` was modified after the index last read it, by the rule status uses
+/// for `modified_files` ([`modified_since_read`]). False when the store holds no symbols
+/// for it.
 pub(crate) fn file_changed_since_read(
     workspace: &Path,
     store: &SqliteStore,
     file_path: &str,
 ) -> Result<bool> {
-    let Some(read_at) = store
+    let Some(last_seen_at) = store
         .file_last_read_at(file_path)
         .with_context(|| format!("failed to read when {file_path} was last indexed"))?
     else {
         return Ok(false);
     };
+    let read_at_ms = store
+        .file_read_at_ms(file_path)
+        .with_context(|| format!("failed to read when {file_path} was last read"))?;
     Ok(matches!(
         file_time(&workspace.join(file_path)),
-        FileTime::Modified(mtime_ms) if mtime_ms.div_euclid(1000) >= read_at
+        FileTime::Modified(mtime_ms) if modified_since_read(mtime_ms, read_at_ms, last_seen_at)
     ))
 }
 
@@ -382,27 +403,17 @@ fn file_time(path: &Path) -> FileTime {
     }
 }
 
-/// Whether a file last modified at `mtime_ms` changed after the indexer last read it,
-/// somewhere within the second `read_at` (symbols record whole seconds). A later second
-/// is a change. Within that same second the order is unknown. The write came first only
-/// if it predates the walk of the full sync the read belongs to, or a later one. Any
-/// other same-second write counts as a change, unless a daemon is watching: it reads a
-/// file only once its writes settle, and rereads it after any later write.
-fn modified_since_read(
-    mtime_ms: i64,
-    read_at: i64,
-    marker: &IndexSyncMarker,
-    watcher_running: bool,
-) -> bool {
-    let mtime_secs = mtime_ms.div_euclid(1000);
-    if mtime_secs != read_at {
-        return mtime_secs > read_at;
+/// Whether a file last modified at `mtime_ms` changed after the indexer last read it.
+/// With its recorded read start (`read_at_ms`: the walk start for a full sync, the moment
+/// before the read for a reindex), any later write is a change, including one made while
+/// a long walk was still running. A file read only by a binary that didn't record that
+/// time has `last_seen_at`, whole seconds written after the read, so a write in that same
+/// second may have come after the read and counts as a change too.
+fn modified_since_read(mtime_ms: i64, read_at_ms: Option<i64>, last_seen_at: i64) -> bool {
+    match read_at_ms {
+        Some(read_at_ms) => mtime_ms > read_at_ms,
+        None => mtime_ms.div_euclid(1000) >= last_seen_at,
     }
-    let before_walk = matches!(
-        (marker.full_sync_at, marker.full_sync_at_ms),
-        (Some(walk_secs), Some(walk_ms)) if walk_secs <= read_at && mtime_ms <= walk_ms
-    );
-    !before_walk && !watcher_running
 }
 
 fn metadata_mtime_millis(metadata: &fs::Metadata) -> Option<i64> {
@@ -573,10 +584,12 @@ pub fn symbol_freshness_note(
     let marker = read_index_sync_marker(workspace);
     let watching = watcher_running(workspace);
     let indexed = describe_time(record.last_seen_at, now);
+    // Without a readable read time, the conservative whole-second comparison applies.
+    let read_at_ms = store.file_read_at_ms(&record.file_path).unwrap_or_default();
     let file = match file_time(&workspace.join(&record.file_path)) {
         FileTime::Missing => format!("file missing from the workspace (indexed {indexed})"),
         FileTime::Modified(mtime_ms)
-            if modified_since_read(mtime_ms, record.last_seen_at, &marker, watching) =>
+            if modified_since_read(mtime_ms, read_at_ms, record.last_seen_at) =>
         {
             format!("file modified after it was indexed ({indexed})")
         }
@@ -678,7 +691,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        FreshnessVerdict, WatcherLock, assess_index_freshness, describe_age,
+        FreshnessVerdict, WatcherLock, assess_index_freshness, describe_age, lock_contended,
         read_index_sync_marker, summary_line, symbol_freshness_note, take_watcher_lock,
         watcher_running, workspace_head,
     };
@@ -966,11 +979,11 @@ mod tests {
             .expect("set modified time");
     }
 
-    /// Symbols record whole seconds, so an edit in the second its file was indexed is
-    /// ambiguous. Only a write that predates the full sync's walk is known to be read; any
-    /// other counts as a change unless a daemon watches.
+    /// A file's recorded read start, not the whole-second `last_seen_at` the sync writes
+    /// afterwards, decides whether an edit came later: an edit made while a long walk was
+    /// running, or in the same second as the read, is a change, daemon or not.
     #[test]
-    fn an_edit_in_the_second_its_file_was_indexed_still_reads_as_modified() {
+    fn edits_after_a_file_was_read_count_however_close_to_the_read() {
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();
         write_workspace(workspace);
@@ -985,6 +998,11 @@ mod tests {
         let walk_ms = read_index_sync_marker(workspace)
             .full_sync_at_ms
             .expect("walk start");
+        assert_eq!(
+            store.file_read_at_ms("pkg/a.py").expect("read time"),
+            Some(walk_ms),
+            "a full sync records its walk start as each file's read"
+        );
         let path = workspace.join("pkg/a.py");
         let modified = || {
             assess_index_freshness(workspace, &store)
@@ -996,7 +1014,7 @@ mod tests {
         set_modified_millis(&path, walk_ms - 1);
         assert_eq!(modified(), 0);
 
-        // Written at the end of the second the file was indexed, after the walk began.
+        // Written just after the walk started, in the second the file was indexed.
         set_modified_millis(&path, record.last_seen_at * 1000 + 999);
         assert_eq!(modified(), 1);
         let note = symbol_freshness_note(workspace, &store, &record);
@@ -1004,12 +1022,38 @@ mod tests {
             note.starts_with("Freshness: file modified after it was indexed ("),
             "{note}"
         );
-
-        // A watching daemon rereads a file after its writes settle.
-        let _lock = WatcherLock::acquire(workspace)
+        // A watching daemon is no proof the edit was reread.
+        let lock = WatcherLock::acquire(workspace)
             .expect("lock")
             .expect("free");
-        assert_eq!(modified(), 0);
+        assert_eq!(modified(), 1);
+        drop(lock);
+
+        // A walk that took seconds: the sync wrote `last_seen_at` well after it read the
+        // file, so an edit made in between is older than `last_seen_at` yet newer than
+        // the read.
+        rusqlite::Connection::open(workspace.join(".aether/meta.sqlite"))
+            .and_then(|conn| {
+                conn.execute(
+                    "UPDATE symbols SET last_seen_at = last_seen_at + 5 WHERE file_path = 'pkg/a.py'",
+                    [],
+                )
+            })
+            .expect("move last_seen_at later");
+        set_modified_millis(&path, walk_ms + 1);
+        assert_eq!(modified(), 1);
+    }
+
+    #[test]
+    fn only_contention_reads_as_another_lock_holder() {
+        assert!(lock_contended(&fs2::lock_contended_error()));
+        assert!(lock_contended(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
+        assert!(!lock_contended(&std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no advisory locks on this filesystem"
+        )));
     }
 
     #[test]
