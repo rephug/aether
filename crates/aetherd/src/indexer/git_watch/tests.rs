@@ -902,6 +902,53 @@ fn a_watched_deletion_of_a_symbol_free_file_clears_its_edges() {
     );
 }
 
+/// Grown past the parse size limit, a symbol-free file keeps the edges of its older text
+/// and has no symbol row to show it changed: status must still call it modified. Once
+/// it is deleted, the size skip must not stop the watcher clearing those edges.
+#[test]
+fn a_symbol_free_file_grown_past_the_size_limit_reads_as_modified_until_deleted() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    let mut repo = SymbolFreeFile::new(workspace);
+    let edges_before = repo.edges("src/main.ts");
+
+    let mut grown = String::from("import { alpha } from \"./a\";\n\nalpha();\n");
+    while grown.len() <= 2 * 1024 * 1024 {
+        grown.push_str("// padding that pushes the file past the parse size limit\n");
+    }
+    fs::write(workspace.join("src/main.ts"), grown).expect("grow main");
+    repo.watch("src/main.ts");
+
+    assert!(
+        repo.observer
+            .skipped_as_oversized(&workspace.join("src/main.ts"))
+    );
+    assert_eq!(repo.edges("src/main.ts"), edges_before, "nothing read it");
+    let stale = crate::freshness::assess_index_freshness(workspace, &repo.store).expect("assess");
+    assert_eq!(stale.changed_file_samples, ["M src/main.ts"], "{stale:?}");
+    assert_eq!(stale.verdict, crate::freshness::FreshnessVerdict::Stale);
+
+    fs::remove_file(workspace.join("src/main.ts")).expect("delete main");
+    repo.watch("src/main.ts");
+
+    assert!(
+        !repo
+            .observer
+            .skipped_as_oversized(&workspace.join("src/main.ts"))
+    );
+    assert_eq!(repo.edges("src/main.ts"), 0);
+    assert_eq!(
+        repo.store.file_read_at_ms("src/main.ts").expect("read"),
+        None
+    );
+    let fresh = crate::freshness::assess_index_freshness(workspace, &repo.store).expect("assess");
+    assert_eq!(
+        fresh.verdict,
+        crate::freshness::FreshnessVerdict::Fresh,
+        "{fresh:?}"
+    );
+}
+
 /// Deleted while nothing watched, the file's edges stay stored, so status must call the
 /// index stale until a full sync clears them.
 #[test]

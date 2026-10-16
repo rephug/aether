@@ -35,9 +35,6 @@ pub const WATCHER_LOCK_FILE: &str = "watcher.lock";
 /// Most changed paths a freshness report names.
 const MAX_CHANGED_FILE_SAMPLES: usize = 10;
 
-/// Files larger than this are never parsed (see the observer), so they are not "new".
-const MAX_INDEXED_FILE_SIZE: u64 = 2 * 1024 * 1024;
-
 /// The commit the index reflects, and when it caught up with it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexSyncMarker {
@@ -533,9 +530,6 @@ fn source_files(workspace: &Path) -> SourceWalk {
             walk.unreadable.push(relative(path));
             continue;
         };
-        if metadata.len() > MAX_INDEXED_FILE_SIZE {
-            continue;
-        }
         let Some(mtime) = metadata_mtime_millis(&metadata) else {
             walk.unreadable.push(relative(path));
             continue;

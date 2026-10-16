@@ -213,6 +213,8 @@ impl ObserverState {
             return Ok(None);
         };
 
+        // Set again below if this read skips the file; a deleted file was not skipped.
+        self.oversized.remove(&relative);
         let current_symbols = if path.exists() && path.is_file() {
             if let Some(metadata) = match fs::metadata(path) {
                 Ok(metadata) => Some(metadata),
@@ -235,7 +237,6 @@ impl ObserverState {
                     return Ok(None);
                 }
             }
-            self.oversized.remove(&relative);
 
             match fs::read_to_string(path) {
                 Ok(source) => self
