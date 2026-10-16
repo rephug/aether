@@ -7,7 +7,7 @@ authors.workspace = true
 
 [features]
 default = []
-verification = []
+verification = ["aetherd/verification"]
 
 [dependencies]
 aether-analysis = { path = "../aether-analysis" }

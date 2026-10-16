@@ -294,6 +294,7 @@ fn build_template_context(workspace: &Path, config: &AetherConfig) -> TemplateCo
         inference_provider: config.inference.provider.as_str().to_owned(),
         agent_schema_version: AETHER_AGENT_SCHEMA_VERSION,
         mcp_binary_hint: resolve_mcp_binary_hint(workspace),
+        verification_tool: cfg!(feature = "verification"),
     }
 }
 
@@ -824,6 +825,51 @@ mod tests {
             "Agent Schema Version: {}",
             AETHER_AGENT_SCHEMA_VERSION
         )));
+    }
+
+    /// The written CLAUDE.md and AGENTS.md mandate no tool this build may lack, make
+    /// SIR writes and why_changed advisory, and leave the tool list to the MCP server.
+    #[test]
+    fn generated_claude_and_agents_md_mandate_no_unavailable_tool() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_config_with_embeddings(workspace, true);
+
+        run_init_agent(
+            workspace,
+            InitAgentOptions {
+                platform: AgentPlatform::All,
+                force: false,
+            },
+        )
+        .expect("init-agent should succeed");
+
+        for file in ["CLAUDE.md", "AGENTS.md"] {
+            let rendered = fs::read_to_string(workspace.join(file)).expect("read agent file");
+            let required = rendered
+                .split("## Required Actions (mandatory)\n")
+                .nth(1)
+                .and_then(|rest| rest.split("\n\n").next())
+                .expect("required section");
+            assert_eq!(
+                required.contains("aether_verify"),
+                cfg!(feature = "verification"),
+                "{file}: {required}"
+            );
+            assert!(
+                !required.contains("aether_why_changed"),
+                "{file}: {required}"
+            );
+            assert!(
+                !required.contains("aether_sir_inject"),
+                "{file}: {required}"
+            );
+            assert!(rendered.contains("`freshness.verdict`"), "{file}");
+            assert!(!rendered.contains("to confirm index freshness"), "{file}");
+            // The 40-tool list is gone.
+            assert!(!rendered.contains("aether_suggest_trait_split"), "{file}");
+            assert!(!rendered.contains("aether_contract_dismiss"), "{file}");
+        }
     }
 
     #[test]
