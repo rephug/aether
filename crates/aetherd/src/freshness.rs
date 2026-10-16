@@ -383,26 +383,27 @@ pub fn assess_index_freshness(workspace: &Path, store: &SqliteStore) -> Result<I
 }
 
 /// Whether `file_path` was modified after the index last read it, by the rule status uses
-/// for `modified_files` ([`modified_since_read`]). False when the store holds no symbols
-/// for it.
+/// for `modified_files` ([`modified_since_read`]). A source file without symbols has only
+/// its `file_reads` time to go by; one the index has never read has changed.
 pub(crate) fn file_changed_since_read(
     workspace: &Path,
     store: &SqliteStore,
     file_path: &str,
 ) -> Result<bool> {
-    let Some(last_seen_at) = store
+    let last_seen_at = store
         .file_last_read_at(file_path)
-        .with_context(|| format!("failed to read when {file_path} was last indexed"))?
-    else {
-        return Ok(false);
-    };
+        .with_context(|| format!("failed to read when {file_path} was last indexed"))?;
     let read_at_ms = store
         .file_read_at_ms(file_path)
         .with_context(|| format!("failed to read when {file_path} was last read"))?;
-    Ok(matches!(
-        file_time(&workspace.join(file_path)),
-        FileTime::Modified(mtime_ms) if modified_since_read(mtime_ms, read_at_ms, last_seen_at)
-    ))
+    let FileTime::Modified(mtime_ms) = file_time(&workspace.join(file_path)) else {
+        return Ok(false);
+    };
+    Ok(match (last_seen_at, read_at_ms) {
+        (Some(last_seen_at), read_at_ms) => modified_since_read(mtime_ms, read_at_ms, last_seen_at),
+        (None, Some(read_at_ms)) => written_after(mtime_ms, read_at_ms),
+        (None, None) => true,
+    })
 }
 
 enum FileTime {

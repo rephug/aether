@@ -258,6 +258,21 @@ fn refresh_paths(config: &IndexerConfig, structural: &mut StructuralIndexer, pat
     }
 }
 
+/// A source file on disk the observer holds no symbols for, as its workspace-relative path
+/// and language.
+fn symbol_free_source(
+    config: &IndexerConfig,
+    path: &Path,
+) -> Option<(String, aether_core::Language)> {
+    if !path.is_file() {
+        return None;
+    }
+    let language = language_for_path(path)?;
+    let file_path =
+        normalize_path(&relative_workspace_path(&config.workspace, path).to_string_lossy());
+    Some((file_path, language))
+}
+
 fn process_reindex_path(
     config: &IndexerConfig,
     observer: &mut ObserverState,
@@ -301,10 +316,15 @@ fn process_reindex_path(
         Ok(None) if observer.skipped_as_oversized(path) => false,
         // An edit that changes no symbol (a comment, blank lines, an import) still changes
         // the file and maybe its edges. Re-extract them, or status would report the file
-        // as modified until the next full sync. A file the index read since it last
-        // changed, as a branch switch leaves most, is skipped.
-        Ok(None) => match observer.symbols_of(path) {
-            Some((file_path, language, _))
+        // as modified until the next full sync. A source file without symbols (imports
+        // only, top-level code) has edges too, so it is handled the same way. A file the
+        // index read since it last changed, as a branch switch leaves most, is skipped.
+        Ok(None) => match observer
+            .symbols_of(path)
+            .map(|(file_path, language, _)| (file_path, language))
+            .or_else(|| symbol_free_source(config, path))
+        {
+            Some((file_path, language))
                 if crate::freshness::file_changed_since_read(
                     &config.workspace,
                     store,
@@ -1335,5 +1355,72 @@ mod tests {
             ["M pkg/a.py"],
             "{freshness:?}"
         );
+    }
+
+    /// A source file without symbols (imports and top-level code only) still has edges.
+    /// The watcher must extract them before it counts the file as read.
+    #[test]
+    fn a_watched_symbol_free_file_has_its_edges_indexed_before_it_counts_as_read() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
+        fs::write(
+            workspace.join(".aether/config.toml"),
+            "[inference]\nprovider = \"mock\"\n\n[storage]\ngraph_backend = \"sqlite\"\n\n[embeddings]\nenabled = false\nvector_backend = \"sqlite\"\n",
+        )
+        .expect("write config");
+        fs::create_dir_all(workspace.join("src")).expect("create src");
+        fs::write(
+            workspace.join("src/a.ts"),
+            "export function alpha(): number {\n  return 1;\n}\n",
+        )
+        .expect("write a");
+        let config = mock_config(workspace);
+        crate::freshness::let_writes_settle();
+        run_initial_index_once(&config).expect("index once");
+        let _watcher_lock = crate::freshness::take_watcher_lock(workspace).expect("watcher lock");
+        let mut observer = ObserverState::new(workspace.to_path_buf()).expect("observer");
+        observer.seed_from_disk().expect("seed observer");
+        let mut structural =
+            StructuralIndexer::new(workspace.to_path_buf()).expect("structural indexer");
+        let store = SqliteStore::open(workspace).expect("open store");
+        let queue_state = SharedQueueState::new(HashMap::new());
+        let edges_of = |file_path: &str| -> i64 {
+            rusqlite::Connection::open(workspace.join(".aether/meta.sqlite"))
+                .and_then(|conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM symbol_edges WHERE file_path = ?1",
+                        [file_path],
+                        |row| row.get(0),
+                    )
+                })
+                .expect("count edges")
+        };
+
+        fs::write(
+            workspace.join("src/main.ts"),
+            "import { alpha } from \"./a\";\n\nalpha();\n",
+        )
+        .expect("write main");
+        crate::freshness::let_writes_settle();
+        process_debounced_paths(
+            &config,
+            &mut observer,
+            &mut structural,
+            &store,
+            &queue_state,
+            vec![workspace.join("src/main.ts")],
+        );
+
+        assert!(
+            store
+                .list_symbols_for_file("src/main.ts")
+                .expect("list symbols")
+                .is_empty()
+        );
+        assert!(edges_of("src/main.ts") > 0, "the file's edges are indexed");
+        let freshness =
+            crate::freshness::assess_index_freshness(workspace, &store).expect("assess");
+        assert_eq!(freshness.new_files, 0, "{freshness:?}");
     }
 }
