@@ -1,6 +1,6 @@
 //! `aetherd doctor`: whether the model ids the config would call exist.
 //!
-//! Shut-down and deprecated ids are reported from the config alone. Then each provider
+//! Shut-down and retiring ids are reported from the config alone. Then each provider
 //! the config selects is resolved as indexing resolves it, and its service is asked to
 //! list its models. Listing is the only request made: nothing is generated or embedded,
 //! so a check spends no tokens.
@@ -87,7 +87,7 @@ pub fn run_doctor(workspace: &Path, config: &AetherConfig) -> Result<DoctorRepor
     for warning in validate_config(config) {
         let status = match warning.code {
             "model_id_shut_down" => CheckStatus::Fail,
-            "model_id_deprecated" => CheckStatus::Warn,
+            "model_id_retiring" => CheckStatus::Warn,
             _ => continue,
         };
         let subject = warning
@@ -294,9 +294,14 @@ fn listing_result(
     if let Some(notice) = model_id_notice(model) {
         let state = match notice.status {
             ModelIdStatus::ShutDown => "shut down",
-            ModelIdStatus::Deprecated => "deprecated",
+            ModelIdStatus::Retiring => "may be retired",
         };
-        detail.push_str(&format!(" ({state}; use '{}')", notice.replacement));
+        let advice = if notice.switching.is_some() {
+            "replacement"
+        } else {
+            "use"
+        };
+        detail.push_str(&format!(" ({state}; {advice} '{}')", notice.replacement));
     } else {
         let similar = similar_ids(model, &ids);
         if !similar.is_empty() {

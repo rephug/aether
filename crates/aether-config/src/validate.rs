@@ -411,14 +411,18 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
         };
         let (code, state) = match notice.status {
             ModelIdStatus::ShutDown => ("model_id_shut_down", "is shut down"),
-            ModelIdStatus::Deprecated => ("model_id_deprecated", "is deprecated"),
+            ModelIdStatus::Retiring => ("model_id_retiring", "may be retired"),
+        };
+        let advice = match notice.switching {
+            Some(switching) => format!(
+                "its replacement '{}' needs more than a new id: {switching}",
+                notice.replacement
+            ),
+            None => format!("use '{}'", notice.replacement),
         };
         warnings.push(ConfigWarning {
             code,
-            message: format!(
-                "{setting}='{model}' {state}: {}; use '{}'",
-                notice.detail, notice.replacement
-            ),
+            message: format!("{setting}='{model}' {state}: {}; {advice}", notice.detail),
         });
     }
 
@@ -729,7 +733,7 @@ task_type = "RETRIEVAL_DOCUMENT"
     }
 
     #[test]
-    fn validate_config_names_shut_down_and_deprecated_model_ids() {
+    fn validate_config_names_shut_down_and_retiring_model_ids() {
         let config = parse_workspace_config_str(
             r#"
 [inference]
@@ -763,12 +767,24 @@ model = "gemini-embedding-2-preview"
                 .message
                 .ends_with("use 'gemini-3.1-flash-lite'")
         );
-        let deprecated = warnings
+        let retiring = warnings
             .iter()
-            .filter(|warning| warning.code == "model_id_deprecated")
+            .filter(|warning| warning.code == "model_id_retiring")
             .collect::<Vec<_>>();
-        assert_eq!(deprecated.len(), 1, "{warnings:?}");
-        assert!(deprecated[0].message.contains("use 'gemini-embedding-2'"));
+        assert_eq!(retiring.len(), 1, "{warnings:?}");
+        let message = &retiring[0].message;
+        assert!(
+            message.starts_with("embeddings.model='gemini-embedding-2-preview' may be retired"),
+            "{message}"
+        );
+        assert!(message.contains("earliest possible date"), "{message}");
+        // The GA id takes task prefixes, not taskType, so a bare "use it" would mislead.
+        assert!(!message.contains("use 'gemini-embedding-2'"), "{message}");
+        assert!(
+            message.contains("its replacement 'gemini-embedding-2' needs more than a new id"),
+            "{message}"
+        );
+        assert!(message.contains("taskType"), "{message}");
     }
 
     #[test]

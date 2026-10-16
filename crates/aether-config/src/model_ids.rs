@@ -1,6 +1,6 @@
-//! Model ids a provider has shut down or deprecated. A config that still names one gets a
-//! warning from [`crate::validate_config`] at startup and from `aetherd doctor`. Nothing
-//! here changes which model a request uses.
+//! Model ids a provider has shut down or listed for retirement. A config that still names
+//! one gets a warning from [`crate::validate_config`] at startup and from `aetherd doctor`.
+//! Nothing here changes which model a request uses.
 
 use crate::root::AetherConfig;
 
@@ -9,8 +9,9 @@ use crate::root::AetherConfig;
 pub enum ModelIdStatus {
     /// No longer served: every request naming it fails.
     ShutDown,
-    /// Still served, but the provider has named its replacement.
-    Deprecated,
+    /// Listed for retirement with a replacement. The provider's date is the earliest it
+    /// might stop serving the id, so it may or may not still answer.
+    Retiring,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,8 +19,10 @@ pub struct ModelIdNotice {
     pub id: &'static str,
     pub status: ModelIdStatus,
     pub replacement: &'static str,
-    /// What happened and when, from the provider's changelog.
+    /// What happened and when, in the provider's words where they matter.
     pub detail: &'static str,
+    /// What moving to `replacement` takes besides changing the id, when it takes more.
+    pub switching: Option<&'static str>,
 }
 
 pub const MODEL_ID_NOTICES: &[ModelIdNotice] = &[
@@ -28,13 +31,21 @@ pub const MODEL_ID_NOTICES: &[ModelIdNotice] = &[
         status: ModelIdStatus::ShutDown,
         replacement: "gemini-3.1-flash-lite",
         detail: "Google shut it down on 2026-05-25; gemini-3.1-flash-lite is GA since 2026-05-07",
+        switching: None,
     },
     ModelIdNotice {
         id: "gemini-embedding-2-preview",
-        status: ModelIdStatus::Deprecated,
+        status: ModelIdStatus::Retiring,
         replacement: "gemini-embedding-2",
-        detail: "Google deprecated the preview id in favour of the GA gemini-embedding-2; \
-                 switching re-embeds every symbol",
+        detail: "Google's deprecations page lists it (as embedding-2-preview) with 2026-08-10 \
+                 as the earliest possible date on which it might be retired",
+        switching: Some(
+            "gemini-embedding-2 doesn't take the taskType field AETHER's gemini_native \
+             provider sends, so requests can fail or lose the query/document distinction \
+             until the provider puts the task in the text instead (Google's code retrieval \
+             form: 'task: code retrieval | query: ...' for queries, 'title: none | text: ...' \
+             for documents); switching also re-embeds every symbol",
+        ),
     },
 ];
 
@@ -126,9 +137,16 @@ mod tests {
             assert_eq!(notice.status, ModelIdStatus::ShutDown);
             assert_eq!(notice.replacement, "gemini-3.1-flash-lite");
         }
-        assert_eq!(
-            model_id_notice("gemini-embedding-2-preview").map(|notice| notice.status),
-            Some(ModelIdStatus::Deprecated)
+        let embedding = model_id_notice("gemini-embedding-2-preview").expect("embedding notice");
+        assert_eq!(embedding.status, ModelIdStatus::Retiring);
+        assert!(embedding.detail.contains("earliest possible date"));
+        let switching = embedding
+            .switching
+            .expect("the switch needs a request change");
+        assert!(switching.contains("taskType"), "{switching}");
+        assert!(
+            switching.contains("task: code retrieval | query:"),
+            "{switching}"
         );
         assert!(model_id_notice("gemini-3.1-flash-lite").is_none());
         assert!(model_id_notice("gemini-embedding-2").is_none());
