@@ -7,7 +7,7 @@ use aether_store::{
     AuditFindingFilters, AuditSeverityCounts, AuditStore, DriftStore, NewAuditFinding,
     SirStateStore, SqliteStore, SymbolSearchResult,
 };
-use rusqlite::{Connection, params_from_iter, types::Value as SqlValue};
+use rusqlite::{Connection, OpenFlags, params_from_iter, types::Value as SqlValue};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -875,7 +875,8 @@ impl AetherMcpServer {
         }
 
         let symbol_records = store.get_symbol_search_results_batch(&symbol_ids)?;
-        let conn = Connection::open(self.sqlite_path())?;
+        let conn =
+            Connection::open_with_flags(self.sqlite_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let sir_metadata_by_symbol = load_sir_metadata_batch(&conn, &symbol_ids)?;
         let test_count_by_symbol = load_test_counts_by_symbol(&conn)?;
         let drift_by_symbol = latest_semantic_drift_by_symbol(store)?;

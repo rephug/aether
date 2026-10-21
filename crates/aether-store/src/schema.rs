@@ -717,6 +717,52 @@ pub(crate) fn apply_migrations(tx: &Transaction<'_>, version: i32) -> Result<(),
         conn.execute("PRAGMA user_version = 21", [])?;
     }
 
+    if version < 22 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE symbol_retirements (
+                retirement_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol_id TEXT NOT NULL,
+                retired_at INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                source_hash TEXT,
+                symbol_json TEXT,
+                evidence_json TEXT NOT NULL
+            );
+            CREATE INDEX idx_symbol_retirements_symbol
+                ON symbol_retirements(symbol_id, retirement_id);
+            CREATE TABLE symbol_lineage (
+                retirement_id INTEGER PRIMARY KEY REFERENCES symbol_retirements(retirement_id),
+                old_symbol_id TEXT NOT NULL,
+                new_symbol_id TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                evidence TEXT NOT NULL,
+                source_revision TEXT,
+                destination_revision TEXT,
+                recorded_at INTEGER NOT NULL
+            );
+            CREATE INDEX idx_symbol_lineage_old ON symbol_lineage(old_symbol_id);
+            CREATE INDEX idx_symbol_lineage_new ON symbol_lineage(new_symbol_id);
+            PRAGMA user_version = 22;
+            "#,
+        )?;
+    }
+
+    // Additive indexes also apply to stores already at the current schema. These
+    // are the lookup keys used when resolving an edge and refreshing one file's
+    // neighbors; without them a small graph update scans the symbol catalog.
+    if table_exists(conn, "symbols")? {
+        conn.execute_batch(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name
+                ON symbols(qualified_name);
+            CREATE INDEX IF NOT EXISTS idx_symbols_file_path
+                ON symbols(file_path);
+            "#,
+        )?;
+    }
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -906,7 +952,7 @@ fn table_has_column(
 
     Ok(false)
 }
-fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, StoreError> {
+pub(crate) fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, StoreError> {
     let mut stmt = conn.prepare(
         r#"
         SELECT 1

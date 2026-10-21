@@ -13,8 +13,8 @@ use aether_config::{
 use aether_core::{EdgeKind, GitContext, Language, Symbol, SymbolChangeEvent, content_hash};
 use aether_infer::{
     EmbeddingProvider, EmbeddingProviderOverrides, EmbeddingPurpose, InferenceProvider,
-    ProviderOverrides, Qwen3LocalProvider, load_embedding_provider_from_config,
-    load_provider_from_env_or_mock,
+    LoadedEmbeddingProvider, LoadedProvider, ProviderOverrides, Qwen3LocalProvider,
+    load_embedding_provider_from_config, load_provider_from_env_or_mock,
     sir_prompt::{self, SirEnrichmentContext},
 };
 #[cfg(test)]
@@ -282,6 +282,10 @@ impl SirPipeline {
         )
     }
 
+    /// Build an inference-only pipeline around the supplied provider.
+    ///
+    /// This does not load configured embeddings. Use
+    /// [`Self::new_with_loaded_providers`] to supply both provider types explicitly.
     pub fn new_with_provider(
         workspace_root: PathBuf,
         sir_concurrency: usize,
@@ -297,6 +301,38 @@ impl SirPipeline {
             model_name,
             None,
             None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Build a pipeline around explicitly supplied inference and embedding providers.
+    ///
+    /// Unlike [`Self::new`], this constructor does not load either provider from the
+    /// workspace configuration. Their supplied identities follow the generated SIRs
+    /// and vectors. The configured vector backend is still used. This supports callers
+    /// that already own their providers and deterministic lifecycle integration tests.
+    pub fn new_with_loaded_providers(
+        workspace_root: PathBuf,
+        sir_concurrency: usize,
+        inference: LoadedProvider,
+        embedding: Option<LoadedEmbeddingProvider>,
+    ) -> Result<Self> {
+        let (embedding_provider, embedding_identity) = embedding.map_or((None, None), |loaded| {
+            (
+                Some(Arc::<dyn EmbeddingProvider>::from(loaded.provider)),
+                Some((loaded.provider_name, loaded.model_name)),
+            )
+        });
+        Self::new_with_provider_and_embeddings(
+            workspace_root,
+            sir_concurrency,
+            Arc::<dyn InferenceProvider>::from(inference.provider),
+            inference.provider_name,
+            inference.model_name,
+            embedding_provider,
+            embedding_identity,
             None,
             None,
             None,

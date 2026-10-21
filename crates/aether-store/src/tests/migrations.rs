@@ -13,7 +13,7 @@ use crate::schema::apply_migrations;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-const CORE_VERSION: i32 = 21;
+const CORE_VERSION: i32 = CORE_SCHEMA_VERSION as i32;
 const PARALLEL_OPENERS: usize = 8;
 const PARALLEL_ROUNDS: usize = 6;
 
@@ -122,6 +122,40 @@ fn parallel_fresh_store_opens_all_reach_current_schema() -> TestResult {
         assert_workspace_schema(&workspace)?;
     }
     Ok(())
+}
+
+#[test]
+fn current_schema_adds_missing_graph_lookup_indexes_without_rewriting_data() -> TestResult {
+    let conn = Connection::open_in_memory()?;
+    run_migrations(&conn)?;
+    conn.execute_batch(
+        "DROP INDEX idx_symbols_qualified_name;
+         DROP INDEX idx_symbols_file_path;
+         INSERT INTO symbols
+             (id, file_path, language, kind, qualified_name, signature_fingerprint, last_seen_at)
+         VALUES ('kept', 'src/lib.rs', 'rust', 'function', 'demo::kept', 'sig-kept', 1);",
+    )?;
+    assert_eq!(user_version(&conn)?, CORE_VERSION);
+
+    run_migrations(&conn)?;
+    for (column, index) in [
+        ("qualified_name", "idx_symbols_qualified_name"),
+        ("file_path", "idx_symbols_file_path"),
+    ] {
+        let query = format!("EXPLAIN QUERY PLAN SELECT id FROM symbols WHERE {column} = ?1");
+        let detail: String = conn.query_row(&query, ["demo::kept"], |row| row.get(3))?;
+        assert!(detail.contains(index), "expected {index}, got {detail}");
+    }
+    let kept: String = conn.query_row(
+        "SELECT qualified_name FROM symbols WHERE id = 'kept'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(kept, "demo::kept");
+    let cookie = schema_cookie(&conn)?;
+    run_migrations(&conn)?;
+    assert_eq!(schema_cookie(&conn)?, cookie, "reopen changed the schema");
+    assert_final_schema(&conn)
 }
 
 #[test]

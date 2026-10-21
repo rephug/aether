@@ -48,6 +48,7 @@ mod index_once_tests;
 mod priority;
 mod quality;
 mod reconciliation;
+pub(crate) use reconciliation::reconcile_symbol_event;
 mod snapshot;
 #[cfg(test)]
 mod startup_tests;

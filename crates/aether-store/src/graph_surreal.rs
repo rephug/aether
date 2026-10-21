@@ -171,6 +171,7 @@ impl SurrealGraphStore {
 
     async fn ensure_schema(&self) -> Result<(), StoreError> {
         let schema = r#"
+            BEGIN TRANSACTION;
             DEFINE TABLE IF NOT EXISTS symbol SCHEMAFULL;
             DEFINE FIELD IF NOT EXISTS symbol_id ON symbol TYPE string;
             DEFINE FIELD IF NOT EXISTS qualified_name ON symbol TYPE string;
@@ -250,11 +251,13 @@ impl SurrealGraphStore {
 
             DEFINE FIELD IF NOT EXISTS callers ON symbol COMPUTED <~depends_on;
             DEFINE FIELD IF NOT EXISTS dependees ON symbol COMPUTED ->depends_on->symbol;
+            COMMIT TRANSACTION;
         "#;
 
         self.db
             .query(schema)
             .await
+            .and_then(|response| response.check())
             .map_err(|err| StoreError::Graph(format!("SurrealDB schema setup failed: {err}")))?;
         Ok(())
     }
@@ -479,6 +482,7 @@ impl SurrealGraphStore {
             .query("DELETE symbol WHERE symbol_id = $symbol_id;")
             .bind(("symbol_id", symbol_id.to_owned()))
             .await
+            .and_then(|response| response.check())
             .map_err(|err| StoreError::Graph(format!("SurrealDB delete symbol failed: {err}")))?;
         Ok(())
     }
@@ -495,23 +499,25 @@ impl SurrealGraphStore {
             return Ok(());
         }
 
-        for chunk in ids.chunks(500) {
-            let symbol_ids = chunk.to_vec();
-            self.db
-                .query(
-                    r#"
-                    DELETE depends_on
-                    WHERE source_symbol_id INSIDE $symbol_ids
-                       OR target_symbol_id INSIDE $symbol_ids;
-                    DELETE symbol WHERE symbol_id INSIDE $symbol_ids;
-                    "#,
-                )
-                .bind(("symbol_ids", symbol_ids))
-                .await
-                .map_err(|err| {
-                    StoreError::Graph(format!("SurrealDB delete symbols batch failed: {err}"))
-                })?;
-        }
+        // Bind the ID array once: SQL parameter limits do not require splitting it into
+        // separately committed chunks. Nodes and all incident edges disappear together.
+        self.db
+            .query(
+                r#"
+                BEGIN TRANSACTION;
+                DELETE depends_on
+                WHERE source_symbol_id INSIDE $symbol_ids
+                   OR target_symbol_id INSIDE $symbol_ids;
+                DELETE symbol WHERE symbol_id INSIDE $symbol_ids;
+                COMMIT TRANSACTION;
+                "#,
+            )
+            .bind(("symbol_ids", ids))
+            .await
+            .and_then(|response| response.check())
+            .map_err(|err| {
+                StoreError::Graph(format!("SurrealDB delete symbols batch failed: {err}"))
+            })?;
 
         Ok(())
     }
@@ -538,6 +544,7 @@ impl SurrealGraphStore {
             .bind(("source_symbol_id", source_symbol_id.to_owned()))
             .bind(("target_symbol_id", target_symbol_id.to_owned()))
             .await
+            .and_then(|response| response.check())
             .map_err(|err| {
                 StoreError::Graph(format!("SurrealDB delete dependency edges failed: {err}"))
             })?;
@@ -657,61 +664,32 @@ impl SurrealGraphStore {
         &self,
         records: &[CouplingEdgeRecord],
     ) -> Result<(), StoreError> {
-        for record in records {
-            let record = CouplingEdgeRecord {
-                file_a: record.file_a.clone(),
-                file_b: record.file_b.clone(),
-                co_change_count: record.co_change_count,
-                total_commits_a: record.total_commits_a,
-                total_commits_b: record.total_commits_b,
-                git_coupling: record.git_coupling,
-                static_signal: record.static_signal,
-                semantic_signal: record.semantic_signal,
-                fused_score: record.fused_score,
-                coupling_type: record.coupling_type.clone(),
-                last_co_change_commit: record.last_co_change_commit.clone(),
-                last_co_change_at: record.last_co_change_at,
-                mined_at: record.mined_at,
-            };
-
-            self.db
-                .query(
-                    r#"
-                    DELETE co_change WHERE file_a = $file_a AND file_b = $file_b;
-                    CREATE co_change SET
-                        file_a = $file_a,
-                        file_b = $file_b,
-                        co_change_count = $co_change_count,
-                        total_commits_a = $total_commits_a,
-                        total_commits_b = $total_commits_b,
-                        git_coupling = $git_coupling,
-                        static_signal = $static_signal,
-                        semantic_signal = $semantic_signal,
-                        fused_score = $fused_score,
-                        coupling_type = $coupling_type,
-                        last_co_change_commit = $last_co_change_commit,
-                        last_co_change_at = $last_co_change_at,
-                        mined_at = $mined_at;
-                    "#,
-                )
-                .bind(("file_a", record.file_a))
-                .bind(("file_b", record.file_b))
-                .bind(("co_change_count", record.co_change_count))
-                .bind(("total_commits_a", record.total_commits_a))
-                .bind(("total_commits_b", record.total_commits_b))
-                .bind(("git_coupling", record.git_coupling))
-                .bind(("static_signal", record.static_signal))
-                .bind(("semantic_signal", record.semantic_signal))
-                .bind(("fused_score", record.fused_score))
-                .bind(("coupling_type", record.coupling_type))
-                .bind(("last_co_change_commit", record.last_co_change_commit))
-                .bind(("last_co_change_at", record.last_co_change_at))
-                .bind(("mined_at", record.mined_at))
-                .await
-                .map_err(|err| {
-                    StoreError::Graph(format!("SurrealDB upsert co_change failed: {err}"))
-                })?;
+        if records.is_empty() {
+            return Ok(());
         }
+        let records = serde_json::to_value(records).map_err(|err| {
+            StoreError::Graph(format!("SurrealDB encode co_change batch failed: {err}"))
+        })?;
+        // Replacing a record must not leave a hole when its new value violates a
+        // schema/index constraint. The entire supplied batch shares one transaction.
+        self.db
+            .query(
+                r#"
+                BEGIN TRANSACTION;
+                FOR $record IN $records {
+                    DELETE co_change WHERE file_a = $record.file_a AND file_b = $record.file_b;
+                    CREATE co_change CONTENT $record;
+                };
+                COMMIT TRANSACTION;
+                "#,
+            )
+            .bind(("records", records))
+            .await
+            .and_then(|response| response.check())
+            .map_err(|err| {
+                StoreError::Graph(format!("SurrealDB upsert co_change failed: {err}"))
+            })?;
+
         Ok(())
     }
 
@@ -866,34 +844,46 @@ impl SurrealGraphStore {
             return Ok(());
         }
 
-        self.db
-            .query("DELETE tested_by WHERE test_file = $test_file;")
-            .bind(("test_file", test_file.to_owned()))
-            .await
-            .map_err(|err| StoreError::Graph(format!("SurrealDB clear tested_by failed: {err}")))?;
-
-        for record in records {
-            self.db
-                .query(
-                    r#"
-                    CREATE tested_by SET
-                        target_file = $target_file,
-                        test_file = $test_file,
-                        intent_count = $intent_count,
-                        confidence = $confidence,
-                        inference_method = $inference_method;
-                    "#,
-                )
-                .bind(("target_file", record.target_file.clone()))
-                .bind(("test_file", record.test_file.clone()))
-                .bind(("intent_count", record.intent_count.max(0)))
-                .bind(("confidence", record.confidence.clamp(0.0, 1.0)))
-                .bind(("inference_method", record.inference_method.clone()))
-                .await
-                .map_err(|err| {
-                    StoreError::Graph(format!("SurrealDB insert tested_by failed: {err}"))
-                })?;
+        if records.iter().any(|record| record.test_file != test_file) {
+            return Err(StoreError::Graph(format!(
+                "SurrealDB replace tested_by for {test_file}: every record must name that test file"
+            )));
         }
+        let records = records
+            .iter()
+            .map(|record| TestedByRecord {
+                target_file: record.target_file.clone(),
+                test_file: record.test_file.clone(),
+                intent_count: record.intent_count.max(0),
+                confidence: record.confidence.clamp(0.0, 1.0),
+                inference_method: record.inference_method.clone(),
+            })
+            .collect::<Vec<_>>();
+        let records = serde_json::to_value(records).map_err(|err| {
+            StoreError::Graph(format!(
+                "SurrealDB encode tested_by replacement failed: {err}"
+            ))
+        })?;
+
+        self.db
+            .query(
+                r#"
+                BEGIN TRANSACTION;
+                DELETE tested_by WHERE test_file = $test_file;
+                FOR $record IN $records {
+                    CREATE tested_by CONTENT $record;
+                };
+                COMMIT TRANSACTION;
+                "#,
+            )
+            .bind(("test_file", test_file.to_owned()))
+            .bind(("records", records))
+            .await
+            .and_then(|response| response.check())
+            .map_err(|err| {
+                StoreError::Graph(format!("SurrealDB replace tested_by failed: {err}"))
+            })?;
+
         Ok(())
     }
 
@@ -1039,7 +1029,8 @@ impl GraphStore for SurrealGraphStore {
         let language = symbol.language.clone();
         let signature_fingerprint = symbol.signature_fingerprint.clone();
         let last_seen_at = symbol.last_seen_at;
-        self.db
+        let mut response = self
+            .db
             .query(
                 r#"
                 UPSERT symbol SET
@@ -1052,7 +1043,8 @@ impl GraphStore for SurrealGraphStore {
                     signature_fingerprint = $signature_fingerprint,
                     last_seen_at = $last_seen_at,
                     updated_at = time::now()
-                WHERE symbol_id = $symbol_id;
+                WHERE symbol_id = $symbol_id
+                RETURN VALUE symbol_id;
                 "#,
             )
             .bind(("symbol_id", symbol_id))
@@ -1064,7 +1056,24 @@ impl GraphStore for SurrealGraphStore {
             .bind(("signature_fingerprint", signature_fingerprint))
             .bind(("last_seen_at", last_seen_at))
             .await
+            .and_then(|response| response.check())
             .map_err(|err| StoreError::Graph(format!("SurrealDB upsert symbol failed: {err}")))?;
+        let written_ids: Vec<String> = response.take(0).map_err(|err| {
+            StoreError::Graph(format!(
+                "SurrealDB upsert symbol result decode failed: {err}"
+            ))
+        })?;
+        // SurrealDB can filter an invalid new row in a conditional UPSERT and
+        // return an empty successful result. Receipt of the query is not proof
+        // that the requested node was written.
+        if written_ids.len() != 1
+            || written_ids.first().map(String::as_str) != Some(symbol.id.as_str())
+        {
+            return Err(StoreError::Graph(format!(
+                "SurrealDB upsert symbol {} produced no unique matching node",
+                symbol.id
+            )));
+        }
         Ok(())
     }
 
@@ -1082,20 +1091,21 @@ impl GraphStore for SurrealGraphStore {
         self.db
             .query(
                 r#"
+                BEGIN TRANSACTION;
                 LET $srcs = (SELECT VALUE id FROM symbol WHERE symbol_id = $source_id LIMIT 1);
                 LET $dsts = (SELECT VALUE id FROM symbol WHERE symbol_id = $target_id LIMIT 1);
                 LET $src = array::first($srcs);
                 LET $dst = array::first($dsts);
-                IF $src = NONE OR $dst = NONE {
-                    RETURN NONE;
+                IF $src != NONE AND $dst != NONE {
+                    DELETE depends_on WHERE in = $src AND out = $dst AND file_path = $file_path AND edge_kind = $edge_kind;
+                    RELATE $src->depends_on->$dst SET
+                        edge_kind = $edge_kind,
+                        file_path = $file_path,
+                        source_symbol_id = $source_id,
+                        target_symbol_id = $target_id,
+                        weight = 1.0;
                 };
-                DELETE depends_on WHERE in = $src AND out = $dst AND file_path = $file_path AND edge_kind = $edge_kind;
-                RELATE $src->depends_on->$dst SET
-                    edge_kind = $edge_kind,
-                    file_path = $file_path,
-                    source_symbol_id = $source_id,
-                    target_symbol_id = $target_id,
-                    weight = 1.0;
+                COMMIT TRANSACTION;
                 "#,
             )
             .bind(("source_id", source_id))
@@ -1103,6 +1113,7 @@ impl GraphStore for SurrealGraphStore {
             .bind(("file_path", file_path))
             .bind(("edge_kind", edge_kind))
             .await
+            .and_then(|response| response.check())
             .map_err(|err| StoreError::Graph(format!("SurrealDB upsert edge failed: {err}")))?;
         Ok(())
     }
@@ -1278,7 +1289,7 @@ impl GraphStore for SurrealGraphStore {
             return Ok(Vec::new());
         }
 
-        let mut min_depth = HashMap::<String, u32>::new();
+        let mut min_depth = HashMap::<String, u32>::from([(symbol_id.to_owned(), 0)]);
         let mut frontier = BTreeSet::<String>::new();
         frontier.insert(symbol_id.to_owned());
 
@@ -1298,14 +1309,17 @@ impl GraphStore for SurrealGraphStore {
             let mut next = BTreeSet::<String>::new();
             for edge in edges {
                 let target = edge.target_id;
-                let entry = min_depth.entry(target.clone()).or_insert(current_depth);
-                if *entry == current_depth {
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    min_depth.entry(target.clone())
+                {
+                    entry.insert(current_depth);
                     next.insert(target);
                 }
             }
             frontier = next;
         }
 
+        min_depth.remove(symbol_id);
         if min_depth.is_empty() {
             return Ok(Vec::new());
         }
@@ -1376,6 +1390,7 @@ impl GraphStore for SurrealGraphStore {
             .query("DELETE depends_on WHERE file_path = $file_path;")
             .bind(("file_path", file_path))
             .await
+            .and_then(|response| response.check())
             .map_err(|err| StoreError::Graph(format!("SurrealDB delete edges failed: {err}")))?;
         Ok(())
     }
@@ -2094,3 +2109,7 @@ mod tests {
         assert!(edges.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "tests/surreal_correctness.rs"]
+mod correctness_tests;

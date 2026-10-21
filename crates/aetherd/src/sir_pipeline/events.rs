@@ -593,21 +593,24 @@ impl SirPipeline {
         store: &SqliteStore,
         event: &SymbolChangeEvent,
     ) -> Result<()> {
-        for symbol in &event.removed {
-            // Removal deletes the symbol row and its SIR, so it takes the inject lock the
-            // leaf writers hold: an `aether_sir_inject` call that resolved this symbol
-            // re-checks it exists under that lock and cannot persist a leaf for a symbol
-            // removed underneath it (the `sir` table has no foreign key to catch that).
-            {
-                let _inject_guard = acquire_inject_write_lock(&self.workspace_root)?;
-                store
-                    .mark_removed(&symbol.id)
-                    .with_context(|| format!("failed to mark symbol removed: {}", symbol.id))?;
-            }
-            let _embed_guard = acquire_embed_write_lock(&self.workspace_root, &symbol.id)?;
+        let retired_ids =
+            crate::indexer::reconcile_symbol_event(&self.workspace_root, store, event)?;
+        for symbol_id in &retired_ids {
+            let _embed_guard = acquire_embed_write_lock(&self.workspace_root, symbol_id)?;
             self.runtime
-                .block_on(self.vector_store.delete_embedding(&symbol.id))
-                .with_context(|| format!("failed to remove vector embedding for {}", symbol.id))?;
+                .block_on(self.vector_store.delete_embedding(symbol_id))
+                .with_context(|| format!("failed to remove vector embedding for {symbol_id}"))?;
+        }
+        if !self.skip_surreal_sync && !retired_ids.is_empty() {
+            self.runtime.block_on(async {
+                let graph = open_graph_store(&self.workspace_root)
+                    .await
+                    .context("failed to open graph for retirement cleanup")?;
+                graph
+                    .delete_symbols_batch(&retired_ids)
+                    .await
+                    .context("failed to remove retired graph declarations")
+            })?;
         }
 
         Ok(())

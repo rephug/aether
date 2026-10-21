@@ -914,8 +914,11 @@ mod tests {
         let pre_flight = fs::read_to_string(workspace.join(".claude/commands/pre-flight.md"))
             .expect("read pre-flight command");
         assert!(pre_flight.contains("argument-hint: <task description>"));
-        assert!(pre_flight.contains("aether_sir_context"));
-        assert!(pre_flight.contains("aether_contract_list"));
+        assert!(pre_flight.contains("Call `aether_preflight` first"));
+        assert!(pre_flight.contains("before exploring files"));
+        assert!(pre_flight.contains("without initializing a store"));
+        assert!(!pre_flight.contains("aether_sir_context"));
+        assert!(!pre_flight.contains("aether_contract_list"));
 
         let review = fs::read_to_string(workspace.join(".claude/commands/review.md"))
             .expect("read review command");

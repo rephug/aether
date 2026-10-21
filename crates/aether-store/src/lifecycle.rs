@@ -44,7 +44,7 @@ fn delete_symbol_embeddings_batch(
     }
     Ok(())
 }
-fn delete_symbol_fully(tx: &Transaction<'_>, symbol_id: &str) -> Result<(), StoreError> {
+fn delete_symbol_active_records(tx: &Transaction<'_>, symbol_id: &str) -> Result<(), StoreError> {
     let symbol_id = symbol_id.trim();
     if symbol_id.is_empty() {
         return Ok(());
@@ -103,7 +103,8 @@ fn delete_symbol_records_for_ids(
     }
 
     for symbol_id in &normalized {
-        delete_symbol_fully(tx, symbol_id)?;
+        history::archive_symbol_tx(tx, symbol_id, "snapshot_prune")?;
+        delete_symbol_active_records(tx, symbol_id)?;
     }
 
     Ok(())
@@ -165,6 +166,24 @@ impl SqliteStore {
         if migrations.is_empty() && prunes.is_empty() {
             return Ok((0, 0));
         }
+        let mut old_ids = HashSet::new();
+        let mut new_ids = HashSet::new();
+        for (old_id, new_id) in &migrations {
+            if !old_ids.insert(old_id.clone()) || !new_ids.insert(new_id.clone()) {
+                return Err(StoreError::Compatibility(
+                    "symbol reconciliation requires one-to-one migration candidates".to_owned(),
+                ));
+            }
+        }
+        if old_ids.iter().any(|id| new_ids.contains(id))
+            || prunes
+                .iter()
+                .any(|id| old_ids.contains(id) || new_ids.contains(id))
+        {
+            return Err(StoreError::Compatibility(
+                "symbol reconciliation candidates must not overlap or be pruned".to_owned(),
+            ));
+        }
 
         let mut mirror_writes = Vec::<(String, String)>::new();
         let mut mirror_deletes = Vec::<String>::new();
@@ -183,6 +202,37 @@ impl SqliteStore {
                         "reconciliation target symbol missing from symbols table: {new_id}"
                     )));
                 };
+
+                let identity =
+                    |id: &str| -> Result<(String, String, String, String, String), StoreError> {
+                        tx.query_row(
+                        "SELECT file_path, language, kind, qualified_name, signature_fingerprint FROM symbols WHERE id = ?1",
+                        [id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                    ).map_err(Into::into)
+                    };
+                let old_identity = identity(old_id)?;
+                let new_identity = identity(new_id)?;
+                if old_identity.0 != new_identity.0
+                    || old_identity.1 != new_identity.1
+                    || old_identity.2 != new_identity.2
+                    || old_identity.3 != new_identity.3
+                    || old_identity.4 == new_identity.4
+                {
+                    return Err(StoreError::Compatibility(format!(
+                        "symbol reconciliation is limited to changed-signature candidates sharing file, language, kind and qualified name: {old_id} -> {new_id}"
+                    )));
+                }
+                // Preserve original attribution before contract moves and before
+                // either history branch can be discarded by conflict resolution.
+                let retirement_id =
+                    history::archive_symbol_tx(&tx, old_id, "signature_change_candidate")?
+                        .ok_or_else(|| {
+                            StoreError::Compatibility(format!(
+                                "missing retirement evidence for {old_id}"
+                            ))
+                        })?;
+                history::record_signature_lineage_tx(&tx, retirement_id, old_id, new_id)?;
 
                 let old_sir = load_sir_row_state(&tx, old_id)?;
                 let new_sir = load_sir_row_state(&tx, new_id)?;
@@ -256,7 +306,7 @@ impl SqliteStore {
                         "reconciliation moved intent contracts to new symbol ID"
                     );
                 }
-                delete_symbol_records_for_ids(&tx, std::slice::from_ref(old_id))?;
+                delete_symbol_active_records(&tx, old_id)?;
                 mirror_deletes.push(old_id.clone());
                 migrated_count += 1;
             }
@@ -320,7 +370,8 @@ impl SqliteStore {
         {
             let conn = self.conn.lock().unwrap();
             let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
-            delete_symbol_fully(&tx, symbol_id)?;
+            history::archive_symbol_tx(&tx, symbol_id, "removed")?;
+            delete_symbol_active_records(&tx, symbol_id)?;
             tx.commit()?;
         }
 

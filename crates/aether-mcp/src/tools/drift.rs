@@ -239,6 +239,11 @@ impl AetherMcpServer {
         graph: Option<Arc<SurrealGraphStore>>,
         request: AetherDriftReportRequest,
     ) -> Result<AetherDriftReportResponse, AetherMcpError> {
+        if self.state.read_only {
+            return Err(AetherMcpError::ReadOnly(
+                "Drift analysis is unavailable in read-only mode because it recomputes and persists findings.".to_owned(),
+            ));
+        }
         let analyzer = DriftAnalyzer::new(self.workspace())?;
         let report = if let Some(graph) = graph.as_deref() {
             analyzer.report_with_graph(
@@ -370,6 +375,11 @@ impl AetherMcpServer {
         graph: Option<Arc<SurrealGraphStore>>,
         request: AetherTraceCauseRequest,
     ) -> Result<AetherTraceCauseResponse, AetherMcpError> {
+        if self.state.read_only {
+            return Err(AetherMcpError::ReadOnly(
+                "Causal tracing is unavailable in read-only mode because its graph traversal requires an embedded SurrealDB open; use symbol history and SQLite dependencies separately.".to_owned(),
+            ));
+        }
         let store = self.state.store.as_ref();
         let target_symbol = self.resolve_trace_cause_symbol(store, &request)?;
         let analyzer = CausalAnalyzer::new(self.workspace())?;

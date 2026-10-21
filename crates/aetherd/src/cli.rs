@@ -837,6 +837,20 @@ pub struct TaskRelevanceArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct PreflightArgs {
+    /// Task to investigate; no branch or initialized index is required
+    pub task: String,
+    /// Workspace-relative file or directory to scope candidate selection
+    #[arg(long)]
+    pub scope: Option<String>,
+    /// Serialized UTF-8 bytes / 4 estimate, not a provider tokenizer count
+    #[arg(long, default_value_t = 2500)]
+    pub max_tokens: usize,
+    #[arg(long, default_value = "markdown", value_parser = ["markdown", "json"])]
+    pub format: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct SirContextArgs {
     #[arg(
         help = "Symbol selector: qualified name, symbol ID, or fuzzy search",
@@ -1123,6 +1137,8 @@ pub enum Commands {
     Enhance(EnhanceArgs),
     /// Start, stop, or inspect the Oh My Pi broker + gateway used by inference.provider=omp
     Omp(OmpArgs),
+    /// Assemble a deterministic task map without provider calls or index writes
+    Preflight(PreflightArgs),
     /// Assemble semantic context for a symbol
     SirContext(SirContextArgs),
     /// Inject or update a symbol's SIR annotation
@@ -1649,6 +1665,31 @@ mod tests {
         ]);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn preflight_accepts_task_scope_budget_without_branch() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "preflight",
+            "repair cache",
+            "--scope",
+            "src/cache.rs",
+            "--max-tokens",
+            "2500",
+            "--format",
+            "json",
+        ])
+        .expect("preflight should parse without a branch");
+        match cli.command {
+            Some(Commands::Preflight(args)) => {
+                assert_eq!(args.task, "repair cache");
+                assert_eq!(args.scope.as_deref(), Some("src/cache.rs"));
+                assert_eq!(args.max_tokens, 2500);
+                assert_eq!(args.format, "json");
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
     }
 
     #[test]
