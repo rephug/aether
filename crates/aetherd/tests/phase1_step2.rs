@@ -7,7 +7,10 @@ use std::time::Duration;
 
 use aether_config::{AetherConfig, VerifyConfig, VerifyMode};
 use aether_infer::sir_prompt::SirEnrichmentContext;
-use aether_infer::{InferError, InferenceProvider, Qwen3LocalProvider, SirContext};
+use aether_infer::{
+    EmbeddingProvider, InferError, InferenceProvider, LoadedEmbeddingProvider, LoadedProvider,
+    Qwen3LocalProvider, SirContext,
+};
 use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id, validate_sir};
 use aether_store::{
     SemanticIndexStore, SirHistoryStore, SirStateStore, SqliteStore, SymbolCatalogStore,
@@ -20,6 +23,20 @@ use tempfile::tempdir;
 
 #[derive(Debug, Clone, Copy)]
 struct HashingMockProvider;
+
+#[derive(Debug, Clone)]
+struct DeterministicEmbeddingProvider {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for DeterministicEmbeddingProvider {
+    async fn embed_text(&self, text: &str) -> Result<Vec<f32>, InferError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let checksum = text.bytes().map(u64::from).sum::<u64>();
+        Ok(vec![text.len() as f32, checksum as f32, 1.0])
+    }
+}
 
 #[async_trait::async_trait]
 impl InferenceProvider for HashingMockProvider {
@@ -599,7 +616,6 @@ fn step2_quality_batch_counts_build_failures_and_cleans_touched_rollups()
 }
 
 #[test]
-#[ignore = "requires running local embedding provider"]
 fn step2_embeddings_refresh_when_hash_changes_and_delete_on_symbol_removal()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;
@@ -614,13 +630,22 @@ fn step2_embeddings_refresh_when_hash_changes_and_delete_on_symbol_removal()
     observer.seed_from_disk()?;
 
     let store = SqliteStore::open(workspace)?;
-    let provider: Arc<dyn InferenceProvider> = Arc::new(HashingMockProvider);
-    let pipeline = SirPipeline::new_with_provider(
+    let embedding_calls = Arc::new(AtomicUsize::new(0));
+    let pipeline = SirPipeline::new_with_loaded_providers(
         workspace.to_path_buf(),
         1,
-        provider,
-        "hashing_mock",
-        "hashing_mock",
+        LoadedProvider {
+            provider: Box::new(HashingMockProvider),
+            provider_name: "hashing_mock".to_owned(),
+            model_name: "hashing_mock".to_owned(),
+        },
+        Some(LoadedEmbeddingProvider {
+            provider: Box::new(DeterministicEmbeddingProvider {
+                calls: embedding_calls.clone(),
+            }),
+            provider_name: "deterministic_embedding".to_owned(),
+            model_name: "fixture-v1".to_owned(),
+        }),
     )?;
 
     let mut sink = Vec::new();
@@ -637,12 +662,26 @@ fn step2_embeddings_refresh_when_hash_changes_and_delete_on_symbol_removal()
     let embedding_meta = store
         .get_symbol_embedding_meta(&symbol.id)?
         .expect("embedding metadata should exist");
+    assert_eq!(embedding_meta.provider, "deterministic_embedding");
+    assert_eq!(embedding_meta.model, "fixture-v1");
+    assert_eq!(embedding_meta.embedding_dim, 3);
+    let initial_calls = embedding_calls.load(Ordering::SeqCst);
+    assert!(initial_calls > 0, "the supplied embedding provider ran");
+    let initial_vector = store.list_symbol_embeddings_for_ids(
+        "deterministic_embedding",
+        "fixture-v1",
+        std::slice::from_ref(&symbol.id),
+    )?[0]
+        .embedding
+        .clone();
 
+    // A vector from an obsolete provider/model must not suppress the new provider
+    // merely because a row already exists for the declaration.
     store.upsert_symbol_embedding(SymbolEmbeddingRecord {
         symbol_id: symbol.id.clone(),
         sir_hash: "stale-hash".to_owned(),
-        provider: "hashing_mock".to_owned(),
-        model: "hashing_mock".to_owned(),
+        provider: "obsolete_provider".to_owned(),
+        model: "obsolete_model".to_owned(),
         embedding: vec![1.0, 0.0, 0.0],
         updated_at: embedding_meta.updated_at.saturating_sub(1),
     })?;
@@ -657,9 +696,28 @@ fn step2_embeddings_refresh_when_hash_changes_and_delete_on_symbol_removal()
         .get_symbol_embedding_meta(&symbol.id)?
         .expect("embedding metadata after refresh");
     assert_ne!(refreshed_meta.sir_hash, "stale-hash");
-    assert_eq!(refreshed_meta.provider, "hashing_mock");
-    assert_eq!(refreshed_meta.model, "hashing_mock");
-    assert!(refreshed_meta.embedding_dim > 0);
+    assert_ne!(refreshed_meta.sir_hash, embedding_meta.sir_hash);
+    assert_eq!(refreshed_meta.provider, "deterministic_embedding");
+    assert_eq!(refreshed_meta.model, "fixture-v1");
+    assert_eq!(refreshed_meta.embedding_dim, 3);
+    assert!(embedding_calls.load(Ordering::SeqCst) > initial_calls);
+    assert!(
+        store
+            .list_symbol_embeddings_for_ids(
+                "obsolete_provider",
+                "obsolete_model",
+                std::slice::from_ref(&symbol.id),
+            )?
+            .is_empty()
+    );
+    let refreshed_vector = store.list_symbol_embeddings_for_ids(
+        "deterministic_embedding",
+        "fixture-v1",
+        std::slice::from_ref(&symbol.id),
+    )?[0]
+        .embedding
+        .clone();
+    assert_ne!(refreshed_vector, initial_vector);
 
     fs::write(&rust_file, "")?;
     let removal_event = observer
@@ -669,6 +727,10 @@ fn step2_embeddings_refresh_when_hash_changes_and_delete_on_symbol_removal()
 
     let after_remove = store.get_symbol_embedding_meta(&symbol.id)?;
     assert!(after_remove.is_none());
+    assert!(
+        !store.list_all_embedding_symbol_ids()?.contains(&symbol.id),
+        "removal clears every provider identity for the declaration"
+    );
 
     Ok(())
 }

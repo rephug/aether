@@ -168,7 +168,11 @@ impl AetherMcpServer {
             min_risk: request.min_risk.unwrap_or(0.0),
         };
 
-        let report = if self.state.config.storage.graph_backend == GraphBackend::Surreal {
+        let mut report = if self.state.read_only {
+            analyzer
+                .analyze_with_handles(&analysis_request, self.state.store.as_ref(), None)
+                .await?
+        } else if self.state.config.storage.graph_backend == GraphBackend::Surreal {
             match self.state.surreal_graph_for_health().await {
                 Ok(graph) => {
                     analyzer
@@ -180,6 +184,10 @@ impl AetherMcpServer {
         } else {
             analyzer.analyze(&analysis_request).await?
         };
+
+        if self.state.read_only {
+            report.notes.push("Read-only mode: embedded SurrealDB analytics are unavailable; use SQLite dependency and test-intent tools for structural evidence.".to_owned());
+        }
 
         Ok(AetherHealthResponse {
             schema_version: report.schema_version,
@@ -278,7 +286,11 @@ impl AetherMcpServer {
         let max_score = request.max_score.unwrap_or(75).min(100);
         let semantic = request.semantic.unwrap_or(true);
         let report = self.compute_health_score_report(semantic, &[]).await?;
-        Ok(format_hotspots_text(&report, limit, max_score))
+        let mut rendered = format_hotspots_text(&report, limit, max_score);
+        if semantic && self.state.read_only {
+            rendered.push_str("\n\nRead-only mode: SurrealDB semantic signals are unavailable; scores use source structure.");
+        }
+        Ok(rendered)
     }
 
     pub async fn aether_health_explain_logic(
@@ -305,12 +317,16 @@ impl AetherMcpServer {
         };
 
         let split_outcome = if crate_score.score <= 50 {
-            if semantic {
+            if semantic && !self.state.read_only {
                 self.split_suggestion_for_crate(crate_score).await
             } else {
                 HealthExplainSplitOutcome {
                     status: "skipped".to_owned(),
-                    message: Some("split suggestion skipped because semantic=false".to_owned()),
+                    message: Some(if self.state.read_only {
+                        "split suggestion unavailable in read-only mode".to_owned()
+                    } else {
+                        "split suggestion skipped because semantic=false".to_owned()
+                    }),
                     suggestion: None,
                     diagnostics: None,
                 }
@@ -327,6 +343,9 @@ impl AetherMcpServer {
         let mut rendered = format_crate_explanation(crate_score, split_outcome.suggestion.as_ref());
         if crate_score.score <= 50 {
             append_split_outcome_text(&mut rendered, &split_outcome);
+        }
+        if semantic && self.state.read_only {
+            rendered.push_str("\n\nRead-only mode: SurrealDB semantic signals are unavailable; scores use source structure.");
         }
         Ok(rendered)
     }
@@ -372,6 +391,9 @@ impl AetherMcpServer {
     }
 
     async fn load_health_semantic_input(&self) -> Result<Option<SemanticInput>, AetherMcpError> {
+        if self.state.read_only {
+            return Ok(None);
+        }
         let analyzer = aether_analysis::HealthAnalyzer::new(self.workspace())?;
         let centrality = analyzer.centrality_by_file().await?;
         if centrality.files.is_empty() && !centrality.notes.is_empty() {

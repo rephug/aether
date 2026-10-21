@@ -1,4 +1,6 @@
-use aether_store::{SirHistorySelector, SirHistoryStore};
+use std::collections::BTreeMap;
+
+use aether_store::{SirHistorySelector, SirHistoryStore, SymbolHistoryStore};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -10,6 +12,9 @@ use crate::AetherMcpError;
 pub struct AetherSymbolTimelineRequest {
     pub symbol_id: String,
     pub limit: Option<u32>,
+    /// Include archived row bodies for retired incarnations. The default returns
+    /// their identities and per-table counts without duplicating large SIR bodies.
+    pub include_retired_evidence: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -29,6 +34,20 @@ pub struct AetherSymbolTimelineResponse {
     pub found: bool,
     pub result_count: u32,
     pub timeline: Vec<AetherSymbolTimelineEntry>,
+    pub retirements: Vec<AetherSymbolRetirement>,
+    pub lineage: Vec<Value>,
+    pub retention_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherSymbolRetirement {
+    pub retirement_id: i64,
+    pub retired_at: i64,
+    pub reason: String,
+    pub source_hash: Option<String>,
+    pub symbol: Option<Value>,
+    pub evidence_counts: BTreeMap<String, usize>,
+    pub evidence: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -131,6 +150,9 @@ impl AetherMcpServer {
                 found: false,
                 result_count: 0,
                 timeline: Vec::new(),
+                retirements: Vec::new(),
+                lineage: Vec::new(),
+                retention_available: false,
             });
         }
 
@@ -141,6 +163,9 @@ impl AetherMcpServer {
                 found: false,
                 result_count: 0,
                 timeline: Vec::new(),
+                retirements: Vec::new(),
+                lineage: Vec::new(),
+                retention_available: false,
             });
         }
 
@@ -163,13 +188,49 @@ impl AetherMcpServer {
             })
             .collect::<Vec<_>>();
         let result_count = timeline.len() as u32;
+        let mut retirements = store.list_symbol_retirements(symbol_id)?;
+        let omitted = retirements.len().saturating_sub(limit as usize);
+        retirements.drain(..omitted);
+        let retirements = retirements
+            .into_iter()
+            .map(|record| {
+                Ok(AetherSymbolRetirement {
+                    retirement_id: record.retirement_id,
+                    retired_at: record.retired_at,
+                    reason: record.reason,
+                    source_hash: record.source_hash,
+                    symbol: record.symbol.map(serde_json::to_value).transpose()?,
+                    evidence_counts: record
+                        .evidence
+                        .iter()
+                        .map(|(table, rows)| (table.clone(), rows.len()))
+                        .collect(),
+                    evidence: request
+                        .include_retired_evidence
+                        .unwrap_or(false)
+                        .then(|| serde_json::to_value(record.evidence))
+                        .transpose()?,
+                })
+            })
+            .collect::<Result<Vec<_>, serde_json::Error>>()?;
+        let mut lineage = store.list_symbol_lineage(symbol_id)?;
+        let omitted = lineage.len().saturating_sub(limit as usize);
+        lineage.drain(..omitted);
+        let lineage = lineage
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(AetherSymbolTimelineResponse {
             symbol_id: symbol_id.to_owned(),
             limit,
-            found: result_count > 0,
+            found: result_count > 0 || !retirements.is_empty() || !lineage.is_empty(),
             result_count,
             timeline,
+            retirements,
+            lineage,
+            retention_available: self.state.schema_version.version
+                >= aether_store::CORE_SCHEMA_VERSION,
         })
     }
 

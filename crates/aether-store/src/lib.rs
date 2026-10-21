@@ -24,6 +24,7 @@ mod contracts;
 mod embeddings;
 mod fingerprint_history;
 mod graph;
+mod history;
 mod language_family;
 mod lexical;
 mod lifecycle;
@@ -72,6 +73,10 @@ pub use graph::{
     SymbolNeighborRecord, TestedByRecord, UpstreamDependencyEdgeRecord,
     UpstreamDependencyNodeRecord, UpstreamDependencyTraversal,
 };
+pub use history::{
+    ArchivedEvidence, SymbolHistoryStore, SymbolLineageRecord, SymbolRetirementRecord,
+    SymbolRetirementSummary,
+};
 pub use language_family::{
     EDGE_FILE_LANGUAGE_CTE, edge_source_family_matches_sql, same_language_family_sql,
 };
@@ -112,6 +117,9 @@ pub(crate) use symbols::{
 };
 
 const SYMBOL_ACCESS_COUNTER_MAX: i64 = i64::MAX;
+/// Highest core schema supported by this build. Read-only clients may open older
+/// schemas; writable opening performs transactional forward migrations.
+pub const CORE_SCHEMA_VERSION: u32 = 22;
 const SYMBOL_ACCESS_DEBOUNCE_SECONDS: u64 = 60;
 const SQLITE_PARAM_CHUNK: usize = 900;
 const RECONCILE_PARAM_CHUNK: usize = 500;
@@ -364,6 +372,7 @@ pub trait Store:
     + SymbolRelationStore
     + SirStateStore
     + SirHistoryStore
+    + SymbolHistoryStore
     + SnapshotStore
     + SemanticIndexStore
     + ThresholdStore
@@ -381,6 +390,7 @@ impl<T> Store for T where
         + SymbolRelationStore
         + SirStateStore
         + SirHistoryStore
+        + SymbolHistoryStore
         + SnapshotStore
         + SemanticIndexStore
         + ThresholdStore

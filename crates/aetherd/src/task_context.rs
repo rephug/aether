@@ -6,11 +6,14 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use aether_core::normalize_path;
-use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_config};
+use aether_infer::{
+    EmbeddingProviderOverrides, EmbeddingPurpose, LoadedEmbeddingProvider,
+    load_embedding_provider_from_config,
+};
 use aether_store::{
-    CouplingEdgeRecord, GraphDependencyEdgeRecord, SemanticIndexStore, SqliteStore,
-    SurrealGraphStore, SymbolCatalogStore, SymbolSearchResult, TaskContextHistoryRecord,
-    block_on_store_future, open_surreal_graph_store_readonly,
+    CouplingEdgeRecord, GraphDependencyEdgeRecord, SqliteStore, SurrealGraphStore,
+    SymbolCatalogStore, SymbolSearchResult, TaskContextHistoryRecord, block_on_store_future,
+    open_surreal_graph_store_readonly, open_vector_store,
 };
 use anyhow::{Context, Result, anyhow};
 use gix::bstr::ByteSlice;
@@ -46,15 +49,6 @@ struct BranchDiffResolution {
     symbol_ids: Vec<String>,
     file_paths: Vec<String>,
     notices: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct SparseCandidate {
-    qualified_name: String,
-    file_path: String,
-    matched_tokens: HashSet<String>,
-    best_match_class: usize,
-    best_rank: usize,
 }
 
 fn embedding_runtime() -> &'static tokio::runtime::Runtime {
@@ -125,7 +119,23 @@ fn dense_retrieval_with_notice(
         }
     };
 
-    let embedding = match block_on_runtime(loaded.provider.embed_text(task_description)) {
+    dense_retrieval_with_provider(workspace, store, task_description, limit, &loaded)
+}
+
+fn dense_retrieval_with_provider(
+    workspace: &Path,
+    store: &SqliteStore,
+    task_description: &str,
+    limit: u32,
+    loaded: &LoadedEmbeddingProvider,
+) -> Result<DenseRetrievalResult> {
+    let vector_store = block_on_runtime(open_vector_store(workspace))
+        .context("failed to open configured vector store for task ranking")?;
+    let embedding = match block_on_runtime(
+        loaded
+            .provider
+            .embed_text_with_purpose(task_description, EmbeddingPurpose::Query),
+    ) {
         Ok(embedding) if !embedding.is_empty() => embedding,
         Ok(_) => {
             return Ok((
@@ -146,21 +156,32 @@ fn dense_retrieval_with_notice(
         }
     };
 
-    let results = store
-        .search_symbols_semantic(
-            embedding.as_slice(),
-            loaded.provider_name.as_str(),
-            loaded.model_name.as_str(),
-            limit,
-        )
-        .context("failed to search symbols semantically for task ranking")?;
-    Ok((
-        results
-            .into_iter()
-            .map(|row| (row.symbol_id, row.semantic_score))
-            .collect(),
-        None,
+    let results = block_on_runtime(vector_store.search_nearest(
+        embedding.as_slice(),
+        loaded.provider_name.as_str(),
+        loaded.model_name.as_str(),
+        limit,
     ))
+    .context("failed to search configured vector store for task ranking")?;
+    let mut ranked = Vec::with_capacity(results.len());
+    for row in results {
+        // A vector projection may lag a deletion; never seed a task map with a
+        // symbol that is no longer present in the authoritative catalog.
+        if store
+            .get_symbol_record(&row.symbol_id)
+            .context("failed to check dense task candidate against symbol catalog")?
+            .is_some()
+        {
+            ranked.push((row.symbol_id, row.semantic_score));
+        }
+    }
+    let notice = ranked.is_empty().then(|| {
+        format!(
+            "configured vector store has no matching embeddings for {}/{}; running sparse-only task ranking",
+            loaded.provider_name, loaded.model_name
+        )
+    });
+    Ok((ranked, notice))
 }
 
 pub fn sparse_retrieval(
@@ -169,51 +190,20 @@ pub fn sparse_retrieval(
     limit: u32,
 ) -> Result<Vec<(String, usize)>> {
     let keywords = extract_keywords(task_description);
-    if keywords.is_empty() {
+    if keywords.is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
 
-    let per_term_limit = limit.max(10);
-    let mut candidates: HashMap<String, SparseCandidate> = HashMap::new();
-    for token in &keywords {
-        let matches = store
-            .search_symbols(token.as_str(), per_term_limit)
-            .with_context(|| format!("failed to search symbols for token '{token}'"))?;
-        for (rank, candidate) in matches.into_iter().enumerate() {
-            let match_class = classify_sparse_match(&candidate, token.as_str());
-            let entry = candidates
-                .entry(candidate.symbol_id.clone())
-                .or_insert_with(|| SparseCandidate {
-                    qualified_name: candidate.qualified_name.clone(),
-                    file_path: candidate.file_path.clone(),
-                    matched_tokens: HashSet::new(),
-                    best_match_class: usize::MAX,
-                    best_rank: usize::MAX,
-                });
-            entry.matched_tokens.insert(token.clone());
-            entry.best_match_class = entry.best_match_class.min(match_class);
-            entry.best_rank = entry.best_rank.min(rank + 1);
-        }
-    }
-
-    let mut ranked = candidates.into_iter().collect::<Vec<_>>();
-    ranked.sort_by(|(left_id, left), (right_id, right)| {
-        right
-            .matched_tokens
-            .len()
-            .cmp(&left.matched_tokens.len())
-            .then_with(|| left.best_match_class.cmp(&right.best_match_class))
-            .then_with(|| left.best_rank.cmp(&right.best_rank))
-            .then_with(|| left.qualified_name.cmp(&right.qualified_name))
-            .then_with(|| left.file_path.cmp(&right.file_path))
-            .then_with(|| left_id.cmp(right_id))
-    });
-
-    Ok(ranked
+    // Rank across the complete catalog before applying the limit. Taking a
+    // separate alphabetic prefix for each word loses multi-term matches in
+    // larger repositories and admits accidental matches through hash IDs.
+    let matches = store
+        .search_symbols_by_terms(&keywords, limit)
+        .context("failed to rank symbol names and paths for task context")?;
+    Ok(matches
         .into_iter()
-        .take(limit as usize)
         .enumerate()
-        .map(|(index, (symbol_id, _))| (symbol_id, index + 1))
+        .map(|(index, row)| (row.symbol_id, index + 1))
         .collect())
 }
 
@@ -637,52 +627,6 @@ fn extract_keywords(task_description: &str) -> Vec<String> {
     keywords
 }
 
-fn classify_sparse_match(candidate: &SymbolSearchResult, token: &str) -> usize {
-    let token = token.trim().to_ascii_lowercase();
-    let qualified_name = candidate.qualified_name.to_ascii_lowercase();
-    let file_path = candidate.file_path.to_ascii_lowercase();
-    let leaf = leaf_name(candidate.qualified_name.as_str()).to_ascii_lowercase();
-    if leaf == token {
-        return 0;
-    }
-    if split_qualified_name(candidate.qualified_name.as_str())
-        .into_iter()
-        .any(|segment| segment.starts_with(token.as_str()))
-    {
-        return 1;
-    }
-    if qualified_name.contains(token.as_str()) {
-        return 2;
-    }
-    if file_path.contains(token.as_str()) {
-        return 3;
-    }
-    if candidate.language.eq_ignore_ascii_case(token.as_str())
-        || candidate.kind.eq_ignore_ascii_case(token.as_str())
-    {
-        return 4;
-    }
-    5
-}
-
-fn leaf_name(qualified_name: &str) -> &str {
-    qualified_name
-        .rsplit("::")
-        .next()
-        .or_else(|| qualified_name.rsplit('.').next())
-        .unwrap_or(qualified_name)
-}
-
-fn split_qualified_name(qualified_name: &str) -> Vec<String> {
-    qualified_name
-        .replace("::", ".")
-        .split('.')
-        .map(str::trim)
-        .filter(|segment| !segment.is_empty())
-        .map(|segment| segment.to_ascii_lowercase())
-        .collect()
-}
-
 fn changed_paths_between_refs(
     workspace: &Path,
     old_ref: &str,
@@ -881,6 +825,109 @@ vector_backend = "sqlite"
             .expect("git stdout utf8")
             .trim()
             .to_owned()
+    }
+
+    #[test]
+    fn sparse_retrieval_ranks_joint_matches_before_alphabetic_prefixes() -> Result<()> {
+        let temp = tempdir()?;
+        let store = SqliteStore::open(temp.path())?;
+        for index in 0..40 {
+            upsert_symbol(
+                &store,
+                &format!("auth-{index:02}"),
+                "src/auth.rs",
+                &format!("Alpha{index:02}::login"),
+            );
+            upsert_symbol(
+                &store,
+                &format!("cache-{index:02}"),
+                "src/cache.rs",
+                &format!("Beta{index:02}::refresh"),
+            );
+        }
+        upsert_symbol(&store, "both", "src/auth_cache.rs", "Zulu::auth_cache");
+        // This ID is a hash-like accidental token match, rather than a
+        // relevant name or path.
+        upsert_symbol(
+            &store,
+            "auth-cache-noise",
+            "src/other.rs",
+            "Aardvark::other",
+        );
+        let ranked = sparse_retrieval(&store, "repair auth cache", 1)?;
+        assert_eq!(ranked, vec![("both".to_owned(), 1)]);
+        Ok(())
+    }
+
+    #[test]
+    fn dense_task_retrieval_uses_query_purpose_and_configured_backend() -> Result<()> {
+        use std::sync::{Arc, Mutex};
+
+        use aether_config::{EmbeddingVectorBackend, load_workspace_config, save_workspace_config};
+        use aether_infer::{EmbeddingProvider, InferError};
+        use aether_store::{SemanticIndexStore, SymbolEmbeddingRecord};
+        use async_trait::async_trait;
+
+        struct RecordingProvider(Arc<Mutex<Vec<EmbeddingPurpose>>>);
+
+        #[async_trait]
+        impl EmbeddingProvider for RecordingProvider {
+            async fn embed_text(&self, _text: &str) -> std::result::Result<Vec<f32>, InferError> {
+                panic!("task queries must request an explicit embedding purpose");
+            }
+
+            async fn embed_text_with_purpose(
+                &self,
+                _text: &str,
+                purpose: EmbeddingPurpose,
+            ) -> std::result::Result<Vec<f32>, InferError> {
+                self.0
+                    .lock()
+                    .expect("record embedding purposes")
+                    .push(purpose);
+                Ok(vec![1.0, 0.0])
+            }
+        }
+
+        let temp = tempdir()?;
+        let workspace = temp.path();
+        write_test_config(workspace);
+        let mut config = load_workspace_config(workspace)?;
+        config.embeddings.vector_backend = EmbeddingVectorBackend::Lancedb;
+        save_workspace_config(workspace, &config)?;
+        let store = SqliteStore::open(workspace)?;
+        upsert_symbol(&store, "lance-target", "src/lance.rs", "Lance::target");
+        upsert_symbol(&store, "sqlite-decoy", "src/sqlite.rs", "Sqlite::decoy");
+
+        let vector_store = block_on_runtime(open_vector_store(workspace))?;
+        let vector = |symbol_id: &str| SymbolEmbeddingRecord {
+            symbol_id: symbol_id.to_owned(),
+            sir_hash: "hash".to_owned(),
+            provider: "recording".to_owned(),
+            model: "two-dim".to_owned(),
+            embedding: vec![1.0, 0.0],
+            updated_at: 1,
+        };
+        block_on_runtime(vector_store.upsert_embedding(vector("lance-target")))?;
+        // Seed SQLite only after the isolated test store's one-time Lance
+        // migration marker exists, so choosing the wrong backend is visible.
+        store.upsert_symbol_embedding(vector("sqlite-decoy"))?;
+        let purposes = Arc::new(Mutex::new(Vec::new()));
+        let provider = LoadedEmbeddingProvider {
+            provider: Box::new(RecordingProvider(Arc::clone(&purposes))),
+            provider_name: "recording".to_owned(),
+            model_name: "two-dim".to_owned(),
+        };
+        let (ranked, notice) =
+            dense_retrieval_with_provider(workspace, &store, "task", 5, &provider)?;
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].0, "lance-target");
+        assert_eq!(notice, None);
+        assert_eq!(
+            *purposes.lock().expect("read purposes"),
+            vec![EmbeddingPurpose::Query]
+        );
+        Ok(())
     }
 
     #[test]

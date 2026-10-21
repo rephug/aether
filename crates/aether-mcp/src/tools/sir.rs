@@ -206,16 +206,29 @@ impl AetherMcpServer {
         }
 
         let store = self.state.store.as_ref();
-        store.increment_symbol_access(&[symbol_id.to_owned()], current_unix_timestamp_millis())?;
+        if !self.state.read_only {
+            store.increment_symbol_access(
+                &[symbol_id.to_owned()],
+                current_unix_timestamp_millis(),
+            )?;
+        }
         let meta = store.get_sir_meta(symbol_id)?;
         let (sir_status, last_error, last_attempt_at) = meta_status_fields(meta.as_ref());
         let sir_blob = store.read_sir_blob(symbol_id)?;
 
         let Some(sir_blob) = sir_blob else {
             let structural = build_structural_view(store, symbol_id)?;
-            if structural.is_some() {
-                let _ = store.enqueue_sir_request(symbol_id);
-            }
+            let queued = if structural.is_some() && !self.state.read_only {
+                match store.enqueue_sir_request(symbol_id) {
+                    Ok(()) => true,
+                    Err(err) => {
+                        tracing::warn!(symbol_id, error = %err, "failed to queue missing SIR");
+                        false
+                    }
+                }
+            } else {
+                false
+            };
             return Ok(AetherGetSirResponse {
                 found: false,
                 level: SirLevel::Leaf.into(),
@@ -226,9 +239,8 @@ impl AetherMcpServer {
                 files_total: None,
                 sir_json: String::new(),
                 sir_hash: String::new(),
-                sir_status: structural
-                    .as_ref()
-                    .map(|_| SIR_STATUS_GENERATING.to_owned())
+                sir_status: queued
+                    .then(|| SIR_STATUS_GENERATING.to_owned())
                     .or(sir_status),
                 structural,
                 last_error,
@@ -587,7 +599,7 @@ impl AetherMcpServer {
             &symbol.qualified_name,
             &symbol.signature_fingerprint,
         );
-        if self.sqlite_path().exists() {
+        if self.sqlite_path().exists() && !self.state.read_only {
             let store = self.state.store.as_ref();
             store.increment_symbol_access(
                 std::slice::from_ref(&symbol_id),

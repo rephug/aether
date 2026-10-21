@@ -54,7 +54,7 @@ pub struct TemplateContext {
     pub mcp_binary_hint: String,
 }
 
-pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 40] = [
+pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 41] = [
     ("aether_status", "Get AETHER local store status"),
     (
         "aether_symbol_lookup",
@@ -134,6 +134,10 @@ pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 40] = [
     (
         "aether_sir_inject",
         "Inject or update a symbol's complete SIR annotation, including intent, behavior, edge_cases, side_effects, dependencies, error_modes, inputs, outputs, complexity, confidence, and model provenance",
+    ),
+    (
+        "aether_preflight",
+        "Assemble a deterministic provider-free task map with dependencies, reverse impact, recorded history, risks and tests",
     ),
     (
         "aether_sir_context",
@@ -408,21 +412,12 @@ mod tests {
         let context = sample_context();
         let pre_flight = PreFlightCommandTemplate::render(&context);
         assert!(pre_flight.starts_with("---\nargument-hint: <task description>\ndescription: "));
-        for tool in [
-            "aether_search",
-            "aether_sir_context",
-            "aether_get_sir",
-            "aether_dependencies",
-            "aether_usage_matrix",
-            "aether_health_hotspots",
-            "aether_health_explain",
-            "aether_contract_list",
-        ] {
-            assert!(
-                pre_flight.contains(&format!("`{tool}`")),
-                "/pre-flight {tool}"
-            );
-        }
+        assert!(pre_flight.contains("`aether_preflight`"));
+        assert!(pre_flight.contains("Read the returned `map.context` before exploring files"));
+        assert!(pre_flight.contains("source-only"));
+        assert!(pre_flight.contains("requires no branch name"));
+        assert!(!pre_flight.contains("`aether_search`"));
+        assert!(!pre_flight.contains("`aether_sir_context`"));
         assert!(pre_flight.contains("**Recommended approach:**"));
 
         let review = ReviewCommandTemplate::render(&context);
@@ -474,6 +469,22 @@ mod tests {
             assert!(rendered.contains("doesn't edit files or inject SIRs"));
         }
         assert!(!review.contains("`aether_refactor_prep`"));
+    }
+
+    #[test]
+    fn preflight_command_receives_one_map_before_exploration() {
+        let command = PreFlightCommandTemplate::render(&sample_context());
+        let assembled = command
+            .find("Call `aether_preflight` first")
+            .expect("assembled map");
+        let explore = command
+            .find("Use the map's investigation order")
+            .expect("exploration");
+        assert!(assembled < explore);
+        assert!(command.contains("without initializing a store"));
+        assert!(command.contains("must not run enrichment or make model/provider calls"));
+        assert!(command.contains("continue\nordinary repository exploration"));
+        assert!(command.contains("Do not initialize, reindex or enrich as a fallback"));
     }
 
     #[test]
@@ -765,7 +776,7 @@ mod tests {
 
     #[test]
     fn tool_descriptions_include_enhance_prompt_tool() {
-        assert_eq!(TOOL_DESCRIPTIONS.len(), 40);
+        assert_eq!(TOOL_DESCRIPTIONS.len(), 41);
         assert!(
             TOOL_DESCRIPTIONS
                 .iter()

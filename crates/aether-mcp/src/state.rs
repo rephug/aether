@@ -135,6 +135,7 @@ impl SharedState {
     /// opening another connection. `None` when embeddings are disabled or no provider is
     /// configured; a load that fails is not cached, so the next call retries it.
     pub fn embedding_pipeline(&self) -> Result<Option<Arc<SirPipeline>>, AetherMcpError> {
+        self.require_writable()?;
         let Some(vector_store) = self.vector_store.clone() else {
             return Ok(None);
         };
@@ -177,7 +178,7 @@ impl SharedState {
             None => true,
         };
         let store = Arc::new(SqliteStore::open(&workspace)?);
-        store.check_compatibility("core", 21)?;
+        store.check_compatibility("core", aether_store::CORE_SCHEMA_VERSION)?;
         let graph = open_shared_graph(&workspace, &config, false)?;
         let surreal_graph = Arc::new(Mutex::new(None));
         let vector_store = open_vector_store_sync_optional(&workspace, &config)?;
@@ -208,7 +209,7 @@ impl SharedState {
             None => true,
         };
         let store = Arc::new(SqliteStore::open(&workspace)?);
-        store.check_compatibility("core", 21)?;
+        store.check_compatibility("core", aether_store::CORE_SCHEMA_VERSION)?;
         let graph = open_shared_graph(&workspace, &config, false)?;
         // SurrealDB opens on first use (or `warm_surreal_graph`): an open can take seconds on
         // a busy machine, and an MCP client gives up on a slow startup.
@@ -232,7 +233,7 @@ impl SharedState {
 
     pub async fn open_readonly_async(workspace: &Path) -> Result<Self, AetherMcpError> {
         let workspace = workspace.canonicalize()?;
-        ensure_workspace_store_ready(&workspace)?;
+        ensure_workspace_store_exists(&workspace)?;
         let config = Arc::new(load_config(&workspace)?);
         let semantic_search_available = match semantic_search_unavailability(config.as_ref()) {
             Some(unavailability) => {
@@ -242,11 +243,12 @@ impl SharedState {
             None => true,
         };
         let store = Arc::new(SqliteStore::open_readonly(&workspace)?);
-        store.check_compatibility("core", 21)?;
+        store.check_compatibility("core", aether_store::CORE_SCHEMA_VERSION)?;
         let graph = open_shared_graph(&workspace, &config, true)?;
-        // SurrealDB opens on first use, as in `open_readwrite_async`.
+        // Embedded SurrealDB has no verified read-only open; use SQLite graph reads.
         let surreal_graph = Arc::new(Mutex::new(None));
-        let vector_store = open_vector_store_async_optional(&workspace, &config).await?;
+        let vector_store = open_vector_store_readonly_optional(&workspace, &config)?;
+        let semantic_search_available = semantic_search_available && vector_store.is_some();
         let schema_version = store.get_schema_version()?;
 
         Ok(Self {
@@ -265,7 +267,7 @@ impl SharedState {
 
     pub fn open_readonly(workspace: &Path) -> Result<Self, AetherMcpError> {
         let workspace = workspace.canonicalize()?;
-        ensure_workspace_store_ready(&workspace)?;
+        ensure_workspace_store_exists(&workspace)?;
         let config = Arc::new(load_config(&workspace)?);
         let semantic_search_available = match semantic_search_unavailability(config.as_ref()) {
             Some(unavailability) => {
@@ -275,10 +277,11 @@ impl SharedState {
             None => true,
         };
         let store = Arc::new(SqliteStore::open_readonly(&workspace)?);
-        store.check_compatibility("core", 21)?;
+        store.check_compatibility("core", aether_store::CORE_SCHEMA_VERSION)?;
         let graph = open_shared_graph(&workspace, &config, true)?;
         let surreal_graph = Arc::new(Mutex::new(None));
-        let vector_store = open_vector_store_sync_optional(&workspace, &config)?;
+        let vector_store = open_vector_store_readonly_optional(&workspace, &config)?;
+        let semantic_search_available = semantic_search_available && vector_store.is_some();
         let schema_version = store.get_schema_version()?;
 
         Ok(Self {
@@ -305,6 +308,11 @@ impl SharedState {
     }
 
     pub async fn surreal_graph(&self) -> Result<Arc<SurrealGraphStore>, AetherMcpError> {
+        if self.read_only {
+            return Err(AetherMcpError::ReadOnly(
+                "Embedded SurrealDB analytics are unavailable in read-only mode; SQLite symbol and dependency reads remain available.".to_owned(),
+            ));
+        }
         if !matches!(
             self.config.storage.graph_backend,
             GraphBackend::Surreal | GraphBackend::Cozo
@@ -319,11 +327,7 @@ impl SharedState {
             return Ok(existing.clone());
         }
 
-        let graph = Arc::new(if self.read_only {
-            SurrealGraphStore::open_readonly(&self.workspace).await?
-        } else {
-            SurrealGraphStore::open(&self.workspace).await?
-        });
+        let graph = Arc::new(SurrealGraphStore::open(&self.workspace).await?);
         *guard = Some(graph.clone());
         Ok(graph)
     }
@@ -335,10 +339,12 @@ impl SharedState {
     /// Opens the SurrealDB graph in the background, so the first tool that needs it does not
     /// wait for the whole open. A tool that arrives first waits for this open to finish.
     pub fn warm_surreal_graph(self: &Arc<Self>) {
-        if !matches!(
-            self.config.storage.graph_backend,
-            GraphBackend::Surreal | GraphBackend::Cozo
-        ) {
+        if self.read_only
+            || !matches!(
+                self.config.storage.graph_backend,
+                GraphBackend::Surreal | GraphBackend::Cozo
+            )
+        {
             return;
         }
         let state = Arc::clone(self);
@@ -353,16 +359,33 @@ impl SharedState {
     }
 }
 
-fn ensure_workspace_store_ready(workspace: &Path) -> Result<(), AetherMcpError> {
-    let aether_dir = workspace.join(".aether");
-    std::fs::create_dir_all(&aether_dir)?;
-
-    let sqlite_path = aether_dir.join("meta.sqlite");
-    if !sqlite_path.exists() {
-        let _bootstrap = SqliteStore::open(workspace)?;
+fn ensure_workspace_store_exists(workspace: &Path) -> Result<(), AetherMcpError> {
+    if !workspace.join(".aether/meta.sqlite").is_file() {
+        return Err(AetherMcpError::Message(
+            "Read-only MCP requires an existing .aether/meta.sqlite index; initialize it with a writable AETHER command first.".to_owned(),
+        ));
     }
-
     Ok(())
+}
+
+fn open_vector_store_readonly_optional(
+    workspace: &Path,
+    config: &AetherConfig,
+) -> Result<Option<Arc<dyn VectorStore>>, AetherMcpError> {
+    if !config.embeddings.enabled {
+        return Ok(None);
+    }
+    match config.embeddings.vector_backend {
+        EmbeddingVectorBackend::Sqlite => {
+            Ok(Some(Arc::new(SqliteVectorStore::open_readonly(workspace)?)))
+        }
+        EmbeddingVectorBackend::Lancedb => {
+            tracing::warn!(
+                "LanceDB vectors unavailable in read-only MCP mode; its opener performs migrations"
+            );
+            Ok(None)
+        }
+    }
 }
 
 fn load_config(workspace: &Path) -> Result<AetherConfig, AetherMcpError> {
@@ -511,7 +534,7 @@ api_key_env = "{api_key_env}"
 
         assert!(ro.read_only);
         assert_eq!(ro.schema_version.component, "core");
-        assert_eq!(ro.schema_version.version, 21);
+        assert_eq!(ro.schema_version.version, aether_store::CORE_SCHEMA_VERSION);
         assert!(ro.schema_version.migrated_at > 0);
     }
 

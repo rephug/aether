@@ -359,6 +359,7 @@ impl ProjectMemoryService {
         let store_clone = store.clone();
         let query_owned = query.to_owned();
         let graph = graph.clone();
+        let track_access = !self.read_only;
 
         let result = tokio::task::spawn_blocking(move || -> Result<AskQueryResult, MemoryError> {
             let coupling_candidates = if include.contains(&AskInclude::Coupling) {
@@ -387,7 +388,9 @@ impl ProjectMemoryService {
             res.query = query_owned;
 
             enrich_symbol_snippets(&store_clone, res.results.as_mut_slice())?;
-            increment_access_from_results(&store_clone, res.results.as_mut_slice(), now_ms)?;
+            if track_access {
+                increment_access_from_results(&store_clone, res.results.as_mut_slice(), now_ms)?;
+            }
 
             Ok(res)
         })

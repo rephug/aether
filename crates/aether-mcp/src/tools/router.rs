@@ -17,18 +17,18 @@ use super::{
     AetherDriftReportRequest, AetherDriftReportResponse, AetherEnhancePromptRequest,
     AetherEnhancePromptResponse, AetherExplainRequest, AetherExplainResponse, AetherGetSirRequest,
     AetherGetSirResponse, AetherHealthExplainRequest, AetherHealthHotspotsRequest,
-    AetherHealthRequest, AetherHealthResponse, AetherMcpServer, AetherRecallRequest,
-    AetherRecallResponse, AetherRefactorPrepRequest, AetherRefactorPrepResponse,
-    AetherRememberRequest, AetherRememberResponse, AetherSearchRequest, AetherSearchResponse,
-    AetherSessionNoteResponse, AetherSirContextRequest, AetherSirContextResponse,
-    AetherSirInjectRequest, AetherSirInjectResponse, AetherStatusResponse,
-    AetherSuggestTraitSplitRequest, AetherSuggestTraitSplitResponse, AetherSymbolLookupRequest,
-    AetherSymbolLookupResponse, AetherSymbolTimelineRequest, AetherSymbolTimelineResponse,
-    AetherTestIntentsRequest, AetherTestIntentsResponse, AetherTextResponse,
-    AetherTraceCauseRequest, AetherTraceCauseResponse, AetherUsageMatrixRequest,
-    AetherUsageMatrixResponse, AetherVerifyIntentRequest, AetherVerifyIntentResponse,
-    AetherWhyChangedRequest, AetherWhyChangedResponse, SERVER_DESCRIPTION, SERVER_NAME,
-    SERVER_VERSION,
+    AetherHealthRequest, AetherHealthResponse, AetherMcpServer, AetherPreflightRequest,
+    AetherPreflightResponse, AetherRecallRequest, AetherRecallResponse, AetherRefactorPrepRequest,
+    AetherRefactorPrepResponse, AetherRememberRequest, AetherRememberResponse, AetherSearchRequest,
+    AetherSearchResponse, AetherSessionNoteResponse, AetherSirContextRequest,
+    AetherSirContextResponse, AetherSirInjectRequest, AetherSirInjectResponse,
+    AetherStatusResponse, AetherSuggestTraitSplitRequest, AetherSuggestTraitSplitResponse,
+    AetherSymbolLookupRequest, AetherSymbolLookupResponse, AetherSymbolTimelineRequest,
+    AetherSymbolTimelineResponse, AetherTestIntentsRequest, AetherTestIntentsResponse,
+    AetherTextResponse, AetherTraceCauseRequest, AetherTraceCauseResponse,
+    AetherUsageMatrixRequest, AetherUsageMatrixResponse, AetherVerifyIntentRequest,
+    AetherVerifyIntentResponse, AetherWhyChangedRequest, AetherWhyChangedResponse,
+    SERVER_DESCRIPTION, SERVER_NAME, SERVER_VERSION,
 };
 #[cfg(feature = "verification")]
 use super::{AetherVerifyRequest, AetherVerifyResponse};
@@ -151,7 +151,7 @@ impl AetherMcpServer {
 
     #[tool(
         name = "aether_search",
-        description = "Search symbols by name, path, language, or kind"
+        description = "Search ranked symbol names and paths with optional semantic retrieval and reranking"
     )]
     pub async fn aether_search(
         &self,
@@ -428,6 +428,22 @@ impl AetherMcpServer {
         self.verbose_log("MCP tool called: aether_sir_inject");
         let server = self.clone();
         tokio::task::spawn_blocking(move || server.aether_sir_inject_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_preflight",
+        description = "Assemble one deterministic task-specific investigation map with dependencies, reverse impact, recorded history/reasons, risks and tests. Read-only and provider-free; reports unknown freshness and missing evidence."
+    )]
+    pub async fn aether_preflight(
+        &self,
+        Parameters(request): Parameters<AetherPreflightRequest>,
+    ) -> Result<Json<AetherPreflightResponse>, McpError> {
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_preflight_logic(request))
             .await
             .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)

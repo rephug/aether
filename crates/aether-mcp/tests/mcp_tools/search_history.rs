@@ -3,6 +3,71 @@
 use super::*;
 
 #[test]
+fn mcp_timeline_resolves_retired_ids_without_restoring_active_evidence() -> Result<()> {
+    let temp = tempdir()?;
+    write_test_config(temp.path());
+    let store = SqliteStore::open(temp.path())?;
+    store.upsert_symbol(SymbolRecord {
+        id: "retired-id".to_owned(),
+        file_path: "src/lib.rs".to_owned(),
+        language: "rust".to_owned(),
+        kind: "function".to_owned(),
+        qualified_name: "retired".to_owned(),
+        signature_fingerprint: "sig".to_owned(),
+        last_seen_at: 1,
+    })?;
+    store.record_sir_version_if_changed(
+        "retired-id",
+        "saved-hash",
+        "mock",
+        "mock",
+        r#"{"intent":"recorded behavior"}"#,
+        10,
+        None,
+    )?;
+    store.insert_intent_contract(
+        "retired-id",
+        "must",
+        "Preserve the recorded reason",
+        None,
+        "test",
+    )?;
+    store.mark_removed("retired-id")?;
+    let server = AetherMcpServer::new(temp.path(), false)?;
+    let summary = server.aether_symbol_timeline_logic(AetherSymbolTimelineRequest {
+        symbol_id: "retired-id".to_owned(),
+        limit: Some(10),
+        include_retired_evidence: None,
+    })?;
+    assert!(summary.found);
+    assert!(summary.retention_available);
+    assert!(summary.timeline.is_empty());
+    assert_eq!(summary.retirements.len(), 1);
+    assert_eq!(summary.retirements[0].evidence_counts["sir_history"], 1);
+    assert_eq!(
+        summary.retirements[0].evidence_counts["intent_contracts"],
+        1
+    );
+    assert!(summary.retirements[0].evidence.is_none());
+    let full = server.aether_symbol_timeline_logic(AetherSymbolTimelineRequest {
+        symbol_id: "retired-id".to_owned(),
+        limit: Some(10),
+        include_retired_evidence: Some(true),
+    })?;
+    let evidence = full.retirements[0]
+        .evidence
+        .as_ref()
+        .expect("requested archive");
+    assert_eq!(evidence["sir_history"][0]["sir_hash"], "saved-hash");
+    assert_eq!(
+        evidence["intent_contracts"][0]["clause_text"],
+        "Preserve the recorded reason"
+    );
+    assert!(store.list_sir_history("retired-id")?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn mcp_search_hybrid_falls_back_when_embedding_api_key_is_missing() -> Result<()> {
     let temp = tempdir()?;
     let workspace = temp.path();
@@ -162,6 +227,7 @@ fn mcp_symbol_timeline_returns_expected_commit_order_and_hashes() -> Result<()> 
             server.aether_symbol_timeline(Parameters(AetherSymbolTimelineRequest {
                 symbol_id: "sym-alpha".to_owned(),
                 limit: None,
+                include_retired_evidence: None,
             })),
         )
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
@@ -187,6 +253,7 @@ fn mcp_symbol_timeline_returns_expected_commit_order_and_hashes() -> Result<()> 
             server.aether_symbol_timeline(Parameters(AetherSymbolTimelineRequest {
                 symbol_id: "sym-alpha".to_owned(),
                 limit: Some(1),
+                include_retired_evidence: None,
             })),
         )
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
@@ -226,6 +293,7 @@ fn mcp_symbol_timeline_reports_null_commit_hash_when_unavailable() -> Result<()>
             server.aether_symbol_timeline(Parameters(AetherSymbolTimelineRequest {
                 symbol_id: "sym-no-git".to_owned(),
                 limit: None,
+                include_retired_evidence: None,
             })),
         )
         .map_err(|err| anyhow::anyhow!(err.to_string()))?

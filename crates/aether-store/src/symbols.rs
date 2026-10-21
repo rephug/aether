@@ -279,7 +279,7 @@ impl SqliteStore {
         );
 
         let mut params_vec = patterns.into_iter().map(SqlValue::Text).collect::<Vec<_>>();
-        params_vec.push(SqlValue::Integer(i64::from(limit.clamp(1, 100))));
+        params_vec.push(SqlValue::Integer(i64::from(limit.clamp(1, 200))));
 
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(sql.as_str())?;

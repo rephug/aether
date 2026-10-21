@@ -18,6 +18,13 @@ pub struct SqliteVectorStore {
 }
 
 impl SqliteVectorStore {
+    /// Open existing SQLite vectors without migrations or write permissions.
+    pub fn open_readonly(workspace_root: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Ok(Self {
+            store: SqliteStore::open_readonly(workspace_root)?,
+        })
+    }
+
     pub fn new(workspace_root: impl AsRef<Path>) -> Result<Self, StoreError> {
         Ok(Self {
             store: SqliteStore::open(workspace_root)?,
