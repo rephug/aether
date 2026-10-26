@@ -18,19 +18,38 @@
 //! project, ...) narrows them to one, C# partial classes included, since neither Java
 //! nor C# puts the package or namespace in the qualified name.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use aether_core::same_language_family;
 use aether_parse::ModuleRoots;
 use aether_store::{
-    NameSite, SqliteStore, SymbolRecord, SymbolRelationStore, call_target_candidates,
-    call_targets_of, narrow_call_edge_candidates, narrow_name_candidates,
+    NameResolution, NameSite, SqliteStore, SymbolRecord, SymbolRelationStore,
+    call_target_candidates, call_targets_of, narrow_call_edge_candidates, narrow_name_candidates,
 };
 
 use crate::AetherMcpError;
 
+/// How the recorded calls naming the symbols asked about resolved, counted once per
+/// caller and callee across every [`CallerAttribution::callers_of`] call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CallerCoverage {
+    /// Callers with a recorded call whose target names the symbol.
+    pub(crate) name_matches: u32,
+    /// Those attributed to it.
+    pub(crate) attributed: u32,
+    /// Of those, the ones [`heuristic_attribution`] matched by a guess.
+    pub(crate) heuristic: u32,
+    /// Those whose call also fits other symbols the caller's file and module don't rule
+    /// out: not attributed, so the symbol may have more callers than listed.
+    pub(crate) ambiguous: u32,
+    /// Those whose call resolves to another symbol of the same name.
+    pub(crate) resolved_elsewhere: u32,
+}
+
 pub(crate) struct CallerAttribution<'a> {
     store: &'a SqliteStore,
+    coverage: CallerCoverage,
     modules: ModuleRoots,
     /// Whether a Rust bare-name call reaches only methods in the caller's own file
     /// ([`narrow_call_edge_candidates`]), as context views resolve call edges.
@@ -45,6 +64,7 @@ impl<'a> CallerAttribution<'a> {
     pub(crate) fn new(store: &'a SqliteStore, workspace_root: &Path) -> Self {
         Self {
             store,
+            coverage: CallerCoverage::default(),
             modules: ModuleRoots::new(workspace_root),
             member_calls_within_file: false,
             candidates_by_target: HashMap::new(),
@@ -75,6 +95,10 @@ impl<'a> CallerAttribution<'a> {
         symbol: &SymbolRecord,
     ) -> Result<Vec<SymbolRecord>, AetherMcpError> {
         let mut callers = HashMap::<String, SymbolRecord>::new();
+        // Callers left out, by why; a caller attributed through another edge is not.
+        let mut ambiguous = HashSet::<String>::new();
+        let mut elsewhere = HashSet::<String>::new();
+        let mut heuristic = 0;
         for target in &call_targets_of(symbol) {
             for edge in SymbolRelationStore::get_callers(self.store, target)? {
                 if callers.contains_key(&edge.source_id) {
@@ -83,11 +107,37 @@ impl<'a> CallerAttribution<'a> {
                 let Some(caller) = self.record(edge.source_id.as_str())? else {
                     continue;
                 };
-                if self.resolves_to(&caller, edge.target_qualified_name.as_str(), symbol)? {
+                let resolution = self.resolve(&caller, edge.target_qualified_name.as_str())?;
+                if resolution.reaches(symbol) {
+                    ambiguous.remove(&caller.id);
+                    elsewhere.remove(&caller.id);
+                    if heuristic_attribution(
+                        &self.candidates_by_target[edge.target_qualified_name.as_str()],
+                        &caller,
+                        edge.target_qualified_name.as_str(),
+                        symbol,
+                    ) {
+                        heuristic += 1;
+                    }
                     callers.insert(caller.id.clone(), caller);
+                } else if matches!(
+                    &resolution,
+                    NameResolution::Ambiguous(candidates)
+                        if candidates.iter().any(|candidate| candidate.id == symbol.id)
+                ) {
+                    elsewhere.remove(&caller.id);
+                    ambiguous.insert(caller.id);
+                } else if !ambiguous.contains(&caller.id) {
+                    elsewhere.insert(caller.id);
                 }
             }
         }
+        let count = |len: usize| u32::try_from(len).unwrap_or(u32::MAX);
+        self.coverage.attributed += count(callers.len());
+        self.coverage.heuristic += heuristic;
+        self.coverage.ambiguous += count(ambiguous.len());
+        self.coverage.resolved_elsewhere += count(elsewhere.len());
+        self.coverage.name_matches += count(callers.len() + ambiguous.len() + elsewhere.len());
 
         let mut callers = callers.into_values().collect::<Vec<_>>();
         callers.sort_by(|left, right| {
@@ -98,12 +148,16 @@ impl<'a> CallerAttribution<'a> {
         Ok(callers)
     }
 
-    fn resolves_to(
+    /// What [`Self::callers_of`] has seen so far.
+    pub(crate) fn coverage(&self) -> CallerCoverage {
+        self.coverage
+    }
+
+    fn resolve(
         &mut self,
         caller: &SymbolRecord,
         target: &str,
-        symbol: &SymbolRecord,
-    ) -> Result<bool, AetherMcpError> {
+    ) -> Result<NameResolution, AetherMcpError> {
         self.candidates(target)?;
         let candidates = &self.candidates_by_target[target];
         let modules = &mut self.modules;
@@ -118,7 +172,7 @@ impl<'a> CallerAttribution<'a> {
                 &mut module_of,
             )
         };
-        Ok(resolution.reaches(symbol))
+        Ok(resolution)
     }
 
     fn candidates(&mut self, target: &str) -> Result<&Vec<SymbolRecord>, AetherMcpError> {
@@ -139,4 +193,28 @@ impl<'a> CallerAttribution<'a> {
             .insert(symbol_id.to_owned(), record.clone());
         Ok(record)
     }
+}
+
+/// Whether attributing `caller`'s call on `target` to `symbol` rested on a guess rather than
+/// an exact name only `symbol` (or its overloads) carries: a Rust call recorded by bare
+/// method name, which any type's method of that name could answer, a standard-library one
+/// included; or a name other symbols in the caller's language family also carry, which
+/// the caller's file or module narrowed to `symbol`.
+fn heuristic_attribution(
+    candidates: &[SymbolRecord],
+    caller: &SymbolRecord,
+    target: &str,
+    symbol: &SymbolRecord,
+) -> bool {
+    target != symbol.qualified_name
+        || call_target_candidates(candidates, target, caller.language.as_str())
+            .iter()
+            .filter(|candidate| {
+                same_language_family(candidate.language.as_str(), caller.language.as_str())
+            })
+            .any(|candidate| {
+                candidate.qualified_name != symbol.qualified_name
+                    || candidate.language != symbol.language
+                    || candidate.file_path != symbol.file_path
+            })
 }

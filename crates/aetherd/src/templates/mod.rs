@@ -1,9 +1,12 @@
+use aether_config::McpToolProfile;
+
 pub mod audit_changes_cmd;
 pub mod audit_cmd;
 pub mod audit_report_cmd;
 pub mod ci_review_workflow;
 pub mod claude_md;
 pub mod codex_instructions;
+pub mod compact;
 pub mod context_cmd;
 pub mod cursor_rules;
 pub mod enrich_cmd;
@@ -26,6 +29,7 @@ pub use audit_report_cmd::AuditReportCommandTemplate;
 pub use ci_review_workflow::GithubReviewWorkflowTemplate;
 pub use claude_md::ClaudeTemplate;
 pub use codex_instructions::CodexInstructionsTemplate;
+pub use compact::CompactGuidanceTemplate;
 pub use context_cmd::ContextCommandTemplate;
 pub use cursor_rules::CursorRulesTemplate;
 pub use enrich_cmd::EnrichCommandTemplate;
@@ -52,155 +56,14 @@ pub struct TemplateContext {
     pub inference_provider: String,
     pub agent_schema_version: u32,
     pub mcp_binary_hint: String,
+    /// Whether the `aether_verify` tool is available: `aether-mcp` registers it only when
+    /// built with its `verification` feature, which turns on this crate's too. An
+    /// `aetherd` built without it never tells agents to call a tool that may be missing.
+    pub verification_tool: bool,
+    /// The `--tools` profile `.mcp.json` passes to aether-mcp; `None` leaves the choice
+    /// to `[mcp] tools` in the workspace config.
+    pub mcp_tools_arg: Option<McpToolProfile>,
 }
-
-pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 40] = [
-    ("aether_status", "Get AETHER local store status"),
-    (
-        "aether_symbol_lookup",
-        "Lookup symbols by qualified name or file path",
-    ),
-    (
-        "aether_dependencies",
-        "Get resolved callers and call dependencies for a symbol",
-    ),
-    (
-        "aether_usage_matrix",
-        "Get a consumer-by-method usage matrix for a trait or struct, showing which files call which methods and suggesting method clusters for trait decomposition",
-    ),
-    (
-        "aether_suggest_trait_split",
-        "Suggest how to decompose a large trait or struct into smaller capability groups based on consumer usage patterns",
-    ),
-    (
-        "aether_call_chain",
-        "Get transitive call-chain levels for a symbol",
-    ),
-    (
-        "aether_search",
-        "Search symbols by name, path, language, or kind",
-    ),
-    (
-        "aether_remember",
-        "Store project memory note content with deterministic deduplication",
-    ),
-    (
-        "aether_session_note",
-        "Capture an in-session project note with source_type=session",
-    ),
-    (
-        "aether_recall",
-        "Recall project memory notes using lexical, semantic, or hybrid retrieval",
-    ),
-    (
-        "aether_ask",
-        "Search symbols, notes, coupling, and test intents with unified ranking",
-    ),
-    (
-        "aether_audit_candidates",
-        "Get ranked list of symbols most in need of deep audit review, combining structural risk with SIR confidence and reasoning trace uncertainty",
-    ),
-    (
-        "aether_audit_cross_symbol",
-        "trace callers and callees with full SIR and source for cross-boundary audit",
-    ),
-    (
-        "aether_audit_submit",
-        "Submit a structured audit finding for a symbol",
-    ),
-    (
-        "aether_audit_report",
-        "Query audit findings by crate, severity, category, or status",
-    ),
-    (
-        "aether_audit_resolve",
-        "Mark an audit finding as fixed, wontfix, or confirmed",
-    ),
-    (
-        "aether_contract_add",
-        "add a behavioral contract on a symbol",
-    ),
-    ("aether_contract_list", "list active intent contracts"),
-    ("aether_contract_remove", "deactivate an intent contract"),
-    (
-        "aether_contract_check",
-        "verify contracts against current SIR",
-    ),
-    (
-        "aether_contract_violations",
-        "query contract violation history",
-    ),
-    ("aether_contract_dismiss", "dismiss a contract violation"),
-    (
-        "aether_sir_inject",
-        "Inject or update a symbol's complete SIR annotation, including intent, behavior, edge_cases, side_effects, dependencies, error_modes, inputs, outputs, complexity, confidence, and model provenance",
-    ),
-    (
-        "aether_sir_context",
-        "Assemble token-budgeted context for a symbol including source, SIR, graph neighbors, health, reasoning trace, and test intents in one call",
-    ),
-    (
-        "aether_enhance_prompt",
-        "Enhance a raw coding prompt with indexed codebase context, symbol matches, files, and architectural notes",
-    ),
-    (
-        "aether_blast_radius",
-        "Analyze coupled files and risk levels for blast-radius impact",
-    ),
-    (
-        "aether_test_intents",
-        "Query extracted behavioral test intents for a file or symbol",
-    ),
-    (
-        "aether_drift_report",
-        "Run semantic drift analysis with boundary and structural anomaly detection",
-    ),
-    (
-        "aether_health",
-        "Get codebase health metrics including critical symbols, bottlenecks, dependency cycles, orphaned code, and risk hotspots.",
-    ),
-    (
-        "aether_health_hotspots",
-        "Return the hottest workspace crates by health score with archetypes and top violations.",
-    ),
-    (
-        "aether_health_explain",
-        "Explain one crate's health score, signals, violations, and split suggestions.",
-    ),
-    (
-        "aether_refactor_prep",
-        "Prepare a file or crate for refactoring by deep-scanning the highest-risk symbols and saving an intent snapshot",
-    ),
-    (
-        "aether_verify_intent",
-        "Compare current SIR against a saved refactor-prep snapshot and flag semantic drift",
-    ),
-    (
-        "aether_trace_cause",
-        "Trace likely upstream semantic causes of a downstream breakage",
-    ),
-    (
-        "aether_acknowledge_drift",
-        "Acknowledge drift findings and create a project note",
-    ),
-    (
-        "aether_symbol_timeline",
-        "Get ordered SIR timeline entries for a symbol",
-    ),
-    (
-        "aether_why_changed",
-        "Explain why a symbol changed between two SIR versions or timestamps",
-    ),
-    ("aether_get_sir", "Get SIR for leaf/file/module level"),
-    (
-        "aether_explain",
-        "Explain symbol at a file position using local SIR",
-    ),
-    (
-        "aether_verify",
-        "Run allowlisted verification commands in host, container, or microvm mode",
-    ),
-];
 
 pub(crate) fn languages_inline(context: &TemplateContext) -> String {
     if context.languages.is_empty() {
@@ -244,57 +107,94 @@ pub(crate) fn search_modes_line(context: &TemplateContext) -> String {
     }
 }
 
-pub(crate) fn required_actions() -> [&'static str; 5] {
-    [
-        "Always call `aether_get_sir` before reverting, deleting, or refactoring symbols.",
-        "Always call `aether_why_changed` before reverting recent changes.",
-        "Always call `aether_verify` after modifying code.",
-        "If `aether_verify` fails, fix the issue before proceeding.",
-        "After creating or significantly modifying key symbols, call `aether_sir_inject` with the full fields you know: intent, behavior, edge_cases, side_effects, dependencies, error_modes, inputs, outputs, complexity, confidence, and model.",
+/// What the generated files make mandatory: only steps every installation can carry out,
+/// and no tool call that writes to the store every session shares, so a session meant to
+/// be read-only can follow them. With nothing mandatory, one line says so.
+/// How the generated files tell an agent to verify its changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerificationStep {
+    /// Through `aether_verify`, which runs the configured verify commands.
+    Tool,
+    /// By running the configured verify commands directly.
+    Commands,
+    /// No verify commands are configured, so there is nothing to run: `aether_verify`
+    /// itself refuses an empty `[verify] commands` list.
+    None,
+}
+
+pub(crate) fn verification_step(context: &TemplateContext) -> VerificationStep {
+    if context.verify_commands.is_empty() {
+        VerificationStep::None
+    } else if context.verification_tool {
+        VerificationStep::Tool
+    } else {
+        VerificationStep::Commands
+    }
+}
+
+pub(crate) fn verification_guidance(context: &TemplateContext) -> String {
+    if context.verify_commands.is_empty() {
+        return "No AETHER verify commands are configured. Choose relevant repository checks from the project instructions; report checks that could not run and what they leave unverified.".to_owned();
+    }
+    match verification_step(context) {
+        VerificationStep::Tool => "Run the configured verification commands and address failures. If the connected server advertises `aether_verify` with the verification feature and these configured commands, you may use it; otherwise run the commands directly with the repository's ordinary tools.".to_owned(),
+        VerificationStep::Commands => "Run the configured verification commands directly with the repository's ordinary tools and address failures; this build does not advertise the optional verification tool.".to_owned(),
+        VerificationStep::None => "No AETHER verify commands are configured. Choose relevant repository checks from the project instructions; report checks that could not run and what they leave unverified.".to_owned(),
+    }
+}
+
+pub(crate) fn required_actions(context: &TemplateContext) -> Vec<String> {
+    vec![
+        "Before risky edits, inspect current source, callers and relevant tests using ordinary repository exploration.".to_owned(),
+        "Run relevant repository validation and regression tests after code changes; report exactly what ran and any blocked checks.".to_owned(),
+        verification_guidance(context),
     ]
 }
+
+/// `aether_get_sir` as advice, with what a call writes.
+pub(crate) const GET_SIR_GUIDANCE: &str = "When advertised, consider `aether_get_sir` for recorded annotation evidence. A writable connection can record access and queue missing SIRs; use a read-only connection for read-only work. Compare annotations with current source and tests.";
 
 pub(crate) fn recommended_actions(context: &TemplateContext) -> Vec<String> {
     let search_guidance = if context.embeddings_enabled {
-        "Consider `aether_search` with hybrid mode when exploring unfamiliar code."
+        "If `aether_search` is available, consider hybrid search when exploring unfamiliar code."
     } else {
-        "Consider `aether_search` (lexical mode) when exploring unfamiliar code."
+        "If `aether_search` is available, consider lexical search when exploring unfamiliar code."
     };
 
     vec![
+        "Ordinary repository exploration remains available when optional AETHER tools are unavailable. Check the connected server's advertised tools before using them.".to_owned(),
         search_guidance.to_owned(),
-        "Consider `aether_symbol_timeline` when reviewing recent changes.".to_owned(),
-        "Consider `aether_call_chain` when tracing dependencies and downstream impact.".to_owned(),
-        "Call `aether_status` at task start to confirm index freshness.".to_owned(),
+        "If `aether_get_sir` is available, consider it as annotation evidence and verify it against current source/tests. Writable servers can record access or queue a missing SIR for generation; use a read-only connection for read-only work.".to_owned(),
+        "If `aether_why_changed` and retained versions are available, inspect the annotation difference alongside Git history and recorded notes; it does not establish the author's reason.".to_owned(),
+        "If `aether_symbol_timeline` is available, consider its retained observations when reviewing historical changes.".to_owned(),
+        "If `aether_call_chain` is available, consider it for heuristic dependencies and downstream impact; absent edges do not prove absence of dependencies.".to_owned(),
+        "If `aether_status` is available, use it for diagnostics. Counts cannot prove freshness, dependency completeness or successful synchronization.".to_owned(),
+        "When explicitly asked to record SIR annotations, and writable tools are available, use `aether_sir_inject` with recorded provenance. It writes the shared store; ordinary exploration does not require annotation writes.".to_owned(),
+        STATUS_GUIDANCE.to_owned(),
+        GET_SIR_GUIDANCE.to_owned(),
+        "If `aether_sir_context` is available, its freshness line is diagnostic evidence to compare with current source and tests.".to_owned(),
     ]
 }
 
-pub(crate) fn markdown_tool_list() -> String {
-    TOOL_DESCRIPTIONS
-        .iter()
-        .map(|(name, description)| format!("- `{name}`: {description}"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
+/// How to read `aether_status`'s freshness fields before trusting other tools.
+pub(crate) const STATUS_GUIDANCE: &str = "When `aether_status` is advertised, read `freshness.summary`. If `freshness.verdict` is `stale`, inspect `freshness.changed_file_samples` and current source regardless of daemon liveness. `freshness.sirs_without_source_hash` counts annotations whose staleness cannot be checked. `freshness.daemon_running` reports liveness, not successful synchronization. A structural freshness verdict does not establish complete call edges, completed generations or cross-store publication.";
 
-pub(crate) fn plain_tool_list() -> String {
-    TOOL_DESCRIPTIONS
-        .iter()
-        .map(|(name, description)| format!("- {name}: {description}"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
+/// Stands in for the tool list: the MCP server sends every tool's name and description.
+pub(crate) const TOOLS_NOTE: &str = "The AETHER MCP server lists its tools with their descriptions; this file does not repeat them.";
 
 #[cfg(test)]
 mod tests {
+    use aether_config::COMPACT_MCP_TOOLS;
+
     use super::{
         AuditChangesCommandTemplate, AuditCommandTemplate, AuditReportCommandTemplate,
-        ClaudeTemplate, CodexInstructionsTemplate, ContextCommandTemplate, CursorRulesTemplate,
-        EnrichCommandTemplate, ExplainAreaCommandTemplate, GithubReviewWorkflowTemplate,
-        HealthCheckCommandTemplate, ImpactCommandTemplate, McpJsonTemplate, NextCommandTemplate,
-        OmpAgentsTemplate, PreFlightCommandTemplate, RefactorCommandTemplate,
-        RefactorDeepCommandTemplate, ReviewCommandTemplate, ScanAllScriptTemplate,
-        ScanCommandTemplate, SkillTemplate, TOOL_DESCRIPTIONS, TemplateContext,
+        ClaudeTemplate, CodexInstructionsTemplate, CompactGuidanceTemplate, ContextCommandTemplate,
+        CursorRulesTemplate, EnrichCommandTemplate, ExplainAreaCommandTemplate,
+        GithubReviewWorkflowTemplate, HealthCheckCommandTemplate, ImpactCommandTemplate,
+        McpJsonTemplate, McpToolProfile, NextCommandTemplate, OmpAgentsTemplate,
+        PreFlightCommandTemplate, RefactorCommandTemplate, RefactorDeepCommandTemplate,
+        ReviewCommandTemplate, ScanAllScriptTemplate, ScanCommandTemplate, SkillTemplate,
+        TOOLS_NOTE, TemplateContext,
     };
 
     fn sample_context() -> TemplateContext {
@@ -310,6 +210,8 @@ mod tests {
             inference_provider: "mock".to_owned(),
             agent_schema_version: 7,
             mcp_binary_hint: "./target/debug/aether-mcp".to_owned(),
+            verification_tool: false,
+            mcp_tools_arg: None,
         }
     }
 
@@ -336,6 +238,47 @@ mod tests {
     }
 
     #[test]
+    fn agent_files_keep_repository_checks_and_match_verification_availability() {
+        for verification_tool in [false, true] {
+            for commands in [Vec::new(), vec!["fixture-check".to_owned()]] {
+                let context = TemplateContext {
+                    verification_tool,
+                    verify_commands: commands.clone(),
+                    ..sample_context()
+                };
+                for guide in [
+                    ClaudeTemplate::render(&context),
+                    CodexInstructionsTemplate::render(&context),
+                    CursorRulesTemplate::render(&context),
+                    SkillTemplate::render(&context),
+                ] {
+                    assert!(
+                        guide.contains("Run relevant repository validation and regression tests")
+                    );
+                    let mentions_verify = guide
+                        .split(|character: char| {
+                            !character.is_ascii_lowercase() && character != '_'
+                        })
+                        .any(|name| name == "aether_verify");
+                    assert_eq!(mentions_verify, verification_tool && !commands.is_empty());
+                    assert!(
+                        !guide
+                            .replace('`', "")
+                            .to_lowercase()
+                            .contains("always call aether_")
+                    );
+                    assert!(guide.contains("read-only connection for read-only work"));
+                    assert!(guide.contains("When explicitly asked to record SIR annotations, and writable tools are available"));
+                    assert!(guide.contains("freshness.sirs_without_source_hash"));
+                }
+            }
+        }
+        let guide = ClaudeTemplate::render(&sample_context());
+        assert!(guide.contains(TOOLS_NOTE));
+        assert!(!guide.contains("aether_suggest_trait_split"));
+    }
+
+    #[test]
     fn claude_template_lists_slash_commands_and_workflow() {
         let rendered = ClaudeTemplate::render(&sample_context());
         assert!(rendered.contains("\n\n## Slash Commands\n"));
@@ -355,52 +298,48 @@ mod tests {
         assert!(rendered.ends_with("and `/health-check` at the start of a session.\n"));
     }
 
-    fn command_templates(context: &TemplateContext) -> Vec<(&'static str, String)> {
-        vec![
-            ("audit", AuditCommandTemplate::render(context)),
-            (
-                "audit-changes",
-                AuditChangesCommandTemplate::render(context),
-            ),
-            ("audit-report", AuditReportCommandTemplate::render(context)),
-            ("context", ContextCommandTemplate::render(context)),
-            ("enrich", EnrichCommandTemplate::render(context)),
-            ("explain-area", ExplainAreaCommandTemplate::render(context)),
-            ("health-check", HealthCheckCommandTemplate::render(context)),
-            ("impact", ImpactCommandTemplate::render(context)),
-            ("next", NextCommandTemplate::render(context)),
-            ("pre-flight", PreFlightCommandTemplate::render(context)),
-            ("refactor", RefactorCommandTemplate::render(context)),
-            (
-                "refactor-deep",
-                RefactorDeepCommandTemplate::render(context),
-            ),
-            ("review", ReviewCommandTemplate::render(context)),
-            ("scan", ScanCommandTemplate::render(context)),
-        ]
-    }
-
-    /// Slash commands are static text, so a renamed or removed tool would go unnoticed:
-    /// every `aether_*` name they mention must be in `TOOL_DESCRIPTIONS`, the tool list
-    /// the generated CLAUDE.md is built from.
-    #[test]
-    fn command_templates_name_only_registered_tools() {
-        for (command, rendered) in command_templates(&sample_context()) {
-            for (start, _) in rendered.match_indices("aether_") {
-                let name: String = rendered[start..]
+    /// Every `aether_*` tool name `rendered` mentions, sorted and deduplicated.
+    fn named_tools(rendered: &str) -> Vec<String> {
+        let mut names = rendered
+            .match_indices("aether_")
+            .map(|(start, _)| {
+                rendered[start..]
                     .chars()
                     .take_while(|ch| ch.is_ascii_lowercase() || *ch == '_')
-                    .collect();
-                if rendered[start..].starts_with("aether_*") {
-                    // The wildcard /context uses to ban tool names.
-                    continue;
-                }
-                assert!(
-                    TOOL_DESCRIPTIONS.iter().any(|(tool, _)| *tool == name),
-                    "/{command} names unknown tool {name}"
-                );
-            }
-        }
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Compact guidance must point at every tool the compact profile serves and at no
+    /// tool it refuses.
+    #[test]
+    fn compact_guidance_names_exactly_the_compact_tools() {
+        let mut context = sample_context();
+        let rendered = CompactGuidanceTemplate::render(&context);
+        let mut expected = COMPACT_MCP_TOOLS.map(str::to_owned).to_vec();
+        expected.sort();
+        assert_eq!(named_tools(&rendered), expected);
+        assert!(rendered.contains("Agent Schema Version: 7"));
+        assert!(rendered.contains("`--tools compact`"));
+        assert!(rendered.contains("- `cargo test --workspace`"));
+        assert!(rendered.contains("mode `hybrid`"));
+
+        context.embeddings_enabled = false;
+        let rendered = CompactGuidanceTemplate::render(&context);
+        assert!(!rendered.contains("hybrid") && rendered.contains("embeddings are off"));
+
+        // The point of the profile: far less guidance in every request's context.
+        let full = ClaudeTemplate::render(&sample_context());
+        assert!(
+            rendered.len() * 4 < full.len(),
+            "{} vs {}",
+            rendered.len(),
+            full.len()
+        );
     }
 
     #[test]
@@ -408,21 +347,12 @@ mod tests {
         let context = sample_context();
         let pre_flight = PreFlightCommandTemplate::render(&context);
         assert!(pre_flight.starts_with("---\nargument-hint: <task description>\ndescription: "));
-        for tool in [
-            "aether_search",
-            "aether_sir_context",
-            "aether_get_sir",
-            "aether_dependencies",
-            "aether_usage_matrix",
-            "aether_health_hotspots",
-            "aether_health_explain",
-            "aether_contract_list",
-        ] {
-            assert!(
-                pre_flight.contains(&format!("`{tool}`")),
-                "/pre-flight {tool}"
-            );
-        }
+        assert!(pre_flight.contains("`aether_preflight`"));
+        assert!(pre_flight.contains("Read the returned `map.context` before exploring files"));
+        assert!(pre_flight.contains("source-only"));
+        assert!(pre_flight.contains("requires no branch name"));
+        assert!(!pre_flight.contains("`aether_search`"));
+        assert!(!pre_flight.contains("`aether_sir_context`"));
         assert!(pre_flight.contains("**Recommended approach:**"));
 
         let review = ReviewCommandTemplate::render(&context);
@@ -474,6 +404,22 @@ mod tests {
             assert!(rendered.contains("doesn't edit files or inject SIRs"));
         }
         assert!(!review.contains("`aether_refactor_prep`"));
+    }
+
+    #[test]
+    fn preflight_command_receives_one_map_before_exploration() {
+        let command = PreFlightCommandTemplate::render(&sample_context());
+        let assembled = command
+            .find("Call `aether_preflight` first")
+            .expect("assembled map");
+        let explore = command
+            .find("Use the map's investigation order")
+            .expect("exploration");
+        assert!(assembled < explore);
+        assert!(command.contains("without initializing a store"));
+        assert!(command.contains("must not run enrichment or make model/provider calls"));
+        assert!(command.contains("continue\nordinary repository exploration"));
+        assert!(command.contains("Do not initialize, reindex or enrich as a fallback"));
     }
 
     #[test]
@@ -630,9 +576,9 @@ mod tests {
     fn cursor_template_uses_numbered_directives() {
         let rendered = CursorRulesTemplate::render(&sample_context());
 
-        assert!(rendered.contains("1. Before editing or refactoring"));
+        assert!(rendered.contains("1. Before risky edits"));
         assert!(rendered.contains("Agent schema version: 7"));
-        assert!(rendered.contains("aether_verify"));
+        assert!(!rendered.contains("aether_verify "));
         assert!(rendered.contains("run aetherd --workspace . --index-once"));
         assert!(!rendered.contains("aether_index_once"));
     }
@@ -744,6 +690,28 @@ mod tests {
     }
 
     #[test]
+    fn mcp_json_template_passes_the_tools_profile_only_when_set() {
+        let args = |mcp_tools_arg| {
+            let context = TemplateContext {
+                mcp_tools_arg,
+                ..sample_context()
+            };
+            let parsed: serde_json::Value =
+                serde_json::from_str(&McpJsonTemplate::render(&context)).expect("valid json");
+            parsed["mcpServers"]["aether"]["args"].clone()
+        };
+        assert_eq!(args(None), serde_json::json!(["--workspace", "."]));
+        assert_eq!(
+            args(Some(McpToolProfile::Compact)),
+            serde_json::json!(["--workspace", ".", "--tools", "compact"])
+        );
+        assert_eq!(
+            args(Some(McpToolProfile::Full)),
+            serde_json::json!(["--workspace", ".", "--tools", "full"])
+        );
+    }
+
+    #[test]
     fn skill_template_contains_workflow_and_anti_patterns() {
         let rendered = SkillTemplate::render(&sample_context());
 
@@ -762,14 +730,7 @@ mod tests {
         assert!(rendered.contains("no verify commands configured"));
         assert!(rendered.contains("lexical only"));
     }
-
-    #[test]
-    fn tool_descriptions_include_enhance_prompt_tool() {
-        assert_eq!(TOOL_DESCRIPTIONS.len(), 40);
-        assert!(
-            TOOL_DESCRIPTIONS
-                .iter()
-                .any(|(name, _)| *name == "aether_enhance_prompt")
-        );
-    }
 }
+
+#[cfg(test)]
+mod guidance_tests;

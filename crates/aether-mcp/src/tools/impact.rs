@@ -88,6 +88,8 @@ pub struct AetherBlastRadiusResponse {
     pub mining_state: Option<AetherBlastRadiusMiningState>,
     pub coupled_files: Vec<AetherBlastRadiusCoupledFile>,
     pub test_guards: Vec<AetherBlastRadiusTestGuard>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -145,6 +147,7 @@ impl AetherMcpServer {
                 mining_state: None,
                 coupled_files: Vec::new(),
                 test_guards: Vec::new(),
+                warnings: Vec::new(),
             });
         }
 
@@ -153,7 +156,15 @@ impl AetherMcpServer {
             .min_risk
             .unwrap_or(AetherCouplingRiskLevel::Medium)
             .into();
-        let blast_result = if let Some(graph) = graph.as_deref() {
+        let mut warnings = Vec::new();
+        let blast_result = if self.state.read_only {
+            warnings.push("SurrealDB coupling scores are unavailable in read-only mode; mining state and test guards use SQLite without auto-mining.".to_owned());
+            Ok(BlastRadiusResult {
+                target_file: target_file.clone(),
+                mining_state: self.state.store.get_coupling_mining_state()?,
+                coupled_files: Vec::new(),
+            })
+        } else if let Some(graph) = graph.as_deref() {
             analyzer.blast_radius_with_graph(
                 graph,
                 BlastRadiusRequest {
@@ -178,8 +189,7 @@ impl AetherMcpServer {
             {
                 BlastRadiusResult {
                     target_file: target_file.clone(),
-                    mining_state: SqliteStore::open(self.workspace())?
-                        .get_coupling_mining_state()?,
+                    mining_state: self.state.store.get_coupling_mining_state()?,
                     coupled_files: Vec::new(),
                 }
             }
@@ -199,10 +209,12 @@ impl AetherMcpServer {
             .into_iter()
             .map(|symbol| symbol.id)
             .collect::<Vec<_>>();
-        store.increment_symbol_access(
-            target_symbol_ids.as_slice(),
-            current_unix_timestamp_millis(),
-        )?;
+        if !self.state.read_only {
+            store.increment_symbol_access(
+                target_symbol_ids.as_slice(),
+                current_unix_timestamp_millis(),
+            )?;
+        }
 
         let mut coupled_files = Vec::with_capacity(blast.coupled_files.len());
         for entry in blast.coupled_files {
@@ -229,37 +241,42 @@ impl AetherMcpServer {
             });
         }
 
-        let test_guards = match TestIntentAnalyzer::new(self.workspace()).and_then(|analyzer| {
-            if let Some(graph) = graph.as_deref() {
-                analyzer.list_guards_for_target_file_with_graph(graph, blast.target_file.as_str())
-            } else {
-                analyzer.list_guards_for_target_file(blast.target_file.as_str())
-            }
-        }) {
-            Ok(guards) => {
-                let mapped = guards
-                    .into_iter()
-                    .map(|guard| AetherBlastRadiusTestGuard {
-                        test_file: guard.test_file,
-                        intents: guard.intents,
-                        confidence: guard.confidence,
-                        inference_method: guard.inference_method,
-                    })
-                    .collect::<Vec<_>>();
-
-                if mapped.is_empty() {
-                    self.fallback_test_guards_from_naming(store, blast.target_file.as_str())?
+        let test_guards = if self.state.read_only {
+            self.fallback_test_guards_from_naming(store, blast.target_file.as_str())?
+        } else {
+            match TestIntentAnalyzer::new(self.workspace()).and_then(|analyzer| {
+                if let Some(graph) = graph.as_deref() {
+                    analyzer
+                        .list_guards_for_target_file_with_graph(graph, blast.target_file.as_str())
                 } else {
-                    mapped
+                    analyzer.list_guards_for_target_file(blast.target_file.as_str())
                 }
-            }
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    target_file = %blast.target_file,
-                    "falling back to naming-based test guard inference"
-                );
-                self.fallback_test_guards_from_naming(store, blast.target_file.as_str())?
+            }) {
+                Ok(guards) => {
+                    let mapped = guards
+                        .into_iter()
+                        .map(|guard| AetherBlastRadiusTestGuard {
+                            test_file: guard.test_file,
+                            intents: guard.intents,
+                            confidence: guard.confidence,
+                            inference_method: guard.inference_method,
+                        })
+                        .collect::<Vec<_>>();
+
+                    if mapped.is_empty() {
+                        self.fallback_test_guards_from_naming(store, blast.target_file.as_str())?
+                    } else {
+                        mapped
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        target_file = %blast.target_file,
+                        "falling back to naming-based test guard inference"
+                    );
+                    self.fallback_test_guards_from_naming(store, blast.target_file.as_str())?
+                }
             }
         };
 
@@ -269,6 +286,7 @@ impl AetherMcpServer {
             mining_state,
             coupled_files,
             test_guards,
+            warnings,
         })
     }
 

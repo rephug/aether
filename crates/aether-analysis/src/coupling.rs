@@ -462,7 +462,11 @@ impl CouplingAnalyzer {
         request: BlastRadiusRequest,
     ) -> Result<BlastRadiusResult, AnalysisError> {
         let file_path = normalize_repo_path(request.file_path.as_str());
-        let mut store = SqliteStore::open(&self.workspace)?;
+        let mut store = if request.auto_mine {
+            SqliteStore::open(&self.workspace)?
+        } else {
+            SqliteStore::open_readonly(&self.workspace)?
+        };
         let mut mining_state = store.get_coupling_mining_state()?;
 
         if request.auto_mine && self.needs_auto_mine(mining_state.as_ref())? {

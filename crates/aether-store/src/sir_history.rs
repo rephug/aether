@@ -1,5 +1,17 @@
 use super::*;
 
+/// A bounded history observation without its potentially large SIR payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SirHistoryMetadataRecord {
+    pub symbol_id: String,
+    pub version: i64,
+    pub sir_hash: String,
+    pub provider: String,
+    pub model: String,
+    pub created_at: i64,
+    pub commit_hash: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SirHistoryRecord {
     pub symbol_id: String,
@@ -250,6 +262,38 @@ pub(crate) fn record_sir_version_if_changed_tx(
 }
 
 impl SqliteStore {
+    pub(crate) fn store_list_recent_sir_history_metadata(
+        &self,
+        symbol_id: &str,
+        limit: u32,
+    ) -> Result<Vec<SirHistoryMetadataRecord>, StoreError> {
+        if limit == 0 || symbol_id.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().map_err(|_| {
+            StoreError::Compatibility(
+                "store lock poisoned while reading recent SIR history metadata".to_owned(),
+            )
+        })?;
+        let mut statement = conn.prepare(
+            "SELECT symbol_id, version, sir_hash, provider, model, created_at, commit_hash
+             FROM sir_history WHERE symbol_id = ?1 ORDER BY version DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![symbol_id.trim(), limit.min(100)], |row| {
+            Ok(SirHistoryMetadataRecord {
+                symbol_id: row.get(0)?,
+                version: row.get(1)?,
+                sir_hash: row.get(2)?,
+                provider: row.get(3)?,
+                model: row.get(4)?,
+                created_at: row.get(5)?,
+                commit_hash: row.get(6)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub(crate) fn store_list_sir_history(
         &self,
         symbol_id: &str,

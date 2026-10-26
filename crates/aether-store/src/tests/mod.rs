@@ -484,8 +484,12 @@ mod migrations;
 mod neighbors;
 mod notes_and_analysis;
 mod reconcile;
+mod retirement;
+mod retirement_cleanup;
 mod schema_and_intents;
+mod schema_future;
 mod sir;
+mod sir_history_metadata;
 
 #[test]
 fn sqlite_store_implements_split_store_traits() {
@@ -508,3 +512,5 @@ fn sqlite_store_implements_split_store_traits() {
 
     assert_store_traits::<SqliteStore>();
 }
+
+mod legacy_retirement;

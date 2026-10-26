@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "description": "Small synthetic Rust/Python/TypeScript dependency and recorded-history corpus. No models or production repository data.",
+  "configuration": "[inference]\nprovider = \"mock\"\n\n[storage]\ngraph_backend = \"sqlite\"\n\n[embeddings]\nenabled = false\nvector_backend = \"sqlite\"\n",
+  "initial_files": {
+    "src/rust/checkout.rs": "pub fn checkout(amount: i64) -> i64 { reserve(amount) }\n",
+    "src/rust/ledger.rs": "pub fn reserve(amount: i64) -> i64 { amount }\n",
+    "tests/rust_checkout.rs": "#[test]\nfn test_checkout_reserves_amount() { assert_eq!(checkout(4), 4); }\n",
+    "src/python/invoice.py": "def create_bill(amount):\n    return add_tax(amount)\n",
+    "src/python/tax.py": "def add_tax(amount):\n    return amount + 2\n",
+    "tests/test_invoice.py": "def test_invoice_includes_tax():\n    assert create_bill(4) == 6\n",
+    "src/typescript/session.ts": "export function session(user: string): string { return token(user); }\n",
+    "src/typescript/token.ts": "export function token(user: string): string { return user + ':signed'; }\n",
+    "src/typescript/old_bridge.ts": "export function legacy_bridge(user: string): string { return session(user); }\n",
+    "tests/session.test.ts": "function test_session_signs_user() { if (session('u') !== 'u:signed') { throw new Error('invalid session'); } }\n"
+  },
+  "initial_commit": "Establish checkout invoice and session behavior\n\nFixture baseline: reserve funds before checkout, tax all invoices, and sign sessions. These are recorded fixture decisions, not inferred explanations.",
+  "updated_files": {
+    "src/rust/checkout.rs": "pub fn checkout(amount: i64) -> i64 { reserve_with_retry(amount, 2) }\n",
+    "src/rust/ledger.rs": "pub fn reserve_with_retry(amount: i64, attempts: u8) -> i64 { if attempts == 0 { 0 } else { amount } }\n",
+    "src/python/invoice.py": "def issue_invoice(amount):\n    return add_tax(amount)\n",
+    "tests/test_invoice.py": "def test_invoice_includes_tax():\n    assert issue_invoice(4) == 6\n"
+  },
+  "deleted_files": ["src/typescript/old_bridge.ts"],
+  "update_commit": "Retire legacy bridge and make reservation retries explicit\n\nRETRY-DURABILITY: checkout must preserve reservation retry count during ledger changes because a transient write can otherwise charge twice.\n\nRename create_bill to issue_invoice in src/python/invoice.py; keep the add_tax dependency and its test. Remove src/typescript/old_bridge.ts because legacy_bridge bypassed the session validation boundary. DELETED-BRIDGE: callers must use session directly.",
+  "notes": [
+    "RETRY-DURABILITY: checkout and reserve_with_retry must keep reservation retries bounded to avoid duplicate charges. Review src/rust/checkout.rs, src/rust/ledger.rs and tests/rust_checkout.rs together.",
+    "INVOICE-RENAME: create_bill became issue_invoice in src/python/invoice.py. The add_tax behavior and tests/test_invoice.py remain part of the contract."
+  ],
+  "tasks": [
+    {
+      "id": "rust-multi-file-reservation",
+      "task": "Change checkout and reserve_with_retry reservation behavior; identify dependencies, reverse impact and the relevant test before editing.",
+      "scope": "src/rust",
+      "required_evidence": ["src/rust/checkout.rs", "src/rust/ledger.rs", "tests/rust_checkout.rs"],
+      "category": "multi-file"
+    },
+    {
+      "id": "python-multi-file-tax",
+      "task": "Change issue_invoice and add_tax behavior together and locate the invoice regression test.",
+      "scope": "src/python",
+      "required_evidence": ["src/python/invoice.py", "src/python/tax.py", "tests/test_invoice.py"],
+      "category": "multi-file"
+    },
+    {
+      "id": "typescript-multi-file-session",
+      "task": "Change session and token signing behavior and locate reverse impact and the session regression test.",
+      "scope": "src/typescript",
+      "required_evidence": ["src/typescript/session.ts", "src/typescript/token.ts", "tests/session.test.ts"],
+      "category": "multi-file"
+    },
+    {
+      "id": "historical-reservation-reason",
+      "task": "Before changing checkout and reserve_with_retry, recover the recorded RETRY-DURABILITY reason for bounded reservation retries.",
+      "scope": "src/rust",
+      "required_evidence": ["RETRY-DURABILITY", "duplicate charges", "src/rust/ledger.rs"],
+      "category": "historical"
+    },
+    {
+      "id": "historical-invoice-rename",
+      "task": "Explain the recorded create_bill to issue_invoice rename and identify the current invoice test and unchanged tax dependency.",
+      "scope": "src/python",
+      "required_evidence": ["create_bill", "issue_invoice", "tests/test_invoice.py", "add_tax"],
+      "category": "historical"
+    },
+    {
+      "id": "historical-deleted-bridge",
+      "task": "Recover why legacy_bridge and src/typescript/old_bridge.ts were deleted, and identify the current session replacement boundary.",
+      "scope": "src/typescript",
+      "required_evidence": ["DELETED-BRIDGE", "src/typescript/old_bridge.ts", "src/typescript/session.ts"],
+      "category": "historical"
+    }
+  ]
+}

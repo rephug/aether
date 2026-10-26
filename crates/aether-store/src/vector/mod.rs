@@ -12,8 +12,8 @@ mod migration;
 mod schema;
 mod sqlite;
 
-pub use lancedb::LanceVectorStore;
 pub(crate) use lancedb::sanitize_for_table_name;
+pub use lancedb::{LanceRetirementCleanup, LanceVectorStore};
 pub use sqlite::SqliteVectorStore;
 
 pub(super) const VECTOR_TABLE_PREFIX: &str = "sir_embeddings_";
@@ -204,6 +204,35 @@ mod tests {
                 .expect("lookup sym-c")
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn prepared_lance_retirement_delete_does_not_reenter_sqlite_or_migration() {
+        let temp = tempdir().expect("workspace");
+        let store = LanceVectorStore::open(temp.path()).await.expect("Lance");
+        store
+            .upsert_embedding(vector_record("retired", "old"))
+            .await
+            .expect("vector");
+        let prepared = LanceRetirementCleanup::open_existing(temp.path())
+            .await
+            .expect("prepare existing tables without migration");
+        // Removing the marker makes ordinary delete try to read SQLite. A prepared
+        // delete must not inspect it or open SQLite while another writer fences it.
+        std::fs::remove_file(temp.path().join(".aether/vectors/.sqlite_migrated_v1"))
+            .expect("marker fault");
+        let connection =
+            rusqlite::Connection::open(temp.path().join(".aether/meta.sqlite")).expect("SQLite");
+        connection
+            .execute_batch("PRAGMA journal_mode = DELETE; BEGIN EXCLUSIVE;")
+            .expect("SQLite fence that also blocks accidental reads");
+        prepared
+            .delete_symbol("retired")
+            .await
+            .expect("external-only deletion must not inspect SQLite or migration state");
+        connection
+            .execute_batch("ROLLBACK;")
+            .expect("release fence");
     }
 
     #[tokio::test]

@@ -9,6 +9,7 @@ use crate::http::{
     build_ollama_deep_generate_body, build_ollama_generate_body, build_ollama_text_generate_body,
     inference_http_client, inference_http_client_with_timeout, ollama_generate_endpoint,
 };
+use crate::model_check::{ModelCatalog, ModelListing};
 use crate::providers::PARSE_VALIDATION_RETRIES;
 use crate::sir_parsing::{
     build_retry_prompt, extract_local_text_part, normalize_candidate_json, parse_and_validate_sir,
@@ -194,6 +195,15 @@ impl InferenceProvider for Qwen3LocalProvider {
 
     fn model_name(&self) -> String {
         self.model.clone()
+    }
+
+    fn model_listings(&self) -> Vec<ModelListing> {
+        vec![ModelListing::new(
+            self.model.clone(),
+            ModelCatalog::Ollama {
+                endpoint: crate::http::normalize_ollama_endpoint(&self.endpoint),
+            },
+        )]
     }
 
     async fn generate_sir(

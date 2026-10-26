@@ -457,7 +457,6 @@ fn rollups_of_pruned_files_stay_invalidated_when_the_structural_pass_fails() {
         &SnapshotScope::of(&observer),
         &events,
         &symbols_by_id,
-        |_| Ok(()),
     );
     assert!(synced.is_err(), "the structural pass must fail");
     assert!(leaf(&store, &removed.id).is_none(), "the prune committed");
@@ -563,7 +562,6 @@ fn a_snapshot_never_undoes_what_was_indexed_after_it_began() {
         &scope,
         &events,
         &symbols_by_id,
-        |_| Ok(()),
     )
     .expect("sync the older snapshot");
 

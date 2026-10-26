@@ -83,24 +83,13 @@ impl StructuralIndexer {
         store: &SqliteStore,
         event: &SymbolChangeEvent,
     ) -> Result<()> {
-        for symbol in &event.removed {
-            // Removal deletes the symbol row and its SIR, so it takes the inject lock the
-            // leaf writers hold (as the SIR pipeline's removal does): an `aether_sir_inject`
-            // call re-checks the symbol under that lock and cannot persist a leaf for a
-            // symbol removed underneath it, which the `sir` table has no foreign key to
-            // reject.
-            let _inject_guard = acquire_inject_write_lock(&self.workspace_root)?;
-            store
-                .mark_removed(&symbol.id)
-                .with_context(|| format!("failed to mark symbol removed: {}", symbol.id))?;
-        }
-
-        let now_ts = unix_timestamp_secs();
-        for symbol in event.added.iter().chain(event.updated.iter()) {
-            store
-                .upsert_symbol(to_symbol_record(symbol, now_ts))
-                .with_context(|| format!("failed to upsert symbol {}", symbol.id))?;
-        }
+        reconcile_symbol_event(&self.workspace_root, store, event)?;
+        crate::retirement_cleanup::replay_and_warn(
+            &self.workspace_root,
+            store,
+            &self.graph_runtime,
+        )
+        .context("replay retirement projections before structural publication")?;
 
         store
             .delete_edges_for_file(&event.file_path)
@@ -181,12 +170,6 @@ impl StructuralIndexer {
         // Its edges now read the files as they are.
         self.stale_files.remove(&event.file_path);
         Ok(())
-    }
-
-    pub(super) fn delete_symbols_batch(&self, symbol_ids: &[String]) -> Result<()> {
-        self.graph_runtime
-            .block_on(self.graph_store.delete_symbols_batch(symbol_ids))
-            .context("failed to delete stale graph symbols")
     }
 }
 

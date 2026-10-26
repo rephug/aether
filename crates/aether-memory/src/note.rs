@@ -113,6 +113,7 @@ pub struct ProjectMemoryService {
     workspace: PathBuf,
     shared_store: Option<Arc<SqliteStore>>,
     shared_vector_store: Option<Arc<dyn VectorStore>>,
+    pub(crate) read_only: bool,
 }
 
 impl ProjectMemoryService {
@@ -121,6 +122,7 @@ impl ProjectMemoryService {
             workspace: workspace.as_ref().to_path_buf(),
             shared_store: None,
             shared_vector_store: None,
+            read_only: false,
         }
     }
 
@@ -133,6 +135,22 @@ impl ProjectMemoryService {
             workspace: workspace.as_ref().to_path_buf(),
             shared_store: Some(store),
             shared_vector_store: vector_store,
+            read_only: false,
+        }
+    }
+
+    /// Reuse read-only handles without recording access or opening fallback stores.
+    /// Mutating memory operations reject requests before touching those handles.
+    pub fn with_shared_readonly(
+        workspace: impl AsRef<Path>,
+        store: Arc<SqliteStore>,
+        vector_store: Option<Arc<dyn VectorStore>>,
+    ) -> Self {
+        Self {
+            workspace: workspace.as_ref().to_path_buf(),
+            shared_store: Some(store),
+            shared_vector_store: vector_store,
+            read_only: true,
         }
     }
 
@@ -140,9 +158,19 @@ impl ProjectMemoryService {
         &self.workspace
     }
 
+    fn require_writable(&self) -> Result<(), MemoryError> {
+        if self.read_only {
+            return Err(MemoryError::InvalidInput(
+                "memory service is read-only".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn open_store(&self) -> Result<Arc<SqliteStore>, MemoryError> {
         match &self.shared_store {
             Some(store) => Ok(Arc::clone(store)),
+            None if self.read_only => Ok(Arc::new(SqliteStore::open_readonly(&self.workspace)?)),
             None => Ok(Arc::new(SqliteStore::open(&self.workspace)?)),
         }
     }
@@ -150,11 +178,15 @@ impl ProjectMemoryService {
     pub(crate) async fn open_vector_store(&self) -> Result<Arc<dyn VectorStore>, MemoryError> {
         match &self.shared_vector_store {
             Some(store) => Ok(Arc::clone(store)),
+            None if self.read_only => Err(MemoryError::InvalidInput(
+                "vector search unavailable: no read-only vector handle was supplied".to_owned(),
+            )),
             None => Ok(open_vector_store(&self.workspace).await?),
         }
     }
 
     pub fn remember(&self, request: RememberRequest) -> Result<RememberResult, MemoryError> {
+        self.require_writable()?;
         let content = request.content.trim();
         if content.is_empty() {
             return Err(MemoryError::InvalidInput(
@@ -212,6 +244,7 @@ impl ProjectMemoryService {
         &self,
         request: NoteEmbeddingRequest,
     ) -> Result<(), MemoryError> {
+        self.require_writable()?;
         let note_id = request.note_id.trim();
         if note_id.is_empty() {
             return Err(MemoryError::InvalidInput(

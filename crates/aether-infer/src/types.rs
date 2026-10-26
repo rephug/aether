@@ -5,6 +5,8 @@ use aether_sir::SirAnnotation;
 use async_trait::async_trait;
 use thiserror::Error;
 
+use crate::model_check::ModelListing;
+
 pub const GEMINI_API_KEY_ENV: &str = DEFAULT_GEMINI_API_KEY_ENV;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -134,6 +136,12 @@ pub trait InferenceProvider: Send + Sync {
         "unknown".to_owned()
     }
 
+    /// The model ids this provider calls, each with the catalog that should list it, for
+    /// `aetherd doctor`. Empty for a provider that calls no hosted model.
+    fn model_listings(&self) -> Vec<ModelListing> {
+        Vec::new()
+    }
+
     async fn generate_sir(
         &self,
         symbol_text: &str,
@@ -187,6 +195,12 @@ pub trait InferenceProvider: Send + Sync {
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>, InferError>;
+
+    /// The model this provider calls, with the catalog that should list it, for `aetherd
+    /// doctor`. Empty for a provider that runs a local model file.
+    fn model_listings(&self) -> Vec<ModelListing> {
+        Vec::new()
+    }
 
     async fn embed_text_with_purpose(
         &self,

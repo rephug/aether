@@ -1,14 +1,30 @@
-use super::{TemplateContext, search_modes_line, verify_commands_markdown};
+use super::{
+    TemplateContext, recommended_actions, required_actions, search_modes_line,
+    verification_guidance, verify_commands_markdown,
+};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SkillTemplate;
 
 impl SkillTemplate {
     pub fn render(context: &TemplateContext) -> String {
+        let required = required_actions(context)
+            .iter()
+            .map(|line| format!("- {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let optional = recommended_actions(context)
+            .iter()
+            .map(|line| format!("- {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         format!(
-            "---\nname: aether-context\ndescription: \"Code intelligence workflow for AETHER-indexed projects. Use before modifying, refactoring, or reviewing unfamiliar code.\"\n---\n\n# AETHER Code Intelligence Workflow\n\n## When to activate\n- Any task involving code modification, refactoring, or review\n- Onboarding to unfamiliar modules or symbols\n- Investigating why code changed recently\n- Tracing dependencies before making risky edits\n\n## Workflow: Orient -> Discover -> Understand -> Modify -> Verify\n\n### 1. Orient\n- Call `aether_status` to confirm index freshness.\n- Verify counts and staleness indicators before relying on search output.\n\n### 2. Discover\n- Use `aether_search` in the best available mode for this project.\n- Available search modes: {}\n\n### 3. Understand\n- For every symbol you plan to modify, call `aether_get_sir`.\n- Call `aether_symbol_timeline` for recent change history.\n- Call `aether_call_chain` when blast radius is unclear.\n\n### 4. Modify\n- Preserve intended side effects and dependency contracts from SIR.\n- Avoid silent behavior changes in error handling paths.\n\n### 5. Verify\n- Run `aether_verify` before completing the task.\n- Preferred commands:\n{}\n\n## Required safety rules\n- Before revert/delete/refactor: call `aether_get_sir`.\n- Before reverting recent code: call `aether_why_changed`.\n- After modifications: call `aether_verify` and fix failures.\n\n## Anti-patterns to avoid\n- Do not guess side effects when `aether_get_sir` can confirm them.\n- Do not revert recent edits without `aether_why_changed`.\n- Do not assume semantic search is available when embeddings are disabled.\n- Do not skip verification on modified code paths.\n",
+            "---\nname: aether-context\ndescription: \"Optional code intelligence evidence for AETHER-indexed projects.\"\n---\n\n# AETHER Code Intelligence Workflow\n\n## When to use\n- Exploring unfamiliar code or recorded history with available AETHER tools\n- An explicitly requested AETHER audit or annotation workflow\n\n## Workflow: Orient -> Discover -> Understand -> Modify -> Verify\n\n### 1. Orient\nInspect current source, Git state and project instructions. Optional status diagnostics cannot prove index freshness or completeness.\n\n### 2. Discover\nUse ordinary repository search and any useful advertised AETHER tools. Available search modes by configuration: {}\n\n### 3. Understand\nCompare annotation/history evidence with current source, callers and relevant tests; distinguish recorded reasons from generated descriptions.\n\n### 4. Modify\nPreserve intended behavior established by source, tests and recorded contracts. Annotation writes belong to explicitly requested workflows with writable tools.\n\n### 5. Verify\n{}\nPreferred configured commands:\n{}\n\n## Required repository checks\n{}\n\n## Optional AETHER guidance\n{}\n\n## Anti-patterns to avoid\n- Do not infer full dependency coverage from missing edges or status counts.\n- Do not present a SIR difference as a recorded design reason.\n- Do not assume semantic search is available from configuration alone.\n- Report blocked validation and its limits.\n",
             search_modes_line(context),
-            verify_commands_markdown(context)
+            verification_guidance(context),
+            verify_commands_markdown(context),
+            required,
+            optional,
         )
     }
 }

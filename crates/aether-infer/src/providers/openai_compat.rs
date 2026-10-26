@@ -10,6 +10,7 @@ use crate::http::{
     inference_http_client_with_timeout, normalize_openai_api_base,
     response_indicates_unsupported_json_mode,
 };
+use crate::model_check::{ModelCatalog, ModelListing};
 use crate::providers::PARSE_VALIDATION_RETRIES;
 use crate::sir_parsing::run_sir_parse_validation_retries;
 use crate::sir_prompt;
@@ -226,6 +227,16 @@ impl InferenceProvider for OpenAiCompatProvider {
 
     fn model_name(&self) -> String {
         self.model.clone()
+    }
+
+    fn model_listings(&self) -> Vec<ModelListing> {
+        vec![ModelListing::new(
+            self.model.clone(),
+            ModelCatalog::OpenAiCompat {
+                api_base: self.api_base.clone(),
+                api_key: self.api_key.clone(),
+            },
+        )]
     }
 
     async fn generate_sir(

@@ -28,7 +28,7 @@ concurrency = 2
   - `mock`: no model at all. Every symbol gets a `[MOCK]` placeholder SIR at confidence 0.1 from tree-sitter facts, so `aether_audit_candidates` ranks it first for `/scan` (zero-key onboarding, Decision #121).
 - `model`
   - Optional provider-specific override.
-  - Gemini default: `gemini-3.1-flash-lite-preview`
+  - Gemini default: `gemini-3.1-flash-lite`
 - `endpoint`
   - Optional provider-specific endpoint override.
   - `qwen3_local` default: `http://127.0.0.1:11434`
@@ -43,7 +43,7 @@ concurrency = 2
 - `concurrency`
   - Default config value is `2`.
   - When `provider = "gemini"` and concurrency is left at the default value, AETHER normalizes it to `16`.
-  - For `gemini-3.1-flash-lite-preview`, `concurrency = 16` is safe under the 4000 RPM limit.
+  - For `gemini-3.1-flash-lite`, `concurrency = 16` is safe under the 4000 RPM limit.
   - For local Ollama on consumer hardware, `concurrency = 2` is appropriate.
 - `timeout_secs`
   - How long one SIR generation attempt may take during scans and watcher updates before it is abandoned (each symbol gets three attempts). Unset means 90 seconds.
@@ -161,7 +161,7 @@ too.
 # Pass 2 — triage: enriched context, self-improvement, all or filtered symbols
 triage_pass = true
 triage_provider = "gemini"
-triage_model = "gemini-3.1-flash-lite-preview"
+triage_model = "gemini-3.1-flash-lite"
 triage_api_key_env = "GEMINI_API_KEY"
 triage_priority_threshold = 0.0
 triage_confidence_threshold = 1.0
@@ -228,6 +228,43 @@ vector_backend = "lancedb" # lancedb | sqlite
 - `enabled = false` keeps search lexical-only.
 - `provider = "qwen3_local"` uses a local HTTP embedding endpoint.
 - `provider = "candle"` uses the bundled local model path under `[embeddings.candle]`.
+- `provider = "gemini_native"` calls Gemini's embedding API. Google's deprecations page lists the preview id `gemini-embedding-2-preview` (as `embedding-2-preview`) with 2026-08-10 as the earliest possible date on which it might be retired, and names `gemini-embedding-2` as its replacement. AETHER warns at startup (`model_id_retiring`) but keeps using the configured id. Switching takes more than the id: `gemini-embedding-2` doesn't take the `taskType` field this provider sends, so it needs the task written into the text instead (`task: code retrieval | query: ...` for queries, `title: none | text: ...` for documents), and switching models re-embeds every symbol.
+
+## MCP Tool Profile
+
+```toml
+[mcp]
+tools = "full" # full | compact
+```
+
+An MCP client sends the name, description and input schema of every tool `aether-mcp` lists to the model on each request, whether or not the model calls it. The full profile lists every tool (40 in the default build, including `aether_preflight` and `aether_status`). The compact profile lists the six that coding agents used most, with shorter descriptions and input schemas: about 2.2 KB of tool definitions instead of 26 KB. (The whole `tools/list` response, output schemas included, shrinks from about 80 KB to 2.2 KB.) The compact tools:
+
+- `aether_symbol_lookup` and `aether_search`: a symbol's `symbol_id`, by name or file path, or by meaning.
+- `aether_dependencies` and `aether_call_chain`: its resolved callers and callees, and what it reaches through calls.
+- `aether_sir_context`: what it does, with its callers, callees and related tests.
+- `aether_test_intents`: what the tests in a file assert.
+
+Notes:
+
+- The compact schemas advertise only the parameters a coding agent needs; the others keep their defaults. For example, compact `aether_symbol_lookup` leaves out `symbol_ids` and `include_source`, which `/scan` uses. Compact tools list no output schema; their results are the same as in the full profile.
+- A call to a tool outside the profile fails with an error that names the profile and how to switch.
+- `aether-mcp --tools compact|full` overrides `[mcp] tools`, so one client can attach the compact profile while others keep the full one:
+
+  ```bash
+  claude mcp add --transport stdio --scope project aether -- aether-mcp --workspace . --tools compact
+  ```
+
+  ```toml
+  # ~/.codex/config.toml
+  [mcp_servers.aether]
+  command = "aether-mcp"
+  args = ["--workspace", "/path/to/project", "--tools", "compact"]
+  ```
+
+- `aetherd init-agent --mcp-tools compact` (default: `[mcp] tools`) writes a compact setup: `.mcp.json` registers `aether-mcp --workspace . --tools compact`, and `CLAUDE.md`, `AGENTS.md`, `.codex-instructions` and `.cursor/rules` get short guidance for the six tools. It doesn't write the slash commands, `scripts/scan_all.sh`, the `aether-context` skill or the review workflow, because they call tools outside the compact profile.
+- Switching an existing generated setup from Full to Compact requires `--force`. Recognized Full-only commands, scripts, skills and workflows move to `.aether/agent-artifact-backups/<unique-run>/` before the profile changes. Their bytes and file modes are preserved. Recognized guidance for other generated clients is refreshed too, since these files share the project registration; an existing `.mcp.json` keeps other servers. Customized files or templates from another build/configuration refuse the transition before any archival or profile change and need manual review. This is a local multi-file operation, not an atomic transaction against concurrent edits.
+- Keep the full profile wherever `/scan`, `/enrich`, `/audit` or the other generated slash commands run: setting `tools = "compact"` here also changes what `scripts/scan_all.sh` and an `.mcp.json` without `--tools` get.
+- `aether-query` serves the profile `[mcp] tools` selects on its MCP endpoint.
 
 ## Environment Variables
 
@@ -253,8 +290,12 @@ No API key is required for `qwen3_local`.
 
 Override precedence is CLI > config file > built-in defaults.
 
+`aether-mcp --tools <full|compact>` overrides `[mcp] tools` the same way (see [MCP Tool Profile](#mcp-tool-profile)).
+
 ## Validation and Normalization
 
+- A model id that its provider has shut down or listed for retirement gets a startup warning (`model_id_shut_down` or `model_id_retiring`) naming the setting, the replacement id and anything besides the id that switching needs. Requests still use the configured id. Google's notices apply only where Google serves the model: through the Gemini API (provider `gemini`, `auto`, a tiered primary of `gemini`, `gemini_native` embeddings, Gemini batches) or as a `google/` route through a gateway. The same name served by Ollama or another OpenAI-compatible endpoint gets no warning.
+- `aetherd --workspace . doctor` resolves the inference provider, any quality pass with its own provider or model, the watcher's `realtime_model`, and the embedding provider the way indexing does, then asks each service (Gemini, Ollama, an OpenAI-compatible endpoint or the omp gateway) to list its models and reports any configured id it doesn't list. It only lists models: nothing is generated or embedded. It exits with status 1 when a model is missing, shut down or can't be checked.
 - Optional strings are trimmed and empty strings are discarded.
 - Probability thresholds are clamped into valid ranges.
 - `triage_timeout_secs` and `deep_timeout_secs` default to `180`.

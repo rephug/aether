@@ -1,5 +1,5 @@
 //! The only test in its binary, so it can set the process environment before SurrealDB
-//! reads it at the first open.
+//! reads it at the first open, and install the process-wide log subscriber.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -39,7 +39,8 @@ async fn first_open_uses_the_fixed_surrealkv_sizes() {
         .with_ansi(false)
         .with_max_level(tracing::Level::INFO)
         .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    // SurrealDB opens stores on a runtime of their own, so its logs come from other threads.
+    tracing::subscriber::set_global_default(subscriber).expect("install log subscriber");
 
     let temp = tempfile::tempdir().expect("tempdir");
     SurrealGraphStore::open(temp.path())

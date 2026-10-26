@@ -1,0 +1,31 @@
+{
+  "backend_order": [
+    "sqlite",
+    "lance"
+  ],
+  "batch_policy": "existing public APIs; SQLite batch currently loops row transactions, Lance uses batch merge",
+  "cache_policy": "no OS cache flush; reopen and warm labels refer to this process/fixture only",
+  "compilation_policy": "compilation excluded from executable timings; record cargo wall separately; both arms share binary/profile",
+  "correctness_gate": "all expected unique query receipts accounted; no API errors/duplicate IDs/missing rows; recall@10=1.0; all 1000 IDs, bitwise float32 vectors and provider/model/hash/timestamp metadata verified after initial batch and after mixed writes (20 changed metadata rows, 980 unchanged)",
+  "cost_policy": "provider calls/tokens/charges zero by construction; no infrastructure pricing assumption",
+  "dimensions": 3072,
+  "expected_search_api_calls_per_backend": 341,
+  "frozen_on": "2026-10-21",
+  "k": 10,
+  "mixed_readers": 16,
+  "oracle": "exhaustive float64 cosine; descending score then lexicographic symbol ID",
+  "order_limitation": "fixed-order single pass; OS cache/order effects are not controlled and no comparative significance is established",
+  "performance_gate": "none; descriptive small diagnostic, not a backend promotion or production latency claim",
+  "process_isolation": "one fresh child process and TempDir per backend",
+  "protocol_version": "aether-vector-storage-diagnostic-v1",
+  "queries": 20,
+  "query_repetition_policy": "20 distinct queries: one first-after-reopen search plus20warm plus16readers*20mixed searches=341 calls per backend",
+  "reader_topology": "independent handles in one process; not 16 MCP processes",
+  "rows": 1000,
+  "seed": 12573522557516447748,
+  "tokio_workers": 2,
+  "validation_timing_policy": "full-row validation is separately timed after initial batch and after mixed writes; report requested-ID copying, public read API and payload/metadata comparison separately; do not fold validation into upsert/search API latency",
+  "vector_kind": "synthetic finite normalized float32; no semantic-quality interpretation",
+  "writer_mode": "same vector payload, changed metadata; bounded concurrent burst, not steady state",
+  "writer_updates": 20
+}

@@ -1,6 +1,11 @@
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
-use rmcp::{ErrorData as McpError, Json, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, Implementation, ListToolsResult, PaginatedRequestParams,
+    ServerCapabilities, ServerInfo,
+};
+use rmcp::service::RequestContext;
+use rmcp::{ErrorData as McpError, Json, RoleServer, ServerHandler, tool, tool_router};
 
 use super::{
     AetherAcknowledgeDriftRequest, AetherAcknowledgeDriftResponse, AetherAskRequest,
@@ -17,18 +22,18 @@ use super::{
     AetherDriftReportRequest, AetherDriftReportResponse, AetherEnhancePromptRequest,
     AetherEnhancePromptResponse, AetherExplainRequest, AetherExplainResponse, AetherGetSirRequest,
     AetherGetSirResponse, AetherHealthExplainRequest, AetherHealthHotspotsRequest,
-    AetherHealthRequest, AetherHealthResponse, AetherMcpServer, AetherRecallRequest,
-    AetherRecallResponse, AetherRefactorPrepRequest, AetherRefactorPrepResponse,
-    AetherRememberRequest, AetherRememberResponse, AetherSearchRequest, AetherSearchResponse,
-    AetherSessionNoteResponse, AetherSirContextRequest, AetherSirContextResponse,
-    AetherSirInjectRequest, AetherSirInjectResponse, AetherStatusResponse,
-    AetherSuggestTraitSplitRequest, AetherSuggestTraitSplitResponse, AetherSymbolLookupRequest,
-    AetherSymbolLookupResponse, AetherSymbolTimelineRequest, AetherSymbolTimelineResponse,
-    AetherTestIntentsRequest, AetherTestIntentsResponse, AetherTextResponse,
-    AetherTraceCauseRequest, AetherTraceCauseResponse, AetherUsageMatrixRequest,
-    AetherUsageMatrixResponse, AetherVerifyIntentRequest, AetherVerifyIntentResponse,
-    AetherWhyChangedRequest, AetherWhyChangedResponse, SERVER_DESCRIPTION, SERVER_NAME,
-    SERVER_VERSION,
+    AetherHealthRequest, AetherHealthResponse, AetherMcpServer, AetherPreflightRequest,
+    AetherPreflightResponse, AetherRecallRequest, AetherRecallResponse, AetherRefactorPrepRequest,
+    AetherRefactorPrepResponse, AetherRememberRequest, AetherRememberResponse, AetherSearchRequest,
+    AetherSearchResponse, AetherSessionNoteResponse, AetherSirContextRequest,
+    AetherSirContextResponse, AetherSirInjectRequest, AetherSirInjectResponse,
+    AetherStatusResponse, AetherSuggestTraitSplitRequest, AetherSuggestTraitSplitResponse,
+    AetherSymbolLookupRequest, AetherSymbolLookupResponse, AetherSymbolTimelineRequest,
+    AetherSymbolTimelineResponse, AetherTestIntentsRequest, AetherTestIntentsResponse,
+    AetherTextResponse, AetherTraceCauseRequest, AetherTraceCauseResponse,
+    AetherUsageMatrixRequest, AetherUsageMatrixResponse, AetherVerifyIntentRequest,
+    AetherVerifyIntentResponse, AetherWhyChangedRequest, AetherWhyChangedResponse,
+    SERVER_DESCRIPTION, SERVER_NAME, SERVER_VERSION,
 };
 #[cfg(feature = "verification")]
 use super::{AetherVerifyRequest, AetherVerifyResponse};
@@ -40,7 +45,10 @@ fn to_mcp_error(err: AetherMcpError) -> McpError {
 
 #[tool_router(router = tool_router, vis = "pub(crate)")]
 impl AetherMcpServer {
-    #[tool(name = "aether_status", description = "Get AETHER local store status")]
+    #[tool(
+        name = "aether_status",
+        description = "Get AETHER index status: symbol and SIR counts, freshness against the workspace (last sync, indexed vs workspace HEAD, files changed since, stale SIRs, whether a daemon watches) and how many call edges the graph resolves per language"
+    )]
     pub async fn aether_status(&self) -> Result<Json<AetherStatusResponse>, McpError> {
         self.verbose_log("MCP tool called: aether_status");
         let server = self.clone();
@@ -70,7 +78,7 @@ impl AetherMcpServer {
 
     #[tool(
         name = "aether_dependencies",
-        description = "Get resolved callers and call dependencies for a symbol"
+        description = "Get resolved callers and call dependencies for a symbol, with coverage counts for the calls the graph could not resolve or attribute"
     )]
     pub async fn aether_dependencies(
         &self,
@@ -136,7 +144,7 @@ impl AetherMcpServer {
 
     #[tool(
         name = "aether_call_chain",
-        description = "Get transitive call-chain levels for a symbol"
+        description = "Get transitive callee levels for a symbol, with coverage counts for the calls the graph could not resolve"
     )]
     pub async fn aether_call_chain(
         &self,
@@ -151,7 +159,7 @@ impl AetherMcpServer {
 
     #[tool(
         name = "aether_search",
-        description = "Search symbols by name, path, language, or kind"
+        description = "Search ranked symbol names and paths with optional semantic retrieval and reranking"
     )]
     pub async fn aether_search(
         &self,
@@ -428,6 +436,22 @@ impl AetherMcpServer {
         self.verbose_log("MCP tool called: aether_sir_inject");
         let server = self.clone();
         tokio::task::spawn_blocking(move || server.aether_sir_inject_logic(request))
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .map(Json)
+            .map_err(to_mcp_error)
+    }
+
+    #[tool(
+        name = "aether_preflight",
+        description = "Assemble one deterministic task-specific investigation map with dependencies, reverse impact, recorded history/reasons, risks and tests. Read-only and provider-free; reports unknown freshness and missing evidence."
+    )]
+    pub async fn aether_preflight(
+        &self,
+        Parameters(request): Parameters<AetherPreflightRequest>,
+    ) -> Result<Json<AetherPreflightResponse>, McpError> {
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || server.aether_preflight_logic(request))
             .await
             .map_err(|err| McpError::internal_error(err.to_string(), None))?
             .map(Json)
@@ -713,8 +737,36 @@ impl AetherMcpServer {
     }
 }
 
-#[tool_handler(router = self.tool_router)]
+// `call_tool` and `list_tools` are what `#[tool_handler]` would generate, except that a
+// call to a tool outside the active profile gets an error naming the profile, and the
+// list is sorted by name so it is the same on every start.
 impl ServerHandler for AetherMcpServer {
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Some(err) = self.tool_outside_profile_error(request.name.as_ref()) {
+            return Err(err);
+        }
+        let call = ToolCallContext::new(self, request, context);
+        self.tool_router.call(call).await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let mut tools = self.tool_router.list_all();
+        tools.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(ListToolsResult {
+            tools,
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             capabilities: ServerCapabilities::builder().enable_tools().build(),

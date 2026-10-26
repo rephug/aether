@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use aether_config::parse_gemini_thinking_level;
+use aether_infer::gemini_accepts_temperature;
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::json;
@@ -30,7 +31,7 @@ impl BatchProvider for GeminiBatchProvider {
         key: &str,
         system_prompt: &str,
         user_prompt: &str,
-        _model: &str,
+        model: &str,
         thinking: &str,
     ) -> Result<String> {
         // Gemini batch: concatenate system+user into a single text field
@@ -39,8 +40,11 @@ impl BatchProvider for GeminiBatchProvider {
 
         let mut gen_config = json!({
             "responseMimeType": "application/json",
-            "temperature": 0.0,
         });
+        // Gemini 3.5 and later ignore temperature, and later generations reject it.
+        if gemini_accepts_temperature(model) {
+            gen_config["temperature"] = json!(0.0);
+        }
 
         if let Some(level) = parse_gemini_thinking_level(Some(thinking)) {
             gen_config["thinkingConfig"] = json!({
@@ -470,6 +474,30 @@ mod tests {
             true
         );
         assert_eq!(json["request"]["generationConfig"]["temperature"], 0.0);
+    }
+
+    #[test]
+    fn format_request_sends_temperature_only_to_models_that_accept_it() {
+        let p = provider();
+        for (model, temperature) in [
+            ("gemini-2.5-flash", Some(0.0)),
+            ("gemini-3.1-flash-lite", Some(0.0)),
+            ("gemini-3.5-flash-lite", None),
+            ("gemini-3.6-flash", None),
+            ("gemini-4-argon", None),
+        ] {
+            let line = p
+                .format_request("sym", "System.", "User.", model, "high")
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let config = &json["request"]["generationConfig"];
+            assert_eq!(
+                config.get("temperature").and_then(|value| value.as_f64()),
+                temperature,
+                "{model}: {config}"
+            );
+            assert_eq!(config["thinkingConfig"]["thinkingLevel"], "HIGH", "{model}");
+        }
     }
 
     #[test]

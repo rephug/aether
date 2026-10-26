@@ -68,6 +68,11 @@ impl AetherMcpServer {
         &self,
         request: AetherEnhancePromptRequest,
     ) -> Result<AetherEnhancePromptResponse, AetherMcpError> {
+        if self.state.read_only {
+            return Err(AetherMcpError::ReadOnly(
+                "Prompt enhancement is unavailable in read-only mode because its context assembler opens writable analysis and vector stores; use aether_sir_context for read-only briefing.".to_owned(),
+            ));
+        }
         let prompt = request.prompt.trim();
         if prompt.is_empty() {
             return Err(AetherMcpError::Message(

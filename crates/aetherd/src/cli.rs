@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use aether_analysis::RiskLevel as CouplingRiskLevel;
-use aether_config::{InferenceProviderKind, OLLAMA_DEFAULT_ENDPOINT, VerifyMode};
+use aether_config::{InferenceProviderKind, McpToolProfile, OLLAMA_DEFAULT_ENDPOINT, VerifyMode};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::init_agent::AgentPlatform;
@@ -51,6 +51,13 @@ pub struct InitAgentArgs {
 
     #[arg(long, help = "Overwrite existing files")]
     pub force: bool,
+
+    #[arg(
+        long,
+        value_name = "full|compact",
+        help = "AETHER MCP tool profile to set up (default: [mcp] tools in .aether/config.toml). compact registers aether-mcp with --tools compact and writes short guidance for its six tools; the slash commands, scan script, skill and review workflow need the full profile and are not written"
+    )]
+    pub mcp_tools: Option<McpToolProfile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Args)]
@@ -837,6 +844,20 @@ pub struct TaskRelevanceArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct PreflightArgs {
+    /// Task to investigate; no branch or initialized index is required
+    pub task: String,
+    /// Workspace-relative file or directory to scope candidate selection
+    #[arg(long)]
+    pub scope: Option<String>,
+    /// Serialized UTF-8 bytes / 4 estimate, not a provider tokenizer count
+    #[arg(long, default_value_t = 2500)]
+    pub max_tokens: usize,
+    #[arg(long, default_value = "markdown", value_parser = ["markdown", "json"])]
+    pub format: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct SirContextArgs {
     #[arg(
         help = "Symbol selector: qualified name, symbol ID, or fuzzy search",
@@ -1123,6 +1144,8 @@ pub enum Commands {
     Enhance(EnhanceArgs),
     /// Start, stop, or inspect the Oh My Pi broker + gateway used by inference.provider=omp
     Omp(OmpArgs),
+    /// Assemble a deterministic task map without provider calls or index writes
+    Preflight(PreflightArgs),
     /// Assemble semantic context for a symbol
     SirContext(SirContextArgs),
     /// Inject or update a symbol's SIR annotation
@@ -1141,6 +1164,8 @@ pub enum Commands {
     SetupLocal(SetupLocalArgs),
     /// Show local index health and SIR coverage
     Status,
+    /// Check that the configured inference and embedding model ids exist (lists models only)
+    Doctor,
     /// Store a project memory note
     Remember(RememberArgs),
     /// Search project memory notes
@@ -1652,6 +1677,31 @@ mod tests {
     }
 
     #[test]
+    fn preflight_accepts_task_scope_budget_without_branch() {
+        let cli = Cli::try_parse_from([
+            "aetherd",
+            "preflight",
+            "repair cache",
+            "--scope",
+            "src/cache.rs",
+            "--max-tokens",
+            "2500",
+            "--format",
+            "json",
+        ])
+        .expect("preflight should parse without a branch");
+        match cli.command {
+            Some(Commands::Preflight(args)) => {
+                assert_eq!(args.task, "repair cache");
+                assert_eq!(args.scope.as_deref(), Some("src/cache.rs"));
+                assert_eq!(args.max_tokens, 2500);
+                assert_eq!(args.format, "json");
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+    }
+
+    #[test]
     fn init_agent_subcommand_parses_with_defaults() {
         let cli = Cli::try_parse_from(["aetherd", "--workspace", ".", "init-agent"])
             .expect("init-agent should parse");
@@ -1728,6 +1778,13 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn doctor_subcommand_parses() {
+        let cli =
+            Cli::try_parse_from(["aetherd", "--workspace", ".", "doctor"]).expect("doctor parse");
+        assert!(matches!(cli.command, Some(Commands::Doctor)));
     }
 
     #[test]

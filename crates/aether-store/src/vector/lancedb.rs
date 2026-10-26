@@ -43,6 +43,111 @@ pub struct LanceVectorStore {
     cas_serial: tokio::sync::Mutex<()>,
 }
 
+/// Open symbol-vector tables prepared before a retirement's SQLite fence.
+/// Deletion performs only external Lance operations: no SQLite reads, migration,
+/// backend discovery or table opening can occur while the catalog is fenced.
+pub struct LanceRetirementCleanup {
+    tables: Vec<(String, Table)>,
+}
+
+fn existing_lance_table_artifacts(vectors_dir: &Path) -> Result<bool, StoreError> {
+    let metadata = match fs::metadata(vectors_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(StoreError::LanceDb(format!(
+                "inspect existing vector directory {}: {error}",
+                vectors_dir.display()
+            )));
+        }
+    };
+    if !metadata.is_dir() {
+        return Err(StoreError::LanceDb(format!(
+            "existing vector path is not a directory: {}",
+            vectors_dir.display()
+        )));
+    }
+    let entries = fs::read_dir(vectors_dir).map_err(|error| {
+        StoreError::LanceDb(format!(
+            "list existing vector directory {}: {error}",
+            vectors_dir.display()
+        ))
+    })?;
+    // Connecting to a missing/empty store can initialize it. Probe local artifacts
+    // on a blocking worker and avoid that operation when no table exists.
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            StoreError::LanceDb(format!(
+                "read vector directory entry in {}: {error}",
+                vectors_dir.display()
+            ))
+        })?;
+        if entry.file_name().to_string_lossy().ends_with(".lance") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+impl LanceRetirementCleanup {
+    /// Open only existing local symbol-vector tables. This never opens SQLite,
+    /// imports vectors/notes, creates a missing store, or writes migration markers.
+    /// Acquire the symbol's embedding lock before preparation and retain it until
+    /// the fenced external delete and acknowledgement have completed.
+    pub async fn open_existing(workspace_root: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let vectors_dir = workspace_root.as_ref().join(".aether/vectors");
+        let probe_path = vectors_dir.clone();
+        let has_tables =
+            tokio::task::spawn_blocking(move || existing_lance_table_artifacts(&probe_path))
+                .await
+                .map_err(|error| {
+                    StoreError::LanceDb(format!("existing-vector filesystem probe failed: {error}"))
+                })??;
+        if !has_tables {
+            return Ok(Self { tables: Vec::new() });
+        }
+        let connection = connect(vectors_dir.to_string_lossy().as_ref())
+            .execute()
+            .await
+            .map_err(map_lancedb_err)?;
+        let names = connection
+            .table_names()
+            .execute()
+            .await
+            .map_err(map_lancedb_err)?
+            .into_iter()
+            .filter(|name| name.starts_with(VECTOR_TABLE_PREFIX))
+            .collect::<Vec<_>>();
+        if names.len() > 128 {
+            return Err(StoreError::LanceDb(
+                "retirement cleanup requires at most 128 symbol-vector tables".to_owned(),
+            ));
+        }
+        let mut tables = Vec::with_capacity(names.len());
+        for name in names {
+            let table = open_listed_table(&connection, &name)
+                .await?
+                .ok_or_else(|| {
+                    StoreError::LanceDb(format!(
+                        "retirement table disappeared during preparation: {name}"
+                    ))
+                })?;
+            tables.push((name, table));
+        }
+        Ok(Self { tables })
+    }
+
+    pub async fn delete_symbol(&self, symbol_id: &str) -> Result<(), StoreError> {
+        let predicate = format!("symbol_id = '{}'", escape_sql_string(symbol_id));
+        for (name, table) in &self.tables {
+            table.delete(&predicate).await.map_err(|error| {
+                StoreError::LanceDb(format!("retirement deletion from {name} failed: {error}"))
+            })?;
+        }
+        Ok(())
+    }
+}
+
 impl LanceVectorStore {
     pub async fn open(workspace_root: impl AsRef<Path>) -> Result<Self, StoreError> {
         let workspace_root = workspace_root.as_ref().to_path_buf();

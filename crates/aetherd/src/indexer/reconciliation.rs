@@ -4,14 +4,13 @@
 
 use super::*;
 
-const RECONCILE_DUPLICATE_STALE_REASON: &str = "duplicate stale symbol matched current snapshot";
 const RECONCILE_AMBIGUOUS_CURRENT_REASON: &str =
     "multiple current symbols matched reconciliation tuple";
 const RECONCILE_MISSING_CURRENT_REASON: &str = "no current symbol matched reconciliation tuple";
 const RECONCILE_UNCHANGED_SIBLING_REASON: &str =
     "only an unchanged sibling matched reconciliation tuple";
 
-type ReconciliationKey = (String, String, String);
+type ReconciliationKey = (String, String, String, String);
 
 #[derive(Debug, Clone)]
 struct PlannedMigration {
@@ -65,15 +64,23 @@ pub(super) struct SnapshotScope<'a> {
     /// See `ObserverState::unread_paths`: files, or directories whose walk failed; `""`
     /// is the whole workspace.
     pub(super) unread_paths: &'a [String],
+    pub(super) blocked_sources: &'a [crate::indexing_gaps::BlockedSource],
     /// When the snapshot started reading the workspace (unix seconds).
     pub(super) taken_at: i64,
+    /// The same moment in milliseconds.
+    pub(super) taken_at_millis: i64,
+    /// HEAD just before the snapshot read the workspace; `None` when it could not be read.
+    pub(super) head: Option<&'a SeededHead>,
 }
 
 impl<'a> SnapshotScope<'a> {
     pub(super) fn of(observer: &'a ObserverState) -> Self {
         Self {
             unread_paths: observer.unread_paths(),
+            blocked_sources: observer.blocked_sources(),
             taken_at: observer.seeded_at(),
+            taken_at_millis: observer.seeded_at_millis(),
+            head: observer.seeded_head(),
         }
     }
 
@@ -82,11 +89,19 @@ impl<'a> SnapshotScope<'a> {
     pub(super) fn everything() -> Self {
         Self {
             unread_paths: &[],
+            blocked_sources: &[],
             taken_at: i64::MAX,
+            taken_at_millis: i64::MAX,
+            head: None,
         }
     }
 
-    fn read_file(&self, file_path: &str) -> bool {
+    /// The commit HEAD pointed at before the walk, if known.
+    pub(super) fn head_commit(&self) -> Option<&'a str> {
+        self.head.and_then(|head| head.commit.as_deref())
+    }
+
+    pub(super) fn read_file(&self, file_path: &str) -> bool {
         !self.unread_paths.iter().any(|path| {
             path.is_empty()
                 || file_path == path
@@ -107,6 +122,7 @@ fn symbol_reconciliation_key(symbol: &Symbol) -> ReconciliationKey {
         symbol.file_path.clone(),
         symbol.qualified_name.clone(),
         symbol.kind.as_str().to_owned(),
+        symbol.language.as_str().to_owned(),
     )
 }
 
@@ -115,14 +131,8 @@ fn symbol_record_reconciliation_key(symbol: &SymbolRecord) -> ReconciliationKey 
         symbol.file_path.clone(),
         symbol.qualified_name.clone(),
         symbol.kind.clone(),
+        symbol.language.clone(),
     )
-}
-
-fn stale_symbol_updated_at(store: &SqliteStore, symbol_id: &str) -> Result<i64> {
-    Ok(store
-        .get_sir_meta(symbol_id)?
-        .map(|meta| meta.updated_at.max(0))
-        .unwrap_or(0))
 }
 
 /// Plans how stale symbol ids (in the store, not in the snapshot, and within `scope`) are
@@ -153,6 +163,14 @@ pub(super) fn plan_symbol_reconciliation(
         return Ok(ReconciliationPlan::default());
     }
 
+    plan_reconciliation_candidates(symbols_by_id, pre_existing_ids, stale_symbols)
+}
+
+fn plan_reconciliation_candidates(
+    symbols_by_id: &HashMap<String, Symbol>,
+    pre_existing_ids: &HashSet<String>,
+    stale_symbols: Vec<SymbolRecord>,
+) -> Result<ReconciliationPlan> {
     let mut current_by_key = BTreeMap::<ReconciliationKey, Vec<Symbol>>::new();
     for symbol in symbols_by_id.values() {
         current_by_key
@@ -162,12 +180,7 @@ pub(super) fn plan_symbol_reconciliation(
     }
 
     let mut stale_by_key = BTreeMap::<ReconciliationKey, Vec<SymbolRecord>>::new();
-    let mut updated_at_by_id = HashMap::<String, i64>::new();
     for symbol in stale_symbols {
-        updated_at_by_id.insert(
-            symbol.id.clone(),
-            stale_symbol_updated_at(store, symbol.id.as_str())?,
-        );
         stale_by_key
             .entry(symbol_record_reconciliation_key(&symbol))
             .or_default()
@@ -192,37 +205,13 @@ pub(super) fn plan_symbol_reconciliation(
                         reason: RECONCILE_UNCHANGED_SIBLING_REASON,
                     }));
             }
-            1 => {
-                stale_matches.sort_by(|left, right| {
-                    updated_at_by_id
-                        .get(right.id.as_str())
-                        .copied()
-                        .unwrap_or(0)
-                        .cmp(&updated_at_by_id.get(left.id.as_str()).copied().unwrap_or(0))
-                        .then_with(|| right.last_seen_at.cmp(&left.last_seen_at))
-                        .then_with(|| left.id.cmp(&right.id))
-                });
-
+            1 if stale_matches.len() == 1 => {
                 let current_symbol = current_matches[0].clone();
                 let winner = stale_matches.remove(0);
-                if !stale_matches.is_empty() {
-                    tracing::warn!(
-                        file_path = %winner.file_path,
-                        qualified_name = %winner.qualified_name,
-                        current_symbol_id = %current_symbol.id,
-                        duplicate_count = stale_matches.len(),
-                        "reconciliation found duplicate stale symbols for a single current symbol"
-                    );
-                }
                 plan.migrations.push(PlannedMigration {
                     old_symbol: winner,
                     new_symbol: current_symbol,
                 });
-                plan.prunes
-                    .extend(stale_matches.into_iter().map(|symbol| PlannedPrune {
-                        symbol,
-                        reason: RECONCILE_DUPLICATE_STALE_REASON,
-                    }));
             }
             _ => {
                 tracing::warn!(
@@ -272,6 +261,73 @@ pub(super) fn plan_symbol_reconciliation(
     plan.cleanup_ids = cleanup_ids;
 
     Ok(plan)
+}
+
+/// Apply the same conservative identity rule to watcher and SIR events as full
+/// snapshots. Publish replacements before retiring old IDs so a signature edit
+/// can retain its evidence. Only declarations explicitly removed by this event
+/// are candidates: an incremental file event cannot prune the rest of a workspace.
+pub(crate) fn reconcile_symbol_event(
+    workspace: &Path,
+    store: &SqliteStore,
+    event: &SymbolChangeEvent,
+) -> Result<Vec<String>> {
+    let _guard = acquire_inject_write_lock(workspace)?;
+    let pre_existing_ids = store
+        .list_symbols_for_file(&event.file_path)
+        .context("failed to read prior declarations for event reconciliation")?
+        .into_iter()
+        .map(|symbol| symbol.id)
+        .collect::<HashSet<_>>();
+    let mut current = HashMap::new();
+    let now = unix_timestamp_secs();
+    for symbol in event.added.iter().chain(&event.updated) {
+        store
+            .upsert_symbol(super::structural::to_symbol_record(symbol, now))
+            .with_context(|| format!("failed to publish changed declaration {}", symbol.id))?;
+        current.insert(symbol.id.clone(), symbol.clone());
+    }
+    let mut removed = Vec::new();
+    let mut seen = HashSet::new();
+    for symbol in &event.removed {
+        if current.contains_key(&symbol.id) || !seen.insert(&symbol.id) {
+            continue;
+        }
+        if let Some(record) = store.get_symbol_record(&symbol.id)? {
+            removed.push(record);
+        }
+    }
+    let plan = plan_reconciliation_candidates(&current, &pre_existing_ids, removed)?;
+    let migrations = plan
+        .migrations
+        .iter()
+        .map(|entry| (entry.old_symbol.id.clone(), entry.new_symbol.id.clone()))
+        .collect::<Vec<_>>();
+    let prunes = plan
+        .prunes
+        .iter()
+        .map(|entry| entry.symbol.id.clone())
+        .collect::<Vec<_>>();
+    store
+        .reconcile_and_prune(&migrations, &prunes)
+        .context("failed to retain history during event reconciliation")?;
+    store
+        .mark_sir_stale(
+            &migrations
+                .iter()
+                .map(|(_, id)| id.clone())
+                .collect::<Vec<_>>(),
+        )
+        .context("failed to mark migrated annotations stale for their changed declaration")?;
+    let mut retired_ids = event
+        .removed
+        .iter()
+        .filter(|symbol| !current.contains_key(&symbol.id))
+        .map(|symbol| symbol.id.clone())
+        .collect::<Vec<_>>();
+    retired_ids.sort();
+    retired_ids.dedup();
+    Ok(retired_ids)
 }
 
 pub(super) fn print_reconciliation_dry_run(
@@ -443,7 +499,325 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_picks_most_recent_on_ambiguity() {
+    fn signature_event_rebuilds_unchanged_callers_in_surreal_projection() {
+        use aether_store::SymbolHistoryStore;
+        let temp = tempdir().expect("tempdir");
+        write_default_config(temp.path());
+        fs::write(temp.path().join(".aether/config.toml"), "[storage]\ngraph_backend = \"surreal\"\n[embeddings]\nenabled = false\nvector_backend = \"sqlite\"\n").expect("config");
+        let store = SqliteStore::open(temp.path()).expect("store");
+        let mut structural =
+            StructuralIndexer::new(temp.path().to_owned()).expect("structural indexer");
+        let old = test_symbol("old", "old-signature");
+        let new = test_symbol("new", "new-signature");
+        let caller = Symbol {
+            id: "caller".into(),
+            qualified_name: "caller".into(),
+            file_path: "caller.rs".into(),
+            ..old.clone()
+        };
+        fs::create_dir_all(temp.path().join(&new.file_path).parent().expect("parent"))
+            .expect("source directory");
+        fs::write(temp.path().join(&new.file_path), "fn run() {}\n").expect("source");
+        store.upsert_symbol(to_symbol_record(&old, 1)).expect("old");
+        store
+            .upsert_symbol(to_symbol_record(&caller, 1))
+            .expect("caller");
+        store
+            .upsert_edges(&[aether_core::SymbolEdge {
+                source_id: caller.id.clone(),
+                target_qualified_name: old.qualified_name.clone(),
+                edge_kind: aether_core::EdgeKind::Calls,
+                file_path: caller.file_path.clone(),
+            }])
+            .expect("raw caller evidence");
+        structural.graph_runtime.block_on(async {
+            store
+                .sync_graph_for_file(structural.graph_store.as_ref(), &old.file_path)
+                .await
+                .expect("initial projection");
+            assert_eq!(
+                structural
+                    .graph_store
+                    .get_dependencies(&caller.id)
+                    .await
+                    .expect("initial caller")[0]
+                    .id,
+                old.id
+            );
+        });
+        let event = SymbolChangeEvent {
+            file_path: new.file_path.clone(),
+            language: new.language,
+            added: vec![new.clone()],
+            removed: vec![old.clone()],
+            updated: vec![],
+        };
+        structural
+            .process_event(&store, &event)
+            .expect("signature event");
+        structural.graph_runtime.block_on(async {
+            let dependencies = structural
+                .graph_store
+                .get_dependencies(&caller.id)
+                .await
+                .expect("refreshed caller");
+            assert_eq!(dependencies.len(), 1);
+            assert_eq!(dependencies[0].id, new.id);
+        });
+        assert_eq!(
+            store.list_symbol_lineage(&old.id).expect("lineage").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn structural_removal_cleans_retired_graph_nodes_and_incoming_edges() {
+        use aether_store::{GraphStore, ResolvedEdge, SymbolHistoryStore};
+        let temp = tempdir().expect("tempdir");
+        write_default_config(temp.path());
+        fs::write(temp.path().join(".aether/config.toml"), "[storage]\ngraph_backend = \"surreal\"\n[embeddings]\nenabled = false\nvector_backend = \"sqlite\"\n").expect("config");
+        let store = SqliteStore::open(temp.path()).expect("store");
+        let mut structural =
+            StructuralIndexer::new(temp.path().to_owned()).expect("structural indexer");
+        let old = test_symbol("old", "signature-old");
+        let caller = Symbol {
+            id: "caller".into(),
+            qualified_name: "caller".into(),
+            file_path: "caller.rs".into(),
+            ..old.clone()
+        };
+        store.upsert_symbol(to_symbol_record(&old, 1)).expect("old");
+        store
+            .upsert_symbol(to_symbol_record(&caller, 1))
+            .expect("caller");
+        let graph = structural
+            .surreal_graph_store
+            .as_ref()
+            .expect("analysis graph fixture");
+        structural.graph_runtime.block_on(async {
+            graph
+                .upsert_symbol_node(&to_symbol_record(&old, 1))
+                .await
+                .expect("old graph node");
+            graph
+                .upsert_symbol_node(&to_symbol_record(&caller, 1))
+                .await
+                .expect("caller graph node");
+            graph
+                .upsert_edge(&ResolvedEdge {
+                    source_id: caller.id.clone(),
+                    target_id: old.id.clone(),
+                    edge_kind: aether_core::EdgeKind::Calls,
+                    file_path: caller.file_path.clone(),
+                })
+                .await
+                .expect("inbound graph edge");
+            assert_eq!(
+                graph
+                    .get_dependencies(&caller.id)
+                    .await
+                    .expect("prior deps")
+                    .len(),
+                1
+            );
+        });
+        let event = SymbolChangeEvent {
+            file_path: old.file_path.clone(),
+            language: old.language,
+            added: vec![],
+            removed: vec![old.clone()],
+            updated: vec![],
+        };
+        structural
+            .process_event(&store, &event)
+            .expect("retire event");
+        let graph = structural
+            .surreal_graph_store
+            .as_ref()
+            .expect("analysis graph fixture");
+        structural.graph_runtime.block_on(async {
+            assert!(
+                !graph
+                    .list_all_symbol_ids()
+                    .await
+                    .expect("remaining graph IDs")
+                    .contains(&old.id)
+            );
+            assert!(
+                graph
+                    .get_dependencies(&caller.id)
+                    .await
+                    .expect("remaining deps")
+                    .is_empty()
+            );
+        });
+        assert_eq!(
+            store
+                .list_symbol_retirements(&old.id)
+                .expect("retained evidence")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn same_id_present_in_added_and_removed_is_not_a_retirement_or_projection_delete() {
+        let temp = tempdir().expect("tempdir");
+        write_default_config(temp.path());
+        let store = SqliteStore::open(temp.path()).expect("store");
+        let symbol = test_symbol("same", "signature");
+        upsert_symbol_snapshot(&store, &symbol, 1);
+        let event = SymbolChangeEvent {
+            file_path: symbol.file_path.clone(),
+            language: symbol.language,
+            added: vec![symbol.clone()],
+            removed: vec![symbol.clone()],
+            updated: vec![],
+        };
+        assert!(
+            reconcile_symbol_event(temp.path(), &store, &event)
+                .expect("reconcile")
+                .is_empty()
+        );
+        assert!(
+            store
+                .get_symbol_record(&symbol.id)
+                .expect("still active")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn event_signature_edit_retains_old_evidence_and_is_idempotent() {
+        use aether_store::SymbolHistoryStore;
+        let temp = tempdir().expect("tempdir");
+        write_default_config(temp.path());
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        let old = test_symbol("old", "signature-old");
+        let new = test_symbol("new", "signature-new");
+        let unrelated = Symbol {
+            id: "unrelated".into(),
+            file_path: "other.rs".into(),
+            ..old.clone()
+        };
+        upsert_symbol_snapshot(&store, &old, 1);
+        upsert_symbol_snapshot(&store, &unrelated, 1);
+        upsert_sir_state(
+            &store,
+            &old.id,
+            "old-hash",
+            r#"{"intent":"keep recorded intent"}"#,
+            100,
+        );
+        let event = SymbolChangeEvent {
+            file_path: old.file_path.clone(),
+            language: old.language,
+            added: vec![new.clone()],
+            removed: vec![old.clone()],
+            updated: vec![],
+        };
+        reconcile_symbol_event(temp.path(), &store, &event).expect("event reconciliation");
+        assert!(
+            store
+                .get_symbol_record(&old.id)
+                .expect("old lookup")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_symbol_record(&unrelated.id)
+                .expect("unrelated lookup")
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .get_sir_meta(&new.id)
+                .expect("migrated SIR")
+                .expect("present SIR")
+                .sir_status,
+            "stale"
+        );
+        assert_eq!(
+            store
+                .list_symbol_retirements(&old.id)
+                .expect("retained history")
+                .len(),
+            1
+        );
+        let lineage = store.list_symbol_lineage(&old.id).expect("lineage");
+        assert_eq!(lineage.len(), 1);
+        reconcile_symbol_event(temp.path(), &store, &event).expect("idempotent replay");
+        assert_eq!(
+            store
+                .list_symbol_retirements(&old.id)
+                .expect("history after replay")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_symbol_lineage(&new.id)
+                .expect("reverse lineage")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn event_does_not_attach_removed_overload_to_existing_sibling_or_other_language() {
+        use aether_store::SymbolHistoryStore;
+        for language in [aether_core::Language::Rust, aether_core::Language::Python] {
+            let temp = tempdir().expect("tempdir");
+            write_default_config(temp.path());
+            let store = SqliteStore::open(temp.path()).expect("open store");
+            let old = test_symbol("old", "signature-old");
+            let new = Symbol {
+                language,
+                ..test_symbol("sibling", "signature-sibling")
+            };
+            upsert_symbol_snapshot(&store, &old, 1);
+            if language == old.language {
+                upsert_symbol_snapshot(&store, &new, 1);
+            }
+            upsert_sir_state(
+                &store,
+                &old.id,
+                "old-hash",
+                r#"{"intent":"old overload"}"#,
+                100,
+            );
+            let event = SymbolChangeEvent {
+                file_path: old.file_path.clone(),
+                language: old.language,
+                added: vec![new.clone()],
+                removed: vec![old.clone()],
+                updated: vec![],
+            };
+            reconcile_symbol_event(temp.path(), &store, &event).expect("event reconciliation");
+            assert!(
+                store
+                    .get_sir_meta(&new.id)
+                    .expect("new SIR lookup")
+                    .is_none()
+            );
+            assert!(
+                store
+                    .list_symbol_lineage(&old.id)
+                    .expect("no false lineage")
+                    .is_empty()
+            );
+            assert_eq!(
+                store
+                    .list_symbol_retirements(&old.id)
+                    .expect("retained old evidence")
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn reconcile_retires_ambiguous_stale_definitions_without_guessing_lineage() {
         let temp = tempdir().expect("tempdir");
         write_default_config(temp.path());
         let store = SqliteStore::open(temp.path()).expect("open store");
@@ -479,12 +853,13 @@ mod tests {
         )
         .expect("plan reconcile");
 
-        assert_eq!(plan.migrations.len(), 1);
-        assert_eq!(plan.migrations[0].old_symbol.id, old_b.id);
-        assert_eq!(plan.migrations[0].new_symbol.id, new_symbol.id);
-        assert_eq!(plan.prunes.len(), 1);
-        assert_eq!(plan.prunes[0].symbol.id, old_a.id);
-        assert_eq!(plan.prunes[0].reason, RECONCILE_DUPLICATE_STALE_REASON);
+        assert!(plan.migrations.is_empty());
+        assert_eq!(plan.prunes.len(), 2);
+        assert!(
+            plan.prunes
+                .iter()
+                .all(|entry| entry.reason == RECONCILE_AMBIGUOUS_CURRENT_REASON)
+        );
     }
 
     #[test]
@@ -774,7 +1149,10 @@ mod tests {
         let unread_paths = vec!["src/unread".to_owned()];
         let scope = SnapshotScope {
             unread_paths: &unread_paths,
+            blocked_sources: &[],
             taken_at: 200,
+            taken_at_millis: 200_000,
+            head: None,
         };
         let plan = plan_symbol_reconciliation(&store, &HashMap::new(), &HashSet::new(), &scope)
             .expect("plan reconcile");

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -60,6 +61,85 @@ impl SqliteGraphStore {
         };
         conn.busy_timeout(Duration::from_secs(5))?;
         Ok(conn)
+    }
+    fn call_chain_sync(
+        &self,
+        symbol_id: &str,
+        depth: u32,
+    ) -> Result<Vec<Vec<SymbolRecord>>, StoreError> {
+        let symbol_id = symbol_id.trim();
+        if symbol_id.is_empty() || depth == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Traverse unique frontiers instead of enumerating paths in a recursive
+        // CTE. Shared callees and cycles otherwise multiply intermediate rows even
+        // though callers only need each symbol's shortest distance from the root.
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+        let mut visited = HashSet::from([symbol_id.to_owned()]);
+        let mut frontier = vec![symbol_id.to_owned()];
+        let mut levels = Vec::new();
+        for _ in 0..depth {
+            let mut level = Vec::new();
+            // Keep below SQLite's parameter limit, including older builds whose
+            // default is 999. A wide call graph must not fail at one frontier.
+            for sources in frontier.chunks(500) {
+                let placeholders = vec!["?"; sources.len()].join(", ");
+                let mut stmt = tx.prepare(&format!(
+                    r#"
+                    SELECT DISTINCT
+                        target.id,
+                        target.file_path,
+                        target.language,
+                        target.kind,
+                        target.qualified_name,
+                        target.signature_fingerprint,
+                        target.last_seen_at
+                    FROM symbol_edges e
+                    JOIN symbols source ON source.id = e.source_id
+                    JOIN symbols target
+                      ON target.qualified_name = e.target_qualified_name
+                     AND {family}
+                    WHERE e.edge_kind = 'calls'
+                      AND e.source_id IN ({placeholders})
+                    "#,
+                    family = same_language_family_sql("source.language", "target.language"),
+                ))?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(sources), |row| {
+                    Ok(SymbolRecord {
+                        id: row.get(0)?,
+                        file_path: row.get(1)?,
+                        language: row.get(2)?,
+                        kind: row.get(3)?,
+                        qualified_name: row.get(4)?,
+                        signature_fingerprint: row.get(5)?,
+                        last_seen_at: row.get(6)?,
+                    })
+                })?;
+                for row in rows {
+                    let record = row?;
+                    if visited.insert(record.id.clone()) {
+                        level.push(record);
+                    }
+                }
+            }
+            if level.is_empty() {
+                break;
+            }
+            level.sort_by(|left, right| {
+                left.qualified_name
+                    .cmp(&right.qualified_name)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            frontier = level.iter().map(|record| record.id.clone()).collect();
+            levels.push(level);
+        }
+        // All frontiers observe one database snapshot even if the indexer writes
+        // between queries. A read-only graph connection supports this transaction.
+        tx.commit()?;
+
+        Ok(levels)
     }
 }
 
@@ -179,84 +259,32 @@ impl GraphStore for SqliteGraphStore {
         symbol_id: &str,
         depth: u32,
     ) -> Result<Vec<Vec<SymbolRecord>>, StoreError> {
-        let symbol_id = symbol_id.trim();
-        if symbol_id.is_empty() || depth == 0 {
-            return Ok(Vec::new());
+        let reader = Self {
+            sqlite_path: self.sqlite_path.clone(),
+            read_only: self.read_only,
+        };
+        let symbol_id = symbol_id.to_owned();
+        let read = move || reader.call_chain_sync(&symbol_id, depth);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(read).await.map_err(|err| {
+                StoreError::Graph(format!("SQLite call-chain read worker failed: {err}"))
+            })?
+        } else {
+            // Keep GraphStore usable from other executors without doing SQLite
+            // I/O on their executor thread or requiring a new Tokio runtime.
+            let (sender, receiver) = futures::channel::oneshot::channel();
+            std::thread::Builder::new()
+                .name("aether-graph-read".to_owned())
+                .spawn(move || {
+                    let _ = sender.send(read());
+                })
+                .map_err(|err| {
+                    StoreError::Graph(format!("failed to start SQLite graph read worker: {err}"))
+                })?;
+            receiver.await.map_err(|err| {
+                StoreError::Graph(format!("SQLite call-chain read worker stopped: {err}"))
+            })?
         }
-
-        let conn = self.connection()?;
-        let mut stmt = conn.prepare(&format!(
-            r#"
-            WITH RECURSIVE reachable(symbol_id, language, depth) AS (
-                SELECT target.id, target.language, 1
-                FROM symbol_edges e
-                JOIN symbols source ON source.id = e.source_id
-                JOIN symbols target
-                  ON target.qualified_name = e.target_qualified_name
-                 AND {start_family}
-                WHERE e.edge_kind = 'calls'
-                  AND e.source_id = ?1
-                UNION ALL
-                SELECT target.id, target.language, reachable.depth + 1
-                FROM reachable
-                JOIN symbol_edges e
-                  ON e.source_id = reachable.symbol_id
-                 AND e.edge_kind = 'calls'
-                JOIN symbols target
-                  ON target.qualified_name = e.target_qualified_name
-                 AND {step_family}
-                WHERE reachable.depth < ?2
-            ),
-            ranked AS (
-                SELECT symbol_id, MIN(depth) AS depth
-                FROM reachable
-                GROUP BY symbol_id
-            )
-            SELECT
-                s.id,
-                s.file_path,
-                s.language,
-                s.kind,
-                s.qualified_name,
-                s.signature_fingerprint,
-                s.last_seen_at,
-                ranked.depth
-            FROM ranked
-            JOIN symbols s ON s.id = ranked.symbol_id
-            ORDER BY ranked.depth ASC, s.qualified_name ASC, s.id ASC
-            "#,
-            start_family = same_language_family_sql("source.language", "target.language"),
-            step_family = same_language_family_sql("reachable.language", "target.language"),
-        ))?;
-        let rows = stmt.query_map(params![symbol_id, depth as i64], |row| {
-            Ok((
-                SymbolRecord {
-                    id: row.get(0)?,
-                    file_path: row.get(1)?,
-                    language: row.get(2)?,
-                    kind: row.get(3)?,
-                    qualified_name: row.get(4)?,
-                    signature_fingerprint: row.get(5)?,
-                    last_seen_at: row.get(6)?,
-                },
-                row.get::<_, i64>(7)?,
-            ))
-        })?;
-
-        let mut levels = Vec::new();
-        let mut current_depth = 0i64;
-        for row in rows {
-            let (record, depth) = row?;
-            if depth != current_depth {
-                current_depth = depth;
-                levels.push(Vec::new());
-            }
-            if let Some(level) = levels.last_mut() {
-                level.push(record);
-            }
-        }
-
-        Ok(levels)
     }
 
     async fn delete_edges_for_file(&self, _file_path: &str) -> Result<(), StoreError> {
@@ -286,6 +314,52 @@ mod tests {
             signature_fingerprint: format!("sig-{id}"),
             last_seen_at: 1_700_000_000,
         }
+    }
+
+    #[tokio::test]
+    async fn call_chain_waiting_for_sqlite_does_not_block_the_async_executor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let store = crate::SqliteStore::open(temp.path())?;
+        store.upsert_symbol(symbol("root", "root"))?;
+        drop(store);
+        let graph = SqliteGraphStore::open_readonly(temp.path())?;
+        let blocker = Connection::open(temp.path().join(".aether/meta.sqlite"))?;
+        blocker.pragma_update(None, "journal_mode", "DELETE")?;
+        blocker.execute_batch("BEGIN EXCLUSIVE;")?;
+
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let reader = tokio::spawn(async move {
+            let _ = started.send(());
+            graph.get_call_chain("root", 1).await
+        });
+        // With blocking SQLite I/O on this current-thread executor, the reader
+        // would time out on the lock before this task could release it.
+        ready.await?;
+        blocker.execute_batch("COMMIT;")?;
+        assert!(reader.await??.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn call_chain_supports_executors_without_a_tokio_runtime()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let store = crate::SqliteStore::open(temp.path())?;
+        store.upsert_symbol(symbol("root", "root"))?;
+        store.upsert_symbol(symbol("callee", "callee"))?;
+        store.upsert_edges(&[SymbolEdge {
+            source_id: "root".to_owned(),
+            target_qualified_name: "callee".to_owned(),
+            edge_kind: EdgeKind::Calls,
+            file_path: "src/lib.rs".to_owned(),
+        }])?;
+        let graph = SqliteGraphStore::open_readonly(temp.path())?;
+        assert_eq!(
+            futures::executor::block_on(graph.get_call_chain("root", 1))?,
+            vec![vec![symbol("callee", "callee")]]
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -375,5 +449,104 @@ mod tests {
         assert_eq!(chain[0][0].id, beta.id);
         assert_eq!(chain[1][0].id, gamma.id);
         assert_eq!(chain[2][0].id, delta.id);
+    }
+
+    #[tokio::test]
+    async fn sqlite_call_chain_uses_shortest_hops_and_excludes_recursive_root() {
+        let temp = tempdir().expect("tempdir");
+        let store = crate::SqliteStore::open(temp.path()).expect("open sqlite store");
+        let graph = SqliteGraphStore::open_readonly(temp.path()).expect("open readonly graph");
+        for name in ["root", "alpha", "beta", "shared", "direct", "leaf"] {
+            store
+                .upsert_symbol(symbol(name, name))
+                .expect("upsert symbol");
+        }
+        let edges = [
+            ("root", "root"),
+            ("root", "beta"),
+            ("root", "alpha"),
+            ("root", "direct"),
+            ("alpha", "shared"),
+            ("beta", "shared"),
+            ("shared", "alpha"),
+            ("shared", "root"),
+            ("shared", "direct"),
+            ("shared", "leaf"),
+        ]
+        .map(|(source, target)| SymbolEdge {
+            source_id: source.to_owned(),
+            target_qualified_name: target.to_owned(),
+            edge_kind: EdgeKind::Calls,
+            file_path: "src/lib.rs".to_owned(),
+        });
+        store.upsert_edges(&edges).expect("upsert cyclic diamond");
+
+        for (depth, expected) in [
+            (0, vec![]),
+            (1, vec![vec!["alpha", "beta", "direct"]]),
+            (2, vec![vec!["alpha", "beta", "direct"], vec!["shared"]]),
+            (
+                12,
+                vec![
+                    vec!["alpha", "beta", "direct"],
+                    vec!["shared"],
+                    vec!["leaf"],
+                ],
+            ),
+        ] {
+            let chain = graph
+                .get_call_chain("root", depth)
+                .await
+                .expect("traverse cyclic diamond");
+            let ids = chain
+                .iter()
+                .map(|level| level.iter().map(|row| row.id.as_str()).collect::<Vec<_>>())
+                .collect::<Vec<_>>();
+            assert_eq!(ids, expected, "depth {depth}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_call_chain_batches_wide_frontiers_without_duplicate_callees() {
+        let temp = tempdir().expect("tempdir");
+        let store = crate::SqliteStore::open(temp.path()).expect("open sqlite store");
+        let graph = SqliteGraphStore::open(temp.path()).expect("open sqlite graph");
+        store
+            .upsert_symbol(symbol("root", "root"))
+            .expect("upsert root");
+        store
+            .upsert_symbol(symbol("leaf", "leaf"))
+            .expect("upsert leaf");
+        let mut edges = Vec::new();
+        for index in 0..510 {
+            let name = format!("branch-{index:03}");
+            store
+                .upsert_symbol(symbol(&name, &name))
+                .expect("upsert branch");
+            edges.push(SymbolEdge {
+                source_id: "root".to_owned(),
+                target_qualified_name: name.clone(),
+                edge_kind: EdgeKind::Calls,
+                file_path: "src/lib.rs".to_owned(),
+            });
+            edges.push(SymbolEdge {
+                source_id: name,
+                target_qualified_name: "leaf".to_owned(),
+                edge_kind: EdgeKind::Calls,
+                file_path: "src/lib.rs".to_owned(),
+            });
+        }
+        store.upsert_edges(&edges).expect("upsert wide diamond");
+
+        let chain = graph
+            .get_call_chain("root", 3)
+            .await
+            .expect("traverse wide graph");
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].len(), 510);
+        assert_eq!(chain[0][0].id, "branch-000");
+        assert_eq!(chain[0][509].id, "branch-509");
+        assert_eq!(chain[1].len(), 1);
+        assert_eq!(chain[1][0].id, "leaf");
     }
 }
