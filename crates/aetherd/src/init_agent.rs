@@ -78,8 +78,7 @@ pub fn run_init_agent(workspace: &Path, options: InitAgentOptions) -> Result<Ini
 
     // Existing project registrations also affect other clients when only one
     // platform was requested. Refresh the Aether entry while preserving its peers.
-    if mcp_tools == McpToolProfile::Compact
-        && workspace.join(MCP_CONFIG_FILE).exists()
+    if workspace.join(MCP_CONFIG_FILE).exists()
         && !files
             .iter()
             .any(|file| file.relative_path == Path::new(MCP_CONFIG_FILE))
@@ -112,7 +111,7 @@ pub fn run_init_agent(workspace: &Path, options: InitAgentOptions) -> Result<Ini
             .map(|file| file.relative_path.clone())
             .collect();
         let full_context = build_template_context(workspace, &config, McpToolProfile::Full);
-        let transition = artifact_transition::retire_full_artifacts(
+        let transition = artifact_transition::transition_artifacts(
             workspace,
             files_for_platform(AgentPlatform::All, &full_context),
             compact_files_for_platform(AgentPlatform::All, &context),
@@ -122,7 +121,26 @@ pub fn run_init_agent(workspace: &Path, options: InitAgentOptions) -> Result<Ini
         files.extend(transition.refreshed);
         transition.archived
     } else {
-        Vec::new()
+        artifact_transition::check_output_paths(workspace, &files)?;
+        let selected = files
+            .iter()
+            .map(|file| file.relative_path.clone())
+            .collect();
+        let compact_context = build_template_context(workspace, &config, McpToolProfile::Compact);
+        let compact = compact_files_for_platform(AgentPlatform::All, &compact_context);
+        if artifact_transition::contains_compact_profile(workspace, &compact)? {
+            let transition = artifact_transition::transition_artifacts(
+                workspace,
+                compact,
+                files_for_platform(AgentPlatform::All, &context),
+                &selected,
+                options.force,
+            )?;
+            files.extend(transition.refreshed);
+            transition.archived
+        } else {
+            Vec::new()
+        }
     };
 
     let mut written_files = Vec::new();
@@ -435,7 +453,7 @@ fn merge_mcp_server(existing_path: &Path, rendered: &str, force: bool) -> Result
     };
     let rendered_json: serde_json::Value =
         serde_json::from_str(rendered).context("rendered .mcp.json template is valid JSON")?;
-    let Some(aether) = rendered_json
+    let Some(mut aether) = rendered_json
         .get("mcpServers")
         .and_then(|value| value.get(MCP_SERVER_KEY))
         .cloned()
@@ -445,6 +463,40 @@ fn merge_mcp_server(existing_path: &Path, rendered: &str, force: bool) -> Result
     match servers.get(MCP_SERVER_KEY) {
         Some(existing) if !force || *existing == aether => return Ok(McpMerge::Unchanged),
         _ => {}
+    }
+    if let Some(existing) = servers.get(MCP_SERVER_KEY) {
+        let Some(mut preserved) = existing.as_object().cloned() else {
+            return Ok(McpMerge::NotJson);
+        };
+        let mut extra = Vec::new();
+        if let Some(arguments) = existing.get("args") {
+            let Some(arguments) = arguments.as_array() else {
+                return Ok(McpMerge::NotJson);
+            };
+            let mut arguments = arguments.iter();
+            while let Some(argument) = arguments.next() {
+                let Some(text) = argument.as_str() else {
+                    return Ok(McpMerge::NotJson);
+                };
+                if matches!(text, "--workspace" | "--tools") {
+                    if arguments.next().and_then(|value| value.as_str()).is_none() {
+                        return Ok(McpMerge::NotJson);
+                    }
+                } else if !text.starts_with("--workspace=") && !text.starts_with("--tools=") {
+                    extra.push(argument.clone());
+                }
+            }
+        }
+        let generated = aether
+            .as_object_mut()
+            .context("rendered Aether registration must be an object")?;
+        generated
+            .get_mut("args")
+            .and_then(|value| value.as_array_mut())
+            .context("rendered Aether arguments must be an array")?
+            .extend(extra);
+        preserved.extend(generated.clone());
+        aether = serde_json::Value::Object(preserved);
     }
     servers.insert(MCP_SERVER_KEY.to_owned(), aether);
     let mut merged =

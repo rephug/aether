@@ -262,6 +262,10 @@ pub struct IndexFreshness {
 }
 
 pub fn assess_index_freshness(workspace: &Path, store: &SqliteStore) -> Result<IndexFreshness> {
+    let quarantine = match crate::indexing_gaps::read_summary(workspace) {
+        Ok(summary) => summary,
+        Err(error) => Some(format!("Indexing quarantine coverage unknown: {error:#}")),
+    };
     let now = crate::time::current_unix_timestamp_secs();
     let marker = read_index_sync_marker(workspace);
     let workspace_head = workspace_head(workspace);
@@ -361,7 +365,7 @@ pub fn assess_index_freshness(workspace: &Path, store: &SqliteStore) -> Result<I
     let changed = modified.len() + deleted.len() + new_files.len() + unreadable.len();
     // Detected changes come first: an index without symbols can still hold the edges of
     // symbol-free files, and a deletion of one leaves them stale.
-    let verdict = if changed > 0 || head_matches == Some(false) {
+    let verdict = if changed > 0 || head_matches == Some(false) || quarantine.is_some() {
         FreshnessVerdict::Stale
     } else if indexed.is_empty() {
         FreshnessVerdict::Empty
@@ -401,6 +405,12 @@ pub fn assess_index_freshness(workspace: &Path, store: &SqliteStore) -> Result<I
     };
     freshness.summary = summary_line(&freshness, now);
     freshness.notes = notes(&freshness);
+    if let Some(summary) = quarantine {
+        freshness
+            .summary
+            .push_str(" Indexing coverage is blocked or unknown; inspect notes.");
+        freshness.notes.push(summary);
+    }
     Ok(freshness)
 }
 

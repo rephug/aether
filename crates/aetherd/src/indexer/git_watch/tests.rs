@@ -6,6 +6,87 @@ use tempfile::tempdir;
 use super::*;
 
 #[test]
+fn review_regression_watch_collision_keeps_rows_and_indexes_rest() {
+    for restart_while_blocked in [false, true] {
+        let temp = tempdir().expect("workspace");
+        let workspace = temp.path();
+        crate::indexer::tests::write_default_config(workspace);
+        let clean = "pub struct Secret; impl std::fmt::Debug for Secret { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(\"secret\") } }";
+        let display = "impl std::fmt::Display for Secret { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(\"secret\") } }";
+        let bad = workspace.join("secret.rs");
+        let good = workspace.join("ok.rs");
+        fs::write(&bad, clean).expect("secret");
+        fs::write(&good, "pub fn before() {}\n").expect("ok");
+        let config = mock_config(workspace);
+        run_initial_index_once(&config).expect("initial index");
+        let store = SqliteStore::open(workspace).expect("store");
+        let before = store
+            .list_symbols_for_file("secret.rs")
+            .expect("prior rows");
+        let read_before = store.file_read_at_ms("secret.rs").expect("prior read");
+        let mut observer = ObserverState::new(workspace.to_path_buf()).expect("observer");
+        if !restart_while_blocked {
+            observer.seed_from_disk().expect("seed");
+        }
+        fs::write(&bad, format!("{clean}\n{display}")).expect("collision");
+        if restart_while_blocked {
+            observer.seed_from_disk().expect("seed blocked");
+        }
+        fs::write(&good, "pub fn after() {}\n").expect("unrelated edit");
+        let mut structural = StructuralIndexer::new(workspace.to_path_buf()).expect("structural");
+        let queue = SharedQueueState::new(HashMap::new());
+        process_reindex_paths(
+            &config,
+            &mut observer,
+            &mut structural,
+            &store,
+            &queue,
+            vec![bad.clone(), good],
+        )
+        .expect("collision must not abort batch");
+        assert_eq!(
+            store
+                .list_symbols_for_file("secret.rs")
+                .expect("retained rows"),
+            before
+        );
+        assert_eq!(
+            store.file_read_at_ms("secret.rs").expect("retained read"),
+            read_before
+        );
+        assert!(
+            store
+                .list_symbols_for_file("ok.rs")
+                .expect("unrelated rows")
+                .iter()
+                .any(|row| row.qualified_name == "after")
+        );
+        assert!(
+            crate::indexing_gaps::read_summary(workspace)
+                .expect("receipt")
+                .unwrap_or_default()
+                .contains("1 quarantined")
+        );
+        fs::write(&bad, "// declarations removed while quarantined\n").expect("recover");
+        process_debounced_paths(
+            &config,
+            &mut observer,
+            &mut structural,
+            &store,
+            &queue,
+            vec![bad],
+        );
+        assert!(
+            store
+                .list_symbols_for_file("secret.rs")
+                .expect("recovered rows")
+                .is_empty()
+        );
+        assert!(observer.blocked_sources().is_empty());
+    }
+}
+
+#[test]
 fn resolve_git_watch_dir_follows_worktree_gitdir_file() {
     let temp = tempdir().expect("tempdir");
     let git_admin = temp.path().join("git-admin/worktrees/demo");

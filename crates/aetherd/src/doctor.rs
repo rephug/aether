@@ -83,6 +83,15 @@ struct RoleModels {
 
 pub fn run_doctor(workspace: &Path, config: &AetherConfig) -> Result<DoctorReport> {
     let mut report = DoctorReport::default();
+    match crate::indexing_gaps::read_summary(workspace) {
+        Ok(Some(summary)) => report.push("indexing.quarantine", CheckStatus::Warn, summary),
+        Ok(None) => {}
+        Err(error) => report.push(
+            "indexing.quarantine",
+            CheckStatus::Warn,
+            format!("Coverage unknown: {error:#}"),
+        ),
+    }
 
     for warning in validate_config(config) {
         let status = match warning.code {
@@ -396,7 +405,9 @@ fn similar_ids(model: &str, ids: &[String]) -> Vec<String> {
 }
 
 pub fn print_doctor_report(report: &DoctorReport) {
-    println!("AETHER doctor: configured models (lists models only, generates nothing)");
+    println!(
+        "AETHER doctor: configured models and indexing coverage (lists models only, generates nothing)"
+    );
     if report.checks.is_empty() {
         println!("  nothing to check: no provider calls a hosted model");
     }
@@ -699,5 +710,31 @@ endpoint = "{endpoint}"
             ["gemini-3.1-flash-lite"]
         );
         assert!(similar_ids("llama3", &ids).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod review_regressions {
+    #[test]
+    fn review_regression_doctor_discloses_quarantine_without_provider_calls() {
+        let temp = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir(temp.path().join(".aether")).expect("configuration");
+        std::fs::write(
+            temp.path().join(".aether/config.toml"),
+            "[inference]\nprovider=\"mock\"\n[embeddings]\nenabled=false\n",
+        )
+        .expect("mock config");
+        std::fs::write(temp.path().join(".aether/indexing-blocked.json"), r#"{"version":1,"snapshot_started_at":1,"omitted_paths":0,"blocked_sources":[{"path":"secret.rs","reason":"duplicate identity"}]}"#).expect("receipt");
+        let config = aether_config::load_workspace_config(temp.path()).expect("mock config");
+        let report = super::run_doctor(temp.path(), &config).expect("doctor with mock providers");
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.subject == "indexing.quarantine"
+                    && check.status == super::CheckStatus::Warn
+                    && check.detail.contains("secret.rs")),
+            "{report:?}"
+        );
     }
 }

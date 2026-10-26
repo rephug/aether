@@ -92,6 +92,9 @@ pub fn read_summary(workspace: &Path) -> Result<Option<String>> {
         .len()
         .checked_add(report.omitted_paths)
         .context("indexing quarantine receipt count overflow")?;
+    if total == 0 {
+        return Ok(None);
+    }
     let paths = report
         .blocked_sources
         .iter()
@@ -114,7 +117,7 @@ pub fn read_summary(workspace: &Path) -> Result<Option<String>> {
         String::new()
     };
     Ok(Some(format!(
-        "Last structural snapshot (started {}): {} quarantined identity-collision files, {} paths omitted from this receipt. Stored rows for blocked files are retained and may be stale. This receipt is not a live freshness or completed-generation guarantee. {}{}",
+        "Latest indexer observation (started {}): {} quarantined identity-collision files, {} paths omitted from this receipt. Stored rows for blocked files are retained and may be stale. Full-sync coverage remains blocked until all files can be read. This receipt is not a live freshness or completed-generation guarantee. {}{}",
         report.snapshot_started_at, total, report.omitted_paths, paths, more
     )))
 }

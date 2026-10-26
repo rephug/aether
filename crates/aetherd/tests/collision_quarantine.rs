@@ -85,6 +85,27 @@ fn legal_collision_does_not_abort_unrelated_indexing_and_is_reported() {
 }
 
 #[test]
+fn review_regression_first_index_collision_is_explained_in_freshness() {
+    let temp = tempdir().expect("fixture");
+    seed(temp.path(), true);
+    run_initial_index_once(&config(temp.path())).expect("partial index");
+    let store = SqliteStore::open(temp.path()).expect("store");
+    let freshness =
+        aetherd::freshness::assess_index_freshness(temp.path(), &store).expect("freshness");
+    assert_eq!(
+        freshness.verdict,
+        aetherd::freshness::FreshnessVerdict::Stale
+    );
+    assert!(
+        freshness
+            .notes
+            .iter()
+            .any(|note| note.contains("1 quarantined identity-collision files")),
+        "{freshness:?}"
+    );
+}
+
+#[test]
 fn collision_keeps_prior_rows_and_sir_then_clears_on_recovery() {
     let temp = tempdir().expect("fixture");
     seed(temp.path(), false);
@@ -144,10 +165,11 @@ fn collision_keeps_prior_rows_and_sir_then_clears_on_recovery() {
     );
     fs::write(temp.path().join("src/secret.rs"), CLEAN).expect("repair source");
     run_initial_index_once(&config(temp.path())).expect("recover quarantine");
-    let report = aetherd::indexing_gaps::read_summary(temp.path())
-        .expect("receipt")
-        .expect("receipt exists");
-    assert!(report.contains("0 quarantined identity-collision files"));
+    assert!(
+        aetherd::indexing_gaps::read_summary(temp.path())
+            .expect("receipt")
+            .is_none()
+    );
     assert_eq!(
         store
             .read_sir_blob(&method.id)

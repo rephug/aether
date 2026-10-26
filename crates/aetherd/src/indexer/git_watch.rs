@@ -199,6 +199,7 @@ pub(super) fn process_git_trigger(
     // A skipped trigger, a diff from a base the marker doesn't name, or a failed reindex
     // (returned above) leaves the freshness marker on the commit it already names.
     if catches_up
+        && observer.blocked_sources().is_empty()
         && let Some(head) = current_head.sha.as_deref()
         && let Err(err) =
             crate::freshness::record_head_caught_up(config.workspace.as_path(), head, started_at)
@@ -217,11 +218,27 @@ pub(super) fn process_reindex_paths(
     paths: Vec<PathBuf>,
 ) -> Result<()> {
     refresh_paths(config, structural, &paths);
-    let processed = paths.iter().try_for_each(|path| {
-        process_reindex_path(config, observer, structural, store, queue_state, path)
-    });
+    let mut first_error = None;
+    for path in &paths {
+        if let Err(error) =
+            process_reindex_path(config, observer, structural, store, queue_state, path)
+        {
+            tracing::error!(path = %path.display(), error = %error, "reindex path failed; continuing unrelated paths");
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
     structural.reindex_stale_files(store);
-    processed
+    crate::indexing_gaps::record(
+        &config.workspace,
+        unix_timestamp_secs(),
+        observer.blocked_sources(),
+    )?;
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// Re-indexes the paths the watcher's debounce released. A path that fails is logged and
@@ -243,6 +260,13 @@ pub(super) fn process_debounced_paths(
         }
     }
     structural.reindex_stale_files(store);
+    if let Err(error) = crate::indexing_gaps::record(
+        &config.workspace,
+        unix_timestamp_secs(),
+        observer.blocked_sources(),
+    ) {
+        tracing::error!(error = %error, "could not publish watcher quarantine coverage");
+    }
 }
 
 /// Re-reads a batch of changed paths for the Python call targets resolved through them,
@@ -281,126 +305,172 @@ fn process_reindex_path(
     queue_state: &SharedQueueState,
     path: &Path,
 ) -> Result<()> {
-    // Taken before the read, so an edit landing while the file is read counts as newer.
-    let read_started_ms = crate::time::current_unix_timestamp_millis();
-    let read = match observer.process_path(path) {
-        Ok(Some(event)) => {
-            if config.print_events {
-                let line = serde_json::to_string(&event)
-                    .context("failed to serialize symbol-change event")?;
-                println!("{line}");
+    let previous_quarantine = observer.quarantine_source(path).cloned();
+    let result = (|| -> Result<()> {
+        // Taken before the read, so an edit landing while the file is read counts as newer.
+        let read_started_ms = crate::time::current_unix_timestamp_millis();
+        let mut observation = observer.process_path(path);
+        if observation.is_ok() && observer.quarantine_source(path).is_some() {
+            return Ok(());
+        }
+        if previous_quarantine.is_some() && observation.is_ok() {
+            let file_path =
+                normalize_path(&relative_workspace_path(&config.workspace, path).to_string_lossy());
+            let current = observer
+                .symbols_of(path)
+                .map(|(_, _, symbols)| symbols)
+                .unwrap_or(&[]);
+            for id in super::reconciliation::reconcile_recovered_file(
+                &config.workspace,
+                store,
+                &file_path,
+                current,
+            )? {
+                queue_state.remove_symbol(&id);
             }
+            if matches!(observation, Ok(None))
+                && let Some(language) = language_for_path(path)
+            {
+                observation = Ok(Some(SymbolChangeEvent {
+                    file_path,
+                    language,
+                    added: Vec::new(),
+                    removed: Vec::new(),
+                    updated: Vec::new(),
+                }));
+            }
+        }
+        let read = match observation {
+            Ok(Some(event)) => {
+                if config.print_events {
+                    let line = serde_json::to_string(&event)
+                        .context("failed to serialize symbol-change event")?;
+                    println!("{line}");
+                }
 
-            structural.process_event(store, &event)?;
-            for removed in &event.removed {
-                queue_state.remove_symbol(&removed.id);
-            }
-            let mut changed = Vec::new();
-            collect_changed_symbols(&event, &mut changed);
-            for symbol in &changed {
-                queue_state.upsert_symbol(symbol.clone());
-            }
-            if let Err(err) =
-                enqueue_changed_symbols(config.workspace.as_path(), store, queue_state, &changed)
-            {
-                tracing::warn!(
-                    file_path = %event.file_path,
-                    error = %err,
-                    "failed to enqueue changed symbols"
-                );
-            }
-            true
-        }
-        // A file skipped for its size was not read: its stored symbols may describe older
-        // text, so nothing may count it as read.
-        Ok(None) if observer.skipped_as_oversized(path) => false,
-        // A source file that is gone and had no symbols (so no event removes any) can still
-        // have edges and test intents stored. An empty event clears them.
-        Ok(None) if !path.exists() => {
-            if let Some(language) = language_for_path(path) {
-                structural.process_event(
+                structural.process_event(store, &event)?;
+                for removed in &event.removed {
+                    queue_state.remove_symbol(&removed.id);
+                }
+                let mut changed = Vec::new();
+                collect_changed_symbols(&event, &mut changed);
+                for symbol in &changed {
+                    queue_state.upsert_symbol(symbol.clone());
+                }
+                if let Err(err) = enqueue_changed_symbols(
+                    config.workspace.as_path(),
                     store,
-                    &SymbolChangeEvent {
-                        file_path: normalize_path(
-                            &relative_workspace_path(&config.workspace, path).to_string_lossy(),
-                        ),
-                        language,
-                        added: Vec::new(),
-                        removed: Vec::new(),
-                        updated: Vec::new(),
-                    },
-                )?;
-            }
-            false
-        }
-        // An edit that changes no symbol (a comment, blank lines, an import) still changes
-        // the file and maybe its edges. Re-extract them, or status would report the file
-        // as modified until the next full sync. A source file without symbols (imports
-        // only, top-level code) has edges too, so it is handled the same way. A file the
-        // index read since it last changed, as a branch switch leaves most, is skipped.
-        Ok(None) => match observer
-            .symbols_of(path)
-            .map(|(file_path, language, _)| (file_path, language))
-            .or_else(|| symbol_free_source(config, path))
-        {
-            Some((file_path, language))
-                if crate::freshness::file_changed_since_read(
-                    &config.workspace,
-                    store,
-                    &file_path,
-                )? =>
-            {
-                structural.process_event(
-                    store,
-                    &SymbolChangeEvent {
-                        file_path,
-                        language,
-                        added: Vec::new(),
-                        removed: Vec::new(),
-                        updated: Vec::new(),
-                    },
-                )?;
+                    queue_state,
+                    &changed,
+                ) {
+                    tracing::warn!(
+                        file_path = %event.file_path,
+                        error = %err,
+                        "failed to enqueue changed symbols"
+                    );
+                }
                 true
             }
-            _ => false,
-        },
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to process {}", path.display()));
+            // A file skipped for its size was not read: its stored symbols may describe older
+            // text, so nothing may count it as read.
+            Ok(None) if observer.skipped_as_oversized(path) => false,
+            // A source file that is gone and had no symbols (so no event removes any) can still
+            // have edges and test intents stored. An empty event clears them.
+            Ok(None) if !path.exists() => {
+                if let Some(language) = language_for_path(path) {
+                    structural.process_event(
+                        store,
+                        &SymbolChangeEvent {
+                            file_path: normalize_path(
+                                &relative_workspace_path(&config.workspace, path).to_string_lossy(),
+                            ),
+                            language,
+                            added: Vec::new(),
+                            removed: Vec::new(),
+                            updated: Vec::new(),
+                        },
+                    )?;
+                }
+                false
+            }
+            // An edit that changes no symbol (a comment, blank lines, an import) still changes
+            // the file and maybe its edges. Re-extract them, or status would report the file
+            // as modified until the next full sync. A source file without symbols (imports
+            // only, top-level code) has edges too, so it is handled the same way. A file the
+            // index read since it last changed, as a branch switch leaves most, is skipped.
+            Ok(None) => match observer
+                .symbols_of(path)
+                .map(|(file_path, language, _)| (file_path, language))
+                .or_else(|| symbol_free_source(config, path))
+            {
+                Some((file_path, language))
+                    if crate::freshness::file_changed_since_read(
+                        &config.workspace,
+                        store,
+                        &file_path,
+                    )? =>
+                {
+                    structural.process_event(
+                        store,
+                        &SymbolChangeEvent {
+                            file_path,
+                            language,
+                            added: Vec::new(),
+                            removed: Vec::new(),
+                            updated: Vec::new(),
+                        },
+                    )?;
+                    true
+                }
+                _ => false,
+            },
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to process {}", path.display()));
+            }
+        };
+
+        // Every symbol the file still declares now matches its row, the unchanged ones too, so
+        // the whole file counts as read; only changed symbols were rewritten above.
+        if read && let Some((_, _, symbols)) = observer.symbols_of(path) {
+            let symbol_ids = symbols
+                .iter()
+                .map(|symbol| symbol.id.clone())
+                .collect::<Vec<_>>();
+            store
+                .mark_symbols_read(&symbol_ids, unix_timestamp_secs())
+                .with_context(|| format!("failed to record reading {}", path.display()))?;
         }
-    };
 
-    // Every symbol the file still declares now matches its row, the unchanged ones too, so
-    // the whole file counts as read; only changed symbols were rewritten above.
-    if read && let Some((_, _, symbols)) = observer.symbols_of(path) {
-        let symbol_ids = symbols
-            .iter()
-            .map(|symbol| symbol.id.clone())
-            .collect::<Vec<_>>();
-        store
-            .mark_symbols_read(&symbol_ids, unix_timestamp_secs())
-            .with_context(|| format!("failed to record reading {}", path.display()))?;
-    }
-
-    let file_path =
-        normalize_path(&relative_workspace_path(&config.workspace, path).to_string_lossy());
-    if path.is_file() && language_for_path(path).is_some() && !observer.skipped_as_oversized(path) {
-        if let Err(err) = store.record_file_reads(&[file_path], read_started_ms) {
+        let file_path =
+            normalize_path(&relative_workspace_path(&config.workspace, path).to_string_lossy());
+        if path.is_file()
+            && language_for_path(path).is_some()
+            && !observer.skipped_as_oversized(path)
+        {
+            if let Err(err) = store.record_file_reads(&[file_path], read_started_ms) {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "failed to record when the file was read"
+                );
+            }
+        } else if !path.exists()
+            && let Err(err) = store.forget_file_reads(&[file_path])
+        {
             tracing::warn!(
                 path = %path.display(),
                 error = %err,
-                "failed to record when the file was read"
+                "failed to forget the read of a removed file"
             );
         }
-    } else if !path.exists()
-        && let Err(err) = store.forget_file_reads(&[file_path])
+        Ok(())
+    })();
+    if result.is_err()
+        && let Some(blocked) = previous_quarantine
     {
-        tracing::warn!(
-            path = %path.display(),
-            error = %err,
-            "failed to forget the read of a removed file"
-        );
+        observer.quarantine(path, blocked.reason);
     }
-    Ok(())
+    result
 }
 
 pub(super) fn resolve_git_watch_dir(workspace: &Path) -> Option<PathBuf> {

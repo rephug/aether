@@ -116,6 +116,38 @@ impl ObserverState {
         &self.blocked_sources
     }
 
+    pub(crate) fn quarantine_source(
+        &self,
+        path: &Path,
+    ) -> Option<&crate::indexing_gaps::BlockedSource> {
+        let relative =
+            normalize_path(&relative_workspace_path(&self.workspace, path).to_string_lossy());
+        self.blocked_sources
+            .iter()
+            .find(|blocked| blocked.path == relative)
+    }
+
+    pub(crate) fn quarantine(&mut self, path: &Path, reason: String) {
+        let relative =
+            normalize_path(&relative_workspace_path(&self.workspace, path).to_string_lossy());
+        if let Some(blocked) = self
+            .blocked_sources
+            .iter_mut()
+            .find(|blocked| blocked.path == relative)
+        {
+            blocked.reason = reason;
+        } else {
+            self.blocked_sources
+                .push(crate::indexing_gaps::BlockedSource {
+                    path: relative.clone(),
+                    reason,
+                });
+        }
+        if !self.unread_paths.contains(&relative) {
+            self.unread_paths.push(relative);
+        }
+    }
+
     pub fn seed_from_disk(&mut self) -> Result<()> {
         // Read before the walk: a checkout during it leaves this older than some files read,
         // so the next HEAD change is diffed from here and covers it.
@@ -263,12 +295,24 @@ impl ObserverState {
             }
 
             match fs::read_to_string(path) {
-                Ok(source) => self
-                    .extractor
-                    .extract_from_source(language, &display_path, &source)
-                    .with_context(|| {
-                        format!("failed to extract symbols from {}", path.display())
-                    })?,
+                Ok(source) => {
+                    match self
+                        .extractor
+                        .extract_from_source(language, &display_path, &source)
+                    {
+                        Ok(symbols) => symbols,
+                        Err(error) if error.is::<aether_parse::DuplicateSymbolIdentity>() => {
+                            tracing::warn!(path = %display_path, error = %error, "quarantined changed source; prior snapshot and stored rows retained");
+                            self.quarantine(path, error.to_string());
+                            return Ok(None);
+                        }
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!("failed to extract symbols from {}", path.display())
+                            });
+                        }
+                    }
+                }
                 Err(err) if err.kind() == ErrorKind::NotFound => Vec::new(),
                 Err(err) => {
                     return Err(err).with_context(|| {
@@ -279,6 +323,12 @@ impl ObserverState {
         } else {
             Vec::new()
         };
+
+        if self.quarantine_source(path).is_some() {
+            self.blocked_sources
+                .retain(|blocked| blocked.path != display_path);
+            self.unread_paths.retain(|unread| unread != &display_path);
+        }
 
         let previous_symbols = previous
             .as_ref()

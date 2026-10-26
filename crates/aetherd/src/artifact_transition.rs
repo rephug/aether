@@ -1,4 +1,4 @@
-//! Retire generated Full-profile entry points before selecting Compact.
+//! Archive recognized profile artifacts before replacing or retiring them.
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
@@ -21,6 +21,47 @@ pub(super) struct Transition {
     pub refreshed: Vec<GeneratedFile>,
 }
 
+pub(super) fn contains_compact_profile(workspace: &Path, files: &[GeneratedFile]) -> Result<bool> {
+    // A shared registration may contain other servers or custom Aether fields,
+    // and every guidance file may have been edited. Detect its explicit Compact
+    // selection without requiring byte equality with an entire JSON template.
+    let registration = workspace.join(".mcp.json");
+    match fs::metadata(&registration) {
+        Ok(metadata) if metadata.len() <= 1024 * 1024 => {
+            let bytes = read_bounded(&registration, 1024 * 1024)?;
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                && let Some(args) = json
+                    .pointer("/mcpServers/aether/args")
+                    .and_then(|value| value.as_array())
+                && (args
+                    .windows(2)
+                    .any(|pair| pair[0] == "--tools" && pair[1] == "compact")
+                    || args.iter().any(|value| value == "--tools=compact"))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect shared MCP profile selection"),
+    }
+    for file in files {
+        let path = workspace.join(&file.relative_path);
+        match fs::metadata(&path) {
+            Ok(metadata)
+                if metadata.len() == file.content.len() as u64
+                    && read_bounded(&path, file.content.len())? == file.content.as_bytes() =>
+            {
+                return Ok(true);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+        }
+    }
+    Ok(false)
+}
+
 pub(super) fn check_output_paths(workspace: &Path, files: &[GeneratedFile]) -> Result<()> {
     let root = workspace
         .canonicalize()
@@ -33,10 +74,10 @@ pub(super) fn check_output_paths(workspace: &Path, files: &[GeneratedFile]) -> R
 
 /// Only exact templates from this build/configuration are managed. Unknown bytes
 /// require manual review. All candidates are checked before any file is moved.
-pub(super) fn retire_full_artifacts(
+pub(super) fn transition_artifacts(
     workspace: &Path,
-    full: Vec<GeneratedFile>,
-    compact: Vec<GeneratedFile>,
+    previous: Vec<GeneratedFile>,
+    requested: Vec<GeneratedFile>,
     selected: &BTreeSet<PathBuf>,
     force: bool,
 ) -> Result<Transition> {
@@ -45,16 +86,16 @@ pub(super) fn retire_full_artifacts(
         .context("resolve agent workspace")?;
     let mut pending = Vec::new();
     let mut refreshed = Vec::new();
-    for file in full {
+    for file in previous {
         // Shared registrations are merged by the caller, never archived wholesale.
-        if selected.contains(&file.relative_path) || file.relative_path == Path::new(".mcp.json") {
+        if file.relative_path == Path::new(".mcp.json") {
             continue;
         }
         let path = root.join(&file.relative_path);
         let Some(metadata) = checked_file(&root, &file.relative_path)? else {
             continue;
         };
-        let replacement = compact
+        let replacement = requested
             .iter()
             .find(|item| item.relative_path == file.relative_path);
         let limit = replacement.map_or(file.content.len(), |item| {
@@ -62,7 +103,7 @@ pub(super) fn retire_full_artifacts(
         });
         if metadata.len() > limit as u64 {
             bail!(
-                "{} is customized or from another template/configuration; review it before selecting Compact",
+                "{} is customized or from another template/configuration; review it before changing tool profiles",
                 path.display()
             );
         }
@@ -72,11 +113,11 @@ pub(super) fn retire_full_artifacts(
         }
         if bytes != file.content.as_bytes() {
             bail!(
-                "{} is customized or from another template/configuration; review it before selecting Compact",
+                "{} is customized or from another template/configuration; review it before changing tool profiles",
                 path.display()
             );
         }
-        if let Some(item) = replacement {
+        if let Some(item) = replacement.filter(|_| !selected.contains(&file.relative_path)) {
             // A global profile switch also refreshes recognized guidance for other clients.
             refreshed.push(GeneratedFile::new(
                 &item.relative_path,
@@ -93,7 +134,7 @@ pub(super) fn retire_full_artifacts(
     }
     if !force {
         bail!(
-            "Full-profile generated artifacts are still discoverable; re-run with --force to archive them before selecting Compact"
+            "Generated artifacts from the other tool profile are still discoverable; re-run with --force to archive them before changing profiles"
         );
     }
 
@@ -102,29 +143,61 @@ pub(super) fn retire_full_artifacts(
     fs::create_dir_all(root.join(backup_parent))
         .context("create agent artifact backup directory")?;
     let backup = create_backup(&root, backup_parent)?;
+    // Publish recovery instructions before the first rename. Even a partial failure
+    // leaves a durable inventory of both moved and still-active files.
+    let manifest = serde_json::json!({
+        "version": 1,
+        "recovery": "For each entry, restore archive_path to original_path only after reviewing any currently active file. An absent archive means that rename had not completed. Keep this manifest and backup until recovery is verified.",
+        "artifacts": pending.iter().map(|(relative, bytes)| serde_json::json!({
+            "original_path": relative,
+            "archive_path": backup.join(relative),
+            "blake3": blake3::hash(bytes).to_hex().to_string(),
+        })).collect::<Vec<_>>(),
+    });
+    let mut receipt = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(root.join(&backup).join("recovery.json"))
+        .context("create profile transition recovery manifest")?;
+    use std::io::Write;
+    receipt
+        .write_all(&serde_json::to_vec_pretty(&manifest)?)
+        .context("write profile transition recovery manifest")?;
+    receipt
+        .sync_all()
+        .context("persist profile transition recovery manifest")?;
     let mut archived = Vec::new();
-    for (relative, bytes) in pending {
-        checked_file(&root, &relative)?.context("artifact disappeared before archival")?;
-        let source = root.join(&relative);
-        if read_bounded(&source, bytes.len())? != bytes {
-            bail!(
-                "{} changed during profile transition; profile registration has not been changed",
-                source.display()
-            );
+    let archive_result = (|| -> Result<()> {
+        for (relative, bytes) in pending {
+            checked_file(&root, &relative)?.context("artifact disappeared before archival")?;
+            let source = root.join(&relative);
+            if read_bounded(&source, bytes.len())? != bytes {
+                bail!(
+                    "{} changed during profile transition; review the recovery manifest before retrying",
+                    source.display()
+                );
+            }
+            let archive_path = backup.join(&relative);
+            let destination = root.join(&archive_path);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent).context("create artifact backup parent")?;
+            }
+            fs::rename(&source, &destination).with_context(|| {
+                format!("archive {} to {}", source.display(), destination.display())
+            })?;
+            archived.push(ArchivedAgentArtifact {
+                original_path: relative,
+                archive_path,
+            });
         }
-        let archive_path = backup.join(&relative);
-        let destination = root.join(&archive_path);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).context("create artifact backup parent")?;
-        }
-        fs::rename(&source, &destination).with_context(|| {
-            format!("archive {} to {}", source.display(), destination.display())
-        })?;
-        archived.push(ArchivedAgentArtifact {
-            original_path: relative,
-            archive_path,
-        });
-    }
+        Ok(())
+    })();
+    archive_result.with_context(|| {
+        format!(
+            "profile transition incomplete; recovery inventory and preserved files: {}",
+            root.join(&backup).join("recovery.json").display()
+        )
+    })?;
     Ok(Transition {
         archived,
         refreshed,

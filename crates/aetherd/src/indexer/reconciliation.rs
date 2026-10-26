@@ -272,12 +272,44 @@ pub(crate) fn reconcile_symbol_event(
     store: &SqliteStore,
     event: &SymbolChangeEvent,
 ) -> Result<Vec<String>> {
+    reconcile_event(workspace, store, event, false)
+}
+
+/// Recovery is a complete successful read of this one formerly quarantined file.
+/// A startup quarantine has no in-memory previous snapshot; compare its catalog
+/// rows explicitly, retaining retirement history for declarations removed meanwhile.
+pub(super) fn reconcile_recovered_file(
+    workspace: &Path,
+    store: &SqliteStore,
+    file_path: &str,
+    symbols: &[Symbol],
+) -> Result<Vec<String>> {
+    let event = SymbolChangeEvent {
+        file_path: file_path.to_owned(),
+        // Language is not consulted by reconciliation; empty files have no symbol.
+        language: symbols
+            .first()
+            .map_or(aether_core::Language::Rust, |symbol| symbol.language),
+        added: symbols.to_vec(),
+        removed: Vec::new(),
+        updated: Vec::new(),
+    };
+    reconcile_event(workspace, store, &event, true)
+}
+
+fn reconcile_event(
+    workspace: &Path,
+    store: &SqliteStore,
+    event: &SymbolChangeEvent,
+    complete_file: bool,
+) -> Result<Vec<String>> {
     let _guard = acquire_inject_write_lock(workspace)?;
-    let pre_existing_ids = store
+    let pre_existing = store
         .list_symbols_for_file(&event.file_path)
-        .context("failed to read prior declarations for event reconciliation")?
-        .into_iter()
-        .map(|symbol| symbol.id)
+        .context("failed to read prior declarations for event reconciliation")?;
+    let pre_existing_ids = pre_existing
+        .iter()
+        .map(|symbol| symbol.id.clone())
         .collect::<HashSet<_>>();
     let mut current = HashMap::new();
     let now = unix_timestamp_secs();
@@ -289,6 +321,13 @@ pub(crate) fn reconcile_symbol_event(
     }
     let mut removed = Vec::new();
     let mut seen = HashSet::new();
+    if complete_file {
+        removed.extend(
+            pre_existing
+                .into_iter()
+                .filter(|symbol| !current.contains_key(&symbol.id)),
+        );
+    }
     for symbol in &event.removed {
         if current.contains_key(&symbol.id) || !seen.insert(&symbol.id) {
             continue;
@@ -297,6 +336,17 @@ pub(crate) fn reconcile_symbol_event(
             removed.push(record);
         }
     }
+    let mut retired_ids = removed
+        .iter()
+        .map(|symbol| symbol.id.clone())
+        .chain(
+            event
+                .removed
+                .iter()
+                .filter(|symbol| !current.contains_key(&symbol.id))
+                .map(|symbol| symbol.id.clone()),
+        )
+        .collect::<Vec<_>>();
     let plan = plan_reconciliation_candidates(&current, &pre_existing_ids, removed)?;
     let migrations = plan
         .migrations
@@ -319,12 +369,6 @@ pub(crate) fn reconcile_symbol_event(
                 .collect::<Vec<_>>(),
         )
         .context("failed to mark migrated annotations stale for their changed declaration")?;
-    let mut retired_ids = event
-        .removed
-        .iter()
-        .filter(|symbol| !current.contains_key(&symbol.id))
-        .map(|symbol| symbol.id.clone())
-        .collect::<Vec<_>>();
     retired_ids.sort();
     retired_ids.dedup();
     Ok(retired_ids)

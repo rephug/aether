@@ -17,6 +17,161 @@ fn options(profile: McpToolProfile, force: bool) -> InitAgentOptions {
 }
 
 #[test]
+fn review_regression_custom_selected_guidance_is_never_overwritten() {
+    for name in [
+        "CLAUDE.md",
+        "AGENTS.md",
+        ".codex-instructions",
+        ".cursor/rules",
+    ] {
+        let temp = workspace();
+        run_init_agent(temp.path(), options(McpToolProfile::Full, false)).expect("full setup");
+        let registration = fs::read(temp.path().join(".mcp.json")).expect("registration");
+        let custom = b"User-authored instructions. Preserve verbatim.\n";
+        fs::write(temp.path().join(name), custom).expect("custom guidance");
+        let result = run_init_agent(temp.path(), options(McpToolProfile::Compact, true));
+        assert!(
+            result.is_err(),
+            "custom {name} must be refused before transition"
+        );
+        assert_eq!(fs::read(temp.path().join(name)).expect("guidance"), custom);
+        assert_eq!(
+            fs::read(temp.path().join(".mcp.json")).expect("registration"),
+            registration
+        );
+        assert!(temp.path().join("scripts/scan_all.sh").exists());
+    }
+}
+
+#[test]
+fn review_regression_compact_to_full_requires_force_before_any_write() {
+    let temp = workspace();
+    run_init_agent(temp.path(), options(McpToolProfile::Compact, false)).expect("compact setup");
+    let registration = fs::read(temp.path().join(".mcp.json")).expect("registration");
+    assert!(run_init_agent(temp.path(), options(McpToolProfile::Full, false)).is_err());
+    assert!(!temp.path().join("scripts/scan_all.sh").exists());
+    assert_eq!(
+        fs::read(temp.path().join(".mcp.json")).expect("registration"),
+        registration
+    );
+}
+
+#[test]
+fn review_regression_mcp_custom_fields_and_extra_arguments_survive() {
+    let temp = workspace();
+    run_init_agent(temp.path(), options(McpToolProfile::Full, false)).expect("full setup");
+    let path = temp.path().join(".mcp.json");
+    let mut registration: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("registration")).expect("JSON");
+    registration["mcpServers"]["aether"]["env"] = serde_json::json!({"FIXTURE_SETTING":"keep"});
+    registration["mcpServers"]["aether"]["args"]
+        .as_array_mut()
+        .expect("arguments")
+        .extend([
+            serde_json::json!("--fixture-option"),
+            serde_json::json!("keep"),
+        ]);
+    fs::write(&path, serde_json::to_vec(&registration).expect("encode"))
+        .expect("custom registration");
+    run_init_agent(temp.path(), options(McpToolProfile::Compact, true))
+        .expect("compact transition");
+    let after: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("registration")).expect("JSON");
+    assert_eq!(
+        after["mcpServers"]["aether"]["env"],
+        registration["mcpServers"]["aether"]["env"]
+    );
+    assert_eq!(
+        after["mcpServers"]["aether"]["args"],
+        serde_json::json!([
+            "--workspace",
+            ".",
+            "--tools",
+            "compact",
+            "--fixture-option",
+            "keep"
+        ])
+    );
+}
+
+#[test]
+fn review_regression_custom_compact_profile_is_detected_from_shared_registration() {
+    let temp = workspace();
+    run_init_agent(temp.path(), options(McpToolProfile::Compact, false)).expect("compact setup");
+    for name in [
+        "CLAUDE.md",
+        "AGENTS.md",
+        ".codex-instructions",
+        ".cursor/rules",
+    ] {
+        fs::write(temp.path().join(name), "Custom instructions; preserve.\n")
+            .expect("custom guidance");
+    }
+    let path = temp.path().join(".mcp.json");
+    let mut registration: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("registration")).expect("JSON");
+    registration["mcpServers"]["other"] = serde_json::json!({"command":"other"});
+    fs::write(&path, serde_json::to_vec(&registration).expect("encode"))
+        .expect("shared registration");
+    assert!(run_init_agent(temp.path(), options(McpToolProfile::Full, true)).is_err());
+    assert_eq!(
+        fs::read_to_string(temp.path().join("CLAUDE.md")).expect("guidance"),
+        "Custom instructions; preserve.\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn review_regression_partial_transition_has_recovery_manifest_and_can_replay() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = workspace();
+    run_init_agent(temp.path(), options(McpToolProfile::Full, false)).expect("full setup");
+    let cursor = temp.path().join(".cursor");
+    let permissions = fs::metadata(&cursor)
+        .expect("cursor metadata")
+        .permissions();
+    fs::set_permissions(&cursor, fs::Permissions::from_mode(0o555))
+        .expect("deny rename for fixture");
+    let result = run_init_agent(temp.path(), options(McpToolProfile::Compact, true));
+    fs::set_permissions(&cursor, permissions).expect("restore fixture permissions");
+    let error = format!("{:#}", result.expect_err("fixture rename must fail"));
+    assert!(error.contains("recovery.json"), "{error}");
+    let backup = fs::read_dir(temp.path().join(".aether/agent-artifact-backups"))
+        .expect("backup root")
+        .next()
+        .expect("backup entry")
+        .expect("backup directory")
+        .path();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(backup.join("recovery.json")).expect("durable manifest"))
+            .expect("manifest JSON");
+    for entry in manifest["artifacts"].as_array().expect("inventory") {
+        let original = temp
+            .path()
+            .join(entry["original_path"].as_str().expect("original"));
+        let archived = temp
+            .path()
+            .join(entry["archive_path"].as_str().expect("archive"));
+        if archived.exists() {
+            assert!(
+                !original.exists(),
+                "recovery must never overwrite active content"
+            );
+            fs::rename(archived, original).expect("reviewed fixture recovery");
+        }
+    }
+    let compact = run_init_agent(temp.path(), options(McpToolProfile::Compact, true))
+        .expect("retry after recovery");
+    assert!(!compact.archived_files.is_empty());
+    assert!(
+        run_init_agent(temp.path(), options(McpToolProfile::Compact, true))
+            .expect("replay")
+            .archived_files
+            .is_empty()
+    );
+}
+
+#[test]
 fn full_to_compact_retires_full_only_artifacts_from_discovery() {
     let temp = workspace();
     let full =
@@ -28,6 +183,7 @@ fn full_to_compact_retires_full_only_artifacts_from_discovery() {
         ".cursor/rules",
         ".mcp.json",
     ];
+    let all_guidance = full.written_files.clone();
     let obsolete = full
         .written_files
         .into_iter()
@@ -43,8 +199,9 @@ fn full_to_compact_retires_full_only_artifacts_from_discovery() {
             .iter()
             .any(|path| path == Path::new(".github/workflows/aether-review.yml"))
     );
-    let original_bytes = obsolete
+    let original_bytes = all_guidance
         .iter()
+        .filter(|path| path.as_path() != Path::new(".mcp.json"))
         .map(|path| {
             (
                 path.clone(),
@@ -54,7 +211,7 @@ fn full_to_compact_retires_full_only_artifacts_from_discovery() {
         .collect::<std::collections::BTreeMap<_, _>>();
     let compact = run_init_agent(temp.path(), options(McpToolProfile::Compact, true))
         .expect("compact transition");
-    assert_eq!(compact.archived_files.len(), obsolete.len());
+    assert_eq!(compact.archived_files.len(), original_bytes.len());
     for archived in &compact.archived_files {
         assert_eq!(
             fs::read(temp.path().join(&archived.archive_path)).expect("archived bytes"),

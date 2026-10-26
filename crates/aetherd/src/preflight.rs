@@ -321,7 +321,7 @@ pub fn assemble_preflight_measured(
             .to_owned(),
     };
     loop {
-        map.context = render(&request.task, &sections);
+        map.context = render(&request.task, &sections, &map.omitted_items);
         map.map_hash = map_identity(&map)?;
         map.estimated_tokens = 0;
         for _ in 0..8 {
@@ -627,11 +627,14 @@ fn excerpt(value: &str, max_chars: usize) -> String {
     }
 }
 
-fn render(task: &str, sections: &[Section]) -> String {
+fn render(task: &str, sections: &[Section], omitted: &BTreeMap<String, usize>) -> String {
     let mut output = format!("# Task pre-flight\n\nTask: {}\n", excerpt(task, 240));
     for section in sections {
         output.push_str(&format!("\n## {}\n\n", section.title));
-        if section.items.is_empty() {
+        let trimmed = omitted.get(section.title).copied().unwrap_or(0);
+        if trimmed > 0 {
+            output.push_str(&format!("{trimmed} evidence items omitted to fit the response budget; omission does not establish absence.\n"));
+        } else if section.items.is_empty() {
             output.push_str(section.empty);
             output.push('\n');
         }
@@ -671,6 +674,43 @@ mod tests {
             signature_fingerprint: id.to_owned(),
             last_seen_at: 1,
         }
+    }
+
+    #[test]
+    fn review_regression_budget_omission_is_not_reported_as_absence() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        fs::write(workspace.path().join("cache.rs"), "fn cache() { disk(); }")?;
+        let store = SqliteStore::open(workspace.path())?;
+        store.upsert_symbol(symbol("cache", "cache.rs"))?;
+        store.upsert_symbol(symbol("disk", "disk.rs"))?;
+        store.upsert_edges(&[SymbolEdge {
+            source_id: "cache".to_owned(),
+            target_qualified_name: "disk".to_owned(),
+            edge_kind: EdgeKind::Calls,
+            file_path: "cache.rs".to_owned(),
+        }])?;
+        let mut input = request("cache");
+        input.max_tokens = 512;
+        // A deterministic measurement forces the last relationship off the budget.
+        let map = assemble_preflight_measured(workspace.path(), &input, |map| {
+            Ok(
+                if map
+                    .omitted_items
+                    .contains_key("Dependencies and reverse impact")
+                {
+                    1
+                } else {
+                    513
+                },
+            )
+        })?;
+        assert!(
+            !map.context.contains("No stored relationships found"),
+            "{}",
+            map.context
+        );
+        assert!(map.context.contains("omitted to fit"), "{}", map.context);
+        Ok(())
     }
 
     #[test]
