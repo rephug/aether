@@ -477,6 +477,7 @@ fn implements_edge(source_id: &str, target: &str, file_path: &str) -> SymbolEdge
     }
 }
 
+mod atomic_publication;
 mod audit;
 mod basic;
 mod language_family;

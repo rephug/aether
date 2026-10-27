@@ -305,6 +305,7 @@ fn process_reindex_path(
     queue_state: &SharedQueueState,
     path: &Path,
 ) -> Result<()> {
+    let checkpoint = observer.checkpoint_path(path);
     let previous_quarantine = observer.quarantine_source(path).cloned();
     let result = (|| -> Result<()> {
         // Taken before the read, so an edit landing while the file is read counts as newer.
@@ -465,10 +466,8 @@ fn process_reindex_path(
         }
         Ok(())
     })();
-    if result.is_err()
-        && let Some(blocked) = previous_quarantine
-    {
-        observer.quarantine(path, blocked.reason);
+    if result.is_err() {
+        observer.restore_path(checkpoint);
     }
     result
 }

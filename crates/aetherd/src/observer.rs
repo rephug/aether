@@ -38,6 +38,15 @@ struct FileSnapshot {
     symbols: Vec<Symbol>,
 }
 
+/// Opaque acknowledgement checkpoint for one in-flight watcher path.
+pub(crate) struct PathCheckpoint {
+    relative: PathBuf,
+    snapshot: Option<FileSnapshot>,
+    blocked: Option<crate::indexing_gaps::BlockedSource>,
+    unread: bool,
+    oversized: bool,
+}
+
 pub struct ObserverState {
     workspace: PathBuf,
     extractor: SymbolExtractor,
@@ -251,6 +260,42 @@ impl ObserverState {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn checkpoint_path(&self, path: &Path) -> PathCheckpoint {
+        let relative = relative_workspace_path(&self.workspace, path);
+        let display = normalize_path(&relative.to_string_lossy());
+        PathCheckpoint {
+            snapshot: self.snapshots.get(&relative).cloned(),
+            blocked: self.quarantine_source(path).cloned(),
+            unread: self.unread_paths.contains(&display),
+            oversized: self.oversized.contains(&relative),
+            relative,
+        }
+    }
+
+    /// A failed persist must be diffed again against the last acknowledged source.
+    /// Replaying an already-committed transaction is harmless and also retries
+    /// projection work that may have failed after canonical publication.
+    pub(crate) fn restore_path(&mut self, checkpoint: PathCheckpoint) {
+        let display = normalize_path(&checkpoint.relative.to_string_lossy());
+        self.snapshots.remove(&checkpoint.relative);
+        if let Some(snapshot) = checkpoint.snapshot {
+            self.snapshots.insert(checkpoint.relative.clone(), snapshot);
+        }
+        self.blocked_sources
+            .retain(|blocked| blocked.path != display);
+        if let Some(blocked) = checkpoint.blocked {
+            self.blocked_sources.push(blocked);
+        }
+        self.unread_paths.retain(|path| path != &display);
+        if checkpoint.unread {
+            self.unread_paths.push(display);
+        }
+        self.oversized.remove(&checkpoint.relative);
+        if checkpoint.oversized {
+            self.oversized.insert(checkpoint.relative);
+        }
     }
 
     pub fn process_path(&mut self, path: &Path) -> Result<Option<SymbolChangeEvent>> {

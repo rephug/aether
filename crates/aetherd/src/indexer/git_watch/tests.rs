@@ -6,6 +6,129 @@ use tempfile::tempdir;
 use super::*;
 
 #[test]
+fn atomic_publication_snapshot_and_watcher_retry_preserve_annotation_and_lineage() {
+    use aether_store::SymbolHistoryStore;
+    for mode in ["snapshot", "watcher", "quarantine_recovery"] {
+        let temp = tempdir().expect("workspace");
+        let workspace = temp.path();
+        crate::indexer::tests::write_default_config(workspace);
+        let path = workspace.join("lib.rs");
+        fs::write(&path, "pub fn track(value: i32) -> i32 { value }\n").expect("old source");
+        let config = mock_config(workspace);
+        run_initial_index_once(&config).expect("initial index");
+        let store = SqliteStore::open(workspace).expect("store");
+        let old = store.list_symbols_for_file("lib.rs").expect("old rows");
+        assert_eq!(old.len(), 1);
+        let old_id = &old[0].id;
+        let payload = r#"{"intent":"atomic retry keeps human annotation"}"#;
+        store.write_sir_blob(old_id, payload).expect("annotation");
+        let conn = rusqlite::Connection::open(workspace.join(".aether/meta.sqlite"))
+            .expect("fixture connection");
+        conn.execute(
+            "UPDATE sir SET source_hash='original-source', sir_status='fresh' WHERE id=?1",
+            [old_id],
+        )
+        .expect("source provenance");
+        conn.execute_batch("CREATE TRIGGER fail_publication BEFORE DELETE ON symbols BEGIN SELECT RAISE(ABORT,'fixture publication interrupted'); END;").expect("interrupt retirement");
+        let read_before = store.file_read_at_ms("lib.rs").expect("read stamp");
+        let mut observer = ObserverState::new(workspace.to_path_buf()).expect("observer");
+        observer.seed_from_disk().expect("seed");
+        if mode == "quarantine_recovery" {
+            observer.quarantine(&path, "fixture prior quarantine".to_owned());
+        }
+        let mut structural = StructuralIndexer::new(workspace.to_path_buf()).expect("structural");
+        let queue = SharedQueueState::new(HashMap::new());
+        fs::write(&path, "pub fn track(value: i64) -> i64 { value }\n").expect("signature edit");
+        let failed = if mode == "snapshot" {
+            run_initial_index_once(&config).map(|_| ())
+        } else {
+            process_reindex_paths(
+                &config,
+                &mut observer,
+                &mut structural,
+                &store,
+                &queue,
+                vec![path.clone()],
+            )
+        };
+        assert!(failed.is_err(), "fixture must fail at retirement ({mode})");
+        if mode != "snapshot" {
+            assert_eq!(
+                observer
+                    .symbols_of(&path)
+                    .expect("last acknowledged source")
+                    .2[0]
+                    .id,
+                *old_id,
+                "failed persist must restore observer before retry ({mode})"
+            );
+        }
+        assert_eq!(
+            store
+                .list_symbols_for_file("lib.rs")
+                .expect("catalog after failure"),
+            old,
+            "replacement and retirement must roll back together ({mode})"
+        );
+        assert_eq!(
+            store.file_read_at_ms("lib.rs").expect("read stamp"),
+            read_before
+        );
+        conn.execute_batch("DROP TRIGGER fail_publication;")
+            .expect("recover");
+        for _ in 0..2 {
+            if mode == "snapshot" {
+                run_initial_index_once(&config).expect("snapshot retry");
+            } else {
+                process_reindex_paths(
+                    &config,
+                    &mut observer,
+                    &mut structural,
+                    &store,
+                    &queue,
+                    vec![path.clone()],
+                )
+                .expect("watcher retry");
+            }
+        }
+        let current = store.list_symbols_for_file("lib.rs").expect("current");
+        assert_eq!(current.len(), 1);
+        let new_id = &current[0].id;
+        assert_ne!(new_id, old_id);
+        assert_eq!(
+            store.read_sir_blob(new_id).expect("annotation").as_deref(),
+            Some(payload)
+        );
+        assert_eq!(
+            store
+                .get_sir_source_hash(new_id)
+                .expect("provenance")
+                .as_deref(),
+            Some("original-source")
+        );
+        assert_eq!(
+            store
+                .get_sir_meta(new_id)
+                .expect("metadata")
+                .expect("new")
+                .sir_status,
+            "stale"
+        );
+        assert_eq!(store.list_symbol_lineage(new_id).expect("lineage").len(), 1);
+        assert_eq!(
+            store
+                .list_symbol_retirements(old_id)
+                .expect("archive")
+                .len(),
+            1
+        );
+        if mode != "snapshot" {
+            assert!(observer.blocked_sources().is_empty());
+        }
+    }
+}
+
+#[test]
 fn review_regression_watch_collision_keeps_rows_and_indexes_rest() {
     for restart_while_blocked in [false, true] {
         let temp = tempdir().expect("workspace");

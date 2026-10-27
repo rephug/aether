@@ -28,10 +28,40 @@ struct PlannedPrune {
 pub(super) struct ReconciliationPlan {
     migrations: Vec<PlannedMigration>,
     prunes: Vec<PlannedPrune>,
-    cleanup_ids: Vec<String>,
 }
 
 impl ReconciliationPlan {
+    pub(super) fn publish(
+        &self,
+        store: &SqliteStore,
+        records: &[SymbolRecord],
+    ) -> Result<(usize, usize)> {
+        let migrations = self
+            .migrations
+            .iter()
+            .map(|entry| (entry.old_symbol.id.clone(), entry.new_symbol.id.clone()))
+            .collect::<Vec<_>>();
+        let prunes = self
+            .prunes
+            .iter()
+            .map(|entry| entry.symbol.id.clone())
+            .collect::<Vec<_>>();
+        let (migrated, pruned) = store
+            .publish_and_reconcile_symbols(records, &migrations, &prunes)
+            .context("failed to atomically publish and reconcile declarations")?;
+        for entry in &self.migrations {
+            tracing::info!(qualified_name = %entry.old_symbol.qualified_name,
+                file_path = %entry.old_symbol.file_path, old_id = %entry.old_symbol.id,
+                new_id = %entry.new_symbol.id, "reconciled stale symbol ID");
+        }
+        tracing::info!(
+            migrated,
+            pruned,
+            "Reconciliation complete: {migrated} migrated, {pruned} pruned"
+        );
+        Ok((migrated, pruned))
+    }
+
     fn is_empty(&self) -> bool {
         self.migrations.is_empty() && self.prunes.is_empty()
     }
@@ -250,21 +280,11 @@ fn plan_reconciliation_candidates(
             .then_with(|| left.symbol.id.cmp(&right.symbol.id))
     });
 
-    let mut cleanup_ids = plan
-        .migrations
-        .iter()
-        .map(|entry| entry.old_symbol.id.clone())
-        .chain(plan.prunes.iter().map(|entry| entry.symbol.id.clone()))
-        .collect::<Vec<_>>();
-    cleanup_ids.sort();
-    cleanup_ids.dedup();
-    plan.cleanup_ids = cleanup_ids;
-
     Ok(plan)
 }
 
 /// Apply the same conservative identity rule to watcher and SIR events as full
-/// snapshots. Publish replacements before retiring old IDs so a signature edit
+/// snapshots. Publish replacements with retirement in one transaction so an edit
 /// can retain its evidence. Only declarations explicitly removed by this event
 /// are candidates: an incremental file event cannot prune the rest of a workspace.
 pub(crate) fn reconcile_symbol_event(
@@ -313,10 +333,9 @@ fn reconcile_event(
         .collect::<HashSet<_>>();
     let mut current = HashMap::new();
     let now = unix_timestamp_secs();
+    let mut records = Vec::new();
     for symbol in event.added.iter().chain(&event.updated) {
-        store
-            .upsert_symbol(super::structural::to_symbol_record(symbol, now))
-            .with_context(|| format!("failed to publish changed declaration {}", symbol.id))?;
+        records.push(super::structural::to_symbol_record(symbol, now));
         current.insert(symbol.id.clone(), symbol.clone());
     }
     let mut removed = Vec::new();
@@ -348,27 +367,7 @@ fn reconcile_event(
         )
         .collect::<Vec<_>>();
     let plan = plan_reconciliation_candidates(&current, &pre_existing_ids, removed)?;
-    let migrations = plan
-        .migrations
-        .iter()
-        .map(|entry| (entry.old_symbol.id.clone(), entry.new_symbol.id.clone()))
-        .collect::<Vec<_>>();
-    let prunes = plan
-        .prunes
-        .iter()
-        .map(|entry| entry.symbol.id.clone())
-        .collect::<Vec<_>>();
-    store
-        .reconcile_and_prune(&migrations, &prunes)
-        .context("failed to retain history during event reconciliation")?;
-    store
-        .mark_sir_stale(
-            &migrations
-                .iter()
-                .map(|(_, id)| id.clone())
-                .collect::<Vec<_>>(),
-        )
-        .context("failed to mark migrated annotations stale for their changed declaration")?;
+    plan.publish(store, &records)?;
     retired_ids.sort();
     retired_ids.dedup();
     Ok(retired_ids)
@@ -413,77 +412,6 @@ pub(super) fn print_reconciliation_dry_run(
     )
     .context("failed to write dry-run reconciliation summary")?;
     Ok(())
-}
-
-/// Execute `plan`. `before_prune` runs under the same inject-lock hold as the SQLite
-/// reconciliation and right before it, for work that must be recorded before the prune
-/// commits (a run interrupted after the prune finds nothing left to plan next time).
-pub(super) fn execute_symbol_reconciliation<BeforePrune, GraphCleanup, VectorCleanup>(
-    workspace: &Path,
-    store: &SqliteStore,
-    plan: &ReconciliationPlan,
-    before_prune: BeforePrune,
-    graph_cleanup: GraphCleanup,
-    vector_cleanup: VectorCleanup,
-) -> Result<(usize, usize)>
-where
-    BeforePrune: FnOnce() -> Result<()>,
-    GraphCleanup: FnOnce(&[String]) -> Result<()>,
-    VectorCleanup: FnOnce(&[String]) -> Result<()>,
-{
-    let migrations = plan
-        .migrations
-        .iter()
-        .map(|entry| (entry.old_symbol.id.clone(), entry.new_symbol.id.clone()))
-        .collect::<Vec<_>>();
-    let prunes = plan
-        .prunes
-        .iter()
-        .map(|entry| entry.symbol.id.clone())
-        .collect::<Vec<_>>();
-
-    // Reconciliation migrates and deletes symbol rows with their SIRs. Like the other
-    // symbol-removal paths it runs under the inject lock: an injection that found the
-    // symbol under that lock must not have it pruned before its leaf write lands, or
-    // the write would recreate an orphan SIR row for an id the index no longer holds.
-    // The lock covers only the SQLite reconciliation; the graph and vector cleanup
-    // below runs after it is released, so a slow backend does not hold every
-    // injection and generated-SIR persist in the workspace for the cleanup's duration.
-    let (migrated, pruned) = {
-        let _inject_guard = acquire_inject_write_lock(workspace)?;
-        before_prune()?;
-        store
-            .reconcile_and_prune(&migrations, &prunes)
-            .context("failed to reconcile stale symbols")?
-    };
-
-    for migration in &plan.migrations {
-        tracing::info!(
-            qualified_name = %migration.old_symbol.qualified_name,
-            file_path = %migration.old_symbol.file_path,
-            old_id = %migration.old_symbol.id,
-            new_id = %migration.new_symbol.id,
-            "reconciled stale symbol ID"
-        );
-    }
-
-    if !plan.cleanup_ids.is_empty() {
-        graph_cleanup(&plan.cleanup_ids).context("failed to clean stale graph symbols")?;
-        if let Err(err) = vector_cleanup(&plan.cleanup_ids) {
-            tracing::warn!(
-                error = %err,
-                cleanup_count = plan.cleanup_ids.len(),
-                "vector cleanup failed during reconciliation; embeddings will regenerate on the next pass"
-            );
-        }
-    }
-
-    tracing::info!(
-        migrated,
-        pruned,
-        "Reconciliation complete: {migrated} migrated, {pruned} pruned"
-    );
-    Ok((migrated, pruned))
 }
 
 #[cfg(test)]
@@ -984,15 +912,7 @@ mod tests {
             &SnapshotScope::everything(),
         )
         .expect("plan reconcile");
-        let (migrated, pruned) = execute_symbol_reconciliation(
-            temp.path(),
-            &store,
-            &plan,
-            || Ok(()),
-            |_| Ok(()),
-            |_| Ok(()),
-        )
-        .expect("execute reconcile");
+        let (migrated, pruned) = plan.publish(&store, &[]).expect("execute reconcile");
         assert_eq!((migrated, pruned), (1, 0));
 
         let (total_symbols, symbols_with_sir) = store
@@ -1028,15 +948,7 @@ mod tests {
             &SnapshotScope::everything(),
         )
         .expect("first plan");
-        execute_symbol_reconciliation(
-            temp.path(),
-            &store,
-            &first_plan,
-            || Ok(()),
-            |_| Ok(()),
-            |_| Ok(()),
-        )
-        .expect("first reconcile");
+        first_plan.publish(&store, &[]).expect("first reconcile");
 
         let second_plan = plan_symbol_reconciliation(
             &store,
@@ -1046,15 +958,7 @@ mod tests {
         )
         .expect("second plan");
         assert!(second_plan.is_empty());
-        let (migrated, pruned) = execute_symbol_reconciliation(
-            temp.path(),
-            &store,
-            &second_plan,
-            || Ok(()),
-            |_| Ok(()),
-            |_| Ok(()),
-        )
-        .expect("second reconcile");
+        let (migrated, pruned) = second_plan.publish(&store, &[]).expect("second reconcile");
         assert_eq!((migrated, pruned), (0, 0));
 
         let (total_symbols, symbols_with_sir) = store
@@ -1104,15 +1008,7 @@ mod tests {
         assert_eq!(plan.prunes[0].symbol.id, removed.id);
         assert_eq!(plan.prunes[0].reason, RECONCILE_UNCHANGED_SIBLING_REASON);
 
-        let (migrated, pruned) = execute_symbol_reconciliation(
-            temp.path(),
-            &store,
-            &plan,
-            || Ok(()),
-            |_| Ok(()),
-            |_| Ok(()),
-        )
-        .expect("execute reconcile");
+        let (migrated, pruned) = plan.publish(&store, &[]).expect("execute reconcile");
         assert_eq!((migrated, pruned), (0, 1));
         assert_eq!(
             store

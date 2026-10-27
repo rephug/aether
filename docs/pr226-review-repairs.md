@@ -90,15 +90,35 @@ without examining their consumers:
 
 ## Remaining limitations requiring follow-up
 
-Publication of replacement symbol rows and their reconciliation are not one
-SQLite transaction. A crash between them can cause a later snapshot to classify
-an already-present replacement as an unchanged sibling and prune the old identity
-instead of migrating it. This repair does not claim to close that crash window.
-Treat this as a merge blocker for the claimed history-correctness change: green
-tests do not establish crash-safe identity migration. Atomic publication and
-retirement, or an explicit durable recovery protocol with interruption tests,
-are needed before promoting the draft. Existing payload archival reduces the
-loss risk; it does not establish uninterrupted active annotation/lineage continuity.
+Replacement publication and reconciliation now use one SQLite IMMEDIATE
+transaction. Current catalog rows, migrated annotations and their original
+source hashes, stale status, contracts, lineage, retirement evidence and external
+cleanup obligations commit or roll back together. Snapshot planning holds the
+inject lock before reading the catalog; watcher and quarantine recovery use the
+same publication operation. A failed watcher persist restores the prior observer
+acknowledgement, so an unchanged subsequent event can retry without a restart.
+The conservative unchanged-overload/sibling rule remains in place. Existing
+reconcile-only callers retain their previous metadata-status behavior.
+
+Regressions cover SQL/archive failures, empty and record-only publication,
+concurrent replay and actual child-process exits without destructors: after the
+replacement insertion, after retirement changes but before commit, and after
+commit before mirror cleanup. Restart retains active annotations, contracts,
+source hashes and exactly one lineage/retirement. A retired mirror cannot
+rehydrate active evidence, including after same-ID reintroduction; explicitly
+written new SQLite annotations remain readable. These process-exit tests do not
+simulate power loss or establish storage-device durability.
+The fix prevents new partial publication; it cannot identify or automatically
+repair catalog rows already committed by an older interrupted implementation.
+Those rows can be indistinguishable from legitimate existing overloads. Review
+or restore such stores before indexing them; retained archives are recovery
+material, not proof that active annotations already migrated correctly.
+
+Mirrors, graph/edge replacement, vectors, file-read stamps and freshness markers
+remain separate effects. Rollups are conservatively invalidated before canonical
+publication and may require rebuilding after an interruption. This is not a
+global filesystem/projection transaction. Durable retirement cleanup handles
+external deletion; it does not establish a complete projection generation.
 Audit rows affected by migration cascades remain in archive JSON rather than
 necessarily remaining queryable through the active audit API. Archived lineage
 is heuristic, and external projections remain a separately replayed component.
