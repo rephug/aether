@@ -20,6 +20,7 @@ use serde_json::from_str as json_from_str;
 use thiserror::Error;
 mod analysis;
 mod audit;
+mod audit_history;
 mod contracts;
 mod embeddings;
 mod fingerprint_history;
@@ -69,6 +70,7 @@ pub use analysis::{
     CommunitySnapshotRecord, CouplingMiningStateRecord, DriftAnalysisStateRecord, DriftResultRecord,
 };
 pub use audit::{AuditFinding, AuditFindingFilters, AuditSeverityCounts, NewAuditFinding};
+pub use audit_history::{RetiredAuditDisclosure, RetiredAuditFinding};
 pub use contracts::{IntentContractRecord, IntentViolationRecord};
 pub use embeddings::{SemanticSearchResult, SymbolEmbeddingMetaRecord, SymbolEmbeddingRecord};
 pub use fingerprint_history::SirFingerprintHistoryRecord;
@@ -379,6 +381,11 @@ pub trait TestIntentStore {
 }
 
 pub trait AuditStore {
+    /// Global, bounded historical disclosure; independent of active finding filters.
+    fn retired_audit_disclosure(
+        &self,
+        sample_limit: u32,
+    ) -> Result<RetiredAuditDisclosure, StoreError>;
     fn insert_audit_finding(&self, record: NewAuditFinding) -> Result<i64, StoreError>;
     fn query_audit_findings(
         &self,
@@ -809,6 +816,18 @@ impl SnapshotStore for SqliteStore {
 }
 
 impl AuditStore for SqliteStore {
+    fn retired_audit_disclosure(
+        &self,
+        sample_limit: u32,
+    ) -> Result<RetiredAuditDisclosure, StoreError> {
+        let conn = self.conn.lock().map_err(|_| {
+            StoreError::Compatibility(
+                "store lock poisoned while disclosing retired audits".to_owned(),
+            )
+        })?;
+        audit_history::read_retired_audits(&conn, sample_limit)
+    }
+
     fn insert_audit_finding(&self, record: NewAuditFinding) -> Result<i64, StoreError> {
         self.store_insert_audit_finding(record)
     }

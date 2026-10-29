@@ -402,3 +402,5 @@ mod profile;
 mod refactor_verify;
 mod search_history;
 mod sir_inject;
+
+mod audit_retirement;

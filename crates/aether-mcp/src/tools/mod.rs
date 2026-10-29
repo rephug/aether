@@ -16,6 +16,7 @@ use crate::state::SharedState;
 #[cfg(test)]
 mod agent_files_tests;
 mod audit;
+mod audit_history;
 mod callers;
 mod common;
 mod context;
@@ -41,6 +42,7 @@ mod usage_matrix;
 mod verification;
 
 pub use audit::*;
+pub use audit_history::*;
 pub use context::*;
 pub use contract::*;
 pub use cross_symbol::*;
