@@ -114,6 +114,16 @@ class RouteSuiteTest(unittest.TestCase):
         self.write("app/start.html", '<a href="https://site.fixture.invalid.evil/agents">Wrong</a>')
         self.assertFalse(self.check()["ok"])
 
+    def test_encoded_consumer_path_separator_requires_dedicated_verifier(self):
+        canonical = "/team/agents"
+        self.provider["routes"][0]["canonical"] = canonical
+        self.manifest[canonical] = self.manifest.pop("/agents")
+        self.manifest["/realtor"]["redirect"] = canonical
+        self.write("site/index.html", f'<a href="{canonical}">Agents</a>')
+        self.suite["contracts"][0]["canonical"] = canonical
+        self.write("app/start.html", f'<a href="{SITE}/team%2Fagents">Ambiguous</a>')
+        self.assertIn("invalid_consumer_artifact", self.codes(self.check()))
+
     def test_unrelated_links_need_explicit_ignore(self):
         self.write("app/start.html", f'<a href="{SITE}/agents">Agents</a><a href="/about">About</a>')
         self.assertFalse(self.check()["ok"])
