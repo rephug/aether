@@ -168,7 +168,7 @@ async fn sync_graph_for_file_skips_unresolved_calls() {
 }
 
 #[tokio::test]
-async fn sync_graph_for_file_syncs_type_ref_and_implements_edges() {
+async fn sync_graph_for_file_syncs_all_structural_edge_kinds() {
     let temp = tempdir().expect("tempdir");
     let store = SqliteStore::open(temp.path()).expect("open store");
     let graph = SurrealGraphStore::open(temp.path())
@@ -219,6 +219,13 @@ async fn sync_graph_for_file_syncs_type_ref_and_implements_edges() {
         .upsert_edges(&[
             type_ref_edge(&alpha.id, "Target", "src/lib.rs"),
             implements_edge(&impl_type.id, "Store", "src/lib.rs"),
+            calls_edge(&alpha.id, "Store", "src/lib.rs"),
+            SymbolEdge {
+                source_id: alpha.id.clone(),
+                target_qualified_name: "Target".to_owned(),
+                edge_kind: EdgeKind::DependsOn,
+                file_path: "src/lib.rs".to_owned(),
+            },
         ])
         .expect("upsert structural edges");
 
@@ -226,13 +233,15 @@ async fn sync_graph_for_file_syncs_type_ref_and_implements_edges() {
         .sync_graph_for_file(&graph, "src/lib.rs")
         .await
         .expect("sync graph for file");
-    assert_eq!(stats.resolved_edges, 2);
+    assert_eq!(stats.resolved_edges, 4);
     assert_eq!(stats.unresolved_edges, 0);
 
     let edges = graph
         .list_dependency_edges()
         .await
         .expect("list dependency edges");
+    assert!(edges.iter().any(|edge| edge.edge_kind == "calls"));
+    assert!(edges.iter().any(|edge| edge.edge_kind == "depends_on"));
     assert!(edges.iter().any(|edge| {
         edge.source_symbol_id == alpha.id
             && edge.target_symbol_id == target.id

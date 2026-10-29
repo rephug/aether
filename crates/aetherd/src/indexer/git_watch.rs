@@ -140,15 +140,23 @@ pub(super) fn process_git_trigger(
     queue_state: &SharedQueueState,
     dirty_paths: HashSet<PathBuf>,
 ) -> Result<()> {
+    let started_at = crate::time::current_unix_timestamp_secs();
     let previous_head = read_persisted_head_state(config.workspace.as_path())?;
     let current_head = read_current_head_state(config.workspace.as_path(), git_watch_dir)?;
+    let indexed_commit = crate::freshness::read_index_sync_marker(config.workspace.as_path()).head;
     let mut paths = dirty_paths.into_iter().collect::<BTreeSet<_>>();
+    // Whether this reindex covers every change between the commit the freshness marker
+    // names and the new HEAD. The watcher's own base advances even past a skipped
+    // trigger, so a diff from it covers the marker's commit only when the two agree.
+    let mut catches_up = false;
 
     if previous_head.sha != current_head.sha {
         let trigger_kind =
             classify_git_trigger_kind(config.workspace.as_path(), &previous_head, &current_head);
         if trigger_kind.is_some_and(|kind| git_trigger_enabled(&watcher_runtime.watcher, kind)) {
-            let git_paths = if !watcher_runtime.watcher.git_trigger_changed_files_only
+            let (git_paths, covers_indexed_commit) = if !watcher_runtime
+                .watcher
+                .git_trigger_changed_files_only
                 || previous_head.sha.is_none()
             {
                 collect_full_reindex_paths(config.workspace.as_path(), observer)
@@ -156,7 +164,7 @@ pub(super) fn process_git_trigger(
                 (previous_head.sha.as_deref(), current_head.sha.as_deref())
             {
                 match changed_paths_between_heads(config.workspace.as_path(), old_sha, new_sha) {
-                    Ok(paths) => paths,
+                    Ok(paths) => (paths, indexed_commit.as_deref() == Some(old_sha)),
                     Err(err) => {
                         tracing::warn!(
                             old_sha,
@@ -170,6 +178,7 @@ pub(super) fn process_git_trigger(
             } else {
                 collect_full_reindex_paths(config.workspace.as_path(), observer)
             };
+            catches_up = covers_indexed_commit;
             paths.extend(git_paths);
         }
     }
@@ -187,6 +196,16 @@ pub(super) fn process_git_trigger(
     }
 
     write_persisted_head_state(config.workspace.as_path(), &current_head)?;
+    // A skipped trigger, a diff from a base the marker doesn't name, or a failed reindex
+    // (returned above) leaves the freshness marker on the commit it already names.
+    if catches_up
+        && observer.blocked_sources().is_empty()
+        && let Some(head) = current_head.sha.as_deref()
+        && let Err(err) =
+            crate::freshness::record_head_caught_up(config.workspace.as_path(), head, started_at)
+    {
+        tracing::warn!(error = %err, "failed to record the index sync marker");
+    }
     Ok(())
 }
 
@@ -199,11 +218,27 @@ pub(super) fn process_reindex_paths(
     paths: Vec<PathBuf>,
 ) -> Result<()> {
     refresh_paths(config, structural, &paths);
-    let processed = paths.iter().try_for_each(|path| {
-        process_reindex_path(config, observer, structural, store, queue_state, path)
-    });
+    let mut first_error = None;
+    for path in &paths {
+        if let Err(error) =
+            process_reindex_path(config, observer, structural, store, queue_state, path)
+        {
+            tracing::error!(path = %path.display(), error = %error, "reindex path failed; continuing unrelated paths");
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
     structural.reindex_stale_files(store);
-    processed
+    crate::indexing_gaps::record(
+        &config.workspace,
+        unix_timestamp_secs(),
+        observer.blocked_sources(),
+    )?;
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// Re-indexes the paths the watcher's debounce released. A path that fails is logged and
@@ -225,6 +260,13 @@ pub(super) fn process_debounced_paths(
         }
     }
     structural.reindex_stale_files(store);
+    if let Err(error) = crate::indexing_gaps::record(
+        &config.workspace,
+        unix_timestamp_secs(),
+        observer.blocked_sources(),
+    ) {
+        tracing::error!(error = %error, "could not publish watcher quarantine coverage");
+    }
 }
 
 /// Re-reads a batch of changed paths for the Python call targets resolved through them,
@@ -240,6 +282,21 @@ fn refresh_paths(config: &IndexerConfig, structural: &mut StructuralIndexer, pat
     }
 }
 
+/// A source file on disk the observer holds no symbols for, as its workspace-relative path
+/// and language.
+fn symbol_free_source(
+    config: &IndexerConfig,
+    path: &Path,
+) -> Option<(String, aether_core::Language)> {
+    if !path.is_file() {
+        return None;
+    }
+    let language = language_for_path(path)?;
+    let file_path =
+        normalize_path(&relative_workspace_path(&config.workspace, path).to_string_lossy());
+    Some((file_path, language))
+}
+
 fn process_reindex_path(
     config: &IndexerConfig,
     observer: &mut ObserverState,
@@ -248,40 +305,171 @@ fn process_reindex_path(
     queue_state: &SharedQueueState,
     path: &Path,
 ) -> Result<()> {
-    match observer.process_path(path) {
-        Ok(Some(event)) => {
-            if config.print_events {
-                let line = serde_json::to_string(&event)
-                    .context("failed to serialize symbol-change event")?;
-                println!("{line}");
+    let checkpoint = observer.checkpoint_path(path);
+    let previous_quarantine = observer.quarantine_source(path).cloned();
+    let result = (|| -> Result<()> {
+        // Taken before the read, so an edit landing while the file is read counts as newer.
+        let read_started_ms = crate::time::current_unix_timestamp_millis();
+        let mut observation = observer.process_path(path);
+        if observation.is_ok() && observer.quarantine_source(path).is_some() {
+            return Ok(());
+        }
+        if previous_quarantine.is_some() && observation.is_ok() {
+            let file_path =
+                normalize_path(&relative_workspace_path(&config.workspace, path).to_string_lossy());
+            let current = observer
+                .symbols_of(path)
+                .map(|(_, _, symbols)| symbols)
+                .unwrap_or(&[]);
+            for id in super::reconciliation::reconcile_recovered_file(
+                &config.workspace,
+                store,
+                &file_path,
+                current,
+            )? {
+                queue_state.remove_symbol(&id);
             }
-
-            structural.process_event(store, &event)?;
-            for removed in &event.removed {
-                queue_state.remove_symbol(&removed.id);
-            }
-            let mut changed = Vec::new();
-            collect_changed_symbols(&event, &mut changed);
-            for symbol in &changed {
-                queue_state.upsert_symbol(symbol.clone());
-            }
-            if let Err(err) =
-                enqueue_changed_symbols(config.workspace.as_path(), store, queue_state, &changed)
+            if matches!(observation, Ok(None))
+                && let Some(language) = language_for_path(path)
             {
+                observation = Ok(Some(SymbolChangeEvent {
+                    file_path,
+                    language,
+                    added: Vec::new(),
+                    removed: Vec::new(),
+                    updated: Vec::new(),
+                }));
+            }
+        }
+        let read = match observation {
+            Ok(Some(event)) => {
+                if config.print_events {
+                    let line = serde_json::to_string(&event)
+                        .context("failed to serialize symbol-change event")?;
+                    println!("{line}");
+                }
+
+                structural.process_event(store, &event)?;
+                for removed in &event.removed {
+                    queue_state.remove_symbol(&removed.id);
+                }
+                let mut changed = Vec::new();
+                collect_changed_symbols(&event, &mut changed);
+                for symbol in &changed {
+                    queue_state.upsert_symbol(symbol.clone());
+                }
+                if let Err(err) = enqueue_changed_symbols(
+                    config.workspace.as_path(),
+                    store,
+                    queue_state,
+                    &changed,
+                ) {
+                    tracing::warn!(
+                        file_path = %event.file_path,
+                        error = %err,
+                        "failed to enqueue changed symbols"
+                    );
+                }
+                true
+            }
+            // A file skipped for its size was not read: its stored symbols may describe older
+            // text, so nothing may count it as read.
+            Ok(None) if observer.skipped_as_oversized(path) => false,
+            // A source file that is gone and had no symbols (so no event removes any) can still
+            // have edges and test intents stored. An empty event clears them.
+            Ok(None) if !path.exists() => {
+                if let Some(language) = language_for_path(path) {
+                    structural.process_event(
+                        store,
+                        &SymbolChangeEvent {
+                            file_path: normalize_path(
+                                &relative_workspace_path(&config.workspace, path).to_string_lossy(),
+                            ),
+                            language,
+                            added: Vec::new(),
+                            removed: Vec::new(),
+                            updated: Vec::new(),
+                        },
+                    )?;
+                }
+                false
+            }
+            // An edit that changes no symbol (a comment, blank lines, an import) still changes
+            // the file and maybe its edges. Re-extract them, or status would report the file
+            // as modified until the next full sync. A source file without symbols (imports
+            // only, top-level code) has edges too, so it is handled the same way. A file the
+            // index read since it last changed, as a branch switch leaves most, is skipped.
+            Ok(None) => match observer
+                .symbols_of(path)
+                .map(|(file_path, language, _)| (file_path, language))
+                .or_else(|| symbol_free_source(config, path))
+            {
+                Some((file_path, language))
+                    if crate::freshness::file_changed_since_read(
+                        &config.workspace,
+                        store,
+                        &file_path,
+                    )? =>
+                {
+                    structural.process_event(
+                        store,
+                        &SymbolChangeEvent {
+                            file_path,
+                            language,
+                            added: Vec::new(),
+                            removed: Vec::new(),
+                            updated: Vec::new(),
+                        },
+                    )?;
+                    true
+                }
+                _ => false,
+            },
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to process {}", path.display()));
+            }
+        };
+
+        // Every symbol the file still declares now matches its row, the unchanged ones too, so
+        // the whole file counts as read; only changed symbols were rewritten above.
+        if read && let Some((_, _, symbols)) = observer.symbols_of(path) {
+            let symbol_ids = symbols
+                .iter()
+                .map(|symbol| symbol.id.clone())
+                .collect::<Vec<_>>();
+            store
+                .mark_symbols_read(&symbol_ids, unix_timestamp_secs())
+                .with_context(|| format!("failed to record reading {}", path.display()))?;
+        }
+
+        let file_path =
+            normalize_path(&relative_workspace_path(&config.workspace, path).to_string_lossy());
+        if path.is_file()
+            && language_for_path(path).is_some()
+            && !observer.skipped_as_oversized(path)
+        {
+            if let Err(err) = store.record_file_reads(&[file_path], read_started_ms) {
                 tracing::warn!(
-                    file_path = %event.file_path,
+                    path = %path.display(),
                     error = %err,
-                    "failed to enqueue changed symbols"
+                    "failed to record when the file was read"
                 );
             }
+        } else if !path.exists()
+            && let Err(err) = store.forget_file_reads(&[file_path])
+        {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "failed to forget the read of a removed file"
+            );
         }
-        Ok(None) => {}
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to process {}", path.display()));
-        }
+        Ok(())
+    })();
+    if result.is_err() {
+        observer.restore_path(checkpoint);
     }
-
-    Ok(())
+    result
 }
 
 pub(super) fn resolve_git_watch_dir(workspace: &Path) -> Option<PathBuf> {
@@ -325,6 +513,12 @@ pub(super) fn write_persisted_head_state(workspace: &Path, head_state: &HeadStat
         head_state.marker.as_deref(),
     )?;
     Ok(())
+}
+
+/// HEAD now, as the watcher reads it: the commit and what `.git/HEAD` says.
+pub(crate) fn current_head(workspace: &Path) -> Result<(Option<String>, Option<String>)> {
+    let head = read_current_head_state(workspace, resolve_git_watch_dir(workspace).as_deref())?;
+    Ok((head.sha, head.marker))
 }
 
 pub(super) fn read_current_head_state(
@@ -480,17 +674,30 @@ pub(super) fn normalize_git_rename_path(path: &str) -> String {
     value.to_owned()
 }
 
+/// Every path a full reindex reads: those the observer tracks and every source file on
+/// disk. The flag says whether the walk read the whole workspace; a path it couldn't read
+/// is logged and left out, so a reindex of the rest doesn't cover the workspace.
 pub(super) fn collect_full_reindex_paths(
     workspace: &Path,
     observer: &ObserverState,
-) -> Vec<PathBuf> {
+) -> (Vec<PathBuf>, bool) {
     let mut paths = observer
         .tracked_paths()
         .into_iter()
         .collect::<BTreeSet<_>>();
+    let mut complete = true;
     for entry in WalkBuilder::new(workspace).standard_filters(true).build() {
-        let Ok(entry) = entry else {
-            continue;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                complete = false;
+                tracing::warn!(
+                    workspace = %workspace.display(),
+                    error = %err,
+                    "full reindex could not read a path; it is left out"
+                );
+                continue;
+            }
         };
         if !entry
             .file_type()
@@ -504,179 +711,8 @@ pub(super) fn collect_full_reindex_paths(
         }
         paths.insert(entry.path().to_path_buf());
     }
-    paths.into_iter().collect()
+    (paths.into_iter().collect(), complete)
 }
 
 #[cfg(test)]
-mod tests {
-    use tempfile::tempdir;
-
-    use super::*;
-
-    #[test]
-    fn resolve_git_watch_dir_follows_worktree_gitdir_file() {
-        let temp = tempdir().expect("tempdir");
-        let git_admin = temp.path().join("git-admin/worktrees/demo");
-        fs::create_dir_all(&git_admin).expect("create git admin dir");
-        fs::write(
-            temp.path().join(".git"),
-            format!("gitdir: {}\n", git_admin.display()),
-        )
-        .expect("write gitdir pointer");
-
-        let resolved = resolve_git_watch_dir(temp.path()).expect("resolve git watch dir");
-        assert_eq!(resolved, git_admin);
-    }
-
-    #[test]
-    fn classify_watch_event_recognizes_git_paths_outside_workspace() {
-        let temp = tempdir().expect("tempdir");
-        let git_admin = temp.path().join("git-admin/worktrees/demo");
-        let source_file = temp.path().join("src/lib.rs");
-        fs::create_dir_all(source_file.parent().expect("source parent")).expect("create src dir");
-        let event = Event {
-            kind: notify::EventKind::Modify(notify::event::ModifyKind::Any),
-            paths: vec![git_admin.join("HEAD"), source_file.clone()],
-            attrs: Default::default(),
-        };
-
-        let classified = classify_watch_event(temp.path(), Some(&git_admin), event);
-        assert!(classified.git_event);
-        assert_eq!(classified.source_paths, vec![source_file]);
-    }
-
-    #[test]
-    fn git_events_suppress_normal_file_debounce_until_settled() {
-        let mut debounce_queue = DebounceQueue::default();
-        let mut git_state = GitDebounceState::default();
-        let source_a = PathBuf::from("src/lib.rs");
-        let source_b = PathBuf::from("src/main.rs");
-
-        enqueue_classified_watch_event(
-            ClassifiedWatchEvent {
-                git_event: true,
-                source_paths: vec![source_a.clone()],
-                watch_dirs: Vec::new(),
-            },
-            &mut debounce_queue,
-            &mut git_state,
-        );
-        enqueue_classified_watch_event(
-            ClassifiedWatchEvent {
-                git_event: false,
-                source_paths: vec![source_b.clone()],
-                watch_dirs: Vec::new(),
-            },
-            &mut debounce_queue,
-            &mut git_state,
-        );
-
-        assert!(git_state.has_pending());
-        assert!(
-            debounce_queue
-                .drain_due(Instant::now(), Duration::ZERO)
-                .is_empty()
-        );
-
-        let mut dirty = git_state.take_dirty_paths().into_iter().collect::<Vec<_>>();
-        dirty.sort();
-        assert_eq!(dirty, vec![source_a, source_b]);
-    }
-
-    #[test]
-    fn a_reexport_change_reextracts_the_python_callers_resolved_through_it() {
-        let temp = tempdir().expect("tempdir");
-        let workspace = temp.path();
-        crate::indexer::tests::write_default_config(workspace);
-        for (path, source) in [
-            ("pkg/__init__.py", "from .old import f\n"),
-            ("pkg/old.py", "def f():\n    return 1\n"),
-            ("pkg/new.py", "def f():\n    return 2\n"),
-            (
-                "tests/test_pkg.py",
-                "from pkg import f\n\n\ndef test_f():\n    f()\n",
-            ),
-        ] {
-            let full_path = workspace.join(path);
-            fs::create_dir_all(full_path.parent().expect("parent")).expect("create dirs");
-            fs::write(full_path, source).expect("write source");
-        }
-        let config = IndexerConfig {
-            workspace: workspace.to_path_buf(),
-            debounce_ms: 300,
-            print_events: false,
-            print_sir: false,
-            embeddings_only: false,
-            force: false,
-            full: false,
-            deep: false,
-            turbo_concurrency: None,
-            dry_run: false,
-            sir_concurrency: 1,
-            lifecycle_logs: false,
-            inference_provider: None,
-            inference_model: None,
-            inference_endpoint: None,
-            inference_api_key_env: None,
-            pause_flag: None,
-        };
-        let mut observer = ObserverState::new(workspace.to_path_buf()).expect("observer");
-        observer.seed_from_disk().expect("seed observer");
-        let store = SqliteStore::open(workspace).expect("open store");
-        let mut structural =
-            StructuralIndexer::new(workspace.to_path_buf()).expect("structural indexer");
-        for event in observer.initial_symbol_events() {
-            structural
-                .process_event(&store, &event)
-                .expect("index file");
-        }
-        let queue_state = SharedQueueState::new(HashMap::new());
-
-        let id = |file: &str, qualified_name: &str| {
-            store
-                .list_symbols_for_file(file)
-                .expect("list symbols")
-                .into_iter()
-                .find(|symbol| symbol.qualified_name == qualified_name)
-                .unwrap_or_else(|| panic!("missing symbol {qualified_name}"))
-                .id
-        };
-        let test_f = id("tests/test_pkg.py", "tests.test_pkg::test_f");
-        let callees = || {
-            store
-                .list_graph_dependency_edges()
-                .expect("list edges")
-                .into_iter()
-                .filter(|edge| edge.edge_kind == "calls" && edge.source_symbol_id == test_f)
-                .map(|edge| edge.target_symbol_id)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(callees(), vec![id("pkg/old.py", "pkg.old::f")]);
-
-        // The package re-exports `f` from another module. Its `__init__.py` has no symbols,
-        // so the edit is no symbol change, and the test file itself is unchanged.
-        fs::write(workspace.join("pkg/__init__.py"), "from .new import f\n").expect("edit");
-        process_reindex_paths(
-            &config,
-            &mut observer,
-            &mut structural,
-            &store,
-            &queue_state,
-            vec![workspace.join("pkg/__init__.py")],
-        )
-        .expect("reindex the package");
-        assert_eq!(callees(), vec![id("pkg/new.py", "pkg.new::f")]);
-
-        // The same through the watcher's debounce path.
-        fs::write(workspace.join("pkg/__init__.py"), "from .old import f\n").expect("edit");
-        process_debounced_paths(
-            &config,
-            &mut observer,
-            &mut structural,
-            &store,
-            &queue_state,
-            vec![workspace.join("pkg/__init__.py")],
-        );
-        assert_eq!(callees(), vec![id("pkg/old.py", "pkg.old::f")]);
-    }
-}
+mod tests;

@@ -7,14 +7,14 @@ use aether_store::{
     AuditFindingFilters, AuditSeverityCounts, AuditStore, DriftStore, NewAuditFinding,
     SirStateStore, SqliteStore, SymbolSearchResult,
 };
-use rusqlite::{Connection, params_from_iter, types::Value as SqlValue};
+use rusqlite::{Connection, OpenFlags, params_from_iter, types::Value as SqlValue};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-use super::AetherMcpServer;
+use super::{AetherMcpServer, HistoricalAuditDisclosure};
 use crate::AetherMcpError;
 
 const DEFAULT_AUDIT_TOP_N: u32 = 20;
@@ -273,6 +273,9 @@ pub struct AetherAuditFindingOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherAuditReportResponse {
+    /// Historical unresolved observations are disclosed independently of active filters.
+    #[serde(default)]
+    pub historical: HistoricalAuditDisclosure,
     pub findings: Vec<AetherAuditFindingOutput>,
     pub summary: AuditSummary,
 }
@@ -838,7 +841,12 @@ impl AetherMcpServer {
             })
             .collect::<Result<Vec<_>, AetherMcpError>>()?;
 
-        Ok(AetherAuditReportResponse { findings, summary })
+        let historical = store.retired_audit_disclosure(limit)?.into();
+        Ok(AetherAuditReportResponse {
+            findings,
+            summary,
+            historical,
+        })
     }
 
     pub fn aether_audit_candidates_logic(
@@ -875,7 +883,8 @@ impl AetherMcpServer {
         }
 
         let symbol_records = store.get_symbol_search_results_batch(&symbol_ids)?;
-        let conn = Connection::open(self.sqlite_path())?;
+        let conn =
+            Connection::open_with_flags(self.sqlite_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let sir_metadata_by_symbol = load_sir_metadata_batch(&conn, &symbol_ids)?;
         let test_count_by_symbol = load_test_counts_by_symbol(&conn)?;
         let drift_by_symbol = latest_semantic_drift_by_symbol(store)?;

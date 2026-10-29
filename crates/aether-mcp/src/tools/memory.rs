@@ -140,9 +140,27 @@ pub struct AetherAskResponse {
     pub query: String,
     pub result_count: u32,
     pub results: Vec<AetherAskResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl AetherMcpServer {
+    fn read_memory_service(&self) -> ProjectMemoryService {
+        if self.state.read_only {
+            ProjectMemoryService::with_shared_readonly(
+                self.workspace(),
+                Arc::clone(&self.state.store),
+                self.state.vector_store.clone(),
+            )
+        } else {
+            ProjectMemoryService::with_shared(
+                self.workspace(),
+                Arc::clone(&self.state.store),
+                self.state.vector_store.clone(),
+            )
+        }
+    }
+
     async fn remember_note_with_source_type(
         &self,
         request: AetherRememberRequest,
@@ -270,7 +288,13 @@ impl AetherMcpServer {
 
         let mut semantic_query = None;
         let mut semantic_fallback_reason = None;
-        if !matches!(mode, SearchMode::Lexical) {
+        if self.state.read_only
+            && self.state.config.embeddings.enabled
+            && self.state.vector_store.is_none()
+        {
+            semantic_fallback_reason =
+                Some("configured vector backend is unavailable in read-only mode".to_owned());
+        } else if !matches!(mode, SearchMode::Lexical) {
             match load_embedding_provider_from_config(
                 self.workspace(),
                 EmbeddingProviderOverrides::default(),
@@ -311,11 +335,7 @@ impl AetherMcpServer {
             }
         }
 
-        let memory = ProjectMemoryService::with_shared(
-            self.workspace(),
-            Arc::clone(&self.state.store),
-            self.state.vector_store.clone(),
-        );
+        let memory = self.read_memory_service();
         let result = memory
             .recall(MemoryRecallRequest {
                 query: request.query.clone(),
@@ -369,40 +389,49 @@ impl AetherMcpServer {
             .map(Into::into)
             .collect::<Vec<_>>();
 
+        let mut warnings = Vec::new();
         let mut semantic_query = None;
-        match load_embedding_provider_from_config(
-            self.workspace(),
-            EmbeddingProviderOverrides::default(),
-        ) {
-            Ok(Some(loaded)) => match loaded
-                .provider
-                .embed_text_with_purpose(request.query.as_str(), EmbeddingPurpose::Query)
-                .await
-            {
-                Ok(embedding) if !embedding.is_empty() => {
-                    semantic_query = Some(MemorySemanticQuery {
-                        provider: loaded.provider_name,
-                        model: loaded.model_name,
-                        embedding,
-                    });
-                }
-                Ok(_) => {}
+        if self.state.read_only && self.state.vector_store.is_none() {
+            if self.state.config.embeddings.enabled {
+                warnings
+                    .push("configured vector backend is unavailable in read-only mode".to_owned());
+            }
+        } else {
+            match load_embedding_provider_from_config(
+                self.workspace(),
+                EmbeddingProviderOverrides::default(),
+            ) {
+                Ok(Some(loaded)) => match loaded
+                    .provider
+                    .embed_text_with_purpose(request.query.as_str(), EmbeddingPurpose::Query)
+                    .await
+                {
+                    Ok(embedding) if !embedding.is_empty() => {
+                        semantic_query = Some(MemorySemanticQuery {
+                            provider: loaded.provider_name,
+                            model: loaded.model_name,
+                            embedding,
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(error = %err, "embedding provider error while handling aether_ask");
+                    }
+                },
+                Ok(None) => {}
                 Err(err) => {
-                    tracing::warn!(error = %err, "embedding provider error while handling aether_ask");
+                    tracing::warn!(error = %err, "failed to load embedding provider for aether_ask");
                 }
-            },
-            Ok(None) => {}
-            Err(err) => {
-                tracing::warn!(error = %err, "failed to load embedding provider for aether_ask");
             }
         }
 
-        let memory = ProjectMemoryService::with_shared(
-            self.workspace(),
-            Arc::clone(&self.state.store),
-            self.state.vector_store.clone(),
-        );
-        let graph = if include.contains(&MemoryAskInclude::Coupling) {
+        let memory = self.read_memory_service();
+        if self.state.read_only
+            && (include.is_empty() || include.contains(&MemoryAskInclude::Coupling))
+        {
+            warnings.push("SurrealDB coupling results are unavailable in read-only mode; symbol, note and test searches use SQLite.".to_owned());
+        }
+        let graph = if !self.state.read_only && include.contains(&MemoryAskInclude::Coupling) {
             self.state.surreal_graph().await.ok()
         } else {
             None
@@ -449,6 +478,7 @@ impl AetherMcpServer {
             query: result.query,
             result_count: results.len() as u32,
             results,
+            warnings,
         })
     }
 }

@@ -89,6 +89,34 @@ pub struct UpstreamDependencyTraversal {
 }
 
 impl SqliteStore {
+    /// Files with raw references to changed declarations, including references
+    /// that could not resolve before the new declaration was indexed. Rebuilding
+    /// only the changed file loses incoming projected edges after an ID change.
+    pub fn list_graph_referring_files(&self, names: &[String]) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| {
+            StoreError::Compatibility(
+                "store lock poisoned while finding incoming projection work".to_owned(),
+            )
+        })?;
+        let mut files = std::collections::BTreeSet::new();
+        for chunk in names.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let mut statement = conn.prepare(&format!(
+                "SELECT DISTINCT e.file_path FROM symbol_edges e JOIN symbols s ON s.id = e.source_id
+                 WHERE e.edge_kind IN ('calls','depends_on','type_ref','implements')
+                 AND e.target_qualified_name IN ({placeholders}) ORDER BY e.file_path"))?;
+            for file in
+                statement.query_map(params_from_iter(chunk), |row| row.get::<_, String>(0))?
+            {
+                files.insert(file?);
+            }
+        }
+        Ok(files.into_iter().collect())
+    }
+
     pub fn list_method_dependency_edges_for_type(
         &self,
         type_qualified_name: &str,
@@ -257,7 +285,89 @@ impl SqliteStore {
         Ok(records)
     }
 
+    /// Targeted reverse structural evidence; unlike `get_callers`, this can
+    /// include type references, implementations and file dependencies. Names are
+    /// not unique identities: callers still filter language and label ambiguity.
+    pub fn list_symbol_edges_for_target_and_kinds(
+        &self,
+        target_qualified_name: &str,
+        edge_kinds: &[EdgeKind],
+    ) -> Result<Vec<SymbolEdge>, StoreError> {
+        let target_qualified_name = target_qualified_name.trim();
+        if target_qualified_name.is_empty() || edge_kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (0..edge_kinds.len())
+            .map(|index| format!("?{}", index + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT source_id, target_qualified_name, edge_kind, file_path
+             FROM symbol_edges
+             WHERE target_qualified_name = ?1 AND edge_kind IN ({placeholders})
+             ORDER BY source_id, target_qualified_name, edge_kind, file_path"
+        );
+        let parameters = std::iter::once(target_qualified_name.to_owned())
+            .chain(edge_kinds.iter().map(|kind| kind.as_str().to_owned()))
+            .collect::<Vec<_>>();
+        let connection = self.conn.lock().map_err(|_| {
+            StoreError::Graph("SQLite reverse-edge connection lock is poisoned".to_owned())
+        })?;
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(parameters), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut edges = Vec::new();
+        for row in rows {
+            let (source_id, target_qualified_name, kind, file_path) = row?;
+            let edge_kind = edge_kind_from_str(&kind).ok_or_else(|| {
+                StoreError::Compatibility(format!(
+                    "unsupported reverse structural edge kind: {kind}"
+                ))
+            })?;
+            edges.push(SymbolEdge {
+                source_id,
+                target_qualified_name,
+                edge_kind,
+                file_path,
+            });
+        }
+        Ok(edges)
+    }
+
     pub async fn sync_graph_for_file(
+        &self,
+        graph_store: &dyn GraphStore,
+        file_path: &str,
+    ) -> Result<GraphSyncStats, StoreError> {
+        let names = self
+            .list_symbols_for_file(file_path)?
+            .into_iter()
+            .map(|symbol| symbol.qualified_name)
+            .collect::<Vec<_>>();
+        let mut files = self.list_graph_referring_files(&names)?;
+        files.push(file_path.to_owned());
+        files.sort();
+        files.dedup();
+        // Publish this file's nodes before references from other files. This also
+        // repairs forward references discovered before the callee existed.
+        let mut stats = self.sync_graph_file(graph_store, file_path).await?;
+        for referring_file in files {
+            if referring_file != file_path {
+                let additional = self.sync_graph_file(graph_store, &referring_file).await?;
+                stats.resolved_edges += additional.resolved_edges;
+                stats.unresolved_edges += additional.unresolved_edges;
+            }
+        }
+        Ok(stats)
+    }
+
+    async fn sync_graph_file(
         &self,
         graph_store: &dyn GraphStore,
         file_path: &str,
@@ -290,7 +400,7 @@ impl SqliteStore {
                   ON target.qualified_name = e.target_qualified_name
                  AND {family}
                 WHERE e.file_path = ?1
-                  AND e.edge_kind IN ('calls', 'type_ref', 'implements')
+                  AND e.edge_kind IN ('calls', 'depends_on', 'type_ref', 'implements')
                   AND target.id IS NULL
                 ORDER BY e.source_id ASC, e.target_qualified_name ASC, e.edge_kind ASC
                 "#
@@ -323,7 +433,7 @@ impl SqliteStore {
                   ON target.qualified_name = e.target_qualified_name
                  AND {family}
                 WHERE e.file_path = ?1
-                  AND e.edge_kind IN ('calls', 'type_ref', 'implements')
+                  AND e.edge_kind IN ('calls', 'depends_on', 'type_ref', 'implements')
                 ORDER BY e.source_id ASC, target.id ASC, e.edge_kind ASC
                 "#
             ))?;
@@ -422,6 +532,9 @@ impl SqliteStore {
             params![file_path],
         )?;
         let family = same_language_family_sql("s_source.language", "s_target.language");
+        // Both directions touching this file were removed above. Restore edges
+        // from other files as well: refreshing only the callee must preserve its
+        // callers and can resolve calls indexed before the callee was discovered.
         tx.execute(
             &format!(
                 r#"
@@ -439,7 +552,10 @@ impl SqliteStore {
                 JOIN symbols s_target
                   ON s_target.qualified_name = e.target_qualified_name
                  AND {family}
-                WHERE s_source.file_path = ?1
+                WHERE e.source_id IN (SELECT id FROM symbols WHERE file_path = ?1)
+                   OR e.target_qualified_name IN (
+                       SELECT qualified_name FROM symbols WHERE file_path = ?1
+                   )
                 "#
             ),
             params![file_path],
@@ -467,7 +583,10 @@ impl SqliteStore {
                 JOIN symbols s_target
                   ON s_target.qualified_name = e.target_qualified_name
                  AND {family}
-                WHERE s_source.file_path = ?1
+                WHERE e.source_id IN (SELECT id FROM symbols WHERE file_path = ?1)
+                   OR e.target_qualified_name IN (
+                       SELECT qualified_name FROM symbols WHERE file_path = ?1
+                   )
                 "#
             ),
             params![file_path],

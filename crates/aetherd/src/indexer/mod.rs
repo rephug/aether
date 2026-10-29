@@ -31,7 +31,9 @@ use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use crate::batch::hash::compute_prompt_hash;
 use crate::batch::write_fingerprint_row;
 use crate::continuous::cosine_distance_from_embeddings;
-use crate::observer::{DebounceQueue, ObserverState, is_ignored_path, relative_workspace_path};
+use crate::observer::{
+    DebounceQueue, ObserverState, SeededHead, is_ignored_path, relative_workspace_path,
+};
 use crate::priority_queue::{
     SirPriorityQueue, compute_priority_score, kind_priority_score, size_inverse_score,
 };
@@ -48,6 +50,7 @@ mod index_once_tests;
 mod priority;
 mod quality;
 mod reconciliation;
+pub(crate) use reconciliation::reconcile_symbol_event;
 mod snapshot;
 #[cfg(test)]
 mod startup_tests;
@@ -55,6 +58,7 @@ mod structural;
 mod worker;
 
 pub use self::enrichment::build_enrichment_context;
+pub(crate) use self::git_watch::current_head;
 use self::git_watch::{
     GitDebounceState, handle_watch_result, process_debounced_paths, process_git_trigger,
     resolve_git_watch_dir,
@@ -67,9 +71,7 @@ use self::quality::{run_deep_pass, run_triage_pass};
 use self::reconciliation::{
     SnapshotScope, plan_symbol_reconciliation, print_reconciliation_dry_run,
 };
-use self::snapshot::{
-    delete_vector_embeddings, files_with_outdated_rollups, symbols_with_stale_source, sync_snapshot,
-};
+use self::snapshot::{files_with_outdated_rollups, symbols_with_stale_source, sync_snapshot};
 
 const REQUEST_POLL_BATCH: usize = 128;
 /// File rollups a worker rebuilds per turn from those left outdated at startup.
@@ -260,7 +262,6 @@ fn run_full_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> Res
         &SnapshotScope::of(&observer),
         &initial_events,
         &symbols_by_id,
-        |symbol_ids| sir_pipeline.delete_embeddings(symbol_ids),
     )?;
 
     let all_symbols = symbols_by_id.values().cloned().collect::<Vec<_>>();
@@ -462,7 +463,6 @@ fn run_initial_index_once_inner(config: &IndexerConfig, skip_teardown: bool) -> 
         &SnapshotScope::of(&observer),
         &initial_events,
         &symbols_by_id,
-        |symbol_ids| delete_vector_embeddings(&config.workspace, symbol_ids),
     )?;
 
     tracing::info!(
@@ -498,7 +498,6 @@ pub(crate) fn run_structural_index_once(
         &SnapshotScope::of(&observer),
         &initial_events,
         &symbols_by_id,
-        |symbol_ids| delete_vector_embeddings(workspace, symbol_ids),
     )?;
     Ok((store, symbols_by_id, symbol_count))
 }
@@ -512,6 +511,9 @@ pub fn run_initial_index_once_for_cli(config: &IndexerConfig) -> Result<()> {
 }
 
 pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
+    // Held for as long as this loop watches, so status can tell a watched workspace from
+    // one nothing keeps in sync. A second watcher stops here instead of running unlocked.
+    let _watcher_lock = crate::freshness::take_watcher_lock(&config.workspace)?;
     let (mut observer, store) = initialize_observer_and_store(&config)?;
     let watcher_runtime = WatcherRuntimeConfig::from_workspace(&config)?;
     let mut structural = StructuralIndexer::new(config.workspace.clone())?;
@@ -590,6 +592,7 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
     let poll_interval = Duration::from_millis(50);
     let mut debounce_queue = DebounceQueue::default();
     let mut git_debounce_state = GitDebounceState::default();
+    let mut last_retirement_replay = Instant::now();
 
     loop {
         match rx.recv_timeout(poll_interval) {
@@ -634,6 +637,16 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
         }
 
         let now = Instant::now();
+        if now.duration_since(last_retirement_replay) >= Duration::from_secs(30) {
+            if let Err(error) = crate::retirement_cleanup::replay_and_warn(
+                &config.workspace,
+                store.as_ref(),
+                &structural.graph_runtime,
+            ) {
+                tracing::warn!(error = %error, "retirement replay remains unavailable");
+            }
+            last_retirement_replay = now;
+        }
         if git_debounce_state.should_fire(now, git_debounce_window) {
             git_debounce_state.extend_dirty(debounce_queue.drain_due(now, Duration::ZERO));
             let dirty_paths = git_debounce_state.take_dirty_paths();
@@ -692,7 +705,6 @@ fn start_from_snapshot(
         &SnapshotScope::of(observer),
         &initial_events,
         &symbols_by_id,
-        |symbol_ids| delete_vector_embeddings(workspace, symbol_ids),
     )?;
     tracing::info!(
         symbol_count,

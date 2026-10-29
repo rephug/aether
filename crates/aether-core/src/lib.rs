@@ -8,14 +8,14 @@ pub mod git;
 pub mod secret;
 pub mod test_code;
 
-pub use git::{BlameLine, CommitInfo, GitContext};
+pub use git::{BlameLine, CommitInfo, GitContext, GitHistoryError};
 pub use secret::Secret;
 pub use test_code::{is_test_file, is_test_symbol};
 
 pub type SymbolId = String;
 pub const NO_SIR_MESSAGE: &str =
     "AETHER: No SIR yet for this symbol. Run aetherd indexing and try again.";
-pub const AETHER_AGENT_SCHEMA_VERSION: u32 = 6;
+pub const AETHER_AGENT_SCHEMA_VERSION: u32 = 7;
 
 pub const SIR_STATUS_STALE: &str = "stale";
 pub const SEARCH_FALLBACK_LOCAL_STORE_NOT_INITIALIZED: &str = "local store not initialized";

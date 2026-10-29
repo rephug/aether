@@ -177,7 +177,9 @@ impl SirPipeline {
                 })?;
         }
 
-        if let Ok(graph) = open_surreal_graph_store_sync(&self.workspace_root) {
+        if !self.skip_surreal_sync
+            && let Ok(graph) = open_surreal_graph_store_sync(&self.workspace_root)
+        {
             let test_intent_analyzer = TestIntentAnalyzer::new(&self.workspace_root)
                 .context("failed to initialize test intent analyzer")?;
             let _ = test_intent_analyzer

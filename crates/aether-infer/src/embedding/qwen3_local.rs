@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::http::{extract_embedding_vector, inference_http_client};
+use crate::model_check::{ModelCatalog, ModelListing};
 use crate::types::{EmbeddingProvider, InferError, normalize_optional};
 
 #[derive(Debug, Clone)]
@@ -50,5 +51,14 @@ impl Qwen3LocalEmbeddingProvider {
 impl EmbeddingProvider for Qwen3LocalEmbeddingProvider {
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>, InferError> {
         self.request_embedding(text).await
+    }
+
+    fn model_listings(&self) -> Vec<ModelListing> {
+        vec![ModelListing::new(
+            self.model.clone(),
+            ModelCatalog::Ollama {
+                endpoint: crate::http::normalize_ollama_endpoint(&self.endpoint),
+            },
+        )]
     }
 }

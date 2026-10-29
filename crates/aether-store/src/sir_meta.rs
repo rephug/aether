@@ -312,24 +312,6 @@ impl SqliteStore {
 
         Ok(())
     }
-    fn read_sir_json_from_db(&self, symbol_id: &str) -> Result<Option<String>, StoreError> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT sir_json
-            FROM sir
-            WHERE id = ?1
-            "#,
-        )?;
-
-        let json = stmt
-            .query_row(params![symbol_id], |row| row.get::<_, Option<String>>(0))
-            .optional()?
-            .flatten()
-            .filter(|value| !value.trim().is_empty());
-
-        Ok(json)
-    }
     pub fn list_symbol_ids_with_sir(&self) -> Result<Vec<String>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -462,27 +444,44 @@ impl SqliteStore {
         &self,
         symbol_id: &str,
     ) -> Result<Option<String>, StoreError> {
-        if let Some(json) = self.read_sir_json_from_db(symbol_id)? {
-            return Ok(Some(json));
+        let conn = self.conn.lock().unwrap_or_else(|error| error.into_inner());
+        // Hold a consistent catalog/retirement view through legacy hydration.
+        // A concurrent retirement must not turn a leftover mirror into an orphan.
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Deferred)?;
+        let json = tx
+            .query_row("SELECT sir_json FROM sir WHERE id=?1", [symbol_id], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .optional()?
+            .flatten()
+            .filter(|value| !value.trim().is_empty());
+        if json.is_some() {
+            return Ok(json);
         }
-
+        // A tombstone also protects same-ID reintroduction: old mirrored content
+        // cannot become the annotation of a new incarnation. Explicit new writes
+        // above remain authoritative. Genuine legacy and synthetic rollups work
+        // without requiring a catalog row.
+        if schema::table_exists(&tx, "symbol_retirements")?
+            && tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM symbol_retirements WHERE symbol_id=?1)",
+                [symbol_id],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            return Ok(None);
+        }
         let Some(content) = self.read_legacy_mirror(symbol_id)? else {
             return Ok(None);
         };
-        // The backfill into SQLite is a write. A read-only handle (the dashboard)
-        // serves the mirror as is rather than failing the read on it.
-        if !self.is_read_only() {
-            self.upsert_sir_json_only(symbol_id, &content)?;
+        if !conn.is_readonly(rusqlite::DatabaseName::Main)? {
+            tx.execute(
+                "INSERT INTO sir (id,sir_hash,sir_version,provider,model,updated_at,sir_json) VALUES (?1,'',1,'','',unixepoch(),?2) ON CONFLICT(id) DO UPDATE SET sir_json=excluded.sir_json",
+                params![symbol_id, content],
+            )?;
         }
+        tx.commit()?;
         Ok(Some(content))
-    }
-
-    fn is_read_only(&self) -> bool {
-        self.conn
-            .lock()
-            .unwrap()
-            .is_readonly(rusqlite::DatabaseName::Main)
-            .unwrap_or(false)
     }
 
     /// The legacy file mirror of a symbol's SIR JSON, if one exists (`Ok(None)` when the

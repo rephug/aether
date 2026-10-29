@@ -1,0 +1,11 @@
+{
+  "/agents": {
+    "media": [
+      "assets/agents.svg"
+    ],
+    "page": "agents.html"
+  },
+  "/realtor": {
+    "redirect": "/agents"
+  }
+}

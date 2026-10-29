@@ -3,6 +3,7 @@ use crate::{
     constants::{DEFAULT_COHERE_API_KEY_ENV, DEFAULT_GEMINI_API_KEY_ENV},
     embeddings::EmbeddingProviderKind,
     inference::{InferenceProviderKind, TieredConfig},
+    model_ids::{ModelIdStatus, configured_model_ids},
     omp::{batch_pricing_providers_list, batch_target_for_omp_route, split_omp_route},
     root::AetherConfig,
     search::SearchRerankerKind,
@@ -404,6 +405,28 @@ pub fn validate_config(config: &AetherConfig) -> Vec<ConfigWarning> {
         });
     }
 
+    for configured in configured_model_ids(config) {
+        let Some(notice) = configured.notice() else {
+            continue;
+        };
+        let (setting, model) = (configured.setting, configured.model);
+        let (code, state) = match notice.status {
+            ModelIdStatus::ShutDown => ("model_id_shut_down", "is shut down"),
+            ModelIdStatus::Retiring => ("model_id_retiring", "may be retired"),
+        };
+        let advice = match notice.switching {
+            Some(switching) => format!(
+                "its replacement '{}' needs more than a new id: {switching}",
+                notice.replacement
+            ),
+            None => format!("use '{}'", notice.replacement),
+        };
+        warnings.push(ConfigWarning {
+            code,
+            message: format!("{setting}='{model}' {state}: {}; {advice}", notice.detail),
+        });
+    }
+
     if let Some(continuous) = &config.continuous {
         let schedule = continuous.schedule.trim().to_ascii_lowercase();
         if !matches!(schedule.as_str(), "hourly" | "nightly") {
@@ -442,6 +465,7 @@ mod tests {
         },
         health::{HealthConfig, HealthScoreConfig},
         inference::{InferenceConfig, InferenceProviderKind, default_sir_concurrency},
+        mcp::McpConfig,
         planner::PlannerConfig,
         root::{DashboardConfig, GeneralConfig, parse_workspace_config_str},
         search::{ProvidersConfig, SearchConfig},
@@ -611,6 +635,7 @@ mod tests {
             planner: PlannerConfig::default(),
             health_score: HealthScoreConfig::default(),
             dashboard: DashboardConfig::default(),
+            mcp: McpConfig::default(),
             continuous: None,
             batch: None,
             seismograph: None,
@@ -708,6 +733,61 @@ task_type = "RETRIEVAL_DOCUMENT"
         let codes = warning_codes(&validate_config(&config));
         assert!(codes.contains(&"embeddings_endpoint_unused_for_gemini_native"));
         assert!(codes.contains(&"embeddings_task_type_unused_for_gemini_native"));
+    }
+
+    #[test]
+    fn validate_config_names_shut_down_and_retiring_model_ids() {
+        let config = parse_workspace_config_str(
+            r#"
+[inference]
+provider = "gemini"
+model = "gemini-3.1-flash-lite-preview"
+
+[sir_quality]
+triage_model = "gemini-3.1-flash-lite"
+
+[embeddings]
+enabled = true
+provider = "gemini_native"
+model = "gemini-embedding-2-preview"
+"#,
+        )
+        .expect("parse config");
+
+        let warnings = validate_config(&config);
+        let shut_down = warnings
+            .iter()
+            .filter(|warning| warning.code == "model_id_shut_down")
+            .collect::<Vec<_>>();
+        assert_eq!(shut_down.len(), 1, "{warnings:?}");
+        assert!(
+            shut_down[0]
+                .message
+                .starts_with("inference.model='gemini-3.1-flash-lite-preview' is shut down")
+        );
+        assert!(
+            shut_down[0]
+                .message
+                .ends_with("use 'gemini-3.1-flash-lite'")
+        );
+        let retiring = warnings
+            .iter()
+            .filter(|warning| warning.code == "model_id_retiring")
+            .collect::<Vec<_>>();
+        assert_eq!(retiring.len(), 1, "{warnings:?}");
+        let message = &retiring[0].message;
+        assert!(
+            message.starts_with("embeddings.model='gemini-embedding-2-preview' may be retired"),
+            "{message}"
+        );
+        assert!(message.contains("earliest possible date"), "{message}");
+        // The GA id takes task prefixes, not taskType, so a bare "use it" would mislead.
+        assert!(!message.contains("use 'gemini-embedding-2'"), "{message}");
+        assert!(
+            message.contains("its replacement 'gemini-embedding-2' needs more than a new id"),
+            "{message}"
+        );
+        assert!(message.contains("taskType"), "{message}");
     }
 
     #[test]

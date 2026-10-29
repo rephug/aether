@@ -13,13 +13,14 @@ use aether_infer::{
     load_reranker_provider_from_config,
 };
 use aether_store::{
-    SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord, SymbolSearchResult,
+    CallEdgeCoverage, SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord,
+    SymbolSearchResult,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::callers::CallerAttribution;
+use super::callers::{CallerAttribution, CallerCoverage};
 use super::{
     AetherMcpServer, LiveSymbolSources, ambiguous_selector, child_method_symbols, effective_limit,
     is_type_symbol_kind,
@@ -99,6 +100,161 @@ pub struct AetherDependenciesResponse {
     pub dependency_count: u32,
     pub callers: Vec<AetherDependencyCaller>,
     pub dependencies: Vec<AetherDependencyTarget>,
+    /// How the recorded calls naming this symbol resolved, so an empty `callers` list
+    /// can be told from callers the index couldn't attribute.
+    pub caller_coverage: AetherCallerCoverage,
+    /// How this symbol's recorded outgoing calls resolved (for an aggregated type, those
+    /// of the type and its methods), so an empty `dependencies` list can be told from
+    /// calls the graph couldn't resolve.
+    pub dependency_coverage: AetherCallEdgeCoverage,
+    /// One sentence on what both lists leave out.
+    pub coverage_note: String,
+}
+
+/// How a set of recorded call edges resolved. A call's target text matches workspace
+/// symbols by exact qualified name in the caller's language family, as the stored graph
+/// links them. Rust calls written inside macro arguments (`format!`, `assert!`, ...) are
+/// not recorded, so no count includes them.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AetherCallEdgeCoverage {
+    pub call_edges: u64,
+    /// Calls whose target names exactly one symbol.
+    pub resolved: u64,
+    /// Calls whose target names several symbols; every candidate is listed.
+    pub ambiguous: u64,
+    /// Calls whose target matches no workspace symbol's qualified name exactly. Not
+    /// listed. Many are external or standard-library calls, but they may be internal:
+    /// Rust method calls are recorded by their bare method name, and a call through a
+    /// module path or alias doesn't spell the qualified name.
+    pub unresolved: u64,
+}
+
+impl From<CallEdgeCoverage> for AetherCallEdgeCoverage {
+    fn from(coverage: CallEdgeCoverage) -> Self {
+        Self {
+            call_edges: coverage.call_edges,
+            resolved: coverage.resolved,
+            ambiguous: coverage.ambiguous,
+            unresolved: coverage.unresolved,
+        }
+    }
+}
+
+/// How the recorded calls naming a symbol (for an aggregated type, it or one of its
+/// methods) resolved, each caller counted once per callee.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AetherCallerCoverage {
+    pub name_matches: u32,
+    /// Listed in `callers`.
+    pub attributed: u32,
+    /// Of `attributed`, callers matched by a heuristic rather than an exact, unique name:
+    /// a Rust call recorded by bare method name (`x.alpha()` may call another type's
+    /// `alpha`, a standard-library one included), or a name other symbols also carry that
+    /// the caller's file or module narrowed to this one. They may not really call it.
+    pub heuristic: u32,
+    /// The name also fits other symbols that the caller's file and module don't rule
+    /// out, so the call isn't attributed: the symbol may have more callers than listed.
+    pub ambiguous: u32,
+    /// The caller's file or module resolves the name to another symbol.
+    pub resolved_elsewhere: u32,
+}
+
+impl From<CallerCoverage> for AetherCallerCoverage {
+    fn from(coverage: CallerCoverage) -> Self {
+        Self {
+            name_matches: coverage.name_matches,
+            attributed: coverage.attributed,
+            heuristic: coverage.heuristic,
+            ambiguous: coverage.ambiguous,
+            resolved_elsewhere: coverage.resolved_elsewhere,
+        }
+    }
+}
+
+/// What a dependency list leaves out, in one clause per kind of gap.
+fn dependency_coverage_clauses(coverage: &AetherCallEdgeCoverage) -> String {
+    if coverage.call_edges == 0 {
+        return "no outgoing calls are recorded".to_owned();
+    }
+    let mut clauses = vec![format!(
+        "{} of {} recorded outgoing calls resolve to one symbol",
+        coverage.resolved, coverage.call_edges
+    )];
+    if coverage.ambiguous > 0 {
+        clauses.push(format!(
+            "{} name several symbols and list every candidate",
+            coverage.ambiguous
+        ));
+    }
+    if coverage.unresolved > 0 {
+        clauses.push(format!(
+            "{} match no qualified name exactly and are not listed; many are external or \
+             standard-library calls, but they may be internal (Rust method calls are \
+             recorded by bare name)",
+            coverage.unresolved
+        ));
+    }
+    clauses.join("; ")
+}
+
+fn dependencies_coverage_note(
+    language: &str,
+    callers: &AetherCallerCoverage,
+    dependencies: &AetherCallEdgeCoverage,
+) -> String {
+    let mut caller_clauses = if callers.name_matches == 0 {
+        vec!["No recorded call names this symbol".to_owned()]
+    } else {
+        vec![format!(
+            "{} of {} callers naming this symbol are attributed",
+            callers.attributed, callers.name_matches
+        )]
+    };
+    if callers.heuristic > 0 {
+        caller_clauses.push(format!(
+            "{} of those by heuristic (a bare method name, or a shared name narrowed by the \
+             caller's file or module), so they may not really call it",
+            callers.heuristic
+        ));
+    }
+    if callers.ambiguous > 0 {
+        caller_clauses.push(format!(
+            "{} more could be calling it but the name also fits other symbols, so they are \
+             not listed",
+            callers.ambiguous
+        ));
+    }
+    format!(
+        "Callers: {}. Dependencies: {}.{}",
+        caller_clauses.join("; "),
+        dependency_coverage_clauses(dependencies),
+        macro_calls_caveat(language)
+    )
+}
+
+fn call_chain_coverage_note(
+    language: &str,
+    levels_empty: bool,
+    coverage: &AetherCallEdgeCoverage,
+) -> String {
+    let mut note = format!(
+        "Callees only (use aether_dependencies for callers): {}.",
+        dependency_coverage_clauses(coverage)
+    );
+    if levels_empty && coverage.call_edges > 0 {
+        note.push_str(" None of the recorded calls reach a workspace symbol.");
+    }
+    note.push_str(macro_calls_caveat(language));
+    note
+}
+
+/// Rust calls written inside macro arguments parse as token trees and make no call edge.
+fn macro_calls_caveat(language: &str) -> &'static str {
+    if language == "rust" {
+        " Calls written inside macro arguments (format!, assert!, ...) are not recorded."
+    } else {
+        ""
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -143,6 +299,12 @@ pub struct AetherCallChainResponse {
     pub max_depth: u32,
     pub depth_count: u32,
     pub levels: Vec<Vec<AetherSymbolLookupMatch>>,
+    /// How the recorded calls out of every symbol the chain expanded (the start and each
+    /// level short of `max_depth`) resolved, so empty `levels` can be told from calls
+    /// the graph couldn't resolve.
+    pub coverage: AetherCallEdgeCoverage,
+    /// One sentence on what `levels` leaves out.
+    pub coverage_note: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -201,6 +363,10 @@ impl AetherSearchResponse {
             fallback_reason,
             matches,
         } = envelope;
+        // Candidate retrieval can be wider than the requested result count
+        // when reranking is enabled, including on a degraded lexical path.
+        let mut matches = matches;
+        matches.truncate(limit as usize);
         let result_count = matches.len() as u32;
 
         Self {
@@ -311,6 +477,21 @@ impl AetherMcpServer {
         ))
     }
 
+    /// How the call edges out of `source_ids` resolve. The query holds the store's
+    /// connection lock while it reads, so it runs on the blocking pool rather than on the
+    /// async worker serving the request.
+    async fn call_edge_coverage(
+        &self,
+        source_ids: Vec<String>,
+    ) -> Result<AetherCallEdgeCoverage, AetherMcpError> {
+        let store = Arc::clone(&self.state.store);
+        let coverage =
+            tokio::task::spawn_blocking(move || store.call_edge_coverage_for_sources(&source_ids))
+                .await
+                .map_err(|err| AetherMcpError::Message(format!("call coverage join: {err}")))??;
+        Ok(coverage.into())
+    }
+
     pub async fn aether_dependencies_logic(
         &self,
         request: AetherDependenciesRequest,
@@ -343,6 +524,8 @@ impl AetherMcpServer {
                 .into_iter()
                 .map(AetherDependencyTarget::from)
                 .collect::<Vec<_>>();
+            let caller_coverage = AetherCallerCoverage::from(attribution.coverage());
+            let dependency_coverage = self.call_edge_coverage(vec![symbol.id.clone()]).await?;
 
             return Ok(AetherDependenciesResponse {
                 symbol_id: symbol_id.to_owned(),
@@ -353,6 +536,13 @@ impl AetherMcpServer {
                 dependency_count: dependencies.len() as u32,
                 callers,
                 dependencies,
+                coverage_note: dependencies_coverage_note(
+                    &symbol.language,
+                    &caller_coverage,
+                    &dependency_coverage,
+                ),
+                caller_coverage,
+                dependency_coverage,
             });
         }
 
@@ -422,6 +612,12 @@ impl AetherMcpServer {
                 .then_with(|| left.symbol_id.cmp(&right.symbol_id))
         });
 
+        let caller_coverage = AetherCallerCoverage::from(attribution.coverage());
+        let source_ids = std::iter::once(symbol.id.clone())
+            .chain(child_methods.iter().map(|method| method.id.clone()))
+            .collect::<Vec<_>>();
+        let dependency_coverage = self.call_edge_coverage(source_ids).await?;
+
         Ok(AetherDependenciesResponse {
             symbol_id: symbol_id.to_owned(),
             found: true,
@@ -431,6 +627,13 @@ impl AetherMcpServer {
             dependency_count: dependencies.len() as u32,
             callers,
             dependencies,
+            coverage_note: dependencies_coverage_note(
+                &symbol.language,
+                &caller_coverage,
+                &dependency_coverage,
+            ),
+            caller_coverage,
+            dependency_coverage,
         })
     }
 
@@ -455,6 +658,8 @@ impl AetherMcpServer {
                 max_depth,
                 depth_count: 0,
                 levels: Vec::new(),
+                coverage: AetherCallEdgeCoverage::default(),
+                coverage_note: "No symbol_id or qualified_name given.".to_owned(),
             });
         }
 
@@ -466,6 +671,8 @@ impl AetherMcpServer {
                 max_depth,
                 depth_count: 0,
                 levels: Vec::new(),
+                coverage: AetherCallEdgeCoverage::default(),
+                coverage_note: "No index: run `aetherd --workspace . --index-once`.".to_owned(),
             });
         }
 
@@ -491,6 +698,8 @@ impl AetherMcpServer {
                 max_depth,
                 depth_count: 0,
                 levels: Vec::new(),
+                coverage: AetherCallEdgeCoverage::default(),
+                coverage_note: "Symbol not found in the index.".to_owned(),
             });
         };
 
@@ -506,12 +715,30 @@ impl AetherMcpServer {
             })
             .collect::<Vec<_>>();
 
+        // Symbols at `max_depth` were reached but not expanded.
+        let expanded = std::iter::once(start_symbol.id.clone())
+            .chain(
+                levels
+                    .iter()
+                    .take(max_depth.saturating_sub(1) as usize)
+                    .flatten()
+                    .map(|entry| entry.symbol_id.clone()),
+            )
+            .collect::<Vec<_>>();
+        let coverage = self.call_edge_coverage(expanded).await?;
+
         Ok(AetherCallChainResponse {
             found: true,
             symbol_id: start_symbol.id,
             qualified_name: start_symbol.qualified_name,
             max_depth,
             depth_count: levels.len() as u32,
+            coverage_note: call_chain_coverage_note(
+                &start_symbol.language,
+                levels.is_empty(),
+                &coverage,
+            ),
+            coverage,
             levels,
         })
     }
@@ -541,7 +768,11 @@ impl AetherMcpServer {
                     return Ok(Vec::new());
                 }
 
-                let matches = store.search_symbols(query.as_str(), retrieval_limit)?;
+                let terms = query
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                let matches = store.search_symbols_by_terms(&terms, retrieval_limit)?;
                 Ok(matches
                     .into_iter()
                     .map(AetherSymbolLookupMatch::from)
@@ -629,7 +860,7 @@ impl AetherMcpServer {
                         rerank_window.max(limit).clamp(1, 200)
                     };
                     let fused = fuse_hybrid_matches(&lexical, &semantic, fuse_limit);
-                    let matches = self
+                    let (matches, rerank_fallback_reason) = self
                         .maybe_rerank_hybrid_matches(
                             &request.query,
                             limit,
@@ -641,7 +872,7 @@ impl AetherMcpServer {
                     SearchEnvelope {
                         mode_requested: SearchMode::Hybrid,
                         mode_used: SearchMode::Hybrid,
-                        fallback_reason: None,
+                        fallback_reason: rerank_fallback_reason,
                         matches,
                     }
                 }
@@ -708,6 +939,17 @@ impl AetherMcpServer {
         query: &str,
         limit: u32,
     ) -> Result<(Vec<AetherSymbolLookupMatch>, Option<String>), AetherMcpError> {
+        if self.state.read_only
+            && self.state.config.embeddings.enabled
+            && self.state.vector_store.is_none()
+        {
+            // Opening Lance through the writable migration path is not a read.
+            // Refuse before provider initialization or a query embedding request.
+            return Ok((
+                Vec::new(),
+                Some("configured vector backend is unavailable in read-only mode".to_owned()),
+            ));
+        }
         let sqlite_path = self.sqlite_path();
         if !sqlite_path.exists() {
             return Ok((
@@ -808,14 +1050,14 @@ impl AetherMcpServer {
         fused_matches: Vec<AetherSymbolLookupMatch>,
         reranker_kind: SearchRerankerKind,
         rerank_window: u32,
-    ) -> Result<Vec<AetherSymbolLookupMatch>, AetherMcpError> {
+    ) -> Result<(Vec<AetherSymbolLookupMatch>, Option<String>), AetherMcpError> {
         if fused_matches.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
 
         let limit = limit.clamp(1, 100) as usize;
         if matches!(reranker_kind, SearchRerankerKind::None) {
-            return Ok(fused_matches.into_iter().take(limit).collect());
+            return Ok((fused_matches.into_iter().take(limit).collect(), None));
         }
 
         let fallback = fused_matches
@@ -828,10 +1070,20 @@ impl AetherMcpServer {
             RerankerProviderOverrides::default(),
         ) {
             Ok(Some(loaded)) => loaded,
-            Ok(None) => return Ok(fallback),
+            Ok(None) => {
+                return Ok((
+                    fallback,
+                    Some("configured reranker is unavailable; using reciprocal-rank fusion without reranking".to_owned()),
+                ));
+            }
             Err(err) => {
                 tracing::warn!(error = %err, "reranker unavailable, falling back to RRF matches");
-                return Ok(fallback);
+                return Ok((
+                    fallback,
+                    Some(format!(
+                        "reranker unavailable: {err}; using reciprocal-rank fusion without reranking"
+                    )),
+                ));
             }
         };
 
@@ -845,14 +1097,20 @@ impl AetherMcpServer {
             )
             .await
         {
-            Ok(matches) => Ok(matches),
+            Ok(matches) => Ok((matches, None)),
             Err(err) => {
                 tracing::warn!(
                     provider = %loaded.provider_name,
                     error = %err,
                     "reranker failed, falling back to RRF matches"
                 );
-                Ok(fallback)
+                Ok((
+                    fallback,
+                    Some(format!(
+                        "reranker {} failed: {err}; using reciprocal-rank fusion without reranking",
+                        loaded.provider_name
+                    )),
+                ))
             }
         }
     }
@@ -970,6 +1228,9 @@ fn empty_dependencies_response(symbol_id: String) -> AetherDependenciesResponse 
         dependency_count: 0,
         callers: Vec::new(),
         dependencies: Vec::new(),
+        caller_coverage: AetherCallerCoverage::default(),
+        dependency_coverage: AetherCallEdgeCoverage::default(),
+        coverage_note: "Symbol not found in the index.".to_owned(),
     }
 }
 
@@ -1013,7 +1274,190 @@ fn fuse_hybrid_matches(
 
     ranked
         .into_iter()
-        .take(limit.clamp(1, 100) as usize)
+        .take(limit.clamp(1, 200) as usize)
         .filter_map(|(symbol_id, _)| by_id.remove(&symbol_id))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use aether_config::{AetherConfig, GraphBackend, save_workspace_config};
+    use aether_infer::MockRerankerProvider;
+    use tempfile::tempdir;
+
+    use super::*;
+
+    fn seed_symbol(store: &SqliteStore, id: &str, name: &str, path: &str) -> anyhow::Result<()> {
+        store.upsert_symbol(SymbolRecord {
+            id: id.to_owned(),
+            qualified_name: name.to_owned(),
+            file_path: path.to_owned(),
+            language: "rust".to_owned(),
+            kind: "function".to_owned(),
+            signature_fingerprint: "signature".to_owned(),
+            last_seen_at: 1,
+        })?;
+        Ok(())
+    }
+
+    fn test_config(workspace: &std::path::Path) -> anyhow::Result<AetherConfig> {
+        let mut config = AetherConfig::default();
+        config.embeddings.enabled = false;
+        config.storage.graph_backend = GraphBackend::Sqlite;
+        save_workspace_config(workspace, &config)?;
+        Ok(config)
+    }
+
+    #[tokio::test]
+    async fn readonly_unavailable_vectors_return_before_loading_a_provider() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let mut config = test_config(temp.path())?;
+        config.embeddings.enabled = true;
+        config.embeddings.vector_backend = aether_config::EmbeddingVectorBackend::Lancedb;
+        save_workspace_config(temp.path(), &config)?;
+        // Create only the catalog. A read-only open must not initialize Lance.
+        let store = SqliteStore::open(temp.path())?;
+        seed_symbol(&store, "candidate", "Auth::login", "src/auth.rs")?;
+        let server = AetherMcpServer::from_state(
+            Arc::new(crate::SharedState::open_readonly(temp.path())?),
+            false,
+        );
+        let (matches, reason) = server.semantic_search_matches("auth", 1).await?;
+        assert!(matches.is_empty());
+        assert_eq!(
+            reason.as_deref(),
+            Some("configured vector backend is unavailable in read-only mode")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ranked_lexical_search_finds_joint_terms_and_honors_result_limit() -> anyhow::Result<()>
+    {
+        let temp = tempdir()?;
+        let mut config = test_config(temp.path())?;
+        config.search.reranker = SearchRerankerKind::Cohere;
+        config.search.rerank_window = 200;
+        save_workspace_config(temp.path(), &config)?;
+        let server = AetherMcpServer::new(temp.path(), false)?;
+        for index in 0..40 {
+            seed_symbol(
+                &server.state.store,
+                &format!("auth-{index:02}"),
+                &format!("Alpha{index:02}::login"),
+                "src/auth.rs",
+            )?;
+            seed_symbol(
+                &server.state.store,
+                &format!("cache-{index:02}"),
+                &format!("Beta{index:02}::refresh"),
+                "src/cache.rs",
+            )?;
+        }
+        seed_symbol(
+            &server.state.store,
+            "both",
+            "Zulu::auth_cache",
+            "src/auth_cache.rs",
+        )?;
+        seed_symbol(
+            &server.state.store,
+            "auth-cache-noise",
+            "Aardvark::other",
+            "src/other.rs",
+        )?;
+        let response = server
+            .aether_search_logic(AetherSearchRequest {
+                query: "auth cache".to_owned(),
+                limit: Some(2),
+                mode: Some(SearchMode::Lexical),
+            })
+            .await?;
+        assert_eq!(response.result_count, 2);
+        assert_eq!(response.matches[0].symbol_id, "both");
+        assert!(
+            response
+                .matches
+                .iter()
+                .all(|row| row.symbol_id != "auth-cache-noise")
+        );
+        assert_eq!(response.fallback_reason, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reranker_can_select_candidate_beyond_the_first_hundred() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        test_config(temp.path())?;
+        let server = AetherMcpServer::new(temp.path(), false)?;
+        for index in 0..150 {
+            seed_symbol(
+                &server.state.store,
+                &format!("candidate-{index:03}"),
+                &format!("Candidate{index:03}::target"),
+                "src/lib.rs",
+            )?;
+        }
+        let lexical = server
+            .state
+            .store
+            .search_symbols_by_terms(&["target".to_owned()], 200)?
+            .into_iter()
+            .map(AetherSymbolLookupMatch::from)
+            .collect::<Vec<_>>();
+        assert_eq!(lexical.len(), 150);
+        let fused = fuse_hybrid_matches(&lexical, &[], 200);
+        assert_eq!(fused.len(), 150);
+        let provider =
+            MockRerankerProvider::new(HashMap::from([("candidate-149".to_owned(), 1.0)]));
+        let ranked = server
+            .rerank_matches_with_provider("target", 1, 200, &fused, &provider)
+            .await?;
+        assert_eq!(ranked[0].symbol_id, "candidate-149");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unavailable_reranker_reports_degraded_fusion_results() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let mut config = test_config(temp.path())?;
+        config.search.reranker = SearchRerankerKind::Cohere;
+        // A unique, absent key name makes the loader fail before any request.
+        config.providers.cohere.api_key_env = format!(
+            "AETHER_TEST_UNSET_RERANKER_KEY_{}_{}",
+            std::process::id(),
+            temp.path()
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
+        save_workspace_config(temp.path(), &config)?;
+        let server = AetherMcpServer::new(temp.path(), false)?;
+        seed_symbol(
+            &server.state.store,
+            "candidate",
+            "Auth::login",
+            "src/auth.rs",
+        )?;
+        let lexical = server.lexical_search_matches("Auth", 1)?;
+        let (matches, fallback_reason) = server
+            .maybe_rerank_hybrid_matches("auth", 1, lexical, SearchRerankerKind::Cohere, 200)
+            .await?;
+        assert_eq!(matches.len(), 1);
+        let reason = fallback_reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("reranker unavailable"));
+        assert!(reason.contains("without reranking"));
+        let response = AetherSearchResponse::from_search_envelope(
+            "auth".to_owned(),
+            1,
+            SearchEnvelope {
+                mode_requested: SearchMode::Hybrid,
+                mode_used: SearchMode::Hybrid,
+                fallback_reason: fallback_reason.clone(),
+                matches,
+            },
+        );
+        assert_eq!(response.fallback_reason, fallback_reason);
+        Ok(())
+    }
 }

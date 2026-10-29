@@ -111,16 +111,18 @@ impl ProjectMemoryService {
             semantic_fallback,
         );
 
-        let note_ids = result
-            .notes
-            .iter()
-            .map(|entry| entry.note.note_id.clone())
-            .collect::<Vec<_>>();
-        store.increment_project_note_access(note_ids.as_slice(), now_ms)?;
+        if !self.read_only {
+            let note_ids = result
+                .notes
+                .iter()
+                .map(|entry| entry.note.note_id.clone())
+                .collect::<Vec<_>>();
+            store.increment_project_note_access(note_ids.as_slice(), now_ms)?;
 
-        for entry in &mut result.notes {
-            entry.note.access_count = entry.note.access_count.saturating_add(1);
-            entry.note.last_accessed_at = Some(now_ms);
+            for entry in &mut result.notes {
+                entry.note.access_count = entry.note.access_count.saturating_add(1);
+                entry.note.last_accessed_at = Some(now_ms);
+            }
         }
 
         Ok(result)

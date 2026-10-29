@@ -6,53 +6,37 @@
 //! changed are flagged or removed.
 
 use aether_core::Language;
-use aether_store::open_vector_store;
 
-use super::reconciliation::{
-    SnapshotScope, execute_symbol_reconciliation, plan_symbol_reconciliation,
-};
+use super::reconciliation::{SnapshotScope, plan_symbol_reconciliation};
 use super::structural::{StructuralIndexer, to_symbol_record};
 use super::*;
-use crate::sir_pipeline::{
-    acquire_embed_write_locks, invalidate_file_rollups, invalidate_file_rollups_locked,
-};
+use crate::sir_pipeline::{invalidate_file_rollups, invalidate_file_rollups_locked};
 
 /// Sync the store to `events`, the workspace's structural snapshot (`symbols_by_id` is
 /// the same snapshot keyed by id). `scope` says what the snapshot can speak for: stored
 /// symbols of files it could not read, and rows and leaves written after it began (a
-/// daemon indexing meanwhile), are left as they are. `vector_cleanup` deletes the
-/// embeddings of pruned and migrated ids.
+/// daemon indexing meanwhile), are left as they are. External projections of pruned
+/// and migrated IDs are replayed from the durable retirement queue.
 ///
-/// The order matters, and every step is recorded before the next one can lose track of
-/// it, so a run interrupted anywhere (a cancelled index, an error in the structural
-/// pass) leaves nothing the next run cannot find again:
-///
-/// 1. Everything that changed is found while the store still shows it: the symbols to
-///    prune or migrate, the symbols that are new, and the leaves whose recorded source
-///    differs from the current body.
-/// 2. Every current symbol row is registered, so reconciliation can migrate a
-///    re-identified symbol's SIR onto the row of its new id.
-/// 3. The rollups of the changed files are flagged (or removed, for a file about to lose
-///    its last leaf) in the same inject-lock hold as the prune and before it commits: a
-///    run that stopped after the prune would find nothing left to prune next time, and
-///    would never revisit those files.
-/// 4. Leaves whose source changed are marked stale, migrated ones included (their
-///    recorded hash is the old body's). Stopped before this, they are still `fresh` with
-///    an outdated source hash, which step 1 finds again.
-/// 5. The structural pass syncs each file's edges and graph nodes last, after the prune,
-///    so ids about to be pruned are never written to the graph or resolved to.
-pub(super) fn sync_snapshot<VectorCleanup>(
+/// Catalog planning and publication share the inject lock. Replacement rows,
+/// migrated annotations (marked stale), lineage, retirement evidence and cleanup
+/// obligations commit together. Changed rollups are conservatively invalidated
+/// before that commit, so an interrupted run can rebuild them. Mirrors, graph/edge
+/// replacement, vector projection and freshness markers remain separate effects;
+/// their global atomicity and unfenced older writers are not guaranteed here.
+pub(super) fn sync_snapshot(
     workspace: &Path,
     store: &SqliteStore,
     structural: &mut StructuralIndexer,
     scope: &SnapshotScope<'_>,
     events: &[SymbolChangeEvent],
     symbols_by_id: &HashMap<String, Symbol>,
-    vector_cleanup: VectorCleanup,
-) -> Result<()>
-where
-    VectorCleanup: FnOnce(&[String]) -> Result<()>,
-{
+) -> Result<()> {
+    crate::indexing_gaps::record(workspace, scope.taken_at, scope.blocked_sources)
+        .context("record structural snapshot identity quarantine")?;
+    // Fence injection and other structural writers before catalog reads/planning,
+    // through atomic publication. External cleanup runs after releasing the lock.
+    let inject_guard = acquire_inject_write_lock(workspace)?;
     // The ids the store held before this snapshot: reconciliation must not take an
     // unchanged symbol for the new identity of a stale one, and a current symbol not
     // among them is new.
@@ -91,31 +75,23 @@ where
         .values()
         .map(|symbol| to_symbol_record(symbol, now_ts))
         .collect::<Vec<_>>();
-    store
-        .upsert_symbols(&records)
-        .context("failed to register the snapshot's symbols")?;
+    let (flagged, removed) = invalidate_file_rollups_locked(store, &changed_files, &pruned_ids)
+        .context("failed to invalidate the rollups of changed files")?;
+    if flagged + removed > 0 {
+        tracing::info!(
+            changed_files = changed_files.len(),
+            flagged,
+            removed,
+            "Invalidated file rollups before canonical publication"
+        );
+    }
+    plan.publish(store, &records)?;
+    drop(inject_guard);
 
-    execute_symbol_reconciliation(
-        workspace,
-        store,
-        &plan,
-        || {
-            let (flagged, removed) =
-                invalidate_file_rollups_locked(store, &changed_files, &pruned_ids)
-                    .context("failed to invalidate the rollups of changed files")?;
-            if flagged + removed > 0 {
-                tracing::info!(
-                    changed_files = changed_files.len(),
-                    flagged,
-                    removed,
-                    "Invalidated file rollups of changed files: {flagged} marked stale, {removed} removed"
-                );
-            }
-            Ok(())
-        },
-        |symbol_ids| structural.delete_symbols_batch(symbol_ids),
-        vector_cleanup,
-    )?;
+    // Replay even when this snapshot has no stale declarations: a previous
+    // process can have committed retirement before its external deletion.
+    crate::retirement_cleanup::replay_and_warn(workspace, store, &structural.graph_runtime)
+        .context("replay persisted retirement work during snapshot startup")?;
 
     let stale_ids = store
         .mark_sir_stale_for_changed_sources(&current, scope.taken_at)
@@ -145,6 +121,88 @@ where
 
     for event in events {
         structural.process_event(store, event)?;
+    }
+
+    // The watcher diffs its next HEAD change against the HEAD from before the walk, not
+    // HEAD now: a checkout during the walk happens before the watches exist, so only that
+    // diff can still cover it.
+    match scope.head {
+        Some(head) => {
+            let head = git_watch::HeadState {
+                sha: head.commit.clone(),
+                marker: head.git_ref.clone(),
+            };
+            if let Err(err) = git_watch::write_persisted_head_state(workspace, &head) {
+                tracing::warn!(error = %err, "failed to record the watcher's HEAD");
+            }
+        }
+        None => tracing::warn!(
+            "HEAD could not be read before the walk; the watcher keeps its previous base"
+        ),
+    }
+
+    // A file the index read before that is gone now has nothing left to describe. A
+    // symbol-free one leaves edges and test intents that no symbol removal clears, so an
+    // empty event clears them, and its read time is forgotten either way.
+    match store.list_file_reads() {
+        Ok(reads) => {
+            let gone = reads
+                .into_keys()
+                .filter(|file_path| {
+                    scope.read_file(file_path) && !workspace.join(file_path).exists()
+                })
+                .collect::<Vec<_>>();
+            for file_path in &gone {
+                if let Some(language) = language_for_path(Path::new(file_path)) {
+                    structural.process_event(
+                        store,
+                        &SymbolChangeEvent {
+                            file_path: file_path.clone(),
+                            language,
+                            added: Vec::new(),
+                            removed: Vec::new(),
+                            updated: Vec::new(),
+                        },
+                    )?;
+                }
+            }
+            if let Err(err) = store.forget_file_reads(&gone) {
+                tracing::warn!(error = %err, "failed to forget the reads of removed files");
+            }
+        }
+        Err(err) => tracing::warn!(error = %err, "failed to list the files the index read"),
+    }
+
+    // Every file the snapshot read was read at some moment after its walk started; that
+    // moment is the latest an edit can have reached it, so a later edit reads as a change.
+    let read_files = symbols_by_id
+        .values()
+        .map(|symbol| symbol.file_path.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if let Err(err) = store.record_file_reads(&read_files, scope.taken_at_millis) {
+        tracing::warn!(error = %err, "failed to record when the snapshot read its files");
+    }
+
+    // Freshness may count this snapshot as a full sync only when it read every path: a
+    // marker that claimed one it couldn't read would hide that path's changes. Without a
+    // new marker, status keeps the previous commit and time, so it errs toward stale.
+    if scope.unread_paths.is_empty() {
+        if let Err(err) = crate::freshness::record_full_sync(
+            workspace,
+            scope.head_commit(),
+            scope.taken_at,
+            scope.taken_at_millis,
+        ) {
+            tracing::warn!(error = %err, "failed to record the index sync marker");
+        }
+    } else {
+        tracing::warn!(
+            unread_paths = scope.unread_paths.len(),
+            "the snapshot could not read every path; the index sync marker keeps its previous \
+             commit and time"
+        );
     }
 
     Ok(())
@@ -222,29 +280,4 @@ pub(super) fn outdated_rollups(
         }
     }
     Ok(outdated)
-}
-
-/// Vector cleanup for a sync without a SIR pipeline (the structural `--index-once`, the
-/// daemon's startup): the configured vector store is opened only when there is
-/// something to delete, and the deletion holds each symbol's embedding lock as the
-/// pipeline's does.
-pub(super) fn delete_vector_embeddings(workspace: &Path, symbol_ids: &[String]) -> Result<()> {
-    if symbol_ids.is_empty() {
-        return Ok(());
-    }
-    let _embed_guards =
-        acquire_embed_write_locks(workspace, symbol_ids.iter().map(String::as_str))?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("failed to build vector cleanup runtime")?;
-    runtime.block_on(async {
-        let vector_store = open_vector_store(workspace)
-            .await
-            .context("failed to open the vector store")?;
-        vector_store
-            .delete_embeddings(symbol_ids)
-            .await
-            .context("failed to delete symbol embeddings")
-    })
 }

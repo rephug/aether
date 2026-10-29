@@ -6,6 +6,14 @@ pub struct SchemaVersion {
     pub version: u32,
     pub migrated_at: i64,
 }
+pub(crate) fn ensure_supported_core_version(version: i32) -> Result<(), StoreError> {
+    if version < 0 || (version as u32) > CORE_SCHEMA_VERSION {
+        return Err(StoreError::Compatibility(format!(
+            "unsupported core schema version {version}; this build supports 0..={CORE_SCHEMA_VERSION}"
+        )));
+    }
+    Ok(())
+}
 pub(crate) fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
     // Take the write lock before reading the version and hold it until the final
     // version is written. Two connections opening the same store (the LSP and the
@@ -21,6 +29,9 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
 /// Applies every migration step above `version`. The caller holds the write
 /// transaction that `version` was read in.
 pub(crate) fn apply_migrations(tx: &Transaction<'_>, version: i32) -> Result<(), StoreError> {
+    // The caller read this version under the same write transaction. Reject
+    // unknown shapes before even additive indexes or schema-version receipts.
+    ensure_supported_core_version(version)?;
     let conn: &Connection = tx;
 
     if version < 1 {
@@ -717,12 +728,102 @@ pub(crate) fn apply_migrations(tx: &Transaction<'_>, version: i32) -> Result<(),
         conn.execute("PRAGMA user_version = 21", [])?;
     }
 
+    if version < 22 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE symbol_retirements (
+                retirement_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol_id TEXT NOT NULL,
+                retired_at INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                source_hash TEXT,
+                symbol_json TEXT,
+                evidence_json TEXT NOT NULL
+            );
+            CREATE INDEX idx_symbol_retirements_symbol
+                ON symbol_retirements(symbol_id, retirement_id);
+            CREATE TABLE symbol_lineage (
+                retirement_id INTEGER PRIMARY KEY REFERENCES symbol_retirements(retirement_id),
+                old_symbol_id TEXT NOT NULL,
+                new_symbol_id TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                evidence TEXT NOT NULL,
+                source_revision TEXT,
+                destination_revision TEXT,
+                recorded_at INTEGER NOT NULL
+            );
+            CREATE INDEX idx_symbol_lineage_old ON symbol_lineage(old_symbol_id);
+            CREATE INDEX idx_symbol_lineage_new ON symbol_lineage(new_symbol_id);
+            PRAGMA user_version = 22;
+            "#,
+        )?;
+    }
+
+    if version < 23 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE retirement_cleanup (
+                retirement_id INTEGER NOT NULL REFERENCES symbol_retirements(retirement_id),
+                projection TEXT NOT NULL CHECK (projection IN ('graph', 'vector')),
+                symbol_id TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'done', 'superseded_by_reintroduction', 'legacy_unknown')),
+                attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                last_error TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (retirement_id, projection)
+            );
+            CREATE INDEX idx_retirement_cleanup_status ON retirement_cleanup(status, updated_at, attempts, retirement_id, projection);
+            CREATE INDEX idx_retirement_cleanup_projection ON retirement_cleanup(status, projection, updated_at, attempts, retirement_id);
+            CREATE INDEX idx_retirement_cleanup_symbol ON retirement_cleanup(symbol_id);
+            -- Older retirements have no recorded backend or completion receipt.
+            -- Retain that uncertainty; do not guess that cleanup succeeded.
+            INSERT INTO retirement_cleanup (retirement_id, projection, symbol_id, backend, status, created_at, updated_at)
+            SELECT retirement_id, 'graph', symbol_id, 'legacy_unknown', 'legacy_unknown', retired_at, unixepoch()
+            FROM symbol_retirements
+            UNION ALL
+            SELECT retirement_id, 'vector', symbol_id, 'legacy_unknown', 'legacy_unknown', retired_at, unixepoch()
+            FROM symbol_retirements;
+            PRAGMA user_version = 23;
+            "#,
+        )?;
+    }
+
+    // Additive indexes also apply to stores already at the current schema. These
+    // are the lookup keys used when resolving an edge and refreshing one file's
+    // neighbors; without them a small graph update scans the symbol catalog.
+    if table_exists(conn, "symbols")? {
+        conn.execute_batch(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name
+                ON symbols(qualified_name);
+            CREATE INDEX IF NOT EXISTS idx_symbols_file_path
+                ON symbols(file_path);
+            "#,
+        )?;
+    }
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_version (
             component TEXT PRIMARY KEY,
             version INTEGER NOT NULL,
             migrated_at INTEGER NOT NULL
+        );
+        "#,
+    )?;
+    // When the indexer last started reading each file (unix milliseconds), so freshness
+    // can tell an edit made after that read from one made before it; `symbols.last_seen_at`
+    // has whole seconds and, after a full sync, the time the sync wrote rather than read.
+    // Only ever added to and read by freshness reports, so it needs no version step:
+    // binaries that predate it ignore it, and the store stays openable by them.
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS file_reads (
+            file_path TEXT PRIMARY KEY,
+            read_at_ms INTEGER NOT NULL
         );
         "#,
     )?;
@@ -906,7 +1007,7 @@ fn table_has_column(
 
     Ok(false)
 }
-fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, StoreError> {
+pub(crate) fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, StoreError> {
     let mut stmt = conn.prepare(
         r#"
         SELECT 1

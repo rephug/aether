@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use tokio::time::sleep;
 
 use crate::http::{GEMINI_API_BASE, inference_http_client, normalize_embedding};
+use crate::model_check::{ModelCatalog, ModelListing};
 use crate::types::{EmbeddingProvider, EmbeddingPurpose, InferError};
 
 /// Maximum number of texts per Gemini `batchEmbedContents` request.
@@ -213,6 +214,16 @@ impl EmbeddingProvider for GeminiNativeEmbeddingProvider {
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>, InferError> {
         self.request_embedding(text, EmbeddingPurpose::Document)
             .await
+    }
+
+    fn model_listings(&self) -> Vec<ModelListing> {
+        vec![ModelListing::new(
+            self.model.clone(),
+            ModelCatalog::Gemini {
+                api_base: self.api_base.clone(),
+                api_key: self.api_key.clone(),
+            },
+        )]
     }
 
     async fn embed_text_with_purpose(

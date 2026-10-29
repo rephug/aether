@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use aether_config::{AetherConfig, config_path, load_workspace_config};
+use aether_config::{AetherConfig, McpToolProfile, config_path, load_workspace_config};
 use aether_core::AETHER_AGENT_SCHEMA_VERSION;
 use aether_parse::LanguageRegistry;
 use anyhow::{Context, Result};
@@ -10,13 +10,17 @@ use clap::ValueEnum;
 
 use crate::templates::{
     AuditChangesCommandTemplate, AuditCommandTemplate, AuditReportCommandTemplate, ClaudeTemplate,
-    CodexInstructionsTemplate, ContextCommandTemplate, CursorRulesTemplate, EnrichCommandTemplate,
-    ExplainAreaCommandTemplate, GithubReviewWorkflowTemplate, HealthCheckCommandTemplate,
-    ImpactCommandTemplate, McpJsonTemplate, NextCommandTemplate, OmpAgentsTemplate,
-    PreFlightCommandTemplate, RefactorCommandTemplate, RefactorDeepCommandTemplate,
-    ReviewCommandTemplate, ScanAllScriptTemplate, ScanCommandTemplate, SkillTemplate,
-    TemplateContext,
+    CodexInstructionsTemplate, CompactGuidanceTemplate, ContextCommandTemplate,
+    CursorRulesTemplate, EnrichCommandTemplate, ExplainAreaCommandTemplate,
+    GithubReviewWorkflowTemplate, HealthCheckCommandTemplate, ImpactCommandTemplate,
+    McpJsonTemplate, NextCommandTemplate, OmpAgentsTemplate, PreFlightCommandTemplate,
+    RefactorCommandTemplate, RefactorDeepCommandTemplate, ReviewCommandTemplate,
+    ScanAllScriptTemplate, ScanCommandTemplate, SkillTemplate, TemplateContext,
 };
+
+#[path = "artifact_transition.rs"]
+mod artifact_transition;
+pub use artifact_transition::ArchivedAgentArtifact;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lower")]
@@ -33,12 +37,15 @@ pub enum AgentPlatform {
 pub struct InitAgentOptions {
     pub platform: AgentPlatform,
     pub force: bool,
+    /// The MCP tool profile to set up; `None` takes `[mcp] tools` from the config.
+    pub mcp_tools: Option<McpToolProfile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitAgentOutcome {
     pub written_files: Vec<PathBuf>,
     pub skipped_existing_files: Vec<PathBuf>,
+    pub archived_files: Vec<ArchivedAgentArtifact>,
     pub used_default_config: bool,
 }
 
@@ -62,8 +69,79 @@ pub fn run_init_agent(workspace: &Path, options: InitAgentOptions) -> Result<Ini
         )
     })?;
 
-    let context = build_template_context(workspace, &config);
-    let files = files_for_platform(options.platform, &context);
+    let mcp_tools = options.mcp_tools.unwrap_or(config.mcp.tools);
+    let context = build_template_context(workspace, &config, mcp_tools);
+    let mut files = match mcp_tools {
+        McpToolProfile::Full => files_for_platform(options.platform, &context),
+        McpToolProfile::Compact => compact_files_for_platform(options.platform, &context),
+    };
+
+    // Existing project registrations also affect other clients when only one
+    // platform was requested. Refresh the Aether entry while preserving its peers.
+    if workspace.join(MCP_CONFIG_FILE).exists()
+        && !files
+            .iter()
+            .any(|file| file.relative_path == Path::new(MCP_CONFIG_FILE))
+    {
+        files.push(GeneratedFile::new(
+            MCP_CONFIG_FILE,
+            McpJsonTemplate::render(&context),
+        ));
+    }
+    let archived_files = if mcp_tools == McpToolProfile::Compact {
+        artifact_transition::check_output_paths(workspace, &files)?;
+        if workspace.join(MCP_CONFIG_FILE).exists() {
+            let current: serde_json::Value = serde_json::from_slice(
+                &fs::read(workspace.join(MCP_CONFIG_FILE))
+                    .context("read shared MCP registration")?,
+            )
+            .context("shared MCP registration must be valid JSON before selecting Compact")?;
+            if !current.is_object()
+                || current
+                    .get("mcpServers")
+                    .is_some_and(|servers| !servers.is_object())
+            {
+                anyhow::bail!(
+                    "shared MCP registration must be an object with an optional mcpServers object; Compact transition refused before archival"
+                );
+            }
+        }
+        let selected = files
+            .iter()
+            .map(|file| file.relative_path.clone())
+            .collect();
+        let full_context = build_template_context(workspace, &config, McpToolProfile::Full);
+        let transition = artifact_transition::transition_artifacts(
+            workspace,
+            files_for_platform(AgentPlatform::All, &full_context),
+            compact_files_for_platform(AgentPlatform::All, &context),
+            &selected,
+            options.force,
+        )?;
+        files.extend(transition.refreshed);
+        transition.archived
+    } else {
+        artifact_transition::check_output_paths(workspace, &files)?;
+        let selected = files
+            .iter()
+            .map(|file| file.relative_path.clone())
+            .collect();
+        let compact_context = build_template_context(workspace, &config, McpToolProfile::Compact);
+        let compact = compact_files_for_platform(AgentPlatform::All, &compact_context);
+        if artifact_transition::contains_compact_profile(workspace, &compact)? {
+            let transition = artifact_transition::transition_artifacts(
+                workspace,
+                compact,
+                files_for_platform(AgentPlatform::All, &context),
+                &selected,
+                options.force,
+            )?;
+            files.extend(transition.refreshed);
+            transition.archived
+        } else {
+            Vec::new()
+        }
+    };
 
     let mut written_files = Vec::new();
     let mut skipped_existing_files = Vec::new();
@@ -126,6 +204,7 @@ pub fn run_init_agent(workspace: &Path, options: InitAgentOptions) -> Result<Ini
     Ok(InitAgentOutcome {
         written_files,
         skipped_existing_files,
+        archived_files,
         used_default_config,
     })
 }
@@ -285,7 +364,44 @@ fn files_for_platform(platform: AgentPlatform, context: &TemplateContext) -> Vec
     files
 }
 
-fn build_template_context(workspace: &Path, config: &AetherConfig) -> TemplateContext {
+/// The compact profile's setup: guidance for its tools and the `.mcp.json`
+/// registration that selects it. The slash commands, scan script, skill and review
+/// workflow call tools outside the compact profile, so they are left out.
+fn compact_files_for_platform(
+    platform: AgentPlatform,
+    context: &TemplateContext,
+) -> Vec<GeneratedFile> {
+    let guidance = CompactGuidanceTemplate::render(context);
+    let mut files = Vec::new();
+    if matches!(platform, AgentPlatform::Claude | AgentPlatform::All) {
+        files.push(GeneratedFile::new("CLAUDE.md", guidance.clone()));
+    }
+    if matches!(platform, AgentPlatform::Codex | AgentPlatform::All) {
+        files.push(GeneratedFile::new(".codex-instructions", guidance.clone()));
+    }
+    if matches!(platform, AgentPlatform::Cursor | AgentPlatform::All) {
+        files.push(GeneratedFile::new(".cursor/rules", guidance.clone()));
+    }
+    if matches!(platform, AgentPlatform::Omp | AgentPlatform::All) {
+        files.push(GeneratedFile::new("AGENTS.md", guidance));
+    }
+    if matches!(
+        platform,
+        AgentPlatform::Claude | AgentPlatform::Omp | AgentPlatform::All
+    ) {
+        files.push(GeneratedFile::new(
+            ".mcp.json",
+            McpJsonTemplate::render(context),
+        ));
+    }
+    files
+}
+
+fn build_template_context(
+    workspace: &Path,
+    config: &AetherConfig,
+    mcp_tools: McpToolProfile,
+) -> TemplateContext {
     TemplateContext {
         languages: detected_languages(),
         source_suffixes: source_suffixes(),
@@ -294,6 +410,11 @@ fn build_template_context(workspace: &Path, config: &AetherConfig) -> TemplateCo
         inference_provider: config.inference.provider.as_str().to_owned(),
         agent_schema_version: AETHER_AGENT_SCHEMA_VERSION,
         mcp_binary_hint: resolve_mcp_binary_hint(workspace),
+        verification_tool: cfg!(feature = "verification"),
+        // Without `--tools`, aether-mcp serves `[mcp] tools`; name the profile whenever
+        // that isn't it, and always for compact so the registration says what it attaches.
+        mcp_tools_arg: (mcp_tools != config.mcp.tools || mcp_tools == McpToolProfile::Compact)
+            .then_some(mcp_tools),
     }
 }
 
@@ -332,7 +453,7 @@ fn merge_mcp_server(existing_path: &Path, rendered: &str, force: bool) -> Result
     };
     let rendered_json: serde_json::Value =
         serde_json::from_str(rendered).context("rendered .mcp.json template is valid JSON")?;
-    let Some(aether) = rendered_json
+    let Some(mut aether) = rendered_json
         .get("mcpServers")
         .and_then(|value| value.get(MCP_SERVER_KEY))
         .cloned()
@@ -342,6 +463,40 @@ fn merge_mcp_server(existing_path: &Path, rendered: &str, force: bool) -> Result
     match servers.get(MCP_SERVER_KEY) {
         Some(existing) if !force || *existing == aether => return Ok(McpMerge::Unchanged),
         _ => {}
+    }
+    if let Some(existing) = servers.get(MCP_SERVER_KEY) {
+        let Some(mut preserved) = existing.as_object().cloned() else {
+            return Ok(McpMerge::NotJson);
+        };
+        let mut extra = Vec::new();
+        if let Some(arguments) = existing.get("args") {
+            let Some(arguments) = arguments.as_array() else {
+                return Ok(McpMerge::NotJson);
+            };
+            let mut arguments = arguments.iter();
+            while let Some(argument) = arguments.next() {
+                let Some(text) = argument.as_str() else {
+                    return Ok(McpMerge::NotJson);
+                };
+                if matches!(text, "--workspace" | "--tools") {
+                    if arguments.next().and_then(|value| value.as_str()).is_none() {
+                        return Ok(McpMerge::NotJson);
+                    }
+                } else if !text.starts_with("--workspace=") && !text.starts_with("--tools=") {
+                    extra.push(argument.clone());
+                }
+            }
+        }
+        let generated = aether
+            .as_object_mut()
+            .context("rendered Aether registration must be an object")?;
+        generated
+            .get_mut("args")
+            .and_then(|value| value.as_array_mut())
+            .context("rendered Aether arguments must be an array")?
+            .extend(extra);
+        preserved.extend(generated.clone());
+        aether = serde_json::Value::Object(preserved);
     }
     servers.insert(MCP_SERVER_KEY.to_owned(), aether);
     let mut merged =
@@ -448,6 +603,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
+    use aether_config::McpToolProfile;
     use aether_core::AETHER_AGENT_SCHEMA_VERSION;
     use tempfile::tempdir;
 
@@ -465,6 +621,7 @@ mod tests {
             InitAgentOptions {
                 platform: AgentPlatform::All,
                 force: false,
+                mcp_tools: None,
             },
         )
         .expect("init-agent should succeed");
@@ -514,6 +671,7 @@ mod tests {
             InitAgentOptions {
                 platform: AgentPlatform::Claude,
                 force: false,
+                mcp_tools: None,
             },
         )
         .expect("init-agent claude should succeed");
@@ -564,6 +722,7 @@ mod tests {
             InitAgentOptions {
                 platform: AgentPlatform::Codex,
                 force: false,
+                mcp_tools: None,
             },
         )
         .expect("init-agent codex should succeed");
@@ -591,6 +750,7 @@ mod tests {
             InitAgentOptions {
                 platform: AgentPlatform::Claude,
                 force: false,
+                mcp_tools: None,
             },
         )
         .expect("init-agent should succeed");
@@ -612,6 +772,7 @@ mod tests {
             InitAgentOptions {
                 platform: AgentPlatform::Claude,
                 force: false,
+                mcp_tools: None,
             },
         )
         .expect("second init-agent should succeed");
@@ -632,6 +793,7 @@ mod tests {
             InitAgentOptions {
                 platform: AgentPlatform::Claude,
                 force: true,
+                mcp_tools: None,
             },
         )
         .expect("forced init-agent should succeed");
@@ -652,6 +814,7 @@ mod tests {
             InitAgentOptions {
                 platform: AgentPlatform::Claude,
                 force: true,
+                mcp_tools: None,
             },
         )
         .expect("repeated forced init-agent should succeed");
@@ -678,6 +841,7 @@ mod tests {
             InitAgentOptions {
                 platform: AgentPlatform::Claude,
                 force: false,
+                mcp_tools: None,
             },
         )
         .expect("init-agent should succeed");
@@ -698,6 +862,7 @@ mod tests {
             InitAgentOptions {
                 platform: AgentPlatform::Claude,
                 force: true,
+                mcp_tools: None,
             },
         )
         .expect_err("forced init-agent must not clobber an unparseable .mcp.json");
@@ -726,6 +891,7 @@ mod tests {
             InitAgentOptions {
                 platform: AgentPlatform::Omp,
                 force: false,
+                mcp_tools: None,
             },
         )
         .expect("init-agent omp should succeed");
@@ -760,6 +926,7 @@ mod tests {
             InitAgentOptions {
                 platform: AgentPlatform::All,
                 force: false,
+                mcp_tools: None,
             },
         )
         .expect("init-agent should succeed with skips");
@@ -793,6 +960,7 @@ mod tests {
             InitAgentOptions {
                 platform: AgentPlatform::Claude,
                 force: true,
+                mcp_tools: None,
             },
         )
         .expect("init-agent should overwrite");
@@ -815,6 +983,7 @@ mod tests {
             InitAgentOptions {
                 platform: AgentPlatform::Claude,
                 force: false,
+                mcp_tools: None,
             },
         )
         .expect("init-agent should succeed");
@@ -824,6 +993,53 @@ mod tests {
             "Agent Schema Version: {}",
             AETHER_AGENT_SCHEMA_VERSION
         )));
+    }
+
+    /// The written CLAUDE.md and AGENTS.md mandate no tool this build may lack, make
+    /// SIR writes and why_changed advisory, and leave the tool list to the MCP server.
+    #[test]
+    fn generated_claude_and_agents_md_mandate_no_unavailable_tool() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_config_with_embeddings(workspace, true);
+
+        run_init_agent(
+            workspace,
+            InitAgentOptions {
+                platform: AgentPlatform::All,
+                force: false,
+                mcp_tools: None,
+            },
+        )
+        .expect("init-agent should succeed");
+
+        for file in ["CLAUDE.md", "AGENTS.md"] {
+            let rendered = fs::read_to_string(workspace.join(file)).expect("read agent file");
+            let required = rendered
+                .split("## Required Actions (mandatory)\n")
+                .nth(1)
+                .and_then(|rest| rest.split("\n\n").next())
+                .expect("required section");
+            assert_eq!(
+                required.contains("aether_verify"),
+                cfg!(feature = "verification"),
+                "{file}: {required}"
+            );
+            assert!(
+                !required.contains("aether_why_changed"),
+                "{file}: {required}"
+            );
+            assert!(
+                !required.contains("aether_sir_inject"),
+                "{file}: {required}"
+            );
+            assert!(!required.contains("aether_get_sir"), "{file}: {required}");
+            assert!(rendered.contains("`freshness.verdict`"), "{file}");
+            assert!(!rendered.contains("to confirm index freshness"), "{file}");
+            // The 40-tool list is gone.
+            assert!(!rendered.contains("aether_suggest_trait_split"), "{file}");
+            assert!(!rendered.contains("aether_contract_dismiss"), "{file}");
+        }
     }
 
     #[test]
@@ -838,6 +1054,7 @@ mod tests {
             InitAgentOptions {
                 platform: AgentPlatform::Claude,
                 force: false,
+                mcp_tools: None,
             },
         )
         .expect("init-agent should succeed");
@@ -856,6 +1073,7 @@ mod tests {
             InitAgentOptions {
                 platform: AgentPlatform::Claude,
                 force: false,
+                mcp_tools: None,
             },
         )
         .expect("init-agent should succeed");
@@ -914,8 +1132,11 @@ mod tests {
         let pre_flight = fs::read_to_string(workspace.join(".claude/commands/pre-flight.md"))
             .expect("read pre-flight command");
         assert!(pre_flight.contains("argument-hint: <task description>"));
-        assert!(pre_flight.contains("aether_sir_context"));
-        assert!(pre_flight.contains("aether_contract_list"));
+        assert!(pre_flight.contains("Call `aether_preflight` first"));
+        assert!(pre_flight.contains("before exploring files"));
+        assert!(pre_flight.contains("without initializing a store"));
+        assert!(!pre_flight.contains("aether_sir_context"));
+        assert!(!pre_flight.contains("aether_contract_list"));
 
         let review = fs::read_to_string(workspace.join(".claude/commands/review.md"))
             .expect("read review command");
@@ -955,6 +1176,7 @@ mod tests {
             InitAgentOptions {
                 platform: AgentPlatform::Claude,
                 force: false,
+                mcp_tools: None,
             },
         )
         .expect("init-agent should succeed");
@@ -969,6 +1191,7 @@ mod tests {
             InitAgentOptions {
                 platform: AgentPlatform::Claude,
                 force: false,
+                mcp_tools: None,
             },
         )
         .expect("init-agent should succeed");
@@ -1008,6 +1231,7 @@ mod tests {
             InitAgentOptions {
                 platform: AgentPlatform::Claude,
                 force: false,
+                mcp_tools: None,
             },
         )
         .expect("init-agent claude should succeed");
@@ -1016,6 +1240,103 @@ mod tests {
         assert!(workflow.contains(
             "\n          SOURCE_SUFFIXES = (\".cs\", \".go\", \".java\", \".js\", \".jsx\", \".py\", \".pyi\", \".rs\", \".ts\", \".tsx\")\n"
         ));
+    }
+
+    #[test]
+    fn init_agent_compact_profile_writes_only_compact_guidance_and_registration() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_config_with_embeddings(workspace, true);
+
+        let outcome = run_init_agent(
+            workspace,
+            InitAgentOptions {
+                platform: AgentPlatform::All,
+                force: false,
+                mcp_tools: Some(McpToolProfile::Compact),
+            },
+        )
+        .expect("init-agent compact should succeed");
+
+        let mut written = outcome
+            .written_files
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        written.sort();
+        assert_eq!(
+            written,
+            [
+                ".codex-instructions",
+                ".cursor/rules",
+                ".mcp.json",
+                "AGENTS.md",
+                "CLAUDE.md"
+            ]
+        );
+        let claude = fs::read_to_string(workspace.join("CLAUDE.md")).expect("read claude");
+        assert!(claude.contains("compact tool profile"));
+        assert!(!claude.contains("aether_sir_inject"));
+        assert_eq!(
+            fs::read_to_string(workspace.join(".codex-instructions")).expect("read codex"),
+            claude
+        );
+        let mcp: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(workspace.join(".mcp.json")).expect("read .mcp.json"),
+        )
+        .expect("valid json");
+        assert_eq!(
+            mcp["mcpServers"]["aether"]["args"],
+            serde_json::json!(["--workspace", ".", "--tools", "compact"])
+        );
+    }
+
+    #[test]
+    fn init_agent_takes_the_profile_from_config_unless_overridden() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_config_with_embeddings(workspace, false);
+        let config_path = workspace.join(".aether/config.toml");
+        let config = fs::read_to_string(&config_path).expect("read config");
+        fs::write(
+            &config_path,
+            format!("{config}\n[mcp]\ntools = \"compact\"\n"),
+        )
+        .expect("write config");
+
+        let init = |mcp_tools| {
+            run_init_agent(
+                workspace,
+                InitAgentOptions {
+                    platform: AgentPlatform::All,
+                    force: true,
+                    mcp_tools,
+                },
+            )
+            .expect("init-agent should succeed");
+            let mcp: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(workspace.join(".mcp.json")).expect("read .mcp.json"),
+            )
+            .expect("valid json");
+            (
+                fs::read_to_string(workspace.join(".codex-instructions")).expect("read codex"),
+                mcp["mcpServers"]["aether"]["args"].clone(),
+            )
+        };
+        let (codex, args) = init(None);
+        assert!(codex.contains("compact tool profile"));
+        assert_eq!(
+            args,
+            serde_json::json!(["--workspace", ".", "--tools", "compact"])
+        );
+        // Overriding the config's compact profile has to reach aether-mcp too.
+        let (codex, args) = init(Some(McpToolProfile::Full));
+        assert!(!codex.contains("compact tool profile"));
+        assert!(codex.contains("aether_sir_inject"));
+        assert_eq!(
+            args,
+            serde_json::json!(["--workspace", ".", "--tools", "full"])
+        );
     }
 
     fn write_config_with_embeddings(workspace: &Path, embeddings_enabled: bool) {
@@ -1044,3 +1365,7 @@ mode = "host"
         .expect("write config");
     }
 }
+
+#[cfg(test)]
+#[path = "profile_transition_tests.rs"]
+mod profile_transition_tests;

@@ -176,7 +176,22 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn info_handler(State(state): State<Arc<AppState>>) -> Response {
-    let status = match state.mcp_server.aether_status_logic() {
+    // Counts only: the full status walks the workspace and counts call edges, which this
+    // endpoint doesn't report. The store read still holds its lock, so it leaves the async
+    // worker.
+    let server = state.mcp_server.clone();
+    let counts = match tokio::task::spawn_blocking(move || server.aether_store_counts_logic()).await
+    {
+        Ok(counts) => counts,
+        Err(err) => {
+            return json_error_with_message(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                format!("store counts join: {err}"),
+            );
+        }
+    };
+    let status = match counts {
         Ok(status) => status,
         Err(err) => {
             return json_error_with_message(

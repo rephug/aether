@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::future::IntoFuture;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use aether_config::{DEFAULT_GRAPH_OPEN_TIMEOUT_SECS, load_workspace_config};
@@ -56,7 +56,9 @@ pub unsafe fn set_surrealkv_sizing_env() {
 
 #[derive(Clone)]
 pub struct SurrealGraphStore {
-    db: Surreal<Db>,
+    // Clones share one session. A cloned `Surreal` handle is a new SurrealDB session, and a
+    // new session's first request can fail (see `retry_until_session_registered`).
+    db: Arc<Surreal<Db>>,
 }
 
 impl SurrealGraphStore {
@@ -90,22 +92,23 @@ impl SurrealGraphStore {
             existing
         } else {
             let open_timeout = open_timeout.unwrap_or_else(|| graph_open_timeout(&workspace_root));
+            let runtime = surreal_runtime()?;
             let mut open_error = None;
             let mut db_opt = None;
             for attempt in 0..10 {
                 match wait_for_open(
-                    Surreal::new::<SurrealKv>(graph_dir.clone()),
+                    runtime.spawn(Surreal::new::<SurrealKv>(graph_dir.clone()).into_future()),
                     SURREAL_OPEN_SLOW_AFTER,
                     open_timeout,
                     &graph_dir,
                 )
                 .await
                 {
-                    Ok(Ok(db)) => {
+                    Ok(Ok(Ok(db))) => {
                         db_opt = Some(db);
                         break;
                     }
-                    Ok(Err(err)) => {
+                    Ok(Ok(Err(err))) => {
                         let message = err.to_string();
                         if message.contains("LOCK is already locked") && attempt < 9 {
                             // Another thread of this process may have opened the store
@@ -121,6 +124,12 @@ impl SurrealGraphStore {
                         }
                         open_error =
                             Some(StoreError::Graph(format!("SurrealDB open failed: {err}")));
+                        break;
+                    }
+                    Ok(Err(err)) => {
+                        open_error = Some(StoreError::Graph(format!(
+                            "SurrealDB open task failed: {err}"
+                        )));
                         break;
                     }
                     Err(_) => {
@@ -148,12 +157,11 @@ impl SurrealGraphStore {
         // writes with a transaction conflict. One open sets them up; the others wait.
         let setup_lock = store_setup_lock(&graph_dir)?;
         let _setup = setup_lock.lock().await;
-        db.use_ns("aether")
-            .use_db("graph")
+        retry_until_session_registered(|| db.use_ns("aether").use_db("graph"))
             .await
             .map_err(|err| StoreError::Graph(format!("SurrealDB namespace setup failed: {err}")))?;
 
-        let store = Self { db };
+        let store = Self { db: Arc::new(db) };
         if !is_schema_initialized(&graph_dir)? {
             store.ensure_schema().await?;
             mark_schema_initialized(graph_dir.clone())?;
@@ -171,6 +179,7 @@ impl SurrealGraphStore {
 
     async fn ensure_schema(&self) -> Result<(), StoreError> {
         let schema = r#"
+            BEGIN TRANSACTION;
             DEFINE TABLE IF NOT EXISTS symbol SCHEMAFULL;
             DEFINE FIELD IF NOT EXISTS symbol_id ON symbol TYPE string;
             DEFINE FIELD IF NOT EXISTS qualified_name ON symbol TYPE string;
@@ -250,11 +259,13 @@ impl SurrealGraphStore {
 
             DEFINE FIELD IF NOT EXISTS callers ON symbol COMPUTED <~depends_on;
             DEFINE FIELD IF NOT EXISTS dependees ON symbol COMPUTED ->depends_on->symbol;
+            COMMIT TRANSACTION;
         "#;
 
         self.db
             .query(schema)
             .await
+            .and_then(|response| response.check())
             .map_err(|err| StoreError::Graph(format!("SurrealDB schema setup failed: {err}")))?;
         Ok(())
     }
@@ -479,6 +490,7 @@ impl SurrealGraphStore {
             .query("DELETE symbol WHERE symbol_id = $symbol_id;")
             .bind(("symbol_id", symbol_id.to_owned()))
             .await
+            .and_then(|response| response.check())
             .map_err(|err| StoreError::Graph(format!("SurrealDB delete symbol failed: {err}")))?;
         Ok(())
     }
@@ -495,23 +507,25 @@ impl SurrealGraphStore {
             return Ok(());
         }
 
-        for chunk in ids.chunks(500) {
-            let symbol_ids = chunk.to_vec();
-            self.db
-                .query(
-                    r#"
-                    DELETE depends_on
-                    WHERE source_symbol_id INSIDE $symbol_ids
-                       OR target_symbol_id INSIDE $symbol_ids;
-                    DELETE symbol WHERE symbol_id INSIDE $symbol_ids;
-                    "#,
-                )
-                .bind(("symbol_ids", symbol_ids))
-                .await
-                .map_err(|err| {
-                    StoreError::Graph(format!("SurrealDB delete symbols batch failed: {err}"))
-                })?;
-        }
+        // Bind the ID array once: SQL parameter limits do not require splitting it into
+        // separately committed chunks. Nodes and all incident edges disappear together.
+        self.db
+            .query(
+                r#"
+                BEGIN TRANSACTION;
+                DELETE depends_on
+                WHERE source_symbol_id INSIDE $symbol_ids
+                   OR target_symbol_id INSIDE $symbol_ids;
+                DELETE symbol WHERE symbol_id INSIDE $symbol_ids;
+                COMMIT TRANSACTION;
+                "#,
+            )
+            .bind(("symbol_ids", ids))
+            .await
+            .and_then(|response| response.check())
+            .map_err(|err| {
+                StoreError::Graph(format!("SurrealDB delete symbols batch failed: {err}"))
+            })?;
 
         Ok(())
     }
@@ -538,6 +552,7 @@ impl SurrealGraphStore {
             .bind(("source_symbol_id", source_symbol_id.to_owned()))
             .bind(("target_symbol_id", target_symbol_id.to_owned()))
             .await
+            .and_then(|response| response.check())
             .map_err(|err| {
                 StoreError::Graph(format!("SurrealDB delete dependency edges failed: {err}"))
             })?;
@@ -657,61 +672,32 @@ impl SurrealGraphStore {
         &self,
         records: &[CouplingEdgeRecord],
     ) -> Result<(), StoreError> {
-        for record in records {
-            let record = CouplingEdgeRecord {
-                file_a: record.file_a.clone(),
-                file_b: record.file_b.clone(),
-                co_change_count: record.co_change_count,
-                total_commits_a: record.total_commits_a,
-                total_commits_b: record.total_commits_b,
-                git_coupling: record.git_coupling,
-                static_signal: record.static_signal,
-                semantic_signal: record.semantic_signal,
-                fused_score: record.fused_score,
-                coupling_type: record.coupling_type.clone(),
-                last_co_change_commit: record.last_co_change_commit.clone(),
-                last_co_change_at: record.last_co_change_at,
-                mined_at: record.mined_at,
-            };
-
-            self.db
-                .query(
-                    r#"
-                    DELETE co_change WHERE file_a = $file_a AND file_b = $file_b;
-                    CREATE co_change SET
-                        file_a = $file_a,
-                        file_b = $file_b,
-                        co_change_count = $co_change_count,
-                        total_commits_a = $total_commits_a,
-                        total_commits_b = $total_commits_b,
-                        git_coupling = $git_coupling,
-                        static_signal = $static_signal,
-                        semantic_signal = $semantic_signal,
-                        fused_score = $fused_score,
-                        coupling_type = $coupling_type,
-                        last_co_change_commit = $last_co_change_commit,
-                        last_co_change_at = $last_co_change_at,
-                        mined_at = $mined_at;
-                    "#,
-                )
-                .bind(("file_a", record.file_a))
-                .bind(("file_b", record.file_b))
-                .bind(("co_change_count", record.co_change_count))
-                .bind(("total_commits_a", record.total_commits_a))
-                .bind(("total_commits_b", record.total_commits_b))
-                .bind(("git_coupling", record.git_coupling))
-                .bind(("static_signal", record.static_signal))
-                .bind(("semantic_signal", record.semantic_signal))
-                .bind(("fused_score", record.fused_score))
-                .bind(("coupling_type", record.coupling_type))
-                .bind(("last_co_change_commit", record.last_co_change_commit))
-                .bind(("last_co_change_at", record.last_co_change_at))
-                .bind(("mined_at", record.mined_at))
-                .await
-                .map_err(|err| {
-                    StoreError::Graph(format!("SurrealDB upsert co_change failed: {err}"))
-                })?;
+        if records.is_empty() {
+            return Ok(());
         }
+        let records = serde_json::to_value(records).map_err(|err| {
+            StoreError::Graph(format!("SurrealDB encode co_change batch failed: {err}"))
+        })?;
+        // Replacing a record must not leave a hole when its new value violates a
+        // schema/index constraint. The entire supplied batch shares one transaction.
+        self.db
+            .query(
+                r#"
+                BEGIN TRANSACTION;
+                FOR $record IN $records {
+                    DELETE co_change WHERE file_a = $record.file_a AND file_b = $record.file_b;
+                    CREATE co_change CONTENT $record;
+                };
+                COMMIT TRANSACTION;
+                "#,
+            )
+            .bind(("records", records))
+            .await
+            .and_then(|response| response.check())
+            .map_err(|err| {
+                StoreError::Graph(format!("SurrealDB upsert co_change failed: {err}"))
+            })?;
+
         Ok(())
     }
 
@@ -866,34 +852,46 @@ impl SurrealGraphStore {
             return Ok(());
         }
 
-        self.db
-            .query("DELETE tested_by WHERE test_file = $test_file;")
-            .bind(("test_file", test_file.to_owned()))
-            .await
-            .map_err(|err| StoreError::Graph(format!("SurrealDB clear tested_by failed: {err}")))?;
-
-        for record in records {
-            self.db
-                .query(
-                    r#"
-                    CREATE tested_by SET
-                        target_file = $target_file,
-                        test_file = $test_file,
-                        intent_count = $intent_count,
-                        confidence = $confidence,
-                        inference_method = $inference_method;
-                    "#,
-                )
-                .bind(("target_file", record.target_file.clone()))
-                .bind(("test_file", record.test_file.clone()))
-                .bind(("intent_count", record.intent_count.max(0)))
-                .bind(("confidence", record.confidence.clamp(0.0, 1.0)))
-                .bind(("inference_method", record.inference_method.clone()))
-                .await
-                .map_err(|err| {
-                    StoreError::Graph(format!("SurrealDB insert tested_by failed: {err}"))
-                })?;
+        if records.iter().any(|record| record.test_file != test_file) {
+            return Err(StoreError::Graph(format!(
+                "SurrealDB replace tested_by for {test_file}: every record must name that test file"
+            )));
         }
+        let records = records
+            .iter()
+            .map(|record| TestedByRecord {
+                target_file: record.target_file.clone(),
+                test_file: record.test_file.clone(),
+                intent_count: record.intent_count.max(0),
+                confidence: record.confidence.clamp(0.0, 1.0),
+                inference_method: record.inference_method.clone(),
+            })
+            .collect::<Vec<_>>();
+        let records = serde_json::to_value(records).map_err(|err| {
+            StoreError::Graph(format!(
+                "SurrealDB encode tested_by replacement failed: {err}"
+            ))
+        })?;
+
+        self.db
+            .query(
+                r#"
+                BEGIN TRANSACTION;
+                DELETE tested_by WHERE test_file = $test_file;
+                FOR $record IN $records {
+                    CREATE tested_by CONTENT $record;
+                };
+                COMMIT TRANSACTION;
+                "#,
+            )
+            .bind(("test_file", test_file.to_owned()))
+            .bind(("records", records))
+            .await
+            .and_then(|response| response.check())
+            .map_err(|err| {
+                StoreError::Graph(format!("SurrealDB replace tested_by failed: {err}"))
+            })?;
+
         Ok(())
     }
 
@@ -952,9 +950,9 @@ fn graph_open_timeout(workspace_root: &Path) -> Duration {
 
 /// Waits up to `limit` for one SurrealDB open, logging once it has taken `slow_after`.
 ///
-/// A slow open is never abandoned and restarted: SurrealDB opens the store in a task it
-/// spawns, which keeps running and holds the store's lock after its caller stops waiting,
-/// so a fresh open would only fail on that lock and redo the same slow work.
+/// A slow open is never abandoned and restarted: the open runs in a task on
+/// [`surreal_runtime`], which keeps running and holds the store's lock after its caller
+/// stops waiting, so a fresh open would only fail on that lock and redo the same slow work.
 async fn wait_for_open<F: IntoFuture>(
     open: F,
     slow_after: Duration,
@@ -973,6 +971,59 @@ async fn wait_for_open<F: IntoFuture>(
         "SurrealDB open is slow; still waiting"
     );
     tokio::time::timeout(limit - slow_after, open).await
+}
+
+/// The runtime every SurrealDB handle in this process is opened on. SurrealDB runs a
+/// handle's router, and the tasks that answer its requests, on the runtime that opened it,
+/// and the process keeps one handle per store for its whole life. A handle opened on a
+/// short-lived runtime (a command's, a test's, the structural indexer's) stopped answering
+/// once that runtime shut down, and one opened on a current-thread runtime stalled whenever
+/// nothing was driving that runtime. This runtime is never shut down.
+fn surreal_runtime() -> Result<&'static tokio::runtime::Runtime, StoreError> {
+    static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .thread_name("aether-surreal")
+                .enable_all()
+                .build()
+                .map_err(|err| format!("failed to initialize SurrealDB tokio runtime: {err}"))
+        })
+        .as_ref()
+        .map_err(|err| StoreError::Graph(err.clone()))
+}
+
+/// How many times a new session's first request is sent before "Session not found" is
+/// returned. One retry always suffices (see [`retry_until_session_registered`]).
+const SESSION_REGISTRATION_ATTEMPTS: usize = 3;
+
+/// Sends a new session's first request, and sends it again if it reached SurrealDB before
+/// the session did.
+///
+/// SurrealDB 3.0 registers a new session (a new handle, or a clone of one) on one channel
+/// and takes requests on another. Its router reads the session channel first, but when its
+/// thread is preempted between reading the two channels, a request sent right after its
+/// session can get there first and fail with "Session not found". The router reads every
+/// waiting session message before it takes another request, so the session is registered by
+/// the time the retry arrives.
+async fn retry_until_session_registered<T, E, F, Fut>(mut request: F) -> Result<T, E>
+where
+    E: std::fmt::Display,
+    F: FnMut() -> Fut,
+    Fut: IntoFuture<Output = Result<T, E>>,
+{
+    let mut attempt = 1;
+    loop {
+        match request().await {
+            Err(err)
+                if attempt < SESSION_REGISTRATION_ATTEMPTS
+                    && err.to_string().contains("Session not found") =>
+            {
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
 }
 
 fn surreal_handle_cache() -> &'static Mutex<HashMap<std::path::PathBuf, Surreal<Db>>> {
@@ -1039,7 +1090,8 @@ impl GraphStore for SurrealGraphStore {
         let language = symbol.language.clone();
         let signature_fingerprint = symbol.signature_fingerprint.clone();
         let last_seen_at = symbol.last_seen_at;
-        self.db
+        let mut response = self
+            .db
             .query(
                 r#"
                 UPSERT symbol SET
@@ -1052,7 +1104,8 @@ impl GraphStore for SurrealGraphStore {
                     signature_fingerprint = $signature_fingerprint,
                     last_seen_at = $last_seen_at,
                     updated_at = time::now()
-                WHERE symbol_id = $symbol_id;
+                WHERE symbol_id = $symbol_id
+                RETURN VALUE symbol_id;
                 "#,
             )
             .bind(("symbol_id", symbol_id))
@@ -1064,7 +1117,24 @@ impl GraphStore for SurrealGraphStore {
             .bind(("signature_fingerprint", signature_fingerprint))
             .bind(("last_seen_at", last_seen_at))
             .await
+            .and_then(|response| response.check())
             .map_err(|err| StoreError::Graph(format!("SurrealDB upsert symbol failed: {err}")))?;
+        let written_ids: Vec<String> = response.take(0).map_err(|err| {
+            StoreError::Graph(format!(
+                "SurrealDB upsert symbol result decode failed: {err}"
+            ))
+        })?;
+        // SurrealDB can filter an invalid new row in a conditional UPSERT and
+        // return an empty successful result. Receipt of the query is not proof
+        // that the requested node was written.
+        if written_ids.len() != 1
+            || written_ids.first().map(String::as_str) != Some(symbol.id.as_str())
+        {
+            return Err(StoreError::Graph(format!(
+                "SurrealDB upsert symbol {} produced no unique matching node",
+                symbol.id
+            )));
+        }
         Ok(())
     }
 
@@ -1082,20 +1152,21 @@ impl GraphStore for SurrealGraphStore {
         self.db
             .query(
                 r#"
+                BEGIN TRANSACTION;
                 LET $srcs = (SELECT VALUE id FROM symbol WHERE symbol_id = $source_id LIMIT 1);
                 LET $dsts = (SELECT VALUE id FROM symbol WHERE symbol_id = $target_id LIMIT 1);
                 LET $src = array::first($srcs);
                 LET $dst = array::first($dsts);
-                IF $src = NONE OR $dst = NONE {
-                    RETURN NONE;
+                IF $src != NONE AND $dst != NONE {
+                    DELETE depends_on WHERE in = $src AND out = $dst AND file_path = $file_path AND edge_kind = $edge_kind;
+                    RELATE $src->depends_on->$dst SET
+                        edge_kind = $edge_kind,
+                        file_path = $file_path,
+                        source_symbol_id = $source_id,
+                        target_symbol_id = $target_id,
+                        weight = 1.0;
                 };
-                DELETE depends_on WHERE in = $src AND out = $dst AND file_path = $file_path AND edge_kind = $edge_kind;
-                RELATE $src->depends_on->$dst SET
-                    edge_kind = $edge_kind,
-                    file_path = $file_path,
-                    source_symbol_id = $source_id,
-                    target_symbol_id = $target_id,
-                    weight = 1.0;
+                COMMIT TRANSACTION;
                 "#,
             )
             .bind(("source_id", source_id))
@@ -1103,6 +1174,7 @@ impl GraphStore for SurrealGraphStore {
             .bind(("file_path", file_path))
             .bind(("edge_kind", edge_kind))
             .await
+            .and_then(|response| response.check())
             .map_err(|err| StoreError::Graph(format!("SurrealDB upsert edge failed: {err}")))?;
         Ok(())
     }
@@ -1278,7 +1350,7 @@ impl GraphStore for SurrealGraphStore {
             return Ok(Vec::new());
         }
 
-        let mut min_depth = HashMap::<String, u32>::new();
+        let mut min_depth = HashMap::<String, u32>::from([(symbol_id.to_owned(), 0)]);
         let mut frontier = BTreeSet::<String>::new();
         frontier.insert(symbol_id.to_owned());
 
@@ -1298,14 +1370,17 @@ impl GraphStore for SurrealGraphStore {
             let mut next = BTreeSet::<String>::new();
             for edge in edges {
                 let target = edge.target_id;
-                let entry = min_depth.entry(target.clone()).or_insert(current_depth);
-                if *entry == current_depth {
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    min_depth.entry(target.clone())
+                {
+                    entry.insert(current_depth);
                     next.insert(target);
                 }
             }
             frontier = next;
         }
 
+        min_depth.remove(symbol_id);
         if min_depth.is_empty() {
             return Ok(Vec::new());
         }
@@ -1376,6 +1451,7 @@ impl GraphStore for SurrealGraphStore {
             .query("DELETE depends_on WHERE file_path = $file_path;")
             .bind(("file_path", file_path))
             .await
+            .and_then(|response| response.check())
             .map_err(|err| StoreError::Graph(format!("SurrealDB delete edges failed: {err}")))?;
         Ok(())
     }
@@ -1677,6 +1753,147 @@ mod tests {
         SurrealGraphStore::open(workspace.join("sub").join(".."))
             .await
             .expect("open the same store through another spelling");
+    }
+
+    fn current_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime")
+    }
+
+    #[test]
+    fn a_store_still_answers_after_the_runtime_that_opened_it_shuts_down() {
+        // The process keeps one handle per store. Commands, tests and the structural indexer
+        // open stores on runtimes of their own; once the first opener's runtime shut down,
+        // every later open of that store failed with "Failed to send command".
+        let temp = tempdir().expect("tempdir");
+        let first = current_thread_runtime();
+        let graph = first
+            .block_on(SurrealGraphStore::open(temp.path()))
+            .expect("first open");
+        first
+            .block_on(graph.upsert_symbol_node(&symbol("sym-a", "a", "src/lib.rs")))
+            .expect("write");
+        drop(graph);
+        drop(first);
+
+        let second = current_thread_runtime();
+        let graph = second
+            .block_on(SurrealGraphStore::open(temp.path()))
+            .expect("open after the first runtime shut down");
+        assert_eq!(
+            second
+                .block_on(graph.list_all_symbol_ids())
+                .expect("read after the first runtime shut down"),
+            vec!["sym-a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_store_answers_while_the_runtime_that_opened_it_is_idle() {
+        // A current-thread runtime runs its tasks only inside `block_on`. A handle opened on
+        // one stalled every other runtime's requests while that runtime sat idle.
+        let temp = tempdir().expect("tempdir");
+        let opener = current_thread_runtime();
+        opener
+            .block_on(SurrealGraphStore::open(temp.path()))
+            .expect("first open");
+
+        let other = current_thread_runtime();
+        let graph = other
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    SurrealGraphStore::open(temp.path()),
+                )
+                .await
+            })
+            .expect("open from another runtime does not stall")
+            .expect("open from another runtime");
+        other
+            .block_on(graph.list_all_symbol_ids())
+            .expect("read from another runtime");
+        drop(opener);
+    }
+
+    #[tokio::test]
+    async fn a_request_that_beats_its_session_is_sent_again() {
+        let mut sent = 0;
+        let result: Result<&str, String> = retry_until_session_registered(|| {
+            sent += 1;
+            let first = sent == 1;
+            async move {
+                if first {
+                    Err("Session not found: 4f1c2a9e-0d55-4c1e-9a43-5d3f0b8e2c71".to_owned())
+                } else {
+                    Ok("namespace set")
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(result, Ok("namespace set"));
+        assert_eq!(sent, 2);
+    }
+
+    #[tokio::test]
+    async fn other_errors_and_a_missing_session_are_returned() {
+        let mut sent = 0;
+        let result: Result<(), String> = retry_until_session_registered(|| {
+            sent += 1;
+            async { Err("Failed to send command: sending into a closed channel".to_owned()) }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(sent, 1, "only a missing session is retried");
+
+        let mut sent = 0;
+        let result: Result<(), String> = retry_until_session_registered(|| {
+            sent += 1;
+            async { Err("Session not found: 4f1c2a9e-0d55-4c1e-9a43-5d3f0b8e2c71".to_owned()) }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(sent, SESSION_REGISTRATION_ATTEMPTS);
+    }
+
+    /// The race needs SurrealDB's router thread to be preempted between reading its two
+    /// channels, so no test can force it. Pinned to one core (`taskset -c 0 cargo test -p
+    /// aether-store --lib new_sessions -- --ignored`), these first requests failed with
+    /// "Session not found" about five times per run without the retry.
+    #[test]
+    #[ignore = "stress test; pin it to one core to make the race likely"]
+    fn new_sessions_survive_racing_the_router() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let db = runtime
+            .block_on(Surreal::new::<SurrealKv>(temp.path().join("graph")).into_future())
+            .expect("open SurrealKV");
+        // Define the namespace once: concurrent first definitions conflict on their own.
+        runtime
+            .block_on(retry_until_session_registered(|| {
+                db.use_ns("aether").use_db("graph")
+            }))
+            .expect("define the namespace");
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..2_000 {
+                        let session = db.clone();
+                        runtime
+                            .block_on(retry_until_session_registered(|| {
+                                session.use_ns("aether").use_db("graph")
+                            }))
+                            .expect("first request on a new session");
+                    }
+                });
+            }
+        });
     }
 
     fn symbol(id: &str, qualified_name: &str, file_path: &str) -> SymbolRecord {
@@ -2094,3 +2311,7 @@ mod tests {
         assert!(edges.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "tests/surreal_correctness.rs"]
+mod correctness_tests;
