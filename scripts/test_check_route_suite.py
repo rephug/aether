@@ -134,6 +134,12 @@ class RouteSuiteTest(unittest.TestCase):
         self.assertIn("wrong_page_mapping", self.codes(result))
         self.assertIn("provider_unverified", self.codes(result))
 
+    def test_encoded_provider_media_path_cannot_validate_a_consumer(self):
+        self.write("site/agents.html", '<img src="/assets/agents.svg%3Fretired">')
+        result = self.check()
+        self.assertIn("wrong_page_media", self.codes(result))
+        self.assertIn("provider_unverified", self.codes(result))
+
     def test_provider_extra_media_and_changed_asset_fail(self):
         self.write("site/agents.html", '<img src="/assets/agents.svg"><img src="/wrong.svg">')
         self.assertIn("unexpected_page_media", self.codes(self.check()))
