@@ -9,6 +9,47 @@ permissions:
   contents: read
 
 jobs:
+  route-artifacts:
+    name: test-route-artifacts
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Test offline route checker
+        run: python3 -B -m unittest discover -s scripts -p 'test_check_route_artifacts.py'
+      - name: Test offline benchmark helpers
+        run: python3 -B -m unittest discover -s scripts/benchmarks -p 'test_*.py'
+
+  verification:
+    name: test-${{ matrix.crate }}-verification
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [aetherd, aether-mcp]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: clippy
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler mold clang
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.crate }}-verification
+      - name: Lint and test verification feature
+        env:
+          PROTOC: /usr/bin/protoc
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          cargo clippy -p ${{ matrix.crate }} --features verification --all-targets -- -D warnings
+          cargo test -p ${{ matrix.crate }} --features verification
+
   fmt:
     name: fmt
     runs-on: ubuntu-24.04

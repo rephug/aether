@@ -39,7 +39,8 @@ const LAYER_ORDER: [&str; 6] = ["source", "sir", "graph", "health", "reasoning",
 pub struct AetherSirContextRequest {
     /// Symbol ID or qualified name selector
     pub symbol: String,
-    /// Maximum token budget (default 8000)
+    /// Maximum estimated tokens in the serialized MCP tool result (UTF-8 bytes / 4, default 8000).
+    /// This is an estimate, not a provider tokenizer count.
     pub max_tokens: Option<usize>,
     /// Output format: "markdown" (default) or "json"
     pub format: Option<String>,
@@ -48,13 +49,17 @@ pub struct AetherSirContextRequest {
     pub include_layers: Option<Vec<String>>,
     /// Dependency traversal depth (1-3, default 1)
     pub depth: Option<u32>,
+    /// Also include layer bodies alongside the assembled context (default false).
+    /// Enable for clients that need the legacy duplicated layer payload.
+    pub include_layer_content: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SirContextLayer {
     /// Layer name (e.g., "source", "sir", "graph")
     pub name: String,
-    /// Layer content
+    /// Layer content, included only when include_layer_content is true.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub content: String,
     /// Approximate token count for this layer
     pub token_estimate: usize,
@@ -73,7 +78,8 @@ pub struct AetherSirContextResponse {
     pub context: String,
     /// Individual layers with their token estimates
     pub layers: Vec<SirContextLayer>,
-    /// Total estimated tokens used
+    /// Estimated tokens in the MCP tool result, including text and structured content
+    /// (UTF-8 bytes / 4, rounded up; excludes the JSON-RPC envelope).
     pub total_tokens: usize,
     /// Token budget remaining
     pub budget_remaining: usize,
@@ -96,7 +102,7 @@ struct GraphEntry {
 }
 
 fn estimate_tokens(content: &str) -> usize {
-    content.len() / CHARS_PER_TOKEN
+    content.len().div_ceil(CHARS_PER_TOKEN)
 }
 
 fn parse_context_format(raw: Option<&str>) -> Result<ContextFormat, AetherMcpError> {
@@ -244,7 +250,7 @@ fn allocation_for_layer(layer: &str, max_tokens: usize) -> usize {
         "tests" => 10,
         _ => 0,
     };
-    ((max_tokens * weight) / 100).max(1)
+    ((max_tokens.saturating_mul(weight)) / 100).max(1)
 }
 
 fn trim_layers_to_budget(layers: Vec<SirContextLayer>, max_tokens: usize) -> Vec<SirContextLayer> {
@@ -798,7 +804,11 @@ fn build_health_layer(server: &AetherMcpServer, record: &SymbolRecord) -> String
     };
 
     let report = runtime.block_on(async {
-        if server.state.config.storage.graph_backend == GraphBackend::Surreal {
+        if server.state.read_only {
+            analyzer
+                .analyze_with_handles(&request, server.state.store.as_ref(), None)
+                .await
+        } else if server.state.config.storage.graph_backend == GraphBackend::Surreal {
             match server.state.surreal_graph_for_health().await {
                 Ok(graph) => analyzer.analyze_with_graph(&request, graph.as_ref()).await,
                 Err(_) => analyzer.analyze(&request).await,
@@ -898,6 +908,97 @@ fn render_json_context(
     serde_json::to_string_pretty(&Value::Object(object)).map_err(Into::into)
 }
 
+fn response_for_layers(
+    record: &SymbolRecord,
+    freshness: &str,
+    layers: &[SirContextLayer],
+    format: ContextFormat,
+    include_layer_content: bool,
+    max_tokens: usize,
+) -> Result<AetherSirContextResponse, AetherMcpError> {
+    let mut response = AetherSirContextResponse {
+        symbol_id: record.id.clone(),
+        qualified_name: record.qualified_name.clone(),
+        file_path: record.file_path.clone(),
+        freshness: freshness.to_owned(),
+        context: String::new(),
+        layers: layers.to_vec(),
+        total_tokens: 0,
+        budget_remaining: 0,
+    };
+    if !include_layer_content {
+        for layer in &mut response.layers {
+            layer.content.clear();
+        }
+    }
+    // Include JSON escaping, headings, metadata and usage fields. A conservative
+    // fixed point accounts for the digits in the usage fields themselves.
+    for _ in 0..8 {
+        response.budget_remaining = max_tokens.saturating_sub(response.total_tokens);
+        response.context = match format {
+            ContextFormat::Markdown => render_markdown_context(record, freshness, layers),
+            ContextFormat::Json => render_json_context(
+                record,
+                freshness,
+                layers,
+                response.total_tokens,
+                response.budget_remaining,
+            )?,
+        };
+        let tool_result = rmcp::model::CallToolResult::structured(serde_json::to_value(&response)?);
+        let measured = estimate_tokens(&serde_json::to_string(&tool_result)?);
+        if measured <= response.total_tokens {
+            return Ok(response);
+        }
+        response.total_tokens = measured;
+    }
+    Err(AetherMcpError::Message(
+        "context size estimate did not converge".to_owned(),
+    ))
+}
+
+fn fit_response_to_budget(
+    record: &SymbolRecord,
+    freshness: &str,
+    layers: Vec<SirContextLayer>,
+    format: ContextFormat,
+    include_layer_content: bool,
+    max_tokens: usize,
+) -> Result<AetherSirContextResponse, AetherMcpError> {
+    let mut layers = trim_layers_to_budget(layers, max_tokens);
+    loop {
+        let response = response_for_layers(
+            record,
+            freshness,
+            &layers,
+            format,
+            include_layer_content,
+            max_tokens,
+        )?;
+        if response.total_tokens <= max_tokens {
+            return Ok(response);
+        }
+        let Some(layer) = layers
+            .iter_mut()
+            .filter(|layer| !layer.content.is_empty())
+            .max_by_key(|layer| layer.content.len())
+        else {
+            return Err(AetherMcpError::Message(format!(
+                "max_tokens is too small for context metadata; use at least {} estimated tokens",
+                response.total_tokens
+            )));
+        };
+        // Escaped MCP content can occupy several times its source length. Scale
+        // down rather than subtracting wire bytes from source bytes, which could
+        // discard the whole layer even when a useful excerpt fits.
+        let target_bytes = ((layer.content.len() as u128 * max_tokens as u128)
+            / response.total_tokens as u128) as usize;
+        let target_bytes = target_bytes.min(layer.content.len().saturating_sub(CHARS_PER_TOKEN));
+        layer.content = middle_truncate(&layer.content, target_bytes / CHARS_PER_TOKEN);
+        layer.token_estimate = estimate_tokens(&layer.content);
+    }
+}
+
 impl AetherMcpServer {
     pub fn aether_sir_context_logic(
         &self,
@@ -934,30 +1035,15 @@ impl AetherMcpServer {
             });
         }
 
-        let layers = trim_layers_to_budget(layers, max_tokens);
-        let total_tokens = layers
-            .iter()
-            .map(|layer| layer.token_estimate)
-            .sum::<usize>();
-        let budget_remaining = max_tokens.saturating_sub(total_tokens);
         let freshness = symbol_freshness_note(self.workspace(), store, &record);
-        let context = match format {
-            ContextFormat::Markdown => render_markdown_context(&record, &freshness, &layers),
-            ContextFormat::Json => {
-                render_json_context(&record, &freshness, &layers, total_tokens, budget_remaining)?
-            }
-        };
-
-        Ok(AetherSirContextResponse {
-            symbol_id: record.id,
-            qualified_name: record.qualified_name,
-            file_path: record.file_path,
-            freshness,
-            context,
+        fit_response_to_budget(
+            &record,
+            &freshness,
             layers,
-            total_tokens,
-            budget_remaining,
-        })
+            format,
+            request.include_layer_content.unwrap_or(false),
+            max_tokens,
+        )
     }
 }
 
@@ -1559,6 +1645,7 @@ vector_backend = "sqlite"
                 format: None,
                 include_layers: None,
                 depth: Some(2),
+                include_layer_content: Some(true),
             },
         );
 
@@ -1595,6 +1682,114 @@ vector_backend = "sqlite"
     }
 
     #[test]
+    fn default_context_payload_has_one_body_and_budgets_the_mcp_result() {
+        use rmcp::handler::server::tool::IntoCallToolResult;
+
+        let temp = tempdir().expect("tempdir");
+        let symbols = seed_workspace(temp.path(), false);
+        let target = symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "target")
+            .expect("target");
+        let server = AetherMcpServer::new(temp.path(), false).expect("server");
+        let request: AetherSirContextRequest = serde_json::from_value(serde_json::json!({
+            "symbol": target.id, "max_tokens": 2000, "include_layers": ["sir"]
+        }))
+        .expect("default request");
+        let response = server.aether_sir_context_logic(request).expect("context");
+        let value = serde_json::to_value(&response).expect("response json");
+        assert!(
+            value["context"]
+                .as_str()
+                .expect("context")
+                .contains("target intent summary")
+        );
+        assert!(value["layers"][0].get("content").is_none());
+        assert_eq!(value["layers"][0]["name"], "sir");
+        let result = rmcp::Json(response.clone())
+            .into_call_tool_result()
+            .expect("SDK tool result");
+        let wire = serde_json::to_string(&result).expect("tool result");
+        assert!(
+            response
+                .total_tokens
+                .abs_diff(super::estimate_tokens(&wire))
+                <= 1
+        );
+        assert!(response.total_tokens <= 2000);
+        assert_eq!(response.budget_remaining, 2000 - response.total_tokens);
+    }
+
+    #[test]
+    fn budget_includes_escaping_metadata_and_optional_legacy_layers() {
+        let record = SymbolRecord {
+            id: "0123456789abcdef".repeat(4),
+            file_path: "src/unicode.rs".to_owned(),
+            qualified_name: "example::quoted".to_owned(),
+            language: "rust".to_owned(),
+            kind: "function".to_owned(),
+            signature_fingerprint: "hash".to_owned(),
+            last_seen_at: 0,
+        };
+        let content = "quoted \"text\" \\ path\n東京 😀 ".repeat(500);
+        let layers = vec![super::SirContextLayer {
+            name: "source".to_owned(),
+            token_estimate: super::estimate_tokens(&content),
+            content,
+        }];
+        for format in [super::ContextFormat::Markdown, super::ContextFormat::Json] {
+            for include_bodies in [false, true] {
+                for budget in [600, 1500] {
+                    let freshness = "Freshness unknown: \"snapshot\" 東京 😀".repeat(2);
+                    let response = super::fit_response_to_budget(
+                        &record,
+                        &freshness,
+                        layers.clone(),
+                        format,
+                        include_bodies,
+                        budget,
+                    )
+                    .expect("fit context");
+                    assert_eq!(response.freshness, freshness);
+                    let result = rmcp::model::CallToolResult::structured(
+                        serde_json::to_value(&response).expect("response"),
+                    );
+                    let wire = serde_json::to_string(&result).expect("wire");
+                    assert!(wire.len() <= budget * super::CHARS_PER_TOKEN);
+                    assert!(
+                        response
+                            .total_tokens
+                            .abs_diff(super::estimate_tokens(&wire))
+                            <= 1
+                    );
+                    assert_eq!(response.budget_remaining, budget - response.total_tokens);
+                    assert!(response.context.contains("truncated"));
+                    if format == super::ContextFormat::Json {
+                        let context = serde_json::from_str::<Value>(&response.context)
+                            .expect("valid JSON after trimming");
+                        assert_eq!(context["freshness"], freshness);
+                    } else {
+                        assert!(response.context.contains(&freshness));
+                    }
+                }
+            }
+        }
+        assert!(
+            super::fit_response_to_budget(
+                &record,
+                "freshness unknown",
+                layers,
+                super::ContextFormat::Markdown,
+                false,
+                1
+            )
+            .expect_err("cannot fit metadata")
+            .to_string()
+            .contains("too small")
+        );
+    }
+
+    #[test]
     fn token_budget_trimming_truncates_large_source() {
         let temp = tempdir().expect("tempdir");
         let symbols = seed_workspace(temp.path(), true);
@@ -1608,10 +1803,11 @@ vector_backend = "sqlite"
             &server,
             AetherSirContextRequest {
                 symbol: target.qualified_name.clone(),
-                max_tokens: Some(120),
+                max_tokens: Some(800),
                 format: None,
                 include_layers: Some(vec!["source".to_owned(), "sir".to_owned()]),
                 depth: Some(1),
+                include_layer_content: Some(true),
             },
         );
 
@@ -1621,7 +1817,7 @@ vector_backend = "sqlite"
             .find(|layer| layer.name == "source")
             .expect("source layer");
         assert!(source_layer.content.contains("[... truncated ...]"));
-        assert!(response.total_tokens <= 120 || response.budget_remaining == 0);
+        assert!(response.total_tokens <= 800);
     }
 
     #[test]
@@ -1642,6 +1838,7 @@ vector_backend = "sqlite"
                 format: None,
                 include_layers: Some(vec!["sir".to_owned(), "reasoning".to_owned()]),
                 depth: None,
+                include_layer_content: Some(true),
             },
         );
 
@@ -1674,6 +1871,7 @@ vector_backend = "sqlite"
                 format: Some("json".to_owned()),
                 include_layers: Some(vec!["source".to_owned(), "sir".to_owned()]),
                 depth: None,
+                include_layer_content: Some(true),
             },
         );
 
@@ -1699,6 +1897,7 @@ vector_backend = "sqlite"
                 format: None,
                 include_layers: None,
                 depth: None,
+                include_layer_content: Some(true),
             })
             .expect_err("missing symbol should fail");
         assert!(err.to_string().contains("symbol not found"));
@@ -1721,6 +1920,7 @@ vector_backend = "sqlite"
                 format: Some("text".to_owned()),
                 include_layers: None,
                 depth: None,
+                include_layer_content: Some(true),
             })
             .expect_err("invalid format should fail");
         assert!(invalid_format.to_string().contains("invalid format"));
@@ -1732,6 +1932,7 @@ vector_backend = "sqlite"
                 format: None,
                 include_layers: Some(vec!["memory".to_owned()]),
                 depth: None,
+                include_layer_content: Some(true),
             })
             .expect_err("invalid layer should fail");
         assert!(invalid_layer.to_string().contains("invalid layer"));
@@ -1743,6 +1944,7 @@ vector_backend = "sqlite"
                 format: None,
                 include_layers: None,
                 depth: Some(4),
+                include_layer_content: Some(true),
             })
             .expect_err("invalid depth should fail");
         assert!(

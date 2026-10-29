@@ -1,6 +1,6 @@
 use super::{
-    GET_SIR_GUIDANCE, STATUS_GUIDANCE, TemplateContext, VerificationStep, required_actions,
-    search_modes_line, verification_step, verify_commands_markdown,
+    TemplateContext, recommended_actions, required_actions, search_modes_line,
+    verification_guidance, verify_commands_markdown,
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -8,43 +8,23 @@ pub struct SkillTemplate;
 
 impl SkillTemplate {
     pub fn render(context: &TemplateContext) -> String {
-        // With no verify commands there is nothing to run, so the workflow says so instead
-        // of asking for a step no one can take.
-        let (verify_step, skip_anti_pattern) = match verification_step(context) {
-            VerificationStep::Tool => (
-                format!(
-                    "- Run `aether_verify` before completing the task. It runs these commands:\n{}",
-                    verify_commands_markdown(context)
-                ),
-                "\n- Do not skip verification on modified code paths.",
-            ),
-            VerificationStep::Commands => (
-                format!(
-                    "- Run the project's verify commands before completing the task:\n{}",
-                    verify_commands_markdown(context)
-                ),
-                "\n- Do not skip verification on modified code paths.",
-            ),
-            VerificationStep::None => (
-                "- No verify commands are configured (`[verify] commands` in \
-                 `.aether/config.toml`), so this workflow has no verification step to run."
-                    .to_owned(),
-                "",
-            ),
-        };
         let required = required_actions(context)
             .iter()
             .map(|line| format!("- {line}"))
             .collect::<Vec<_>>()
             .join("\n");
+        let optional = recommended_actions(context)
+            .iter()
+            .map(|line| format!("- {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         format!(
-            "---\nname: aether-context\ndescription: \"Code intelligence workflow for AETHER-indexed projects. Use before modifying, refactoring, or reviewing unfamiliar code.\"\n---\n\n# AETHER Code Intelligence Workflow\n\n## When to activate\n- Any task involving code modification, refactoring, or review\n- Onboarding to unfamiliar modules or symbols\n- Investigating why code changed recently\n- Tracing dependencies before making risky edits\n\n## Workflow: Orient -> Discover -> Understand -> Modify -> Verify\n\n### 1. Orient\n- {}\n\n### 2. Discover\n- Use `aether_search` in the best available mode for this project.\n- Available search modes: {}\n\n### 3. Understand\n- {}\n- Call `aether_symbol_timeline` for recent change history.\n- Call `aether_call_chain` when blast radius is unclear.\n\n### 4. Modify\n- Preserve intended side effects and dependency contracts from SIR.\n- Avoid silent behavior changes in error handling paths.\n\n### 5. Verify\n{}\n\n## Required safety rules\n{}\n\n## Anti-patterns to avoid\n- Do not guess side effects when `aether_get_sir` can confirm them.\n- Do not revert recent edits without checking why they were made: `git log` holds the reasons, and `aether_why_changed` shows how the SIR changed.\n- Do not assume semantic search is available when embeddings are disabled.{}\n",
-            STATUS_GUIDANCE,
+            "---\nname: aether-context\ndescription: \"Optional code intelligence evidence for AETHER-indexed projects.\"\n---\n\n# AETHER Code Intelligence Workflow\n\n## When to use\n- Exploring unfamiliar code or recorded history with available AETHER tools\n- An explicitly requested AETHER audit or annotation workflow\n\n## Workflow: Orient -> Discover -> Understand -> Modify -> Verify\n\n### 1. Orient\nInspect current source, Git state and project instructions. Optional status diagnostics cannot prove index freshness or completeness.\n\n### 2. Discover\nUse ordinary repository search and any useful advertised AETHER tools. Available search modes by configuration: {}\n\n### 3. Understand\nCompare annotation/history evidence with current source, callers and relevant tests; distinguish recorded reasons from generated descriptions.\n\n### 4. Modify\nPreserve intended behavior established by source, tests and recorded contracts. Annotation writes belong to explicitly requested workflows with writable tools.\n\n### 5. Verify\n{}\nPreferred configured commands:\n{}\n\n## Required repository checks\n{}\n\n## Optional AETHER guidance\n{}\n\n## Anti-patterns to avoid\n- Do not infer full dependency coverage from missing edges or status counts.\n- Do not present a SIR difference as a recorded design reason.\n- Do not assume semantic search is available from configuration alone.\n- Report blocked validation and its limits.\n",
             search_modes_line(context),
-            GET_SIR_GUIDANCE,
-            verify_step,
+            verification_guidance(context),
+            verify_commands_markdown(context),
             required,
-            skip_anti_pattern
+            optional,
         )
     }
 }

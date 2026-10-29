@@ -1,0 +1,24 @@
+{
+  "asset_sha256": {
+    "assets/agents.svg": "1bcb11e36e467ec5c1ef19483887d84830fcf693a84aaeef4d8063cf869f8662"
+  },
+  "manifest": "route-manifest.json",
+  "routes": [
+    {
+      "aliases": [
+        "/realtor"
+      ],
+      "canonical": "/agents",
+      "entrypoints": [
+        {
+          "path": "index.html"
+        }
+      ],
+      "media": [
+        "assets/agents.svg"
+      ],
+      "page": "agents.html"
+    }
+  ],
+  "version": 1
+}

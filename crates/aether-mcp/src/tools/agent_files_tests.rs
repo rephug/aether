@@ -38,6 +38,7 @@ fn context() -> TemplateContext {
         mcp_binary_hint: "./target/debug/aether-mcp".to_owned(),
         // What `init-agent` sets from the same build's features.
         verification_tool: cfg!(feature = "verification"),
+        mcp_tools_arg: None,
     }
 }
 

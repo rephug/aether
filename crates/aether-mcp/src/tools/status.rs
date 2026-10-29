@@ -1,5 +1,6 @@
 use aether_core::normalize_path;
 use aether_store::LanguageCallEdgeCoverage;
+use aether_store::RetirementCleanupStore;
 use aetherd::freshness::{FreshnessVerdict, IndexFreshness, assess_index_freshness};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,10 @@ pub struct AetherStatusResponse {
     pub symbol_count: i64,
     pub sir_count: i64,
     pub sir_coverage: SirCoverageStats,
+    /// External retirement backlog only. Unavailable means unknown; an empty
+    /// backlog does not establish that all graph/vector projections are fresh.
+    #[serde(default)]
+    pub retirement_cleanup: serde_json::Value,
     /// How far the index has drifted from the workspace. Read `freshness.summary` before
     /// trusting any other tool's output.
     pub freshness: AetherIndexFreshness,
@@ -287,8 +292,57 @@ impl AetherMcpServer {
             symbol_count,
             sir_count,
             sir_coverage,
+            retirement_cleanup: serde_json::to_value(
+                self.state.store.retirement_cleanup_summary(5)?,
+            )?,
             freshness,
             call_graph,
         })
+    }
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+    use aether_config::{
+        AetherConfig, EmbeddingVectorBackend, GraphBackend, save_workspace_config,
+    };
+    use aether_store::{SqliteStore, SymbolCatalogStore, SymbolRecord};
+    use std::sync::Arc;
+
+    #[test]
+    fn readonly_status_exposes_pending_cleanup_without_attempting_repair() -> anyhow::Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let mut config = AetherConfig::default();
+        config.storage.graph_backend = GraphBackend::Surreal;
+        config.embeddings.vector_backend = EmbeddingVectorBackend::Sqlite;
+        config.embeddings.enabled = false;
+        save_workspace_config(workspace.path(), &config)?;
+        let writer = SqliteStore::open(workspace.path())?;
+        writer.upsert_symbol(SymbolRecord {
+            id: "retired".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            language: "rust".to_owned(),
+            kind: "function".to_owned(),
+            qualified_name: "retired".to_owned(),
+            signature_fingerprint: "fixture".to_owned(),
+            last_seen_at: 1,
+        })?;
+        writer.mark_removed("retired")?;
+        let before = writer.retirement_cleanup_summary(10)?;
+        let state = Arc::new(crate::SharedState::open_readonly(workspace.path())?);
+        let server = AetherMcpServer::from_state(state, false);
+        let response = server.aether_status_logic()?;
+        let payload = serde_json::to_value(&response)?;
+        assert!(payload["freshness"]["summary"].is_string());
+        assert!(payload["call_graph"]["rule"].is_string());
+        assert!(payload["retirement_cleanup"].is_object());
+        assert_eq!(
+            response.retirement_cleanup["pending_graph"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(writer.retirement_cleanup_summary(10)?, before);
+        assert!(!workspace.path().join(".aether/graph").exists());
+        Ok(())
     }
 }

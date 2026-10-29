@@ -1,5 +1,12 @@
 use super::*;
 
+pub(super) struct ReconciliationEffects {
+    migrated_count: usize,
+    pruned_count: usize,
+    mirror_writes: Vec<(String, String)>,
+    mirror_deletes: Vec<String>,
+}
+
 fn normalize_symbol_ids(symbol_ids: &[String]) -> Vec<String> {
     let mut normalized = symbol_ids
         .iter()
@@ -44,7 +51,7 @@ fn delete_symbol_embeddings_batch(
     }
     Ok(())
 }
-fn delete_symbol_fully(tx: &Transaction<'_>, symbol_id: &str) -> Result<(), StoreError> {
+fn delete_symbol_active_records(tx: &Transaction<'_>, symbol_id: &str) -> Result<(), StoreError> {
     let symbol_id = symbol_id.trim();
     if symbol_id.is_empty() {
         return Ok(());
@@ -96,6 +103,8 @@ fn move_intent_contract_records(
 fn delete_symbol_records_for_ids(
     tx: &Transaction<'_>,
     symbol_ids: &[String],
+    backends: retirement_cleanup::RetirementBackends,
+    store: &SqliteStore,
 ) -> Result<(), StoreError> {
     let normalized = normalize_symbol_ids(symbol_ids);
     if normalized.is_empty() {
@@ -103,7 +112,14 @@ fn delete_symbol_records_for_ids(
     }
 
     for symbol_id in &normalized {
-        delete_symbol_fully(tx, symbol_id)?;
+        history::archive_symbol_tx(
+            tx,
+            symbol_id,
+            "snapshot_prune",
+            backends,
+            store.sir_blob_path(symbol_id).as_deref(),
+        )?;
+        delete_symbol_active_records(tx, symbol_id)?;
     }
 
     Ok(())
@@ -155,121 +171,245 @@ impl SqliteStore {
         tx.commit()?;
         Ok(())
     }
+    /// Atomically publish current declarations, transfer annotations and lineage,
+    /// retire old identities, and persist projection cleanup obligations. Mirrors
+    /// are best-effort after commit; SQLite remains authoritative on restart.
+    pub fn publish_and_reconcile_symbols(
+        &self,
+        records: &[SymbolRecord],
+        migrations: &[(String, String)],
+        prunes: &[String],
+    ) -> Result<(usize, usize), StoreError> {
+        self.reconcile_symbols(records, migrations, prunes, true)
+    }
+
+    /// Compatibility entry point for callers that already registered their rows.
+    /// It retains the previous metadata-status behavior.
     pub fn reconcile_and_prune(
         &self,
         migrations: &[(String, String)],
         prunes: &[String],
     ) -> Result<(usize, usize), StoreError> {
-        let migrations = normalize_reconcile_pairs(migrations);
-        let prunes = normalize_symbol_ids(prunes);
-        if migrations.is_empty() && prunes.is_empty() {
+        self.reconcile_symbols(&[], migrations, prunes, false)
+    }
+
+    fn reconcile_symbols(
+        &self,
+        records: &[SymbolRecord],
+        migrations: &[(String, String)],
+        prunes: &[String],
+        stale_migrations: bool,
+    ) -> Result<(usize, usize), StoreError> {
+        if records.is_empty() && migrations.is_empty() && prunes.is_empty() {
             return Ok((0, 0));
         }
+        let effects = {
+            let conn = self.conn.lock().unwrap_or_else(|error| error.into_inner());
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+            let effects =
+                self.reconcile_symbols_tx(&tx, records, migrations, prunes, stale_migrations)?;
+            tx.commit()?;
+            effects
+        };
+        let counts = (effects.migrated_count, effects.pruned_count);
+        self.finish_reconciliation_mirrors(effects);
+        Ok(counts)
+    }
 
+    /// All canonical changes belong to the caller's one transaction. Keeping this
+    /// separate from post-commit mirrors also permits real process-exit tests at
+    /// both durable boundaries without production failure-injection controls.
+    pub(super) fn reconcile_symbols_tx(
+        &self,
+        tx: &Transaction<'_>,
+        records: &[SymbolRecord],
+        migrations: &[(String, String)],
+        prunes: &[String],
+        stale_migrations: bool,
+    ) -> Result<ReconciliationEffects, StoreError> {
+        let migrations = normalize_reconcile_pairs(migrations);
+        let prunes = normalize_symbol_ids(prunes);
+        let mut old_ids = HashSet::new();
+        let mut new_ids = HashSet::new();
+        for (old_id, new_id) in &migrations {
+            if !old_ids.insert(old_id.clone()) || !new_ids.insert(new_id.clone()) {
+                return Err(StoreError::Compatibility(
+                    "symbol reconciliation requires one-to-one migration candidates".to_owned(),
+                ));
+            }
+        }
+        if old_ids.iter().any(|id| new_ids.contains(id))
+            || prunes
+                .iter()
+                .any(|id| old_ids.contains(id) || new_ids.contains(id))
+        {
+            return Err(StoreError::Compatibility(
+                "symbol reconciliation candidates must not overlap or be pruned".to_owned(),
+            ));
+        }
+
+        let mut record_ids = HashSet::new();
+        for record in records {
+            if record.id.trim().is_empty()
+                || !record_ids.insert(record.id.as_str())
+                || old_ids.contains(&record.id)
+                || prunes.contains(&record.id)
+            {
+                return Err(StoreError::Compatibility(
+                    "publication requires unique current IDs disjoint from retired IDs".to_owned(),
+                ));
+            }
+        }
+        symbols::upsert_symbols_tx(tx, records)?;
         let mut mirror_writes = Vec::<(String, String)>::new();
         let mut mirror_deletes = Vec::<String>::new();
+        let mut migrated_count = 0usize;
 
-        let (migrated_count, pruned_count) = {
-            let conn = self.conn.lock().unwrap();
-            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
-            let mut migrated_count = 0usize;
+        for (old_id, new_id) in &migrations {
+            let Some(old_access) = load_symbol_access_state(tx, old_id)? else {
+                continue;
+            };
+            let Some(new_access) = load_symbol_access_state(tx, new_id)? else {
+                return Err(StoreError::Compatibility(format!(
+                    "reconciliation target symbol missing from symbols table: {new_id}"
+                )));
+            };
 
-            for (old_id, new_id) in &migrations {
-                let Some(old_access) = load_symbol_access_state(&tx, old_id)? else {
-                    continue;
+            let identity =
+                |id: &str| -> Result<(String, String, String, String, String), StoreError> {
+                    tx.query_row(
+                    "SELECT file_path, language, kind, qualified_name, signature_fingerprint FROM symbols WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                ).map_err(Into::into)
                 };
-                let Some(new_access) = load_symbol_access_state(&tx, new_id)? else {
-                    return Err(StoreError::Compatibility(format!(
-                        "reconciliation target symbol missing from symbols table: {new_id}"
-                    )));
-                };
+            let old_identity = identity(old_id)?;
+            let new_identity = identity(new_id)?;
+            if old_identity.0 != new_identity.0
+                || old_identity.1 != new_identity.1
+                || old_identity.2 != new_identity.2
+                || old_identity.3 != new_identity.3
+                || old_identity.4 == new_identity.4
+            {
+                return Err(StoreError::Compatibility(format!(
+                    "symbol reconciliation is limited to changed-signature candidates sharing file, language, kind and qualified name: {old_id} -> {new_id}"
+                )));
+            }
+            // Preserve original attribution before contract moves and before
+            // either history branch can be discarded by conflict resolution.
+            let retirement_id = history::archive_symbol_tx(
+                tx,
+                old_id,
+                "signature_change_candidate",
+                self.retirement_backends,
+                self.sir_blob_path(old_id).as_deref(),
+            )?
+            .ok_or_else(|| {
+                StoreError::Compatibility(format!("missing retirement evidence for {old_id}"))
+            })?;
+            history::record_signature_lineage_tx(tx, retirement_id, old_id, new_id)?;
 
-                let old_sir = load_sir_row_state(&tx, old_id)?;
-                let new_sir = load_sir_row_state(&tx, new_id)?;
+            let old_sir = load_sir_row_state(tx, old_id)?;
+            let new_sir = load_sir_row_state(tx, new_id)?;
 
-                let move_current_sir = match (old_sir.as_ref(), new_sir.as_ref()) {
-                    (Some(_), None) => true,
-                    (Some(old_row), Some(new_row)) if old_row.updated_at > new_row.updated_at => {
-                        tracing::warn!(
-                            old_id = %old_id,
-                            new_id = %new_id,
-                            old_updated_at = old_row.updated_at,
-                            new_updated_at = new_row.updated_at,
-                            "reconciliation conflict: migrated older target SIR to newer symbol ID"
-                        );
-                        true
-                    }
-                    (Some(old_row), Some(new_row)) => {
-                        tracing::warn!(
-                            old_id = %old_id,
-                            new_id = %new_id,
-                            old_updated_at = old_row.updated_at,
-                            new_updated_at = new_row.updated_at,
-                            "reconciliation conflict: keeping target SIR and discarding stale branch history"
-                        );
-                        false
-                    }
-                    (None, _) => false,
-                };
-
-                let mut old_history = load_sir_history_transfer_records(&tx, old_id)?;
-                if old_history.is_empty()
-                    && let Some(row) = old_sir.as_ref()
-                {
-                    old_history.push(SirHistoryTransferRecord {
-                        sir_hash: row.sir_hash.clone(),
-                        provider: row.provider.clone(),
-                        model: row.model.clone(),
-                        created_at: row.updated_at.max(0),
-                        sir_json: row.sir_json.clone().unwrap_or_default(),
-                        commit_hash: None,
-                    });
-                }
-
-                let append_old_history = new_sir.is_none() || move_current_sir;
-                let mut latest_migrated_version = None::<i64>;
-                if append_old_history && !old_history.is_empty() {
-                    let base_version = load_max_sir_history_version(&tx, new_id)?;
-                    latest_migrated_version =
-                        append_sir_history_records(&tx, new_id, base_version, &old_history)?;
-                }
-
-                if move_current_sir && let Some(row) = old_sir.as_ref() {
-                    let sir_version =
-                        latest_migrated_version.unwrap_or_else(|| row.sir_version.max(1));
-                    upsert_sir_row_state(&tx, new_id, row, sir_version)?;
-                    if let Some(sir_json) = row.sir_json.as_ref() {
-                        mirror_writes.push((new_id.clone(), sir_json.clone()));
-                    }
-                }
-
-                let merged_access = merge_symbol_access_state(new_access, old_access);
-                update_symbol_access_state(&tx, new_id, &merged_access)?;
-                let (moved_contracts, moved_violations) =
-                    move_intent_contract_records(&tx, old_id, new_id)?;
-                if moved_contracts > 0 || moved_violations > 0 {
-                    tracing::info!(
+            let move_current_sir = match (old_sir.as_ref(), new_sir.as_ref()) {
+                (Some(_), None) => true,
+                (Some(old_row), Some(new_row)) if old_row.updated_at > new_row.updated_at => {
+                    tracing::warn!(
                         old_id = %old_id,
                         new_id = %new_id,
-                        contracts = moved_contracts,
-                        violations = moved_violations,
-                        "reconciliation moved intent contracts to new symbol ID"
+                        old_updated_at = old_row.updated_at,
+                        new_updated_at = new_row.updated_at,
+                        "reconciliation conflict: migrated older target SIR to newer symbol ID"
                     );
+                    true
                 }
-                delete_symbol_records_for_ids(&tx, std::slice::from_ref(old_id))?;
-                mirror_deletes.push(old_id.clone());
-                migrated_count += 1;
+                (Some(old_row), Some(new_row)) => {
+                    tracing::warn!(
+                        old_id = %old_id,
+                        new_id = %new_id,
+                        old_updated_at = old_row.updated_at,
+                        new_updated_at = new_row.updated_at,
+                        "reconciliation conflict: keeping target SIR and discarding stale branch history"
+                    );
+                    false
+                }
+                (None, _) => false,
+            };
+
+            let mut old_history = load_sir_history_transfer_records(tx, old_id)?;
+            if old_history.is_empty()
+                && let Some(row) = old_sir.as_ref()
+            {
+                old_history.push(SirHistoryTransferRecord {
+                    sir_hash: row.sir_hash.clone(),
+                    provider: row.provider.clone(),
+                    model: row.model.clone(),
+                    created_at: row.updated_at.max(0),
+                    sir_json: row.sir_json.clone().unwrap_or_default(),
+                    commit_hash: None,
+                });
             }
 
-            for chunk in prunes.chunks(RECONCILE_PARAM_CHUNK) {
-                delete_symbol_records_for_ids(&tx, chunk)?;
-                mirror_deletes.extend(chunk.iter().cloned());
+            let append_old_history = new_sir.is_none() || move_current_sir;
+            let mut latest_migrated_version = None::<i64>;
+            if append_old_history && !old_history.is_empty() {
+                let base_version = load_max_sir_history_version(tx, new_id)?;
+                latest_migrated_version =
+                    append_sir_history_records(tx, new_id, base_version, &old_history)?;
             }
 
-            tx.commit()?;
-            (migrated_count, prunes.len())
-        };
+            if move_current_sir && let Some(row) = old_sir.as_ref() {
+                let sir_version = latest_migrated_version.unwrap_or_else(|| row.sir_version.max(1));
+                upsert_sir_row_state(tx, new_id, row, sir_version)?;
+                if let Some(sir_json) = row.sir_json.as_ref() {
+                    mirror_writes.push((new_id.clone(), sir_json.clone()));
+                }
+            }
 
+            let merged_access = merge_symbol_access_state(new_access, old_access);
+            update_symbol_access_state(tx, new_id, &merged_access)?;
+            let (moved_contracts, moved_violations) =
+                move_intent_contract_records(tx, old_id, new_id)?;
+            if moved_contracts > 0 || moved_violations > 0 {
+                tracing::info!(
+                    old_id = %old_id,
+                    new_id = %new_id,
+                    contracts = moved_contracts,
+                    violations = moved_violations,
+                    "reconciliation moved intent contracts to new symbol ID"
+                );
+            }
+            if stale_migrations {
+                tx.execute(
+                    "UPDATE sir SET sir_status='stale' WHERE id=?1 AND LOWER(TRIM(sir_status)) IN ('fresh','ready')",
+                    [new_id],
+                )?;
+            }
+            delete_symbol_active_records(tx, old_id)?;
+            mirror_deletes.push(old_id.clone());
+            migrated_count += 1;
+        }
+
+        for chunk in prunes.chunks(RECONCILE_PARAM_CHUNK) {
+            delete_symbol_records_for_ids(tx, chunk, self.retirement_backends, self)?;
+            mirror_deletes.extend(chunk.iter().cloned());
+        }
+
+        Ok(ReconciliationEffects {
+            migrated_count,
+            pruned_count: prunes.len(),
+            mirror_writes,
+            mirror_deletes,
+        })
+    }
+
+    fn finish_reconciliation_mirrors(&self, effects: ReconciliationEffects) {
+        let ReconciliationEffects {
+            mirror_writes,
+            mirror_deletes,
+            ..
+        } = effects;
         let mut deleted = HashSet::new();
         for symbol_id in mirror_deletes {
             if !deleted.insert(symbol_id.clone()) {
@@ -309,8 +449,6 @@ impl SqliteStore {
                 }
             }
         }
-
-        Ok((migrated_count, pruned_count))
     }
     pub(crate) fn store_mark_removed(&self, symbol_id: &str) -> Result<(), StoreError> {
         let symbol_id = symbol_id.trim();
@@ -320,7 +458,14 @@ impl SqliteStore {
         {
             let conn = self.conn.lock().unwrap();
             let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
-            delete_symbol_fully(&tx, symbol_id)?;
+            history::archive_symbol_tx(
+                &tx,
+                symbol_id,
+                "removed",
+                self.retirement_backends,
+                self.sir_blob_path(symbol_id).as_deref(),
+            )?;
+            delete_symbol_active_records(&tx, symbol_id)?;
             tx.commit()?;
         }
 

@@ -20,17 +20,20 @@ use serde_json::from_str as json_from_str;
 use thiserror::Error;
 mod analysis;
 mod audit;
+mod audit_history;
 mod contracts;
 mod embeddings;
 mod fingerprint_history;
 mod freshness;
 mod graph;
 mod graph_coverage;
+mod history;
 mod language_family;
 mod lexical;
 mod lifecycle;
 mod name_resolution;
 mod project_notes;
+mod retirement_cleanup;
 mod schema;
 mod seismograph;
 mod sir_history;
@@ -58,14 +61,16 @@ pub use graph_cozo_compat::CozoGraphStore; // #[deprecated]
 pub use graph_sqlite::SqliteGraphStore;
 pub use graph_surreal::{SURREALKV_SIZING_ENV, SurrealGraphStore, set_surrealkv_sizing_env};
 pub use vector::{
-    LanceVectorStore, ProjectNoteVectorRecord, ProjectNoteVectorSearchResult, SqliteVectorStore,
-    VectorEmbeddingMetaRecord, VectorRecord, VectorSearchResult, VectorStore, open_vector_store,
+    LanceRetirementCleanup, LanceVectorStore, ProjectNoteVectorRecord,
+    ProjectNoteVectorSearchResult, SqliteVectorStore, VectorEmbeddingMetaRecord, VectorRecord,
+    VectorSearchResult, VectorStore, open_vector_store,
 };
 
 pub use analysis::{
     CommunitySnapshotRecord, CouplingMiningStateRecord, DriftAnalysisStateRecord, DriftResultRecord,
 };
 pub use audit::{AuditFinding, AuditFindingFilters, AuditSeverityCounts, NewAuditFinding};
+pub use audit_history::{RetiredAuditDisclosure, RetiredAuditFinding};
 pub use contracts::{IntentContractRecord, IntentViolationRecord};
 pub use embeddings::{SemanticSearchResult, SymbolEmbeddingMetaRecord, SymbolEmbeddingRecord};
 pub use fingerprint_history::SirFingerprintHistoryRecord;
@@ -76,6 +81,10 @@ pub use graph::{
     UpstreamDependencyNodeRecord, UpstreamDependencyTraversal,
 };
 pub use graph_coverage::{CallEdgeCoverage, LanguageCallEdgeCoverage};
+pub use history::{
+    ArchivedEvidence, SymbolHistoryStore, SymbolLineageRecord, SymbolRetirementRecord,
+    SymbolRetirementSummary,
+};
 pub use language_family::{
     EDGE_FILE_LANGUAGE_CTE, edge_source_family_matches_sql, same_language_family_sql,
 };
@@ -87,13 +96,17 @@ pub use project_notes::{
     ProjectEntityRefRecord, ProjectNoteEmbeddingRecord, ProjectNoteRecord,
     ProjectNoteSemanticSearchResult,
 };
+pub use retirement_cleanup::{
+    RetirementCleanupOutcome, RetirementCleanupRecord, RetirementCleanupStatus,
+    RetirementCleanupStore, RetirementCleanupSummary, RetirementProjection,
+};
 pub use schema::SchemaVersion;
 pub use seismograph::{
     AftershockModelRecord, CascadeRecord, CommunityStabilityRecord, SeismographMetricRecord,
 };
 pub use sir_history::{
-    SirHistoryBaselineSelector, SirHistoryRecord, SirHistoryResolvedPair, SirHistorySelector,
-    SirVersionWriteResult,
+    SirHistoryBaselineSelector, SirHistoryMetadataRecord, SirHistoryRecord, SirHistoryResolvedPair,
+    SirHistorySelector, SirVersionWriteResult,
 };
 pub use sir_meta::{SirIdentity, SirMetaRecord, SirRowSnapshot};
 pub use snapshots::{IntentSnapshot, IntentSnapshotSummary, SnapshotEntry};
@@ -116,6 +129,13 @@ pub(crate) use symbols::{
 };
 
 const SYMBOL_ACCESS_COUNTER_MAX: i64 = i64::MAX;
+/// Highest core schema supported by this build. Read-only clients may open older
+/// schemas; writable opening performs transactional forward migrations.
+pub const CORE_SCHEMA_VERSION: u32 = 23;
+/// First core schema with explicit per-incarnation history archives.
+pub const SYMBOL_HISTORY_SCHEMA_VERSION: u32 = 22;
+/// First core schema with durable retirement projection cleanup receipts.
+pub const RETIREMENT_CLEANUP_SCHEMA_VERSION: u32 = 23;
 const SYMBOL_ACCESS_DEBOUNCE_SECONDS: u64 = 60;
 const SQLITE_PARAM_CHUNK: usize = 900;
 const RECONCILE_PARAM_CHUNK: usize = 500;
@@ -181,6 +201,13 @@ pub trait SirStateStore {
 }
 
 pub trait SirHistoryStore {
+    /// Recent metadata only, newest first; zero returns empty and limits cap at
+    /// 100. This query never selects SIR payload JSON.
+    fn list_recent_sir_history_metadata(
+        &self,
+        symbol_id: &str,
+        limit: u32,
+    ) -> Result<Vec<SirHistoryMetadataRecord>, StoreError>;
     fn list_sir_history(&self, symbol_id: &str) -> Result<Vec<SirHistoryRecord>, StoreError>;
     fn latest_sir_history_pair(
         &self,
@@ -354,6 +381,11 @@ pub trait TestIntentStore {
 }
 
 pub trait AuditStore {
+    /// Global, bounded historical disclosure; independent of active finding filters.
+    fn retired_audit_disclosure(
+        &self,
+        sample_limit: u32,
+    ) -> Result<RetiredAuditDisclosure, StoreError>;
     fn insert_audit_finding(&self, record: NewAuditFinding) -> Result<i64, StoreError>;
     fn query_audit_findings(
         &self,
@@ -371,6 +403,8 @@ pub trait Store:
     + SymbolRelationStore
     + SirStateStore
     + SirHistoryStore
+    + SymbolHistoryStore
+    + RetirementCleanupStore
     + SnapshotStore
     + SemanticIndexStore
     + ThresholdStore
@@ -388,6 +422,8 @@ impl<T> Store for T where
         + SymbolRelationStore
         + SirStateStore
         + SirHistoryStore
+        + SymbolHistoryStore
+        + RetirementCleanupStore
         + SnapshotStore
         + SemanticIndexStore
         + ThresholdStore
@@ -550,6 +586,7 @@ pub struct SqliteStore {
     aether_dir: PathBuf,
     sir_dir: PathBuf,
     mirror_sir_files: bool,
+    retirement_backends: retirement_cleanup::RetirementBackends,
     symbol_access_debounce: Mutex<HashMap<String, Instant>>,
 }
 
@@ -575,13 +612,19 @@ impl SqliteStore {
         let sir_dir = aether_dir.join("sir");
         let sqlite_path = aether_dir.join("meta.sqlite");
 
-        if !read_only {
+        if !read_only && !sqlite_path.exists() {
             fs::create_dir_all(&sir_dir)?;
         }
 
         let conn = Connection::open_with_flags(sqlite_path, flags)?;
         conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        // Refuse unknown schemas before changing journal mode or creating missing
+        // artifact directories. Migration repeats this check under its writer
+        // transaction to close races with another upgrading process.
+        let core_version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        schema::ensure_supported_core_version(core_version)?;
         if !read_only {
+            fs::create_dir_all(&sir_dir)?;
             configure_wal(&conn, SQLITE_BUSY_TIMEOUT)?;
             run_migrations(&conn)?;
         }
@@ -594,6 +637,7 @@ impl SqliteStore {
             aether_dir,
             sir_dir,
             mirror_sir_files: config.storage.mirror_sir_files,
+            retirement_backends: retirement_cleanup::RetirementBackends::from_config(&config),
             symbol_access_debounce: Mutex::new(HashMap::new()),
         })
     }
@@ -690,6 +734,14 @@ impl SirStateStore for SqliteStore {
 }
 
 impl SirHistoryStore for SqliteStore {
+    fn list_recent_sir_history_metadata(
+        &self,
+        symbol_id: &str,
+        limit: u32,
+    ) -> Result<Vec<SirHistoryMetadataRecord>, StoreError> {
+        self.store_list_recent_sir_history_metadata(symbol_id, limit)
+    }
+
     fn list_sir_history(&self, symbol_id: &str) -> Result<Vec<SirHistoryRecord>, StoreError> {
         self.store_list_sir_history(symbol_id)
     }
@@ -764,6 +816,18 @@ impl SnapshotStore for SqliteStore {
 }
 
 impl AuditStore for SqliteStore {
+    fn retired_audit_disclosure(
+        &self,
+        sample_limit: u32,
+    ) -> Result<RetiredAuditDisclosure, StoreError> {
+        let conn = self.conn.lock().map_err(|_| {
+            StoreError::Compatibility(
+                "store lock poisoned while disclosing retired audits".to_owned(),
+            )
+        })?;
+        audit_history::read_retired_audits(&conn, sample_limit)
+    }
+
     fn insert_audit_finding(&self, record: NewAuditFinding) -> Result<i64, StoreError> {
         self.store_insert_audit_finding(record)
     }

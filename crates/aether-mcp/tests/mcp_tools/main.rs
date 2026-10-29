@@ -398,6 +398,9 @@ mod call_coverage;
 mod core_tools;
 mod graph_tools;
 mod memory_audit;
+mod profile;
 mod refactor_verify;
 mod search_history;
 mod sir_inject;
+
+mod audit_retirement;

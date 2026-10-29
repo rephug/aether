@@ -279,7 +279,7 @@ impl SqliteStore {
         );
 
         let mut params_vec = patterns.into_iter().map(SqlValue::Text).collect::<Vec<_>>();
-        params_vec.push(SqlValue::Integer(i64::from(limit.clamp(1, 100))));
+        params_vec.push(SqlValue::Integer(i64::from(limit.clamp(1, 200))));
 
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(sql.as_str())?;
@@ -545,34 +545,7 @@ impl SqliteStore {
         }
         let conn = self.conn.lock().unwrap();
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
-        {
-            let mut upsert = tx.prepare(
-                r#"
-                INSERT INTO symbols (
-                    id, file_path, language, kind, qualified_name, signature_fingerprint,
-                    last_seen_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                ON CONFLICT(id) DO UPDATE SET
-                    file_path = excluded.file_path,
-                    language = excluded.language,
-                    kind = excluded.kind,
-                    qualified_name = excluded.qualified_name,
-                    signature_fingerprint = excluded.signature_fingerprint,
-                    last_seen_at = excluded.last_seen_at
-                "#,
-            )?;
-            for record in records {
-                upsert.execute(params![
-                    record.id,
-                    record.file_path,
-                    record.language,
-                    record.kind,
-                    record.qualified_name,
-                    record.signature_fingerprint,
-                    record.last_seen_at,
-                ])?;
-            }
-        }
+        upsert_symbols_tx(&tx, records)?;
         tx.commit()?;
         Ok(())
     }
@@ -768,4 +741,38 @@ impl SqliteStore {
 
         self.increment_symbol_access(symbol_ids_to_increment.as_slice(), accessed_at)
     }
+}
+
+/// Reuse the catalog write inside canonical retirement publication.
+pub(super) fn upsert_symbols_tx(
+    tx: &Transaction<'_>,
+    records: &[SymbolRecord],
+) -> Result<(), StoreError> {
+    let mut upsert = tx.prepare(
+        r#"
+        INSERT INTO symbols (
+            id, file_path, language, kind, qualified_name, signature_fingerprint,
+            last_seen_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(id) DO UPDATE SET
+            file_path = excluded.file_path,
+            language = excluded.language,
+            kind = excluded.kind,
+            qualified_name = excluded.qualified_name,
+            signature_fingerprint = excluded.signature_fingerprint,
+            last_seen_at = excluded.last_seen_at
+        "#,
+    )?;
+    for record in records {
+        upsert.execute(params![
+            record.id,
+            record.file_path,
+            record.language,
+            record.kind,
+            record.qualified_name,
+            record.signature_fingerprint,
+            record.last_seen_at,
+        ])?;
+    }
+    Ok(())
 }

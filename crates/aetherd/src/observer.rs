@@ -38,6 +38,15 @@ struct FileSnapshot {
     symbols: Vec<Symbol>,
 }
 
+/// Opaque acknowledgement checkpoint for one in-flight watcher path.
+pub(crate) struct PathCheckpoint {
+    relative: PathBuf,
+    snapshot: Option<FileSnapshot>,
+    blocked: Option<crate::indexing_gaps::BlockedSource>,
+    unread: bool,
+    oversized: bool,
+}
+
 pub struct ObserverState {
     workspace: PathBuf,
     extractor: SymbolExtractor,
@@ -46,6 +55,7 @@ pub struct ObserverState {
     /// directories whose walk failed (`""`: the whole workspace). Their absence from the
     /// snapshot says nothing about the symbols stored for them.
     unread_paths: Vec<String>,
+    blocked_sources: Vec<crate::indexing_gaps::BlockedSource>,
     /// When the last `seed_from_disk` started reading the workspace (unix seconds; 0
     /// before any). The snapshot cannot speak for a store row written after it.
     seeded_at: i64,
@@ -75,6 +85,7 @@ impl ObserverState {
             extractor: SymbolExtractor::new()?,
             snapshots: HashMap::new(),
             unread_paths: Vec::new(),
+            blocked_sources: Vec::new(),
             seeded_at: 0,
             seeded_at_millis: 0,
             seeded_head: None,
@@ -110,6 +121,42 @@ impl ObserverState {
         &self.unread_paths
     }
 
+    pub fn blocked_sources(&self) -> &[crate::indexing_gaps::BlockedSource] {
+        &self.blocked_sources
+    }
+
+    pub(crate) fn quarantine_source(
+        &self,
+        path: &Path,
+    ) -> Option<&crate::indexing_gaps::BlockedSource> {
+        let relative =
+            normalize_path(&relative_workspace_path(&self.workspace, path).to_string_lossy());
+        self.blocked_sources
+            .iter()
+            .find(|blocked| blocked.path == relative)
+    }
+
+    pub(crate) fn quarantine(&mut self, path: &Path, reason: String) {
+        let relative =
+            normalize_path(&relative_workspace_path(&self.workspace, path).to_string_lossy());
+        if let Some(blocked) = self
+            .blocked_sources
+            .iter_mut()
+            .find(|blocked| blocked.path == relative)
+        {
+            blocked.reason = reason;
+        } else {
+            self.blocked_sources
+                .push(crate::indexing_gaps::BlockedSource {
+                    path: relative.clone(),
+                    reason,
+                });
+        }
+        if !self.unread_paths.contains(&relative) {
+            self.unread_paths.push(relative);
+        }
+    }
+
     pub fn seed_from_disk(&mut self) -> Result<()> {
         // Read before the walk: a checkout during it leaves this older than some files read,
         // so the next HEAD change is diffed from here and covers it.
@@ -123,6 +170,8 @@ impl ObserverState {
         self.seeded_at_millis = crate::time::current_unix_timestamp_millis();
         self.seeded_at = self.seeded_at_millis.div_euclid(1000);
         self.unread_paths.clear();
+        self.blocked_sources.clear();
+        self.snapshots.clear();
         for entry in WalkBuilder::new(&self.workspace)
             .standard_filters(true)
             .build()
@@ -183,18 +232,70 @@ impl ObserverState {
                 }
             };
 
-            let symbols = self
+            let symbols = match self
                 .extractor
                 .extract_from_source(language, &display_path, &source)
-                .with_context(|| {
-                    format!("failed to extract symbols from {}", full_path.display())
-                })?;
+            {
+                Ok(symbols) => symbols,
+                Err(error) if error.is::<aether_parse::DuplicateSymbolIdentity>() => {
+                    tracing::warn!(path = %display_path, error = %error,
+                        "quarantined source identity collision; stored rows are preserved");
+                    self.blocked_sources
+                        .push(crate::indexing_gaps::BlockedSource {
+                            path: display_path.clone(),
+                            reason: error.to_string(),
+                        });
+                    self.unread_paths.push(display_path);
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to extract symbols from {}", full_path.display())
+                    });
+                }
+            };
 
             self.snapshots
                 .insert(relative, FileSnapshot { language, symbols });
         }
 
         Ok(())
+    }
+
+    pub(crate) fn checkpoint_path(&self, path: &Path) -> PathCheckpoint {
+        let relative = relative_workspace_path(&self.workspace, path);
+        let display = normalize_path(&relative.to_string_lossy());
+        PathCheckpoint {
+            snapshot: self.snapshots.get(&relative).cloned(),
+            blocked: self.quarantine_source(path).cloned(),
+            unread: self.unread_paths.contains(&display),
+            oversized: self.oversized.contains(&relative),
+            relative,
+        }
+    }
+
+    /// A failed persist must be diffed again against the last acknowledged source.
+    /// Replaying an already-committed transaction is harmless and also retries
+    /// projection work that may have failed after canonical publication.
+    pub(crate) fn restore_path(&mut self, checkpoint: PathCheckpoint) {
+        let display = normalize_path(&checkpoint.relative.to_string_lossy());
+        self.snapshots.remove(&checkpoint.relative);
+        if let Some(snapshot) = checkpoint.snapshot {
+            self.snapshots.insert(checkpoint.relative.clone(), snapshot);
+        }
+        self.blocked_sources
+            .retain(|blocked| blocked.path != display);
+        if let Some(blocked) = checkpoint.blocked {
+            self.blocked_sources.push(blocked);
+        }
+        self.unread_paths.retain(|path| path != &display);
+        if checkpoint.unread {
+            self.unread_paths.push(display);
+        }
+        self.oversized.remove(&checkpoint.relative);
+        if checkpoint.oversized {
+            self.oversized.insert(checkpoint.relative);
+        }
     }
 
     pub fn process_path(&mut self, path: &Path) -> Result<Option<SymbolChangeEvent>> {
@@ -239,12 +340,24 @@ impl ObserverState {
             }
 
             match fs::read_to_string(path) {
-                Ok(source) => self
-                    .extractor
-                    .extract_from_source(language, &display_path, &source)
-                    .with_context(|| {
-                        format!("failed to extract symbols from {}", path.display())
-                    })?,
+                Ok(source) => {
+                    match self
+                        .extractor
+                        .extract_from_source(language, &display_path, &source)
+                    {
+                        Ok(symbols) => symbols,
+                        Err(error) if error.is::<aether_parse::DuplicateSymbolIdentity>() => {
+                            tracing::warn!(path = %display_path, error = %error, "quarantined changed source; prior snapshot and stored rows retained");
+                            self.quarantine(path, error.to_string());
+                            return Ok(None);
+                        }
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!("failed to extract symbols from {}", path.display())
+                            });
+                        }
+                    }
+                }
                 Err(err) if err.kind() == ErrorKind::NotFound => Vec::new(),
                 Err(err) => {
                     return Err(err).with_context(|| {
@@ -255,6 +368,12 @@ impl ObserverState {
         } else {
             Vec::new()
         };
+
+        if self.quarantine_source(path).is_some() {
+            self.blocked_sources
+                .retain(|blocked| blocked.path != display_path);
+            self.unread_paths.retain(|unread| unread != &display_path);
+        }
 
         let previous_symbols = previous
             .as_ref()

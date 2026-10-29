@@ -22,7 +22,7 @@ impl CursorRulesTemplate {
             .join("\n");
 
         format!(
-            "# AETHER Cursor Rules\n\nAgent schema version: {}\nInference provider: {}\nMCP binary hint: {}\n\n## Tool reference\n{}\n\n## Workspace context\n- Languages: {}\n- Search modes: {}\n\n## Mandatory directives\n{}\n\n## Recommended directives\n{}\n\n## Staleness guidance\nAfter heavy edit churn, call aether_status again before relying on retrieval output. freshness.modified_files, freshness.deleted_files and freshness.new_files count the source files changed since the last sync; if any is not zero and freshness.daemon_running is false, run aetherd --workspace . --index-once.\n\n## Verify commands\n{}\n",
+            "# AETHER Cursor Rules\n\nAgent schema version: {}\nInference provider: {}\nMCP binary hint: {}\n\n## Tool reference\n{}\n\n## Workspace context\n- Languages: {}\n- Search modes: {}\n\n## Required actions (equivalent checklist)\n{}\n\n## Recommended directives\n{}\n\n## Staleness guidance\nIf available, aether_status supplies diagnostics; counts alone cannot establish freshness or complete dependencies. Compare current source/Git with indexed evidence. When an index refresh is explicitly requested, run aetherd --workspace . --index-once and inspect any errors or omissions.\n\n## Verify commands\n{}\n",
             context.agent_schema_version,
             context.inference_provider,
             context.mcp_binary_hint,

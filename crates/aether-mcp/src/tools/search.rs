@@ -363,6 +363,10 @@ impl AetherSearchResponse {
             fallback_reason,
             matches,
         } = envelope;
+        // Candidate retrieval can be wider than the requested result count
+        // when reranking is enabled, including on a degraded lexical path.
+        let mut matches = matches;
+        matches.truncate(limit as usize);
         let result_count = matches.len() as u32;
 
         Self {
@@ -764,7 +768,11 @@ impl AetherMcpServer {
                     return Ok(Vec::new());
                 }
 
-                let matches = store.search_symbols(query.as_str(), retrieval_limit)?;
+                let terms = query
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                let matches = store.search_symbols_by_terms(&terms, retrieval_limit)?;
                 Ok(matches
                     .into_iter()
                     .map(AetherSymbolLookupMatch::from)
@@ -852,7 +860,7 @@ impl AetherMcpServer {
                         rerank_window.max(limit).clamp(1, 200)
                     };
                     let fused = fuse_hybrid_matches(&lexical, &semantic, fuse_limit);
-                    let matches = self
+                    let (matches, rerank_fallback_reason) = self
                         .maybe_rerank_hybrid_matches(
                             &request.query,
                             limit,
@@ -864,7 +872,7 @@ impl AetherMcpServer {
                     SearchEnvelope {
                         mode_requested: SearchMode::Hybrid,
                         mode_used: SearchMode::Hybrid,
-                        fallback_reason: None,
+                        fallback_reason: rerank_fallback_reason,
                         matches,
                     }
                 }
@@ -931,6 +939,17 @@ impl AetherMcpServer {
         query: &str,
         limit: u32,
     ) -> Result<(Vec<AetherSymbolLookupMatch>, Option<String>), AetherMcpError> {
+        if self.state.read_only
+            && self.state.config.embeddings.enabled
+            && self.state.vector_store.is_none()
+        {
+            // Opening Lance through the writable migration path is not a read.
+            // Refuse before provider initialization or a query embedding request.
+            return Ok((
+                Vec::new(),
+                Some("configured vector backend is unavailable in read-only mode".to_owned()),
+            ));
+        }
         let sqlite_path = self.sqlite_path();
         if !sqlite_path.exists() {
             return Ok((
@@ -1031,14 +1050,14 @@ impl AetherMcpServer {
         fused_matches: Vec<AetherSymbolLookupMatch>,
         reranker_kind: SearchRerankerKind,
         rerank_window: u32,
-    ) -> Result<Vec<AetherSymbolLookupMatch>, AetherMcpError> {
+    ) -> Result<(Vec<AetherSymbolLookupMatch>, Option<String>), AetherMcpError> {
         if fused_matches.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
 
         let limit = limit.clamp(1, 100) as usize;
         if matches!(reranker_kind, SearchRerankerKind::None) {
-            return Ok(fused_matches.into_iter().take(limit).collect());
+            return Ok((fused_matches.into_iter().take(limit).collect(), None));
         }
 
         let fallback = fused_matches
@@ -1051,10 +1070,20 @@ impl AetherMcpServer {
             RerankerProviderOverrides::default(),
         ) {
             Ok(Some(loaded)) => loaded,
-            Ok(None) => return Ok(fallback),
+            Ok(None) => {
+                return Ok((
+                    fallback,
+                    Some("configured reranker is unavailable; using reciprocal-rank fusion without reranking".to_owned()),
+                ));
+            }
             Err(err) => {
                 tracing::warn!(error = %err, "reranker unavailable, falling back to RRF matches");
-                return Ok(fallback);
+                return Ok((
+                    fallback,
+                    Some(format!(
+                        "reranker unavailable: {err}; using reciprocal-rank fusion without reranking"
+                    )),
+                ));
             }
         };
 
@@ -1068,14 +1097,20 @@ impl AetherMcpServer {
             )
             .await
         {
-            Ok(matches) => Ok(matches),
+            Ok(matches) => Ok((matches, None)),
             Err(err) => {
                 tracing::warn!(
                     provider = %loaded.provider_name,
                     error = %err,
                     "reranker failed, falling back to RRF matches"
                 );
-                Ok(fallback)
+                Ok((
+                    fallback,
+                    Some(format!(
+                        "reranker {} failed: {err}; using reciprocal-rank fusion without reranking",
+                        loaded.provider_name
+                    )),
+                ))
             }
         }
     }
@@ -1239,7 +1274,190 @@ fn fuse_hybrid_matches(
 
     ranked
         .into_iter()
-        .take(limit.clamp(1, 100) as usize)
+        .take(limit.clamp(1, 200) as usize)
         .filter_map(|(symbol_id, _)| by_id.remove(&symbol_id))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use aether_config::{AetherConfig, GraphBackend, save_workspace_config};
+    use aether_infer::MockRerankerProvider;
+    use tempfile::tempdir;
+
+    use super::*;
+
+    fn seed_symbol(store: &SqliteStore, id: &str, name: &str, path: &str) -> anyhow::Result<()> {
+        store.upsert_symbol(SymbolRecord {
+            id: id.to_owned(),
+            qualified_name: name.to_owned(),
+            file_path: path.to_owned(),
+            language: "rust".to_owned(),
+            kind: "function".to_owned(),
+            signature_fingerprint: "signature".to_owned(),
+            last_seen_at: 1,
+        })?;
+        Ok(())
+    }
+
+    fn test_config(workspace: &std::path::Path) -> anyhow::Result<AetherConfig> {
+        let mut config = AetherConfig::default();
+        config.embeddings.enabled = false;
+        config.storage.graph_backend = GraphBackend::Sqlite;
+        save_workspace_config(workspace, &config)?;
+        Ok(config)
+    }
+
+    #[tokio::test]
+    async fn readonly_unavailable_vectors_return_before_loading_a_provider() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let mut config = test_config(temp.path())?;
+        config.embeddings.enabled = true;
+        config.embeddings.vector_backend = aether_config::EmbeddingVectorBackend::Lancedb;
+        save_workspace_config(temp.path(), &config)?;
+        // Create only the catalog. A read-only open must not initialize Lance.
+        let store = SqliteStore::open(temp.path())?;
+        seed_symbol(&store, "candidate", "Auth::login", "src/auth.rs")?;
+        let server = AetherMcpServer::from_state(
+            Arc::new(crate::SharedState::open_readonly(temp.path())?),
+            false,
+        );
+        let (matches, reason) = server.semantic_search_matches("auth", 1).await?;
+        assert!(matches.is_empty());
+        assert_eq!(
+            reason.as_deref(),
+            Some("configured vector backend is unavailable in read-only mode")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ranked_lexical_search_finds_joint_terms_and_honors_result_limit() -> anyhow::Result<()>
+    {
+        let temp = tempdir()?;
+        let mut config = test_config(temp.path())?;
+        config.search.reranker = SearchRerankerKind::Cohere;
+        config.search.rerank_window = 200;
+        save_workspace_config(temp.path(), &config)?;
+        let server = AetherMcpServer::new(temp.path(), false)?;
+        for index in 0..40 {
+            seed_symbol(
+                &server.state.store,
+                &format!("auth-{index:02}"),
+                &format!("Alpha{index:02}::login"),
+                "src/auth.rs",
+            )?;
+            seed_symbol(
+                &server.state.store,
+                &format!("cache-{index:02}"),
+                &format!("Beta{index:02}::refresh"),
+                "src/cache.rs",
+            )?;
+        }
+        seed_symbol(
+            &server.state.store,
+            "both",
+            "Zulu::auth_cache",
+            "src/auth_cache.rs",
+        )?;
+        seed_symbol(
+            &server.state.store,
+            "auth-cache-noise",
+            "Aardvark::other",
+            "src/other.rs",
+        )?;
+        let response = server
+            .aether_search_logic(AetherSearchRequest {
+                query: "auth cache".to_owned(),
+                limit: Some(2),
+                mode: Some(SearchMode::Lexical),
+            })
+            .await?;
+        assert_eq!(response.result_count, 2);
+        assert_eq!(response.matches[0].symbol_id, "both");
+        assert!(
+            response
+                .matches
+                .iter()
+                .all(|row| row.symbol_id != "auth-cache-noise")
+        );
+        assert_eq!(response.fallback_reason, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reranker_can_select_candidate_beyond_the_first_hundred() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        test_config(temp.path())?;
+        let server = AetherMcpServer::new(temp.path(), false)?;
+        for index in 0..150 {
+            seed_symbol(
+                &server.state.store,
+                &format!("candidate-{index:03}"),
+                &format!("Candidate{index:03}::target"),
+                "src/lib.rs",
+            )?;
+        }
+        let lexical = server
+            .state
+            .store
+            .search_symbols_by_terms(&["target".to_owned()], 200)?
+            .into_iter()
+            .map(AetherSymbolLookupMatch::from)
+            .collect::<Vec<_>>();
+        assert_eq!(lexical.len(), 150);
+        let fused = fuse_hybrid_matches(&lexical, &[], 200);
+        assert_eq!(fused.len(), 150);
+        let provider =
+            MockRerankerProvider::new(HashMap::from([("candidate-149".to_owned(), 1.0)]));
+        let ranked = server
+            .rerank_matches_with_provider("target", 1, 200, &fused, &provider)
+            .await?;
+        assert_eq!(ranked[0].symbol_id, "candidate-149");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unavailable_reranker_reports_degraded_fusion_results() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let mut config = test_config(temp.path())?;
+        config.search.reranker = SearchRerankerKind::Cohere;
+        // A unique, absent key name makes the loader fail before any request.
+        config.providers.cohere.api_key_env = format!(
+            "AETHER_TEST_UNSET_RERANKER_KEY_{}_{}",
+            std::process::id(),
+            temp.path()
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
+        save_workspace_config(temp.path(), &config)?;
+        let server = AetherMcpServer::new(temp.path(), false)?;
+        seed_symbol(
+            &server.state.store,
+            "candidate",
+            "Auth::login",
+            "src/auth.rs",
+        )?;
+        let lexical = server.lexical_search_matches("Auth", 1)?;
+        let (matches, fallback_reason) = server
+            .maybe_rerank_hybrid_matches("auth", 1, lexical, SearchRerankerKind::Cohere, 200)
+            .await?;
+        assert_eq!(matches.len(), 1);
+        let reason = fallback_reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("reranker unavailable"));
+        assert!(reason.contains("without reranking"));
+        let response = AetherSearchResponse::from_search_envelope(
+            "auth".to_owned(),
+            1,
+            SearchEnvelope {
+                mode_requested: SearchMode::Hybrid,
+                mode_used: SearchMode::Hybrid,
+                fallback_reason: fallback_reason.clone(),
+                matches,
+            },
+        );
+        assert_eq!(response.fallback_reason, fallback_reason);
+        Ok(())
+    }
 }

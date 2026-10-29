@@ -158,7 +158,7 @@ This is the full list. Not the highlights — everything. If another tool does a
 ### Surfaces
 
 - **33 CLI Commands** — Organized by purpose: intelligence queries, context assembly, presets, contracts, seismograph, batch/continuous, maintenance.
-- **39 MCP Tools** (40 with the `verification` feature) — Structured access for AI agents. Every response includes `schema_version` for forward compatibility.
+- **40 MCP Tools** (41 with the `verification` feature) — Structured access for AI agents. Every response includes `schema_version` for forward compatibility.
 - **40+ Dashboard Pages** — HTMX + D3.js + Tailwind. Seismograph timelines, tectonic plate treemaps, velocity gauges, contract health monitors, blast radius radial trees, force-directed architecture maps, time machine, causal explorer.
 - **VS Code Extension** — Semantic hover intelligence. Status bar. Command palette integration.
 - **Tauri Desktop App** — System tray, onboarding wizard, native installers (MSI/DMG/AppImage/DEB), auto-update.
@@ -249,7 +249,7 @@ Everything in AETHER is a complex workflow built on simple decisions. I didn't n
 
 **327 commits. 109 pull requests. 17 Rust crates. 136,000 lines of code. Five weeks.**
 
-From zero to a semantic intelligence engine with Personalized PageRank, Noisy-OR staleness models, community detection, a three-pass inference pipeline, a continuous intelligence daemon, a batch processing system, a 40-page interactive dashboard, 39 MCP tools, 33 CLI commands, a Seismograph that tracks semantic earthquakes, intent contracts that enforce behavioral expectations, a Tauri desktop app with system tray integration, and a task context engine that uses Reciprocal Rank Fusion to rank every symbol in your codebase by relevance to whatever you're working on.
+From zero to a semantic intelligence engine with Personalized PageRank, Noisy-OR staleness models, community detection, a three-pass inference pipeline, a continuous intelligence daemon, a batch processing system, a 40-page interactive dashboard, 40 MCP tools, 33 CLI commands, a Seismograph that tracks semantic earthquakes, intent contracts that enforce behavioral expectations, a Tauri desktop app with system tray integration, and a task context engine that uses Reciprocal Rank Fusion to rank every symbol in your codebase by relevance to whatever you're working on.
 
 I need to sit down. I'm getting dizzy just reading that back.
 
@@ -283,7 +283,7 @@ Some people hear "vibe coded" and think "toy project." And maybe they're right? 
 - A Seismograph engine with PageRank-weighted EMA semantic velocity, Louvain community stability scoring, time-respecting epicenter tracing, and logistic regression aftershock prediction
 - Intent contracts with a two-stage verification cascade (embedding cosine pre-filter → LLM judge), leaky bucket violation handling, and cross-symbol contract propagation through the enrichment context
 - 40+ dashboard pages with D3 force-directed graphs, interactive architecture maps, seismograph timelines, tectonic plate visualizations, and contract health monitoring
-- 39 MCP tools for AI agent integration (40 with the `verification` feature)
+- 40 MCP tools for AI agent integration (41 with the `verification` feature)
 - 33 CLI commands
 - A Tauri 2.x desktop app with system tray, notifications, onboarding wizard, and auto-update
 - Schema migrations through version 21
@@ -373,7 +373,7 @@ Your code changes
        │
        ▼
   You query it however you want
-  CLI (33 commands) · LSP hover · MCP tools (39) · Dashboard (40+ pages) · Desktop app
+  CLI (33 commands) · LSP hover · MCP tools (40) · Dashboard (40+ pages) · Desktop app
 ```
 
 All of this runs locally. No code leaves your machine unless you choose a cloud inference provider. Run Ollama and AETHER works fully offline with real AI-generated intelligence — no API keys, no cloud calls, nothing phoning home.
@@ -432,6 +432,8 @@ Hook up your AI agent:
 # Register as MCP server for Claude Code
 claude mcp add --transport stdio --scope project aether -- aether-mcp --workspace .
 ```
+
+Add `--tools compact` to serve only the six tools coding agents use most (symbol lookup and search, dependencies, call chain, SIR context, test intents): the tool list then takes a fraction of the context it otherwise adds to every request. See [MCP Tool Profile](docs/CONFIG.md#mcp-tool-profile).
 
 Now your agent has persistent, structured access to your entire codebase's meaning. It doesn't have to re-read files every session. It doesn't have to guess. It *knows*.
 
@@ -646,6 +648,8 @@ The desktop app wraps the same dashboard you get from `aetherd --workspace .` �
 ## The MCP Tools
 
 Register AETHER with any MCP-compatible agent (Claude Code, Codex, etc.) and it gets structured access to everything. 39 tools (40 with the `verification` feature), zero guessing.
+
+Every listed tool sits in the agent's context on every request. `aether-mcp --tools compact` (or `[mcp] tools = "compact"`) lists only `aether_symbol_lookup`, `aether_search`, `aether_dependencies`, `aether_call_chain`, `aether_sir_context` and `aether_test_intents`, in about a twelfth of the space; see [MCP Tool Profile](docs/CONFIG.md#mcp-tool-profile).
 
 ### Search & Lookup
 
@@ -941,7 +945,7 @@ The core difference: they export files. AETHER understands what's in them and ra
 | Batch reindexing | N/A | N/A | Proprietary | N/A | Gemini Batch API (50% off) |
 | Works offline | Yes | No | No | Usually no | Yes — Ollama + Candle |
 | Tracks meaning changes | No | No | No | No | Git-linked SIR versioning |
-| Agent-accessible | No | Not really | Proprietary | Ad hoc | 39 MCP tools |
+| Agent-accessible | No | Not really | Proprietary | Ad hoc | 40 MCP tools |
 | Detects drift | No | No | No | No | Automatic, zero config |
 | Finds root causes | No | No | No | No | Causal chain traversal |
 | Knows what's dangerous | No | No | No | No | PageRank × drift × tests |

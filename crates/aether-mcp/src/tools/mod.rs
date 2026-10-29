@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 
+use aether_config::McpToolProfile;
 use aether_sir::{SirAnnotation, validate_sir};
 use aether_store::{SirMetaRecord, SirStateStore};
 use anyhow::Result;
@@ -15,6 +16,7 @@ use crate::state::SharedState;
 #[cfg(test)]
 mod agent_files_tests;
 mod audit;
+mod audit_history;
 mod callers;
 mod common;
 mod context;
@@ -26,6 +28,8 @@ mod health;
 mod history;
 mod impact;
 mod memory;
+mod preflight;
+mod profile;
 mod refactor;
 mod router;
 mod search;
@@ -38,6 +42,7 @@ mod usage_matrix;
 mod verification;
 
 pub use audit::*;
+pub use audit_history::*;
 pub use context::*;
 pub use contract::*;
 pub use cross_symbol::*;
@@ -47,6 +52,7 @@ pub use health::*;
 pub use history::*;
 pub use impact::*;
 pub use memory::*;
+pub use preflight::*;
 pub use refactor::*;
 pub use search::*;
 pub use sir::*;
@@ -74,6 +80,7 @@ pub(crate) const SIR_STATUS_GENERATING: &str = "generating";
 pub struct AetherMcpServer {
     pub(crate) state: Arc<SharedState>,
     pub(crate) verbose: bool,
+    pub(crate) tool_profile: McpToolProfile,
     pub(crate) tool_router: ToolRouter<Self>,
 }
 
@@ -88,17 +95,26 @@ impl AetherMcpServer {
         Ok(Self::from_state(state, verbose))
     }
 
+    /// A server with the tool profile `[mcp] tools` selects in the workspace config.
     pub fn from_state(state: Arc<SharedState>, verbose: bool) -> Self {
-        let tool_router = Self::tool_router();
-        #[cfg(feature = "verification")]
-        let tool_router =
-            tool_router.with_route((Self::aether_verify_tool_attr(), Self::aether_verify));
-
+        let tool_profile = state.config.mcp.tools;
         Self {
             state,
             verbose,
-            tool_router,
+            tool_profile,
+            tool_router: Self::tool_router_for(tool_profile),
         }
+    }
+
+    /// This server, listing and serving the tools of `profile` instead.
+    pub fn with_tool_profile(mut self, profile: McpToolProfile) -> Self {
+        self.tool_profile = profile;
+        self.tool_router = Self::tool_router_for(profile);
+        self
+    }
+
+    pub fn tool_profile(&self) -> McpToolProfile {
+        self.tool_profile
     }
 
     pub fn workspace(&self) -> &Path {
@@ -182,8 +198,17 @@ impl AetherMcpServer {
     }
 }
 
-pub async fn run_stdio_server(workspace: impl AsRef<Path>, verbose: bool) -> Result<()> {
-    let server = AetherMcpServer::init(workspace, verbose).await?;
+/// Serve MCP over stdio. `tools` overrides the workspace config's `[mcp] tools`.
+pub async fn run_stdio_server(
+    workspace: impl AsRef<Path>,
+    verbose: bool,
+    tools: Option<McpToolProfile>,
+) -> Result<()> {
+    let mut server = AetherMcpServer::init(workspace, verbose).await?;
+    if let Some(profile) = tools {
+        server = server.with_tool_profile(profile);
+    }
+    server.verbose_log(&format!("serving the {} tool profile", server.tool_profile));
     let state = Arc::clone(&server.state);
     let service = server.serve(stdio()).await?;
     // Only after the handshake: a SurrealDB open can outlast a client's startup timeout.

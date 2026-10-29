@@ -8,7 +8,7 @@ pub mod git;
 pub mod secret;
 pub mod test_code;
 
-pub use git::{BlameLine, CommitInfo, GitContext};
+pub use git::{BlameLine, CommitInfo, GitContext, GitHistoryError};
 pub use secret::Secret;
 pub use test_code::{is_test_file, is_test_symbol};
 

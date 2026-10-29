@@ -647,3 +647,108 @@ fn process_event_resolves_python_calls_through_package_reexports() {
         .collect::<Vec<_>>();
     assert_eq!(targets, vec!["pkg.impl::f".to_owned()]);
 }
+
+#[test]
+fn inference_only_no_removal_events_preserve_pending_graph_cleanup() {
+    use aether_config::{
+        AetherConfig, EmbeddingVectorBackend, GraphBackend, save_workspace_config,
+    };
+    use aether_store::{RetirementCleanupStore, RetirementProjection};
+    for use_compatibility_alias in [false, true] {
+        let temp = tempdir().expect("workspace");
+        let workspace = temp.path();
+        let mut config = AetherConfig::default();
+        config.storage.graph_backend = GraphBackend::Surreal;
+        config.embeddings.vector_backend = EmbeddingVectorBackend::Sqlite;
+        config.embeddings.enabled = false;
+        save_workspace_config(workspace, &config).expect("temporary config");
+        fs::create_dir(workspace.join("src")).expect("source dir");
+        fs::write(
+            workspace.join("src/unrelated.rs"),
+            "// unrelated empty source\n",
+        )
+        .expect("source");
+        let store = SqliteStore::open(workspace).expect("store");
+        store
+            .upsert_symbol(demo_symbol_record_with_kind(
+                "retired",
+                "retired",
+                "function",
+                "src/old.rs",
+            ))
+            .expect("old symbol");
+        store.mark_removed("retired").expect("retirement");
+        let before = store
+            .list_pending_retirement_cleanup(10)
+            .expect("pending graph");
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].projection, RetirementProjection::Graph);
+        assert_eq!(before[0].attempts, 0);
+        // A file-level edge from an older version must still be refreshed by
+        // the compatibility alias, which skips only the external graph.
+        store
+            .upsert_edges(&[SymbolEdge {
+                source_id: "file:src/unrelated.rs".to_owned(),
+                target_qualified_name: "StaleDependency".to_owned(),
+                edge_kind: EdgeKind::DependsOn,
+                file_path: "src/unrelated.rs".to_owned(),
+            }])
+            .expect("stale local edge");
+        assert!(
+            !workspace.join(".aether/graph").exists(),
+            "fixture opened Surreal"
+        );
+        let pipeline = SirPipeline::new_with_provider(
+            workspace.to_path_buf(),
+            1,
+            Arc::new(PanicInferenceProvider),
+            "panic",
+            "panic",
+        )
+        .expect("inference-only pipeline");
+        assert!(
+            !workspace.join(".aether/graph").exists(),
+            "constructor opened Surreal"
+        );
+        let pipeline = if use_compatibility_alias {
+            pipeline.with_skip_surreal_sync(true)
+        } else {
+            pipeline.with_skip_graph_sync(true)
+        };
+        let event = SymbolChangeEvent {
+            file_path: "src/unrelated.rs".to_owned(),
+            language: Language::Rust,
+            added: Vec::new(),
+            updated: Vec::new(),
+            removed: Vec::new(),
+        };
+        pipeline
+            .process_event(&store, &event, false, false, &mut Vec::new())
+            .expect("unrelated event");
+        let local_edges = store
+            .list_symbol_edges_for_source_and_kinds("file:src/unrelated.rs", &[EdgeKind::DependsOn])
+            .expect("local edge refresh");
+        assert_eq!(
+            local_edges.len(),
+            usize::from(!use_compatibility_alias),
+            "compatibility alias must refresh SQLite edges; full graph skip must leave them alone"
+        );
+        assert_eq!(
+            store
+                .list_pending_retirement_cleanup(10)
+                .expect("graph remains pending"),
+            before
+        );
+        assert_eq!(
+            store
+                .retirement_cleanup_summary(0)
+                .expect("visible backlog")
+                .pending_graph,
+            1
+        );
+        assert!(
+            !workspace.join(".aether/graph").exists(),
+            "inference-only processing opened Surreal (compatibility alias: {use_compatibility_alias})"
+        );
+    }
+}

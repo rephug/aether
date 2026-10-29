@@ -30,6 +30,19 @@ pub struct TestIntent {
     pub symbol_id: Option<String>,
 }
 
+/// A legal source file contains definitions the current identity scheme cannot
+/// distinguish. Callers may quarantine it without suppressing unrelated errors.
+#[derive(Debug)]
+pub struct DuplicateSymbolIdentity(pub String);
+
+impl std::fmt::Display for DuplicateSymbolIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DuplicateSymbolIdentity {}
+
 pub struct SymbolExtractor {
     registry: LanguageRegistry,
     parsers: HashMap<&'static str, Parser>,
@@ -213,6 +226,20 @@ fn extract_with_config(
 
     let mut symbols = extract_symbols(language, file_path, source_bytes, root, config);
     symbols.sort_by(|a, b| a.id.cmp(&b.id));
+    // C# partial declarations intentionally share an identity. Rust currently has
+    // no representation for distinct definitions with the same ID (e.g. cfg
+    // alternatives), so reject those instead of silently overwriting a record.
+    if language == Language::Rust
+        && let Some(pair) = symbols.windows(2).find(|pair| pair[0].id == pair[1].id)
+    {
+        return Err(DuplicateSymbolIdentity(format!(
+            "duplicate symbol identity in {file_path}: '{}' at lines {} and {} (id {}); refusing to overwrite either definition",
+            pair[0].qualified_name,
+            pair[0].range.start.line,
+            pair[1].range.start.line,
+            pair[0].id,
+        )).into());
+    }
 
     let mut edges = extract_edges(language, file_path, source_bytes, root, config, &symbols);
     if language == Language::Python
@@ -1065,6 +1092,74 @@ mod tests {
             .collect::<Vec<_>>();
         targets.sort();
         targets
+    }
+
+    #[test]
+    fn colliding_rust_trait_implementations_fail_instead_of_overwriting() {
+        let mut extractor = SymbolExtractor::new().expect("extractor");
+        let source = r#"
+struct Worker;
+trait Read { fn run(&self); }
+trait Write { fn run(&self); }
+impl Read for Worker { fn run(&self) {} }
+impl Write for Worker { fn run(&self) {} }
+"#;
+        let error = extractor
+            .extract_with_edges_from_source(Language::Rust, "src/lib.rs", source)
+            .expect_err("trait identity collisions must not overwrite either method");
+        assert!(error.to_string().contains("Worker::run"));
+    }
+
+    #[test]
+    fn inherent_and_trait_methods_with_identical_signatures_are_explicitly_unsupported() {
+        let mut extractor = SymbolExtractor::new().expect("extractor");
+        let source = "struct Worker; trait Run { fn run(&self); } impl Worker { fn run(&self) {} } impl Run for Worker { fn run(&self) {} }";
+        let error = extractor
+            .extract_from_source(Language::Rust, "src/lib.rs", source)
+            .expect_err("legal inherent/trait collision must not overwrite either definition");
+        assert!(error.to_string().contains("Worker::run"));
+    }
+
+    #[test]
+    fn qualified_generic_trait_implementations_are_explicitly_unsupported_when_colliding() {
+        let mut extractor = SymbolExtractor::new().expect("extractor");
+        let source = r#"
+mod io { pub trait Read<T> { fn run(&self); } pub trait Write<T> { fn run(&self); } }
+struct Worker<T>(T);
+impl<T> io::Read<T> for Worker<T> { fn run(&self) {} }
+impl<T> io::Write<T> for Worker<T> { fn run(&self) {} }
+"#;
+        let error = extractor
+            .extract_from_source(Language::Rust, "src/lib.rs", source)
+            .expect_err("qualified generic traits need distinct implementation identities");
+        assert!(error.to_string().contains("duplicate symbol identity"));
+        assert!(error.to_string().contains("run"));
+    }
+
+    #[test]
+    fn cfg_alternatives_with_colliding_identities_are_explicitly_unsupported() {
+        let mut extractor = SymbolExtractor::new().expect("extractor");
+        let source = "#[cfg(unix)] fn platform() {}\n#[cfg(windows)] fn platform() {}";
+        let error = extractor
+            .extract_with_edges_from_source(Language::Rust, "src/lib.rs", source)
+            .expect_err("cfg identity ambiguity must be surfaced");
+        assert!(error.to_string().contains("duplicate symbol identity"));
+    }
+
+    #[test]
+    fn duplicate_symbol_identities_are_rejected_before_indexing() {
+        let mut extractor = SymbolExtractor::new().expect("extractor");
+        let error = extractor
+            .extract_with_edges_from_source(
+                Language::Rust,
+                "src/lib.rs",
+                "fn same() {}\nfn same() {}",
+            )
+            .expect_err("ambiguous identities must not overwrite each other");
+        let message = error.to_string();
+        assert!(message.contains("duplicate symbol identity in src/lib.rs"));
+        assert!(message.contains("same"));
+        assert!(message.contains("refusing to overwrite"));
     }
 
     #[test]

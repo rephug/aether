@@ -338,6 +338,30 @@ fn run_subcommand(workspace: &Path, config: &AetherConfig, command: Commands) ->
         Commands::TaskRelevance(args) => run_task_relevance_subcommand(workspace, args),
         Commands::Enhance(args) => run_enhance_subcommand(workspace, args),
         Commands::Omp(args) => aetherd::omp_gateway::run_omp_command(workspace, config, args),
+        Commands::Preflight(args) => {
+            let map = aetherd::preflight::assemble_preflight(
+                workspace,
+                &aetherd::preflight::PreflightRequest {
+                    task: args.task,
+                    scope: args.scope,
+                    max_tokens: args.max_tokens,
+                },
+            )?;
+            if args.format == "json" {
+                println!("{}", serde_json::to_string(&map)?);
+            } else {
+                println!(
+                    "{}\nMap hash: {}\nSource hash: {}\nEstimated serialized tokens: {} ({})\nOmitted items: {}",
+                    map.context,
+                    map.map_hash,
+                    map.source_hash,
+                    map.estimated_tokens,
+                    map.estimate_basis,
+                    serde_json::to_string(&map.omitted_items)?
+                );
+            }
+            Ok(())
+        }
         Commands::SirContext(args) => run_sir_context_subcommand(workspace, args),
         Commands::SirInject(args) => run_sir_inject_subcommand(workspace, args),
         Commands::SirDiff(args) => run_sir_diff_subcommand(workspace, args),
@@ -482,12 +506,13 @@ fn run_continuous_subcommand(
 
 fn load_config_for_command(workspace: &Path, command: Option<&Commands>) -> Result<AetherConfig> {
     let load_result = match command {
-        Some(Commands::HealthScore(_)) => load_workspace_config(workspace).with_context(|| {
-            format!(
-                "failed to load workspace config at {}",
-                workspace.join(".aether/config.toml").display()
-            )
-        }),
+        Some(Commands::HealthScore(_) | Commands::Preflight(_)) => load_workspace_config(workspace)
+            .with_context(|| {
+                format!(
+                    "failed to load workspace config at {}",
+                    workspace.join(".aether/config.toml").display()
+                )
+            }),
         _ => ensure_workspace_config(workspace).with_context(|| {
             format!(
                 "failed to load or create workspace config at {}",
@@ -504,6 +529,7 @@ fn run_init_agent_command(workspace: &Path, args: InitAgentArgs) -> Result<()> {
         InitAgentOptions {
             platform: args.platform,
             force: args.force,
+            mcp_tools: args.mcp_tools,
         },
     )
     .context("failed to generate agent integration files")?;
@@ -511,6 +537,14 @@ fn run_init_agent_command(workspace: &Path, args: InitAgentArgs) -> Result<()> {
     if outcome.used_default_config {
         eprintln!(
             "warning: missing .aether/config.toml, generated templates using default config values"
+        );
+    }
+
+    for artifact in &outcome.archived_files {
+        eprintln!(
+            "archived {} to {}",
+            artifact.original_path.display(),
+            artifact.archive_path.display()
         );
     }
 
@@ -836,6 +870,9 @@ fn run_status_subcommand(workspace: &Path) -> Result<()> {
         "SIR Coverage: {} / {} ({coverage_pct:.1}%)",
         symbols_with_sir, total_symbols
     );
+    if let Some(summary) = aetherd::indexing_gaps::read_summary(workspace)? {
+        println!("{summary}");
+    }
     let freshness = aetherd::freshness::assess_index_freshness(workspace, &store)
         .context("failed to assess index freshness")?;
     println!("{}", freshness.summary);
