@@ -1,0 +1,12 @@
+{
+  "/agents": {
+    "page": "realtor.html",
+    "media": [
+      "assets/agents.svg"
+    ]
+  },
+  "/realtor": {
+    "page": "realtor.html",
+    "canonical": "/agents"
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "projects": {
+    "website": {
+      "root": "website",
+      "origin": "https://website.fixture.invalid",
+      "route_contract": "route-contract.json"
+    },
+    "app": {
+      "root": "app",
+      "origin": "https://app.fixture.invalid"
+    }
+  },
+  "contracts": [
+    {
+      "id": "agent-directory-entry",
+      "provider": "website",
+      "canonical": "/agents",
+      "consumers": [
+        {
+          "project": "app",
+          "path": "start.html",
+          "ignore_hrefs": [
+            "/about"
+          ]
+        }
+      ]
+    }
+  ]
+}

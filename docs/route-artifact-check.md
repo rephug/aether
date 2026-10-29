@@ -50,3 +50,7 @@ bytes, invalid redirects, missing/oversized inputs, missing media receipts,
 invalid roots, total byte limits, symlink escape and path traversal rejection.
 JavaScript execution, dynamic routing, CSS/srcset media discovery, browser caches
 and CDN headers are outside this prototype's coverage.
+
+For declared provider/consumer snapshots across projects, see
+[cross-project route suites](cross-project-route-contracts.md). They add exact
+origin-aware consumer checks around this verifier; they do not activate a gate.

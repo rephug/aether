@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "origin": "https://website.fixture.invalid",
+  "manifest": "route-manifest.json",
+  "routes": [
+    {
+      "canonical": "/agents",
+      "aliases": [
+        "/realtor"
+      ],
+      "alias_modes": {
+        "/realtor": "same_page"
+      },
+      "page": "realtor.html",
+      "media": [
+        "assets/agents.svg"
+      ],
+      "entrypoints": [
+        {
+          "path": "index.html"
+        }
+      ]
+    }
+  ],
+  "asset_sha256": {
+    "assets/agents.svg": "53e7e9a0cd06aaceb445c955b39e9fdd4df1069ea9c45fdcd4e034e8f73ce09e"
+  }
+}
