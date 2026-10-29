@@ -14,7 +14,7 @@ use serde_json::Value as JsonValue;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-use super::AetherMcpServer;
+use super::{AetherMcpServer, HistoricalAuditDisclosure};
 use crate::AetherMcpError;
 
 const DEFAULT_AUDIT_TOP_N: u32 = 20;
@@ -273,6 +273,9 @@ pub struct AetherAuditFindingOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherAuditReportResponse {
+    /// Historical unresolved observations are disclosed independently of active filters.
+    #[serde(default)]
+    pub historical: HistoricalAuditDisclosure,
     pub findings: Vec<AetherAuditFindingOutput>,
     pub summary: AuditSummary,
 }
@@ -838,7 +841,12 @@ impl AetherMcpServer {
             })
             .collect::<Result<Vec<_>, AetherMcpError>>()?;
 
-        Ok(AetherAuditReportResponse { findings, summary })
+        let historical = store.retired_audit_disclosure(limit)?.into();
+        Ok(AetherAuditReportResponse {
+            findings,
+            summary,
+            historical,
+        })
     }
 
     pub fn aether_audit_candidates_logic(
