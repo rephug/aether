@@ -309,14 +309,10 @@ fn qualify(file_path: &str, symbol_name: &str, parent: Option<&str>) -> String {
     }
 }
 
-/// The qualified name of a `def`: a method is qualified by its enclosing classes alone, any
-/// other function by its enclosing classes and functions.
+/// Include every lexical class and function owner, including functions that contain
+/// a local class, so its methods cannot alias methods on a module-level class.
 fn function_qualified_name(node: Node<'_>, name: &str, source: &[u8], file_path: &str) -> String {
-    let parent = if is_method_definition(node) {
-        nearest_ancestor_name(node, source, &["class_definition"])
-    } else {
-        nearest_ancestor_name(node, source, &["class_definition", "function_definition"])
-    };
+    let parent = nearest_ancestor_name(node, source, &["class_definition", "function_definition"]);
     qualify(file_path, name, parent.as_deref())
 }
 
@@ -1050,11 +1046,6 @@ fn import_edges(node: Node<'_>, source: &[u8], file_path: &str) -> Vec<SymbolEdg
 /// What one walk of the whole file learns that a scope's own statements don't show.
 #[derive(Default)]
 struct FileAssignments {
-    /// The qualified names the symbol mapper gives methods of classes declared inside a
-    /// function. It leaves the function out (`def f(): class C: def m` is `C::m`), so such a
-    /// name may also be that of an unrelated method, and a target spelled with it may reach
-    /// either.
-    shared_method_names: HashSet<String>,
     /// Attributes assigned through a method's first parameter (`self.name = …`), by the
     /// method's class. An instance attribute hides the class's method of that name.
     instance_attributes: HashMap<usize, HashSet<String>>,
@@ -1138,11 +1129,10 @@ impl<'a, 'tree> Resolver<'a, 'tree> {
     /// parameter, a local, anything the file doesn't define or import, a method on a value
     /// of unknown type, and a call of an expression that isn't a name. A bare method name
     /// can't name a Python symbol, but the store resolves targets across languages, where it
-    /// could name an unrelated function. Neither does a target that a method of a class
-    /// declared inside a function is also named (see `FileAssignments`).
+    /// could name an unrelated function.
     fn call_target(&self, call: Node<'tree>, enclosing: Enclosing<'_, 'tree>) -> Option<String> {
         let callee = call.child_by_field_name("function")?;
-        let target = match callee.kind() {
+        match callee.kind() {
             "identifier" => {
                 let name = node_text(callee, self.source);
                 match self.resolve_name(call, enclosing, &name)? {
@@ -1153,11 +1143,7 @@ impl<'a, 'tree> Resolver<'a, 'tree> {
             }
             "attribute" => self.member_call_target(call, callee, enclosing),
             _ => None,
-        }?;
-        let shared = &self
-            .assignments(*enclosing.nodes.first()?)
-            .shared_method_names;
-        (!shared.contains(&target)).then_some(target)
+        }
     }
 
     /// The qualified target of `receiver.member()` when the receiver is a dotted name whose
@@ -1437,21 +1423,6 @@ impl<'a, 'tree> Resolver<'a, 'tree> {
             loop {
                 let node = cursor.node();
                 match node.kind() {
-                    "function_definition" => {
-                        if enclosing_class(&ancestors).is_some()
-                            && ancestors.iter().any(|ancestor: &Node<'tree>| {
-                                ancestor.kind() == "function_definition"
-                            })
-                            && let Some(name) = named_child_text(node, "name", self.source)
-                        {
-                            found.shared_method_names.insert(function_qualified_name(
-                                node,
-                                &name,
-                                self.source,
-                                self.file.file_path,
-                            ));
-                        }
-                    }
                     "assignment" | "augmented_assignment" | "for_statement" => {
                         if let Some(left) = node.child_by_field_name("left") {
                             self.add_attribute_targets(left, &ancestors, &mut found);
@@ -1657,20 +1628,20 @@ impl<'a, 'tree> Resolver<'a, 'tree> {
         }
     }
 
-    /// The qualified name the symbol mapper gives a `def` or `class`. `None` for a method of
-    /// a class declared inside a function: its name leaves the function out (`def f(): class
-    /// C: def m` is `C::m`), so it may be shared with an unrelated method.
+    /// The qualified name the symbol mapper gives a `def` or `class`, including all
+    /// enclosing function and class scopes.
     fn definition_qualified_name(&self, definition: Node<'tree>) -> Option<String> {
         if let Some(name) = self.qualified_names.borrow().get(&definition.id()) {
             return name.clone();
         }
         let qualified = named_child_text(definition, "name", self.source).and_then(|name| {
             match definition.kind() {
-                "function_definition" => (!(is_method_definition(definition)
-                    && has_ancestor_kind(definition, "function_definition")))
-                .then(|| {
-                    function_qualified_name(definition, &name, self.source, self.file.file_path)
-                }),
+                "function_definition" => Some(function_qualified_name(
+                    definition,
+                    &name,
+                    self.source,
+                    self.file.file_path,
+                )),
                 "class_definition" => Some(class_qualified_name(
                     definition,
                     &name,
@@ -2130,6 +2101,107 @@ mod tests {
         let edges =
             parse_import_from_statement("from module import (\n    a,\n    b,\n)", "src/main.py");
         assert_eq!(edges, vec!["module.a".to_owned(), "module.b".to_owned()]);
+    }
+
+    const LOCAL_CLASS_SHADOW: &str = r#"
+class Handler:
+    def handle(self, event):
+        return event
+    def run(self, event):
+        return self.handle(event)
+
+def make_noop_handler():
+    class Handler:
+        def handle(self, event):
+            return None
+        def run(self, event):
+            return self.handle(event)
+    return Handler()
+"#;
+
+    #[test]
+    fn function_local_class_methods_have_unique_identities() {
+        let file = crate::SymbolExtractor::new()
+            .expect("extractor")
+            .extract_with_edges_from_source(
+                aether_core::Language::Python,
+                "scope_test.py",
+                LOCAL_CLASS_SHADOW,
+            )
+            .expect("parse legal local classes");
+        let ids = file
+            .symbols
+            .iter()
+            .map(|s| &s.id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            ids.len(),
+            file.symbols.len(),
+            "distinct local declarations must not alias"
+        );
+    }
+
+    #[test]
+    fn function_local_class_self_calls_bind_to_the_local_method() {
+        let file = crate::SymbolExtractor::new()
+            .expect("extractor")
+            .extract_with_edges_from_source(
+                aether_core::Language::Python,
+                "scope_test.py",
+                LOCAL_CLASS_SHADOW,
+            )
+            .expect("parse legal local classes");
+        let local_run = file
+            .symbols
+            .iter()
+            .find(|s| s.qualified_name == "scope_test::make_noop_handler::Handler::run")
+            .expect("local run");
+        assert!(file.edges.iter().any(|e| e.source_id == local_run.id
+            && e.target_qualified_name == "scope_test::make_noop_handler::Handler::handle"));
+        assert!(!file.edges.iter().any(|e| e.source_id == local_run.id
+            && e.target_qualified_name == "scope_test::Handler::handle"));
+    }
+
+    #[test]
+    fn function_local_class_does_not_hide_module_class_calls() {
+        let file = crate::SymbolExtractor::new()
+            .expect("extractor")
+            .extract_with_edges_from_source(
+                aether_core::Language::Python,
+                "scope_test.py",
+                LOCAL_CLASS_SHADOW,
+            )
+            .expect("parse legal local classes");
+        let global_run = file
+            .symbols
+            .iter()
+            .find(|s| s.qualified_name == "scope_test::Handler::run")
+            .expect("module-level run");
+        assert!(file.edges.iter().any(|e| e.source_id == global_run.id
+            && e.target_qualified_name == "scope_test::Handler::handle"));
+        assert!(!file.edges.iter().any(|e| e.source_id == global_run.id
+            && e.target_qualified_name == "scope_test::make_noop_handler::Handler::handle"));
+    }
+
+    #[test]
+    fn function_local_class_calls_fixture_has_unique_symbol_ids() {
+        let symbols = crate::SymbolExtractor::new()
+            .expect("extractor")
+            .extract_from_source(
+                aether_core::Language::Python,
+                "crates/aether-parse/tests/fixtures/python_calls.py",
+                include_str!("../../tests/fixtures/python_calls.py"),
+            )
+            .expect("parse full calls fixture");
+        let ids = symbols
+            .iter()
+            .map(|s| &s.id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            ids.len(),
+            symbols.len(),
+            "fixture must be admissible for atomic publication"
+        );
     }
 
     #[test]
