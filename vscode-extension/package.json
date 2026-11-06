@@ -16,6 +16,7 @@
     "onLanguage:typescriptreact",
     "onLanguage:javascript",
     "onLanguage:javascriptreact",
+    "onLanguage:python",
     "onCommand:aether.restartServer",
     "onCommand:aether.selectInferenceProvider",
     "onCommand:aether.indexOnce",

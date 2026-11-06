@@ -1,11 +1,15 @@
 # AETHER VS Code Extension
 
-This extension starts the AETHER LSP server over stdio and adds command/status UX for indexing and symbol search in Rust/TypeScript/JavaScript workspaces.
+This extension starts the AETHER LSP server over stdio and adds command/status UX for indexing and symbol search in Rust/TypeScript/JavaScript/Python workspaces.
 
 In a multi-root workspace the extension starts one AETHER language server per folder,
 and each answers hovers only for files its folder owns (with nested folders, the
 innermost one). Adding or removing a folder starts or stops just that folder's server.
 The index and search commands still act on the first folder.
+
+Hover explanations use the saved file on disk. While a document has unsaved edits,
+AETHER hides its hover; save the file to request explanations again. Responses are
+also discarded if the document changes or closes while the request is running.
 
 ## What It Is Useful For
 
@@ -94,7 +98,7 @@ Available settings:
 
 ## Verify It Works
 
-Open a Rust/TS/JS file and hover a function. After indexing runs, hover should show SIR text such as:
+Open a saved Rust/TS/JS/Python file and hover a function. After indexing runs, hover should show SIR text such as:
 
 `Mock summary for ...`
 

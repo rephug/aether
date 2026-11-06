@@ -112,9 +112,11 @@ impl SirPipeline {
         prompt_overrides: Option<&HashMap<String, SirPromptOverride>>,
         planned_against: Option<&HashMap<String, SirIdentity>>,
     ) -> Result<ProcessEventStats> {
-        self.process_removed_symbols(store, event)?;
-        if !self.skip_local_edges {
-            self.replace_edges_for_file(store, event)?;
+        if self.publish_structural_updates {
+            self.process_removed_symbols(store, event)?;
+            if !self.skip_local_edges {
+                self.replace_edges_for_file(store, event)?;
+            }
         }
 
         let changed_symbols = self.collect_changed_symbols(event);
@@ -131,7 +133,9 @@ impl SirPipeline {
         let mut stats = ProcessEventStats::default();
 
         if !changed_symbols.is_empty() {
-            self.upsert_changed_symbols(store, &changed_symbols)?;
+            if self.publish_structural_updates {
+                self.upsert_changed_symbols(store, &changed_symbols)?;
+            }
 
             let prepared = self.prepare_candidate_jobs(
                 store,

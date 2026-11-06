@@ -53,7 +53,7 @@ const workspaceA = folder(workspaceAPath, 'A', 0);
 const workspaceB = folder(workspaceBPath, 'B', 1);
 function document(filePath, text) {
   return {
-    uri: uri(filePath), languageId: 'typescript', version: 1, isDirty: false,
+    uri: uri(filePath), languageId: 'typescript', version: 1, isDirty: false, isClosed: false,
     text, getText() { return this.text; },
     positionAt(offset) { const prefix = this.text.slice(0, offset).split('\n'); return { line: prefix.length - 1, character: prefix.at(-1).length }; },
     edit(text, dirty = true) { this.text = text; this.version++; this.isDirty = dirty; },
@@ -202,7 +202,9 @@ async function main() {
     assert.equal(client.id, 'aether:'+workspaceA.uri.toString()); assert.equal(client.name, 'AETHER LSP');
     assert.equal(client.serverOptions.command, path.resolve(extensionPath, '../target/debug/aetherd.exe'));
     assert.deepEqual(Array.from(client.serverOptions.args), ['--', '--workspace', workspaceAPath, '--lsp', '--index', '--inference-provider', 'mock', '--inference-model', 'fixture-model', '--inference-endpoint', 'http://127.0.0.1:11434', '--inference-api-key-env', 'GEMINI_API_KEY']);
-    assert.deepEqual(Array.from(client.clientOptions.documentSelector, (value) => [value.scheme, value.language]), [['file', 'rust'], ['file', 'typescript'], ['file', 'typescriptreact'], ['file', 'javascript'], ['file', 'javascriptreact']]);
+    const languages = ['rust', 'typescript', 'typescriptreact', 'javascript', 'javascriptreact', 'python'];
+    assert.deepEqual(Array.from(client.clientOptions.documentSelector, (value) => [value.scheme, value.language]), languages.map(language => ['file', language]));
+    for (const language of languages) assert(manifest.activationEvents.includes('onLanguage:' + language), 'activation missing for ' + language);
     assert.equal(env.state.commands.size, 6); assert.equal(env.state.spawns.length, 0); assert.equal(env.state.errors.length, 0);
     await env.dispose(); return { languageClientId: client.id, registeredCommands: [...env.state.commands.keys()], actualChildProcesses: 0 };
   });
@@ -212,6 +214,16 @@ async function main() {
     assert.equal(calls, 1); assert.strictEqual(actual, expected); assert.equal(actual.contents[0].value, '**combine** returns the sum of numeric inputs a and b.');
     assert.deepEqual(actual.range, { start: { line: 0, character: 16 }, end: { line: 0, character: 23 } });
     assert.equal(env.state.spawns.length, 0); await env.dispose(); return { scope: 'fixture-backed response forwarding; source semantics supplied by deterministic next mock' };
+  });
+  await test('Python hover forwards a saved document through its owning client', async () => {
+    const env = environment(); await env.activate();
+    const doc = document(path.join(workspaceAPath, 'math.py'), 'def combine(a, b):\n    return a + b\n');
+    doc.languageId = 'python';
+    const expected = { contents: [{ value: 'Python fixture explanation', isTrusted: false }] };
+    assert.strictEqual(await env.hover(doc, position, token(), async current => {
+      assert.strictEqual(current, doc); return expected;
+    }), expected);
+    await env.dispose();
   });
   for (const value of [undefined, null]) await test('hover preserves ' + String(value) + ' no-symbol result', async () => {
     const env = environment(); await env.activate(); assert.strictEqual(await env.hover(makeDoc(), position, token(), async () => value), value); assert.match(env.status.text, /idle$/); await env.dispose();
@@ -237,12 +249,39 @@ async function main() {
     assert.strictEqual(actual.contents[0], content); assert.equal(actual.contents[0].isTrusted, false); assert.equal(actual.contents[0].supportHtml, false); assert.equal(env.state.spawns.length, 0); await env.dispose();
     return { limitation: 'No VS Code renderer exercised; incoming trusted MarkdownString is also returned unchanged.' };
   });
-  await test('hover reevaluates next after unsaved source edits and has no extension-side result cache', async () => {
+  await test('hover waits for saved source before requesting disk-based explanations', async () => {
     const env = environment(); await env.activate(); const doc = makeDoc(); const tok = token(); let calls = 0;
     const next = async (currentDoc) => { assert.strictEqual(currentDoc, doc); calls++; return fixtureHover(currentDoc); };
     const before = await env.hover(doc, position, tok, next); doc.edit(sourceA.replace('a + b', 'a * b')); env.docChange(doc);
-    const after = await env.hover(doc, position, tok, next); assert.equal(calls, 2); assert.equal(doc.isDirty, true); assert.equal(doc.version, 2); assert.match(before.contents[0].value, /sum/); assert.match(after.contents[0].value, /product/); assert.notStrictEqual(before, after); assert.equal(env.state.spawns.length, 0); await env.dispose();
-    return { scope: 'Extension passes current document to next; backend handling of unsaved didChange is outside this mocked client.' };
+    assert.equal(await env.hover(doc, position, tok, next), undefined);
+    assert.equal(calls, 1); assert.match(before.contents[0].value, /sum/);
+    doc.isDirty = false;
+    const after = await env.hover(doc, position, tok, next);
+    assert.equal(calls, 2); assert.match(after.contents[0].value, /product/);
+    assert.equal(env.state.spawns.length, 0); await env.dispose();
+    return { scope: 'Dirty buffers are suppressed; clean buffers resume requests without cached results. Backend explanations are mocked.' };
+  });
+  for (const saveBeforeResponse of [false, true]) await test('hover discards a response after edits' + (saveBeforeResponse ? ' even when saved again' : ''), async () => {
+    const env = environment(); await env.activate(); const doc = makeDoc(); let resolve;
+    const request = env.hover(doc, position, token(), () => new Promise(r => resolve = r));
+    doc.edit(sourceA.replace('a + b', 'a * b'));
+    if (saveBeforeResponse) doc.isDirty = false;
+    resolve(stale);
+    assert.equal(await request, undefined); assert.doesNotMatch(env.status.text, /stale:/);
+    await env.dispose();
+  });
+  await test('hover discards responses for a document closed during the request', async () => {
+    const env = environment(); await env.activate(); const doc = makeDoc(); let resolve;
+    const request = env.hover(doc, position, token(), () => new Promise(r => resolve = r));
+    doc.isClosed = true; resolve(stale);
+    assert.equal(await request, undefined); assert.doesNotMatch(env.status.text, /stale:/);
+    await env.dispose();
+  });
+  await test('hover does not request an explanation for an already closed document', async () => {
+    const env = environment(); await env.activate(); const doc = makeDoc(); doc.isClosed = true;
+    let calls = 0;
+    assert.equal(await env.hover(doc, position, token(), async () => { calls++; return stale; }), undefined);
+    assert.equal(calls, 0); await env.dispose();
   });
   await test('hover after rename receives the renamed document URI, without extension-side cached hover', async () => {
     const env = environment(); await env.activate(); const beforeDoc = makeDoc(); await env.hover(beforeDoc, position, token(), async () => fixtureHover(beforeDoc)); const afterDoc = document(path.join(workspaceAPath, 'renamed.ts'), sourceA); env.rename(beforeDoc.uri, afterDoc.uri);

@@ -90,7 +90,30 @@ pub(super) fn classify_watch_event(
 
         if path.is_dir() {
             if !is_ignored_path(&path) {
-                classified.watch_dirs.push(path);
+                // A rename into this workspace emits a directory event, without
+                // create events for the files already below it. Watch every nested
+                // directory and index its existing sources before waiting for edits.
+                classified.source_paths.push(path.clone());
+                for entry in WalkBuilder::new(&path)
+                    .standard_filters(true)
+                    .filter_entry(|entry| !is_ignored_path(entry.path()))
+                    .build()
+                {
+                    match entry {
+                        Ok(entry) if entry.file_type().is_some_and(|kind| kind.is_dir()) => {
+                            classified.watch_dirs.push(entry.into_path());
+                        }
+                        Ok(entry)
+                            if entry.file_type().is_some_and(|kind| kind.is_file())
+                                && language_for_path(entry.path()).is_some() =>
+                        {
+                            classified.source_paths.push(entry.into_path());
+                        }
+                        Ok(_) => {}
+                        Err(error) => tracing::warn!(path = %path.display(), error = %error,
+                            "could not inspect changed directory; prior catalog rows are retained"),
+                    }
+                }
             }
             continue;
         }
@@ -217,6 +240,7 @@ pub(super) fn process_reindex_paths(
     queue_state: &SharedQueueState,
     paths: Vec<PathBuf>,
 ) -> Result<()> {
+    let paths = expand_directory_event_paths(config, observer, store, paths);
     refresh_paths(config, structural, &paths);
     let mut first_error = None;
     for path in &paths {
@@ -251,6 +275,7 @@ pub(super) fn process_debounced_paths(
     queue_state: &SharedQueueState,
     paths: Vec<PathBuf>,
 ) {
+    let paths = expand_directory_event_paths(config, observer, store, paths);
     refresh_paths(config, structural, &paths);
     for path in &paths {
         if let Err(err) =
@@ -267,6 +292,46 @@ pub(super) fn process_debounced_paths(
     ) {
         tracing::error!(error = %error, "could not publish watcher quarantine coverage");
     }
+}
+
+/// Removed directory notifications no longer have a tree to walk. Include prior
+/// symbol-bearing and symbol-free sources so their rows, edges and read times retire.
+fn expand_directory_event_paths(
+    config: &IndexerConfig,
+    observer: &ObserverState,
+    store: &SqliteStore,
+    paths: Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    if !paths.iter().any(|path| path.is_dir() || !path.exists()) {
+        return paths;
+    }
+    let mut known = observer.tracked_paths();
+    match store.list_file_reads() {
+        Ok(reads) => known.extend(reads.into_keys().map(|path| config.workspace.join(path))),
+        Err(error) => tracing::warn!(error = %error,
+            "could not list prior symbol-free files for directory reindex"),
+    }
+    expand_known_descendants(paths, known)
+}
+
+fn expand_known_descendants(
+    paths: Vec<PathBuf>,
+    known: impl IntoIterator<Item = PathBuf>,
+) -> Vec<PathBuf> {
+    let directories = paths
+        .iter()
+        .filter(|path| path.is_dir() || !path.exists())
+        .collect::<Vec<_>>();
+    let mut expanded = paths.iter().cloned().collect::<BTreeSet<_>>();
+    for path in known {
+        if directories
+            .iter()
+            .any(|directory| path.starts_with(directory))
+        {
+            expanded.insert(path);
+        }
+    }
+    expanded.into_iter().collect()
 }
 
 /// Re-reads a batch of changed paths for the Python call targets resolved through them,
@@ -714,5 +779,7 @@ pub(super) fn collect_full_reindex_paths(
     (paths.into_iter().collect(), complete)
 }
 
+#[cfg(test)]
+mod directory_tests;
 #[cfg(test)]
 mod tests;

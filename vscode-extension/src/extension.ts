@@ -349,7 +349,7 @@ async function startWorkspaceClient(
   const serverOptions: ServerOptions = executable;
 
   const clientOptions: LanguageClientOptions = {
-    documentSelector: ['rust', 'typescript', 'typescriptreact', 'javascript', 'javascriptreact']
+    documentSelector: ['rust', 'typescript', 'typescriptreact', 'javascript', 'javascriptreact', 'python']
       .map((language) => ({
         scheme: 'file',
         language,
@@ -365,11 +365,14 @@ async function startWorkspaceClient(
           return owner !== undefined && workspaceKey(owner) === key &&
             workspaceStillPresent(key) && clients.get(key) === entry && !entry.stopping;
         };
-        if (!ownsDocument()) {
+        // The LSP currently resolves against saved files, without didChange sync.
+        // An unsaved buffer's positions can refer to a different symbol on disk.
+        if (!ownsDocument() || document.isDirty || document.isClosed) {
           return undefined;
         }
+        const version = document.version;
         const hover = await next(document, position, token);
-        if (!ownsDocument()) {
+        if (!ownsDocument() || document.isDirty || document.isClosed || document.version !== version) {
           return undefined;
         }
         observeHoverForStaleWarning(document, position, hover);

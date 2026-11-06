@@ -151,7 +151,8 @@ pub(super) fn spawn_semantic_worker(
         1,
         watcher_runtime.provider_overrides(config),
     )
-    .with_context(|| format!("failed to initialize SIR pipeline for worker {worker_id}"))?;
+    .with_context(|| format!("failed to initialize SIR pipeline for worker {worker_id}"))?
+    .with_structural_updates(false);
     let generation_pass = watcher_runtime.generation_pass;
     let prompt_config_fingerprint = watcher_runtime.prompt_config_fingerprint(&pipeline);
     let workspace_root = config.workspace.clone();
@@ -316,6 +317,9 @@ pub(super) fn finalize_watcher_generation(
         .with_context(|| format!("failed to rebuild prompt hash input for {}", symbol.id))?;
     let prompt_hash = compute_prompt_hash(job.symbol_text.as_str(), &[], prompt_config_fingerprint);
 
+    // Keep the read and metadata update together with respect to structural
+    // retirement; a late finalizer must not recreate a leaf removed between them.
+    let inject_guard = acquire_inject_write_lock(workspace_root)?;
     let current_meta = store
         .get_sir_meta(symbol.id.as_str())
         .with_context(|| format!("failed to reload SIR metadata for {}", symbol.id))?
@@ -326,6 +330,7 @@ pub(super) fn finalize_watcher_generation(
             ..current_meta
         })
         .with_context(|| format!("failed to persist watcher prompt hash for {}", symbol.id))?;
+    drop(inject_guard);
     let current_embedding = pipeline
         .load_symbol_embedding(symbol.id.as_str())
         .with_context(|| format!("failed to reload embedding for {}", symbol.id))?;

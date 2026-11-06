@@ -174,6 +174,7 @@ pub struct SirPipeline {
     tiered_parse_fallback_model: Option<String>,
     skip_surreal_sync: bool,
     skip_local_edges: bool,
+    publish_structural_updates: bool,
     contracts_config: Option<ContractsConfig>,
 }
 
@@ -456,6 +457,7 @@ impl SirPipeline {
             tiered_parse_fallback_model,
             skip_surreal_sync: false,
             skip_local_edges: false,
+            publish_structural_updates: true,
             contracts_config,
         })
     }
@@ -467,6 +469,14 @@ impl SirPipeline {
 
     pub fn with_skip_local_edges(mut self, skip_local_edges: bool) -> Self {
         self.skip_local_edges = skip_local_edges;
+        self
+    }
+
+    /// Watcher workers annotate the catalog already published by the structural
+    /// indexer. Their delayed jobs must never recreate retired symbols or replace
+    /// edges from an older event.
+    pub(crate) fn with_structural_updates(mut self, enabled: bool) -> Self {
+        self.publish_structural_updates = enabled;
         self
     }
 
