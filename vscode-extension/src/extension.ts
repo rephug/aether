@@ -85,7 +85,10 @@ const DEFAULT_SEARCH_MODE: SearchMode = 'lexical';
 const INDEXING_ACTIVITY_WINDOW_MS = 5_000;
 const STARTUP_INDEXING_WINDOW_MS = 8_000;
 const STATUS_REFRESH_INTERVAL_MS = 1_000;
-const STALE_WARNING_FRAGMENT = 'AETHER WARNING: SIR is stale';
+const STALE_WARNING_FRAGMENTS = [
+  'AETHER: This explanation may be out of date',
+  'AETHER WARNING: SIR is stale', // Older servers remain supported.
+];
 
 const statusModel: StatusModel = {
   activeTasks: new Set<string>(),
@@ -367,8 +370,11 @@ async function startWorkspaceClient(
         };
         // The LSP currently resolves against saved files, without didChange sync.
         // An unsaved buffer's positions can refer to a different symbol on disk.
-        if (!ownsDocument() || document.isDirty || document.isClosed) {
+        if (!ownsDocument() || document.isClosed) {
           return undefined;
+        }
+        if (document.isDirty) {
+          return new vscode.Hover('AETHER: Save this file to see an explanation of the saved code.');
         }
         const version = document.version;
         const hover = await next(document, position, token);
@@ -429,7 +435,7 @@ function observeHoverForStaleWarning(
   }
 
   const contentText = hoverContentsToText(hover.contents);
-  if (!contentText.includes(STALE_WARNING_FRAGMENT)) {
+  if (!STALE_WARNING_FRAGMENTS.some((fragment) => contentText.includes(fragment))) {
     return;
   }
 
@@ -1137,7 +1143,7 @@ function renderStatusBar(): void {
   if (hasError) {
     hint = ' (error)';
   } else if (staleCount > 0) {
-    hint = ` (stale:${staleCount})`;
+    hint = ` (outdated:${staleCount})`;
   }
 
   const baseState = indexing ? 'indexing' : 'idle';
@@ -1165,7 +1171,7 @@ function renderStatusBar(): void {
   }
 
   if (staleCount > 0) {
-    tooltipLines.push(`Observed stale hints: ${staleCount}`);
+    tooltipLines.push(`Observed out-of-date hovers (this session): ${staleCount}`);
   }
 
   if (statusModel.lastError) {

@@ -13,8 +13,7 @@ pub use secret::Secret;
 pub use test_code::{is_test_file, is_test_symbol};
 
 pub type SymbolId = String;
-pub const NO_SIR_MESSAGE: &str =
-    "AETHER: No SIR yet for this symbol. Run aetherd indexing and try again.";
+pub const NO_SIR_MESSAGE: &str = "AETHER: No saved explanation is available here yet. Start indexing and hover over a supported function or type, then try again.";
 pub const AETHER_AGENT_SCHEMA_VERSION: u32 = 7;
 
 pub const SIR_STATUS_STALE: &str = "stale";
@@ -108,10 +107,12 @@ pub fn stale_warning_message(sir_status: Option<&str>, last_error: Option<&str>)
     let last_error = last_error
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(|value| format!(" Last error: {value}"))
+        .map(|value| format!(" Last update failed: {value}"))
         .unwrap_or_default();
 
-    Some(format!("AETHER WARNING: SIR is stale.{last_error}"))
+    Some(format!(
+        "AETHER: This explanation may be out of date.{last_error}"
+    ))
 }
 
 pub fn format_hover_markdown_sections(
@@ -120,44 +121,74 @@ pub fn format_hover_markdown_sections(
 ) -> String {
     let mut blocks = Vec::with_capacity(8);
     blocks.push(format!("### {}", sections.symbol));
-    blocks.push(format!("**Confidence:** {:.2}", sections.confidence));
+    let intent = sections.intent.trim();
+    let summary_end = intent.char_indices().nth(280).map(|(end, _)| {
+        intent[..end]
+            .rfind(char::is_whitespace)
+            .filter(|boundary| *boundary > end / 2)
+            .unwrap_or(end)
+    });
+    let summary = summary_end.map(|end| format!("{}…", intent[..end].trim_end()));
+    blocks.push(format!(
+        "**What this does**\n{}",
+        if intent.is_empty() {
+            "Not described in this explanation."
+        } else {
+            summary.as_deref().unwrap_or(intent)
+        }
+    ));
 
     if let Some(warning) = stale_warning {
         blocks.push(format!("> {warning}"));
     }
 
-    blocks.push(format!("**Intent**\n{}", sections.intent));
     blocks.push(format!(
         "**Inputs**\n{}",
         format_hover_list(&sections.inputs)
     ));
     blocks.push(format!(
-        "**Outputs**\n{}",
+        "**Result**\n{}",
         format_hover_list(&sections.outputs)
     ));
+    let cautions = sections
+        .side_effects
+        .iter()
+        .filter(|item| !item.trim().is_empty())
+        .map(|item| format!("Changes: {}", item.trim()))
+        .chain(
+            sections
+                .error_modes
+                .iter()
+                .filter(|item| !item.trim().is_empty())
+                .map(|item| format!("Possible failure: {}", item.trim())),
+        )
+        .collect::<Vec<_>>();
+    blocks.push(format!("**Watch out for**\n{}", if cautions.is_empty() {
+        "No cautions were recorded. This does not confirm that there are no side effects or errors.".to_owned()
+    } else { format_hover_list(&cautions) }));
     blocks.push(format!(
-        "**Side Effects**\n{}",
-        format_hover_list(&sections.side_effects)
+        "---\n**Technical details**\n\n**Uses**\n{}\n\n**Reported confidence:** {:.2} (not a correctness check)",
+        format_hover_list(&sections.dependencies), sections.confidence
     ));
-    blocks.push(format!(
-        "**Dependencies**\n{}",
-        format_hover_list(&sections.dependencies)
-    ));
-    blocks.push(format!(
-        "**Error Modes**\n{}",
-        format_hover_list(&sections.error_modes)
-    ));
+    if summary.is_some() {
+        blocks.push(format!("**Full explanation**\n{intent}"));
+    }
 
     blocks.join("\n\n")
 }
 
 fn format_hover_list(items: &[String]) -> String {
+    let items = items
+        .iter()
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>();
     if items.is_empty() {
-        "(none)".to_owned()
+        "Not described in this explanation.".to_owned()
     } else {
         items
             .iter()
-            .map(|item| format!("- {}", item.trim()))
+            .map(|item| format!("- {item}"))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -532,7 +563,9 @@ mod tests {
         let warning = stale_warning_message(Some("stale"), Some(" provider timeout "));
         assert_eq!(
             warning.as_deref(),
-            Some("AETHER WARNING: SIR is stale. Last error: provider timeout")
+            Some(
+                "AETHER: This explanation may be out of date. Last update failed: provider timeout"
+            )
         );
     }
 
@@ -555,14 +588,47 @@ mod tests {
                 dependencies: vec!["serde".to_owned()],
                 error_modes: vec![],
             },
-            Some("AETHER WARNING: SIR is stale."),
+            Some("AETHER: This explanation may be out of date."),
         );
 
         assert!(markdown.contains("### demo::alpha"));
-        assert!(markdown.contains("**Confidence:** 0.75"));
-        assert!(markdown.contains("> AETHER WARNING: SIR is stale."));
-        assert!(markdown.contains("**Intent**"));
-        assert!(markdown.contains("**Side Effects**\n(none)"));
+        assert!(markdown.contains("**Reported confidence:** 0.75"));
+        assert!(markdown.contains("> AETHER: This explanation may be out of date."));
+        assert!(markdown.contains("**What this does**"));
+        assert!(markdown.contains("**Watch out for**\nNo cautions were recorded."));
+        assert!(markdown.find("What this does") < markdown.find("Inputs"));
+        assert!(markdown.find("**Result**") < markdown.find("Technical details"));
+        assert!(markdown.contains("not a correctness check"));
+        assert!(!markdown.contains("(none)"));
+    }
+
+    #[test]
+    fn hover_preserves_meaningful_cautions_and_discloses_unrecorded_fields() {
+        let mut sections = HoverMarkdownSections {
+            symbol: "save".into(),
+            intent: "Writes the supplied text to a file.".into(),
+            confidence: 0.8,
+            inputs: vec!["text: contents to save".into()],
+            outputs: vec![" ".into()],
+            side_effects: vec!["Replaces the file contents".into()],
+            dependencies: vec![],
+            error_modes: vec!["Returns an error if the file is not writable".into()],
+        };
+        let markdown = format_hover_markdown_sections(&sections, None);
+        assert!(markdown.contains("Changes: Replaces the file contents"));
+        assert!(
+            markdown.contains("Possible failure: Returns an error if the file is not writable")
+        );
+        assert!(markdown.contains("**Result**\nNot described in this explanation."));
+        sections.side_effects = vec![" ".into()];
+        sections.error_modes.clear();
+        assert!(
+            format_hover_markdown_sections(&sections, None).contains("No cautions were recorded")
+        );
+        sections.intent = "Writes café names to the requested file. ".repeat(20);
+        let markdown = format_hover_markdown_sections(&sections, None);
+        assert!(markdown.contains("…\n\n**Inputs**"));
+        assert!(markdown.contains(&format!("**Full explanation**\n{}", sections.intent.trim())));
     }
 
     #[test]

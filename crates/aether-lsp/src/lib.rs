@@ -53,6 +53,9 @@ static SYMBOL_EXTRACTOR: OnceLock<std::sync::Mutex<aether_parse::SymbolExtractor
     OnceLock::new();
 const HEALTH_SCORE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
+#[cfg(test)]
+mod hover_clarity_tests;
+
 fn get_extractor()
 -> Result<std::sync::MutexGuard<'static, aether_parse::SymbolExtractor>, HoverResolveError> {
     let mutex = SYMBOL_EXTRACTOR.get_or_init(|| {
@@ -330,8 +333,9 @@ fn resolve_hover_markdown_for_source_with_graph(
         current_unix_timestamp_millis(),
     )?;
 
+    let sir_identity = store.get_sir_identity(&symbol_id)?;
     let sir_meta = store.get_sir_meta(&symbol_id)?;
-    let stale_warning = stale_warning_message(
+    let mut stale_warning = stale_warning_message(
         sir_meta.as_ref().map(|meta| meta.sir_status.as_str()),
         sir_meta
             .as_ref()
@@ -345,10 +349,43 @@ fn resolve_hover_markdown_for_source_with_graph(
                 store,
                 symbol_id.as_str(),
                 symbol,
-                stale_warning.as_deref(),
+                sir_meta
+                    .as_ref()
+                    .and_then(|meta| meta.last_error.as_deref()),
             )));
         }
     };
+
+    // Saved body edits can keep a symbol id while the indexer has not updated
+    // its status. Compare the source this explanation was written for as well.
+    let source_hash = store.get_sir_source_hash(&symbol_id)?.filter(|hash| {
+        hash.trim().len() == 64 && hash.trim().bytes().all(|byte| byte.is_ascii_hexdigit())
+    });
+    // Do not pair an older blob with a fingerprint written by a concurrent
+    // generator. The identity includes the store's write generation.
+    if sir_identity != store.get_sir_identity(&symbol_id)? {
+        stale_warning = Some("AETHER: This explanation may be out of date. It changed while being read; hover again for the latest version.".to_owned());
+    } else {
+        match source_hash {
+            Some(hash) if !hash.trim().eq_ignore_ascii_case(&symbol.content_hash) => {
+                let warning = stale_warning.get_or_insert_with(|| {
+                    "AETHER: This explanation may be out of date.".to_owned()
+                });
+                warning
+                    .push_str(" The saved code has changed since this explanation was generated.");
+            }
+            None => {
+                let warning = stale_warning.get_or_insert_with(String::new);
+                if !warning.is_empty() {
+                    warning.push(' ');
+                }
+                warning.push_str(
+                    "AETHER: Could not check whether this explanation matches the saved code.",
+                );
+            }
+            Some(_) => {}
+        }
+    }
 
     let sir: SirAnnotation = serde_json::from_str(&sir_json)?;
     let mut markdown = format_hover_markdown_sections(
@@ -423,14 +460,16 @@ fn resolve_import_hover_markdown(
         return Ok(None);
     };
     let resolved_import_path = resolved_import_path.canonicalize()?;
-    if !resolved_import_path.starts_with(workspace_root) {
+    let canonical_workspace_root = workspace_root.canonicalize()?;
+    if !resolved_import_path.starts_with(&canonical_workspace_root) {
         return Ok(None);
     }
 
     let Some(language) = language_for_path(&resolved_import_path) else {
         return Ok(None);
     };
-    let relative_path = workspace_relative_display_path(workspace_root, &resolved_import_path);
+    let relative_path =
+        workspace_relative_display_path(&canonical_workspace_root, &resolved_import_path);
     let file_rollup_id = synthetic_file_sir_id(language.as_str(), &relative_path);
 
     if let Some(rollup_blob) = store.read_sir_blob(&file_rollup_id)?
@@ -460,7 +499,7 @@ fn resolve_import_hover_markdown(
             dependencies: sir.dependencies,
             error_modes: sir.error_modes,
         },
-        None,
+        Some("AETHER: This imported explanation has not been checked against the saved code."),
     )))
 }
 
@@ -492,11 +531,12 @@ fn resolve_rust_import_hover_markdown(
     }
 
     let resolved_path = resolved_path.canonicalize()?;
-    if !resolved_path.starts_with(workspace_root) {
+    let canonical_workspace_root = workspace_root.canonicalize()?;
+    if !resolved_path.starts_with(&canonical_workspace_root) {
         return Ok(None);
     }
 
-    let relative_path = workspace_relative_display_path(workspace_root, &resolved_path);
+    let relative_path = workspace_relative_display_path(&canonical_workspace_root, &resolved_path);
     let file_rollup_id = synthetic_file_sir_id("rust", &relative_path);
     if let Some(rollup_blob) = store.read_sir_blob(&file_rollup_id)?
         && let Ok(file_sir) = serde_json::from_str::<FileSir>(&rollup_blob)
@@ -630,21 +670,24 @@ fn find_crate_src_root(source_file: &Path) -> Option<PathBuf> {
 fn format_file_rollup_markdown(file_path: &str, file_sir: &FileSir) -> String {
     [
         format!("### {file_path}"),
-        format!("**Confidence:** {:.2}", file_sir.confidence),
-        format!("**Symbol Count:** {}", file_sir.symbol_count),
-        format!("**Intent**\n{}", file_sir.intent),
+        format!("**What this file does**\n{}", file_sir.intent),
+        "> AETHER: This imported file summary has not been checked against the saved code.".to_owned(),
         format!("**Exports**\n{}", format_markdown_list(&file_sir.exports)),
         format!(
-            "**Side Effects**\n{}",
+            "**Changes it may make**\n{}",
             format_markdown_list(&file_sir.side_effects)
         ),
         format!(
-            "**Dependencies**\n{}",
-            format_markdown_list(&file_sir.dependencies)
+            "**Possible failures**\n{}",
+            format_markdown_list(&file_sir.error_modes)
         ),
         format!(
-            "**Error Modes**\n{}",
-            format_markdown_list(&file_sir.error_modes)
+            "---\n**Technical details**\n\n**Symbols summarized:** {}\n\n**Reported confidence:** {:.2} (not a correctness check)",
+            file_sir.symbol_count, file_sir.confidence
+        ),
+        format!(
+            "**Uses**\n{}",
+            format_markdown_list(&file_sir.dependencies)
         ),
     ]
     .join("\n\n")
@@ -652,7 +695,7 @@ fn format_file_rollup_markdown(file_path: &str, file_sir: &FileSir) -> String {
 
 fn format_markdown_list(items: &[String]) -> String {
     if items.is_empty() {
-        "(none)".to_owned()
+        "Not recorded; this does not mean there are none.".to_owned()
     } else {
         items
             .iter()
@@ -666,9 +709,18 @@ fn render_pending_hover_markdown(
     store: &SqliteStore,
     symbol_id: &str,
     symbol: &Symbol,
-    stale_warning: Option<&str>,
+    generation_error: Option<&str>,
 ) -> String {
-    let _ = store.enqueue_sir_request(symbol_id);
+    let (request_status, request_error) = match store.enqueue_sir_request(symbol_id) {
+        Ok(()) => (
+            "An explanation has been requested. Waiting for the result; make sure Aether indexing is running and try hovering again later.",
+            None,
+        ),
+        Err(error) => (
+            "The explanation could not be requested. Check the AETHER server and try again.",
+            Some(error.to_string()),
+        ),
+    };
 
     let mut dependencies = store
         .get_dependencies(symbol_id)
@@ -697,15 +749,25 @@ fn render_pending_hover_markdown(
 
     let mut blocks = vec![
         format!("### {}", symbol.qualified_name),
+        "**What this does**\nNo saved explanation is available yet.".to_owned(),
+        request_status.to_owned(),
+        "---\n**Code details**".to_owned(),
         format!("**Kind:** {}", symbol.kind.as_str()),
         format!("**File:** {}", symbol.file_path),
-        format!("**Dependencies**\n{}", format_markdown_list(&dependencies)),
-        format!("**Callers**\n{}", format_markdown_list(&callers)),
-        "⏳ SIR generation in progress...".to_owned(),
+        format!("**Calls**\n{}", format_markdown_list(&dependencies)),
+        format!("**Called by**\n{}", format_markdown_list(&callers)),
     ];
 
-    if let Some(warning) = stale_warning {
-        blocks.insert(1, format!("> {warning}"));
+    if let Some(error) = generation_error
+        .map(str::trim)
+        .filter(|error| !error.is_empty())
+    {
+        blocks.insert(2, format!("> Last generation attempt failed: {error}"));
+    }
+    if let Some(error) = request_error {
+        blocks.push(format!(
+            "**Request details**\nCould not save the explanation request: {error}"
+        ));
     }
 
     blocks.join("\n\n")
@@ -718,7 +780,7 @@ fn compact_why_hint(store: &SqliteStore, symbol_id: &str) -> Result<Option<Strin
     }
     if history.len() == 1 {
         return Ok(Some(
-            "> AETHER WHY: only one recorded SIR version.".to_owned(),
+            "**Explanation history:** One saved version; no earlier version to compare.".to_owned(),
         ));
     }
 
@@ -733,7 +795,7 @@ fn compact_why_hint(store: &SqliteStore, symbol_id: &str) -> Result<Option<Strin
         _ => (Vec::new(), Vec::new(), Vec::new()),
     };
     let summary = format!(
-        "> AETHER WHY: latest v{} -> v{}; added: {}; removed: {}; modified: {}.",
+        "**Explanation history:** v{} -> v{}; added: {}; removed: {}; modified: {}.",
         from.version,
         to.version,
         format_compact_field_list(&added),
@@ -979,6 +1041,14 @@ fn workspace_relative_display_path(workspace_root: &Path, file_path: &Path) -> S
         return normalize_path(&relative.to_string_lossy());
     }
 
+    // Windows canonical paths use the extended-length prefix while editor URIs
+    // usually do not. Both forms must map to the same catalog-relative identity.
+    if let (Ok(root), Ok(file)) = (workspace_root.canonicalize(), file_path.canonicalize())
+        && let Ok(relative) = file.strip_prefix(root)
+    {
+        return normalize_path(&relative.to_string_lossy());
+    }
+
     normalize_path(&file_path.to_string_lossy())
 }
 
@@ -1186,10 +1256,10 @@ mod tests {
                 .expect("hover markdown");
 
         assert!(markdown.contains("### alpha"));
-        assert!(markdown.contains("**Confidence:** 0.75"));
-        assert!(markdown.contains("**Intent**\nMock summary for alpha"));
+        assert!(markdown.contains("**Reported confidence:** 0.75"));
+        assert!(markdown.contains("**What this does**\nMock summary for alpha"));
         assert!(markdown.contains("**Inputs**\n- x"));
-        assert!(markdown.contains("**Side Effects**\n(none)"));
+        assert!(markdown.contains("**Watch out for**\nNo cautions were recorded."));
     }
 
     #[test]
@@ -1241,8 +1311,7 @@ mod tests {
                 .expect("resolve hover")
                 .expect("hover markdown");
 
-        assert!(markdown.contains("AETHER WARNING: SIR is stale. Last error: provider timeout"));
-        assert!(markdown.contains("SIR generation in progress"));
+        assert!(markdown.contains("Last generation attempt failed: provider timeout"));
         let queued = store
             .list_sir_request_symbol_ids(10)
             .expect("list sir requests");
@@ -1295,7 +1364,7 @@ mod tests {
                 .expect("resolve hover")
                 .expect("hover markdown");
 
-        assert!(markdown.contains("> AETHER WARNING: SIR is stale."));
+        assert!(markdown.contains("> AETHER: This explanation may be out of date."));
         assert!(markdown.contains("### alpha"));
     }
 
@@ -1385,7 +1454,7 @@ mod tests {
                 .expect("hover markdown");
 
         assert!(markdown.contains("### alpha"));
-        assert!(markdown.contains("> AETHER WHY: latest v1 -> v2;"));
+        assert!(markdown.contains("**Explanation history:** v1 -> v2;"));
         assert!(
             markdown.contains("added: none; removed: none; modified: confidence,intent,outputs.")
         );
@@ -1456,7 +1525,9 @@ mod tests {
                 .expect("resolve hover")
                 .expect("hover markdown");
 
-        assert!(markdown.contains("> AETHER WHY: only one recorded SIR version."));
+        assert!(markdown.contains(
+            "**Explanation history:** One saved version; no earlier version to compare."
+        ));
     }
 
     #[test]

@@ -85,6 +85,7 @@ function environment(options = {}) {
   const settings = { inferenceProvider: 'mock', inferenceModel: 'fixture-model', ...options.settings };
   const vscode = {
     Disposable,
+    Hover: class { constructor(contents) { this.contents = [contents]; } },
     StatusBarAlignment: { Left: 1 },
     ConfigurationTarget: { Workspace: 2 },
     ProgressLocation: { Notification: 15 },
@@ -253,7 +254,8 @@ async function main() {
     const env = environment(); await env.activate(); const doc = makeDoc(); const tok = token(); let calls = 0;
     const next = async (currentDoc) => { assert.strictEqual(currentDoc, doc); calls++; return fixtureHover(currentDoc); };
     const before = await env.hover(doc, position, tok, next); doc.edit(sourceA.replace('a + b', 'a * b')); env.docChange(doc);
-    assert.equal(await env.hover(doc, position, tok, next), undefined);
+    const unsaved = await env.hover(doc, position, tok, next);
+    assert.match(unsaved.contents[0], /Save this file/);
     assert.equal(calls, 1); assert.match(before.contents[0].value, /sum/);
     doc.isDirty = false;
     const after = await env.hover(doc, position, tok, next);
@@ -267,14 +269,14 @@ async function main() {
     doc.edit(sourceA.replace('a + b', 'a * b'));
     if (saveBeforeResponse) doc.isDirty = false;
     resolve(stale);
-    assert.equal(await request, undefined); assert.doesNotMatch(env.status.text, /stale:/);
+    assert.equal(await request, undefined); assert.doesNotMatch(env.status.text, /outdated:/);
     await env.dispose();
   });
   await test('hover discards responses for a document closed during the request', async () => {
     const env = environment(); await env.activate(); const doc = makeDoc(); let resolve;
     const request = env.hover(doc, position, token(), () => new Promise(r => resolve = r));
     doc.isClosed = true; resolve(stale);
-    assert.equal(await request, undefined); assert.doesNotMatch(env.status.text, /stale:/);
+    assert.equal(await request, undefined); assert.doesNotMatch(env.status.text, /outdated:/);
     await env.dispose();
   });
   await test('hover does not request an explanation for an already closed document', async () => {
@@ -291,20 +293,25 @@ async function main() {
   await test('stale warning formats are observed, repeat exact URI/position is deduplicated', async () => {
     const env = environment(); await env.activate(); const doc = makeDoc();
     for (const contents of ['AETHER WARNING: SIR is stale', { value: 'AETHER WARNING: SIR is stale' }, [{ language: 'rust', value: 'AETHER WARNING: SIR is stale' }]]) await env.hover(doc, position, token(), async () => ({ contents }));
-    assert.match(env.status.text, /stale:1/); await env.hover(doc, { line: 0, character: 19 }, token(), async () => stale); assert.match(env.status.text, /stale:2/); await env.dispose();
+    assert.match(env.status.text, /outdated:1/); await env.hover(doc, { line: 0, character: 19 }, token(), async () => stale); assert.match(env.status.text, /outdated:2/); await env.dispose();
     return { countingUnit: 'URI + requested cursor position, not distinct stale symbol or file' };
+  });
+  await test('plain-English freshness warning is recognized alongside older servers', async () => {
+    const env = environment(); await env.activate();
+    await env.hover(makeDoc(), position, token(), async () => ({ contents: ['AETHER: This explanation may be out of date. The saved code has changed.'] }));
+    assert.match(env.status.text, /outdated:1/); await env.dispose();
   });
   await test('metadata watcher is scoped to root A and records index activity', async () => {
     const env = environment({ workspaceFolders: [workspaceA, workspaceB] }); await env.activate(); assert.equal(env.state.watchers.length, 2); const watcher = env.state.watchers[0]; assert.strictEqual(watcher.pattern.base, workspaceA); assert.equal(watcher.pattern.pattern, '.aether/meta.sqlite'); watcher.change.emit(uri(path.join(workspaceAPath, '.aether', 'meta.sqlite'))); assert.match(env.status.text, /indexing/); await env.advance(5001); assert.match(env.status.text, /idle/); await env.dispose();
   });
   await test('fresh hover preserves documented session observation count', async () => {
-    const env = environment(); await env.activate(); const doc = makeDoc(); await env.hover(doc, position, token(), async () => stale); await env.hover(doc, position, token(), async () => fixtureHover(doc)); const actual = env.status.text; await env.dispose(); assert.match(actual, /stale:1/, 'expected historical observation after fresh explanation: ' + actual);
+    const env = environment(); await env.activate(); const doc = makeDoc(); await env.hover(doc, position, token(), async () => stale); await env.hover(doc, position, token(), async () => fixtureHover(doc)); const actual = env.status.text; await env.dispose(); assert.match(actual, /outdated:1/, 'expected historical observation after fresh explanation: ' + actual);
   }, 'README documents warnings observed in this VS Code session, not current stale inventory.');
   await test('metadata update preserves documented session observation count', async () => {
-    const env = environment(); await env.activate(); const doc = makeDoc(); await env.hover(doc, position, token(), async () => stale); env.state.watchers[0].change.emit(uri(path.join(workspaceAPath, '.aether', 'meta.sqlite'))); await env.hover(doc, position, token(), async () => fixtureHover(doc)); await env.advance(5001); const actual = env.status.text; await env.dispose(); assert.match(actual, /stale:1/, 'expected historical observation after metadata update: ' + actual);
+    const env = environment(); await env.activate(); const doc = makeDoc(); await env.hover(doc, position, token(), async () => stale); env.state.watchers[0].change.emit(uri(path.join(workspaceAPath, '.aether', 'meta.sqlite'))); await env.hover(doc, position, token(), async () => fixtureHover(doc)); await env.advance(5001); const actual = env.status.text; await env.dispose(); assert.match(actual, /outdated:1/, 'expected historical observation after metadata update: ' + actual);
   }, 'README documents historical observations; current hover freshness is checked separately.');
   await test('workspace callback preserves documented session observation count', async () => {
-    const env = environment(); await env.activate(); await env.hover(makeDoc(), position, token(), async () => stale); await env.folders([workspaceB]); const actual = env.status.text; const tooltip = env.status.tooltip; assert.equal(env.state.clients.length, 2); assert.equal(env.state.clients[0].stops, 1); assert.match(tooltip, /Workspace: B/); await env.dispose(); assert.match(actual, /stale:1/, 'expected session-wide observation after workspace callback: ' + actual);
+    const env = environment(); await env.activate(); await env.hover(makeDoc(), position, token(), async () => stale); await env.folders([workspaceB]); const actual = env.status.text; const tooltip = env.status.tooltip; assert.equal(env.state.clients.length, 2); assert.equal(env.state.clients[0].stops, 1); assert.match(tooltip, /Workspace: B/); await env.dispose(); assert.match(actual, /outdated:1/, 'expected session-wide observation after workspace callback: ' + actual);
   }, 'Count is documented session-wide; this callback test is not a real host workspace restart.');
   await test('multi-root hover isolates root B from root A backend workspace', async () => {
     const env = environment({ workspaceFolders: [workspaceA, workspaceB] }); await env.activate(); const docB = makeDoc(workspaceB, sourceB); await env.hover(docB, position, token(), async () => fixtureHover(docB)); const client = env.state.clients[0]; const selectedRoot = client.serverOptions.args[client.serverOptions.args.indexOf('--workspace') + 1]; const workspaceScoped = client.clientOptions.workspaceFolder?.uri?.fsPath === workspaceAPath || client.clientOptions.documentSelector.every((selector) => !!selector.pattern); const evidence = { selectedRoot, hoveredRoot: workspaceBPath, workspaceFolderOption: client.clientOptions.workspaceFolder ?? null, documentSelector: client.clientOptions.documentSelector }; await env.dispose(); assert.ok(selectedRoot === workspaceBPath || workspaceScoped, 'root B hover routed through sole root A client with unrestricted selectors: ' + JSON.stringify(evidence));
@@ -359,7 +366,7 @@ async function extraMultiRootTests(){
  await test('adding root B keeps the running root A client',async()=>{const env=environment();await env.activate();const a=ownedClient(env,workspaceA);await env.folders([workspaceA,workspaceB]);assert.equal(env.state.clients.length,2);assert.strictEqual(ownedClient(env,workspaceA),a);assert.equal(a.starts,1);assert.equal(a.stops,0);assert.equal(env.state.watchers.length,2);await env.dispose();});
  await test('removing root B stops only B and disposes its watcher',async()=>{const env=environment({workspaceFolders:[workspaceA,workspaceB]});await env.activate();const a=ownedClient(env,workspaceA),b=ownedClient(env,workspaceB);await env.folders([workspaceA]);assert.equal(a.stops,0);assert.equal(b.stops,1);assert(env.state.watchers[1].disposed);assert(!env.state.watchers[0].disposed);await env.dispose();});
  await test('nested folders use only their most specific owner',async()=>{const nested=folder(path.join(workspaceAPath,'nested'),'nested',1),env=environment({workspaceFolders:[workspaceA,nested]});await env.activate();const doc=makeDoc(nested,sourceB);let outerCalls=0;assert.equal(await provider(ownedClient(env,workspaceA),doc,async()=>{outerCalls++;return fixtureHover(doc);}),undefined);assert.equal(outerCalls,0);assert.match((await provider(ownedClient(env,nested),doc,async()=>fixtureHover(doc))).contents[0].value,/difference/);await env.dispose();});
- await test('an in-flight hover is discarded when its root is removed',async()=>{const env=environment({workspaceFolders:[workspaceA,workspaceB]});await env.activate();let resolve;const doc=makeDoc(workspaceB,sourceB),pending=provider(ownedClient(env,workspaceB),doc,()=>new Promise(r=>resolve=r));await env.folders([workspaceA]);resolve(stale);assert.equal(await pending,undefined);assert.doesNotMatch(env.status.text,/stale:/);await env.dispose();});
+ await test('an in-flight hover is discarded when its root is removed',async()=>{const env=environment({workspaceFolders:[workspaceA,workspaceB]});await env.activate();let resolve;const doc=makeDoc(workspaceB,sourceB),pending=provider(ownedClient(env,workspaceB),doc,()=>new Promise(r=>resolve=r));await env.folders([workspaceA]);resolve(stale);assert.equal(await pending,undefined);assert.doesNotMatch(env.status.text,/outdated:/);await env.dispose();});
  await test('rapid remove/re-add retires the old client generation',async()=>{const env=environment({workspaceFolders:[workspaceA,workspaceB]});await env.activate();const old=ownedClient(env,workspaceB);let resolve;const doc=makeDoc(workspaceB,sourceB),pending=provider(old,doc,()=>new Promise(r=>resolve=r));const removed=env.folders([workspaceA]),added=env.folders([workspaceA,workspaceB]);await Promise.all([removed,added]);resolve(stale);assert.equal(await pending,undefined);assert.equal(old.stops,1);assert.notStrictEqual(ownedClient(env,workspaceB),old);assert.equal(env.state.clients.length,3);await env.dispose();});
  await test('a root removed during startup is stopped before publication',async()=>{let release;const gate=new Promise(r=>release=r);const env=environment({workspaceFolders:[workspaceA,workspaceB],onStart:async c=>{if(c.clientOptions.workspaceFolder.uri.toString()===workspaceB.uri.toString())await gate;}});const activating=env.activate();for(let i=0;i<1000&&env.state.clients.length<2;i++)await Promise.resolve();assert.equal(env.state.clients.length,2,'both roots should be starting a client');const change=env.folders([workspaceA]);release();await Promise.all([activating,change]);assert.equal(env.state.clients[1].stops,1);assert.equal(env.state.clients[0].stops,0);await env.dispose();});
  await test('failed stop retains its handle and is retried without duplicate client',async()=>{let fail=true;const env=environment({workspaceFolders:[workspaceA,workspaceB],onStop:async c=>{if(c.clientOptions.workspaceFolder.uri.toString()===workspaceB.uri.toString()&&fail){fail=false;throw Error('fixture stop failure');}}});await env.activate();const b=ownedClient(env,workspaceB);await env.folders([workspaceA]);assert.equal(b.stops,1);assert(env.state.outputs.some(s=>s.includes('Failed to stop LSP for B')));await env.folders([workspaceA]);assert.equal(b.stops,2);assert.equal(env.state.clients.length,2);await env.dispose();});

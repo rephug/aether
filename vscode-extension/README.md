@@ -8,8 +8,19 @@ innermost one). Adding or removing a folder starts or stops just that folder's s
 The index and search commands still act on the first folder.
 
 Hover explanations use the saved file on disk. While a document has unsaved edits,
-AETHER hides its hover; save the file to request explanations again. Responses are
+AETHER asks you to save the file before showing an explanation. Responses are
 also discarded if the document changes or closes while the request is running.
+
+Explanations lead with what the code does, its inputs, result, and cautions.
+Dependencies, model confidence, and explanation history appear below those sections.
+Empty fields mean the model did not record a finding; they do not prove the absence
+of side effects or failures. A source fingerprint mismatch warns that the explanation
+may be out of date, even before background indexing notices the saved edit. Older
+explanations without a source fingerprint disclose that freshness could not be checked.
+
+When an explanation is missing, hover requests it and says it is waiting for the result. That request does not prove that a background worker has started it.
+Generation errors, when recorded, appear as a failed last update. Hover reuses saved
+explanations; it does not run a new LLM call for each hover.
 
 ## What It Is Useful For
 
@@ -60,7 +71,7 @@ The extension shows a status bar item:
 
 - `AETHER: indexing`: active index task, startup window, or recent `.aether/meta.sqlite` write detected.
 - `AETHER: idle`: no active indexing signal.
-- `AETHER: idle (stale:N)`: stale hover warnings observed in this VS Code session.
+- `AETHER: idle (outdated:N)`: out-of-date hover warnings observed during this VS Code session. This count persists when explanations refresh.
 - `AETHER: idle (error)`: the latest extension-triggered action failed (binary build/startup/index/search/open).
 
 Clicking the status bar item runs `AETHER: Search Symbols`.
@@ -111,3 +122,16 @@ npm test
 ```
 
 `npm run verify` runs all three.
+
+An optional real VS Code check uses an existing daemon binary built from the same
+source, a separate editor profile, synthetic Python code, and mock inference only:
+
+```text
+node test/run-live-hover.cjs <aetherd-binary> <new-output-directory>
+```
+
+The check leaves workspace trust unchanged. An untrusted test workspace stops the
+check before the extension starts. After the owner has trusted that synthetic
+workspace in its test profile, `--resume` reuses the profile and preserves earlier
+result files. This check verifies editor/LSP behavior; mock text cannot establish
+the quality of real model-generated explanations.
