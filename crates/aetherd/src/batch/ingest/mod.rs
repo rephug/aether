@@ -13,6 +13,7 @@ use anyhow::{Context, Result, anyhow};
 
 use crate::batch::build::{BatchRequestOrigin, KEYMAP_SIDECAR_KIND, ORIGIN_SIDECAR_KIND};
 use crate::batch::hash::diff_prompt_hashes;
+use crate::batch::key::{key_has_build_id, parse_key};
 use crate::batch::{BatchProvider, BatchResultLine, PassConfig};
 use crate::continuous::cosine_distance_from_embeddings;
 use crate::sir_pipeline::{
@@ -486,6 +487,9 @@ fn prepare_symbol(
         ));
     }
     let provider_kind = provider_kind_from_name(provider_name);
+    if let Some(evidence) = origin.and_then(|origin| origin.evidence) {
+        aether_infer::sir_evidence::log_sir_evidence_issues(&sir, evidence, &symbol_id);
+    }
     let payload = UpsertSirIntentPayload {
         symbol: symbol_from_record(&symbol_record)?,
         sir,
@@ -649,35 +653,6 @@ pub(crate) fn write_fingerprint_row(
             sir_write_generation,
         })
         .with_context(|| format!("failed to insert fingerprint history row for {symbol_id}"))
-}
-
-/// Split a request key `symbol_id|prompt_hash[|build_id]` into its symbol id and prompt
-/// hash (the build id only distinguishes sidecar entries, see `BuildSummary::build_id`).
-fn key_has_build_id(key: &str) -> bool {
-    key_build_id(key).is_some()
-}
-
-/// The build id of a three-part key (`symbol_id|prompt_hash|build_id`), if any.
-fn key_build_id(key: &str) -> Option<&str> {
-    key.splitn(3, '|')
-        .nth(2)
-        .map(str::trim)
-        .filter(|build_id| !build_id.is_empty())
-}
-
-fn parse_key(key: &str) -> Result<(&str, &str)> {
-    let (symbol_id, rest) = key.split_once('|').unwrap_or((key, "unknown"));
-    let prompt_hash = rest
-        .split_once('|')
-        .map_or(rest, |(prompt_hash, _)| prompt_hash);
-    let symbol_id = symbol_id.trim();
-    let prompt_hash = prompt_hash.trim();
-    if symbol_id.is_empty() || prompt_hash.is_empty() {
-        return Err(anyhow!(
-            "batch response key is missing symbol_id or prompt_hash"
-        ));
-    }
-    Ok((symbol_id, prompt_hash))
 }
 
 /// Load the origin sidecars written during JSONL build (see `BuildSummary::origins`),

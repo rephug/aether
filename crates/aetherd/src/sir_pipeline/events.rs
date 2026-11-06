@@ -262,19 +262,13 @@ impl SirPipeline {
                     // Not re-read here: the enrichment in the prompt describes the SIR
                     // the item was built from, so that is the write the guard compares.
                     job.prior_sir = item.baseline_sir_identity;
-                    let prompt = if item.use_cot {
-                        sir_prompt::build_enriched_sir_prompt_with_cot(
-                            &job.symbol_text,
-                            &job.context,
-                            &item.enrichment,
-                        )
-                    } else {
-                        sir_prompt::build_enriched_sir_prompt(
-                            &job.symbol_text,
-                            &job.context,
-                            &item.enrichment,
-                        )
-                    };
+                    let prompt = sir_prompt::build_enriched_sir_prompt_with_source_size(
+                        &job.symbol_text,
+                        &job.context,
+                        &item.enrichment,
+                        item.use_cot,
+                        job.original_source_bytes,
+                    );
                     job.custom_prompt = Some(prompt);
                     job.deep_mode = item.use_cot;
                     jobs.push(job);
@@ -900,19 +894,13 @@ impl SirPipeline {
                 .with_context(|| {
                     format!("failed to build deep SIR job for {}", symbol.qualified_name)
                 })?;
-            let prompt = if spec.use_cot {
-                sir_prompt::build_enriched_sir_prompt_with_cot(
-                    &job.symbol_text,
-                    &job.context,
-                    &spec.enrichment,
-                )
-            } else {
-                sir_prompt::build_enriched_sir_prompt(
-                    &job.symbol_text,
-                    &job.context,
-                    &spec.enrichment,
-                )
-            };
+            let prompt = sir_prompt::build_enriched_sir_prompt_with_source_size(
+                &job.symbol_text,
+                &job.context,
+                &spec.enrichment,
+                spec.use_cot,
+                job.original_source_bytes,
+            );
             prompt_overrides.insert(
                 symbol.id.clone(),
                 SirPromptOverride {

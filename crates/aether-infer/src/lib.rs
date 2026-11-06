@@ -5,6 +5,7 @@ mod loaders;
 mod model_check;
 mod providers;
 mod reranker;
+pub mod sir_evidence;
 mod sir_parsing;
 pub mod sir_prompt;
 mod types;

@@ -40,6 +40,10 @@ impl OpenAiBatchProvider {
 
 #[async_trait::async_trait]
 impl BatchProvider for OpenAiBatchProvider {
+    fn cache_context(&self) -> serde_json::Value {
+        json!({ "provider": self.name(), "api_base": OPENAI_API_BASE, "endpoint": OPENAI_RESPONSES_ENDPOINT })
+    }
+
     fn format_request(
         &self,
         key: &str,

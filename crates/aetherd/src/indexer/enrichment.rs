@@ -56,7 +56,10 @@ pub fn build_enrichment_context(
                 .get(peer.id.as_str())
                 .copied()
                 .unwrap_or(0.0),
-            peer.qualified_name,
+            format!(
+                "{} [file={}; id={}]",
+                peer.qualified_name, peer.file_path, peer.id
+            ),
             peer_sir.intent,
         ));
     }

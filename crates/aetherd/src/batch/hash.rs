@@ -49,8 +49,28 @@ pub fn compute_prompt_hash(source: &str, neighbor_intents: &[&str], config: &str
     format!("{source_hash}|{neighbor_hash}|{config_hash}")
 }
 
+/// Versioned cache identity for the full source identity, complete dynamic prompt,
+/// and effective provider request template (including system/schema/model/settings).
+/// Keep delimiters inside the hash distinct from the batch key's `|` separator.
+pub fn compute_effective_prompt_hash(
+    source_identity: &str,
+    user_prompt: &str,
+    request_template: &str,
+) -> String {
+    format!(
+        "v3:{}:{}:{}",
+        compute_source_hash_segment(source_identity),
+        compute_config_hash_segment(user_prompt),
+        compute_config_hash_segment(request_template),
+    )
+}
+
 pub fn decompose_prompt_hash(hash: &str) -> (Option<&str>, Option<&str>, Option<&str>) {
-    let mut parts = hash.split('|');
+    let mut parts = if let Some(hash) = hash.strip_prefix("v3:") {
+        hash.split(':')
+    } else {
+        hash.split('|')
+    };
     (parts.next(), parts.next(), parts.next())
 }
 
@@ -70,6 +90,54 @@ mod tests {
         compute_config_hash_segment, compute_neighbor_hash_segment, compute_prompt_hash,
         compute_source_hash_segment, diff_prompt_hashes,
     };
+    use super::{compute_effective_prompt_hash, decompose_prompt_hash};
+
+    #[test]
+    fn effective_identity_covers_context_and_request_and_is_a_single_key_token() {
+        let base = compute_effective_prompt_hash(
+            "full-source-hash",
+            "complete user context",
+            "effective settings and system/schema",
+        );
+        assert!(!base.contains('|'));
+        assert!(base.starts_with("v3:"));
+        assert_eq!(
+            decompose_prompt_hash(&base).0,
+            Some(compute_source_hash_segment("full-source-hash").as_str())
+        );
+        assert_ne!(
+            base,
+            compute_effective_prompt_hash(
+                "changed-source-hash",
+                "complete user context",
+                "effective settings and system/schema"
+            )
+        );
+        assert_ne!(
+            base,
+            compute_effective_prompt_hash(
+                "full-source-hash",
+                "changed user context",
+                "effective settings and system/schema"
+            )
+        );
+        assert_ne!(
+            base,
+            compute_effective_prompt_hash(
+                "full-source-hash",
+                "complete user context",
+                "changed settings or system/schema"
+            )
+        );
+        assert_ne!(
+            base,
+            compute_prompt_hash(
+                "full-source-hash",
+                &["complete user context"],
+                "effective settings and system/schema"
+            )
+        );
+    }
 
     #[test]
     fn compute_prompt_hash_is_stable_for_identical_inputs() {

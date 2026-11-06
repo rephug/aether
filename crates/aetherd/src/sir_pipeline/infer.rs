@@ -35,6 +35,8 @@ pub(crate) struct SirJob {
     /// the text the prompt was built from rather than of an earlier snapshot, so a
     /// caller recording what a prompt described records exactly that.
     pub(crate) source_hash: String,
+    /// Size before truncation, carried separately so the excerpt remains raw source.
+    pub(crate) original_source_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +100,7 @@ pub(crate) fn build_job(
             symbol.file_path,
         ));
     }
+    let original_source_bytes = symbol_text.len();
     let effective_limit = match max_chars {
         Some(0) | None => MAX_SYMBOL_TEXT_CHARS,
         Some(value) => value,
@@ -128,14 +131,26 @@ pub(crate) fn build_job(
         line_count: symbol_text.lines().count(),
     };
 
+    let custom_prompt = (symbol_text.len() < original_source_bytes).then(|| {
+        format!(
+            "{}\n\n{}",
+            aether_infer::sir_prompt::sir_scan_system_prompt(aether_infer::PromptTier::Compact),
+            aether_infer::sir_prompt::sir_scan_user_prompt_with_source_size(
+                &symbol_text,
+                &context,
+                original_source_bytes,
+            )
+        )
+    });
     Ok(SirJob {
         symbol,
         symbol_text,
         context,
-        custom_prompt: None,
+        custom_prompt,
         deep_mode: false,
         prior_sir: None,
         source_hash,
+        original_source_bytes,
     })
 }
 
@@ -269,7 +284,12 @@ pub(super) async fn generate_sir_jobs(
                 deep_mode,
                 prior_sir,
                 source_hash,
+                original_source_bytes,
             } = job;
+            let evidence = aether_infer::sir_evidence::SirEvidenceContext {
+                supplied_lines: symbol_text.lines().count(),
+                source_truncated: symbol_text.len() < original_source_bytes,
+            };
             let qualified_name = symbol.qualified_name.clone();
 
             let permit = semaphore.acquire_owned().await;
@@ -306,6 +326,9 @@ pub(super) async fn generate_sir_jobs(
                 .with_context(|| format!("failed to generate SIR for symbol {qualified_name}")),
             };
 
+            if let Ok(result) = &generated {
+                aether_infer::sir_evidence::log_sir_evidence_issues(&result.sir, evidence, &symbol.id);
+            }
             match generated {
                 Ok(result) => SirGenerationOutcome::Success(Box::new(GeneratedSir {
                     symbol,
@@ -359,6 +382,9 @@ pub(super) async fn generate_sir_jobs(
                         }),
                     };
 
+                    if let Ok(result) = &fallback_generated {
+                        aether_infer::sir_evidence::log_sir_evidence_issues(&result.sir, evidence, &symbol.id);
+                    }
                     match fallback_generated {
                         Ok(result) => SirGenerationOutcome::Success(Box::new(GeneratedSir {
                             symbol,

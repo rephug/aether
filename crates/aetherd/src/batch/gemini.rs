@@ -9,6 +9,7 @@ use serde_json::json;
 use super::{BatchPollStatus, BatchProvider, BatchResultLine};
 
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com";
+const GEMINI_API_VERSION: &str = "v1beta";
 
 pub(crate) struct GeminiBatchProvider {
     client: reqwest::Client,
@@ -26,6 +27,10 @@ impl GeminiBatchProvider {
 
 #[async_trait::async_trait]
 impl BatchProvider for GeminiBatchProvider {
+    fn cache_context(&self) -> serde_json::Value {
+        json!({ "provider": self.name(), "api_base": GEMINI_API_BASE, "api_version": GEMINI_API_VERSION })
+    }
+
     fn format_request(
         &self,
         key: &str,
@@ -86,7 +91,9 @@ impl BatchProvider for GeminiBatchProvider {
         // --- Phase 1: Start resumable upload ---
         let start_resp = self
             .client
-            .post(format!("{}/upload/v1beta/files", GEMINI_API_BASE))
+            .post(format!(
+                "{GEMINI_API_BASE}/upload/{GEMINI_API_VERSION}/files"
+            ))
             .header("x-goog-api-key", &self.api_key)
             .header("X-Goog-Upload-Protocol", "resumable")
             .header("X-Goog-Upload-Command", "start")
@@ -170,8 +177,7 @@ impl BatchProvider for GeminiBatchProvider {
         let create_resp = self
             .client
             .post(format!(
-                "{}/v1beta/models/{}:batchGenerateContent",
-                GEMINI_API_BASE, model
+                "{GEMINI_API_BASE}/{GEMINI_API_VERSION}/models/{model}:batchGenerateContent"
             ))
             .header("x-goog-api-key", &self.api_key)
             .header("Content-Type", "application/json")
@@ -215,7 +221,9 @@ impl BatchProvider for GeminiBatchProvider {
 
         let resp = self
             .client
-            .get(format!("{}/v1beta/{}", GEMINI_API_BASE, batch_name))
+            .get(format!(
+                "{GEMINI_API_BASE}/{GEMINI_API_VERSION}/{batch_name}"
+            ))
             .header("x-goog-api-key", &self.api_key)
             .header("Content-Type", "application/json")
             .send()
@@ -277,7 +285,9 @@ impl BatchProvider for GeminiBatchProvider {
         // Get batch status to extract responses file
         let resp = self
             .client
-            .get(format!("{}/v1beta/{}", GEMINI_API_BASE, batch_name))
+            .get(format!(
+                "{GEMINI_API_BASE}/{GEMINI_API_VERSION}/{batch_name}"
+            ))
             .header("x-goog-api-key", &self.api_key)
             .header("Content-Type", "application/json")
             .send()
@@ -308,8 +318,7 @@ impl BatchProvider for GeminiBatchProvider {
         let download_resp = self
             .client
             .get(format!(
-                "{}/download/v1beta/{}:download?alt=media",
-                GEMINI_API_BASE, responses_file
+                "{GEMINI_API_BASE}/download/{GEMINI_API_VERSION}/{responses_file}:download?alt=media"
             ))
             .header("x-goog-api-key", &self.api_key)
             .send()

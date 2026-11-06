@@ -54,15 +54,18 @@ impl AnthropicBatchProvider {
 
 #[async_trait::async_trait]
 impl BatchProvider for AnthropicBatchProvider {
+    fn cache_context(&self) -> serde_json::Value {
+        json!({ "provider": self.name(), "api_base": ANTHROPIC_API_BASE, "api_version": ANTHROPIC_VERSION, "beta": ANTHROPIC_BETA_EXTENDED_CACHE_TTL })
+    }
+
     /// Anthropic limits `custom_id` to 64 chars matching `^[a-zA-Z0-9_-]{1,64}$`, and a
     /// compound key `symbol_id|prompt_hash|build_id` exceeds that. The id keeps the
     /// build id (so a result identifies the build it answers, and the keymap entry for
     /// it cannot be crossed with another build's) after as much of the symbol id as
     /// fits; a key without a build id sends the symbol id alone, as before.
     fn request_key(&self, key: &str) -> String {
-        let mut parts = key.splitn(3, '|');
-        let symbol_id = parts.next().unwrap_or(key);
-        let build_id = parts.nth(1).filter(|value| !value.is_empty());
+        let symbol_id = key.split('|').next().unwrap_or(key);
+        let build_id = super::key::key_build_id(key);
         let custom_id = match build_id {
             Some(build_id) => {
                 let symbol_budget = ANTHROPIC_CUSTOM_ID_MAX_LEN.saturating_sub(build_id.len() + 1);

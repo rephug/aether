@@ -135,6 +135,10 @@ fn build_job_records_the_hash_of_the_text_it_read_for_the_prompt() {
     assert_eq!(job.symbol_text, "fn late(");
     assert_eq!(job.source_hash, content_hash(snapshot_source));
     assert_eq!(job.source_hash, symbol.content_hash);
+    assert_eq!(job.original_source_bytes, snapshot_source.len());
+    let prompt = job.custom_prompt.expect("truncation-aware live prompt");
+    assert!(prompt.contains("Source availability: TRUNCATED (8 of"));
+    assert!(prompt.contains("L1: fn late("));
 }
 
 #[test]

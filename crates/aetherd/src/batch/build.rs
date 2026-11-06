@@ -5,14 +5,15 @@ use std::path::{Path, PathBuf};
 
 use aether_core::Symbol;
 use aether_infer::sir_prompt::{
-    SirEnrichmentContext, resolve_prompt_tier, sir_enriched_system_prompt,
-    sir_enriched_user_prompt, sir_scan_system_prompt, sir_scan_user_prompt,
+    SIR_PROMPT_VERSION, SIR_RESPONSE_SCHEMA, SirEnrichmentContext, resolve_prompt_tier,
+    sir_enriched_system_prompt, sir_enriched_user_prompt_with_source_size, sir_scan_system_prompt,
+    sir_scan_user_prompt_with_source_size,
 };
 use aether_sir::{FileSir, SirAnnotation, synthetic_file_sir_id};
 use aether_store::{GraphDependencyEdgeRecord, SqliteStore};
 use anyhow::{Context, Result, anyhow};
 
-use crate::batch::hash::compute_prompt_hash;
+use crate::batch::hash::compute_effective_prompt_hash;
 use crate::batch::{BatchProvider, BatchRuntimeConfig, PassConfig};
 use crate::cli::BatchPass;
 use crate::observer::ObserverState;
@@ -136,6 +137,9 @@ pub(crate) struct BuildSummary {
 pub(crate) struct BatchRequestOrigin {
     pub prior_sir: Option<SirIdentity>,
     pub source_hash: String,
+    /// Optional for compatibility with outstanding batches built before evidence auditing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<aether_infer::sir_evidence::SirEvidenceContext>,
 }
 
 pub(crate) fn snapshot_workspace_symbols(workspace: &Path) -> Result<HashMap<String, Symbol>> {
@@ -209,6 +213,24 @@ pub(crate) fn build_pass_jsonl_for_ids(
     };
 
     let provider_name = provider.name();
+    // Pure formatting captures provider defaults, output limits and response mode.
+    // Per-build IDs and dynamic context have stable placeholders; the exact user
+    // prompt is hashed separately. This template is identical for the whole pass.
+    let request_template = provider.format_request(
+        "aether-cache-identity",
+        &system_prompt,
+        "aether-dynamic-context",
+        &pass_config.model,
+        &pass_config.thinking,
+    )?;
+    let effective_config = serde_json::json!({
+        "prompt_version": SIR_PROMPT_VERSION,
+        "schema": SIR_RESPONSE_SCHEMA,
+        "pass_config": pass_config.config_fingerprint(provider_name),
+        "provider_context": provider.cache_context(),
+        "request_template": request_template,
+    })
+    .to_string();
 
     let mut summary = BuildSummary {
         files: Vec::new(),
@@ -319,11 +341,11 @@ pub(crate) fn build_pass_jsonl_for_ids(
             None => (None, None, None),
         };
 
-        // Build per-symbol user prompt and collect neighbor entries for hash.
-        let (neighbor_entries, user_prompt) = match pass_config.pass {
-            BatchPass::Scan => (
-                Vec::new(),
-                sir_scan_user_prompt(&job.symbol_text, &job.context),
+        let user_prompt = match pass_config.pass {
+            BatchPass::Scan => sir_scan_user_prompt_with_source_size(
+                &job.symbol_text,
+                &job.context,
+                job.original_source_bytes,
             ),
             BatchPass::Triage | BatchPass::Deep => {
                 let baseline_sir = baseline_blob
@@ -354,25 +376,18 @@ pub(crate) fn build_pass_jsonl_for_ids(
                     &caller_contracts_map,
                 );
                 let include_cot = matches!(pass_config.pass, BatchPass::Deep);
-                let user = sir_enriched_user_prompt(
+                sir_enriched_user_prompt_with_source_size(
                     &job.symbol_text,
                     &job.context,
                     &enrichment,
                     include_cot,
-                );
-                (enrichment.neighbor_intents, user)
+                    job.original_source_bytes,
+                )
             }
         };
 
-        let neighbor_texts = neighbor_entries
-            .iter()
-            .map(|(_, intent)| intent.as_str())
-            .collect::<Vec<_>>();
-        let prompt_hash = compute_prompt_hash(
-            job.symbol_text.as_str(),
-            &neighbor_texts,
-            pass_config.config_fingerprint(provider_name).as_str(),
-        );
+        let prompt_hash =
+            compute_effective_prompt_hash(&job.source_hash, &user_prompt, &effective_config);
         let existing_hash = existing_meta
             .as_ref()
             .and_then(|record| record.prompt_hash.as_deref());
@@ -413,6 +428,10 @@ pub(crate) fn build_pass_jsonl_for_ids(
             BatchRequestOrigin {
                 prior_sir: existing_identity,
                 source_hash: job.source_hash.clone(),
+                evidence: Some(aether_infer::sir_evidence::SirEvidenceContext {
+                    supplied_lines: job.symbol_text.lines().count(),
+                    source_truncated: job.symbol_text.len() < job.original_source_bytes,
+                }),
             },
         );
         let line = provider.format_request(
@@ -560,7 +579,12 @@ fn build_enrichment_context(
                 let neighbor_symbol = symbols_by_id.get(neighbor_id.as_str())?;
                 let neighbor_sir = neighbor_sirs.get(neighbor_id.as_str())?;
                 Some((
-                    neighbor_symbol.qualified_name.clone(),
+                    format!(
+                        "{} [file={}; id={}]",
+                        neighbor_symbol.qualified_name,
+                        neighbor_symbol.file_path,
+                        neighbor_symbol.id
+                    ),
                     neighbor_sir.intent.clone(),
                 ))
             })
