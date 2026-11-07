@@ -22,8 +22,8 @@ use super::staleness::{compute_staleness, effective_age, time_staleness};
 use super::{ensure_supported_schedule, parse_requeue_pass, resolve_continuous_config};
 use crate::batch::hash::{compute_source_hash_segment, decompose_prompt_hash};
 use crate::batch::{
-    BatchPollStatus, build_pass_jsonl_for_ids, create_batch_provider, ingest_results,
-    remove_build_sidecars, resolve_batch_runtime_config, unaccounted_requests,
+    BatchPollStatus, BatchProvider, build_pass_jsonl_for_ids, create_batch_provider,
+    ingest_results, remove_build_sidecars, resolve_batch_runtime_config, unaccounted_requests,
 };
 use crate::indexer::run_structural_index_once;
 use crate::sir_pipeline::build_job;
@@ -110,6 +110,17 @@ fn run_monitor_once_inner(
     config: &AetherConfig,
     started_at: i64,
 ) -> Result<ContinuousStatusSnapshot> {
+    run_monitor_once_with_provider(workspace, config, started_at, || {
+        create_batch_provider(config, None)
+    })
+}
+
+pub(crate) fn run_monitor_once_with_provider(
+    workspace: &Path,
+    config: &AetherConfig,
+    started_at: i64,
+    provider_factory: impl FnOnce() -> Result<Box<dyn BatchProvider>>,
+) -> Result<ContinuousStatusSnapshot> {
     let continuous = resolve_continuous_config(config);
     ensure_supported_schedule(continuous.schedule.as_str())?;
     let requeue_pass = parse_requeue_pass(continuous.requeue_pass.as_str())?;
@@ -168,8 +179,8 @@ fn run_monitor_once_inner(
 
     let contracts_enabled = config.contracts.as_ref().is_some_and(|c| c.enabled);
     let pass_config = runtime.for_pass(requeue_pass).clone();
-    let provider = create_batch_provider(config, None)
-        .context("failed to create batch provider for continuous monitor")?;
+    let provider =
+        provider_factory().context("failed to create batch provider for continuous monitor")?;
     let build_summary = build_pass_jsonl_for_ids(
         workspace,
         &store,

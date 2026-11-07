@@ -12,6 +12,8 @@ use anyhow::{Result, anyhow};
 use crate::cli::{BatchPass, ContinuousArgs, ContinuousCommand};
 
 pub(crate) use math::cosine_distance_from_embeddings;
+#[cfg(test)]
+pub(crate) use monitor::run_monitor_once_with_provider;
 pub(crate) use monitor::{ContinuousStatusSnapshot, load_status_snapshot, run_monitor_once};
 
 pub fn run_continuous_command(
@@ -121,7 +123,7 @@ fn print_status_snapshot(status: &ContinuousStatusSnapshot) {
     }
     println!("Selected for requeue:    {}", status.selected_symbols);
     println!("JSONL requests written:  {}", status.written_requests);
-    println!("Prompt-hash skips:       {}", status.skipped_requests);
+    println!("Skipped requests:        {}", status.skipped_requests);
     println!("Unresolved symbols:      {}", status.unresolved_symbols);
     println!("Batch chunks:            {}", status.chunk_count);
     println!("Auto-submit enabled:     {}", status.auto_submit);

@@ -140,6 +140,10 @@ pub(crate) struct BatchRequestOrigin {
     /// Optional for compatibility with outstanding batches built before evidence auditing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<aether_infer::sir_evidence::SirEvidenceContext>,
+    /// The baseline actually sent for enrichment. Old sidecars omit it and retain
+    /// their existing ingest behavior; they cannot seed a completion receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrichment_baseline: Option<String>,
 }
 
 pub(crate) fn snapshot_workspace_symbols(workspace: &Path) -> Result<HashMap<String, Symbol>> {
@@ -341,12 +345,8 @@ pub(crate) fn build_pass_jsonl_for_ids(
             None => (None, None, None),
         };
 
-        let user_prompt = match pass_config.pass {
-            BatchPass::Scan => sir_scan_user_prompt_with_source_size(
-                &job.symbol_text,
-                &job.context,
-                job.original_source_bytes,
-            ),
+        let enrichment = match pass_config.pass {
+            BatchPass::Scan => None,
             BatchPass::Triage | BatchPass::Deep => {
                 let baseline_sir = baseline_blob
                     .as_deref()
@@ -365,7 +365,7 @@ pub(crate) fn build_pass_jsonl_for_ids(
                     );
                     continue;
                 };
-                let enrichment = build_enrichment_context(
+                Some(build_enrichment_context(
                     symbol,
                     pass_config,
                     &graph,
@@ -374,16 +374,23 @@ pub(crate) fn build_pass_jsonl_for_ids(
                     symbols_by_id,
                     baseline_sir,
                     &caller_contracts_map,
-                );
-                let include_cot = matches!(pass_config.pass, BatchPass::Deep);
-                sir_enriched_user_prompt_with_source_size(
-                    &job.symbol_text,
-                    &job.context,
-                    &enrichment,
-                    include_cot,
-                    job.original_source_bytes,
-                )
+                ))
             }
+        };
+        let include_cot = matches!(pass_config.pass, BatchPass::Deep);
+        let user_prompt = match enrichment.as_ref() {
+            Some(enrichment) => sir_enriched_user_prompt_with_source_size(
+                &job.symbol_text,
+                &job.context,
+                enrichment,
+                include_cot,
+                job.original_source_bytes,
+            ),
+            None => sir_scan_user_prompt_with_source_size(
+                &job.symbol_text,
+                &job.context,
+                job.original_source_bytes,
+            ),
         };
 
         let prompt_hash =
@@ -394,6 +401,39 @@ pub(crate) fn build_pass_jsonl_for_ids(
         if existing_hash == Some(prompt_hash.as_str()) {
             summary.skipped += 1;
             continue;
+        }
+
+        if let (Some(meta), Some(identity), Some(enrichment)) = (
+            existing_meta.as_ref(),
+            existing_identity.as_ref(),
+            enrichment.as_ref(),
+        ) && let Some(current_baseline) = enrichment.baseline_sir.as_ref()
+            && let Some((completed_hash, previous_baseline)) = super::completion::previous_baseline(
+                workspace,
+                pass_config.pass,
+                meta,
+                identity,
+                current_baseline,
+            )
+        {
+            let mut completed_inputs = enrichment.clone();
+            completed_inputs.baseline_sir = Some(previous_baseline);
+            let completed_prompt = sir_enriched_user_prompt_with_source_size(
+                &job.symbol_text,
+                &job.context,
+                &completed_inputs,
+                include_cot,
+                job.original_source_bytes,
+            );
+            if compute_effective_prompt_hash(&job.source_hash, &completed_prompt, &effective_config)
+                == completed_hash
+            {
+                // An application receipt, not a cache hit for a prompt containing
+                // the new baseline. Keep the actual request fingerprint unchanged.
+                summary.skipped += 1;
+                tracing::debug!(symbol_id = %symbol_id, pass = pass_config.pass.as_str(), "reused completed enrichment with unchanged external inputs");
+                continue;
+            }
         }
 
         if writer.is_none() || current_lines >= runtime.jsonl_chunk_size {
@@ -432,6 +472,12 @@ pub(crate) fn build_pass_jsonl_for_ids(
                     supplied_lines: job.symbol_text.lines().count(),
                     source_truncated: job.symbol_text.len() < job.original_source_bytes,
                 }),
+                enrichment_baseline: enrichment
+                    .as_ref()
+                    .and_then(|enrichment| enrichment.baseline_sir.as_ref())
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .context("failed to encode enrichment baseline for batch origin")?,
             },
         );
         let line = provider.format_request(

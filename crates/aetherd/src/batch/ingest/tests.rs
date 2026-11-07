@@ -1,6 +1,8 @@
 //! Batch ingest tests: result parsing and key handling, the superseded-result skips,
 //! the resumed retry of a downstream-failed result and its once-per-result fingerprint.
 
+mod enrichment;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -231,6 +233,7 @@ fn prepare_symbol_skips_a_result_whose_sir_moved_on_since_the_build() {
     let origins = HashMap::from([(
         key.clone(),
         BatchRequestOrigin {
+            enrichment_baseline: None,
             evidence: None,
             prior_sir: built_against,
             source_hash: source_hash.clone(),
@@ -292,6 +295,7 @@ fn prepare_symbol_skips_a_result_whose_sir_moved_on_since_the_build() {
     let origins = HashMap::from([(
         key.clone(),
         BatchRequestOrigin {
+            enrichment_baseline: None,
             evidence: None,
             prior_sir: reviewed_identity.clone(),
             source_hash: source_hash.clone(),
@@ -427,6 +431,7 @@ fn prepare_symbol_resumes_a_result_an_earlier_attempt_already_persisted() {
     let origins = HashMap::from([(
         key.clone(),
         BatchRequestOrigin {
+            enrichment_baseline: None,
             evidence: None,
             prior_sir: built_against,
             source_hash: symbol.content_hash.clone(),
@@ -615,6 +620,7 @@ fn a_resumed_result_writes_its_fingerprint_row_once_against_its_true_predecessor
     let origins = HashMap::from([(
         key.clone(),
         BatchRequestOrigin {
+            enrichment_baseline: None,
             evidence: None,
             prior_sir: built_against,
             source_hash: symbol.content_hash.clone(),
@@ -631,7 +637,7 @@ fn a_resumed_result_writes_its_fingerprint_row_once_against_its_true_predecessor
     };
     let chunk = |summary: &mut IngestSummary| {
         let mut buffer = Vec::new();
-        process_chunk(
+        let _completed_writes = process_chunk(
             &pipeline,
             &store,
             &triage_pass_config(),
@@ -701,6 +707,7 @@ fn a_resumed_result_writes_its_fingerprint_row_once_against_its_true_predecessor
         &HashMap::from([(
             format!("{id}|prompt-fp|build-1"),
             BatchRequestOrigin {
+                enrichment_baseline: None,
                 evidence: None,
                 prior_sir: current_sir_identity(&store, id).expect("identity"),
                 source_hash: symbol.content_hash.clone(),
@@ -761,6 +768,7 @@ fn a_resumed_result_writes_its_fingerprint_row_once_against_its_true_predecessor
     let origins2 = HashMap::from([(
         key2.clone(),
         BatchRequestOrigin {
+            enrichment_baseline: None,
             evidence: None,
             prior_sir: current_sir_identity(&store, id2).expect("identity"),
             source_hash: symbol2.content_hash.clone(),
@@ -786,7 +794,7 @@ fn a_resumed_result_writes_its_fingerprint_row_once_against_its_true_predecessor
     .expect("applied");
     let mut summary = IngestSummary::default();
     let mut buffer = Vec::new();
-    process_chunk(
+    let _completed_writes = process_chunk(
         &pipeline,
         &store,
         &triage_pass_config(),

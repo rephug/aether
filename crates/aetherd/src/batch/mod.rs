@@ -4,6 +4,7 @@ pub(crate) mod anthropic;
 mod build;
 #[cfg(test)]
 mod build_tests;
+mod completion;
 mod extract;
 pub(crate) mod gemini;
 mod ingest;

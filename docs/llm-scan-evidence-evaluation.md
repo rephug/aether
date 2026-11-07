@@ -66,13 +66,14 @@ attributing a baseline/policy update to observed neighbor behavior. Legacy
 neighbor-only comparisons retain their prior behavior.
 
 Because enrichment includes its baseline, accepting an enriched result changes a
-subsequent enrichment request's identity. Repeated enrichment can therefore run
-again on unchanged source, including a symbol selected again by an automated
-schedule. Existing candidate and batch limits still apply, but the fingerprint
-itself is not a convergence or "already processed" guarantee. Repeated scheduling
-needs a separate policy to bound enrichment; do not omit baseline evidence from
-the cache to hide that distinction. Prompt changes do not automatically launch a
-paid rescan.
+subsequent enrichment request's identity. A separate completion receipt now
+recognizes an unchanged completed enrichment while preserving the actual request
+fingerprint and baseline evidence. It is bound to the accepted output's exact
+write and all other effective inputs; see [completion reuse and its regression
+scope](llm-enrichment-idempotency.md). Existing candidate and batch limits remain
+per-run limits, not a convergence or spending guarantee. Changed context, separate
+in-flight builds, cache loss and storage errors can still allow more work.
+Prompt changes do not automatically launch a paid rescan.
 
 ## Offline checks and their limits
 
