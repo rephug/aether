@@ -66,29 +66,30 @@
       "properties": {
         "aether.inferenceProvider": {
           "type": "string",
-          "enum": ["auto", "mock", "gemini", "qwen3_local"],
+          "enum": ["auto", "mock", "gemini", "qwen3_local", "omp"],
           "default": "auto",
           "description": "Inference provider used by aetherd."
         },
         "aether.inferenceModel": {
           "type": "string",
-          "enum": [
+          "examples": [
             "qwen2.5-coder:7b-instruct-q4_K_M",
             "qwen2.5-coder:1.5b-instruct-q4_K_M",
-            "gemini-2.0-flash"
+            "gemini-2.0-flash",
+            "openai-codex/gpt-6-luna"
           ],
           "default": "gemini-2.0-flash",
-          "description": "Model name passed to the selected provider for SIR generation."
+          "description": "Model name passed to the selected provider for SIR generation. For OMP, use the full provider/model route."
         },
         "aether.inferenceEndpoint": {
           "type": "string",
           "default": "http://127.0.0.1:11434",
-          "description": "Local HTTP endpoint for qwen3_local provider."
+          "description": "HTTP endpoint for the selected provider. For OMP, use the authenticated gateway API base, for example http://127.0.0.1:4000/v1."
         },
         "aether.geminiApiKeyEnv": {
           "type": "string",
           "default": "GEMINI_API_KEY",
-          "description": "Environment variable name containing Gemini API key."
+          "description": "Environment variable name containing the provider credential. For OMP, use OMP_GATEWAY_TOKEN or configure OMP_GATEWAY_TOKEN_FILE in the daemon environment."
         },
         "aether.searchMode": {
           "type": "string",

@@ -78,6 +78,7 @@ function environment(options = {}) {
   const state = { clients: [], spawns: [], outputs: [], errors: [], warnings: [], infos: [], watchers: [], intervals: [], commands: new Map(), now: 1700000000000, registeredEvents: {} };
   const folderEvent = event();
   const docEvent = event();
+  const saveEvent = event();
   const renameEvent = event();
   const deleteEvent = event();
   const status = { text: '', tooltip: '', show() {}, dispose() {} };
@@ -100,6 +101,7 @@ function environment(options = {}) {
       },
       onDidChangeWorkspaceFolders(callback) { state.registeredEvents.workspaceFolders = (state.registeredEvents.workspaceFolders || 0) + 1; return folderEvent.register(callback); },
       onDidChangeTextDocument(callback) { state.registeredEvents.textDocument = (state.registeredEvents.textDocument || 0) + 1; return docEvent.register(callback); },
+      onDidSaveTextDocument(callback) { return saveEvent.register(callback); },
       onDidRenameFiles(callback) { state.registeredEvents.rename = (state.registeredEvents.rename || 0) + 1; return renameEvent.register(callback); },
       onDidDeleteFiles(callback) { state.registeredEvents.delete = (state.registeredEvents.delete || 0) + 1; return deleteEvent.register(callback); },
       createFileSystemWatcher(pattern) {
@@ -114,10 +116,10 @@ function environment(options = {}) {
       showErrorMessage(message) { state.errors.push(message); return Promise.resolve(undefined); },
       showWarningMessage(message) { state.warnings.push(message); return Promise.resolve(undefined); },
       showInformationMessage(message) { state.infos.push(message); return Promise.resolve(undefined); },
-      showQuickPick() { return Promise.resolve(undefined); },
+      showQuickPick(items) { state.quickPickItems = items; return Promise.resolve(options.pickProvider === undefined ? undefined : items.find(item => item.value === options.pickProvider)); },
       showInputBox() { return Promise.resolve(undefined); },
     },
-    commands: { registerCommand(id, callback) { state.commands.set(id, callback); return new Disposable(); } },
+    commands: { registerCommand(id, callback) { state.commands.set(id, callback); return new Disposable(); }, executeCommand(id) { (state.executedCommands ||= []).push(id); return Promise.resolve(); } },
   };
   class LanguageClient {
     constructor(id, name, serverOptions, clientOptions) { Object.assign(this, { id, name, serverOptions, clientOptions, starts: 0, stops: 0 }); state.clients.push(this); }
@@ -175,6 +177,7 @@ function environment(options = {}) {
     async advance(milliseconds) { state.now += milliseconds; state.intervals.filter((i) => !i.cleared).forEach((i) => i.callback()); await settle(); },
     async folders(folders) { const previous=vscode.workspace.workspaceFolders||[];vscode.workspace.workspaceFolders=folders;folderEvent.emit({added:folders.filter(f=>!previous.some(p=>p.uri.toString()===f.uri.toString())),removed:previous.filter(p=>!folders.some(f=>p.uri.toString()===f.uri.toString()))});await exports.__drain();await settle(); },
     docChange: (doc) => docEvent.emit({ document: doc }),
+    docSave: (doc) => { doc.isDirty = false; return saveEvent.emit(doc); },
     rename: (oldUri, newUri) => renameEvent.emit({ files: [{ oldUri, newUri }] }),
     async dispose() { await exports.deactivate(); context.subscriptions.forEach((entry) => entry.dispose()); },
   };
@@ -196,6 +199,25 @@ const stale = { contents: [{ value: '**combine**\n\nAETHER WARNING: SIR is stale
 
 async function main() {
   assert.equal(compiled.diagnostics.filter((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error).length, 0);
+  await test('OMP settings accept subscription routes and pass them unchanged to the daemon', async () => {
+    assert(manifest.contributes.configuration.properties['aether.inferenceProvider'].enum.includes('omp'));
+    assert.equal(manifest.contributes.configuration.properties['aether.inferenceModel'].enum, undefined, 'Custom provider model ids must remain configurable');
+    const route = 'openai-codex/gpt-6-luna';
+    const env = environment({ settings: { inferenceProvider: 'omp', inferenceModel: route, inferenceEndpoint: 'http://127.0.0.1:4000/v1', geminiApiKeyEnv: 'OMP_GATEWAY_TOKEN' } });
+    await env.activate();
+    const args = Array.from(env.state.clients[0].serverOptions.args);
+    for (const [flag, value] of [['--inference-provider', 'omp'], ['--inference-model', route], ['--inference-endpoint', 'http://127.0.0.1:4000/v1'], ['--inference-api-key-env', 'OMP_GATEWAY_TOKEN']]) assert.equal(args[args.indexOf(flag) + 1], value);
+    assert.equal(env.state.spawns.length, 0); await env.dispose();
+  });
+  await test('provider picker offers OMP and restart applies the selected subscription provider', async () => {
+    const env = environment({ pickProvider: 'omp' }); await env.activate();
+    await env.state.commands.get('aether.selectInferenceProvider')();
+    assert(env.state.quickPickItems.some(item => item.value === 'omp' && /subscription/i.test(item.detail)));
+    await env.state.commands.get('aether.restartServer')();
+    const args = env.state.clients.at(-1).serverOptions.args;
+    assert.equal(args[args.indexOf('--inference-provider') + 1], 'omp');
+    assert.equal(env.state.clients[0].stops, 1); await env.dispose();
+  });
   await test('activation configures exact AETHER identity, selected root, mock provider, languages, and registered commands', async () => {
     const env = environment(); await env.activate();
     assert.equal(env.state.clients.length, 1);
@@ -262,6 +284,35 @@ async function main() {
     assert.equal(calls, 2); assert.match(after.contents[0].value, /product/);
     assert.equal(env.state.spawns.length, 0); await env.dispose();
     return { scope: 'Dirty buffers are suppressed; clean buffers resume requests without cached results. Backend explanations are mocked.' };
+  });
+  await test('editing the active document dismisses its previously returned hover before regeneration', async () => {
+    const env = environment(); await env.activate(); const doc = makeDoc(); env.vscode.window.activeTextEditor = { document: doc };
+    await env.hover(doc, position, token(), async () => fixtureHover(doc));
+    env.docChange(doc); await settle(); assert.deepEqual(env.state.executedCommands || [], []);
+    doc.edit(sourceA.replace('a + b', 'a * b')); env.docChange(doc); await settle();
+    assert.deepEqual(env.state.executedCommands, ['editor.action.hideHover']);
+    doc.isDirty = false;
+    const updated = await env.hover(doc, position, token(), async () => fixtureHover(doc));
+    assert.match(updated.contents[0].value, /product/); assert.equal(env.state.spawns.length, 0); await env.dispose();
+  });
+  await test('saving an active unsaved document dismisses its save-before-hover message', async () => {
+    const env = environment(); await env.activate(); const doc = makeDoc(); doc.isDirty = true; env.vscode.window.activeTextEditor = { document: doc };
+    const response = await env.hover(doc, position, token(), () => { throw new Error('No backend call for an unsaved file'); });
+    assert.match(response.contents[0], /Save this file/); env.docSave(doc); await settle();
+    assert.deepEqual(env.state.executedCommands, ['editor.action.hideHover']); await env.dispose();
+  });
+  await test('unrelated and background edits do not dismiss the active editor hover', async () => {
+    const env = environment(); await env.activate(); const doc = makeDoc(); const other = document(path.join(workspaceAPath, 'other.ts'), sourceA);
+    env.vscode.window.activeTextEditor = { document: doc };
+    await env.hover(doc, position, token(), async () => fixtureHover(doc));
+    other.edit(sourceB); env.docChange(other); await settle(); assert.deepEqual(env.state.executedCommands || [], []);
+    env.vscode.window.activeTextEditor = { document: other }; doc.edit(sourceB); env.docChange(doc); await settle();
+    assert.deepEqual(env.state.executedCommands || [], []); await env.dispose();
+  });
+  await test('edits without a previously returned Aether hover do not invoke UI commands', async () => {
+    const env = environment(); await env.activate(); const doc = makeDoc(); env.vscode.window.activeTextEditor = { document: doc };
+    doc.edit(sourceB); env.docChange(doc); env.docSave(doc); await settle();
+    assert.deepEqual(env.state.executedCommands || [], []); await env.dispose();
   });
   for (const saveBeforeResponse of [false, true]) await test('hover discards a response after edits' + (saveBeforeResponse ? ' even when saved again' : ''), async () => {
     const env = environment(); await env.activate(); const doc = makeDoc(); let resolve;

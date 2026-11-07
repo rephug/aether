@@ -10,6 +10,10 @@ The index and search commands still act on the first folder.
 Hover explanations use the saved file on disk. While a document has unsaved edits,
 AETHER asks you to save the file before showing an explanation. Responses are
 also discarded if the document changes or closes while the request is running.
+An open AETHER hover is dismissed when its active document changes, and a
+save-before-hover message is dismissed when that document is saved. This clears
+VS Code's cached popup; the next hover reads the current saved explanation.
+AETHER does not reopen the popup or move your focus when generation finishes.
 
 Explanations lead with what the code does, its inputs, result, and cautions.
 Dependencies, model confidence, and explanation history appear below those sections.
@@ -64,6 +68,16 @@ The extension launches:
 ```text
 aetherd -- --workspace <workspaceRoot> --lsp --index --inference-provider ... --inference-model ... --inference-endpoint ... --inference-api-key-env ...
 ```
+
+For an existing Oh My Pi subscription login, select `omp` as the inference provider,
+set the model to the full route (for example `openai-codex/gpt-6-luna`), and set the
+endpoint to the gateway API base (for example `http://127.0.0.1:4000/v1`). Custom
+model names are accepted. Supply the gateway credential through the daemon's
+`OMP_GATEWAY_TOKEN` or `OMP_GATEWAY_TOKEN_FILE` environment; the legacy setting
+`aether.geminiApiKeyEnv` can select a different credential variable. Run
+`AETHER: Restart Server` after changing provider settings. VS Code passes these
+settings as daemon overrides; they take precedence over `.aether/config.toml`.
+Configure embeddings separately in that file if generation should avoid embedding calls.
 
 ## Status Bar
 

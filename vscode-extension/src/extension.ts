@@ -26,8 +26,9 @@ const workspaceMetaWatchers = new Map<string, vscode.Disposable[]>();
 let statusRefreshTimer: NodeJS.Timeout | undefined;
 let selectedWorkspaceFolder: vscode.WorkspaceFolder | undefined;
 let lastSearchResults: SearchMatch[] = [];
+let lastAetherHover: { uri: string; version: number; wasDirty: boolean } | undefined;
 
-type InferenceProvider = 'auto' | 'mock' | 'gemini' | 'qwen3_local';
+type InferenceProvider = 'auto' | 'mock' | 'gemini' | 'qwen3_local' | 'omp';
 type SearchMode = 'lexical' | 'semantic' | 'hybrid';
 
 interface AetherSettings {
@@ -100,6 +101,7 @@ const statusModel: StatusModel = {
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   deactivating = false;
+  lastAetherHover = undefined;
   outputChannel = vscode.window.createOutputChannel('AETHER');
   context.subscriptions.push(outputChannel);
 
@@ -138,6 +140,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     })
   );
   context.subscriptions.push(new vscode.Disposable(disposeWorkspaceWatchers));
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeTextDocument((event) => dismissChangedHover(event.document)),
+    vscode.workspace.onDidSaveTextDocument((document) => dismissChangedHover(document))
+  );
 
   context.subscriptions.push(
     vscode.commands.registerCommand('aether.restartServer', async () => {
@@ -185,6 +191,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
 export async function deactivate(): Promise<void> {
   deactivating = true;
+  lastAetherHover = undefined;
   disposeWorkspaceWatchers();
 
   if (statusRefreshTimer) {
@@ -193,6 +200,34 @@ export async function deactivate(): Promise<void> {
   }
 
   await stopClient();
+}
+
+function rememberHover(document: vscode.TextDocument): void {
+  lastAetherHover = {
+    uri: document.uri.toString(),
+    version: document.version,
+    wasDirty: document.isDirty,
+  };
+}
+
+function dismissChangedHover(document: vscode.TextDocument): void {
+  const previous = lastAetherHover;
+  if (!previous || previous.uri !== document.uri.toString()) {
+    return;
+  }
+  if (previous.version === document.version && previous.wasDirty === document.isDirty) {
+    return;
+  }
+  lastAetherHover = undefined;
+  if (vscode.window.activeTextEditor?.document.uri.toString() !== previous.uri) {
+    return;
+  }
+  // VS Code can keep an already-open hover even after a programmatic edit/save.
+  // Dismiss its cached text; the next hover request resolves against current source.
+  // Do not reopen it automatically or move the user's focus.
+  void vscode.commands.executeCommand('editor.action.hideHover').then(undefined, (error: unknown) => {
+    outputChannel?.appendLine(`AETHER: Could not dismiss the previous hover (${String(error)})`);
+  });
 }
 
 async function restartClient(context: vscode.ExtensionContext): Promise<void> {
@@ -231,6 +266,11 @@ async function selectInferenceProvider(): Promise<void> {
       label: 'qwen3_local',
       detail: 'Local HTTP endpoint provider (no API key required).',
       value: 'qwen3_local',
+    },
+    {
+      label: 'omp',
+      detail: 'Oh My Pi gateway using your configured provider subscription.',
+      value: 'omp',
     },
   ];
 
@@ -374,6 +414,7 @@ async function startWorkspaceClient(
           return undefined;
         }
         if (document.isDirty) {
+          rememberHover(document);
           return new vscode.Hover('AETHER: Save this file to see an explanation of the saved code.');
         }
         const version = document.version;
@@ -382,6 +423,9 @@ async function startWorkspaceClient(
           return undefined;
         }
         observeHoverForStaleWarning(document, position, hover);
+        if (hover) {
+          rememberHover(document);
+        }
         return hover;
       },
     },
