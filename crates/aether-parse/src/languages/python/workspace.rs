@@ -172,43 +172,66 @@ impl PythonWorkspace {
     }
 
     /// Re-reads `path` (a file or a directory) after it changed, appeared or went away,
-    /// with the directories above it. Returns the extracted files that looked up, in what
-    /// changed, a name whose binding or presence changed: their targets may now resolve
-    /// differently. Nothing that no extraction read is re-read.
+    /// with cached descendants and the directories above it. Returns the extracted files
+    /// that looked up, in what changed, a name whose binding or presence changed: their
+    /// targets may now resolve differently. Nothing that no extraction read is re-read.
     pub(crate) fn refresh(&mut self, parser: &mut Parser, path: &str) -> Vec<String> {
         let path = normalize_path(path);
         let path = path.trim_matches('/');
         let mut stale = BTreeSet::new();
 
-        if let Some((key, previous)) = self
-            .modules
-            .get_key_value(path)
-            .map(|(key, state)| (Arc::clone(key), state.clone()))
-        {
-            let current = read_module(&self.root, path, parser, Some(&previous));
+        // Directory notifications may stand for edits anywhere below them, including
+        // a replacement with exactly the same entry names. Re-read only cached paths:
+        // walking the subtree would do work no target lookup has needed.
+        let refresh_descendants =
+            path.is_empty() || self.listings.contains_key(path) || self.root.join(path).is_dir();
+        let modules = if refresh_descendants {
+            self.modules
+                .iter()
+                .filter(|(key, _)| at_or_under(key, path))
+                .map(|(key, state)| (Arc::clone(key), state.clone()))
+                .collect::<Vec<_>>()
+        } else {
+            self.modules
+                .get_key_value(path)
+                .map(|(key, state)| (Arc::clone(key), state.clone()))
+                .into_iter()
+                .collect()
+        };
+        for (key, previous) in modules {
+            let current = read_module(&self.root, &key, parser, Some(&previous));
             let changed = changed_names(&previous, &current);
             self.modules.insert(Arc::clone(&key), current);
             stale.extend(self.affected(&Read::Module(key), &changed));
         }
 
-        let mut directories = vec![path];
+        let mut directories = if refresh_descendants {
+            self.listings
+                .keys()
+                .filter(|key| at_or_under(key, path))
+                .map(|key| key.to_string())
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
+        directories.insert(path.to_owned());
         let mut rest = path;
         while let Some((parent, _)) = rest.rsplit_once('/') {
-            directories.push(parent);
+            directories.insert(parent.to_owned());
             rest = parent;
         }
         if !path.is_empty() {
-            directories.push("");
+            directories.insert(String::new());
         }
         for directory in directories {
             let Some((key, previous)) = self
                 .listings
-                .get_key_value(directory)
+                .get_key_value(directory.as_str())
                 .map(|(key, entries)| (Arc::clone(key), entries.clone()))
             else {
                 continue;
             };
-            let current = list_directory(&self.root, directory);
+            let current = list_directory(&self.root, &directory);
             let changed = match (&previous, &current) {
                 (Some(before), Some(after)) => Changed::Names(
                     before
@@ -230,7 +253,7 @@ impl PythonWorkspace {
                 (Changed::All, None) => Vec::new(),
             };
             for name in gone {
-                self.forget_under(&join(directory, &name));
+                self.forget_under(&join(&directory, &name));
             }
             stale.extend(self.affected(&Read::Listing(key), &changed));
         }
@@ -264,14 +287,8 @@ impl PythonWorkspace {
 
     /// Drops what was read at or under `path`.
     fn forget_under(&mut self, path: &str) {
-        let under = |key: &str| {
-            key == path
-                || key
-                    .strip_prefix(path)
-                    .is_some_and(|rest| rest.starts_with('/'))
-        };
-        self.listings.retain(|key, _| !under(key));
-        self.modules.retain(|key, _| !under(key));
+        self.listings.retain(|key, _| !at_or_under(key, path));
+        self.modules.retain(|key, _| !at_or_under(key, path));
     }
 
     fn record_reads(&mut self, file_path: &str, read: BTreeSet<Read>) {
@@ -297,6 +314,14 @@ impl PythonWorkspace {
             self.reads.insert(reader, read);
         }
     }
+}
+
+fn at_or_under(key: &str, path: &str) -> bool {
+    path.is_empty()
+        || key == path
+        || key
+            .strip_prefix(path)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Whether a `*` import may bind a name.

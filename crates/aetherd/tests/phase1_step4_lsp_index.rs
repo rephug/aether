@@ -11,8 +11,8 @@ use tempfile::tempdir;
 use tower_lsp::lsp_types::Position;
 
 #[test]
-fn lsp_index_mode_path_generates_sir_and_hover_reads_it() -> Result<(), Box<dyn std::error::Error>>
-{
+fn lsp_index_mode_indexes_structure_and_hover_requests_explanations()
+-> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;
     let workspace = temp.path();
     fs::create_dir_all(workspace.join(".aether"))?;
@@ -81,15 +81,17 @@ vector_backend = "sqlite"
         resolve_hover_markdown_for_path(workspace, &store, &rust_file, Position::new(0, 4))?
             .expect("rust hover should resolve");
 
-    assert!(rust_hover.contains("SIR generation in progress"));
+    assert!(rust_hover.contains("An explanation has been requested"));
+    assert!(rust_hover.contains("Waiting for the result"));
+    assert!(!rust_hover.contains("in progress"));
     assert!(rust_hover.contains("**Kind:**"));
 
     let ts_hover =
         resolve_hover_markdown_for_path(workspace, &store, &ts_file, Position::new(1, 10))?
             .expect("ts hover should resolve");
 
-    assert!(ts_hover.contains("SIR generation in progress"));
-    assert!(ts_hover.contains("**Dependencies**"));
+    assert!(ts_hover.contains("An explanation has been requested"));
+    assert!(ts_hover.contains("**Calls**"));
 
     Ok(())
 }

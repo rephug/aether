@@ -112,9 +112,11 @@ impl SirPipeline {
         prompt_overrides: Option<&HashMap<String, SirPromptOverride>>,
         planned_against: Option<&HashMap<String, SirIdentity>>,
     ) -> Result<ProcessEventStats> {
-        self.process_removed_symbols(store, event)?;
-        if !self.skip_local_edges {
-            self.replace_edges_for_file(store, event)?;
+        if self.publish_structural_updates {
+            self.process_removed_symbols(store, event)?;
+            if !self.skip_local_edges {
+                self.replace_edges_for_file(store, event)?;
+            }
         }
 
         let changed_symbols = self.collect_changed_symbols(event);
@@ -131,7 +133,9 @@ impl SirPipeline {
         let mut stats = ProcessEventStats::default();
 
         if !changed_symbols.is_empty() {
-            self.upsert_changed_symbols(store, &changed_symbols)?;
+            if self.publish_structural_updates {
+                self.upsert_changed_symbols(store, &changed_symbols)?;
+            }
 
             let prepared = self.prepare_candidate_jobs(
                 store,
@@ -258,19 +262,13 @@ impl SirPipeline {
                     // Not re-read here: the enrichment in the prompt describes the SIR
                     // the item was built from, so that is the write the guard compares.
                     job.prior_sir = item.baseline_sir_identity;
-                    let prompt = if item.use_cot {
-                        sir_prompt::build_enriched_sir_prompt_with_cot(
-                            &job.symbol_text,
-                            &job.context,
-                            &item.enrichment,
-                        )
-                    } else {
-                        sir_prompt::build_enriched_sir_prompt(
-                            &job.symbol_text,
-                            &job.context,
-                            &item.enrichment,
-                        )
-                    };
+                    let prompt = sir_prompt::build_enriched_sir_prompt_with_source_size(
+                        &job.symbol_text,
+                        &job.context,
+                        &item.enrichment,
+                        item.use_cot,
+                        job.original_source_bytes,
+                    );
                     job.custom_prompt = Some(prompt);
                     job.deep_mode = item.use_cot;
                     jobs.push(job);
@@ -896,19 +894,13 @@ impl SirPipeline {
                 .with_context(|| {
                     format!("failed to build deep SIR job for {}", symbol.qualified_name)
                 })?;
-            let prompt = if spec.use_cot {
-                sir_prompt::build_enriched_sir_prompt_with_cot(
-                    &job.symbol_text,
-                    &job.context,
-                    &spec.enrichment,
-                )
-            } else {
-                sir_prompt::build_enriched_sir_prompt(
-                    &job.symbol_text,
-                    &job.context,
-                    &spec.enrichment,
-                )
-            };
+            let prompt = sir_prompt::build_enriched_sir_prompt_with_source_size(
+                &job.symbol_text,
+                &job.context,
+                &spec.enrichment,
+                spec.use_cot,
+                job.original_source_bytes,
+            );
             prompt_overrides.insert(
                 symbol.id.clone(),
                 SirPromptOverride {

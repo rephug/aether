@@ -611,6 +611,91 @@ def test_f():
 }
 
 #[test]
+fn directory_refresh_reloads_nested_reexports() {
+    let dir = workspace(&[
+        ("pkg/api/__init__.py", "from .old import f\n"),
+        ("pkg/api/old.py", "def f():\n    return 1\n"),
+        ("pkg/api/new.py", "def f():\n    return 2\n"),
+        ("app.py", "from pkg.api import f\n\ndef run():\n    f()\n"),
+        ("pkg2/__init__.py", "from .old import g\n"),
+        ("pkg2/old.py", "def g():\n    return 1\n"),
+        ("pkg2/new.py", "def g():\n    return 2\n"),
+        ("other.py", "from pkg2 import g\n\ndef run():\n    g()\n"),
+    ]);
+    let root = dir.path();
+    let mut extractor = extractor(root);
+    assert_eq!(
+        targets(&mut extractor, root, "app.py"),
+        sorted(&["pkg.api.old::f"])
+    );
+    assert_eq!(
+        targets(&mut extractor, root, "other.py"),
+        sorted(&["pkg2.old::g"])
+    );
+
+    // A coalesced directory notification must refresh cached descendants even when
+    // no entry was added or removed. A sibling with the same prefix is independent.
+    write(root, "pkg/api/__init__.py", "from .new import f\n");
+    write(root, "pkg2/__init__.py", "from .new import g\n");
+    assert_eq!(
+        extractor.refresh_workspace_file("pkg"),
+        vec!["app.py".to_owned()]
+    );
+    assert_eq!(
+        targets(&mut extractor, root, "app.py"),
+        sorted(&["pkg.api.new::f"])
+    );
+    assert_eq!(
+        targets(&mut extractor, root, "other.py"),
+        sorted(&["pkg2.old::g"])
+    );
+    assert!(extractor.refresh_workspace_file("pkg").is_empty());
+    assert_eq!(
+        extractor.refresh_workspace_file(""),
+        vec!["other.py".to_owned()]
+    );
+    assert_eq!(
+        targets(&mut extractor, root, "other.py"),
+        sorted(&["pkg2.new::g"])
+    );
+}
+
+#[test]
+fn directory_refresh_discovers_nested_modules() {
+    let dir = workspace(&[
+        ("pkg/api/__init__.py", "from .impl import f\n"),
+        ("app.py", "from pkg.api import f\n\ndef run():\n    f()\n"),
+    ]);
+    let root = dir.path();
+    let mut extractor = extractor(root);
+    assert_eq!(
+        targets(&mut extractor, root, "app.py"),
+        sorted(&["pkg.api::f"])
+    );
+
+    write(root, "pkg/api/impl.py", "def f():\n    return 1\n");
+    assert_eq!(
+        extractor.refresh_workspace_file("pkg"),
+        vec!["app.py".to_owned()]
+    );
+    assert_eq!(
+        targets(&mut extractor, root, "app.py"),
+        sorted(&["pkg.api.impl::f"])
+    );
+
+    // Removal through the same directory-only notification clears cached modules.
+    fs::remove_file(root.join("pkg/api/impl.py")).expect("remove module");
+    assert_eq!(
+        extractor.refresh_workspace_file("pkg"),
+        vec!["app.py".to_owned()]
+    );
+    assert_eq!(
+        targets(&mut extractor, root, "app.py"),
+        sorted(&["pkg.api::f"])
+    );
+}
+
+#[test]
 fn import_cycles_end() {
     let dir = workspace(&[
         ("cyc/__init__.py", "from .a import f\nfrom .b import *\n"),

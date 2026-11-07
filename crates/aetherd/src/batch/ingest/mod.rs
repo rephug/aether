@@ -13,6 +13,7 @@ use anyhow::{Context, Result, anyhow};
 
 use crate::batch::build::{BatchRequestOrigin, KEYMAP_SIDECAR_KIND, ORIGIN_SIDECAR_KIND};
 use crate::batch::hash::diff_prompt_hashes;
+use crate::batch::key::{key_has_build_id, parse_key};
 use crate::batch::{BatchProvider, BatchResultLine, PassConfig};
 use crate::continuous::cosine_distance_from_embeddings;
 use crate::sir_pipeline::{
@@ -58,6 +59,7 @@ pub(crate) struct IngestSummary {
 /// Per-symbol state collected during Phase 1 (parse + persist SIR).
 struct PreparedSymbol {
     symbol_id: String,
+    request_key: String,
     prompt_hash: String,
     canonical_json: String,
     sir_hash: String,
@@ -97,6 +99,33 @@ pub(crate) fn ingest_results(
     provider: &dyn BatchProvider,
     provider_name: &str,
 ) -> Result<IngestSummary> {
+    ingest_results_with_pipeline(
+        workspace,
+        store,
+        pass_config,
+        results_path,
+        config,
+        provider,
+        provider_name,
+        || {
+            SirPipeline::new_embeddings_only(workspace.to_path_buf())
+                .map(|pipeline| pipeline.with_skip_surreal_sync(true))
+                .context("failed to initialize batch ingest pipeline")
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ingest_results_with_pipeline<P: std::borrow::Borrow<SirPipeline>>(
+    workspace: &Path,
+    store: &SqliteStore,
+    pass_config: &PassConfig,
+    results_path: &Path,
+    config: &AetherConfig,
+    provider: &dyn BatchProvider,
+    provider_name: &str,
+    pipeline_factory: impl FnOnce() -> Result<P>,
+) -> Result<IngestSummary> {
     let keymap = load_keymap(results_path, pass_config.pass.as_str())?;
     if !keymap.is_empty() {
         tracing::debug!(
@@ -109,14 +138,13 @@ pub(crate) fn ingest_results(
     let file = std::fs::File::open(results_path)
         .with_context(|| format!("failed to open batch results {}", results_path.display()))?;
     let reader = BufReader::new(file);
-
-    let pipeline = SirPipeline::new_embeddings_only(workspace.to_path_buf())
-        .map(|pipeline| pipeline.with_skip_surreal_sync(true))
-        .context("failed to initialize batch ingest pipeline")?;
+    let pipeline_holder = pipeline_factory()?;
+    let pipeline: &SirPipeline = pipeline_holder.borrow();
 
     let mut summary = IngestSummary::default();
     let mut embedding_buffer: Vec<(SymbolEmbeddingRecord, SirIdentity)> =
         Vec::with_capacity(INGEST_VECTOR_BATCH_SIZE);
+    let mut completed_writes = Vec::new();
 
     // Collect raw lines into a buffer so we can process them in chunks.
     let mut line_chunk: Vec<String> = Vec::with_capacity(EMBED_BATCH_SIZE);
@@ -137,8 +165,8 @@ pub(crate) fn ingest_results(
         line_chunk.push(line);
 
         if line_chunk.len() >= EMBED_BATCH_SIZE {
-            process_chunk(
-                &pipeline,
+            completed_writes.extend(process_chunk(
+                pipeline,
                 store,
                 pass_config,
                 config,
@@ -149,15 +177,15 @@ pub(crate) fn ingest_results(
                 &line_chunk,
                 &mut summary,
                 &mut embedding_buffer,
-            )?;
+            )?);
             line_chunk.clear();
         }
     }
 
     // Process any remaining lines.
     if !line_chunk.is_empty() {
-        process_chunk(
-            &pipeline,
+        completed_writes.extend(process_chunk(
+            pipeline,
             store,
             pass_config,
             config,
@@ -168,7 +196,7 @@ pub(crate) fn ingest_results(
             &line_chunk,
             &mut summary,
             &mut embedding_buffer,
-        )?;
+        )?);
     }
 
     // Flush any remaining buffered embeddings to vector store.
@@ -177,6 +205,29 @@ pub(crate) fn ingest_results(
             .flush_embedding_batch(store, embedding_buffer)
             .context("failed to flush final embedding batch during ingest")?;
         note_superseded_vectors(&superseded);
+    }
+
+    // An ingest failing downstream gets no completion receipts. A successful
+    // leaf write followed by an embedding/vector failure must remain resumable.
+    for (request_key, identity) in completed_writes {
+        let Some(baseline_json) = origins
+            .get(&request_key)
+            .and_then(|origin| origin.enrichment_baseline.as_deref())
+        else {
+            continue;
+        };
+        if let Err(err) = super::completion::record(
+            workspace,
+            store,
+            pass_config.pass,
+            &request_key,
+            &identity,
+            baseline_json,
+        ) {
+            // The SIR and downstream work succeeded. Losing this optional cache
+            // means a later build may request enrichment again, never a false hit.
+            tracing::warn!(request_key = %request_key, error = %err, "could not record completed batch enrichment");
+        }
     }
 
     Ok(summary)
@@ -200,7 +251,7 @@ fn process_chunk(
     lines: &[String],
     summary: &mut IngestSummary,
     embedding_buffer: &mut Vec<(SymbolEmbeddingRecord, SirIdentity)>,
-) -> Result<()> {
+) -> Result<Vec<(String, SirIdentity)>> {
     let mut prepared: Vec<PreparedSymbol> = Vec::with_capacity(lines.len());
     let mut embed_inputs: Vec<EmbeddingInput> = Vec::new();
     let embedding_identity = pipeline.embedding_identity();
@@ -370,7 +421,10 @@ fn process_chunk(
         note_superseded_vectors(&superseded);
     }
 
-    Ok(())
+    Ok(prepared
+        .into_iter()
+        .map(|prep| (prep.request_key, prep.identity))
+        .collect())
 }
 
 /// Phase 1: Parse a single batch result line and persist SIR to SQLite.
@@ -486,6 +540,9 @@ fn prepare_symbol(
         ));
     }
     let provider_kind = provider_kind_from_name(provider_name);
+    if let Some(evidence) = origin.and_then(|origin| origin.evidence) {
+        aether_infer::sir_evidence::log_sir_evidence_issues(&sir, evidence, &symbol_id);
+    }
     let payload = UpsertSirIntentPayload {
         symbol: symbol_from_record(&symbol_record)?,
         sir,
@@ -605,6 +662,7 @@ fn prepare_symbol(
 
     Ok(Some(PreparedSymbol {
         symbol_id,
+        request_key,
         prompt_hash,
         canonical_json,
         sir_hash: sir_hash_value,
@@ -649,35 +707,6 @@ pub(crate) fn write_fingerprint_row(
             sir_write_generation,
         })
         .with_context(|| format!("failed to insert fingerprint history row for {symbol_id}"))
-}
-
-/// Split a request key `symbol_id|prompt_hash[|build_id]` into its symbol id and prompt
-/// hash (the build id only distinguishes sidecar entries, see `BuildSummary::build_id`).
-fn key_has_build_id(key: &str) -> bool {
-    key_build_id(key).is_some()
-}
-
-/// The build id of a three-part key (`symbol_id|prompt_hash|build_id`), if any.
-fn key_build_id(key: &str) -> Option<&str> {
-    key.splitn(3, '|')
-        .nth(2)
-        .map(str::trim)
-        .filter(|build_id| !build_id.is_empty())
-}
-
-fn parse_key(key: &str) -> Result<(&str, &str)> {
-    let (symbol_id, rest) = key.split_once('|').unwrap_or((key, "unknown"));
-    let prompt_hash = rest
-        .split_once('|')
-        .map_or(rest, |(prompt_hash, _)| prompt_hash);
-    let symbol_id = symbol_id.trim();
-    let prompt_hash = prompt_hash.trim();
-    if symbol_id.is_empty() || prompt_hash.is_empty() {
-        return Err(anyhow!(
-            "batch response key is missing symbol_id or prompt_hash"
-        ));
-    }
-    Ok((symbol_id, prompt_hash))
 }
 
 /// Load the origin sidecars written during JSONL build (see `BuildSummary::origins`),

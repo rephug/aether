@@ -53,7 +53,7 @@ const workspaceA = folder(workspaceAPath, 'A', 0);
 const workspaceB = folder(workspaceBPath, 'B', 1);
 function document(filePath, text) {
   return {
-    uri: uri(filePath), languageId: 'typescript', version: 1, isDirty: false,
+    uri: uri(filePath), languageId: 'typescript', version: 1, isDirty: false, isClosed: false,
     text, getText() { return this.text; },
     positionAt(offset) { const prefix = this.text.slice(0, offset).split('\n'); return { line: prefix.length - 1, character: prefix.at(-1).length }; },
     edit(text, dirty = true) { this.text = text; this.version++; this.isDirty = dirty; },
@@ -78,6 +78,7 @@ function environment(options = {}) {
   const state = { clients: [], spawns: [], outputs: [], errors: [], warnings: [], infos: [], watchers: [], intervals: [], commands: new Map(), now: 1700000000000, registeredEvents: {} };
   const folderEvent = event();
   const docEvent = event();
+  const saveEvent = event();
   const renameEvent = event();
   const deleteEvent = event();
   const status = { text: '', tooltip: '', show() {}, dispose() {} };
@@ -85,6 +86,7 @@ function environment(options = {}) {
   const settings = { inferenceProvider: 'mock', inferenceModel: 'fixture-model', ...options.settings };
   const vscode = {
     Disposable,
+    Hover: class { constructor(contents) { this.contents = [contents]; } },
     StatusBarAlignment: { Left: 1 },
     ConfigurationTarget: { Workspace: 2 },
     ProgressLocation: { Notification: 15 },
@@ -99,6 +101,7 @@ function environment(options = {}) {
       },
       onDidChangeWorkspaceFolders(callback) { state.registeredEvents.workspaceFolders = (state.registeredEvents.workspaceFolders || 0) + 1; return folderEvent.register(callback); },
       onDidChangeTextDocument(callback) { state.registeredEvents.textDocument = (state.registeredEvents.textDocument || 0) + 1; return docEvent.register(callback); },
+      onDidSaveTextDocument(callback) { return saveEvent.register(callback); },
       onDidRenameFiles(callback) { state.registeredEvents.rename = (state.registeredEvents.rename || 0) + 1; return renameEvent.register(callback); },
       onDidDeleteFiles(callback) { state.registeredEvents.delete = (state.registeredEvents.delete || 0) + 1; return deleteEvent.register(callback); },
       createFileSystemWatcher(pattern) {
@@ -113,10 +116,10 @@ function environment(options = {}) {
       showErrorMessage(message) { state.errors.push(message); return Promise.resolve(undefined); },
       showWarningMessage(message) { state.warnings.push(message); return Promise.resolve(undefined); },
       showInformationMessage(message) { state.infos.push(message); return Promise.resolve(undefined); },
-      showQuickPick() { return Promise.resolve(undefined); },
+      showQuickPick(items) { state.quickPickItems = items; return Promise.resolve(options.pickProvider === undefined ? undefined : items.find(item => item.value === options.pickProvider)); },
       showInputBox() { return Promise.resolve(undefined); },
     },
-    commands: { registerCommand(id, callback) { state.commands.set(id, callback); return new Disposable(); } },
+    commands: { registerCommand(id, callback) { state.commands.set(id, callback); return new Disposable(); }, executeCommand(id) { (state.executedCommands ||= []).push(id); return Promise.resolve(); } },
   };
   class LanguageClient {
     constructor(id, name, serverOptions, clientOptions) { Object.assign(this, { id, name, serverOptions, clientOptions, starts: 0, stops: 0 }); state.clients.push(this); }
@@ -174,6 +177,7 @@ function environment(options = {}) {
     async advance(milliseconds) { state.now += milliseconds; state.intervals.filter((i) => !i.cleared).forEach((i) => i.callback()); await settle(); },
     async folders(folders) { const previous=vscode.workspace.workspaceFolders||[];vscode.workspace.workspaceFolders=folders;folderEvent.emit({added:folders.filter(f=>!previous.some(p=>p.uri.toString()===f.uri.toString())),removed:previous.filter(p=>!folders.some(f=>p.uri.toString()===f.uri.toString()))});await exports.__drain();await settle(); },
     docChange: (doc) => docEvent.emit({ document: doc }),
+    docSave: (doc) => { doc.isDirty = false; return saveEvent.emit(doc); },
     rename: (oldUri, newUri) => renameEvent.emit({ files: [{ oldUri, newUri }] }),
     async dispose() { await exports.deactivate(); context.subscriptions.forEach((entry) => entry.dispose()); },
   };
@@ -195,6 +199,25 @@ const stale = { contents: [{ value: '**combine**\n\nAETHER WARNING: SIR is stale
 
 async function main() {
   assert.equal(compiled.diagnostics.filter((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error).length, 0);
+  await test('OMP settings accept subscription routes and pass them unchanged to the daemon', async () => {
+    assert(manifest.contributes.configuration.properties['aether.inferenceProvider'].enum.includes('omp'));
+    assert.equal(manifest.contributes.configuration.properties['aether.inferenceModel'].enum, undefined, 'Custom provider model ids must remain configurable');
+    const route = 'openai-codex/gpt-6-luna';
+    const env = environment({ settings: { inferenceProvider: 'omp', inferenceModel: route, inferenceEndpoint: 'http://127.0.0.1:4000/v1', geminiApiKeyEnv: 'OMP_GATEWAY_TOKEN' } });
+    await env.activate();
+    const args = Array.from(env.state.clients[0].serverOptions.args);
+    for (const [flag, value] of [['--inference-provider', 'omp'], ['--inference-model', route], ['--inference-endpoint', 'http://127.0.0.1:4000/v1'], ['--inference-api-key-env', 'OMP_GATEWAY_TOKEN']]) assert.equal(args[args.indexOf(flag) + 1], value);
+    assert.equal(env.state.spawns.length, 0); await env.dispose();
+  });
+  await test('provider picker offers OMP and restart applies the selected subscription provider', async () => {
+    const env = environment({ pickProvider: 'omp' }); await env.activate();
+    await env.state.commands.get('aether.selectInferenceProvider')();
+    assert(env.state.quickPickItems.some(item => item.value === 'omp' && /subscription/i.test(item.detail)));
+    await env.state.commands.get('aether.restartServer')();
+    const args = env.state.clients.at(-1).serverOptions.args;
+    assert.equal(args[args.indexOf('--inference-provider') + 1], 'omp');
+    assert.equal(env.state.clients[0].stops, 1); await env.dispose();
+  });
   await test('activation configures exact AETHER identity, selected root, mock provider, languages, and registered commands', async () => {
     const env = environment(); await env.activate();
     assert.equal(env.state.clients.length, 1);
@@ -202,7 +225,9 @@ async function main() {
     assert.equal(client.id, 'aether:'+workspaceA.uri.toString()); assert.equal(client.name, 'AETHER LSP');
     assert.equal(client.serverOptions.command, path.resolve(extensionPath, '../target/debug/aetherd.exe'));
     assert.deepEqual(Array.from(client.serverOptions.args), ['--', '--workspace', workspaceAPath, '--lsp', '--index', '--inference-provider', 'mock', '--inference-model', 'fixture-model', '--inference-endpoint', 'http://127.0.0.1:11434', '--inference-api-key-env', 'GEMINI_API_KEY']);
-    assert.deepEqual(Array.from(client.clientOptions.documentSelector, (value) => [value.scheme, value.language]), [['file', 'rust'], ['file', 'typescript'], ['file', 'typescriptreact'], ['file', 'javascript'], ['file', 'javascriptreact']]);
+    const languages = ['rust', 'typescript', 'typescriptreact', 'javascript', 'javascriptreact', 'python'];
+    assert.deepEqual(Array.from(client.clientOptions.documentSelector, (value) => [value.scheme, value.language]), languages.map(language => ['file', language]));
+    for (const language of languages) assert(manifest.activationEvents.includes('onLanguage:' + language), 'activation missing for ' + language);
     assert.equal(env.state.commands.size, 6); assert.equal(env.state.spawns.length, 0); assert.equal(env.state.errors.length, 0);
     await env.dispose(); return { languageClientId: client.id, registeredCommands: [...env.state.commands.keys()], actualChildProcesses: 0 };
   });
@@ -212,6 +237,16 @@ async function main() {
     assert.equal(calls, 1); assert.strictEqual(actual, expected); assert.equal(actual.contents[0].value, '**combine** returns the sum of numeric inputs a and b.');
     assert.deepEqual(actual.range, { start: { line: 0, character: 16 }, end: { line: 0, character: 23 } });
     assert.equal(env.state.spawns.length, 0); await env.dispose(); return { scope: 'fixture-backed response forwarding; source semantics supplied by deterministic next mock' };
+  });
+  await test('Python hover forwards a saved document through its owning client', async () => {
+    const env = environment(); await env.activate();
+    const doc = document(path.join(workspaceAPath, 'math.py'), 'def combine(a, b):\n    return a + b\n');
+    doc.languageId = 'python';
+    const expected = { contents: [{ value: 'Python fixture explanation', isTrusted: false }] };
+    assert.strictEqual(await env.hover(doc, position, token(), async current => {
+      assert.strictEqual(current, doc); return expected;
+    }), expected);
+    await env.dispose();
   });
   for (const value of [undefined, null]) await test('hover preserves ' + String(value) + ' no-symbol result', async () => {
     const env = environment(); await env.activate(); assert.strictEqual(await env.hover(makeDoc(), position, token(), async () => value), value); assert.match(env.status.text, /idle$/); await env.dispose();
@@ -237,12 +272,69 @@ async function main() {
     assert.strictEqual(actual.contents[0], content); assert.equal(actual.contents[0].isTrusted, false); assert.equal(actual.contents[0].supportHtml, false); assert.equal(env.state.spawns.length, 0); await env.dispose();
     return { limitation: 'No VS Code renderer exercised; incoming trusted MarkdownString is also returned unchanged.' };
   });
-  await test('hover reevaluates next after unsaved source edits and has no extension-side result cache', async () => {
+  await test('hover waits for saved source before requesting disk-based explanations', async () => {
     const env = environment(); await env.activate(); const doc = makeDoc(); const tok = token(); let calls = 0;
     const next = async (currentDoc) => { assert.strictEqual(currentDoc, doc); calls++; return fixtureHover(currentDoc); };
     const before = await env.hover(doc, position, tok, next); doc.edit(sourceA.replace('a + b', 'a * b')); env.docChange(doc);
-    const after = await env.hover(doc, position, tok, next); assert.equal(calls, 2); assert.equal(doc.isDirty, true); assert.equal(doc.version, 2); assert.match(before.contents[0].value, /sum/); assert.match(after.contents[0].value, /product/); assert.notStrictEqual(before, after); assert.equal(env.state.spawns.length, 0); await env.dispose();
-    return { scope: 'Extension passes current document to next; backend handling of unsaved didChange is outside this mocked client.' };
+    const unsaved = await env.hover(doc, position, tok, next);
+    assert.match(unsaved.contents[0], /Save this file/);
+    assert.equal(calls, 1); assert.match(before.contents[0].value, /sum/);
+    doc.isDirty = false;
+    const after = await env.hover(doc, position, tok, next);
+    assert.equal(calls, 2); assert.match(after.contents[0].value, /product/);
+    assert.equal(env.state.spawns.length, 0); await env.dispose();
+    return { scope: 'Dirty buffers are suppressed; clean buffers resume requests without cached results. Backend explanations are mocked.' };
+  });
+  await test('editing the active document dismisses its previously returned hover before regeneration', async () => {
+    const env = environment(); await env.activate(); const doc = makeDoc(); env.vscode.window.activeTextEditor = { document: doc };
+    await env.hover(doc, position, token(), async () => fixtureHover(doc));
+    env.docChange(doc); await settle(); assert.deepEqual(env.state.executedCommands || [], []);
+    doc.edit(sourceA.replace('a + b', 'a * b')); env.docChange(doc); await settle();
+    assert.deepEqual(env.state.executedCommands, ['editor.action.hideHover']);
+    doc.isDirty = false;
+    const updated = await env.hover(doc, position, token(), async () => fixtureHover(doc));
+    assert.match(updated.contents[0].value, /product/); assert.equal(env.state.spawns.length, 0); await env.dispose();
+  });
+  await test('saving an active unsaved document dismisses its save-before-hover message', async () => {
+    const env = environment(); await env.activate(); const doc = makeDoc(); doc.isDirty = true; env.vscode.window.activeTextEditor = { document: doc };
+    const response = await env.hover(doc, position, token(), () => { throw new Error('No backend call for an unsaved file'); });
+    assert.match(response.contents[0], /Save this file/); env.docSave(doc); await settle();
+    assert.deepEqual(env.state.executedCommands, ['editor.action.hideHover']); await env.dispose();
+  });
+  await test('unrelated and background edits do not dismiss the active editor hover', async () => {
+    const env = environment(); await env.activate(); const doc = makeDoc(); const other = document(path.join(workspaceAPath, 'other.ts'), sourceA);
+    env.vscode.window.activeTextEditor = { document: doc };
+    await env.hover(doc, position, token(), async () => fixtureHover(doc));
+    other.edit(sourceB); env.docChange(other); await settle(); assert.deepEqual(env.state.executedCommands || [], []);
+    env.vscode.window.activeTextEditor = { document: other }; doc.edit(sourceB); env.docChange(doc); await settle();
+    assert.deepEqual(env.state.executedCommands || [], []); await env.dispose();
+  });
+  await test('edits without a previously returned Aether hover do not invoke UI commands', async () => {
+    const env = environment(); await env.activate(); const doc = makeDoc(); env.vscode.window.activeTextEditor = { document: doc };
+    doc.edit(sourceB); env.docChange(doc); env.docSave(doc); await settle();
+    assert.deepEqual(env.state.executedCommands || [], []); await env.dispose();
+  });
+  for (const saveBeforeResponse of [false, true]) await test('hover discards a response after edits' + (saveBeforeResponse ? ' even when saved again' : ''), async () => {
+    const env = environment(); await env.activate(); const doc = makeDoc(); let resolve;
+    const request = env.hover(doc, position, token(), () => new Promise(r => resolve = r));
+    doc.edit(sourceA.replace('a + b', 'a * b'));
+    if (saveBeforeResponse) doc.isDirty = false;
+    resolve(stale);
+    assert.equal(await request, undefined); assert.doesNotMatch(env.status.text, /outdated:/);
+    await env.dispose();
+  });
+  await test('hover discards responses for a document closed during the request', async () => {
+    const env = environment(); await env.activate(); const doc = makeDoc(); let resolve;
+    const request = env.hover(doc, position, token(), () => new Promise(r => resolve = r));
+    doc.isClosed = true; resolve(stale);
+    assert.equal(await request, undefined); assert.doesNotMatch(env.status.text, /outdated:/);
+    await env.dispose();
+  });
+  await test('hover does not request an explanation for an already closed document', async () => {
+    const env = environment(); await env.activate(); const doc = makeDoc(); doc.isClosed = true;
+    let calls = 0;
+    assert.equal(await env.hover(doc, position, token(), async () => { calls++; return stale; }), undefined);
+    assert.equal(calls, 0); await env.dispose();
   });
   await test('hover after rename receives the renamed document URI, without extension-side cached hover', async () => {
     const env = environment(); await env.activate(); const beforeDoc = makeDoc(); await env.hover(beforeDoc, position, token(), async () => fixtureHover(beforeDoc)); const afterDoc = document(path.join(workspaceAPath, 'renamed.ts'), sourceA); env.rename(beforeDoc.uri, afterDoc.uri);
@@ -252,20 +344,25 @@ async function main() {
   await test('stale warning formats are observed, repeat exact URI/position is deduplicated', async () => {
     const env = environment(); await env.activate(); const doc = makeDoc();
     for (const contents of ['AETHER WARNING: SIR is stale', { value: 'AETHER WARNING: SIR is stale' }, [{ language: 'rust', value: 'AETHER WARNING: SIR is stale' }]]) await env.hover(doc, position, token(), async () => ({ contents }));
-    assert.match(env.status.text, /stale:1/); await env.hover(doc, { line: 0, character: 19 }, token(), async () => stale); assert.match(env.status.text, /stale:2/); await env.dispose();
+    assert.match(env.status.text, /outdated:1/); await env.hover(doc, { line: 0, character: 19 }, token(), async () => stale); assert.match(env.status.text, /outdated:2/); await env.dispose();
     return { countingUnit: 'URI + requested cursor position, not distinct stale symbol or file' };
+  });
+  await test('plain-English freshness warning is recognized alongside older servers', async () => {
+    const env = environment(); await env.activate();
+    await env.hover(makeDoc(), position, token(), async () => ({ contents: ['AETHER: This explanation may be out of date. The saved code has changed.'] }));
+    assert.match(env.status.text, /outdated:1/); await env.dispose();
   });
   await test('metadata watcher is scoped to root A and records index activity', async () => {
     const env = environment({ workspaceFolders: [workspaceA, workspaceB] }); await env.activate(); assert.equal(env.state.watchers.length, 2); const watcher = env.state.watchers[0]; assert.strictEqual(watcher.pattern.base, workspaceA); assert.equal(watcher.pattern.pattern, '.aether/meta.sqlite'); watcher.change.emit(uri(path.join(workspaceAPath, '.aether', 'meta.sqlite'))); assert.match(env.status.text, /indexing/); await env.advance(5001); assert.match(env.status.text, /idle/); await env.dispose();
   });
   await test('fresh hover preserves documented session observation count', async () => {
-    const env = environment(); await env.activate(); const doc = makeDoc(); await env.hover(doc, position, token(), async () => stale); await env.hover(doc, position, token(), async () => fixtureHover(doc)); const actual = env.status.text; await env.dispose(); assert.match(actual, /stale:1/, 'expected historical observation after fresh explanation: ' + actual);
+    const env = environment(); await env.activate(); const doc = makeDoc(); await env.hover(doc, position, token(), async () => stale); await env.hover(doc, position, token(), async () => fixtureHover(doc)); const actual = env.status.text; await env.dispose(); assert.match(actual, /outdated:1/, 'expected historical observation after fresh explanation: ' + actual);
   }, 'README documents warnings observed in this VS Code session, not current stale inventory.');
   await test('metadata update preserves documented session observation count', async () => {
-    const env = environment(); await env.activate(); const doc = makeDoc(); await env.hover(doc, position, token(), async () => stale); env.state.watchers[0].change.emit(uri(path.join(workspaceAPath, '.aether', 'meta.sqlite'))); await env.hover(doc, position, token(), async () => fixtureHover(doc)); await env.advance(5001); const actual = env.status.text; await env.dispose(); assert.match(actual, /stale:1/, 'expected historical observation after metadata update: ' + actual);
+    const env = environment(); await env.activate(); const doc = makeDoc(); await env.hover(doc, position, token(), async () => stale); env.state.watchers[0].change.emit(uri(path.join(workspaceAPath, '.aether', 'meta.sqlite'))); await env.hover(doc, position, token(), async () => fixtureHover(doc)); await env.advance(5001); const actual = env.status.text; await env.dispose(); assert.match(actual, /outdated:1/, 'expected historical observation after metadata update: ' + actual);
   }, 'README documents historical observations; current hover freshness is checked separately.');
   await test('workspace callback preserves documented session observation count', async () => {
-    const env = environment(); await env.activate(); await env.hover(makeDoc(), position, token(), async () => stale); await env.folders([workspaceB]); const actual = env.status.text; const tooltip = env.status.tooltip; assert.equal(env.state.clients.length, 2); assert.equal(env.state.clients[0].stops, 1); assert.match(tooltip, /Workspace: B/); await env.dispose(); assert.match(actual, /stale:1/, 'expected session-wide observation after workspace callback: ' + actual);
+    const env = environment(); await env.activate(); await env.hover(makeDoc(), position, token(), async () => stale); await env.folders([workspaceB]); const actual = env.status.text; const tooltip = env.status.tooltip; assert.equal(env.state.clients.length, 2); assert.equal(env.state.clients[0].stops, 1); assert.match(tooltip, /Workspace: B/); await env.dispose(); assert.match(actual, /outdated:1/, 'expected session-wide observation after workspace callback: ' + actual);
   }, 'Count is documented session-wide; this callback test is not a real host workspace restart.');
   await test('multi-root hover isolates root B from root A backend workspace', async () => {
     const env = environment({ workspaceFolders: [workspaceA, workspaceB] }); await env.activate(); const docB = makeDoc(workspaceB, sourceB); await env.hover(docB, position, token(), async () => fixtureHover(docB)); const client = env.state.clients[0]; const selectedRoot = client.serverOptions.args[client.serverOptions.args.indexOf('--workspace') + 1]; const workspaceScoped = client.clientOptions.workspaceFolder?.uri?.fsPath === workspaceAPath || client.clientOptions.documentSelector.every((selector) => !!selector.pattern); const evidence = { selectedRoot, hoveredRoot: workspaceBPath, workspaceFolderOption: client.clientOptions.workspaceFolder ?? null, documentSelector: client.clientOptions.documentSelector }; await env.dispose(); assert.ok(selectedRoot === workspaceBPath || workspaceScoped, 'root B hover routed through sole root A client with unrestricted selectors: ' + JSON.stringify(evidence));
@@ -320,7 +417,7 @@ async function extraMultiRootTests(){
  await test('adding root B keeps the running root A client',async()=>{const env=environment();await env.activate();const a=ownedClient(env,workspaceA);await env.folders([workspaceA,workspaceB]);assert.equal(env.state.clients.length,2);assert.strictEqual(ownedClient(env,workspaceA),a);assert.equal(a.starts,1);assert.equal(a.stops,0);assert.equal(env.state.watchers.length,2);await env.dispose();});
  await test('removing root B stops only B and disposes its watcher',async()=>{const env=environment({workspaceFolders:[workspaceA,workspaceB]});await env.activate();const a=ownedClient(env,workspaceA),b=ownedClient(env,workspaceB);await env.folders([workspaceA]);assert.equal(a.stops,0);assert.equal(b.stops,1);assert(env.state.watchers[1].disposed);assert(!env.state.watchers[0].disposed);await env.dispose();});
  await test('nested folders use only their most specific owner',async()=>{const nested=folder(path.join(workspaceAPath,'nested'),'nested',1),env=environment({workspaceFolders:[workspaceA,nested]});await env.activate();const doc=makeDoc(nested,sourceB);let outerCalls=0;assert.equal(await provider(ownedClient(env,workspaceA),doc,async()=>{outerCalls++;return fixtureHover(doc);}),undefined);assert.equal(outerCalls,0);assert.match((await provider(ownedClient(env,nested),doc,async()=>fixtureHover(doc))).contents[0].value,/difference/);await env.dispose();});
- await test('an in-flight hover is discarded when its root is removed',async()=>{const env=environment({workspaceFolders:[workspaceA,workspaceB]});await env.activate();let resolve;const doc=makeDoc(workspaceB,sourceB),pending=provider(ownedClient(env,workspaceB),doc,()=>new Promise(r=>resolve=r));await env.folders([workspaceA]);resolve(stale);assert.equal(await pending,undefined);assert.doesNotMatch(env.status.text,/stale:/);await env.dispose();});
+ await test('an in-flight hover is discarded when its root is removed',async()=>{const env=environment({workspaceFolders:[workspaceA,workspaceB]});await env.activate();let resolve;const doc=makeDoc(workspaceB,sourceB),pending=provider(ownedClient(env,workspaceB),doc,()=>new Promise(r=>resolve=r));await env.folders([workspaceA]);resolve(stale);assert.equal(await pending,undefined);assert.doesNotMatch(env.status.text,/outdated:/);await env.dispose();});
  await test('rapid remove/re-add retires the old client generation',async()=>{const env=environment({workspaceFolders:[workspaceA,workspaceB]});await env.activate();const old=ownedClient(env,workspaceB);let resolve;const doc=makeDoc(workspaceB,sourceB),pending=provider(old,doc,()=>new Promise(r=>resolve=r));const removed=env.folders([workspaceA]),added=env.folders([workspaceA,workspaceB]);await Promise.all([removed,added]);resolve(stale);assert.equal(await pending,undefined);assert.equal(old.stops,1);assert.notStrictEqual(ownedClient(env,workspaceB),old);assert.equal(env.state.clients.length,3);await env.dispose();});
  await test('a root removed during startup is stopped before publication',async()=>{let release;const gate=new Promise(r=>release=r);const env=environment({workspaceFolders:[workspaceA,workspaceB],onStart:async c=>{if(c.clientOptions.workspaceFolder.uri.toString()===workspaceB.uri.toString())await gate;}});const activating=env.activate();for(let i=0;i<1000&&env.state.clients.length<2;i++)await Promise.resolve();assert.equal(env.state.clients.length,2,'both roots should be starting a client');const change=env.folders([workspaceA]);release();await Promise.all([activating,change]);assert.equal(env.state.clients[1].stops,1);assert.equal(env.state.clients[0].stops,0);await env.dispose();});
  await test('failed stop retains its handle and is retried without duplicate client',async()=>{let fail=true;const env=environment({workspaceFolders:[workspaceA,workspaceB],onStop:async c=>{if(c.clientOptions.workspaceFolder.uri.toString()===workspaceB.uri.toString()&&fail){fail=false;throw Error('fixture stop failure');}}});await env.activate();const b=ownedClient(env,workspaceB);await env.folders([workspaceA]);assert.equal(b.stops,1);assert(env.state.outputs.some(s=>s.includes('Failed to stop LSP for B')));await env.folders([workspaceA]);assert.equal(b.stops,2);assert.equal(env.state.clients.length,2);await env.dispose();});

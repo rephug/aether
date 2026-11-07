@@ -123,6 +123,28 @@ pub(super) fn sync_snapshot(
         structural.process_event(store, event)?;
     }
 
+    // Missing from the parsed snapshot does not mean missing from the catalog:
+    // unreadable/quarantined files and rows newer than the snapshot are retained.
+    // A fresh external graph still needs those stored nodes and their stored
+    // edges. Replay canonical data only; do not reparse blocked source or advance
+    // its read/freshness timestamps. This also repairs incoming references that
+    // were projected before the retained target nodes existed.
+    let snapshot_ids = symbols_by_id.keys().cloned().collect::<HashSet<_>>();
+    let retained_files = store
+        .list_stale_symbols(&snapshot_ids)
+        .context("failed to list retained symbols for graph replay")?
+        .into_iter()
+        .map(|symbol| symbol.file_path)
+        .collect::<BTreeSet<_>>();
+    for file_path in retained_files {
+        structural
+            .graph_runtime
+            .block_on(store.sync_graph_for_file(structural.graph_store.as_ref(), &file_path))
+            .with_context(|| {
+                format!("failed to replay retained graph projection for {file_path}")
+            })?;
+    }
+
     // The watcher diffs its next HEAD change against the HEAD from before the walk, not
     // HEAD now: a checkout during the walk happens before the watches exist, so only that
     // diff can still cover it.

@@ -66,16 +66,16 @@ fn hover_resolution_returns_test_sir_for_rust_and_ts_symbols()
             .expect("rust hover should resolve");
 
     assert!(rust_hover.contains("Test SIR for"));
-    assert!(rust_hover.contains("**Confidence:**"));
-    assert!(rust_hover.contains("**Intent**"));
+    assert!(rust_hover.contains("**Reported confidence:**"));
+    assert!(rust_hover.contains("**What this does**"));
 
     let ts_hover =
         resolve_hover_markdown_for_path(workspace, &store, &ts_file, Position::new(1, 10))?
             .expect("ts hover should resolve");
 
     assert!(ts_hover.contains("Test SIR for"));
-    assert!(ts_hover.contains("**Confidence:**"));
-    assert!(ts_hover.contains("**Dependencies**"));
+    assert!(ts_hover.contains("**Reported confidence:**"));
+    assert!(ts_hover.contains("**Uses**"));
 
     Ok(())
 }
@@ -121,7 +121,7 @@ fn hover_resolution_shows_stale_warning_and_clears_after_fresh_meta()
     let stale_hover =
         resolve_hover_markdown_for_path(workspace, &store, &rust_file, Position::new(0, 4))?
             .expect("stale hover should resolve");
-    assert!(stale_hover.contains("AETHER WARNING: SIR is stale."));
+    assert!(stale_hover.contains("AETHER: This explanation may be out of date."));
     assert!(stale_hover.contains("provider unavailable"));
 
     store.upsert_sir_meta(aether_store::SirMetaRecord {
@@ -143,7 +143,7 @@ fn hover_resolution_shows_stale_warning_and_clears_after_fresh_meta()
     let fresh_hover =
         resolve_hover_markdown_for_path(workspace, &store, &rust_file, Position::new(0, 4))?
             .expect("fresh hover should resolve");
-    assert!(!fresh_hover.contains("AETHER WARNING: SIR is stale."));
+    assert!(!fresh_hover.contains("AETHER: This explanation may be out of date."));
 
     Ok(())
 }

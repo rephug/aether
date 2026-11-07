@@ -26,8 +26,9 @@ const workspaceMetaWatchers = new Map<string, vscode.Disposable[]>();
 let statusRefreshTimer: NodeJS.Timeout | undefined;
 let selectedWorkspaceFolder: vscode.WorkspaceFolder | undefined;
 let lastSearchResults: SearchMatch[] = [];
+let lastAetherHover: { uri: string; version: number; wasDirty: boolean } | undefined;
 
-type InferenceProvider = 'auto' | 'mock' | 'gemini' | 'qwen3_local';
+type InferenceProvider = 'auto' | 'mock' | 'gemini' | 'qwen3_local' | 'omp';
 type SearchMode = 'lexical' | 'semantic' | 'hybrid';
 
 interface AetherSettings {
@@ -85,7 +86,10 @@ const DEFAULT_SEARCH_MODE: SearchMode = 'lexical';
 const INDEXING_ACTIVITY_WINDOW_MS = 5_000;
 const STARTUP_INDEXING_WINDOW_MS = 8_000;
 const STATUS_REFRESH_INTERVAL_MS = 1_000;
-const STALE_WARNING_FRAGMENT = 'AETHER WARNING: SIR is stale';
+const STALE_WARNING_FRAGMENTS = [
+  'AETHER: This explanation may be out of date',
+  'AETHER WARNING: SIR is stale', // Older servers remain supported.
+];
 
 const statusModel: StatusModel = {
   activeTasks: new Set<string>(),
@@ -97,6 +101,7 @@ const statusModel: StatusModel = {
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   deactivating = false;
+  lastAetherHover = undefined;
   outputChannel = vscode.window.createOutputChannel('AETHER');
   context.subscriptions.push(outputChannel);
 
@@ -135,6 +140,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     })
   );
   context.subscriptions.push(new vscode.Disposable(disposeWorkspaceWatchers));
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeTextDocument((event) => dismissChangedHover(event.document)),
+    vscode.workspace.onDidSaveTextDocument((document) => dismissChangedHover(document))
+  );
 
   context.subscriptions.push(
     vscode.commands.registerCommand('aether.restartServer', async () => {
@@ -182,6 +191,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
 export async function deactivate(): Promise<void> {
   deactivating = true;
+  lastAetherHover = undefined;
   disposeWorkspaceWatchers();
 
   if (statusRefreshTimer) {
@@ -190,6 +200,34 @@ export async function deactivate(): Promise<void> {
   }
 
   await stopClient();
+}
+
+function rememberHover(document: vscode.TextDocument): void {
+  lastAetherHover = {
+    uri: document.uri.toString(),
+    version: document.version,
+    wasDirty: document.isDirty,
+  };
+}
+
+function dismissChangedHover(document: vscode.TextDocument): void {
+  const previous = lastAetherHover;
+  if (!previous || previous.uri !== document.uri.toString()) {
+    return;
+  }
+  if (previous.version === document.version && previous.wasDirty === document.isDirty) {
+    return;
+  }
+  lastAetherHover = undefined;
+  if (vscode.window.activeTextEditor?.document.uri.toString() !== previous.uri) {
+    return;
+  }
+  // VS Code can keep an already-open hover even after a programmatic edit/save.
+  // Dismiss its cached text; the next hover request resolves against current source.
+  // Do not reopen it automatically or move the user's focus.
+  void vscode.commands.executeCommand('editor.action.hideHover').then(undefined, (error: unknown) => {
+    outputChannel?.appendLine(`AETHER: Could not dismiss the previous hover (${String(error)})`);
+  });
 }
 
 async function restartClient(context: vscode.ExtensionContext): Promise<void> {
@@ -228,6 +266,11 @@ async function selectInferenceProvider(): Promise<void> {
       label: 'qwen3_local',
       detail: 'Local HTTP endpoint provider (no API key required).',
       value: 'qwen3_local',
+    },
+    {
+      label: 'omp',
+      detail: 'Oh My Pi gateway using your configured provider subscription.',
+      value: 'omp',
     },
   ];
 
@@ -349,7 +392,7 @@ async function startWorkspaceClient(
   const serverOptions: ServerOptions = executable;
 
   const clientOptions: LanguageClientOptions = {
-    documentSelector: ['rust', 'typescript', 'typescriptreact', 'javascript', 'javascriptreact']
+    documentSelector: ['rust', 'typescript', 'typescriptreact', 'javascript', 'javascriptreact', 'python']
       .map((language) => ({
         scheme: 'file',
         language,
@@ -365,14 +408,24 @@ async function startWorkspaceClient(
           return owner !== undefined && workspaceKey(owner) === key &&
             workspaceStillPresent(key) && clients.get(key) === entry && !entry.stopping;
         };
-        if (!ownsDocument()) {
+        // The LSP currently resolves against saved files, without didChange sync.
+        // An unsaved buffer's positions can refer to a different symbol on disk.
+        if (!ownsDocument() || document.isClosed) {
           return undefined;
         }
+        if (document.isDirty) {
+          rememberHover(document);
+          return new vscode.Hover('AETHER: Save this file to see an explanation of the saved code.');
+        }
+        const version = document.version;
         const hover = await next(document, position, token);
-        if (!ownsDocument()) {
+        if (!ownsDocument() || document.isDirty || document.isClosed || document.version !== version) {
           return undefined;
         }
         observeHoverForStaleWarning(document, position, hover);
+        if (hover) {
+          rememberHover(document);
+        }
         return hover;
       },
     },
@@ -426,7 +479,7 @@ function observeHoverForStaleWarning(
   }
 
   const contentText = hoverContentsToText(hover.contents);
-  if (!contentText.includes(STALE_WARNING_FRAGMENT)) {
+  if (!STALE_WARNING_FRAGMENTS.some((fragment) => contentText.includes(fragment))) {
     return;
   }
 
@@ -1134,7 +1187,7 @@ function renderStatusBar(): void {
   if (hasError) {
     hint = ' (error)';
   } else if (staleCount > 0) {
-    hint = ` (stale:${staleCount})`;
+    hint = ` (outdated:${staleCount})`;
   }
 
   const baseState = indexing ? 'indexing' : 'idle';
@@ -1162,7 +1215,7 @@ function renderStatusBar(): void {
   }
 
   if (staleCount > 0) {
-    tooltipLines.push(`Observed stale hints: ${staleCount}`);
+    tooltipLines.push(`Observed out-of-date hovers (this session): ${staleCount}`);
   }
 
   if (statusModel.lastError) {

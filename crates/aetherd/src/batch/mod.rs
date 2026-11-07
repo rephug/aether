@@ -2,9 +2,13 @@ pub mod hash;
 
 pub(crate) mod anthropic;
 mod build;
+#[cfg(test)]
+mod build_tests;
+mod completion;
 mod extract;
 pub(crate) mod gemini;
 mod ingest;
+mod key;
 pub(crate) mod openai;
 mod run;
 
@@ -51,6 +55,12 @@ pub(crate) enum BatchPollStatus {
 /// Abstraction over provider-specific batch API mechanics.
 #[async_trait::async_trait]
 pub(crate) trait BatchProvider: Send + Sync {
+    /// Non-secret endpoint/protocol settings that are absent from a JSONL line.
+    /// Credentials are deliberately excluded from request identity.
+    fn cache_context(&self) -> serde_json::Value {
+        serde_json::json!({ "provider": self.name() })
+    }
+
     /// The identifier this provider sends with a request built for `key` and hands
     /// back on its result line: the key itself unless the provider limits it (see
     /// the Anthropic provider). The build-time keymap is keyed by this value so ingest
@@ -159,10 +169,16 @@ impl PassConfig {
     /// Fingerprint used for prompt hash deduplication. Includes provider to prevent
     /// false matches when switching providers with the same model name.
     pub(crate) fn config_fingerprint(&self, provider: &str) -> String {
-        format!(
-            "{}:{}:{}:{}:{}",
-            provider, self.model, self.thinking, self.max_chars, self.prompt_tier
-        )
+        serde_json::json!({
+            "provider": provider,
+            "pass": self.pass.as_str(),
+            "model": self.model,
+            "thinking": self.thinking,
+            "max_chars": self.max_chars,
+            "prompt_tier": self.prompt_tier,
+            "neighbor_depth": self.neighbor_depth,
+        })
+        .to_string()
     }
 }
 

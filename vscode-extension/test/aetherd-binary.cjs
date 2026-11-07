@@ -138,8 +138,9 @@ async function main() {
   });
 
   await test('an aetherd on PATH is used before building', async () => {
-    const env = load({ env: { PATH: '/fixture/bin:/fixture/tools' }, files: ['/fixture/tools/aetherd'] });
-    assert.equal(await env.ensure(), '/fixture/tools/aetherd');
+    const binary = path.join('/fixture/tools', 'aetherd');
+    const env = load({ env: { PATH: '/fixture/bin:/fixture/tools' }, files: [binary] });
+    assert.equal(await env.ensure(), binary);
     assert.equal(env.state.spawns.length, 0);
   });
 
@@ -155,8 +156,9 @@ async function main() {
   });
 
   await test('Windows splits PATH on ; and looks for aetherd.exe', async () => {
-    const env = load({ platform: 'win32', env: { PATH: '/fixture/bin;/fixture/tools' }, files: ['/fixture/tools/aetherd', '/fixture/tools/aetherd.exe'] });
-    assert.equal(await env.ensure(), '/fixture/tools/aetherd.exe');
+    const binary = path.join('/fixture/tools', 'aetherd.exe');
+    const env = load({ platform: 'win32', env: { PATH: '/fixture/bin;/fixture/tools' }, files: [path.join('/fixture/tools', 'aetherd'), binary] });
+    assert.equal(await env.ensure(), binary);
   });
 
   await test('the aether.aetherdPath setting wins over every other location', async () => {

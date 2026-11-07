@@ -4,6 +4,103 @@
 use super::*;
 
 #[test]
+fn semantic_worker_event_does_not_republish_a_retired_symbol() {
+    let temp = tempdir().expect("workspace");
+    let workspace = temp.path();
+    write_embeddings_only_config(workspace);
+    let store = SqliteStore::open(workspace).expect("store");
+    let (symbol, record) = parsed_symbol(workspace, "old.rs", "fn queued() {}\n");
+    store.upsert_symbol(record).expect("publish structural row");
+    store
+        .mark_removed(&symbol.id)
+        .expect("retire structural row");
+    fs::rename(workspace.join("old.rs"), workspace.join("new.rs")).expect("rename source");
+    let pipeline = build_write_pipeline(workspace, Arc::new(PanicInferenceProvider))
+        .with_structural_updates(false)
+        .with_skip_surreal_sync(true);
+    let event = SymbolChangeEvent {
+        file_path: symbol.file_path.clone(),
+        language: Language::Rust,
+        added: vec![symbol.clone()],
+        updated: Vec::new(),
+        removed: Vec::new(),
+    };
+    pipeline
+        .process_event(&store, &event, false, false, &mut std::io::sink())
+        .expect("skip obsolete queued event");
+    assert!(
+        store
+            .get_symbol_record(&symbol.id)
+            .expect("catalog")
+            .is_none()
+    );
+    assert_eq!(count_table_rows(workspace, "sir"), 0);
+    assert_eq!(count_table_rows(workspace, "symbol_edges"), 0);
+}
+
+#[test]
+fn semantic_worker_event_annotates_current_catalog_without_republishing_it() {
+    let temp = tempdir().expect("workspace");
+    let workspace = temp.path();
+    write_embeddings_only_config(workspace);
+    let store = SqliteStore::open(workspace).expect("store");
+    let (symbol, record) = parsed_symbol(workspace, "lib.rs", "fn current() {}\n");
+    store
+        .upsert_symbol(record.clone())
+        .expect("publish structural row");
+    let pipeline = build_write_pipeline(
+        workspace,
+        Arc::new(FixedInferenceProvider { sir: demo_sir() }),
+    )
+    .with_structural_updates(false)
+    .with_skip_surreal_sync(true);
+    let event = SymbolChangeEvent {
+        file_path: symbol.file_path.clone(),
+        language: Language::Rust,
+        added: vec![symbol.clone()],
+        updated: Vec::new(),
+        removed: Vec::new(),
+    };
+    pipeline
+        .process_event(&store, &event, false, false, &mut std::io::sink())
+        .expect("annotate current symbol");
+    assert_eq!(
+        store.get_symbol_record(&symbol.id).expect("catalog"),
+        Some(record)
+    );
+    assert!(store.read_sir_blob(&symbol.id).expect("SIR").is_some());
+}
+
+#[test]
+fn successful_generation_for_retired_catalog_row_cannot_create_an_orphan() {
+    let temp = tempdir().expect("workspace");
+    let workspace = temp.path();
+    write_embeddings_only_config(workspace);
+    let store = SqliteStore::open(workspace).expect("store");
+    let (symbol, record) = parsed_symbol(workspace, "lib.rs", "fn retired() {}\n");
+    store.upsert_symbol(record).expect("publish structural row");
+    store
+        .mark_removed(&symbol.id)
+        .expect("retire while source remains");
+    let pipeline = build_write_pipeline(workspace, Arc::new(PanicInferenceProvider));
+    let generated = infer::GeneratedSir {
+        source_hash: symbol.content_hash.clone(),
+        symbol,
+        sir: demo_sir(),
+        provider_name: "test_provider".to_owned(),
+        model_name: "test_model".to_owned(),
+        reasoning_trace: None,
+        prior_sir: None,
+    };
+    let persisted = pipeline
+        .persist_successful_generation_sqlite(&store, &generated, SIR_GENERATION_PASS_SCAN, None)
+        .expect("supersede retired result");
+    assert!(matches!(persisted, GenerationPersist::Superseded));
+    assert_eq!(count_table_rows(workspace, "sir"), 0);
+    assert_eq!(count_table_rows(workspace, "write_intents"), 0);
+}
+
+#[test]
 fn build_job_records_the_hash_of_the_text_it_read_for_the_prompt() {
     let temp = tempdir().expect("tempdir");
     let workspace = temp.path();
@@ -38,6 +135,10 @@ fn build_job_records_the_hash_of_the_text_it_read_for_the_prompt() {
     assert_eq!(job.symbol_text, "fn late(");
     assert_eq!(job.source_hash, content_hash(snapshot_source));
     assert_eq!(job.source_hash, symbol.content_hash);
+    assert_eq!(job.original_source_bytes, snapshot_source.len());
+    let prompt = job.custom_prompt.expect("truncation-aware live prompt");
+    assert!(prompt.contains("Source availability: TRUNCATED (8 of"));
+    assert!(prompt.contains("L1: fn late("));
 }
 
 #[test]

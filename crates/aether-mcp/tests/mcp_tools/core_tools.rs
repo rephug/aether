@@ -180,7 +180,7 @@ vector_backend = "sqlite"
     assert!(!explain.symbol_id.is_empty());
     assert!(explain.hover_markdown.contains("### alpha"));
     assert!(explain.hover_markdown.contains("Mock summary for alpha"));
-    assert!(explain.hover_markdown.contains("**Confidence:**"));
+    assert!(explain.hover_markdown.contains("**Reported confidence:**"));
     assert_eq!(explain.sir_status.as_deref(), Some("fresh"));
     assert_eq!(explain.last_error, None);
     assert!(explain.last_attempt_at.unwrap_or_default() > 0);
@@ -251,11 +251,9 @@ vector_backend = "sqlite"
         stale_explain.last_error.as_deref(),
         Some("provider timeout")
     );
-    assert!(
-        stale_explain
-            .hover_markdown
-            .contains("> AETHER WARNING: SIR is stale. Last error: provider timeout")
-    );
+    assert!(stale_explain.hover_markdown.contains(
+        "> AETHER: This explanation may be out of date. Last update failed: provider timeout"
+    ));
     assert!(stale_explain.last_attempt_at.unwrap_or_default() > existing_meta.last_attempt_at);
 
     let sir_dir = workspace.join(".aether/sir");

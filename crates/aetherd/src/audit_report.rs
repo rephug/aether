@@ -34,6 +34,20 @@ pub fn render_audit_report(
         format!("Scope: {scope_label} | Status: {status} | Min severity: {min_severity}\n\n")
             .as_str(),
     );
+    output.push_str(
+        format!(
+            "Showing {} of {} matching findings.\n",
+            findings.len(),
+            summary.total
+        )
+        .as_str(),
+    );
+    if findings.len() < summary.total as usize {
+        output.push_str(
+            "Report truncated: increase --limit (maximum 200) or narrow the filters to see more findings.\n",
+        );
+    }
+    output.push('\n');
 
     if findings.is_empty() {
         output.push_str("No audit findings matched the requested filters.\n\n");
@@ -57,8 +71,12 @@ pub fn render_audit_report(
                 )
                 .as_str(),
             );
+            output.push_str(format!("  Finding ID: {}\n", finding.id).as_str());
+            output.push_str(format!("  Symbol ID: {}\n", finding.symbol_id).as_str());
             output.push_str(format!("  File: {file_path}\n").as_str());
             output.push_str(format!("  Description: {}\n", finding.description).as_str());
+            output.push_str(format!("  Trigger: {}\n", finding.trigger_condition).as_str());
+            output.push_str(format!("  Impact: {}\n", finding.impact).as_str());
             output.push_str(format!("  Certainty: {}\n", finding.certainty).as_str());
             output.push_str(format!("  Status: {}\n", finding.status).as_str());
             output.push_str(
@@ -86,9 +104,8 @@ mod tests {
     use super::render_audit_report;
     use aether_store::{AuditFinding, AuditSeverityCounts, SymbolSearchResult};
 
-    #[test]
-    fn render_audit_report_formats_findings_and_summary() {
-        let findings = vec![AuditFinding {
+    fn sample_finding() -> AuditFinding {
+        AuditFinding {
             id: 1,
             symbol_id: "sym-reconcile".to_owned(),
             audit_type: "symbol".to_owned(),
@@ -105,7 +122,12 @@ mod tests {
             status: "open".to_owned(),
             created_at: 1_772_310_400,
             resolved_at: None,
-        }];
+        }
+    }
+
+    #[test]
+    fn render_audit_report_formats_findings_and_summary() {
+        let findings = vec![sample_finding()];
         let symbols = [(
             "sym-reconcile".to_owned(),
             SymbolSearchResult {
@@ -141,10 +163,56 @@ mod tests {
         assert!(rendered.contains("AETHER Audit Report"));
         assert!(rendered.contains("Scope: aether-store | Status: open | Min severity: low"));
         assert!(rendered.contains("[HIGH] silent_failure - reconcile_and_prune"));
+        assert!(rendered.contains("Finding ID: 1"));
+        assert!(rendered.contains("Symbol ID: sym-reconcile"));
         assert!(rendered.contains("File: crates/aether-store/src/lifecycle.rs"));
         assert!(rendered.contains("Description: sir_quality rows orphaned on reconciliation"));
+        assert!(rendered.contains("Trigger: partial transaction failure"));
+        assert!(rendered.contains("Impact: orphaned rows"));
         assert!(rendered.contains("Certainty: confirmed"));
         assert!(rendered.contains("Status: open"));
+        assert!(rendered.contains("Showing 1 of 12 matching findings."));
+        assert!(rendered.contains("Report truncated: increase --limit (maximum 200)"));
         assert!(rendered.contains("Summary: 0 critical, 3 high, 7 medium, 2 low (12 total)"));
+    }
+
+    #[test]
+    fn complete_report_keeps_ids_when_symbol_metadata_is_missing() {
+        let rendered = render_audit_report(
+            "workspace",
+            "open",
+            "low",
+            &[sample_finding()],
+            &Default::default(),
+            &AuditSeverityCounts {
+                total: 1,
+                high: 1,
+                ..Default::default()
+            },
+        );
+
+        assert!(rendered.contains("Showing 1 of 1 matching findings."));
+        assert!(!rendered.contains("Report truncated"));
+        assert!(rendered.contains("[HIGH] silent_failure - sym-reconcile"));
+        assert!(rendered.contains("Finding ID: 1"));
+        assert!(rendered.contains("Symbol ID: sym-reconcile"));
+        assert!(rendered.contains("File: <unknown>"));
+    }
+
+    #[test]
+    fn empty_report_does_not_claim_truncation() {
+        let rendered = render_audit_report(
+            "workspace",
+            "open",
+            "low",
+            &[],
+            &Default::default(),
+            &AuditSeverityCounts::default(),
+        );
+
+        assert!(rendered.contains("Showing 0 of 0 matching findings."));
+        assert!(rendered.contains("No audit findings matched the requested filters."));
+        assert!(!rendered.contains("Report truncated"));
+        assert!(rendered.contains("(0 total)"));
     }
 }

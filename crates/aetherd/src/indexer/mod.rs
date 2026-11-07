@@ -53,6 +53,8 @@ mod reconciliation;
 pub(crate) use reconciliation::reconcile_symbol_event;
 mod snapshot;
 #[cfg(test)]
+mod snapshot_projection_tests;
+#[cfg(test)]
 mod startup_tests;
 mod structural;
 mod worker;

@@ -30,6 +30,8 @@ pub struct VelocityResult {
 /// Model-upgrade spikes are filtered out: rows where the generation config changed but
 /// neither the source nor the neighbor intents did. A real neighbor change counts even
 /// when the config changed too (see [`neighbors_really_changed`]).
+/// Format transitions are excluded because their identity components are incomparable.
+/// A v3 context digest cannot prove that a neighbor changed during a config change.
 pub fn compute_semantic_velocity(
     records: &[SirFingerprintHistoryRecord],
     pagerank_map: &HashMap<String, f64>,
@@ -40,7 +42,13 @@ pub fn compute_semantic_velocity(
     // Filter out model-upgrade spikes: only the config changed.
     let filtered: Vec<&SirFingerprintHistoryRecord> = records
         .iter()
-        .filter(|r| !r.config_changed || r.source_changed || neighbors_really_changed(r))
+        .filter(|r| {
+            let version_changed = r.prompt_hash_previous.as_deref().is_some_and(|previous| {
+                previous.starts_with("v3:") != r.prompt_hash.starts_with("v3:")
+            });
+            !version_changed
+                && (!r.config_changed || r.source_changed || neighbors_really_changed(r))
+        })
         .collect();
 
     let symbols_regenerated = filtered.len();
@@ -99,7 +107,15 @@ pub fn compute_semantic_velocity(
 /// between the two flips the neighbor segment without any neighbor changing; only a
 /// change between two prompts that both carried neighbors counts.
 fn neighbors_really_changed(record: &SirFingerprintHistoryRecord) -> bool {
-    if !record.neighbor_changed {
+    if !record.neighbor_changed
+        || record.prompt_hash.starts_with("v3:")
+        || record
+            .prompt_hash_previous
+            .as_deref()
+            .is_some_and(|hash| hash.starts_with("v3:"))
+    {
+        // v3 hashes all dynamic context, including the baseline and caller contracts.
+        // It has no separate neighbor-only digest from which to establish attribution.
         return false;
     }
     let empty = compute_neighbor_hash_segment(&[]);
@@ -214,6 +230,73 @@ mod tests {
         let result = compute_semantic_velocity(&records, &pr, 0.15, 0.2, None);
         assert_eq!(result.symbols_regenerated, 1);
         assert_eq!(result.symbols_above_noise, 1);
+    }
+
+    #[test]
+    fn velocity_does_not_mistake_v3_context_or_format_changes_for_neighbor_evidence() {
+        use crate::batch::hash::{
+            compute_effective_prompt_hash, compute_prompt_hash, diff_prompt_hashes,
+        };
+        let record = |previous: String, current: String| {
+            let (source, neighbor, config) = diff_prompt_hashes(&previous, &current);
+            SirFingerprintHistoryRecord {
+                prompt_hash: current,
+                prompt_hash_previous: Some(previous),
+                ..make_record_with_neighbors("sym", 0.6, source, neighbor, config)
+            }
+        };
+        let source = "fn same() {}";
+        let identity = aether_core::content_hash(source);
+        let v3 = |source: &str, context: &str, config: &str| {
+            compute_effective_prompt_hash(source, context, config)
+        };
+        let cases = [
+            (
+                "format transition",
+                record(
+                    compute_prompt_hash(source, &["peer"], "old"),
+                    v3(&identity, "context", "new"),
+                ),
+                0,
+            ),
+            (
+                "context and config",
+                record(
+                    v3(&identity, "old context", "old"),
+                    v3(&identity, "new context", "new"),
+                ),
+                0,
+            ),
+            (
+                "config only",
+                record(
+                    v3(&identity, "context", "old"),
+                    v3(&identity, "context", "new"),
+                ),
+                0,
+            ),
+            (
+                "source and config",
+                record(
+                    v3(&identity, "context", "old"),
+                    v3("changed full-source identity", "context", "new"),
+                ),
+                1,
+            ),
+            (
+                "context only",
+                record(
+                    v3(&identity, "old context", "same"),
+                    v3(&identity, "new context", "same"),
+                ),
+                1,
+            ),
+        ];
+        let pagerank = HashMap::from([("sym".to_owned(), 1.0)]);
+        for (name, record, expected) in cases {
+            let result = compute_semantic_velocity(&[record], &pagerank, 0.15, 0.2, None);
+            assert_eq!(result.symbols_regenerated, expected, "{name}");
+        }
     }
 
     #[test]

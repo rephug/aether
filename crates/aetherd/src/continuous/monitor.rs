@@ -22,8 +22,8 @@ use super::staleness::{compute_staleness, effective_age, time_staleness};
 use super::{ensure_supported_schedule, parse_requeue_pass, resolve_continuous_config};
 use crate::batch::hash::{compute_source_hash_segment, decompose_prompt_hash};
 use crate::batch::{
-    BatchPollStatus, build_pass_jsonl_for_ids, create_batch_provider, ingest_results,
-    remove_build_sidecars, resolve_batch_runtime_config, unaccounted_requests,
+    BatchPollStatus, BatchProvider, build_pass_jsonl_for_ids, create_batch_provider,
+    ingest_results, remove_build_sidecars, resolve_batch_runtime_config, unaccounted_requests,
 };
 use crate::indexer::run_structural_index_once;
 use crate::sir_pipeline::build_job;
@@ -110,6 +110,17 @@ fn run_monitor_once_inner(
     config: &AetherConfig,
     started_at: i64,
 ) -> Result<ContinuousStatusSnapshot> {
+    run_monitor_once_with_provider(workspace, config, started_at, || {
+        create_batch_provider(config, None)
+    })
+}
+
+pub(crate) fn run_monitor_once_with_provider(
+    workspace: &Path,
+    config: &AetherConfig,
+    started_at: i64,
+    provider_factory: impl FnOnce() -> Result<Box<dyn BatchProvider>>,
+) -> Result<ContinuousStatusSnapshot> {
     let continuous = resolve_continuous_config(config);
     ensure_supported_schedule(continuous.schedule.as_str())?;
     let requeue_pass = parse_requeue_pass(continuous.requeue_pass.as_str())?;
@@ -168,8 +179,8 @@ fn run_monitor_once_inner(
 
     let contracts_enabled = config.contracts.as_ref().is_some_and(|c| c.enabled);
     let pass_config = runtime.for_pass(requeue_pass).clone();
-    let provider = create_batch_provider(config, None)
-        .context("failed to create batch provider for continuous monitor")?;
+    let provider =
+        provider_factory().context("failed to create batch provider for continuous monitor")?;
     let build_summary = build_pass_jsonl_for_ids(
         workspace,
         &store,
@@ -537,8 +548,8 @@ fn source_change_evidence(
     })
 }
 
-/// Compares the prompt hash's source segment with the symbol's current (truncated)
-/// text; `None` when there is no stored hash or the text can't be read.
+/// Compares full-source identity for v3, or the excerpt for legacy fingerprints;
+/// `None` when there is no stored hash or the text can't be read.
 fn source_segment_changed(
     workspace: &Path,
     symbol: &Symbol,
@@ -546,8 +557,15 @@ fn source_segment_changed(
     max_chars: Option<usize>,
 ) -> Option<bool> {
     let stored_source = stored_prompt_hash.and_then(|hash| decompose_prompt_hash(hash).0)?;
+    let versioned = stored_prompt_hash.is_some_and(|hash| hash.starts_with("v3:"));
     let current_source = build_job(workspace, symbol.clone(), None, max_chars)
-        .map(|job| compute_source_hash_segment(job.symbol_text.as_str()))
+        .map(|job| {
+            compute_source_hash_segment(if versioned {
+                &job.source_hash
+            } else {
+                &job.symbol_text
+            })
+        })
         .ok()?;
     Some(current_source != stored_source)
 }
@@ -919,6 +937,30 @@ mod tests {
             .extract_from_path(std::path::Path::new("src/lib.rs"), source)
             .expect("parse")
             .remove(0)
+    }
+
+    #[test]
+    fn v3_source_segment_detects_edits_beyond_an_unchanged_excerpt() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let before = parse_only_symbol(workspace, "fn run() -> i32 { 1 }\n");
+        let job =
+            crate::sir_pipeline::build_job(workspace, before.clone(), None, Some(8)).expect("job");
+        let hash = crate::batch::hash::compute_effective_prompt_hash(
+            &job.source_hash,
+            "user context",
+            "provider request",
+        );
+        assert_eq!(
+            source_segment_changed(workspace, &before, Some(&hash), Some(8)),
+            Some(false)
+        );
+        let after = parse_only_symbol(workspace, "fn run() -> i32 { 2 }\n");
+        assert_eq!(after.id, before.id);
+        assert_eq!(
+            source_segment_changed(workspace, &after, Some(&hash), Some(8)),
+            Some(true)
+        );
     }
 
     #[test]

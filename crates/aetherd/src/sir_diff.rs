@@ -53,10 +53,15 @@ fn execute_sir_diff_command(workspace: &Path, args: SirDiffArgs) -> Result<Strin
     let (body_changed, body_detail) = match meta
         .prompt_hash
         .as_deref()
-        .and_then(|hash| decompose_prompt_hash(hash).0)
+        .and_then(|hash| decompose_prompt_hash(hash).0.map(|source| (hash, source)))
     {
-        Some(stored_source_hash) => {
-            let current_source_hash = compute_source_hash_segment(fresh.symbol_source.as_str());
+        Some((prompt_hash, stored_source_hash)) => {
+            let current_source_hash =
+                compute_source_hash_segment(if prompt_hash.starts_with("v3:") {
+                    &fresh.symbol.content_hash
+                } else {
+                    fresh.symbol_source.as_str()
+                });
             let changed = stored_source_hash != current_source_hash;
             (
                 Some(changed),
@@ -216,6 +221,33 @@ vector_backend = "sqlite"
         .expect("diff");
 
         assert!(rendered.contains("No structural drift detected"));
+    }
+
+    #[test]
+    fn diff_understands_v3_whole_source_identity() {
+        let source = "pub fn alpha() -> i32 { 1 }\n";
+        let prompt_hash = crate::batch::hash::compute_effective_prompt_hash(
+            &aether_core::content_hash(source.trim_end()),
+            "limited source excerpt",
+            "effective request settings",
+        );
+        let (temp, record) = seed_workspace(source, Some(prompt_hash));
+        let render = || {
+            execute_sir_diff_command(
+                temp.path(),
+                SirDiffArgs {
+                    selector: record.id.clone(),
+                },
+            )
+            .expect("diff")
+        };
+        assert!(render().contains("No structural drift detected"));
+        fs::write(
+            temp.path().join("src/lib.rs"),
+            "pub fn alpha() -> i32 { 2 }\n",
+        )
+        .expect("edit beyond excerpt");
+        assert!(render().contains("[BODY] Source hash changed"));
     }
 
     #[test]

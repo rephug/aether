@@ -260,6 +260,18 @@ impl SirPipeline {
         // `aether_sir_inject` call with a reviewed, high-confidence SIR, say) landed
         // meanwhile and must not be overwritten by this older result.
         let _inject_guard = acquire_inject_write_lock(&self.workspace_root)?;
+        // A structural writer can retire the symbol while inference runs, even
+        // while its old source remains on disk (for example, a newly ignored file).
+        // Check under the same lock as retirement so success cannot create an orphan.
+        if store
+            .get_symbol_record(&generated.symbol.id)
+            .with_context(|| format!("failed to load symbol {}", generated.symbol.id))?
+            .is_none()
+        {
+            tracing::info!(symbol_id = %generated.symbol.id,
+                "skipping generated SIR: the symbol was removed while it was being generated");
+            return Ok(GenerationPersist::Superseded);
+        }
         let current_sir = current_sir_identity(store, &generated.symbol.id)?;
         if current_sir != generated.prior_sir {
             // One exception: a write bound to text older than what this job read (an
