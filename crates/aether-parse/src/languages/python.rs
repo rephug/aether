@@ -13,8 +13,10 @@ use crate::parser::{TestIntent, humanize_test_name, normalize_intent_text};
 use crate::parser::{build_symbol, named_child_text, node_text};
 use crate::registry::{LanguageConfig, LanguageHooks, QueryCaptures};
 
+mod identity;
 mod workspace;
 
+pub(crate) use identity::disambiguate_symbol_identities;
 pub(crate) use workspace::PythonWorkspace;
 
 pub fn config() -> LanguageConfig {
@@ -130,7 +132,7 @@ impl LanguageHooks for PythonHooks {
         captures: &QueryCaptures<'_, '_>,
         source: &[u8],
         file_path: &str,
-        _symbols: &[Symbol],
+        symbols: &[Symbol],
     ) -> Option<Vec<TestIntent>> {
         let node = captures.node_with_prefix("test.")?;
         if node.kind() != "function_definition" {
@@ -142,9 +144,15 @@ impl LanguageHooks for PythonHooks {
             return None;
         }
 
-        let symbol_id = self
-            .map_function_symbol(language, file_path, source, node)
-            .map(|symbol| symbol.id);
+        // Collision-aware IDs are assigned after mapping declarations. Match the
+        // final symbol rather than rebuilding its pre-disambiguation identity.
+        let symbol_id = symbols
+            .iter()
+            .find(|symbol| {
+                symbol.range.start_byte == Some(node.start_byte())
+                    && symbol.range.end_byte == Some(node.end_byte())
+            })
+            .map(|symbol| symbol.id.clone());
         let intent_text = python_docstring(node, source)
             .unwrap_or_else(|| humanize_test_name(test_name.as_str()));
         let intent_text = normalize_intent_text(intent_text.as_str());
