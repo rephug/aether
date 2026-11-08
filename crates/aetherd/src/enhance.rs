@@ -315,6 +315,14 @@ pub(crate) fn extract_intent_via_keywords(
         if STOP_WORDS.contains(&lower.as_str()) {
             continue;
         }
+        if TASK_WORDS.contains(&lower.as_str())
+            && store
+                .list_symbols_for_call_target(token)
+                .with_context(|| format!("failed to check symbol component '{token}'"))?
+                .is_empty()
+        {
+            continue;
+        }
 
         if let Some(path) = resolve_file_token(workspace, store, token)? {
             if seen_files.insert(path.clone()) {
@@ -328,7 +336,7 @@ pub(crate) fn extract_intent_via_keywords(
             || token.chars().any(|ch| ch.is_ascii_uppercase());
         if looks_symbolic {
             let matches = resolve_symbol_query(store, token, MAX_EXPLICIT_MATCHES)?;
-            if !matches.is_empty() {
+            if !matches.is_empty() || token.contains("::") || token.contains('.') {
                 if seen_symbols.insert(token.clone()) {
                     target_symbols.push(token.clone());
                 }
@@ -883,7 +891,7 @@ fn resolve_symbol_query(
     limit: usize,
 ) -> Result<Vec<SymbolRecord>> {
     let query = query.trim();
-    if query.is_empty() {
+    if query.is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
 
@@ -915,8 +923,35 @@ fn resolve_symbol_query(
         }
     }
 
-    if records.len() >= limit {
+    // Exact names and ids must not be padded with unrelated substring matches.
+    if !records.is_empty() {
         return Ok(records);
+    }
+
+    {
+        // Python/TypeScript callers commonly use Class.method, while the index
+        // stores module::Class::method. Match complete name components, retaining
+        // the caller's owner qualifier instead of falling back to a bare method.
+        let dotted_query = query.replace("::", ".");
+        let leaf = dotted_query.rsplit('.').next().unwrap_or_default();
+        let suffix = format!(".{dotted_query}");
+        for record in store
+            .list_symbols_for_call_target(leaf)
+            .with_context(|| format!("failed to resolve qualified symbol {query}"))?
+        {
+            let dotted_name = record.qualified_name.replace("::", ".");
+            if (dotted_name == dotted_query || dotted_name.ends_with(&suffix))
+                && seen.insert(record.id.clone())
+            {
+                records.push(record);
+                if records.len() >= limit {
+                    break;
+                }
+            }
+        }
+        if !records.is_empty() || query.contains("::") || query.contains('.') {
+            return Ok(records);
+        }
     }
 
     for candidate in store
@@ -1034,6 +1069,16 @@ fn prompt_has_explicit_targets(prompt: &str) -> bool {
         || prompt.contains(".rs")
         || prompt.contains(".toml")
         || prompt.contains('`')
+        || tokenize_prompt(prompt).iter().any(|token| {
+            token.contains('.')
+                && token.split('.').all(|component| {
+                    let mut chars = component.chars();
+                    chars
+                        .next()
+                        .is_some_and(|ch| ch.is_alphabetic() || ch == '_')
+                        && chars.all(|ch| ch.is_alphanumeric() || ch == '_')
+                })
+        })
 }
 
 fn tokenize_prompt(prompt: &str) -> Vec<String> {
@@ -1284,7 +1329,8 @@ mod tests {
 
     use super::{
         EnhanceDocumentFormat, EnhanceRequest, TaskType, enhance_prompt_core,
-        extract_intent_via_keywords, read_sir_annotation,
+        extract_intent_via_keywords, prompt_has_explicit_targets, read_sir_annotation,
+        resolve_symbol_query,
     };
 
     #[derive(Clone, Default)]
@@ -1461,6 +1507,157 @@ enabled = true
 
         assert_eq!(intent.task_type, TaskType::BugFix);
         assert!(intent.concepts.iter().any(|concept| concept == "login"));
+    }
+
+    #[test]
+    fn qualified_method_prompt_resolves_edit_sites_instead_of_task_verbs() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        let store = seed_qualified_workspace(workspace);
+        let result = enhance_prompt_core(
+            workspace,
+            &store,
+            &EnhanceRequest::new(
+                "Add deserializer_kwargs to Serializer.__init__ and forward it in Serializer.load_payload while keeping Serializer.dump_payload unchanged.",
+                1_600,
+                false,
+                true,
+            ),
+        )
+        .expect("enhance qualified prompt");
+
+        for method in ["__init__", "load_payload", "dump_payload"] {
+            assert!(
+                result
+                    .resolved_symbols
+                    .contains(&format!("itsdangerous.serializer::Serializer::{method}"))
+            );
+        }
+        assert!(
+            result
+                .resolved_symbols
+                .iter()
+                .all(|name| !name.contains("BadData"))
+        );
+        assert!(result.enhanced_prompt.contains("Loads a payload"));
+    }
+
+    fn seed_qualified_workspace(workspace: &Path) -> SqliteStore {
+        write_test_config(workspace);
+        let store = SqliteStore::open(workspace).expect("open store");
+        for (id, name, intent) in [
+            (
+                "init",
+                "itsdangerous.serializer::Serializer::__init__",
+                "Configures serializers",
+            ),
+            (
+                "load",
+                "itsdangerous.serializer::Serializer::load_payload",
+                "Loads a payload",
+            ),
+            (
+                "dump",
+                "itsdangerous.serializer::Serializer::dump_payload",
+                "Dumps a payload",
+            ),
+            (
+                "other",
+                "itsdangerous.serializer::OtherSerializer::load_payload",
+                "Unrelated owner",
+            ),
+            (
+                "extension",
+                "itsdangerous.serializer::Serializer::load_payload_extra",
+                "Unrelated method",
+            ),
+            ("bad", "itsdangerous.exc::BadData", "Unrelated error"),
+        ] {
+            seed_symbol(&store, id, "serializer.py", name, "method", intent);
+        }
+        store
+    }
+
+    #[test]
+    fn qualified_resolution_accepts_dots_and_scopes_without_losing_owner() {
+        let temp = tempdir().expect("tempdir");
+        let store = seed_qualified_workspace(temp.path());
+        for query in [
+            "Serializer.load_payload",
+            "Serializer::load_payload",
+            "itsdangerous.serializer.Serializer.load_payload",
+            "itsdangerous.serializer::Serializer::load_payload",
+            "load",
+        ] {
+            let records = resolve_symbol_query(&store, query, 3).expect("resolve qualified symbol");
+            assert_eq!(records.len(), 1, "query {query}");
+            assert_eq!(records[0].id, "load", "query {query}");
+        }
+        assert!(
+            resolve_symbol_query(&store, "MissingSerializer.load_payload", 3)
+                .expect("resolve missing owner")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unresolved_qualified_method_is_reported_without_fuzzy_substitution() {
+        let temp = tempdir().expect("tempdir");
+        let store = seed_qualified_workspace(temp.path());
+        let result = enhance_prompt_core(
+            temp.path(),
+            &store,
+            &EnhanceRequest::new("MissingSerializer.load_payload", 1_600, false, true),
+        )
+        .expect("enhance missing owner");
+        assert!(result.resolved_symbols.is_empty());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| { warning == "no symbol matched 'MissingSerializer.load_payload'" })
+        );
+    }
+
+    #[test]
+    fn dotted_method_is_an_explicit_target_without_requiring_offline_flag() {
+        assert!(prompt_has_explicit_targets(
+            "Inspect Serializer.load_payload."
+        ));
+        assert!(!prompt_has_explicit_targets("Inspect the serializer."));
+        assert!(!prompt_has_explicit_targets(
+            "Investigate v1.2 compatibility"
+        ));
+        assert!(!prompt_has_explicit_targets(
+            "Inspect Serializer..load_payload"
+        ));
+    }
+
+    #[test]
+    fn task_words_preserve_real_symbol_components() {
+        let temp = tempdir().expect("tempdir");
+        let store = seed_qualified_workspace(temp.path());
+        for (id, name) in [("write", "std::io::Write"), ("add", "math::add")] {
+            seed_symbol(&store, id, "lib.rs", name, "function", "Real named symbol");
+        }
+        let result = enhance_prompt_core(
+            temp.path(),
+            &store,
+            &EnhanceRequest::new("Inspect Write and add", 1_600, false, true),
+        )
+        .expect("enhance task-word symbols");
+        assert!(
+            result
+                .resolved_symbols
+                .contains(&"std::io::Write".to_owned())
+        );
+        assert!(result.resolved_symbols.contains(&"math::add".to_owned()));
+        assert!(
+            result
+                .resolved_symbols
+                .iter()
+                .all(|name| !name.contains("BadData"))
+        );
     }
 
     #[test]
