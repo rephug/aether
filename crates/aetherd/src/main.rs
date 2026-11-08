@@ -451,7 +451,12 @@ fn audit_report_file_path_prefix(crate_filter: Option<&str>) -> Option<String> {
 }
 
 fn run_audit_report_subcommand(workspace: &Path, args: AuditReportArgs) -> Result<()> {
-    let store = SqliteStore::open(workspace).context("failed to open local store")?;
+    let store = SqliteStore::open_readonly(workspace).with_context(|| {
+        format!(
+            "failed to open existing audit catalog at {} in read-only mode",
+            workspace.join(".aether/meta.sqlite").display()
+        )
+    })?;
     let min_severity = args.min_severity.trim().to_ascii_lowercase();
     let status = args.status.trim().to_ascii_lowercase();
     let filters = AuditFindingFilters {
@@ -506,13 +511,14 @@ fn run_continuous_subcommand(
 
 fn load_config_for_command(workspace: &Path, command: Option<&Commands>) -> Result<AetherConfig> {
     let load_result = match command {
-        Some(Commands::HealthScore(_) | Commands::Preflight(_)) => load_workspace_config(workspace)
-            .with_context(|| {
+        Some(Commands::HealthScore(_) | Commands::Preflight(_) | Commands::AuditReport(_)) => {
+            load_workspace_config(workspace).with_context(|| {
                 format!(
                     "failed to load workspace config at {}",
                     workspace.join(".aether/config.toml").display()
                 )
-            }),
+            })
+        }
         _ => ensure_workspace_config(workspace).with_context(|| {
             format!(
                 "failed to load or create workspace config at {}",

@@ -1016,6 +1016,7 @@ pub struct AuditReportArgs {
     #[arg(
         long,
         default_value = "open",
+        value_parser = parse_audit_report_status,
         help = "Status to include: open, confirmed, fixed, wontfix"
     )]
     pub status: String,
@@ -1026,6 +1027,16 @@ pub struct AuditReportArgs {
         help = "Maximum number of findings to display"
     )]
     pub limit: u32,
+}
+
+fn parse_audit_report_status(raw: &str) -> Result<String, String> {
+    let status = raw.trim().to_ascii_lowercase();
+    match status.as_str() {
+        "open" | "confirmed" | "fixed" | "wontfix" => Ok(status),
+        _ => Err(format!(
+            "invalid audit status '{raw}'; expected one of: open, confirmed, fixed, wontfix"
+        )),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
@@ -1152,7 +1163,7 @@ pub enum Commands {
     SirInject(SirInjectArgs),
     /// Show SIR vs source code delta
     SirDiff(SirDiffArgs),
-    /// Show audit findings grouped by severity for a crate or path prefix
+    /// Read stored audit findings by severity without initializing or upgrading the catalog
     AuditReport(AuditReportArgs),
     /// Generate agent configuration files for AI coding agents
     InitAgent(InitAgentArgs),
@@ -2230,6 +2241,39 @@ mod tests {
                 assert_eq!(args.limit, 25);
             }
             other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audit_report_rejects_unknown_status_instead_of_returning_an_empty_report() {
+        for status in ["opne", "all", "", "   ", " fixedx "] {
+            let error = Cli::try_parse_from(["aetherd", "audit-report", "--status", status])
+                .expect_err("unknown audit statuses must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("expected one of: open, confirmed, fixed, wontfix"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_report_status_keeps_supported_values_and_existing_normalization() {
+        for (raw, expected) in [
+            ("open", "open"),
+            ("confirmed", "confirmed"),
+            ("fixed", "fixed"),
+            ("wontfix", "wontfix"),
+            ("OPEN", "open"),
+            (" Fixed ", "fixed"),
+        ] {
+            let cli = Cli::try_parse_from(["aetherd", "audit-report", "--status", raw])
+                .expect("supported normalized status should parse");
+            match cli.command {
+                Some(Commands::AuditReport(args)) => assert_eq!(args.status, expected),
+                other => panic!("unexpected command: {other:?}"),
+            }
         }
     }
 
