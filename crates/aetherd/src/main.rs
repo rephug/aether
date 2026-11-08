@@ -443,11 +443,12 @@ fn audit_report_file_path_prefix(crate_filter: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
 
-    if trimmed.contains('/') {
-        return Some(normalize_path(trimmed));
+    let normalized = normalize_path(trimmed);
+    if normalized.contains('/') {
+        return Some(normalized);
     }
 
-    Some(format!("crates/{trimmed}/"))
+    Some(format!("crates/{normalized}/"))
 }
 
 fn run_audit_report_subcommand(workspace: &Path, args: AuditReportArgs) -> Result<()> {
