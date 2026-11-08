@@ -41,6 +41,7 @@ pub struct NewAuditFinding {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuditFindingFilters {
     pub symbol_id: Option<String>,
+    /// Literal normalized path prefix; SQL wildcard characters are ordinary path characters.
     pub file_path_prefix: Option<String>,
     pub min_severity: Option<String>,
     pub category: Option<String>,
@@ -107,6 +108,18 @@ fn normalized_file_path_prefix(prefix: Option<&str>) -> Option<String> {
     normalize_optional_filter(prefix.as_ref().copied()).map(|value| normalize_path(&value))
 }
 
+fn literal_path_prefix_pattern(prefix: &str) -> String {
+    let mut pattern = String::with_capacity(prefix.len() + 1);
+    for character in prefix.chars() {
+        if matches!(character, '\\' | '%' | '_') {
+            pattern.push('\\');
+        }
+        pattern.push(character);
+    }
+    pattern.push('%');
+    pattern
+}
+
 fn build_audit_where_clause(
     filters: &AuditFindingFilters,
 ) -> Result<(String, Vec<SqlValue>, bool), StoreError> {
@@ -121,8 +134,8 @@ fn build_audit_where_clause(
 
     if let Some(prefix) = normalized_file_path_prefix(filters.file_path_prefix.as_deref()) {
         join_symbols = true;
-        conditions.push("s.file_path LIKE ?".to_owned());
-        params.push(SqlValue::Text(format!("{prefix}%")));
+        conditions.push(r"s.file_path LIKE ? ESCAPE '\'".to_owned());
+        params.push(SqlValue::Text(literal_path_prefix_pattern(&prefix)));
     }
 
     if let Some(min_severity) = normalize_optional_filter(filters.min_severity.as_deref()) {

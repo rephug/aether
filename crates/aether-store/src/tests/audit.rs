@@ -176,3 +176,92 @@ fn count_audit_findings_by_severity_respects_scope_filters() {
     assert_eq!(counts.low, 0);
     assert_eq!(counts.informational, 0);
 }
+
+#[test]
+fn audit_file_path_prefix_matches_literal_paths_in_rows_and_counts() {
+    for (prefix, target, neighbor) in [
+        (
+            "crates/pay_core/",
+            "crates/pay_core/src/lib.rs",
+            "crates/payxcore/src/lib.rs",
+        ),
+        ("src/100%/", "src/100%/lib.rs", "src/100x/lib.rs"),
+        (
+            "src/pay_core/100%/",
+            "src/pay_core/100%/lib.rs",
+            "src/payxcore/100x/lib.rs",
+        ),
+        (
+            "crates\\pay_core\\",
+            "crates/pay_core/src/lib.rs",
+            "crates/payxcore/src/lib.rs",
+        ),
+    ] {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("open store");
+        let mut target_symbol = symbol_record();
+        target_symbol.file_path = target.to_owned();
+        seed_symbol_with_sir(&store, target_symbol);
+        let mut neighbor_symbol = symbol_record_ts();
+        neighbor_symbol.file_path = neighbor.to_owned();
+        seed_symbol_with_sir(&store, neighbor_symbol);
+        store
+            .insert_audit_finding(new_audit_finding("sym-1", "high", "arithmetic", "open"))
+            .expect("insert target finding");
+        store
+            .insert_audit_finding(new_audit_finding("sym-2", "critical", "state", "open"))
+            .expect("insert unrelated higher-priority finding");
+        let filters = AuditFindingFilters {
+            file_path_prefix: Some(prefix.to_owned()),
+            status: Some("open".to_owned()),
+            limit: Some(1),
+            ..Default::default()
+        };
+        let findings = store
+            .query_audit_findings(&filters)
+            .expect("query findings");
+        let counts = store
+            .count_audit_findings_by_severity(&filters)
+            .expect("count findings");
+        assert_eq!(findings.len(), 1, "literal prefix {prefix}");
+        assert_eq!(
+            (
+                findings[0].symbol_id.as_str(),
+                counts.total,
+                counts.high,
+                counts.critical
+            ),
+            ("sym-1", 1, 1, 0),
+            "literal scope must not admit the neighbor or inflate the summary: {prefix}"
+        );
+    }
+}
+
+#[test]
+fn audit_file_path_prefix_does_not_treat_an_unmatched_percent_path_as_a_glob() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    let mut symbol = symbol_record();
+    symbol.file_path = "src/payments/lib.rs".to_owned();
+    seed_symbol_with_sir(&store, symbol);
+    store
+        .insert_audit_finding(new_audit_finding("sym-1", "high", "arithmetic", "open"))
+        .expect("insert finding");
+    let filters = AuditFindingFilters {
+        file_path_prefix: Some("src/pay%/".to_owned()),
+        ..Default::default()
+    };
+    assert!(
+        store
+            .query_audit_findings(&filters)
+            .expect("query")
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .count_audit_findings_by_severity(&filters)
+            .expect("count")
+            .total,
+        0
+    );
+}
