@@ -4,13 +4,14 @@ use std::path::Path;
 use std::rc::Rc;
 
 use aether_core::{
-    EdgeKind, Language, Symbol, SymbolEdge, SymbolKind, file_source_id, normalize_path,
+    EdgeKind, Language, Symbol, SymbolEdge, SymbolKind, content_hash, file_source_id,
+    normalize_path,
 };
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Query, QueryCursor};
 
 use crate::parser::{TestIntent, humanize_test_name, normalize_intent_text};
-use crate::parser::{build_symbol, named_child_text, node_text};
+use crate::parser::{build_symbol, named_child_text, node_range, node_text};
 use crate::registry::{LanguageConfig, LanguageHooks, QueryCaptures};
 
 mod workspace;
@@ -223,11 +224,17 @@ impl PythonHooks {
         let inner = node
             .child_by_field_name("definition")
             .or_else(|| find_inner_definition(node))?;
-        match inner.kind() {
+        let mut symbol = match inner.kind() {
             "function_definition" => self.map_function_symbol(language, file_path, source, inner),
             "class_definition" => self.map_class_symbol(language, file_path, source, inner),
             _ => None,
-        }
+        }?;
+        // Decorators can change behavior without changing the declaration or body.
+        // Keep the inner declaration's stable identity, but include every decorator
+        // in freshness checks, hover hit testing, and the source sent for explanation.
+        symbol.content_hash = content_hash(&node_text(node, source));
+        symbol.range = node_range(node);
+        Some(symbol)
     }
 
     fn map_variable_symbol(
@@ -1066,7 +1073,7 @@ struct FileAssignments {
 struct Resolver<'a, 'tree> {
     file: FileContext<'a>,
     source: &'a [u8],
-    /// Function and method symbols by the byte range of their `def`.
+    /// Function and method symbols by their declaration range, including decorators.
     functions: HashMap<(usize, usize), &'a str>,
     scopes: RefCell<HashMap<usize, Rc<ScopeIndex<'tree>>>>,
     /// Names a function rebinds in an enclosing scope, by that scope's body.
@@ -1111,7 +1118,14 @@ impl<'a, 'tree> Resolver<'a, 'tree> {
             .rev()
             .map(|&index| enclosing.nodes[index])
             .filter(|node| node.kind() == "function_definition")
-            .find_map(|node| self.functions.get(&(node.start_byte(), node.end_byte())))
+            .find_map(|node| {
+                let declaration = node
+                    .parent()
+                    .filter(|parent| parent.kind() == "decorated_definition")
+                    .unwrap_or(node);
+                self.functions
+                    .get(&(declaration.start_byte(), declaration.end_byte()))
+            })
             .map_or_else(
                 || file_source_id(self.file.file_path),
                 |id| (*id).to_owned(),
