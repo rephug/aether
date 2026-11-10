@@ -14,6 +14,8 @@ pub mod daemon_detect;
 pub mod doctor;
 pub mod drift;
 pub mod enhance;
+mod enhance_navigation;
+mod enhance_ranking;
 pub mod enhance_templates;
 pub mod freshness;
 pub mod fsck;

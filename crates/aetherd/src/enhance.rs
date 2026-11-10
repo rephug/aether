@@ -18,11 +18,16 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::EnhanceArgs;
+use crate::enhance_navigation::{SourceLocation, SourceNavigation};
+use crate::enhance_ranking::{
+    admitted_queries, match_rank, rank_query_matches, select_ranked_symbols,
+};
 use crate::enhance_templates::{estimate_tokens, render_enhanced_document};
 use crate::search::{SearchMode, execute_search};
 
 const EXTRACTION_WORD_LIMIT: usize = 500;
 const MAX_EXPLICIT_MATCHES: usize = 3;
+const MAX_TARGET_QUERIES: usize = 64;
 const MAX_SYMBOL_CONTEXTS: usize = 8;
 const MAX_FILE_CONTEXTS: usize = 6;
 const MAX_FILE_SUMMARIES: usize = 3;
@@ -145,6 +150,7 @@ pub(crate) struct EnhanceSymbolContext {
     pub qualified_name: String,
     pub kind: String,
     pub file_path: String,
+    pub source_location: Option<SourceLocation>,
     pub generation_pass: Option<String>,
     pub intent: Option<String>,
     pub inputs: Vec<String>,
@@ -419,26 +425,36 @@ fn assemble_context(
     intent: &EnhanceIntent,
 ) -> Result<AssemblyOutcome> {
     let mut warnings = Vec::<String>::new();
-    let mut resolved_symbol_records = Vec::<SymbolRecord>::new();
-    let mut seen_symbol_ids = HashSet::<String>::new();
+    let mut candidates = Vec::new();
     let mut referenced_files = Vec::<String>::new();
     let mut seen_files = HashSet::<String>::new();
     let mut file_symbol_cache = HashMap::<String, Vec<SymbolRecord>>::new();
 
-    for query in intent.target_symbols.iter().take(MAX_SYMBOL_CONTEXTS) {
+    let (queries, truncated) = admitted_queries(&intent.target_symbols, MAX_TARGET_QUERIES);
+    if truncated {
+        warnings.push(format!(
+            "Symbol queries exceed the {MAX_TARGET_QUERIES}-query limit; only the deterministic admitted set was resolved."
+        ));
+    }
+    for query in queries {
         let matches = resolve_symbol_query(store, query, MAX_EXPLICIT_MATCHES)?;
         if matches.is_empty() {
             warnings.push(format!("no symbol matched '{query}'"));
             continue;
         }
-        for record in matches {
-            if seen_symbol_ids.insert(record.id.clone()) {
-                resolved_symbol_records.push(record);
-            }
+        for record in matches.into_iter().take(MAX_EXPLICIT_MATCHES) {
+            let rank = match_rank(query, &record);
+            candidates.push((record, rank));
         }
     }
+    let mut resolved_symbol_records = select_ranked_symbols(candidates, MAX_SYMBOL_CONTEXTS);
+    let mut seen_symbol_ids = resolved_symbol_records
+        .iter()
+        .map(|record| record.id.clone())
+        .collect::<HashSet<_>>();
 
-    for file in intent.target_files.iter().take(MAX_FILE_CONTEXTS) {
+    let (files, _) = admitted_queries(&intent.target_files, MAX_FILE_CONTEXTS);
+    for file in files {
         match resolve_file_token(workspace, store, file)? {
             Some(path) => {
                 let records = store
@@ -457,7 +473,11 @@ fn assemble_context(
         }
     }
 
-    for concept in intent.concepts.iter().take(MAX_CONCEPTS) {
+    let (concepts, _) = admitted_queries(&intent.concepts, MAX_CONCEPTS);
+    for concept in concepts {
+        if resolved_symbol_records.len() >= MAX_SYMBOL_CONTEXTS {
+            break;
+        }
         let execution = execute_search(workspace, concept, 3, SearchMode::Hybrid)
             .with_context(|| format!("failed to search concept '{concept}'"))?;
         if let Some(reason) = execution.fallback_reason.as_deref() {
@@ -471,6 +491,9 @@ fn assemble_context(
         }
 
         for entry in execution.matches.iter().take(3) {
+            if resolved_symbol_records.len() >= MAX_SYMBOL_CONTEXTS {
+                break;
+            }
             let Some(record) = store
                 .get_symbol_record(entry.symbol_id.as_str())
                 .with_context(|| format!("failed to load symbol record {}", entry.symbol_id))?
@@ -529,14 +552,18 @@ fn assemble_context(
     };
 
     let mut symbol_contexts = Vec::<EnhanceSymbolContext>::new();
+    let mut navigation = SourceNavigation::default();
     for record in resolved_symbol_records.iter().take(MAX_SYMBOL_CONTEXTS) {
-        symbol_contexts.push(build_symbol_context(
+        let mut symbol_context = build_symbol_context(
             store,
             record,
             health_by_symbol.get(record.id.as_str()),
             drift_records.as_slice(),
             community_by_symbol.get(record.id.as_str()).copied(),
-        )?);
+        )?;
+        symbol_context.source_location =
+            navigation.location(workspace, &record.file_path, &record.id, &mut warnings);
+        symbol_contexts.push(symbol_context);
     }
 
     let mut file_contexts = Vec::<EnhanceFileContext>::new();
@@ -635,6 +662,7 @@ fn build_symbol_context(
         qualified_name: record.qualified_name.clone(),
         kind: record.kind.clone(),
         file_path: record.file_path.clone(),
+        source_location: None,
         generation_pass: meta.map(|entry| entry.generation_pass),
         intent: sir
             .as_ref()
@@ -901,9 +929,8 @@ fn resolve_symbol_query(
     if let Some(record) = store
         .get_symbol_record(query)
         .with_context(|| format!("failed to resolve symbol id {query}"))?
-        && seen.insert(record.id.clone())
     {
-        records.push(record);
+        return Ok(vec![record]);
     }
 
     for candidate in store
@@ -944,13 +971,10 @@ fn resolve_symbol_query(
                 && seen.insert(record.id.clone())
             {
                 records.push(record);
-                if records.len() >= limit {
-                    break;
-                }
             }
         }
         if !records.is_empty() || query.contains("::") || query.contains('.') {
-            return Ok(records);
+            return Ok(rank_query_matches(query, records, limit));
         }
     }
 
@@ -1399,6 +1423,127 @@ enabled = true
 "#,
         )
         .expect("write config");
+    }
+
+    #[test]
+    fn exact_targets_survive_more_than_eight_broad_queries_in_either_order() {
+        let workspace = tempfile::tempdir().expect("independent ranking workspace");
+        write_test_config(workspace.path());
+        let store = SqliteStore::open(workspace.path()).expect("synthetic catalog");
+        let mut queries = Vec::new();
+        for index in 0..12 {
+            let query = format!("nebula{index}");
+            seed_symbol(
+                &store,
+                &format!("decoy-{index}"),
+                &format!("src/decoy{index}.rs"),
+                &format!("{query}::catalog"),
+                "function",
+                "Independent package decoy.",
+            );
+            queries.push(query);
+        }
+        seed_symbol(
+            &store,
+            "packet-target",
+            "src/packet.rs",
+            "quasar::PacketReader::decode",
+            "method",
+            "Decode a public packet fixture.",
+        );
+        queries.push("PacketReader.decode".into());
+        let mut intent = super::EnhanceIntent {
+            target_symbols: queries,
+            ..Default::default()
+        };
+        let first =
+            super::assemble_context(workspace.path(), &store, &intent).expect("first order");
+        intent.target_symbols.reverse();
+        let reversed =
+            super::assemble_context(workspace.path(), &store, &intent).expect("reversed order");
+        assert_eq!(first.resolved_symbols[0], "quasar::PacketReader::decode");
+        assert_eq!(first.resolved_symbols.len(), super::MAX_SYMBOL_CONTEXTS);
+        assert_eq!(first.resolved_symbols, reversed.resolved_symbols);
+        assert_eq!(first.referenced_files, reversed.referenced_files);
+        assert_eq!(first.referenced_files[0], "src/packet.rs");
+    }
+
+    #[test]
+    fn normalized_exact_name_precedes_owner_suffixes_before_resolver_limit() {
+        let workspace = tempfile::tempdir().expect("independent owner workspace");
+        let store = SqliteStore::open(workspace.path()).expect("synthetic catalog");
+        for prefix in ["A", "B", "C", "D"] {
+            seed_symbol(
+                &store,
+                prefix,
+                "src/a.rs",
+                &format!("{prefix}::Pack::Reader::decode"),
+                "method",
+                "Owner suffix decoy.",
+            );
+        }
+        seed_symbol(
+            &store,
+            "exact-owner",
+            "src/z.rs",
+            "Pack::Reader::decode",
+            "method",
+            "Exact normalized target.",
+        );
+        for query in ["Pack.Reader.decode", "Pack::Reader::decode"] {
+            let records = resolve_symbol_query(&store, query, 3).expect("resolve independently");
+            assert_eq!(records[0].id, "exact-owner");
+            assert!(records.len() <= 3);
+        }
+        assert!(
+            resolve_symbol_query(&store, "MissingOwner.decode", 3)
+                .expect("missing owner")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn enhancement_renders_verified_current_source_location() {
+        let workspace = tempfile::tempdir().expect("independent navigation workspace");
+        write_test_config(workspace.path());
+        fs::create_dir(workspace.path().join("src")).expect("source directory");
+        let source =
+            "// packet fixture\n\npub fn checksum(data: &[u8]) -> usize {\n    data.len()\n}\n";
+        fs::write(workspace.path().join("src/packet.rs"), source).expect("source fixture");
+        let symbols = aether_parse::SymbolExtractor::new()
+            .expect("parser")
+            .extract_from_path(Path::new("src/packet.rs"), source)
+            .expect("parse source");
+        let symbol = symbols
+            .iter()
+            .find(|item| item.name == "checksum")
+            .expect("checksum");
+        let store = SqliteStore::open(workspace.path()).expect("synthetic catalog");
+        store
+            .upsert_symbol(aether_store::SymbolRecord {
+                id: symbol.id.clone(),
+                file_path: symbol.file_path.clone(),
+                language: "rust".into(),
+                kind: "function".into(),
+                qualified_name: symbol.qualified_name.clone(),
+                signature_fingerprint: symbol.signature_fingerprint.clone(),
+                last_seen_at: 0,
+            })
+            .expect("index independent symbol");
+        let intent = super::EnhanceIntent {
+            target_symbols: vec![symbol.qualified_name.clone()],
+            ..Default::default()
+        };
+        let assembled = super::assemble_context(workspace.path(), &store, &intent)
+            .expect("assemble source context");
+        let rendered = crate::enhance_templates::render_enhanced_document(
+            "Locate checksum",
+            &assembled.context,
+            512,
+            false,
+        )
+        .expect("render context");
+        assert!(rendered.contains("src/packet.rs:3-5"));
     }
 
     fn seed_symbol(
