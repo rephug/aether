@@ -227,6 +227,13 @@ fn format_symbol(symbol: &EnhanceSymbolContext) -> String {
         symbol.qualified_name, symbol.kind, symbol.file_path
     ));
 
+    if let Some(location) = symbol.source_location {
+        lines.push(format!(
+            "- **Source:** `{}:{}-{}`",
+            symbol.file_path, location.start_line, location.end_line
+        ));
+    }
+
     if let Some(intent) = symbol.intent.as_deref() {
         lines.push(format!("- **Intent:** {intent}"));
     }
@@ -368,6 +375,33 @@ mod tests {
     use crate::enhance::{
         AssembledEnhanceContext, EnhanceFileContext, EnhanceSymbolContext, TaskType,
     };
+
+    #[test]
+    fn verified_navigation_is_rendered_in_text_and_json_documents() {
+        let mut context = AssembledEnhanceContext {
+            symbols: vec![EnhanceSymbolContext {
+                qualified_name: "quasar::PacketReader::decode".into(),
+                kind: "method".into(),
+                file_path: "src/packet.rs".into(),
+                source_location: Some(crate::enhance_navigation::SourceLocation {
+                    start_line: 3,
+                    end_line: 5,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for json in [false, true] {
+            let rendered = render_enhanced_document("Inspect packet decoding", &context, 512, json)
+                .expect("render navigation");
+            assert!(rendered.contains("src/packet.rs:3-5"));
+            assert!(estimate_tokens(&rendered) <= 512);
+        }
+        context.symbols[0].source_location = None;
+        let rendered = render_enhanced_document("Inspect packet decoding", &context, 512, false)
+            .expect("render without unverified location");
+        assert!(!rendered.contains("**Source:**"));
+    }
 
     #[test]
     fn middle_truncate_counts_multibyte_characters() {

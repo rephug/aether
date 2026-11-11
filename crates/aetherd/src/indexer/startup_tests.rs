@@ -59,16 +59,14 @@ fn daemon_startup_queues_symbols_edited_while_it_was_down() {
 
     let (store, queue_state) = start_daemon(workspace);
 
-    let queue = queue_state.lock_queue();
     assert!(
-        queue.contains(&edited.id),
+        queue_state.is_queued(&edited.id),
         "a symbol edited while the daemon was down must be regenerated"
     );
     assert!(
-        !queue.contains(&keep.id),
+        !queue_state.is_queued(&keep.id),
         "an unchanged symbol is not queued, even one a failed attempt left stale"
     );
-    drop(queue);
     assert!(
         queue_state.take_pending_rollup_chunk(usize::MAX).is_none(),
         "the module's rollup is rebuilt with its queued leaf, not set aside"

@@ -34,9 +34,7 @@ use crate::continuous::cosine_distance_from_embeddings;
 use crate::observer::{
     DebounceQueue, ObserverState, SeededHead, is_ignored_path, relative_workspace_path,
 };
-use crate::priority_queue::{
-    SirPriorityQueue, compute_priority_score, kind_priority_score, size_inverse_score,
-};
+use crate::priority_queue::{compute_priority_score, kind_priority_score, size_inverse_score};
 use crate::sir_pipeline::{
     MAX_SYMBOL_TEXT_CHARS, QualityBatchItem, SIR_GENERATION_PASS_DEEP, SIR_GENERATION_PASS_PREMIUM,
     SIR_GENERATION_PASS_REGENERATED, SIR_GENERATION_PASS_SCAN, SIR_GENERATION_PASS_TRIAGE,
@@ -47,10 +45,15 @@ mod enrichment;
 mod git_watch;
 #[cfg(test)]
 mod index_once_tests;
+#[cfg(test)]
+mod live_scheduling_tests;
 mod priority;
 mod quality;
 mod reconciliation;
 pub(crate) use reconciliation::reconcile_symbol_event;
+mod scheduler;
+#[cfg(test)]
+mod scheduler_tests;
 mod snapshot;
 #[cfg(test)]
 mod snapshot_projection_tests;
@@ -720,9 +723,9 @@ fn start_from_snapshot(
     // A queued leaf's processing rebuilds its file's rollup (also when generation fails),
     // so only the files without one are set aside.
     {
-        let queue = queue_state.lock_queue();
+        let scheduler = queue_state.lock_scheduler();
         for symbol in symbols_by_id.values() {
-            if queue.contains(&symbol.id) {
+            if scheduler.is_queued(&symbol.id) {
                 outdated_rollups.remove(&symbol.file_path);
             }
         }

@@ -10,7 +10,7 @@ use aether_config::InferenceProviderKind;
 use aether_core::{Language, Symbol, SymbolChangeEvent};
 use aether_parse::SymbolExtractor;
 use aether_sir::{FileSir, synthetic_file_sir_id};
-use aether_store::{SirStateStore, SqliteStore, SymbolCatalogStore};
+use aether_store::{SirStateStore, SqliteStore, SymbolCatalogStore, SymbolHistoryStore};
 use tempfile::tempdir;
 
 use super::reconciliation::SnapshotScope;
@@ -179,6 +179,170 @@ pub(super) fn mirror_path(workspace: &Path, symbol_id: &str) -> std::path::PathB
     workspace
         .join(".aether/sir")
         .join(format!("{symbol_id}.json"))
+}
+
+#[test]
+fn structural_index_archives_a_legacy_python_collision_without_guessing_ownership() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    write_workspace(workspace);
+    let singleton = "def choose(value):\n    return value + 1\n";
+    fs::write(workspace.join(MODULE), singleton).expect("write singleton");
+    let original = named(&parse(workspace, MODULE), "choose");
+    index_once(workspace, true);
+    let original_blob = {
+        let store = SqliteStore::open(workspace).expect("open original store");
+        store
+            .insert_intent_contract(
+                &original.id,
+                "must",
+                "Preserve this original declaration's attribution",
+                None,
+                "synthetic-regression",
+            )
+            .expect("seed original contract");
+        store
+            .read_sir_blob(&original.id)
+            .expect("read original explanation")
+            .expect("mock full index produced an explanation")
+    };
+
+    fs::write(
+        workspace.join(MODULE),
+        "if ENABLED:\n    def choose(value):\n        return value + 1\nelse:\n    def choose(value):\n        return value - 1\n",
+    )
+    .expect("write conditional declarations");
+    let variants = parse(workspace, MODULE);
+    let expected = variants
+        .iter()
+        .map(|symbol| symbol.id.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(variants.len(), 2);
+    assert_eq!(
+        expected.len(),
+        2,
+        "both declarations need distinct identities"
+    );
+    assert!(!expected.contains(&original.id));
+
+    index_once(workspace, false);
+    let original_retirements = {
+        let store = SqliteStore::open(workspace).expect("open split store");
+        let retirements = store
+            .list_symbol_retirements(&original.id)
+            .expect("read original retirement");
+        assert_eq!(retirements.len(), 1);
+        let archived = &retirements[0];
+        assert_eq!(
+            archived.source_hash.as_deref(),
+            Some(original.content_hash.as_str())
+        );
+        assert_eq!(
+            archived.evidence["sir"][0]["sir_json"].as_str(),
+            Some(original_blob.as_str()),
+            "the original explanation remains attributed to its retired identity"
+        );
+        assert_eq!(archived.evidence["intent_contracts"].len(), 1);
+        assert_eq!(
+            archived.evidence["intent_contracts"][0]["symbol_id"].as_str(),
+            Some(original.id.as_str())
+        );
+        retirements
+    };
+
+    for _ in 0..2 {
+        index_once(workspace, false);
+        let store = SqliteStore::open(workspace).expect("reopen split store");
+        let published = store
+            .list_symbols_for_file(MODULE)
+            .expect("read published variants")
+            .into_iter()
+            .map(|symbol| symbol.id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(published, expected);
+        assert!(
+            store
+                .get_symbol_record(&original.id)
+                .expect("old row")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .list_symbol_retirements(&original.id)
+                .expect("retained original"),
+            original_retirements,
+            "reindexing must not duplicate or rewrite the retirement evidence"
+        );
+        for id in expected.iter().chain(std::iter::once(&original.id)) {
+            assert!(
+                leaf(&store, id).is_none(),
+                "no explanation inherited by {id}"
+            );
+            assert!(
+                store
+                    .read_sir_blob(id)
+                    .expect("active explanation")
+                    .is_none()
+            );
+            assert!(store.list_symbol_lineage(id).expect("lineage").is_empty());
+            assert!(
+                store
+                    .list_intent_contracts_for_symbol(id, true)
+                    .expect("contracts")
+                    .is_empty(),
+                "no contract ownership may be guessed for {id}"
+            );
+        }
+    }
+
+    // Removing the conditional alternatives reintroduces the stable singleton ID,
+    // but must not revive evidence from its earlier retired incarnation.
+    fs::write(workspace.join(MODULE), singleton).expect("restore singleton");
+    assert_eq!(named(&parse(workspace, MODULE), "choose").id, original.id);
+    for _ in 0..2 {
+        index_once(workspace, false);
+        let store = SqliteStore::open(workspace).expect("reopen restored singleton");
+        let current = store.list_symbols_for_file(MODULE).expect("singleton row");
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].id, original.id);
+        assert_eq!(
+            store
+                .list_symbol_retirements(&original.id)
+                .expect("original archive"),
+            original_retirements
+        );
+        for id in expected.iter().chain(std::iter::once(&original.id)) {
+            assert!(leaf(&store, id).is_none());
+            assert!(
+                store
+                    .read_sir_blob(id)
+                    .expect("no revived explanation")
+                    .is_none()
+            );
+            assert!(
+                store
+                    .list_symbol_lineage(id)
+                    .expect("no guessed lineage")
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .list_intent_contracts_for_symbol(id, true)
+                    .expect("no revived contracts")
+                    .is_empty()
+            );
+        }
+        for id in &expected {
+            assert_eq!(
+                store
+                    .list_symbol_retirements(id)
+                    .expect("variant retirement")
+                    .len(),
+                1,
+                "each removed variant is archived exactly once"
+            );
+        }
+    }
 }
 
 #[test]

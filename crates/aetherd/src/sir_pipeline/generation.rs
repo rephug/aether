@@ -140,7 +140,7 @@ impl SirPipeline {
         commit_hash: Option<&str>,
         print_sir: bool,
         out: &mut dyn Write,
-    ) -> Result<Option<String>> {
+    ) -> Result<GenerationCommit> {
         let persisted = match self.persist_successful_generation_sqlite(
             store,
             &generated,
@@ -148,7 +148,8 @@ impl SirPipeline {
             commit_hash,
         )? {
             GenerationPersist::Persisted(persisted) => *persisted,
-            GenerationPersist::Superseded | GenerationPersist::Failed => return Ok(None),
+            GenerationPersist::Superseded => return Ok(GenerationCommit::Superseded),
+            GenerationPersist::Failed => return Ok(GenerationCommit::LeafFailed),
         };
 
         match self.refresh_embedding_if_needed(
@@ -183,7 +184,7 @@ impl SirPipeline {
                         "failed to retire the superseded write intent"
                     );
                 }
-                return Ok(None);
+                return Ok(GenerationCommit::Superseded);
             }
             Err(err) => {
                 let message = format!("{err:#}");
@@ -197,7 +198,7 @@ impl SirPipeline {
                     error = %err,
                     "embedding refresh error"
                 );
-                return Ok(None);
+                return Ok(GenerationCommit::DownstreamFailed);
             }
         }
 
@@ -211,7 +212,7 @@ impl SirPipeline {
                 error = %err,
                 "failed to update write intent status to vector_done"
             );
-            return Ok(None);
+            return Ok(GenerationCommit::DownstreamFailed);
         }
 
         if print_sir {
@@ -228,7 +229,7 @@ impl SirPipeline {
             "SIR generated successfully"
         );
 
-        Ok(Some(persisted.intent_id))
+        Ok(GenerationCommit::Committed(persisted.intent_id))
     }
 
     pub(super) fn persist_successful_generation_sqlite(

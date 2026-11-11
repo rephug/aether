@@ -225,11 +225,15 @@ fn extract_with_config(
     let source_bytes = source.as_bytes();
 
     let mut symbols = extract_symbols(language, file_path, source_bytes, root, config);
+    if language == Language::Python && config.id == PYTHON_CONFIG_ID {
+        crate::languages::python::disambiguate_symbol_identities(&mut symbols, root, source_bytes);
+    }
     symbols.sort_by(|a, b| a.id.cmp(&b.id));
     // C# partial declarations intentionally share an identity. Rust currently has
     // no representation for distinct definitions with the same ID (e.g. cfg
-    // alternatives), so reject those instead of silently overwriting a record.
-    if language == Language::Rust
+    // alternatives). Python resolves branch/decorator alternatives above, but
+    // still rejects indistinguishable contexts instead of losing a declaration.
+    if matches!(language, Language::Rust | Language::Python)
         && let Some(pair) = symbols.windows(2).find(|pair| pair[0].id == pair[1].id)
     {
         return Err(DuplicateSymbolIdentity(format!(

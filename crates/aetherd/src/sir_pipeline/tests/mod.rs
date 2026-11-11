@@ -17,6 +17,7 @@ mod intents;
 mod method_dependencies;
 mod persistence;
 mod processing;
+mod source_freshness;
 mod source_guards;
 
 #[derive(Clone)]

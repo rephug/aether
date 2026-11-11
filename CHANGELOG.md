@@ -65,6 +65,18 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Watcher provider failures retain a delayed recovery obligation until a current SIR
+  exists, without requiring another edit, request or daemon restart. Recovery uses
+  exponential per-symbol cooldown, globally spaced recovery task starts and fair
+  service alongside ordinary work. Current manual SIRs satisfy retry debt and are
+  protected by source-aware skip decisions as well as existing persist-time guards.
+- Watcher: a symbol edited while its SIR was being generated is regenerated once that
+  run completes. The edit used to be skipped because the symbol was in progress, and the
+  run's result was then rejected as stale, so the symbol kept its old SIR (or none) until
+  its next edit or a daemon restart. Edits during one run coalesce into one follow-up
+  for the latest version; a symbol deleted and declared again under the same id waits
+  for the run its id still has instead of running beside it; a task that errors is
+  retried twice behind the other queued symbols instead of being requeued forever.
 - `aetherd --index-once` no longer serves stale SIR after edits made while nothing was
   watching. A symbol whose body changed since its SIR was written (its recorded
   `source_hash` no longer matches) is marked `stale`, including a SIR that

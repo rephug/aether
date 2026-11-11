@@ -148,6 +148,7 @@ impl SirPipeline {
                 prompt_overrides,
                 planned_against,
             )?;
+            stats.unresolved_leaf_count += prepared.unresolved_leaf_count;
             self.log_prepared_jobs(event.file_path.as_str(), &prepared);
 
             tracing::info!(
@@ -177,14 +178,21 @@ impl SirPipeline {
                             print_sir,
                             out,
                         )? {
-                            Some(intent_id) => {
+                            GenerationCommit::Committed(intent_id) => {
                                 intents_ready_for_graph.push(intent_id);
                                 stats.success_count += 1;
                             }
-                            None => stats.failure_count += 1,
+                            GenerationCommit::LeafFailed => {
+                                stats.unresolved_leaf_count += 1;
+                                stats.failure_count += 1;
+                            }
+                            GenerationCommit::Superseded | GenerationCommit::DownstreamFailed => {
+                                stats.failure_count += 1;
+                            }
                         }
                     }
                     SirGenerationOutcome::Failure(failed) => {
+                        stats.generation_failure_count += 1;
                         stats.failure_count += 1;
                         self.handle_failed_generation(
                             store,
@@ -192,7 +200,8 @@ impl SirPipeline {
                             generation_pass,
                             print_sir,
                             out,
-                        )?;
+                        )
+                        .map_err(|err| err.context(ProviderGenerationFailure))?;
                     }
                 }
             }
@@ -225,7 +234,14 @@ impl SirPipeline {
             out,
             commit_hash.as_deref(),
             generation_pass,
-        )?;
+        )
+        .map_err(|err| {
+            if stats.generation_failure_count > 0 {
+                err.context(ProviderGenerationFailure)
+            } else {
+                err
+            }
+        })?;
 
         Ok(stats)
     }
@@ -274,6 +290,7 @@ impl SirPipeline {
                     jobs.push(job);
                 }
                 Err(err) => {
+                    stats.unresolved_leaf_count += 1;
                     stats.failure_count += 1;
                     tracing::warn!(
                         symbol_id = %symbol_id,
@@ -328,6 +345,7 @@ impl SirPipeline {
                         GenerationPersist::Persisted(persisted) => *persisted,
                         GenerationPersist::Superseded => continue,
                         GenerationPersist::Failed => {
+                            stats.unresolved_leaf_count += 1;
                             stats.failure_count += 1;
                             continue;
                         }
@@ -348,6 +366,7 @@ impl SirPipeline {
                     })?;
                 }
                 SirGenerationOutcome::Failure(failed) => {
+                    stats.generation_failure_count += 1;
                     stats.failure_count += 1;
                     self.handle_failed_generation(store, *failed, generation_pass, print_sir, out)?;
                 }
@@ -458,6 +477,7 @@ impl SirPipeline {
                     jobs.push(job)
                 }
                 Err(err) => {
+                    stats.unresolved_leaf_count += 1;
                     stats.failure_count += 1;
                     tracing::warn!(
                         symbol_id = %symbol_id,
@@ -519,6 +539,7 @@ impl SirPipeline {
                         GenerationPersist::Persisted(persisted) => *persisted,
                         GenerationPersist::Superseded => continue,
                         GenerationPersist::Failed => {
+                            stats.unresolved_leaf_count += 1;
                             stats.failure_count += 1;
                             continue;
                         }
@@ -539,6 +560,7 @@ impl SirPipeline {
                     })?;
                 }
                 SirGenerationOutcome::Failure(failed) => {
+                    stats.generation_failure_count += 1;
                     stats.failure_count += 1;
                     let symbol_id = failed.symbol.id.clone();
                     self.handle_failed_generation(store, *failed, generation_pass, print_sir, out)
@@ -645,6 +667,7 @@ impl SirPipeline {
         planned_against: Option<&HashMap<String, SirIdentity>>,
     ) -> Result<PreparedCandidateJobs> {
         let mut jobs = Vec::new();
+        let mut unresolved_leaf_count = 0;
         let mut skipped_existing = 0usize;
 
         for (symbol, allow_existing_skip) in changed_symbols {
@@ -695,6 +718,7 @@ impl SirPipeline {
                     jobs.push(job);
                 }
                 Err(err) => {
+                    unresolved_leaf_count += 1;
                     tracing::warn!(
                         file_path = %file_path,
                         error = %err,
@@ -705,6 +729,7 @@ impl SirPipeline {
         }
 
         Ok(PreparedCandidateJobs {
+            unresolved_leaf_count,
             jobs,
             skipped_existing,
         })
@@ -949,6 +974,16 @@ impl SirPipeline {
         };
         if existing_blob.trim().is_empty() {
             return Ok(false);
+        }
+
+        // Source binding is authoritative when available. Unlike timestamps kept
+        // in whole seconds, it orders edits and injections in the same second and
+        // prevents a provider-recovery attempt from replacing a current manual SIR.
+        if let Some(source_hash) = store
+            .get_sir_source_hash(&symbol.id)
+            .with_context(|| format!("failed to read SIR source hash for {}", symbol.id))?
+        {
+            return Ok(source_hash == symbol.content_hash);
         }
 
         let Some(source_modified_at_ms) =
