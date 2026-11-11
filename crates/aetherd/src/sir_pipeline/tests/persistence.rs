@@ -78,7 +78,7 @@ fn commit_successful_generation_injects_method_dependencies_from_symbol_edges_ac
     };
 
     let mut out = Vec::new();
-    let intent_id = pipeline
+    let outcome = pipeline
         .commit_successful_generation(
             &store,
             generated,
@@ -87,8 +87,10 @@ fn commit_successful_generation_injects_method_dependencies_from_symbol_edges_ac
             false,
             &mut out,
         )
-        .expect("commit successful generation")
-        .expect("intent id");
+        .expect("commit successful generation");
+    let GenerationCommit::Committed(intent_id) = outcome else {
+        panic!("generation should commit successfully");
+    };
 
     let stored_blob = store
         .read_sir_blob(parent_symbol.id.as_str())
@@ -418,8 +420,8 @@ fn a_generation_superseded_during_its_embedding_retires_its_intent_without_a_suc
     };
 
     // The leaf commits, then an injection replaces it while its vector is generated.
-    // The commit is not a success (no intent id is returned, so the event path does
-    // not count it), the intent is retired rather than advanced to vector_done for a
+    // The commit is explicitly superseded, so the event path does not count it as
+    // a success. The intent is retired rather than advanced to vector_done for a
     // leaf the store no longer holds, and no vector for the daemon's SIR is stored.
     let mut out = Vec::new();
     let outcome = pipeline
@@ -433,7 +435,7 @@ fn a_generation_superseded_during_its_embedding_retires_its_intent_without_a_suc
         )
         .expect("commit");
     assert!(
-        outcome.is_none(),
+        matches!(outcome, GenerationCommit::Superseded),
         "a superseded generation is not a success"
     );
     assert_eq!(
@@ -549,7 +551,7 @@ fn a_generation_replaced_and_restored_during_its_embedding_is_still_superseded()
         )
         .expect("commit");
     assert!(
-        outcome.is_none(),
+        matches!(outcome, GenerationCommit::Superseded),
         "a write replaced and restored underneath the daemon is not its success"
     );
     assert_eq!(

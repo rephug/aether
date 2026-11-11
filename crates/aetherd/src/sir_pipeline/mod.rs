@@ -87,7 +87,25 @@ pub const SIR_GENERATION_PASS_REGENERATED: &str = "regenerated";
 pub struct ProcessEventStats {
     pub success_count: usize,
     pub failure_count: usize,
+    /// Leaf inference failures, excluding superseded results and downstream writes.
+    pub generation_failure_count: usize,
+    /// Leaf preparation or persistence failed; excludes supersession and vector work.
+    pub unresolved_leaf_count: usize,
 }
+
+/// Retains provider-failure classification if recording that failure or rebuilding
+/// its file rollup also errors. The watcher must not lose recovery debt because
+/// secondary bookkeeping returned an error instead of processing statistics.
+#[derive(Debug)]
+pub(crate) struct ProviderGenerationFailure;
+
+impl std::fmt::Display for ProviderGenerationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("leaf provider generation failed before bookkeeping completed")
+    }
+}
+
+impl std::error::Error for ProviderGenerationFailure {}
 
 #[derive(Debug, Clone)]
 pub struct SirPromptOverride {
@@ -179,11 +197,19 @@ pub struct SirPipeline {
 }
 
 struct PreparedCandidateJobs {
+    unresolved_leaf_count: usize,
     jobs: Vec<SirJob>,
     skipped_existing: usize,
 }
 
 /// What became of one generated SIR at persist time.
+enum GenerationCommit {
+    Committed(String),
+    Superseded,
+    LeafFailed,
+    DownstreamFailed,
+}
+
 enum GenerationPersist {
     Persisted(Box<PersistedSuccessfulGeneration>),
     /// Another writer stored a SIR for the symbol while this one was being generated;
