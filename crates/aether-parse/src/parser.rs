@@ -233,8 +233,15 @@ fn extract_with_config(
     // no representation for distinct definitions with the same ID (e.g. cfg
     // alternatives). Python resolves branch/decorator alternatives above, but
     // still rejects indistinguishable contexts instead of losing a declaration.
-    if matches!(language, Language::Rust | Language::Python)
-        && let Some(pair) = symbols.windows(2).find(|pair| pair[0].id == pair[1].id)
+    if matches!(
+        language,
+        Language::Rust
+            | Language::Python
+            | Language::TypeScript
+            | Language::Tsx
+            | Language::JavaScript
+            | Language::Jsx
+    ) && let Some(pair) = symbols.windows(2).find(|pair| pair[0].id == pair[1].id)
     {
         return Err(DuplicateSymbolIdentity(format!(
             "duplicate symbol identity in {file_path}: '{}' at lines {} and {} (id {}); refusing to overwrite either definition",
@@ -566,9 +573,9 @@ pub fn language_for_path(path: &Path) -> Option<Language> {
     let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
     match ext.as_str() {
         "rs" => Some(Language::Rust),
-        "ts" => Some(Language::TypeScript),
+        "ts" | "mts" | "cts" => Some(Language::TypeScript),
         "tsx" => Some(Language::Tsx),
-        "js" => Some(Language::JavaScript),
+        "js" | "mjs" | "cjs" => Some(Language::JavaScript),
         "jsx" => Some(Language::Jsx),
         "py" | "pyi" => Some(Language::Python),
         "go" => Some(Language::Go),
@@ -954,22 +961,182 @@ fn collect_rust_context(node: Node<'_>, source: &[u8]) -> Vec<String> {
 
 fn collect_typescript_context(node: Node<'_>, source: &[u8]) -> Vec<String> {
     let mut context = Vec::new();
+    let mut child = node;
     let mut current = node.parent();
 
     while let Some(cursor) = current {
         match cursor.kind() {
-            "class_declaration" | "interface_declaration" => {
+            "class_declaration"
+            | "interface_declaration"
+            | "function_declaration"
+            | "function_expression"
+            | "method_definition"
+            | "variable_declarator" => {
                 if let Some(name) = named_child_text(cursor, "name", source) {
                     context.push(name);
                 }
             }
+            "pair" => {
+                if let Some(name) = named_child_text(cursor, "key", source) {
+                    context.push(name);
+                }
+            }
+            "object"
+                if cursor
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "return_statement") =>
+            {
+                context.push("$return".to_owned());
+            }
+            // A callback, anonymous class, or object argument belongs to its call
+            // site. Scalar arguments identify test names and property keys without
+            // incorporating any callback or method body into the stable identity.
+            "arguments" => {
+                let call = cursor
+                    .parent()
+                    .and_then(|call| {
+                        call.child_by_field_name("function")
+                            .or_else(|| call.child_by_field_name("constructor"))
+                    })
+                    .map(|callee| normalize_for_fingerprint(&node_text(callee, source)))
+                    .unwrap_or_else(|| "$call".to_owned());
+                let mut walk = cursor.walk();
+                let args = cursor.named_children(&mut walk).collect::<Vec<_>>();
+                let ordinal = args
+                    .iter()
+                    .position(|arg| arg.id() == child.id())
+                    .unwrap_or(0);
+                let labels = args
+                    .iter()
+                    .filter(|arg| {
+                        matches!(
+                            arg.kind(),
+                            "string"
+                                | "number"
+                                | "true"
+                                | "false"
+                                | "null"
+                                | "identifier"
+                                | "binary_expression"
+                                | "template_string"
+                        )
+                    })
+                    .map(|arg| normalize_for_fingerprint(&node_text(*arg, source)))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let site = cursor
+                    .parent()
+                    .map(|call| typescript_call_occurrence(call, source))
+                    .unwrap_or_default();
+                context.push(if labels.is_empty() {
+                    format!("$arg({call},{ordinal}{site})")
+                } else {
+                    format!("$arg({call},{ordinal};{labels}{site})")
+                });
+            }
+            "if_statement" | "ternary_expression" => {
+                let condition = cursor
+                    .child_by_field_name("condition")
+                    .map(|condition| normalize_for_fingerprint(&node_text(condition, source)))
+                    .unwrap_or_default();
+                let branch = if cursor
+                    .child_by_field_name("alternative")
+                    .is_some_and(|alternative| alternative.id() == child.id())
+                {
+                    "else"
+                } else {
+                    "then"
+                };
+                context.push(format!("$if({condition},{branch})"));
+            }
             _ => {}
         }
+        child = cursor;
         current = cursor.parent();
     }
 
     context.reverse();
     context
+}
+
+// Repeated anonymous objects in the same lexical block can have identical call
+// headers (e.g. two synthetic events with preventDefault methods). Their source
+// order is the remaining declaration discriminator. Count matching call headers,
+// not byte offsets, so whitespace, unrelated statements and method-body edits do
+// not perturb identity. Inserting another identical call may renumber this group.
+fn typescript_call_occurrence(call: Node<'_>, source: &[u8]) -> String {
+    fn header(node: Node<'_>, source: &[u8]) -> String {
+        let callee = node
+            .child_by_field_name("function")
+            .or_else(|| node.child_by_field_name("constructor"))
+            .map(|callee| normalize_for_fingerprint(&node_text(callee, source)))
+            .unwrap_or_default();
+        let labels = node
+            .child_by_field_name("arguments")
+            .map(|args| {
+                let mut walk = args.walk();
+                args.named_children(&mut walk)
+                    .filter(|arg| {
+                        matches!(
+                            arg.kind(),
+                            "string"
+                                | "number"
+                                | "true"
+                                | "false"
+                                | "null"
+                                | "identifier"
+                                | "binary_expression"
+                                | "template_string"
+                        )
+                    })
+                    .map(|arg| normalize_for_fingerprint(&node_text(arg, source)))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        format!("{callee};{labels}")
+    }
+    let mut scope = call;
+    while let Some(parent) = scope.parent() {
+        scope = parent;
+        if matches!(scope.kind(), "statement_block" | "program") {
+            break;
+        }
+    }
+    let key = header(call, source);
+    let mut matches = Vec::new();
+    let mut pending = vec![scope];
+    while let Some(node) = pending.pop() {
+        if matches!(node.kind(), "call_expression" | "new_expression")
+            && header(node, source) == key
+        {
+            matches.push(node);
+        }
+        if node.id() != scope.id()
+            && matches!(
+                node.kind(),
+                "function_declaration"
+                    | "function_expression"
+                    | "arrow_function"
+                    | "method_definition"
+                    | "class_declaration"
+                    | "class"
+            )
+        {
+            continue;
+        }
+        let mut walk = node.walk();
+        pending.extend(node.named_children(&mut walk));
+    }
+    if matches.len() < 2 {
+        return String::new();
+    }
+    matches.sort_by_key(|node| node.start_byte());
+    matches
+        .iter()
+        .position(|node| node.id() == call.id())
+        .map(|ordinal| format!("@{ordinal}"))
+        .unwrap_or_default()
 }
 
 fn qualify(context: &[String], name: &str) -> String {
@@ -1096,6 +1263,133 @@ mod tests {
             .collect::<Vec<_>>();
         targets.sort();
         targets
+    }
+
+    #[test]
+    fn repeated_anonymous_event_methods_keep_distinct_body_stable_ids() {
+        let mut extractor = SymbolExtractor::new().expect("extractor");
+        let source = "test('events', () => { submit({ preventDefault() {} }); submit({ preventDefault() {} }); });";
+        let before = extractor
+            .extract_from_source(Language::JavaScript, "events.mjs", source)
+            .expect("repeated event objects are distinct declarations");
+        assert_eq!(before.len(), 2);
+        assert_ne!(before[0].id, before[1].id);
+        let edited = source
+            .replace("preventDefault() {}", "preventDefault() { report(); }")
+            .replace("; submit", "; unrelated(); submit");
+        let after = extractor
+            .extract_from_source(Language::JavaScript, "events.mjs", &edited)
+            .expect("body edit and unrelated statement preserve identities");
+        assert_eq!(
+            before.iter().map(|s| &s.id).collect::<Vec<_>>(),
+            after.iter().map(|s| &s.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn typescript_branch_and_callback_object_owners_are_distinct() {
+        let mut extractor = SymbolExtractor::new().expect("extractor");
+        let source = r#"
+function factory(empty: boolean) {
+  if (empty) return { dispose() {} };
+  return { dispose() {} };
+}
+test('first', () => { const obj = { dispose() {} }; });
+test('second', () => { const obj = { dispose() {} }; });
+function install() {
+  set('ResizeObserver', class { disconnect() {} });
+  set('IntersectionObserver', class { disconnect() {} });
+}
+"#;
+        let before = extractor
+            .extract_from_source(Language::TypeScript, "owners.ts", source)
+            .expect("distinct branches and callback owners");
+        assert_eq!(
+            before
+                .iter()
+                .filter(|s| s.qualified_name.ends_with("dispose"))
+                .count(),
+            4
+        );
+        assert_eq!(
+            before
+                .iter()
+                .filter(|s| s.qualified_name.ends_with("disconnect"))
+                .count(),
+            2
+        );
+        let edited = source
+            .replace("dispose() {}", "dispose() { release(); }")
+            .replace("disconnect() {}", "disconnect() { release(); }");
+        let after = extractor
+            .extract_from_source(Language::TypeScript, "owners.ts", &edited)
+            .expect("body changes retain owners");
+        assert_eq!(
+            before.iter().map(|s| &s.id).collect::<Vec<_>>(),
+            after.iter().map(|s| &s.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn module_extensions_route_to_the_same_ecmascript_parser() {
+        let mut extractor = SymbolExtractor::new().expect("extractor");
+        for (ext, language) in [
+            ("mjs", Language::JavaScript),
+            ("cjs", Language::JavaScript),
+            ("mts", Language::TypeScript),
+            ("cts", Language::TypeScript),
+        ] {
+            let path = format!("voice.{ext}");
+            assert_eq!(language_for_path(Path::new(&path)), Some(language));
+            let symbols = extractor
+                .extract_from_path(Path::new(&path), "export class Voice { stop() {} }")
+                .expect("module parses");
+            assert!(symbols.iter().any(|s| s.qualified_name == "Voice::stop"));
+            assert!(symbols.iter().all(|s| s.language == language));
+        }
+    }
+
+    #[test]
+    fn typescript_factory_object_methods_have_distinct_stable_owners() {
+        let mut extractor = SymbolExtractor::new().expect("extractor");
+        let source = r#"
+function makeEgg() { return { dispose() {}, setOpen(amount: number) {} }; }
+function makePile() {
+  const models: any[] = [];
+  models.push({ dispose() {}, setOpen(amount: number) {} });
+  return { dispose() {} };
+}
+const left = { dispose() {} };
+const right = { dispose() {} };
+"#;
+        let symbols = extractor
+            .extract_from_source(Language::TypeScript, "actors.ts", source)
+            .expect("legal factory objects must index");
+        let names: Vec<_> = symbols.iter().map(|s| s.qualified_name.as_str()).collect();
+        for expected in [
+            "makeEgg::$return::dispose",
+            "makePile::$return::dispose",
+            "makePile::$arg(models.push,0)::dispose",
+            "left::dispose",
+            "right::dispose",
+        ] {
+            assert!(names.contains(&expected), "missing {expected}: {names:?}");
+        }
+        let edited = source.replace("dispose() {}", "dispose() { console.log(1); }");
+        let after = extractor
+            .extract_from_source(Language::TypeScript, "actors.ts", &edited)
+            .expect("body edit");
+        for old in &symbols {
+            let new = after
+                .iter()
+                .find(|s| s.qualified_name == old.qualified_name)
+                .expect("same declaration");
+            assert_eq!(
+                old.id, new.id,
+                "body edit must preserve {}",
+                old.qualified_name
+            );
+        }
     }
 
     #[test]

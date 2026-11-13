@@ -27,7 +27,7 @@ pub fn config() -> LanguageConfig {
 
     LanguageConfig {
         id: "typescript",
-        extensions: &["ts"],
+        extensions: &["ts", "mts", "cts"],
         ts_language,
         symbol_query,
         edge_query,
@@ -57,7 +57,7 @@ pub fn tsx_js_config() -> LanguageConfig {
 
     LanguageConfig {
         id: "tsx_js",
-        extensions: &["tsx", "js", "jsx"],
+        extensions: &["tsx", "js", "jsx", "mjs", "cjs"],
         ts_language,
         symbol_query,
         edge_query,

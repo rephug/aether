@@ -1220,7 +1220,8 @@ mod tests {
         assert_eq!(
             super::source_suffixes(),
             vec![
-                ".cs", ".go", ".java", ".js", ".jsx", ".py", ".pyi", ".rs", ".ts", ".tsx"
+                ".cjs", ".cs", ".cts", ".go", ".java", ".js", ".jsx", ".mjs", ".mts", ".py",
+                ".pyi", ".rs", ".ts", ".tsx"
             ]
         );
 
@@ -1238,7 +1239,7 @@ mod tests {
         let workflow = fs::read_to_string(temp.path().join(".github/workflows/aether-review.yml"))
             .expect("read review workflow");
         assert!(workflow.contains(
-            "\n          SOURCE_SUFFIXES = (\".cs\", \".go\", \".java\", \".js\", \".jsx\", \".py\", \".pyi\", \".rs\", \".ts\", \".tsx\")\n"
+            "\n          SOURCE_SUFFIXES = (\".cjs\", \".cs\", \".cts\", \".go\", \".java\", \".js\", \".jsx\", \".mjs\", \".mts\", \".py\", \".pyi\", \".rs\", \".ts\", \".tsx\")\n"
         ));
     }
 
