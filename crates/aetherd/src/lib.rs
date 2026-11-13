@@ -16,6 +16,7 @@ pub mod drift;
 pub mod enhance;
 mod enhance_navigation;
 mod enhance_ranking;
+mod enhance_suggestions;
 pub mod enhance_templates;
 pub mod freshness;
 pub mod fsck;
