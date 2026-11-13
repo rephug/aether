@@ -121,10 +121,62 @@ fn exact_targets_survive_more_than_eight_broad_queries_in_either_order() {
     let reversed =
         super::assemble_context(workspace.path(), &store, &intent).expect("reversed order");
     assert_eq!(first.resolved_symbols[0], "quasar::PacketReader::decode");
-    assert_eq!(first.resolved_symbols.len(), super::MAX_SYMBOL_CONTEXTS);
+    assert_eq!(
+        first.resolved_symbols.len(),
+        1 + super::FOCUSED_DISCOVERY_ALLOWANCE
+    );
     assert_eq!(first.resolved_symbols, reversed.resolved_symbols);
     assert_eq!(first.referenced_files, reversed.referenced_files);
     assert_eq!(first.referenced_files[0], "src/packet.rs");
+}
+
+#[test]
+fn incidental_lowercase_leaf_matches_keep_the_full_discovery_budget() {
+    let workspace = tempfile::tempdir().expect("independent discovery workspace");
+    write_test_config(workspace.path());
+    let store = SqliteStore::open(workspace.path()).expect("synthetic catalog");
+    let mut queries = Vec::new();
+    for index in 0..12 {
+        let query = format!("items{index}");
+        seed_symbol(
+            &store,
+            &format!("item-{index}"),
+            &format!("src/items{index}.rs"),
+            &format!("catalog::{query}"),
+            "function",
+            "Independent discovery candidate.",
+        );
+        queries.push(query);
+    }
+    let intent = super::EnhanceIntent {
+        raw_prompt: "Investigate items in the catalog".into(),
+        target_symbols: queries,
+        ..Default::default()
+    };
+    let result =
+        super::assemble_context(workspace.path(), &store, &intent).expect("discovery context");
+    assert_eq!(result.resolved_symbols.len(), super::MAX_SYMBOL_CONTEXTS);
+
+    let focused_intent = super::EnhanceIntent {
+        raw_prompt: "Investigate `items9` in the catalog".into(),
+        ..intent
+    };
+    let focused = super::assemble_context(workspace.path(), &store, &focused_intent)
+        .expect("explicitly quoted focus");
+    assert_eq!(focused.resolved_symbols.len(), 3);
+    assert_eq!(focused.resolved_symbols[0], "catalog::items9");
+    let broad_text =
+        super::render_enhanced_document("Inspect catalog", &result.context, 8_192, false)
+            .expect("render broad discovery");
+    let focused_text =
+        super::render_enhanced_document("Inspect catalog", &focused.context, 8_192, false)
+            .expect("render focused discovery");
+    assert!(focused_text.len() < broad_text.len());
+    println!(
+        "focused disclosure bytes: broad={} focused={}",
+        broad_text.len(),
+        focused_text.len()
+    );
 }
 
 #[test]

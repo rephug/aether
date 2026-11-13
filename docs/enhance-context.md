@@ -29,3 +29,17 @@ Suggestions are limited to three candidates for each of the first three eligible
 unmatched qualified queries. Exact matches keep priority. The existing exact-leaf
 catalog queries may materialize many same-leaf records; this limits displayed
 hints and the number of queries, not database scan work.
+
+
+## Focused discovery
+
+When indexed exact matches for an ID, qualified name, capitalized identifier,
+or explicitly backtick-quoted identifier establish a target, enhancement reserves at most two additional symbol slots for
+broad substring and concept discovery (within the existing eight-symbol ceiling).
+Incidental lowercase prose matching a leaf name does not establish a focus.
+Duplicate query spellings do not increase this allowance. Exact targets retain
+priority. Queries without exact evidence retain the full discovery ceiling.
+
+This is progressive disclosure, not a claim that omitted matches are irrelevant:
+ask a focused follow-up query to explore another symbol. Current-source identity
+verification and source-location omission warnings remain unchanged.

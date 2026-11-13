@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::cli::EnhanceArgs;
 use crate::enhance_navigation::{SourceLocation, SourceNavigation};
 use crate::enhance_ranking::{
-    admitted_queries, match_rank, rank_query_matches, select_ranked_symbols,
+    admitted_queries, focused_symbol_limit, match_rank, rank_query_matches, select_focused_symbols,
 };
 use crate::enhance_suggestions::SuggestionQuery;
 use crate::enhance_templates::{estimate_tokens, render_enhanced_document};
@@ -30,6 +30,7 @@ const EXTRACTION_WORD_LIMIT: usize = 500;
 const MAX_EXPLICIT_MATCHES: usize = 3;
 const MAX_TARGET_QUERIES: usize = 64;
 const MAX_SYMBOL_CONTEXTS: usize = 8;
+const FOCUSED_DISCOVERY_ALLOWANCE: usize = 2;
 const MAX_FILE_CONTEXTS: usize = 6;
 const MAX_FILE_SUMMARIES: usize = 3;
 const MAX_GRAPH_NEIGHBORS: usize = 5;
@@ -427,6 +428,7 @@ fn assemble_context(
 ) -> Result<AssemblyOutcome> {
     let mut warnings = Vec::<String>::new();
     let mut candidates = Vec::new();
+    let mut focus_candidates = Vec::new();
     let mut suggestion_queries = 0;
     let mut referenced_files = Vec::<String>::new();
     let mut seen_files = HashSet::<String>::new();
@@ -468,10 +470,26 @@ fn assemble_context(
         }
         for record in matches.into_iter().take(MAX_EXPLICIT_MATCHES) {
             let rank = match_rank(query, &record);
+            // Ordinary prose can happen to match a leaf name. Only visibly
+            // explicit identifiers establish a focus for progressive disclosure.
+            if query == record.id
+                || query.contains("::")
+                || query.contains('.')
+                || query.chars().any(|ch| ch.is_ascii_uppercase())
+                || intent.raw_prompt.contains(&format!("`{query}`"))
+            {
+                focus_candidates.push((record.clone(), rank));
+            }
             candidates.push((record, rank));
         }
     }
-    let mut resolved_symbol_records = select_ranked_symbols(candidates, MAX_SYMBOL_CONTEXTS);
+    let symbol_limit = focused_symbol_limit(
+        &focus_candidates,
+        MAX_SYMBOL_CONTEXTS,
+        FOCUSED_DISCOVERY_ALLOWANCE,
+    );
+    let mut resolved_symbol_records =
+        select_focused_symbols(candidates, &focus_candidates, symbol_limit);
     let mut seen_symbol_ids = resolved_symbol_records
         .iter()
         .map(|record| record.id.clone())
@@ -499,7 +517,7 @@ fn assemble_context(
 
     let (concepts, _) = admitted_queries(&intent.concepts, MAX_CONCEPTS);
     for concept in concepts {
-        if resolved_symbol_records.len() >= MAX_SYMBOL_CONTEXTS {
+        if resolved_symbol_records.len() >= symbol_limit {
             break;
         }
         let execution = execute_search(workspace, concept, 3, SearchMode::Hybrid)
@@ -515,7 +533,7 @@ fn assemble_context(
         }
 
         for entry in execution.matches.iter().take(3) {
-            if resolved_symbol_records.len() >= MAX_SYMBOL_CONTEXTS {
+            if resolved_symbol_records.len() >= symbol_limit {
                 break;
             }
             let Some(record) = store
