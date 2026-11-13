@@ -49,6 +49,45 @@ pub(super) fn admitted_queries(queries: &[String], limit: usize) -> (Vec<&str>, 
     (unique.into_iter().take(limit).collect(), truncated)
 }
 
+/// Exact targets establish a focus; retain only a small discovery allowance.
+/// Deduplicate identities so repeated query spellings cannot inflate the allowance.
+/// With no exact evidence, preserve the full discovery budget.
+pub(super) fn focused_symbol_limit(
+    candidates: &[(SymbolRecord, MatchRank)],
+    limit: usize,
+    discovery_allowance: usize,
+) -> usize {
+    let exact = candidates
+        .iter()
+        .filter(|(_, rank)| *rank != MatchRank::Fuzzy)
+        .map(|(record, _)| record.id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    if exact == 0 {
+        limit
+    } else {
+        exact.saturating_add(discovery_allowance).min(limit)
+    }
+}
+
+/// Explicit exact focus outranks incidental matches of an ordinary prose word.
+/// Within each group retain the established name/identity ranking.
+pub(super) fn select_focused_symbols(
+    candidates: Vec<(SymbolRecord, MatchRank)>,
+    focus: &[(SymbolRecord, MatchRank)],
+    limit: usize,
+) -> Vec<SymbolRecord> {
+    let ids = focus
+        .iter()
+        .filter(|(_, rank)| *rank != MatchRank::Fuzzy)
+        .map(|(record, _)| record.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut selected = select_ranked_symbols(candidates, usize::MAX);
+    selected.sort_by_key(|record| !ids.contains(record.id.as_str()));
+    selected.truncate(limit);
+    selected
+}
+
 /// Keep each symbol's strongest provenance before applying the output budget.
 pub(super) fn select_ranked_symbols(
     candidates: Vec<(SymbolRecord, MatchRank)>,
@@ -111,6 +150,24 @@ mod tests {
             signature_fingerprint: "test-signature".into(),
             last_seen_at: 0,
         }
+    }
+
+    #[test]
+    fn exact_focus_bounds_discovery_without_penalizing_discovery_only_queries() {
+        let target = record("target", "pkg::Reader::decode", "reader.rs");
+        let broad = record("broad", "pkg::decoded_cache", "cache.rs");
+        assert_eq!(
+            focused_symbol_limit(&[(broad.clone(), MatchRank::Fuzzy)], 8, 2),
+            8
+        );
+        let candidates = vec![
+            (target.clone(), MatchRank::Leaf),
+            (target, MatchRank::OwnerQualified),
+            (broad, MatchRank::Fuzzy),
+        ];
+        assert_eq!(focused_symbol_limit(&candidates, 8, 2), 3);
+        assert_eq!(focused_symbol_limit(&candidates, 1, 2), 1);
+        assert_eq!(focused_symbol_limit(&candidates, 0, 2), 0);
     }
 
     #[test]
