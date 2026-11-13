@@ -15,3 +15,17 @@ can still include the indexed symbol when its current location is unavailable.
 Offline enhancement needs local source files for these locations, in addition
 to its index. An index-only copy can return symbol metadata but cannot verify
 source locations.
+
+For an unmatched qualified query, enhancement can list **possible indexed
+matches** separately in its warnings. It checks camelCase leaf spellings against
+snake_case variants while retaining the supplied owner. A missing intermediate
+class is suggested only when the qualifier matches an indexed file-module path.
+The full candidate name and indexed path are shown; ambiguous owners remain
+separate candidates. These hints do not populate `resolved_symbols`, provide
+verified source ranges, or claim current explanations. Verify a candidate with
+its full qualified name and source before relying on it.
+
+Suggestions are limited to three candidates for each of the first three eligible
+unmatched qualified queries. Exact matches keep priority. The existing exact-leaf
+catalog queries may materialize many same-leaf records; this limits displayed
+hints and the number of queries, not database scan work.

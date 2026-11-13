@@ -22,6 +22,7 @@ use crate::enhance_navigation::{SourceLocation, SourceNavigation};
 use crate::enhance_ranking::{
     admitted_queries, match_rank, rank_query_matches, select_ranked_symbols,
 };
+use crate::enhance_suggestions::SuggestionQuery;
 use crate::enhance_templates::{estimate_tokens, render_enhanced_document};
 use crate::search::{SearchMode, execute_search};
 
@@ -426,6 +427,7 @@ fn assemble_context(
 ) -> Result<AssemblyOutcome> {
     let mut warnings = Vec::<String>::new();
     let mut candidates = Vec::new();
+    let mut suggestion_queries = 0;
     let mut referenced_files = Vec::<String>::new();
     let mut seen_files = HashSet::<String>::new();
     let mut file_symbol_cache = HashMap::<String, Vec<SymbolRecord>>::new();
@@ -440,6 +442,28 @@ fn assemble_context(
         let matches = resolve_symbol_query(store, query, MAX_EXPLICIT_MATCHES)?;
         if matches.is_empty() {
             warnings.push(format!("no symbol matched '{query}'"));
+            if suggestion_queries < 3
+                && let Some(hint) = SuggestionQuery::parse(query)
+            {
+                suggestion_queries += 1;
+                let mut possible = Vec::new();
+                for leaf in &hint.leaves {
+                    possible.extend(store.list_symbols_for_call_target(leaf).with_context(
+                        || format!("failed to find indexed suggestions for '{query}'"),
+                    )?);
+                }
+                let possible = hint.select(possible, 3);
+                if !possible.is_empty() {
+                    let names = possible
+                        .iter()
+                        .map(|record| {
+                            format!("`{}` in `{}`", record.qualified_name, record.file_path)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    warnings.push(format!("Possible indexed matches for '{query}' (suggestions only; not resolved): {names}. Verify the full owner and source before using."));
+                }
+            }
             continue;
         }
         for record in matches.into_iter().take(MAX_EXPLICIT_MATCHES) {
@@ -1826,6 +1850,77 @@ enabled = true
         assert!(result.enhanced_prompt.contains("## Enhanced Prompt"));
         assert!(result.enhanced_prompt.contains("### Target Symbols"));
         assert!(result.enhanced_prompt.contains("### Related Files"));
+    }
+
+    #[test]
+    fn qualified_miss_suggests_indexed_owner_without_resolving_it() {
+        let temp = tempdir().expect("independent suggestion catalog");
+        write_test_config(temp.path());
+        let store = SqliteStore::open(temp.path()).expect("catalog");
+        seed_symbol(
+            &store,
+            "hint",
+            "src/quasar/packet.py",
+            "quasar.packet::PacketEmitter::emit_packet",
+            "method",
+            "Independent fixture.",
+        );
+        let intent = super::EnhanceIntent {
+            target_symbols: vec!["packet.emitPacket".into()],
+            ..Default::default()
+        };
+        let result = super::assemble_context(temp.path(), &store, &intent).expect("assemble");
+        assert!(result.resolved_symbols.is_empty());
+        assert!(result.referenced_files.is_empty());
+        assert!(result.context.symbols.is_empty());
+        assert!(result.warnings.iter().any(|warning| {
+            warning.contains("suggestions only; not resolved")
+                && warning.contains("quasar.packet::PacketEmitter::emit_packet")
+                && warning.contains("src/quasar/packet.py")
+        }));
+        assert!(
+            resolve_symbol_query(&store, "packet.emitPacket", 3)
+                .expect("exact resolver")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn exact_owner_match_does_not_add_spelling_suggestions() {
+        let temp = tempdir().expect("independent exact catalog");
+        write_test_config(temp.path());
+        let store = SqliteStore::open(temp.path()).expect("catalog");
+        seed_symbol(
+            &store,
+            "exact",
+            "src/quasar/packet.py",
+            "quasar.packet::PacketEmitter::emitPacket",
+            "method",
+            "Exact fixture.",
+        );
+        seed_symbol(
+            &store,
+            "hint",
+            "src/quasar/packet.py",
+            "quasar.packet::PacketEmitter::emit_packet",
+            "method",
+            "Spelling fixture.",
+        );
+        let intent = super::EnhanceIntent {
+            target_symbols: vec!["PacketEmitter.emitPacket".into()],
+            ..Default::default()
+        };
+        let result = super::assemble_context(temp.path(), &store, &intent).expect("assemble");
+        assert_eq!(
+            result.resolved_symbols,
+            vec!["quasar.packet::PacketEmitter::emitPacket"]
+        );
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("suggestions only"))
+        );
     }
 
     #[test]
