@@ -1014,6 +1014,7 @@ fn collect_typescript_context(node: Node<'_>, source: &[u8]) -> Vec<String> {
                 let mut walk = cursor.walk();
                 if let Some(ordinal) = cursor
                     .named_children(&mut walk)
+                    .filter(|element| element.kind() != "comment")
                     .position(|element| element.id() == child.id())
                 {
                     context.push(format!("$element({ordinal})"));
@@ -1029,7 +1030,10 @@ fn collect_typescript_context(node: Node<'_>, source: &[u8]) -> Vec<String> {
                     .map(|callee| typescript_owner_text(callee, source))
                     .unwrap_or_else(|| "$call".to_owned());
                 let mut walk = cursor.walk();
-                let args = cursor.named_children(&mut walk).collect::<Vec<_>>();
+                let args = cursor
+                    .named_children(&mut walk)
+                    .filter(|arg| arg.kind() != "comment")
+                    .collect::<Vec<_>>();
                 let ordinal = args
                     .iter()
                     .position(|arg| arg.id() == child.id())
@@ -1361,6 +1365,9 @@ mod tests {
                 source
                     .replace("alpha();", "alpha(); extra();")
                     .replace("beta();", "beta(); extra();")
+                    .replace("send(", "send(/* argument comment */ ")
+                    .replace("[", "[/* leading element comment */ ")
+                    .replace(", { dispose", ", /* between elements */ { dispose")
             );
             let after = extractor
                 .extract_with_edges_from_source(Language::JavaScript, "anonymous.mjs", &edited)
