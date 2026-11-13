@@ -959,6 +959,25 @@ fn collect_rust_context(node: Node<'_>, source: &[u8]) -> Vec<String> {
     context
 }
 
+// Ownership text is token-normalized, not whitespace-stripped source: spaces
+// inside quoted names and template literals are semantic, not formatting.
+fn typescript_owner_text(node: Node<'_>, source: &[u8]) -> String {
+    if node.kind() == "comment" {
+        return String::new();
+    }
+    if matches!(node.kind(), "string" | "template_string" | "regex") {
+        return node_text(node, source).trim().to_owned();
+    }
+    if node.child_count() == 0 {
+        return normalize_for_fingerprint(&node_text(node, source));
+    }
+    let mut walk = node.walk();
+    node.children(&mut walk)
+        .map(|child| typescript_owner_text(child, source))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 fn collect_typescript_context(node: Node<'_>, source: &[u8]) -> Vec<String> {
     let mut context = Vec::new();
     let mut child = node;
@@ -991,6 +1010,15 @@ fn collect_typescript_context(node: Node<'_>, source: &[u8]) -> Vec<String> {
             // A callback, anonymous class, or object argument belongs to its call
             // site. Scalar arguments identify test names and property keys without
             // incorporating any callback or method body into the stable identity.
+            "array" => {
+                let mut walk = cursor.walk();
+                if let Some(ordinal) = cursor
+                    .named_children(&mut walk)
+                    .position(|element| element.id() == child.id())
+                {
+                    context.push(format!("$element({ordinal})"));
+                }
+            }
             "arguments" => {
                 let call = cursor
                     .parent()
@@ -998,7 +1026,7 @@ fn collect_typescript_context(node: Node<'_>, source: &[u8]) -> Vec<String> {
                         call.child_by_field_name("function")
                             .or_else(|| call.child_by_field_name("constructor"))
                     })
-                    .map(|callee| normalize_for_fingerprint(&node_text(callee, source)))
+                    .map(|callee| typescript_owner_text(callee, source))
                     .unwrap_or_else(|| "$call".to_owned());
                 let mut walk = cursor.walk();
                 let args = cursor.named_children(&mut walk).collect::<Vec<_>>();
@@ -1021,7 +1049,7 @@ fn collect_typescript_context(node: Node<'_>, source: &[u8]) -> Vec<String> {
                                 | "template_string"
                         )
                     })
-                    .map(|arg| normalize_for_fingerprint(&node_text(*arg, source)))
+                    .map(|arg| typescript_owner_text(*arg, source))
                     .collect::<Vec<_>>()
                     .join(",");
                 let site = cursor
@@ -1037,7 +1065,7 @@ fn collect_typescript_context(node: Node<'_>, source: &[u8]) -> Vec<String> {
             "if_statement" | "ternary_expression" => {
                 let condition = cursor
                     .child_by_field_name("condition")
-                    .map(|condition| normalize_for_fingerprint(&node_text(condition, source)))
+                    .map(|condition| typescript_owner_text(condition, source))
                     .unwrap_or_default();
                 let branch = if cursor
                     .child_by_field_name("alternative")
@@ -1069,7 +1097,7 @@ fn typescript_call_occurrence(call: Node<'_>, source: &[u8]) -> String {
         let callee = node
             .child_by_field_name("function")
             .or_else(|| node.child_by_field_name("constructor"))
-            .map(|callee| normalize_for_fingerprint(&node_text(callee, source)))
+            .map(|callee| typescript_owner_text(callee, source))
             .unwrap_or_default();
         let labels = node
             .child_by_field_name("arguments")
@@ -1089,7 +1117,7 @@ fn typescript_call_occurrence(call: Node<'_>, source: &[u8]) -> String {
                                 | "template_string"
                         )
                     })
-                    .map(|arg| normalize_for_fingerprint(&node_text(arg, source)))
+                    .map(|arg| typescript_owner_text(arg, source))
                     .collect::<Vec<_>>()
                     .join(",")
             })
@@ -1099,7 +1127,10 @@ fn typescript_call_occurrence(call: Node<'_>, source: &[u8]) -> String {
     let mut scope = call;
     while let Some(parent) = scope.parent() {
         scope = parent;
-        if matches!(scope.kind(), "statement_block" | "program") {
+        if matches!(
+            scope.kind(),
+            "statement_block" | "program" | "arrow_function"
+        ) {
             break;
         }
     }
@@ -1263,6 +1294,91 @@ mod tests {
             .collect::<Vec<_>>();
         targets.sort();
         targets
+    }
+
+    #[test]
+    fn call_owner_literals_remain_distinct_and_formatting_independent() {
+        let mut extractor = SymbolExtractor::new().expect("extractor");
+        let first = "test('a b', () => { send({ dispose() { alpha(); } }); });";
+        let second = "test('ab', () => { send({ dispose() { beta(); } }); });";
+        let before = extractor
+            .extract_with_edges_from_source(
+                Language::JavaScript,
+                "literal.mjs",
+                &format!("{first}\n{second}"),
+            )
+            .expect("distinct literal owners");
+        let after = extractor
+            .extract_with_edges_from_source(
+                Language::JavaScript,
+                "literal.mjs",
+                &format!("{second}\n{first}").replace("send(", "send ( "),
+            )
+            .expect("reordering unrelated named calls does not change owners");
+        for name in ["alpha", "beta"] {
+            let old = before
+                .edges
+                .iter()
+                .find(|edge| edge.target_qualified_name == name)
+                .expect("original edge");
+            let new = after
+                .edges
+                .iter()
+                .find(|edge| edge.target_qualified_name == name)
+                .expect("reordered edge");
+            assert_eq!(old.source_id, new.source_id);
+        }
+    }
+
+    #[test]
+    fn expression_arrow_and_array_object_methods_keep_identity_and_call_edges() {
+        let mut extractor = SymbolExtractor::new().expect("extractor");
+        for source in [
+            "const f = () => (send({ dispose() { alpha(); } }), send({ dispose() { beta(); } }));",
+            "const f = () => [send({ dispose() { alpha(); } }), send({ dispose() { beta(); } })];",
+            "const xs = [{ dispose() { alpha(); } }, { dispose() { beta(); } }];",
+        ] {
+            let before = extractor
+                .extract_with_edges_from_source(Language::JavaScript, "anonymous.mjs", source)
+                .expect("separate anonymous object declarations");
+            assert_eq!(before.symbols.len(), 2);
+            assert_ne!(before.symbols[0].id, before.symbols[1].id);
+            let alpha = before
+                .edges
+                .iter()
+                .find(|e| e.target_qualified_name == "alpha")
+                .expect("alpha call");
+            let beta = before
+                .edges
+                .iter()
+                .find(|e| e.target_qualified_name == "beta")
+                .expect("beta call");
+            assert_ne!(alpha.source_id, beta.source_id);
+            assert!(before.symbols.iter().any(|s| s.id == alpha.source_id));
+            assert!(before.symbols.iter().any(|s| s.id == beta.source_id));
+            let edited = format!(
+                "// unrelated spacing\n{}",
+                source
+                    .replace("alpha();", "alpha(); extra();")
+                    .replace("beta();", "beta(); extra();")
+            );
+            let after = extractor
+                .extract_with_edges_from_source(Language::JavaScript, "anonymous.mjs", &edited)
+                .expect("body changes and line shifts");
+            assert_eq!(
+                before.symbols.iter().map(|s| &s.id).collect::<Vec<_>>(),
+                after.symbols.iter().map(|s| &s.id).collect::<Vec<_>>()
+            );
+            for edge in [&alpha, &beta] {
+                assert!(
+                    after
+                        .edges
+                        .iter()
+                        .any(|candidate| candidate.source_id == edge.source_id
+                            && candidate.target_qualified_name == edge.target_qualified_name)
+                );
+            }
+        }
     }
 
     #[test]
