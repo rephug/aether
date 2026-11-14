@@ -445,6 +445,152 @@ fn search_symbols_respects_empty_query_and_limit() {
 }
 
 #[test]
+fn search_symbols_ranks_literal_selectors_before_substrings_and_metadata() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    for (id, name, path, language) in [
+        ("full-name", "voice", "src/lib.rs", "rust"),
+        ("leaf", "Zulu::voice", "src/lib.rs", "rust"),
+        ("dotted-leaf", "Zzz.voice", "src/lib.rs", "typescript"),
+        ("prefix", "voice_session", "src/lib.rs", "rust"),
+        ("substring", "Alpha::avoid_voice", "src/lib.rs", "rust"),
+        ("path", "Aardvark::unrelated", "src/voice.rs", "rust"),
+        ("metadata", "AAA::metadata", "src/lib.rs", "voice"),
+        ("voice-id-noise", "AAA::opaque", "src/lib.rs", "rust"),
+    ] {
+        let mut record = symbol_record();
+        record.id = id.to_owned();
+        record.qualified_name = name.to_owned();
+        record.file_path = path.to_owned();
+        record.language = language.to_owned();
+        store.upsert_symbol(record).expect("upsert symbol");
+    }
+
+    let hits = store.search_symbols(" VOICE ", 20).expect("rank search");
+    let ids = hits
+        .iter()
+        .map(|hit| hit.symbol_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        [
+            "full-name",
+            "leaf",
+            "dotted-leaf",
+            "prefix",
+            "substring",
+            "path",
+            "metadata",
+            "voice-id-noise"
+        ]
+    );
+    assert_eq!(
+        store.search_symbols("voice", 1).expect("limited search")[0].symbol_id,
+        "full-name"
+    );
+    assert_eq!(
+        store
+            .search_symbols("voice-id-noise", 1)
+            .expect("id search")[0]
+            .symbol_id,
+        "voice-id-noise"
+    );
+    assert_eq!(
+        store
+            .search_symbols("src/voice.rs", 1)
+            .expect("path search")[0]
+            .symbol_id,
+        "path"
+    );
+}
+
+#[test]
+fn search_symbols_prioritizes_exact_id_name_and_path_selectors() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    for (id, name, path) in [
+        ("lookup", "Zulu::other", "src/lib.rs"),
+        ("name", "lookup", "src/lib.rs"),
+        ("path", "Alpha::other", "lookup"),
+        ("prefix", "lookup_more", "src/lib.rs"),
+    ] {
+        let mut record = symbol_record();
+        record.id = id.to_owned();
+        record.qualified_name = name.to_owned();
+        record.file_path = path.to_owned();
+        store.upsert_symbol(record).expect("upsert symbol");
+    }
+    let hits = store.search_symbols("lookup", 20).expect("exact selectors");
+    let ids = hits
+        .iter()
+        .map(|hit| hit.symbol_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["lookup", "name", "path", "prefix"]);
+}
+
+#[test]
+fn search_symbols_treats_like_metacharacters_literally() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    for (id, name, path) in [
+        ("underscore", "Zulu::a_b", "src/a_b.rs"),
+        ("percent", "Zulu::a%b", "src/a%b.rs"),
+        ("backslash", r"Zulu::a\b", r"src/a\b.rs"),
+        ("noise", "Alpha::axb", "src/axb.rs"),
+    ] {
+        let mut record = symbol_record();
+        record.id = id.to_owned();
+        record.qualified_name = name.to_owned();
+        record.file_path = path.to_owned();
+        store.upsert_symbol(record).expect("upsert symbol");
+    }
+    for (query, id) in [
+        ("a_b", "underscore"),
+        ("a%b", "percent"),
+        (r"a\b", "backslash"),
+    ] {
+        for query in [query.to_owned(), format!("src/{query}.rs")] {
+            let hits = store.search_symbols(&query, 20).expect("literal search");
+            assert_eq!(hits.len(), 1, "query {query:?}: {hits:?}");
+            assert_eq!(hits[0].symbol_id, id);
+        }
+    }
+}
+
+#[test]
+fn search_symbols_by_terms_prefers_exact_names_within_match_tiers() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    for (id, name, path) in [
+        ("suffix-noise", "AAA::revoice", "src/other.rs"),
+        ("substring", "Alpha::voice_callback", "src/other.rs"),
+        ("leaf", "Zulu::voice", "src/other.rs"),
+        ("dotted-leaf", "Zzz.voice", "src/other.rs"),
+        ("full-name", "voice", "src/other.rs"),
+        ("joint", "Beta::voice_callback", "src/session.rs"),
+        ("path", "AAA::unrelated", "src/voice.rs"),
+    ] {
+        let mut record = symbol_record();
+        record.id = id.to_owned();
+        record.qualified_name = name.to_owned();
+        record.file_path = path.to_owned();
+        store.upsert_symbol(record).expect("upsert symbol");
+    }
+    let hits = store
+        .search_symbols_by_terms(&["VOICE".to_owned()], 3)
+        .expect("ranked terms");
+    let ids = hits
+        .iter()
+        .map(|hit| hit.symbol_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["leaf", "dotted-leaf", "full-name"]);
+    let hits = store
+        .search_symbols_by_terms(&["voice".to_owned(), "session".to_owned()], 1)
+        .expect("joint terms");
+    assert_eq!(hits[0].symbol_id, "joint");
+}
+
+#[test]
 fn search_symbols_by_terms_ranks_by_matched_terms_over_the_whole_table() {
     let temp = tempdir().expect("tempdir");
     let store = SqliteStore::open(temp.path()).expect("open store");
