@@ -801,8 +801,23 @@ pub(crate) fn apply_migrations(tx: &Transaction<'_>, version: i32) -> Result<(),
                 ON symbols(qualified_name);
             CREATE INDEX IF NOT EXISTS idx_symbols_file_path
                 ON symbols(file_path);
+            CREATE INDEX IF NOT EXISTS idx_symbols_id_nocase
+                ON symbols(id COLLATE NOCASE);
+            CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name_nocase
+                ON symbols(qualified_name COLLATE NOCASE);
+            CREATE INDEX IF NOT EXISTS idx_symbols_file_path_nocase
+                ON symbols(file_path COLLATE NOCASE);
             "#,
         )?;
+        // Portable built-ins keep this lookup key maintained by older writers
+        // too. The original suffix predicates remove false single-colon matches.
+        let suffix_index = format!(
+            "CREATE INDEX IF NOT EXISTS idx_symbols_search_tail ON symbols(
+                ({}) COLLATE NOCASE, qualified_name, id
+            );",
+            symbols::SYMBOL_SEARCH_TAIL_SQL,
+        );
+        conn.execute_batch(&suffix_index)?;
     }
 
     conn.execute_batch(
