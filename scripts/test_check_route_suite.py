@@ -114,6 +114,16 @@ class RouteSuiteTest(unittest.TestCase):
         self.write("app/start.html", '<a href="https://site.fixture.invalid.evil/agents">Wrong</a>')
         self.assertFalse(self.check()["ok"])
 
+    def test_encoded_consumer_path_separator_requires_dedicated_verifier(self):
+        canonical = "/team/agents"
+        self.provider["routes"][0]["canonical"] = canonical
+        self.manifest[canonical] = self.manifest.pop("/agents")
+        self.manifest["/realtor"]["redirect"] = canonical
+        self.write("site/index.html", f'<a href="{canonical}">Agents</a>')
+        self.suite["contracts"][0]["canonical"] = canonical
+        self.write("app/start.html", f'<a href="{SITE}/team%2Fagents">Ambiguous</a>')
+        self.assertIn("invalid_consumer_artifact", self.codes(self.check()))
+
     def test_unrelated_links_need_explicit_ignore(self):
         self.write("app/start.html", f'<a href="{SITE}/agents">Agents</a><a href="/about">About</a>')
         self.assertFalse(self.check()["ok"])
@@ -132,6 +142,12 @@ class RouteSuiteTest(unittest.TestCase):
         self.manifest["/agents"]["page"] = "wrong-page.html"
         result = self.check()
         self.assertIn("wrong_page_mapping", self.codes(result))
+        self.assertIn("provider_unverified", self.codes(result))
+
+    def test_encoded_provider_media_path_cannot_validate_a_consumer(self):
+        self.write("site/agents.html", '<img src="/assets/agents.svg%3Fretired">')
+        result = self.check()
+        self.assertIn("wrong_page_media", self.codes(result))
         self.assertIn("provider_unverified", self.codes(result))
 
     def test_provider_extra_media_and_changed_asset_fail(self):

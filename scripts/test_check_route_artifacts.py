@@ -79,6 +79,30 @@ class RouteArtifactsTest(unittest.TestCase):
         self.write('index.html', '<a href="agents?campaign=1#watch">Agents</a>')
         self.assertTrue(self.run_check()['ok'])
 
+    def test_encoded_delimiters_do_not_turn_wrong_paths_into_valid_routes(self):
+        for suffix in ['%3Fretired', '%23retired']:
+            with self.subTest(suffix=suffix):
+                self.write('index.html', f'<a href="/agents{suffix}">Wrong path</a>')
+                self.assertFalse(self.run_check()['ok'])
+
+    def test_encoded_delimiters_do_not_hide_wrong_media(self):
+        for suffix in ['%3Fretired', '%23retired']:
+            with self.subTest(suffix=suffix):
+                self.write('agents.html', f'<img src="/assets/agents.svg{suffix}">')
+                self.assertFalse(self.run_check()['ok'])
+
+    def test_encoded_url_structure_and_controls_are_rejected(self):
+        for href in ['%2Fagents', 'https%3A%2F%2Ffixture.invalid%2Fagents',
+                     '/%61gents%0A', '/ag\tents', '/agents%7F']:
+            with self.subTest(href=href):
+                self.write('index.html', f'<a href="{href}">Ambiguous</a>')
+                self.assertFalse(self.run_check()['ok'])
+
+    def test_encoded_unreserved_path_bytes_are_supported(self):
+        self.write('index.html', '<a href="/%61gents?campaign=1#top">Agents</a>')
+        self.write('agents.html', '<img src="/assets/%61gents.svg?v=123#preview">')
+        self.assertTrue(self.run_check()['ok'])
+
     def test_duplicate_contract_keys_fail_closed(self):
         self.write('contract.json', '{"version": 1, "version": 1}')
         result = check(self.root, self.root / 'contract.json')

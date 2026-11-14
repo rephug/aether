@@ -99,13 +99,19 @@ def local_url(value, base, origin):
     if not isinstance(value, str) or not value or value != value.strip():
         raise ValueError('URL must be a nonempty string without surrounding whitespace')
     decoded = unquote(value)
-    if '\\' in decoded or '..' in PurePosixPath(urlsplit(decoded).path).parts:
-        raise ValueError(f'URL traversal is unsupported: {value}')
-    target = urlsplit(urljoin(origin + base, decoded))
+    if any(ord(char) <= 32 or ord(char) == 127 for char in value + decoded):
+        raise ValueError('URL controls and spaces require a dedicated verifier')
+    # Parse before decoding: %3F and %23 are path bytes, not URL delimiters.
+    # Encoded separators have server-dependent handling, so reject them.
+    raw_path = urlsplit(value).path
+    if ('\\' in decoded or '..' in PurePosixPath(unquote(raw_path)).parts
+            or re.search(r'%(?:2f|5c)', raw_path, re.IGNORECASE)):
+        raise ValueError(f'URL traversal or encoded separator is unsupported: {value}')
+    target = urlsplit(urljoin(origin + base, value))
     site = urlsplit(origin)
     if target.scheme not in {'http', 'https'} or target.netloc != site.netloc:
         raise ValueError(f'nonlocal URL requires a dedicated verifier: {value}')
-    return target.path or '/'
+    return unquote(target.path) or '/'
 
 
 def check(root, contract_path):
