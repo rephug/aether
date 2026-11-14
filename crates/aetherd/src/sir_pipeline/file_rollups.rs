@@ -6,11 +6,90 @@ use std::collections::HashSet;
 use super::*;
 
 impl SirPipeline {
+    // No cross-instance reuse: InferenceProvider does not expose all endpoint and
+    // prompt overrides. A new pipeline must establish its own cache provenance.
+    fn file_rollup_cache_key(
+        &self,
+        file_path: &str,
+        language: Language,
+        leaves: &[FileLeafSir],
+        generation_pass: &str,
+    ) -> Result<String> {
+        let mut sorted = leaves.to_vec();
+        sorted.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
+        let inputs = sorted
+            .iter()
+            .map(|leaf| (&leaf.qualified_name, canonicalize_sir_json(&leaf.sir)))
+            .collect::<Vec<_>>();
+        let bytes = serde_json::to_vec(&(
+            "file-rollup-cache-v1",
+            sir_prompt::SIR_PROMPT_VERSION,
+            file_path,
+            language.as_str(),
+            &self.provider_name,
+            &self.model_name,
+            generation_pass,
+            self.inference_timeout_secs,
+            inputs,
+        ))
+        .context("failed to fingerprint rollup inputs")?;
+        Ok(blake3::hash(&bytes).to_hex().to_string())
+    }
+
+    fn file_rollup_is_cached(
+        &self,
+        store: &SqliteStore,
+        file_path: &str,
+        language: Language,
+        leaves: &[FileLeafSir],
+        generation_pass: &str,
+    ) -> Result<bool> {
+        let rollup_id = synthetic_file_sir_id(language.as_str(), file_path);
+        let key = self.file_rollup_cache_key(file_path, language, leaves, generation_pass)?;
+        let cached = self
+            .rollup_cache
+            .lock()
+            .map_err(|_| anyhow!("rollup cache poisoned"))?
+            .get(&rollup_id)
+            .cloned();
+        let Some((old_key, output_hash)) = cached else {
+            return Ok(false);
+        };
+        if old_key != key {
+            return Ok(false);
+        }
+        // Use the same lock as rollup writers, and re-check the input snapshot too.
+        let _guard = acquire_inject_write_lock(&self.workspace_root)?;
+        let current = load_file_leaf_sirs(store, file_path)?;
+        if self.file_rollup_cache_key(file_path, language, &current, generation_pass)? != key {
+            return Ok(false);
+        }
+        let Some(meta) = store.get_sir_meta(&rollup_id)? else {
+            return Ok(false);
+        };
+        if meta.sir_status != SIR_STATUS_FRESH
+            || meta.sir_hash != output_hash
+            || meta.provider != self.provider_name
+            || meta.model != self.model_name
+            || meta.generation_pass != generation_pass
+        {
+            return Ok(false);
+        }
+        let Some(blob) = store.read_sir_blob(&rollup_id)? else {
+            return Ok(false);
+        };
+        let Ok(sir) = serde_json::from_str::<FileSir>(&blob) else {
+            return Ok(false);
+        };
+        Ok(file_sir_hash(&sir) == output_hash)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn bulk_upsert_file_rollups(
         &self,
         store: &SqliteStore,
         touched_files: BTreeMap<String, Language>,
+        force: bool,
         print_sir: bool,
         out: &mut dyn Write,
         commit_hash: Option<&str>,
@@ -30,6 +109,17 @@ impl SirPipeline {
 
             if leaf_sirs.is_empty() {
                 stale_rollups.push((file_path, language));
+                continue;
+            }
+            if !force
+                && self.file_rollup_is_cached(
+                    store,
+                    &file_path,
+                    language,
+                    &leaf_sirs,
+                    generation_pass,
+                )?
+            {
                 continue;
             }
             fingerprints.insert(file_path.clone(), leaf_fingerprint(&leaf_sirs));
@@ -118,6 +208,7 @@ impl SirPipeline {
         self.bulk_upsert_file_rollups(
             store,
             files,
+            false,
             print_sir,
             out,
             commit_hash.as_deref(),
@@ -286,11 +377,10 @@ impl SirPipeline {
             )
             .with_context(|| format!("failed to record file rollup history for {file_path}"))?;
 
-        if version_write.changed {
-            store
-                .write_sir_blob(&rollup_id, &canonical_json)
-                .with_context(|| format!("failed to write file rollup for {file_path}"))?;
-        }
+        // Repair a missing/replaced blob even when its history hash is unchanged.
+        store
+            .write_sir_blob(&rollup_id, &canonical_json)
+            .with_context(|| format!("failed to write file rollup for {file_path}"))?;
 
         store
             .upsert_sir_meta(SirMetaRecord {
@@ -310,6 +400,24 @@ impl SirPipeline {
             })
             .with_context(|| format!("failed to upsert file rollup metadata for {file_path}"))?;
 
+        // Only remember a successfully persisted snapshot, never a rejected stale result.
+        // Do not pin API failures (deterministic fallback) in the cache.
+        let leaves = load_file_leaf_sirs(store, file_path)?;
+        if computed_from.is_some_and(|expected| leaf_fingerprint(&leaves) == expected)
+            && (leaves.len() <= 5 || file_sir.intent != concatenate_file_sir(&leaves).intent)
+        {
+            let key = self.file_rollup_cache_key(file_path, language, &leaves, generation_pass)?;
+            let mut cache = self
+                .rollup_cache
+                .lock()
+                .map_err(|_| anyhow!("rollup cache poisoned"))?;
+            // Bound memory even for long-running workspaces with many renamed files.
+            if cache.len() >= 1024 && !cache.contains_key(&rollup_id) {
+                cache.clear();
+            }
+            cache.insert(rollup_id.clone(), (key, sir_hash_value.clone()));
+        }
+
         if print_sir {
             writeln!(
                 out,
@@ -328,6 +436,7 @@ impl SirPipeline {
         store: &SqliteStore,
         file_path: &str,
         language: Language,
+        force: bool,
         print_sir: bool,
         out: &mut dyn Write,
         commit_hash: Option<&str>,
@@ -343,6 +452,17 @@ impl SirPipeline {
             return Ok(());
         }
 
+        if !force
+            && self.file_rollup_is_cached(
+                store,
+                file_path,
+                language,
+                &leaf_sirs,
+                generation_pass,
+            )?
+        {
+            return Ok(());
+        }
         let fingerprint = leaf_fingerprint(&leaf_sirs);
         let file_sir = aggregate_file_sir(
             file_path,

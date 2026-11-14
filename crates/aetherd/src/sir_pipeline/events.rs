@@ -230,6 +230,7 @@ impl SirPipeline {
             store,
             &event.file_path,
             event.language,
+            force,
             print_sir,
             out,
             commit_hash.as_deref(),
@@ -403,6 +404,7 @@ impl SirPipeline {
         self.bulk_upsert_file_rollups(
             store,
             touched_files,
+            false,
             print_sir,
             out,
             commit_hash.as_deref(),
@@ -598,6 +600,7 @@ impl SirPipeline {
         self.bulk_upsert_file_rollups(
             store,
             touched_files,
+            force,
             print_sir,
             out,
             commit_hash.as_deref(),
