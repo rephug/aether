@@ -1153,3 +1153,53 @@ fn sir_snapshot_keeps_source_hash_and_blob_together_across_publication() {
     assert_eq!(after.source_hash.as_deref(), Some("new-source"));
     assert_ne!(before.identity, after.identity);
 }
+
+#[test]
+fn sir_snapshot_blocks_retired_mirrors_but_allows_explicit_publication() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("store");
+    let id = "returning-snapshot";
+    store
+        .upsert_sir_meta(SirMetaRecord {
+            id: id.to_owned(),
+            sir_status: "error".to_owned(),
+            ..sir_meta_record()
+        })
+        .expect("metadata-only failed generation");
+    fs::create_dir_all(temp.path().join(".aether/sir")).expect("mirror directory");
+    fs::write(
+        temp.path().join(".aether/sir/returning-snapshot.json"),
+        r#"{"intent":"previous incarnation"}"#,
+    )
+    .expect("surviving mirror");
+    store.conn.lock().expect("lock").execute(
+        "INSERT INTO symbol_retirements (symbol_id, retired_at, reason, evidence_json) VALUES (?1, 1, 'fixture', '{}')",
+        [id],
+    ).expect("retirement tombstone");
+    let readonly = SqliteStore::open_readonly(temp.path()).expect("readonly");
+    for reader in [&store, &readonly] {
+        let snapshot = reader
+            .get_sir_meta_with_blob(id)
+            .expect("snapshot")
+            .expect("metadata row");
+        assert!(
+            snapshot.blob.is_none(),
+            "retired mirror must not be resurrected"
+        );
+        assert!(reader.read_sir_blob(id).expect("blob").is_none());
+    }
+    store
+        .write_sir_blob(id, r#"{"intent":"new incarnation"}"#)
+        .expect("explicit publication");
+    for reader in [&store, &readonly] {
+        assert_eq!(
+            reader
+                .get_sir_meta_with_blob(id)
+                .expect("snapshot")
+                .expect("row")
+                .blob
+                .as_deref(),
+            Some(r#"{"intent":"new incarnation"}"#)
+        );
+    }
+}
