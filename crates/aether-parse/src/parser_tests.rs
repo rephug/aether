@@ -1348,3 +1348,53 @@ fn unindexed_generator_names_shadow_outer_function_namesakes() {
         );
     }
 }
+
+#[test]
+fn parameter_initializers_cannot_see_body_var_bindings() {
+    let extracted = extract_with_edges(
+        Language::JavaScript,
+        "params.mjs",
+        "function helper() {} function caller(arg=helper()) { var helper; helper(); }",
+    );
+    assert_eq!(
+        edge_targets_for_source(&extracted, "caller", EdgeKind::Calls),
+        vec!["helper"]
+    );
+    let extracted = extract_with_edges(
+        Language::JavaScript,
+        "params.mjs",
+        "function helper() {} function caller(helper,arg=helper()) { var helper; }",
+    );
+    assert!(edge_targets_for_source(&extracted, "caller", EdgeKind::Calls).is_empty());
+    let extracted = extract_with_edges(
+        Language::JavaScript,
+        "params.mjs",
+        "function helper() {} function caller(arg=helper()) { function helper() {} helper(); }",
+    );
+    let targets = edge_targets_for_source(&extracted, "caller", EdgeKind::Calls);
+    assert!(targets.contains(&"helper".to_owned()));
+    assert!(targets.contains(&"caller::helper".to_owned()));
+}
+
+#[test]
+fn static_initialization_var_bindings_do_not_shadow_outer_calls() {
+    let extracted = extract_with_edges(
+        Language::JavaScript,
+        "static.mjs",
+        "function helper() {} function caller() { class C { static { var helper; } } helper(); }",
+    );
+    assert_eq!(
+        edge_targets_for_source(&extracted, "caller", EdgeKind::Calls),
+        vec!["helper"]
+    );
+}
+
+#[test]
+fn nested_closures_still_see_enclosing_body_var_shadow() {
+    let extracted = extract_with_edges(
+        Language::JavaScript,
+        "closure.mjs",
+        "function helper() {} function caller() { var helper; function inner(){ helper(); } }",
+    );
+    assert!(edge_targets_for_source(&extracted, "caller::inner", EdgeKind::Calls).is_empty());
+}

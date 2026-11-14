@@ -461,6 +461,7 @@ fn binding_scope(mut node: Node<'_>, function_scoped: bool) -> Option<Node<'_>> 
         if matches!(
             node.kind(),
             "program"
+                | "class_static_block"
                 | "function_declaration"
                 | "generator_function_declaration"
                 | "function_expression"
@@ -473,7 +474,11 @@ fn binding_scope(mut node: Node<'_>, function_scoped: bool) -> Option<Node<'_>> 
                 "statement_block" | "for_statement" | "for_in_statement" | "switch_body"
             ))
         {
-            return Some(node);
+            return Some(if function_scoped {
+                node.child_by_field_name("body").unwrap_or(node)
+            } else {
+                node
+            });
         }
     }
     None
