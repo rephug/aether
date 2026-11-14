@@ -36,6 +36,60 @@ pub(crate) struct SymbolAccessState {
 /// Upper bound on the terms one `search_symbols_by_terms` call scores.
 const SYMBOL_TERM_SEARCH_MAX_TERMS: usize = 16;
 
+// The visible name ends at its first NUL, as SQLite LIKE does. Every character
+// except ':' and '.' is in the trim set, so rtrim leaves the last separator.
+// This key narrows suffix candidates; the original LIKE predicates still decide
+// whether a ':' is a real '::' boundary. Keep this expression shared with the
+// index definition so SQLite can use the expression index.
+pub(super) const SYMBOL_SEARCH_TAIL_SQL: &str = r#"
+    substr(
+        substr(qualified_name, 1, length(qualified_name)),
+        length(rtrim(
+            substr(qualified_name, 1, length(qualified_name)),
+            replace(replace(substr(qualified_name, 1, length(qualified_name)), ':', ''), '.', '')
+        )) + 1
+    )
+"#;
+
+fn collect_symbol_search_rows(
+    conn: &Connection,
+    sql: &str,
+    bindings: &[&dyn rusqlite::ToSql],
+) -> Result<Vec<SymbolSearchResult>, StoreError> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(bindings, read_symbol_search_row)?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+fn read_symbol_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolSearchResult> {
+    Ok(SymbolSearchResult {
+        symbol_id: row.get(0)?,
+        qualified_name: row.get(1)?,
+        file_path: row.get(2)?,
+        language: row.get(3)?,
+        kind: row.get(4)?,
+        access_count: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0),
+        last_accessed_at: row.get(6)?,
+    })
+}
+
+fn append_symbol_search_rows(
+    records: &mut Vec<SymbolSearchResult>,
+    seen: &mut HashSet<String>,
+    candidates: impl IntoIterator<Item = SymbolSearchResult>,
+    limit: usize,
+) -> bool {
+    for record in candidates {
+        if seen.insert(record.symbol_id.clone()) {
+            records.push(record);
+            if records.len() == limit {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Escapes `\`, `%` and `_` for a `LIKE ... ESCAPE '\'` pattern.
 fn escape_like_pattern(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
@@ -218,36 +272,42 @@ impl SqliteStore {
     /// Matched terms are counted in SQL over the whole table, so a symbol
     /// matching more terms always ranks above one matching fewer, however
     /// many symbols match a single term. Ties prefer terms found in the
-    /// qualified name over terms found only in the file path, then fall back
-    /// to `qualified_name` and `id`. Unlike `search_symbols`, this does not
-    /// look at `id`, `language` or `kind`, so a short word cannot match a
+    /// qualified name over terms found only in the file path, then prefer
+    /// exact names or qualified-name suffixes at a `::` or `.` boundary.
+    /// Remaining ties fall back to `qualified_name` and `id`. Unlike
+    /// `search_symbols`, this does not look at `id`, `language` or `kind`,
+    /// so a short word cannot match a
     /// symbol through its hash id or its kind.
     pub fn search_symbols_by_terms(
         &self,
         terms: &[String],
         limit: u32,
     ) -> Result<Vec<SymbolSearchResult>, StoreError> {
-        let mut patterns = Vec::<String>::new();
+        let mut normalized_terms = Vec::<String>::new();
         for term in terms {
             let term = term.trim().to_lowercase();
             if term.is_empty() {
                 continue;
             }
-            let pattern = format!("%{}%", escape_like_pattern(term.as_str()));
-            if !patterns.contains(&pattern) {
-                patterns.push(pattern);
+            if !normalized_terms.contains(&term) {
+                normalized_terms.push(term);
             }
-            if patterns.len() >= SYMBOL_TERM_SEARCH_MAX_TERMS {
+            if normalized_terms.len() >= SYMBOL_TERM_SEARCH_MAX_TERMS {
                 break;
             }
         }
-        if patterns.is_empty() {
+        if normalized_terms.is_empty() {
             return Ok(Vec::new());
         }
 
-        let name_match = |index: usize| format!("LOWER(qualified_name) LIKE ?{index} ESCAPE '\\'");
-        let path_match = |index: usize| format!("LOWER(file_path) LIKE ?{index} ESCAPE '\\'");
-        let matched_terms = (1..=patterns.len())
+        // Each term binds a substring pattern, literal name, and two suffix
+        // patterns. Bind the values so wildcard characters stay literal in
+        // both the candidate filter and the relevance scores.
+        let name_match =
+            |index: usize| format!("LOWER(qualified_name) LIKE ?{} ESCAPE '\\'", index * 4 + 1);
+        let path_match =
+            |index: usize| format!("LOWER(file_path) LIKE ?{} ESCAPE '\\'", index * 4 + 1);
+        let matched_terms = (0..normalized_terms.len())
             .map(|index| {
                 format!(
                     "CASE WHEN {} OR {} THEN 1 ELSE 0 END",
@@ -257,11 +317,24 @@ impl SqliteStore {
             })
             .collect::<Vec<_>>()
             .join(" + ");
-        let name_terms = (1..=patterns.len())
+        let name_terms = (0..normalized_terms.len())
             .map(|index| format!("CASE WHEN {} THEN 1 ELSE 0 END", name_match(index)))
             .collect::<Vec<_>>()
             .join(" + ");
-        let limit_index = patterns.len() + 1;
+        let exact_name_terms = (0..normalized_terms.len())
+            .map(|index| {
+                format!(
+                    "CASE WHEN LOWER(qualified_name) = ?{} \
+                     OR LOWER(qualified_name) LIKE ?{} ESCAPE '\\' \
+                     OR LOWER(qualified_name) LIKE ?{} ESCAPE '\\' THEN 1 ELSE 0 END",
+                    index * 4 + 2,
+                    index * 4 + 3,
+                    index * 4 + 4,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let limit_index = normalized_terms.len() * 4 + 1;
         let sql = format!(
             r#"
             SELECT id, qualified_name, file_path, language, kind, access_count, last_accessed_at
@@ -269,16 +342,27 @@ impl SqliteStore {
                 SELECT id, qualified_name, file_path, language, kind, access_count,
                        last_accessed_at,
                        {matched_terms} AS matched_terms,
-                       {name_terms} AS name_terms
+                       {name_terms} AS name_terms,
+                       {exact_name_terms} AS exact_name_terms
                 FROM symbols
             )
             WHERE matched_terms > 0
-            ORDER BY matched_terms DESC, name_terms DESC, qualified_name ASC, id ASC
+            ORDER BY matched_terms DESC, name_terms DESC, exact_name_terms DESC,
+                     qualified_name ASC, id ASC
             LIMIT ?{limit_index}
             "#
         );
 
-        let mut params_vec = patterns.into_iter().map(SqlValue::Text).collect::<Vec<_>>();
+        let mut params_vec = Vec::with_capacity(normalized_terms.len() * 4 + 1);
+        for term in normalized_terms {
+            let escaped = escape_like_pattern(&term);
+            params_vec.extend([
+                SqlValue::Text(format!("%{escaped}%")),
+                SqlValue::Text(term),
+                SqlValue::Text(format!("%::{escaped}")),
+                SqlValue::Text(format!("%.{escaped}")),
+            ]);
+        }
         params_vec.push(SqlValue::Integer(i64::from(limit.clamp(1, 200))));
 
         let conn = self.conn.lock().unwrap();
@@ -606,7 +690,196 @@ impl SqliteStore {
         let records = rows.collect::<Result<Vec<_>, _>>()?;
         Ok(records)
     }
+    /// Literal, case-insensitive substring lookup. Rank exact selectors,
+    /// qualified-name suffixes and prefixes ahead of general substrings,
+    /// path matches and metadata matches before applying the result limit.
     pub(crate) fn store_search_symbols(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<SymbolSearchResult>, StoreError> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        if query.contains('\0') {
+            return self.store_search_symbols_fallback(query, limit);
+        }
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|err| StoreError::LockPoisoned(format!("lexical search connection: {err}")))?;
+        let index_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN (
+                'idx_symbols_id_nocase', 'idx_symbols_qualified_name_nocase',
+                'idx_symbols_file_path_nocase', 'idx_symbols_search_tail'
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+        // Read-only catalogs may predate the additive indexes. Do not create
+        // indexes or run the unindexed tail expression against those catalogs.
+        if index_count != 4 {
+            drop(conn);
+            return self.store_search_symbols_fallback(query, limit);
+        }
+
+        let capped_limit = limit.clamp(1, 100) as i64;
+        let result_limit = capped_limit as usize;
+        let escaped = escape_like_pattern(query);
+        let pattern = format!("%{escaped}%");
+        let prefix = format!("{escaped}%");
+        let rust_suffix = format!("%::{escaped}");
+        let dotted_suffix = format!("%.{escaped}");
+        let bindings = params![
+            pattern,
+            query,
+            prefix,
+            rust_suffix,
+            dotted_suffix,
+            escaped,
+            query,
+            capped_limit
+        ];
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Deferred)?;
+        let mut records = Vec::with_capacity(result_limit);
+        let mut seen = HashSet::with_capacity(result_limit);
+
+        // Every tier fetches the full cap, not just the unfilled remainder.
+        // At most records.len() of those candidates can be duplicates, so the
+        // cap still contains enough unseen rows. Exhaust each higher tier before
+        // moving on, all within one read snapshot.
+        for predicate in [
+            "id = ?2 COLLATE NOCASE AND LOWER(id) = LOWER(?2)",
+            "qualified_name = ?2 COLLATE NOCASE AND LOWER(qualified_name) = LOWER(?2)",
+            "file_path = ?2 COLLATE NOCASE AND LOWER(file_path) = LOWER(?2)",
+        ] {
+            let sql = format!(
+                "SELECT id, qualified_name, file_path, language, kind, access_count, last_accessed_at
+                 FROM symbols WHERE {predicate}
+                 ORDER BY qualified_name ASC, id ASC LIMIT ?8"
+            );
+            let candidates = collect_symbol_search_rows(&tx, &sql, bindings)?;
+            if append_symbol_search_rows(&mut records, &mut seen, candidates, result_limit) {
+                tx.commit()?;
+                return Ok(records);
+            }
+        }
+
+        // A qualified suffix can share a very broad tail with unrelated names.
+        // The single-scan fallback avoids exhausting that entire candidate range.
+        // Discard the partial results so the fallback returns one coherent snapshot.
+        if query.contains(':') || query.contains('.') {
+            tx.commit()?;
+            drop(conn);
+            return self.store_search_symbols_fallback(query, limit);
+        }
+
+        let suffix_sql = format!(
+            r#"
+            SELECT id, qualified_name, file_path, language, kind, access_count, last_accessed_at
+            FROM symbols
+            WHERE ({tail}) COLLATE NOCASE = ?7
+              AND qualified_name LIKE ?1 ESCAPE '\'
+              AND (qualified_name LIKE ?4 ESCAPE '\' OR qualified_name LIKE ?5 ESCAPE '\')
+            ORDER BY qualified_name ASC, id ASC LIMIT ?8
+            "#,
+            tail = SYMBOL_SEARCH_TAIL_SQL,
+        );
+        let candidates = collect_symbol_search_rows(&tx, &suffix_sql, bindings)?;
+        if append_symbol_search_rows(&mut records, &mut seen, candidates, result_limit) {
+            tx.commit()?;
+            return Ok(records);
+        }
+
+        // Probe only a bounded prefix of name order. Dense prefix/substring
+        // queries can fill their tier without sorting every matching symbol.
+        // Matching rows in this sample are already that tier's ordered prefix.
+        let probe_limit = capped_limit * 2;
+        let mut stmt = tx.prepare(
+            r#"
+            SELECT id, qualified_name, file_path, language, kind, access_count, last_accessed_at,
+                   qualified_name LIKE ?3 ESCAPE '\', qualified_name LIKE ?1 ESCAPE '\'
+            FROM symbols ORDER BY qualified_name ASC, id ASC LIMIT ?9
+            "#,
+        )?;
+        let sample = stmt
+            .query_map(
+                params![
+                    pattern,
+                    query,
+                    prefix,
+                    rust_suffix,
+                    dotted_suffix,
+                    escaped,
+                    query,
+                    capped_limit,
+                    probe_limit
+                ],
+                |row| {
+                    Ok((
+                        read_symbol_search_row(row)?,
+                        row.get::<_, bool>(7)?,
+                        row.get::<_, bool>(8)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let candidates = sample.iter().filter(|row| row.1).map(|row| row.0.clone());
+        if append_symbol_search_rows(&mut records, &mut seen, candidates, result_limit) {
+            tx.commit()?;
+            return Ok(records);
+        }
+
+        let candidates = collect_symbol_search_rows(
+            &tx,
+            r#"
+            SELECT id, qualified_name, file_path, language, kind, access_count, last_accessed_at
+            FROM symbols
+            WHERE qualified_name LIKE ?3 ESCAPE '\' AND qualified_name LIKE ?1 ESCAPE '\'
+            ORDER BY qualified_name ASC, id ASC LIMIT ?8
+            "#,
+            bindings,
+        )?;
+        if append_symbol_search_rows(&mut records, &mut seen, candidates, result_limit) {
+            tx.commit()?;
+            return Ok(records);
+        }
+
+        let candidates = sample.into_iter().filter(|row| row.2).map(|row| row.0);
+        if append_symbol_search_rows(&mut records, &mut seen, candidates, result_limit) {
+            tx.commit()?;
+            return Ok(records);
+        }
+
+        // Sparse names and metadata/path queries use one remaining scan, rather
+        // than separately exhausting four unindexed substring tiers. Previously
+        // emitted IDs can consume at most seen.len() of the full-cap candidates.
+        let candidates = collect_symbol_search_rows(
+            &tx,
+            r#"
+            SELECT id, qualified_name, file_path, language, kind, access_count, last_accessed_at
+            FROM symbols
+            WHERE id LIKE ?1 ESCAPE '\' OR qualified_name LIKE ?1 ESCAPE '\'
+               OR file_path LIKE ?1 ESCAPE '\' OR language LIKE ?1 ESCAPE '\'
+               OR kind LIKE ?1 ESCAPE '\'
+            ORDER BY CASE
+                WHEN qualified_name LIKE ?1 ESCAPE '\' THEN 0
+                WHEN file_path LIKE ?1 ESCAPE '\' THEN 1
+                WHEN language LIKE ?1 ESCAPE '\' OR kind LIKE ?1 ESCAPE '\' THEN 2
+                ELSE 3
+            END, qualified_name ASC, id ASC LIMIT ?8
+            "#,
+            bindings,
+        )?;
+        append_symbol_search_rows(&mut records, &mut seen, candidates, result_limit);
+        tx.commit()?;
+        Ok(records)
+    }
+
+    pub(crate) fn store_search_symbols_fallback(
         &self,
         query: &str,
         limit: u32,
@@ -617,34 +890,68 @@ impl SqliteStore {
         }
 
         let capped_limit = limit.clamp(1, 100) as i64;
-        let pattern = format!("%{query}%");
+        let escaped = escape_like_pattern(query);
+        let pattern = format!("%{escaped}%");
+        let prefix = format!("{escaped}%");
+        let rust_suffix = format!("%::{escaped}");
+        let dotted_suffix = format!("%.{escaped}");
 
+        // SQLite's built-in LIKE already folds ASCII case, like its LOWER.
+        // Avoid allocating lowercase strings for every field of every row.
+        // Gate exact comparisons with a literal LIKE, but retain equality to
+        // distinguish strings past embedded NULs (LIKE stops at a NUL).
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"
             SELECT id, qualified_name, file_path, language, kind, access_count, last_accessed_at
             FROM symbols
-            WHERE LOWER(id) LIKE LOWER(?1)
-               OR LOWER(qualified_name) LIKE LOWER(?1)
-               OR LOWER(file_path) LIKE LOWER(?1)
-               OR LOWER(language) LIKE LOWER(?1)
-               OR LOWER(kind) LIKE LOWER(?1)
-            ORDER BY qualified_name ASC, id ASC
+            WHERE id LIKE ?1 ESCAPE '\'
+               OR qualified_name LIKE ?1 ESCAPE '\'
+               OR file_path LIKE ?1 ESCAPE '\'
+               OR language LIKE ?1 ESCAPE '\'
+               OR kind LIKE ?1 ESCAPE '\'
+            ORDER BY CASE
+                WHEN id LIKE ?7 ESCAPE '\' AND LOWER(id) = LOWER(?3) THEN 0
+                WHEN qualified_name LIKE ?7 ESCAPE '\'
+                  AND LOWER(qualified_name) = LOWER(?3) THEN 1
+                WHEN file_path LIKE ?7 ESCAPE '\'
+                  AND LOWER(file_path) = LOWER(?3) THEN 2
+                WHEN qualified_name LIKE ?1 ESCAPE '\' THEN CASE
+                    WHEN qualified_name LIKE ?5 ESCAPE '\'
+                      OR qualified_name LIKE ?6 ESCAPE '\' THEN 3
+                    WHEN qualified_name LIKE ?4 ESCAPE '\' THEN 4
+                    ELSE 5 END
+                WHEN file_path LIKE ?1 ESCAPE '\' THEN 6
+                WHEN language LIKE ?1 ESCAPE '\'
+                  OR kind LIKE ?1 ESCAPE '\' THEN 7
+                ELSE 8
+            END, qualified_name ASC, id ASC
             LIMIT ?2
             "#,
         )?;
 
-        let rows = stmt.query_map(params![pattern, capped_limit], |row| {
-            Ok(SymbolSearchResult {
-                symbol_id: row.get(0)?,
-                qualified_name: row.get(1)?,
-                file_path: row.get(2)?,
-                language: row.get(3)?,
-                kind: row.get(4)?,
-                access_count: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0),
-                last_accessed_at: row.get(6)?,
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![
+                pattern,
+                capped_limit,
+                query,
+                prefix,
+                rust_suffix,
+                dotted_suffix,
+                escaped
+            ],
+            |row| {
+                Ok(SymbolSearchResult {
+                    symbol_id: row.get(0)?,
+                    qualified_name: row.get(1)?,
+                    file_path: row.get(2)?,
+                    language: row.get(3)?,
+                    kind: row.get(4)?,
+                    access_count: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0),
+                    last_accessed_at: row.get(6)?,
+                })
+            },
+        )?;
 
         let records = rows.collect::<Result<Vec<_>, _>>()?;
         Ok(records)

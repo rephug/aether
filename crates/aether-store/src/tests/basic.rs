@@ -445,6 +445,398 @@ fn search_symbols_respects_empty_query_and_limit() {
 }
 
 #[test]
+fn search_symbols_ranks_literal_selectors_before_substrings_and_metadata() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    for (id, name, path, language) in [
+        ("full-name", "voice", "src/lib.rs", "rust"),
+        ("leaf", "Zulu::voice", "src/lib.rs", "rust"),
+        ("dotted-leaf", "Zzz.voice", "src/lib.rs", "typescript"),
+        ("prefix", "voice_session", "src/lib.rs", "rust"),
+        ("substring", "Alpha::avoid_voice", "src/lib.rs", "rust"),
+        ("path", "Aardvark::unrelated", "src/voice.rs", "rust"),
+        ("metadata", "AAA::metadata", "src/lib.rs", "voice"),
+        ("voice-id-noise", "AAA::opaque", "src/lib.rs", "rust"),
+    ] {
+        let mut record = symbol_record();
+        record.id = id.to_owned();
+        record.qualified_name = name.to_owned();
+        record.file_path = path.to_owned();
+        record.language = language.to_owned();
+        store.upsert_symbol(record).expect("upsert symbol");
+    }
+
+    let hits = store.search_symbols(" VOICE ", 20).expect("rank search");
+    let ids = hits
+        .iter()
+        .map(|hit| hit.symbol_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        [
+            "full-name",
+            "leaf",
+            "dotted-leaf",
+            "prefix",
+            "substring",
+            "path",
+            "metadata",
+            "voice-id-noise"
+        ]
+    );
+    assert_eq!(
+        store.search_symbols("voice", 1).expect("limited search")[0].symbol_id,
+        "full-name"
+    );
+    assert_eq!(
+        store
+            .search_symbols("voice-id-noise", 1)
+            .expect("id search")[0]
+            .symbol_id,
+        "voice-id-noise"
+    );
+    assert_eq!(
+        store
+            .search_symbols("src/voice.rs", 1)
+            .expect("path search")[0]
+            .symbol_id,
+        "path"
+    );
+}
+
+#[test]
+fn search_symbols_prioritizes_exact_id_name_and_path_selectors() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    for (id, name, path) in [
+        ("lookup", "Zulu::other", "src/lib.rs"),
+        ("name", "lookup", "src/lib.rs"),
+        ("path", "Alpha::other", "lookup"),
+        ("prefix", "lookup_more", "src/lib.rs"),
+    ] {
+        let mut record = symbol_record();
+        record.id = id.to_owned();
+        record.qualified_name = name.to_owned();
+        record.file_path = path.to_owned();
+        store.upsert_symbol(record).expect("upsert symbol");
+    }
+    let hits = store.search_symbols("lookup", 20).expect("exact selectors");
+    let ids = hits
+        .iter()
+        .map(|hit| hit.symbol_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["lookup", "name", "path", "prefix"]);
+}
+
+#[test]
+fn search_symbols_treats_like_metacharacters_literally() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    for (id, name, path) in [
+        ("underscore", "Zulu::a_b", "src/a_b.rs"),
+        ("percent", "Zulu::a%b", "src/a%b.rs"),
+        ("backslash", r"Zulu::a\b", r"src/a\b.rs"),
+        ("noise", "Alpha::axb", "src/axb.rs"),
+    ] {
+        let mut record = symbol_record();
+        record.id = id.to_owned();
+        record.qualified_name = name.to_owned();
+        record.file_path = path.to_owned();
+        store.upsert_symbol(record).expect("upsert symbol");
+    }
+    for (query, id) in [
+        ("a_b", "underscore"),
+        ("a%b", "percent"),
+        (r"a\b", "backslash"),
+    ] {
+        for query in [query.to_owned(), format!("src/{query}.rs")] {
+            let hits = store.search_symbols(&query, 20).expect("literal search");
+            assert_eq!(hits.len(), 1, "query {query:?}: {hits:?}");
+            assert_eq!(hits[0].symbol_id, id);
+        }
+    }
+}
+
+#[test]
+fn search_symbols_by_terms_prefers_exact_names_within_match_tiers() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    for (id, name, path) in [
+        ("suffix-noise", "AAA::revoice", "src/other.rs"),
+        ("substring", "Alpha::voice_callback", "src/other.rs"),
+        ("leaf", "Zulu::voice", "src/other.rs"),
+        ("dotted-leaf", "Zzz.voice", "src/other.rs"),
+        ("full-name", "voice", "src/other.rs"),
+        ("joint", "Beta::voice_callback", "src/session.rs"),
+        ("path", "AAA::unrelated", "src/voice.rs"),
+    ] {
+        let mut record = symbol_record();
+        record.id = id.to_owned();
+        record.qualified_name = name.to_owned();
+        record.file_path = path.to_owned();
+        store.upsert_symbol(record).expect("upsert symbol");
+    }
+    let hits = store
+        .search_symbols_by_terms(&["VOICE".to_owned()], 3)
+        .expect("ranked terms");
+    let ids = hits
+        .iter()
+        .map(|hit| hit.symbol_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["leaf", "dotted-leaf", "full-name"]);
+    let hits = store
+        .search_symbols_by_terms(&["voice".to_owned(), "session".to_owned()], 1)
+        .expect("joint terms");
+    assert_eq!(hits[0].symbol_id, "joint");
+}
+
+#[test]
+fn search_symbols_preserves_ascii_folding_and_exact_ids_with_nuls() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    for (id, name) in [
+        ("ABC\0X", "Alpha::noise"),
+        ("abc\0y", "Zulu::target"),
+        ("upper", "Zulu::Éclair"),
+        ("lower", "Zulu::éclair"),
+        ("ascii", "Zulu::MiXeD"),
+    ] {
+        let mut record = symbol_record();
+        record.id = id.to_owned();
+        record.qualified_name = name.to_owned();
+        store.upsert_symbol(record).expect("upsert symbol");
+    }
+    let hits = store.search_symbols("ABC\0y", 20).expect("NUL selector");
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].symbol_id, "abc\0y");
+    let hits = store.search_symbols("éclair", 20).expect("Unicode search");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].symbol_id, "lower");
+    let hits = store.search_symbols("mIxEd", 1).expect("ASCII search");
+    assert_eq!(hits[0].symbol_id, "ascii");
+}
+
+#[test]
+fn search_symbols_by_terms_escapes_exact_suffix_scores() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    for (index, term) in ["_", "%", "\\"].into_iter().enumerate() {
+        let exact_id = format!("exact-{index}");
+        for (id, name) in [
+            (exact_id.clone(), format!("Zulu::{term}")),
+            (format!("noise-{index}"), format!("Alpha{term}noise::X")),
+        ] {
+            let mut record = symbol_record();
+            record.id = id;
+            record.qualified_name = name;
+            store.upsert_symbol(record).expect("upsert symbol");
+        }
+        let hits = store
+            .search_symbols_by_terms(&[term.to_owned()], 1)
+            .expect("literal suffix search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].symbol_id, exact_id);
+    }
+}
+
+#[test]
+fn search_symbols_by_terms_caps_normalized_terms_at_sixteen() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    let all_terms = (0..16)
+        .map(|index| format!("t{index:02}"))
+        .collect::<Vec<_>>();
+    for (id, name) in [
+        ("all", format!("Zulu::{}", all_terms.join("::"))),
+        ("one", "Beta::t00".to_owned()),
+        ("ignored", "Alpha::t16".to_owned()),
+    ] {
+        let mut record = symbol_record();
+        record.id = id.to_owned();
+        record.qualified_name = name;
+        store.upsert_symbol(record).expect("upsert symbol");
+    }
+    let mut terms = vec!["  ".to_owned(), " T00 ".to_owned(), "t00".to_owned()];
+    terms.extend((1..=16).map(|index| format!("t{index:02}")));
+    let hits = store
+        .search_symbols_by_terms(&terms, 200)
+        .expect("term cap");
+    let ids = hits
+        .iter()
+        .map(|hit| hit.symbol_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["all", "one"]);
+    assert_eq!(
+        store
+            .search_symbols_by_terms(&terms, 1)
+            .expect("limited term cap")[0]
+            .symbol_id,
+        "all"
+    );
+}
+
+#[test]
+fn tiered_symbol_lookup_matches_fallback_across_ties_and_overlaps() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    let mut records = Vec::new();
+    for index in 0..30 {
+        for name in [
+            "voice".to_owned(),
+            "Duplicate::voice".to_owned(),
+            format!("Alpha{index:02}::voice_callback"),
+            format!("voice_prefix{index:02}"),
+        ] {
+            let mut record = symbol_record();
+            record.id = format!("row-{}", records.len());
+            record.qualified_name = name;
+            record.file_path = if index % 3 == 0 {
+                "voice"
+            } else {
+                "src/voice.rs"
+            }
+            .to_owned();
+            records.push(record);
+        }
+    }
+    for (id, name) in [
+        ("voice", "Zulu::exact_id"),
+        ("colon", "Aardvark:voice"),
+        ("overlap", "A:::voice"),
+        ("dotted", "a.b.voice"),
+        ("qualified", "Outer::Duplicate::voice"),
+        ("nul-name", "Foo::voice\0hidden::later"),
+        ("nul-a", "ABC\0X"),
+        ("nul-b", "abc\0y"),
+        ("underscore", "Zulu::_"),
+        ("percent", "Zulu::%"),
+        ("slash", "Zulu::\\"),
+        ("upper", "Zulu::Éclair"),
+        ("lower", "Zulu::éclair"),
+    ] {
+        let mut record = symbol_record();
+        record.id = id.to_owned();
+        record.qualified_name = name.to_owned();
+        records.push(record);
+    }
+    store.upsert_symbols(&records).expect("seed overlap matrix");
+    for query in [
+        "voice",
+        "VOICE",
+        "Duplicate",
+        "Alpha",
+        "prefix",
+        "exact_id",
+        "_",
+        "%",
+        "\\",
+        "Éclair",
+        "éclair",
+        "ABC\0y",
+        "hidden",
+        "later",
+        "Duplicate::voice",
+        "a.b.voice",
+        "::voice",
+        ":voice",
+        "src/voice.rs",
+        "function",
+        "rust",
+        "absent",
+        "  voice  ",
+    ] {
+        for limit in [0, 1, 2, 3, 10, 100, 500] {
+            let expected = store
+                .store_search_symbols_fallback(query, limit)
+                .expect("fallback");
+            let actual = store.search_symbols(query, limit).expect("tiered lookup");
+            assert_eq!(actual, expected, "query {query:?}, limit {limit}");
+        }
+    }
+}
+
+#[test]
+fn symbol_lookup_keeps_older_readonly_catalogs_unchanged() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    store.upsert_symbol(symbol_record()).expect("seed symbol");
+    let expected = store.search_symbols("run", 20).expect("indexed lookup");
+    let readonly = SqliteStore::open_readonly(temp.path()).expect("indexed readonly catalog");
+    assert_eq!(
+        readonly
+            .search_symbols("run", 20)
+            .expect("indexed readonly lookup"),
+        expected
+    );
+    drop(readonly);
+    {
+        let conn = store.conn.lock().expect("store lock");
+        conn.execute_batch(
+            "DROP INDEX idx_symbols_id_nocase;
+             DROP INDEX idx_symbols_qualified_name_nocase;
+             DROP INDEX idx_symbols_file_path_nocase;
+             DROP INDEX idx_symbols_search_tail;",
+        )
+        .expect("simulate older catalog");
+    }
+    drop(store);
+    let store = SqliteStore::open_readonly(temp.path()).expect("readonly catalog");
+    assert_eq!(
+        store.search_symbols("run", 20).expect("fallback lookup"),
+        expected
+    );
+    let conn = store.conn.lock().expect("store lock");
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN (
+            'idx_symbols_id_nocase', 'idx_symbols_qualified_name_nocase',
+            'idx_symbols_file_path_nocase', 'idx_symbols_search_tail'
+        )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("index count");
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn symbol_lookup_tail_index_tracks_name_changes_and_removal() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    for (id, name) in [
+        ("changed", "Zulu::voice"),
+        ("voice-noise", "AAA::voice_callback"),
+        ("audio-noise", "AAA::audio_callback"),
+    ] {
+        let mut record = symbol_record();
+        record.id = id.to_owned();
+        record.qualified_name = name.to_owned();
+        store.upsert_symbol(record).expect("seed symbol");
+    }
+    assert_eq!(
+        store.search_symbols("voice", 1).expect("voice lookup")[0].symbol_id,
+        "changed"
+    );
+    let mut changed = symbol_record();
+    changed.id = "changed".to_owned();
+    changed.qualified_name = "Zulu::audio".to_owned();
+    store.upsert_symbol(changed).expect("rename symbol");
+    assert_eq!(
+        store.search_symbols("audio", 1).expect("audio lookup")[0].symbol_id,
+        "changed"
+    );
+    assert_eq!(
+        store.search_symbols("voice", 1).expect("old name lookup")[0].symbol_id,
+        "voice-noise"
+    );
+    store.mark_removed("changed").expect("retire symbol");
+    assert_eq!(
+        store.search_symbols("audio", 1).expect("retired lookup")[0].symbol_id,
+        "audio-noise"
+    );
+}
+
+#[test]
 fn search_symbols_by_terms_ranks_by_matched_terms_over_the_whole_table() {
     let temp = tempdir().expect("tempdir");
     let store = SqliteStore::open(temp.path()).expect("open store");
