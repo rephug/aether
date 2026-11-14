@@ -1398,3 +1398,49 @@ fn nested_closures_still_see_enclosing_body_var_shadow() {
     );
     assert!(edge_targets_for_source(&extracted, "caller::inner", EdgeKind::Calls).is_empty());
 }
+
+#[test]
+fn default_parameter_bindings_own_their_object_methods() {
+    let source = "function setup(left={run(){leftWork();}}, right={run(){rightWork();}}) {} function unrelated() {}";
+    let first = extract_with_edges(Language::JavaScript, "defaults.mjs", source);
+    assert_eq!(first.symbols.len(), 4);
+    for (owner, target) in [
+        ("setup::$param(left)::run", "leftWork"),
+        ("setup::$param(right)::run", "rightWork"),
+    ] {
+        assert_eq!(
+            edge_targets_for_source(&first, owner, EdgeKind::Calls),
+            vec![target]
+        );
+    }
+    let second = extract_with_edges(
+        Language::JavaScript,
+        "defaults.mjs",
+        &source.replace("leftWork();", "leftWork(); changed();"),
+    );
+    for symbol in first
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.kind == SymbolKind::Method)
+    {
+        assert!(second.symbols.iter().any(|next| next.id == symbol.id));
+    }
+}
+
+#[test]
+fn destructured_parameter_defaults_have_distinct_binding_owners() {
+    let extracted = extract_with_edges(
+        Language::JavaScript,
+        "defaults.mjs",
+        "function setup({left={run(){leftWork();}}, right={run(){rightWork();}}}={}) {}",
+    );
+    assert_eq!(extracted.symbols.len(), 3);
+    assert_eq!(
+        edge_targets_for_source(&extracted, "setup::$default(left)::run", EdgeKind::Calls),
+        vec!["leftWork"]
+    );
+    assert_eq!(
+        edge_targets_for_source(&extracted, "setup::$default(right)::run", EdgeKind::Calls),
+        vec!["rightWork"]
+    );
+}

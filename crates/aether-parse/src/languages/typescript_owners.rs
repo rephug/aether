@@ -155,6 +155,27 @@ fn collect_typescript_context(
                     });
                 }
             }
+            "required_parameter" | "optional_parameter" => {
+                if cursor
+                    .child_by_field_name("value")
+                    .is_some_and(|value| value.id() == child.id())
+                    && let Some(pattern) = cursor.child_by_field_name("pattern")
+                {
+                    context.push(format!(
+                        "$param({})",
+                        typescript_owner_text(pattern, source)
+                    ));
+                }
+            }
+            "assignment_pattern" | "object_assignment_pattern" => {
+                if cursor
+                    .child_by_field_name("right")
+                    .is_some_and(|right| right.id() == child.id())
+                    && let Some(left) = cursor.child_by_field_name("left")
+                {
+                    context.push(format!("$default({})", typescript_owner_text(left, source)));
+                }
+            }
             "assignment_expression" => {
                 if cursor
                     .child_by_field_name("right")
