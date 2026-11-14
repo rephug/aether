@@ -46,7 +46,9 @@ pub(crate) fn lexical_call_target(
     source: &[u8],
     occurrences: &CallOccurrences,
 ) -> Option<Option<String>> {
-    let callee = call.child_by_field_name("function")?;
+    let callee = call
+        .child_by_field_name("function")
+        .or_else(|| call.child_by_field_name("constructor"))?;
     if callee.kind() != "identifier" {
         return None;
     }
@@ -380,6 +382,11 @@ impl CallOccurrences {
                 };
                 if let Some(scope) = scope {
                     add_shadow_bindings(&mut result, scope, name, source);
+                    if node.kind() == "class_declaration" {
+                        let name = node_text(name, source);
+                        let target = typescript_qualified_name(node, &name, source, &result);
+                        result.declarations.insert((scope.id(), name), Some(target));
+                    }
                 }
             }
         }

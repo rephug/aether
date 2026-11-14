@@ -1041,3 +1041,39 @@ fn javascript_switch_case_function_target_matches_qualified_declaration() {
         vec!["caller::helper"]
     );
 }
+
+#[test]
+fn javascript_identifier_constructors_resolve_lexically() {
+    let extracted = extract_with_edges(
+        Language::JavaScript,
+        "construct.mjs",
+        "function Local() {} function outer() { function Local() {} new Local(); } function other() { new Local(); } function shadow(Local) { new Local(); }",
+    );
+    assert_eq!(
+        edge_targets_for_source(&extracted, "outer", EdgeKind::Calls),
+        vec!["outer::Local"]
+    );
+    assert_eq!(
+        edge_targets_for_source(&extracted, "other", EdgeKind::Calls),
+        vec!["Local"]
+    );
+    assert!(edge_targets_for_source(&extracted, "shadow", EdgeKind::Calls).is_empty());
+}
+
+#[test]
+fn javascript_class_constructors_keep_static_targets_without_crossing_shadow_bindings() {
+    let extracted = extract_with_edges(
+        Language::JavaScript,
+        "classes.mjs",
+        "class Widget {} function caller() { new Widget(); } function outer() { class Widget {} new Widget(); } function shadow(Widget) { new Widget(); }",
+    );
+    assert_eq!(
+        edge_targets_for_source(&extracted, "caller", EdgeKind::Calls),
+        vec!["Widget"]
+    );
+    assert_eq!(
+        edge_targets_for_source(&extracted, "outer", EdgeKind::Calls),
+        vec!["outer::Widget"]
+    );
+    assert!(edge_targets_for_source(&extracted, "shadow", EdgeKind::Calls).is_empty());
+}
