@@ -21,6 +21,11 @@ pub struct LanguageConfig {
 }
 
 pub trait LanguageHooks: Send + Sync {
+    /// Optional per-file hooks, created once and shared by symbol/edge extraction.
+    fn for_extraction(&self, _root: Node<'_>, _source: &[u8]) -> Option<Box<dyn LanguageHooks>> {
+        None
+    }
+
     fn qualify_name(
         &self,
         _file_path: &str,

@@ -1,10 +1,10 @@
 use aether_core::{EdgeKind, Language, Symbol, SymbolEdge, SymbolKind, file_source_id};
 use tree_sitter::{Node, Query};
 
-use crate::parser::{
-    TestIntent, build_symbol, normalize_intent_text, typescript_call_target,
-    typescript_qualified_name, typescript_source_function_id,
+use super::typescript_owners::{
+    CallOccurrences, typescript_qualified_name, typescript_source_function_id,
 };
+use crate::parser::{TestIntent, build_symbol, normalize_intent_text, typescript_call_target};
 use crate::registry::{LanguageConfig, LanguageHooks, QueryCaptures};
 
 pub fn config() -> LanguageConfig {
@@ -33,7 +33,7 @@ pub fn config() -> LanguageConfig {
         edge_query,
         test_intent_query: Some(test_intent_query),
         module_markers: &["package.json"],
-        hooks: Some(Box::new(TypeScriptHooks)),
+        hooks: Some(Box::new(TypeScriptHooks::default())),
     }
 }
 
@@ -63,13 +63,21 @@ pub fn tsx_js_config() -> LanguageConfig {
         edge_query,
         test_intent_query: Some(test_intent_query),
         module_markers: &["package.json"],
-        hooks: Some(Box::new(TypeScriptHooks)),
+        hooks: Some(Box::new(TypeScriptHooks::default())),
     }
 }
 
-struct TypeScriptHooks;
+#[derive(Default)]
+struct TypeScriptHooks {
+    occurrences: CallOccurrences,
+}
 
 impl LanguageHooks for TypeScriptHooks {
+    fn for_extraction(&self, root: Node<'_>, source: &[u8]) -> Option<Box<dyn LanguageHooks>> {
+        Some(Box::new(Self {
+            occurrences: CallOccurrences::new(root, source),
+        }))
+    }
     fn map_symbol(
         &self,
         language: Language,
@@ -94,7 +102,7 @@ impl LanguageHooks for TypeScriptHooks {
             _ => return None,
         };
 
-        let qualified_name = typescript_qualified_name(node, &name, source);
+        let qualified_name = typescript_qualified_name(node, &name, source, &self.occurrences);
         Some(build_symbol(
             language,
             file_path,
@@ -120,7 +128,13 @@ impl LanguageHooks for TypeScriptHooks {
         match capture_name {
             "edge.call" => {
                 let target = typescript_call_target(node, source)?;
-                let source_id = typescript_source_function_id(language, file_path, source, node)?;
+                let source_id = typescript_source_function_id(
+                    language,
+                    file_path,
+                    source,
+                    node,
+                    &self.occurrences,
+                )?;
                 Some(vec![SymbolEdge {
                     source_id,
                     target_qualified_name: target,
