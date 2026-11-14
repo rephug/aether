@@ -194,6 +194,8 @@ pub struct SirPipeline {
     skip_local_edges: bool,
     publish_structural_updates: bool,
     contracts_config: Option<ContractsConfig>,
+    // Instance scoped: provider overrides are not completely represented by name/model.
+    rollup_cache: Mutex<HashMap<String, (String, String)>>,
 }
 
 struct PreparedCandidateJobs {
@@ -485,6 +487,7 @@ impl SirPipeline {
             skip_local_edges: false,
             publish_structural_updates: true,
             contracts_config,
+            rollup_cache: Mutex::new(HashMap::new()),
         })
     }
 

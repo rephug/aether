@@ -17,6 +17,7 @@ mod intents;
 mod method_dependencies;
 mod persistence;
 mod processing;
+mod rollup_cache;
 mod source_freshness;
 mod source_guards;
 
