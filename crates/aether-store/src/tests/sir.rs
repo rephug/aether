@@ -1088,3 +1088,68 @@ fn mark_sir_stale_moves_only_fresh_rows() {
             .is_none()
     );
 }
+
+#[test]
+fn sir_snapshot_keeps_source_hash_and_blob_together_across_publication() {
+    let temp = tempdir().expect("tempdir");
+    let store = std::sync::Arc::new(SqliteStore::open(temp.path()).expect("store"));
+    let meta = |value: &str| SirMetaRecord {
+        id: "snapshot".to_owned(),
+        sir_hash: value.to_owned(),
+        sir_version: 1,
+        provider: "mock".to_owned(),
+        model: "mock".to_owned(),
+        generation_pass: "scan".to_owned(),
+        reasoning_trace: None,
+        prompt_hash: None,
+        staleness_score: None,
+        updated_at: 1,
+        sir_status: "fresh".to_owned(),
+        last_error: None,
+        last_attempt_at: 1,
+    };
+    store
+        .persist_sir_state_atomically_with_source(
+            meta("old"),
+            "old",
+            None,
+            None,
+            Some("old-source"),
+        )
+        .expect("initial write");
+    let before = store
+        .get_sir_meta_with_blob("snapshot")
+        .expect("snapshot")
+        .expect("row");
+    let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+    std::thread::scope(|scope| {
+        let writer = store.clone();
+        let writer_gate = gate.clone();
+        let task = scope.spawn(move || {
+            writer_gate.wait();
+            writer
+                .persist_sir_state_atomically_with_source(
+                    meta("new"),
+                    "new",
+                    None,
+                    None,
+                    Some("new-source"),
+                )
+                .expect("concurrent publication");
+        });
+        gate.wait();
+        task.join().expect("writer");
+    });
+    // A later writer must never replace the blob or source in an already-read row.
+    assert_eq!(before.meta.sir_hash, "old");
+    assert_eq!(before.blob.as_deref(), Some("old"));
+    assert_eq!(before.source_hash.as_deref(), Some("old-source"));
+    let after = store
+        .get_sir_meta_with_blob("snapshot")
+        .expect("snapshot")
+        .expect("row");
+    assert_eq!(after.meta.sir_hash, "new");
+    assert_eq!(after.blob.as_deref(), Some("new"));
+    assert_eq!(after.source_hash.as_deref(), Some("new-source"));
+    assert_ne!(before.identity, after.identity);
+}

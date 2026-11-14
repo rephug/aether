@@ -27,6 +27,7 @@ pub struct SirIdentity {
 pub struct SirRowSnapshot {
     pub meta: SirMetaRecord,
     pub identity: SirIdentity,
+    pub source_hash: Option<String>,
     pub blob: Option<String>,
 }
 
@@ -861,7 +862,8 @@ impl SqliteStore {
                 last_error,
                 last_attempt_at,
                 sir_json,
-                write_generation
+                write_generation,
+                source_hash
             FROM sir
             WHERE id = ?1
             "#,
@@ -878,6 +880,7 @@ impl SqliteStore {
                 Ok(SirRowSnapshot {
                     meta,
                     identity,
+                    source_hash: row.get(15)?,
                     blob: row
                         .get::<_, Option<String>>(13)?
                         .filter(|value| !value.trim().is_empty()),

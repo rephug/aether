@@ -206,6 +206,10 @@ fn custom_symbol_record(
 }
 
 fn run_index_and_seed_sir(workspace: &Path) -> Result<()> {
+    run_index_and_seed_sir_with_source(workspace, false)
+}
+
+fn run_index_and_seed_sir_with_source(workspace: &Path, record_source: bool) -> Result<()> {
     run_initial_index_once(&IndexerConfig {
         workspace: workspace.to_path_buf(),
         debounce_ms: 300,
@@ -239,6 +243,21 @@ fn run_index_and_seed_sir(workspace: &Path) -> Result<()> {
         let Some(symbol) = store.get_symbol_record(symbol_id.as_str())? else {
             continue;
         };
+        let source_hash = if record_source {
+            let path = workspace.join(&symbol.file_path);
+            let language = aether_parse::language_for_path(&path).expect("fixture language");
+            let source = fs::read_to_string(&path)?;
+            Some(
+                aether_parse::SymbolExtractor::new()?
+                    .extract_from_source(language, &symbol.file_path, &source)?
+                    .into_iter()
+                    .find(|parsed| parsed.id == symbol.id)
+                    .expect("indexed fixture symbol")
+                    .content_hash,
+            )
+        } else {
+            None
+        };
         let symbol_name = symbol
             .qualified_name
             .rsplit("::")
@@ -261,21 +280,27 @@ fn run_index_and_seed_sir(workspace: &Path) -> Result<()> {
         let sir_json = serde_json::to_string(&sir)?;
         let hash = sir_hash(&sir);
         store.write_sir_blob(symbol.id.as_str(), sir_json.as_str())?;
-        store.upsert_sir_meta(SirMetaRecord {
-            id: symbol.id.clone(),
-            sir_hash: hash,
-            sir_version: 1,
-            provider: "test".to_owned(),
-            model: "test".to_owned(),
-            generation_pass: "single".to_owned(),
-            reasoning_trace: None,
-            prompt_hash: None,
-            staleness_score: None,
-            updated_at: now,
-            sir_status: "fresh".to_owned(),
-            last_error: None,
-            last_attempt_at: now,
-        })?;
+        store.persist_sir_state_atomically_with_source(
+            SirMetaRecord {
+                id: symbol.id.clone(),
+                sir_hash: hash,
+                sir_version: 1,
+                provider: "test".to_owned(),
+                model: "test".to_owned(),
+                generation_pass: "single".to_owned(),
+                reasoning_trace: None,
+                prompt_hash: None,
+                staleness_score: None,
+                updated_at: now,
+                sir_status: "fresh".to_owned(),
+                last_error: None,
+                last_attempt_at: now,
+            },
+            &sir_json,
+            None,
+            None,
+            source_hash.as_deref(),
+        )?;
         let file_key = (symbol.language.clone(), symbol.file_path.clone());
         file_entries
             .entry(file_key.clone())

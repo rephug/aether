@@ -51,8 +51,23 @@ impl Default for HealthRequest {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthUnavailableReason {
+    Disabled,
+    UnsupportedBackend,
+    MetadataUnavailable,
+    GraphUnavailable,
+    GraphQueryFailed,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HealthReport {
+    /// False means metrics are unavailable, not a healthy empty graph.
+    #[serde(default)]
+    pub analysis_available: bool,
+    #[serde(default)]
+    pub unavailable_reason: Option<HealthUnavailableReason>,
     pub schema_version: String,
     pub analysis: HealthAnalysisSummary,
     pub critical_symbols: Vec<SymbolHealthEntry>,
@@ -212,6 +227,7 @@ impl HealthAnalyzer {
         let analyzed_at = now_millis();
         if !self.config.enabled {
             return Ok(empty_report(
+                HealthUnavailableReason::Disabled,
                 analyzed_at,
                 vec![
                     "Health analysis disabled by configuration ([health].enabled = false)"
@@ -222,6 +238,7 @@ impl HealthAnalyzer {
 
         if self.graph_backend != GraphBackend::Surreal {
             return Ok(empty_report(
+                HealthUnavailableReason::UnsupportedBackend,
                 analyzed_at,
                 vec![format!(
                     "Health analysis currently requires Surreal graph backend; configured backend is {}",
@@ -233,6 +250,7 @@ impl HealthAnalyzer {
         let sqlite_path = self.workspace.join(".aether").join("meta.sqlite");
         if !sqlite_path.exists() {
             return Ok(empty_report(
+                HealthUnavailableReason::MetadataUnavailable,
                 analyzed_at,
                 vec!["SQLite metadata store unavailable; returning empty health report".to_owned()],
             ));
@@ -243,6 +261,7 @@ impl HealthAnalyzer {
             Ok(graph) => graph,
             Err(err) => {
                 return Ok(empty_report(
+                    HealthUnavailableReason::GraphUnavailable,
                     analyzed_at,
                     vec![format!(
                         "Surreal graph store unavailable; returning empty health report: {err}"
@@ -450,6 +469,7 @@ impl HealthAnalyzer {
         let analyzed_at = now_millis();
         if !self.config.enabled {
             return Ok(empty_report(
+                HealthUnavailableReason::Disabled,
                 analyzed_at,
                 vec![
                     "Health analysis disabled by configuration ([health].enabled = false)"
@@ -461,6 +481,7 @@ impl HealthAnalyzer {
         let sqlite_path = self.workspace.join(".aether").join("meta.sqlite");
         if !sqlite_path.exists() {
             return Ok(empty_report(
+                HealthUnavailableReason::MetadataUnavailable,
                 analyzed_at,
                 vec!["SQLite metadata store unavailable; returning empty health report".to_owned()],
             ));
@@ -496,7 +517,11 @@ impl HealthAnalyzer {
             notes.push(
                 "Health analysis disabled by configuration ([health].enabled = false)".to_owned(),
             );
-            return Ok(empty_report(analyzed_at, notes));
+            return Ok(empty_report(
+                HealthUnavailableReason::Disabled,
+                analyzed_at,
+                notes,
+            ));
         }
 
         if graph.is_none() && self.graph_backend != GraphBackend::Surreal {
@@ -504,7 +529,11 @@ impl HealthAnalyzer {
                 "Health analysis currently requires Surreal graph backend; configured backend is {}",
                 self.graph_backend.as_str()
             ));
-            return Ok(empty_report(analyzed_at, notes));
+            return Ok(empty_report(
+                HealthUnavailableReason::UnsupportedBackend,
+                analyzed_at,
+                notes,
+            ));
         }
 
         let sqlite_path = self.workspace.join(".aether").join("meta.sqlite");
@@ -512,14 +541,22 @@ impl HealthAnalyzer {
             notes.push(
                 "SQLite metadata store unavailable; returning empty health report".to_owned(),
             );
-            return Ok(empty_report(analyzed_at, notes));
+            return Ok(empty_report(
+                HealthUnavailableReason::MetadataUnavailable,
+                analyzed_at,
+                notes,
+            ));
         }
 
         let graph = if let Some(existing) = graph {
             existing
         } else {
             notes.push("Surreal graph store unavailable; returning empty health report".to_owned());
-            return Ok(empty_report(analyzed_at, notes));
+            return Ok(empty_report(
+                HealthUnavailableReason::GraphUnavailable,
+                analyzed_at,
+                notes,
+            ));
         };
 
         let dependency_edges = match query_dependency_edges(graph).await {
@@ -528,7 +565,11 @@ impl HealthAnalyzer {
                 notes.push(format!(
                     "Dependency edge query failed; returning empty health report: {err}"
                 ));
-                return Ok(empty_report(analyzed_at, notes));
+                return Ok(empty_report(
+                    HealthUnavailableReason::GraphQueryFailed,
+                    analyzed_at,
+                    notes,
+                ));
             }
         };
 
@@ -538,7 +579,11 @@ impl HealthAnalyzer {
                 notes.push(format!(
                     "Symbol query failed; returning empty health report: {err}"
                 ));
-                return Ok(empty_report(analyzed_at, notes));
+                return Ok(empty_report(
+                    HealthUnavailableReason::GraphQueryFailed,
+                    analyzed_at,
+                    notes,
+                ));
             }
         };
 
@@ -951,6 +996,8 @@ impl HealthAnalyzer {
         };
 
         Ok(HealthReport {
+            analysis_available: true,
+            unavailable_reason: None,
             schema_version: HEALTH_SCHEMA_VERSION.to_owned(),
             analysis,
             critical_symbols,
@@ -991,8 +1038,14 @@ fn effective_include_set(raw: &[HealthInclude]) -> HashSet<HealthInclude> {
     raw.iter().copied().collect()
 }
 
-fn empty_report(analyzed_at: i64, notes: Vec<String>) -> HealthReport {
+fn empty_report(
+    reason: HealthUnavailableReason,
+    analyzed_at: i64,
+    notes: Vec<String>,
+) -> HealthReport {
     HealthReport {
+        analysis_available: false,
+        unavailable_reason: Some(reason),
         schema_version: HEALTH_SCHEMA_VERSION.to_owned(),
         analysis: HealthAnalysisSummary {
             total_symbols: 0,
@@ -1193,6 +1246,38 @@ mod tests {
 
     use super::{HealthAnalyzer, HealthInclude, HealthRequest, now_millis};
 
+    #[test]
+    fn unavailable_health_is_distinct_from_empty_graph() {
+        let report = super::empty_report(
+            super::HealthUnavailableReason::GraphUnavailable,
+            1,
+            vec!["graph locked".to_owned()],
+        );
+        assert!(!report.analysis_available);
+        assert_eq!(report.analysis.total_symbols, 0);
+        assert_eq!(report.notes, vec!["graph locked"]);
+    }
+
+    #[test]
+    fn health_without_graph_handle_reports_unavailable_not_healthy_zero() {
+        let temp = tempdir().expect("tempdir");
+        write_test_config(temp.path());
+        let store = SqliteStore::open(temp.path()).expect("store");
+        let analyzer = HealthAnalyzer::new(temp.path()).expect("analyzer");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let report = runtime
+            .block_on(analyzer.analyze_with_handles(&HealthRequest::default(), &store, None))
+            .expect("unavailable report");
+        assert!(!report.analysis_available);
+        assert_eq!(
+            report.unavailable_reason,
+            Some(super::HealthUnavailableReason::GraphUnavailable)
+        );
+    }
+
     fn write_test_config(workspace: &Path) {
         fs::create_dir_all(workspace.join(".aether")).expect("create .aether");
         fs::write(
@@ -1371,6 +1456,8 @@ vector_backend = "sqlite"
 
         assert_eq!(report.analysis.total_symbols, 3);
         assert_eq!(report.analysis.total_edges, 2);
+        assert!(report.analysis_available);
+        assert_eq!(report.unavailable_reason, None);
         assert!(!report.critical_symbols.is_empty());
 
         let alpha = report

@@ -12,12 +12,13 @@ use aether_sir::{
     file_sir_hash, sir_hash, synthetic_file_sir_id, synthetic_module_sir_id, validate_sir,
 };
 use aether_store::{
-    SirHistoryStore, SirMetaRecord, SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord,
-    SymbolRelationStore,
+    SirHistoryStore, SirMetaRecord, SirRowSnapshot, SirStateStore, SqliteStore, SymbolCatalogStore,
+    SymbolRecord, SymbolRelationStore,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::common::LiveSymbolSources;
 use super::{
     AetherMcpServer, SIR_STATUS_GENERATING, current_unix_timestamp, current_unix_timestamp_millis,
     symbol_leaf_name,
@@ -35,6 +36,7 @@ pub struct AetherGetSirRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherGetSirResponse {
+    pub freshness: Option<SirFreshness>,
     pub found: bool,
     pub level: SirLevelRequest,
     pub symbol_id: String,
@@ -48,6 +50,16 @@ pub struct AetherGetSirResponse {
     pub structural: Option<SirStructuralView>,
     pub last_error: Option<String>,
     pub last_attempt_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SirFreshness {
+    /// None when the SIR has no recorded source provenance.
+    pub source_hash_matches: Option<bool>,
+    pub recorded_source_hash: Option<String>,
+    pub current_source_hash: Option<String>,
+    pub is_mock: bool,
+    pub generation_pass: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -103,6 +115,7 @@ pub struct AetherExplainPosition {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherExplainResponse {
+    pub freshness: Option<SirFreshness>,
     pub found: bool,
     pub file_path: String,
     pub position: AetherExplainPosition,
@@ -212,9 +225,10 @@ impl AetherMcpServer {
                 current_unix_timestamp_millis(),
             )?;
         }
-        let meta = store.get_sir_meta(symbol_id)?;
+        let (snapshot, freshness) = self.live_leaf_sir_meta(symbol_id)?;
+        let meta = snapshot.as_ref().map(|row| row.meta.clone());
         let (sir_status, last_error, last_attempt_at) = meta_status_fields(meta.as_ref());
-        let sir_blob = store.read_sir_blob(symbol_id)?;
+        let sir_blob = snapshot.and_then(|row| row.blob);
 
         let Some(sir_blob) = sir_blob else {
             let structural = build_structural_view(store, symbol_id)?;
@@ -230,6 +244,7 @@ impl AetherMcpServer {
                 false
             };
             return Ok(AetherGetSirResponse {
+                freshness,
                 found: false,
                 level: SirLevel::Leaf.into(),
                 symbol_id: symbol_id.to_owned(),
@@ -259,6 +274,7 @@ impl AetherMcpServer {
             .unwrap_or_else(|| sir_hash(&sir));
 
         Ok(AetherGetSirResponse {
+            freshness,
             found: true,
             level: SirLevel::Leaf.into(),
             symbol_id: symbol_id.to_owned(),
@@ -299,6 +315,7 @@ impl AetherMcpServer {
 
         let Some(blob) = blob else {
             return Ok(AetherGetSirResponse {
+                freshness: None,
                 found: false,
                 level: SirLevel::File.into(),
                 symbol_id: rollup_id,
@@ -324,6 +341,7 @@ impl AetherMcpServer {
             .unwrap_or_else(|| file_sir_hash(&file_sir));
 
         Ok(AetherGetSirResponse {
+            freshness: None,
             found: true,
             level: SirLevel::File.into(),
             symbol_id: rollup_id,
@@ -353,6 +371,7 @@ impl AetherMcpServer {
 
         if !self.sqlite_path().exists() {
             return Ok(AetherGetSirResponse {
+                freshness: None,
                 found: false,
                 level: SirLevel::Module.into(),
                 symbol_id: module_id,
@@ -376,6 +395,7 @@ impl AetherMcpServer {
         let blob = store.read_sir_blob(&coverage.module_id)?;
         let Some(blob) = blob else {
             return Ok(AetherGetSirResponse {
+                freshness: None,
                 found: false,
                 level: SirLevel::Module.into(),
                 symbol_id: coverage.module_id,
@@ -401,6 +421,7 @@ impl AetherMcpServer {
             .unwrap_or_else(|| file_sir_hash(&module_sir));
 
         Ok(AetherGetSirResponse {
+            freshness: None,
             found: true,
             level: SirLevel::Module.into(),
             symbol_id: coverage.module_id,
@@ -537,6 +558,47 @@ impl AetherMcpServer {
         })
     }
 
+    /// A persisted freshness label is not proof that the workspace still holds the
+    /// source used for inference. Validate on read, without rewriting stored metadata.
+    fn live_leaf_sir_meta(
+        &self,
+        symbol_id: &str,
+    ) -> Result<(Option<SirRowSnapshot>, Option<SirFreshness>), AetherMcpError> {
+        if !self.sqlite_path().exists() {
+            return Ok((None, None));
+        }
+        let store = self.state.store.as_ref();
+        let Some(mut snapshot) = store.get_sir_meta_with_blob(symbol_id)? else {
+            return Ok((None, None));
+        };
+        let meta = &mut snapshot.meta;
+        let recorded = snapshot
+            .source_hash
+            .clone()
+            .filter(|hash| !hash.trim().is_empty());
+        let current = match store.get_symbol_record(symbol_id)? {
+            Some(symbol) => {
+                LiveSymbolSources::new(self.workspace()).hash_for(&symbol.file_path, symbol_id)?
+            }
+            None => None,
+        };
+        let matches = recorded.as_ref().map(|hash| Some(hash) == current.as_ref());
+        if (meta.sir_status.trim().eq_ignore_ascii_case("fresh")
+            || meta.sir_status.trim().eq_ignore_ascii_case("ready"))
+            && matches != Some(true)
+        {
+            meta.sir_status = "stale".to_owned();
+        }
+        let freshness = SirFreshness {
+            source_hash_matches: matches,
+            recorded_source_hash: recorded,
+            current_source_hash: current,
+            is_mock: meta.provider.eq_ignore_ascii_case("mock"),
+            generation_pass: meta.generation_pass.clone(),
+        };
+        Ok((Some(snapshot), Some(freshness)))
+    }
+
     pub fn aether_explain_logic(
         &self,
         request: AetherExplainRequest,
@@ -576,6 +638,7 @@ impl AetherMcpServer {
 
         let Some(symbol) = target_symbol else {
             return Ok(AetherExplainResponse {
+                freshness: None,
                 found: false,
                 file_path: normalized_file_path,
                 position: AetherExplainPosition {
@@ -607,10 +670,18 @@ impl AetherMcpServer {
             )?;
         }
 
-        let meta = self.read_sir_meta(&symbol_id)?;
+        let (snapshot, freshness) = self.live_leaf_sir_meta(&symbol_id)?;
+        let meta = snapshot.as_ref().map(|row| row.meta.clone());
         let (sir_status, last_error, last_attempt_at) = meta_status_fields(meta.as_ref());
         let stale_warning = stale_warning_message(sir_status.as_deref(), last_error.as_deref());
-        let sir = self.read_valid_sir_blob(&symbol_id)?;
+        let sir = snapshot
+            .and_then(|row| row.blob)
+            .map(|blob| -> Result<SirAnnotation, AetherMcpError> {
+                let sir: SirAnnotation = serde_json::from_str(&blob)?;
+                validate_sir(&sir)?;
+                Ok(sir)
+            })
+            .transpose()?;
 
         let (found, hover_markdown, sir) = match sir {
             Some(sir) => (
@@ -640,6 +711,7 @@ impl AetherMcpServer {
         };
 
         Ok(AetherExplainResponse {
+            freshness,
             found,
             file_path: normalized_file_path,
             position: AetherExplainPosition {
@@ -665,6 +737,7 @@ fn empty_get_sir_response(level: SirLevelRequest, symbol_id: String) -> AetherGe
     };
 
     AetherGetSirResponse {
+        freshness: None,
         found: false,
         level,
         symbol_id,
