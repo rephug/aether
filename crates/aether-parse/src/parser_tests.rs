@@ -1277,3 +1277,74 @@ fn unsupported_ambiguous_owner_forms_are_explicitly_rejected() {
         );
     }
 }
+
+#[test]
+fn generator_local_bindings_do_not_shadow_surrounding_callers() {
+    for generator in [
+        "function* iter() { var helper; }",
+        "const iter = function* () { var helper; };",
+        "async function* iter() { var helper; }",
+    ] {
+        let source =
+            format!("function helper() {{}} function caller() {{ {generator} helper(); }}");
+        let extracted = extract_with_edges(Language::JavaScript, "generator.mjs", &source);
+        assert_eq!(
+            edge_targets_for_source(&extracted, "caller", EdgeKind::Calls),
+            vec!["helper"]
+        );
+    }
+}
+
+#[test]
+fn conditional_object_argument_labels_exclude_nested_declaration_bodies() {
+    let source = "send(enabled && {run(){work();}}); send(enabled && {run(){otherWork();}});";
+    let first = extract_with_edges(Language::JavaScript, "conditional.mjs", source);
+    assert_eq!(first.symbols.len(), 2);
+    let second = extract_with_edges(
+        Language::JavaScript,
+        "conditional.mjs",
+        &source.replace("work();", "work(); changedBody();"),
+    );
+    assert!(
+        first
+            .symbols
+            .iter()
+            .all(|symbol| second.symbols.iter().any(|next| next.id == symbol.id))
+    );
+    assert_eq!(
+        second
+            .edges
+            .iter()
+            .filter(|edge| ["work", "changedBody", "otherWork"]
+                .contains(&edge.target_qualified_name.as_str()))
+            .count(),
+        3
+    );
+    for edge in second.edges.iter().filter(|edge| {
+        ["work", "changedBody", "otherWork"].contains(&edge.target_qualified_name.as_str())
+    }) {
+        assert!(
+            second
+                .symbols
+                .iter()
+                .any(|symbol| symbol.id == edge.source_id)
+        );
+    }
+}
+
+#[test]
+fn unindexed_generator_names_shadow_outer_function_namesakes() {
+    for inner in [
+        "function* helper() {} helper();",
+        "const iter = function* helper() { helper(); };",
+    ] {
+        let source = format!("function helper() {{}} function outer() {{ {inner} }}");
+        let extracted = extract_with_edges(Language::JavaScript, "generator.mjs", &source);
+        assert!(
+            !extracted
+                .edges
+                .iter()
+                .any(|edge| edge.target_qualified_name == "helper")
+        );
+    }
+}

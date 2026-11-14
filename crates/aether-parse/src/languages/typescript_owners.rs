@@ -86,9 +86,28 @@ fn typescript_owner_text(node: Node<'_>, source: &[u8]) -> String {
     if node.child_count() == 0 {
         return normalize_for_fingerprint(&node_text(node, source));
     }
+    let body = if matches!(
+        node.kind(),
+        "function_declaration"
+            | "function_expression"
+            | "generator_function_declaration"
+            | "generator_function"
+            | "arrow_function"
+            | "method_definition"
+    ) {
+        node.child_by_field_name("body")
+    } else {
+        None
+    };
     let mut walk = node.walk();
     node.children(&mut walk)
-        .map(|child| typescript_owner_text(child, source))
+        .map(|child| {
+            if body.is_some_and(|body| body.id() == child.id()) {
+                "$body".to_owned()
+            } else {
+                typescript_owner_text(child, source)
+            }
+        })
         .collect::<Vec<_>>()
         .join("")
 }
@@ -107,7 +126,9 @@ fn collect_typescript_context(
             "class_declaration"
             | "interface_declaration"
             | "function_declaration"
+            | "generator_function_declaration"
             | "function_expression"
+            | "generator_function"
             | "variable_declarator" => {
                 if let Some(name) = named_child_text(cursor, "name", source) {
                     context.push(name);
@@ -324,7 +345,9 @@ impl CallOccurrences {
                     && matches!(
                         node.kind(),
                         "function_declaration"
+                            | "generator_function_declaration"
                             | "function_expression"
+                            | "generator_function"
                             | "arrow_function"
                             | "method_definition"
                             | "class_declaration"
@@ -401,10 +424,15 @@ impl CallOccurrences {
             {
                 add_shadow_bindings(&mut result, node, parameter, source);
             }
-            if matches!(node.kind(), "class_declaration" | "function_expression")
-                && let Some(name) = node.child_by_field_name("name")
+            if matches!(
+                node.kind(),
+                "class_declaration"
+                    | "function_expression"
+                    | "generator_function"
+                    | "generator_function_declaration"
+            ) && let Some(name) = node.child_by_field_name("name")
             {
-                let scope = if node.kind() == "function_expression" {
+                let scope = if matches!(node.kind(), "function_expression" | "generator_function") {
                     Some(node)
                 } else {
                     binding_scope(node, false)
@@ -434,7 +462,9 @@ fn binding_scope(mut node: Node<'_>, function_scoped: bool) -> Option<Node<'_>> 
             node.kind(),
             "program"
                 | "function_declaration"
+                | "generator_function_declaration"
                 | "function_expression"
+                | "generator_function"
                 | "arrow_function"
                 | "method_definition"
         ) || (!function_scoped
