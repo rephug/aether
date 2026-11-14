@@ -39,6 +39,63 @@ pub(crate) fn typescript_source_function_id(
     ))
 }
 
+/// Direct eval can replace any enclosing mutable binding. Parentheses and
+/// erased TypeScript expression wrappers preserve that operation at runtime.
+/// An escaped bare callee is opaque here: it may spell eval after JS Unicode
+/// identifier decoding, so withhold proof rather than guessing its binding.
+pub(crate) fn contains_potential_direct_eval(root: Node<'_>, source: &[u8]) -> bool {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "call_expression"
+            && let Some(mut callee) = node.child_by_field_name("function")
+        {
+            loop {
+                let child = match callee.kind() {
+                    "parenthesized_expression"
+                    | "as_expression"
+                    | "satisfies_expression"
+                    | "non_null_expression" => {
+                        let mut cursor = callee.walk();
+                        callee
+                            .named_children(&mut cursor)
+                            .find(|child| child.kind() != "comment")
+                    }
+                    "instantiation_expression" => {
+                        callee.child_by_field_name("function").or_else(|| {
+                            let mut cursor = callee.walk();
+                            callee
+                                .named_children(&mut cursor)
+                                .find(|child| !matches!(child.kind(), "comment" | "type_arguments"))
+                        })
+                    }
+                    "type_assertion" => {
+                        let mut cursor = callee.walk();
+                        callee
+                            .named_children(&mut cursor)
+                            .filter(|child| child.kind() != "comment")
+                            .last()
+                    }
+                    "identifier" => {
+                        let name = node_text(callee, source);
+                        if name == "eval" || name.contains('\\') {
+                            return true;
+                        }
+                        None
+                    }
+                    _ => None,
+                };
+                let Some(child) = child else {
+                    break;
+                };
+                callee = child;
+            }
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
 /// Resolve hoisted lexical function declarations before falling back to a raw
 /// external/member target. Only enclosing blocks are visible, never sibling scopes.
 pub(crate) fn lexical_call_target(
@@ -55,6 +112,10 @@ pub(crate) fn lexical_call_target(
     let name = node_text(callee, source);
     let mut current = call.parent();
     while let Some(scope) = current {
+        // A with-object can supply the identifier before an outer lexical name.
+        if scope.kind() == "with_statement" {
+            return Some(None);
+        }
         if let Some(target) = occurrences.declarations.get(&(scope.id(), name.clone())) {
             return Some(target.clone());
         }
@@ -382,9 +443,19 @@ impl CallOccurrences {
         let mut scopes = HashMap::new();
         let mut declarations = Vec::new();
         let mut bindings = Vec::new();
+        let mut mutations = Vec::new();
         let mut pending = vec![root];
         while let Some(node) = pending.pop() {
             bindings.push(node);
+            if matches!(
+                node.kind(),
+                "assignment_expression"
+                    | "augmented_assignment_expression"
+                    | "update_expression"
+                    | "for_in_statement"
+            ) {
+                mutations.push(node);
+            }
             if node.kind() == "function_declaration" {
                 declarations.push(node);
             }
@@ -521,6 +592,16 @@ impl CallOccurrences {
                 }
             }
         }
+        // A function declaration may be reassigned. Its lexical name alone is no
+        // longer proof of the runtime callee, including writes in nested closures.
+        for mutation in mutations {
+            if let Some(left) = mutation
+                .child_by_field_name("left")
+                .or_else(|| mutation.child_by_field_name("argument"))
+            {
+                invalidate_written_names(&mut result, mutation, left, source);
+            }
+        }
         result
     }
 
@@ -569,6 +650,7 @@ fn add_shadow_bindings(
             cache
                 .declarations
                 .entry((scope.id(), node_text(pattern, source)))
+                .and_modify(|target| *target = None)
                 .or_insert(None);
         }
         "pair_pattern" => {
@@ -590,6 +672,44 @@ fn add_shadow_bindings(
             let mut walk = pattern.walk();
             for child in pattern.named_children(&mut walk) {
                 add_shadow_bindings(cache, scope, child, source);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn invalidate_written_names(
+    cache: &mut CallOccurrences,
+    mutation: Node<'_>,
+    pattern: Node<'_>,
+    source: &[u8],
+) {
+    match pattern.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            let name = node_text(pattern, source);
+            let mut current = mutation.parent();
+            while let Some(scope) = current {
+                if let Some(target) = cache.declarations.get_mut(&(scope.id(), name.clone())) {
+                    *target = None;
+                    break;
+                }
+                current = scope.parent();
+            }
+        }
+        "pair_pattern" => {
+            if let Some(value) = pattern.child_by_field_name("value") {
+                invalidate_written_names(cache, mutation, value, source);
+            }
+        }
+        "assignment_pattern" | "object_assignment_pattern" => {
+            if let Some(left) = pattern.child_by_field_name("left") {
+                invalidate_written_names(cache, mutation, left, source);
+            }
+        }
+        "array_pattern" | "object_pattern" | "rest_pattern" => {
+            let mut cursor = pattern.walk();
+            for child in pattern.named_children(&mut cursor) {
+                invalidate_written_names(cache, mutation, child, source);
             }
         }
         _ => {}

@@ -731,19 +731,12 @@ fn render_pending_hover_markdown(
     dependencies.sort();
     dependencies.dedup();
 
-    let mut callers = Vec::new();
-    for edge in store
-        .get_callers(symbol.qualified_name.as_str())
+    let mut callers = store
+        .list_callers_for_symbol(symbol_id)
         .unwrap_or_default()
-    {
-        let caller = store
-            .get_symbol_record(edge.source_id.as_str())
-            .ok()
-            .flatten()
-            .map(|record| record.qualified_name)
-            .unwrap_or(edge.source_id);
-        callers.push(caller);
-    }
+        .into_iter()
+        .map(|caller| caller.qualified_name)
+        .collect::<Vec<_>>();
     callers.sort();
     callers.dedup();
 

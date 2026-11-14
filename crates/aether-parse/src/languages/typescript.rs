@@ -1,8 +1,14 @@
 use aether_core::{EdgeKind, Language, Symbol, SymbolEdge, SymbolKind, file_source_id};
+use std::path::Path;
 use tree_sitter::{Node, Query};
 
+#[path = "typescript_imports.rs"]
+mod imports;
+use imports::{Imports, string_literal_contents};
+
 use super::typescript_owners::{
-    CallOccurrences, lexical_call_target, typescript_qualified_name, typescript_source_function_id,
+    CallOccurrences, contains_potential_direct_eval, lexical_call_target,
+    typescript_qualified_name, typescript_source_function_id,
 };
 use crate::parser::{TestIntent, build_symbol, normalize_intent_text, typescript_call_target};
 use crate::registry::{LanguageConfig, LanguageHooks, QueryCaptures};
@@ -70,14 +76,41 @@ pub fn tsx_js_config() -> LanguageConfig {
 #[derive(Default)]
 struct TypeScriptHooks {
     occurrences: CallOccurrences,
+    imports: Imports,
+    proofs_blocked: bool,
 }
 
 impl LanguageHooks for TypeScriptHooks {
     fn for_extraction(&self, root: Node<'_>, source: &[u8]) -> Option<Box<dyn LanguageHooks>> {
         Some(Box::new(Self {
             occurrences: CallOccurrences::new(root, source),
+            imports: Imports::default(),
+            proofs_blocked: root.has_error() || contains_potential_direct_eval(root, source),
         }))
     }
+
+    fn for_extraction_at(
+        &self,
+        root: Node<'_>,
+        source: &[u8],
+        file_path: &str,
+        workspace_root: Option<&Path>,
+    ) -> Option<Box<dyn LanguageHooks>> {
+        Some(Box::new(Self {
+            occurrences: CallOccurrences::new(root, source),
+            imports: if root.has_error() {
+                Imports::default()
+            } else {
+                Imports::new(root, source, file_path, workspace_root)
+            },
+            proofs_blocked: root.has_error() || contains_potential_direct_eval(root, source),
+        }))
+    }
+
+    fn resolution_dependencies(&self) -> Vec<String> {
+        self.imports.dependencies()
+    }
+
     fn map_symbol(
         &self,
         language: Language,
@@ -120,18 +153,48 @@ impl LanguageHooks for TypeScriptHooks {
         captures: &QueryCaptures<'_, '_>,
         source: &[u8],
         file_path: &str,
-        _symbols: &[Symbol],
+        symbols: &[Symbol],
     ) -> Option<Vec<SymbolEdge>> {
         let capture_name = captures.first_capture_name_with_prefix("edge.")?;
         let node = captures.node_with_prefix("edge.")?;
 
         match capture_name {
             "edge.call" => {
-                let target = match lexical_call_target(node, source, &self.occurrences) {
-                    Some(Some(target)) => target,
-                    Some(None) => return Some(Vec::new()),
-                    None => typescript_call_target(node, source)?,
+                // Recovery can omit shadowing declarations, and direct eval can
+                // replace enclosing bindings. Neither source proves this callee.
+                let lexical_target = if self.proofs_blocked {
+                    None
+                } else {
+                    lexical_call_target(node, source, &self.occurrences)
                 };
+                let raw_target = typescript_call_target(node, source)?;
+                let target = lexical_target
+                    .as_ref()
+                    .and_then(|target| target.as_ref())
+                    .cloned()
+                    .unwrap_or_else(|| raw_target.clone());
+                let target_symbol_id = if matches!(&lexical_target, Some(Some(_))) {
+                    let mut candidates = symbols
+                        .iter()
+                        .filter(|symbol| symbol.qualified_name == target);
+                    let candidate = candidates.next();
+                    candidate
+                        .filter(|_| candidates.next().is_none())
+                        .map(|symbol| symbol.id.clone())
+                } else {
+                    None
+                };
+                // A lexical binding, including a parameter or local variable, prevents
+                // a same-spelled import from proving this call's destination.
+                let imported = if !self.proofs_blocked && lexical_target.is_none() {
+                    self.imports.target(&raw_target)
+                } else {
+                    None
+                };
+                let target = imported
+                    .map(|target| target.qualified_name.clone())
+                    .unwrap_or(target);
+                let target_file_path = imported.map(|target| target.file_path.clone());
                 let source_id = typescript_source_function_id(
                     language,
                     file_path,
@@ -142,23 +205,24 @@ impl LanguageHooks for TypeScriptHooks {
                 Some(vec![SymbolEdge {
                     source_id,
                     target_qualified_name: target,
+                    target_symbol_id,
+                    target_file_path,
                     edge_kind: EdgeKind::Calls,
                     file_path: file_path.to_owned(),
                 }])
             }
             "edge.depends_on" => {
-                let target = captures.capture_text("source", source)?;
-                let target = target
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .to_owned();
+                let source_node = node.child_by_field_name("source")?;
+                let source_text = crate::parser::node_text(source_node, source);
+                let target = string_literal_contents(&source_text)?.to_owned();
                 if target.is_empty() {
                     return None;
                 }
                 Some(vec![SymbolEdge {
                     source_id: file_source_id(file_path),
                     target_qualified_name: target,
+                    target_symbol_id: None,
+                    target_file_path: None,
                     edge_kind: EdgeKind::DependsOn,
                     file_path: file_path.to_owned(),
                 }])

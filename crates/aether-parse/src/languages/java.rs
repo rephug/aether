@@ -206,6 +206,8 @@ impl LanguageHooks for JavaHooks {
                 .collect(),
             "edge.depends_on" => import_target(node, source)
                 .map(|import| SymbolEdge {
+                    target_symbol_id: None,
+                    target_file_path: None,
                     source_id: file_source_id(file_path),
                     target_qualified_name: import.path,
                     edge_kind: EdgeKind::DependsOn,
@@ -402,6 +404,8 @@ fn call_edge(
         return None;
     }
     Some(SymbolEdge {
+        target_symbol_id: None,
+        target_file_path: None,
         source_id,
         target_qualified_name: target,
         edge_kind: EdgeKind::Calls,
@@ -1148,6 +1152,8 @@ fn type_ref_edges(
     targets
         .into_iter()
         .map(|target| SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: source_symbol.id.clone(),
             target_qualified_name: target,
             edge_kind: EdgeKind::TypeRef,
@@ -1231,6 +1237,8 @@ fn implements_edges(
     targets
         .into_iter()
         .map(|target| SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: source_symbol.id.clone(),
             target_qualified_name: target,
             edge_kind: EdgeKind::Implements,

@@ -95,19 +95,33 @@ vector_backend = "sqlite"
     let (events, symbols, _) = collect_initial_snapshot(&observer);
     assert!(events.iter().all(|event| event.file_path != RETAINED));
     let mut structural = StructuralIndexer::new(workspace.to_path_buf()).expect("fresh graph");
-    assert!(
-        structural
-            .graph_runtime
-            .block_on(
-                structural
-                    .surreal_graph_store
-                    .as_ref()
-                    .expect("native")
-                    .list_all_symbol_ids()
-            )
-            .expect("empty graph")
-            .is_empty()
+    // First native open now rebuilds directly from canonical proof before any
+    // observer events are replayed. It must not claim to have read retained source.
+    let bootstrap_ids = structural
+        .graph_runtime
+        .block_on(
+            structural
+                .surreal_graph_store
+                .as_ref()
+                .expect("native")
+                .list_all_symbol_ids(),
+        )
+        .expect("bootstrapped graph")
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        bootstrap_ids,
+        store
+            .list_all_symbol_ids()
+            .expect("canonical identities")
+            .into_iter()
+            .collect()
     );
+    assert_eq!(
+        store.file_read_at_ms(RETAINED).expect("retained read"),
+        prior_read
+    );
+    assert_eq!(crate::freshness::read_index_sync_marker(workspace), marker);
 
     for _ in 0..2 {
         sync_snapshot(
@@ -152,9 +166,12 @@ vector_backend = "sqlite"
             .list_symbol_edges_for_target_and_kinds("target", &[aether_core::EdgeKind::Calls])
             .expect("canonical caller edge");
         assert!(
-            canonical_incoming
-                .iter()
-                .any(|edge| edge.source_id == caller.id)
+            canonical_incoming.iter().any(|edge| {
+                edge.source_id == caller.id
+                    && edge.target_symbol_id.is_none()
+                    && edge.target_file_path.is_none()
+            }),
+            "the caller's unimported spelling remains raw evidence"
         );
         let canonical_outgoing = store
             .list_symbol_edges_for_target_and_kinds("kept", &[aether_core::EdgeKind::Calls])
@@ -173,7 +190,10 @@ vector_backend = "sqlite"
             .graph_runtime
             .block_on(structural.graph_store.get_dependencies(&caller.id))
             .expect("caller dependencies");
-        assert!(incoming.iter().any(|row| row.id == constructor.id));
+        assert!(
+            incoming.iter().all(|row| row.id != constructor.id),
+            "an unimported same spelling in another file does not prove a call"
+        );
         assert_eq!(
             store.list_symbols_for_file(RETAINED).expect("prior rows"),
             retained

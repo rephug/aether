@@ -678,7 +678,7 @@ fn build_symbol_context(
         .get_sir_meta(record.id.as_str())
         .with_context(|| format!("failed to load SIR metadata for {}", record.id))?;
     let dependencies = read_dependencies(store, record.id.as_str())?;
-    let callers = read_callers(store, record.qualified_name.as_str())?;
+    let callers = read_callers(store, record.id.as_str())?;
     let contracts = store
         .list_active_contracts_for_symbol(record.id.as_str())
         .with_context(|| format!("failed to list contracts for {}", record.id))?
@@ -934,22 +934,17 @@ fn read_dependencies(store: &SqliteStore, symbol_id: &str) -> Result<Vec<String>
     Ok(entries)
 }
 
-fn read_callers(store: &SqliteStore, qualified_name: &str) -> Result<Vec<String>> {
+fn read_callers(store: &SqliteStore, symbol_id: &str) -> Result<Vec<String>> {
     let mut entries = Vec::<String>::new();
     let mut seen = HashSet::<String>::new();
-    for edge in store
-        .get_callers(qualified_name)
-        .with_context(|| format!("failed to load callers for {qualified_name}"))?
+    for caller in store
+        .list_callers_for_symbol(symbol_id)
+        .with_context(|| format!("failed to load callers for {symbol_id}"))?
         .into_iter()
         .take(MAX_GRAPH_NEIGHBORS)
     {
-        let label = store
-            .get_symbol_record(edge.source_id.as_str())
-            .with_context(|| format!("failed to load caller {}", edge.source_id))?
-            .map(|record| record.qualified_name)
-            .unwrap_or(edge.source_id);
-        if seen.insert(label.clone()) {
-            entries.push(label);
+        if seen.insert(caller.qualified_name.clone()) {
+            entries.push(caller.qualified_name);
         }
     }
     Ok(entries)

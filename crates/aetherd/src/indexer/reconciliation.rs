@@ -505,6 +505,8 @@ mod tests {
             .expect("caller");
         store
             .upsert_edges(&[aether_core::SymbolEdge {
+                target_symbol_id: None,
+                target_file_path: Some(old.file_path.clone()),
                 source_id: caller.id.clone(),
                 target_qualified_name: old.qualified_name.clone(),
                 edge_kind: aether_core::EdgeKind::Calls,

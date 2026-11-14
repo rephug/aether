@@ -329,6 +329,12 @@ impl EdgeKind {
 pub struct SymbolEdge {
     pub source_id: String,
     pub target_qualified_name: String,
+    /// Exact target established by the parser. Missing IDs never fall back to a name.
+    #[serde(default)]
+    pub target_symbol_id: Option<String>,
+    /// Explicit import provenance: an exact normalized indexed file path.
+    #[serde(default)]
+    pub target_file_path: Option<String>,
     pub edge_kind: EdgeKind,
     pub file_path: String,
 }

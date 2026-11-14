@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 
 use aether_analysis::{GraphAlgorithmEdge, connected_components, louvain_communities, page_rank};
 use aether_config::GraphBackend;
-use aether_store::{EDGE_FILE_LANGUAGE_CTE, edge_source_family_matches_sql};
 
 use crate::state::SharedState;
 use crate::support;
@@ -83,43 +82,20 @@ pub(crate) fn load_symbols(shared: &SharedState) -> Result<Vec<SymbolInfo>, Stri
 pub(crate) fn load_dependency_algo_edges(
     shared: &SharedState,
 ) -> Result<Vec<GraphAlgorithmEdge>, String> {
-    let Some(conn) =
-        support::open_meta_sqlite_ro(shared.workspace.as_path()).map_err(|e| e.to_string())?
-    else {
-        return Ok(Vec::new());
-    };
-
-    let mut stmt = conn
-        .prepare(&format!(
-            r#"
-            WITH {EDGE_FILE_LANGUAGE_CTE}
-            SELECT e.source_id, t.id, e.edge_kind
-            FROM symbol_edges e
-            LEFT JOIN edge_file_language source_file ON source_file.file_path = e.file_path
-            JOIN symbols t
-              ON t.qualified_name = e.target_qualified_name
-             AND {family}
-            WHERE e.edge_kind IN ('calls', 'depends_on', 'type_ref', 'implements')
-            "#,
-            family = edge_source_family_matches_sql("source_file.language", "t.language"),
-        ))
-        .map_err(|e| e.to_string())?;
-
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(GraphAlgorithmEdge {
-                source_id: row.get::<_, String>(0)?,
-                target_id: row.get::<_, String>(1)?,
-                edge_kind: row.get::<_, String>(2)?,
-            })
+    shared
+        .store
+        .list_graph_dependency_edges()
+        .map(|edges| {
+            edges
+                .into_iter()
+                .map(|edge| GraphAlgorithmEdge {
+                    source_id: edge.source_symbol_id,
+                    target_id: edge.target_symbol_id,
+                    edge_kind: edge.edge_kind,
+                })
+                .collect()
         })
-        .map_err(|e| e.to_string())?;
-
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row.map_err(|e| e.to_string())?);
-    }
-    Ok(out)
+        .map_err(|err| err.to_string())
 }
 
 pub(crate) async fn pagerank_map(

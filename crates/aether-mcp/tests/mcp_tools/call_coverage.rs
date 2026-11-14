@@ -31,7 +31,7 @@ vector_backend = "sqlite"
     )?;
     fs::write(workspace.join("src/a.rs"), "fn dup() -> i32 { 1 }\n")?;
     fs::write(workspace.join("src/b.rs"), "fn dup() -> i32 { 2 }\n")?;
-    // `s.area()` is recorded by its bare method name, so attributing it is a guess.
+    // The explicit nominal parameter type establishes the inherent method target.
     fs::write(
         workspace.join("src/shape.rs"),
         "struct Square;\nimpl Square {\n    fn area(&self) -> i32 { 4 }\n}\nfn measure(s: Square) -> i32 { s.area() }\n",
@@ -112,7 +112,7 @@ vector_backend = "sqlite"
     );
     // Unresolved is not the same as external.
     for wording in [
-        "1 match no qualified name exactly",
+        "1 lack sufficient target evidence",
         "may be internal",
         "Calls written inside macro arguments",
     ] {
@@ -128,7 +128,7 @@ vector_backend = "sqlite"
         external.coverage_note
     );
 
-    // A caller found through a bare method name is listed, and labelled a heuristic match.
+    // A nominal typed receiver proves its unique inherent method without a heuristic.
     let area = dependencies(id_of("src/shape.rs", "Square::area")?)?;
     assert_eq!(
         area.callers
@@ -142,10 +142,10 @@ vector_backend = "sqlite"
             area.caller_coverage.attributed,
             area.caller_coverage.heuristic
         ),
-        (1, 1)
+        (1, 0)
     );
     assert!(
-        area.coverage_note.contains("1 of those by heuristic"),
+        !area.coverage_note.contains("by heuristic"),
         "{}",
         area.coverage_note
     );
@@ -160,23 +160,24 @@ vector_backend = "sqlite"
         (2, 2)
     );
 
-    // A name two files declare: both candidates listed, and counted as ambiguous.
+    // A bare name in unrelated files provides no import or module proof.
     let calls_dup = dependencies(id_of("src/lib.rs", "calls_dup")?)?;
-    assert_eq!(calls_dup.dependency_count, 2);
-    assert_eq!(calls_dup.dependency_coverage.ambiguous, 1);
+    assert_eq!(calls_dup.dependency_count, 0);
+    assert_eq!(calls_dup.dependency_coverage.unresolved, 1);
+    assert_eq!(calls_dup.dependency_coverage.ambiguous, 0);
 
-    // ...and neither `dup` gets the caller, which coverage says.
+    // Neither unrelated declaration receives the unproved caller.
     let dup = dependencies(id_of("src/a.rs", "dup")?)?;
     assert!(dup.callers.is_empty());
     assert_eq!(
         (
             dup.caller_coverage.name_matches,
-            dup.caller_coverage.ambiguous
+            dup.caller_coverage.resolved_elsewhere
         ),
         (1, 1)
     );
     assert!(
-        dup.coverage_note.contains("could be calling it"),
+        dup.coverage_note.contains("lack proof for this symbol"),
         "{}",
         dup.coverage_note
     );
@@ -222,7 +223,7 @@ vector_backend = "sqlite"
             rust.ambiguous,
             rust.unresolved
         ),
-        (5, 2, 1, 2)
+        (5, 3, 0, 2)
     );
     assert!(status.call_graph.rule.contains("exact qualified name"));
     assert!(status.call_graph.rule.contains("may be internal"));

@@ -1,5 +1,16 @@
 use super::*;
 
+fn proven_edge(source: &SymbolRecord, target: &SymbolRecord, edge_kind: EdgeKind) -> SymbolEdge {
+    SymbolEdge {
+        source_id: source.id.clone(),
+        target_qualified_name: target.qualified_name.clone(),
+        target_symbol_id: Some(target.id.clone()),
+        target_file_path: None,
+        edge_kind,
+        file_path: source.file_path.clone(),
+    }
+}
+
 fn test_symbol(id: &str, file_path: &str, qualified_name: &str) -> SymbolRecord {
     SymbolRecord {
         id: id.to_owned(),
@@ -22,11 +33,7 @@ fn populate_symbol_neighbors_creates_forward_and_reverse_rows() {
     store.upsert_symbol(alpha.clone()).expect("upsert alpha");
     store.upsert_symbol(beta.clone()).expect("upsert beta");
     store
-        .upsert_edges(&[calls_edge(
-            alpha.id.as_str(),
-            beta.qualified_name.as_str(),
-            alpha.file_path.as_str(),
-        )])
+        .upsert_edges(&[proven_edge(&alpha, &beta, EdgeKind::Calls)])
         .expect("upsert edge");
 
     store
@@ -72,11 +79,7 @@ fn populate_symbol_neighbors_replaces_stale_rows_for_reindexed_file() {
     }
 
     store
-        .upsert_edges(&[calls_edge(
-            alpha.id.as_str(),
-            beta.qualified_name.as_str(),
-            alpha.file_path.as_str(),
-        )])
+        .upsert_edges(&[proven_edge(&alpha, &beta, EdgeKind::Calls)])
         .expect("upsert first edge");
     store
         .populate_symbol_neighbors(alpha.file_path.as_str())
@@ -86,11 +89,7 @@ fn populate_symbol_neighbors_replaces_stale_rows_for_reindexed_file() {
         .delete_edges_for_file(alpha.file_path.as_str())
         .expect("delete old file edges");
     store
-        .upsert_edges(&[calls_edge(
-            alpha.id.as_str(),
-            gamma.qualified_name.as_str(),
-            alpha.file_path.as_str(),
-        )])
+        .upsert_edges(&[proven_edge(&alpha, &gamma, EdgeKind::Calls)])
         .expect("upsert replacement edge");
     store
         .populate_symbol_neighbors(alpha.file_path.as_str())
@@ -141,9 +140,9 @@ fn refreshing_callee_preserves_incoming_edges_and_replaces_only_its_outgoing_edg
     }
     store
         .upsert_edges(&[
-            calls_edge(&alpha.id, &beta.qualified_name, &alpha.file_path),
-            calls_edge(&beta.id, &gamma.qualified_name, &beta.file_path),
-            calls_edge(&delta.id, &gamma.qualified_name, &delta.file_path),
+            proven_edge(&alpha, &beta, EdgeKind::Calls),
+            proven_edge(&beta, &gamma, EdgeKind::Calls),
+            proven_edge(&delta, &gamma, EdgeKind::Calls),
         ])
         .expect("upsert edges");
     for symbol in [&alpha, &beta, &delta] {
@@ -156,7 +155,7 @@ fn refreshing_callee_preserves_incoming_edges_and_replaces_only_its_outgoing_edg
         .delete_edges_for_file(&beta.file_path)
         .expect("delete callee's old edges");
     store
-        .upsert_edges(&[calls_edge(&beta.id, &delta.qualified_name, &beta.file_path)])
+        .upsert_edges(&[proven_edge(&beta, &delta, EdgeKind::Calls)])
         .expect("replace callee's outgoing edge");
     for _ in 0..2 {
         store
@@ -199,11 +198,7 @@ fn refreshing_new_callee_resolves_previously_unresolved_callers() {
     let beta = test_symbol("sym-beta", "src/b.rs", "beta");
     store.upsert_symbol(alpha.clone()).expect("upsert caller");
     store
-        .upsert_edges(&[calls_edge(
-            &alpha.id,
-            &beta.qualified_name,
-            &alpha.file_path,
-        )])
+        .upsert_edges(&[proven_edge(&alpha, &beta, EdgeKind::Calls)])
         .expect("upsert unresolved edge");
     store
         .populate_symbol_neighbors(&alpha.file_path)
@@ -245,16 +240,8 @@ fn get_symbol_neighbors_by_type_filters_rows() {
 
     store
         .upsert_edges(&[
-            calls_edge(
-                alpha.id.as_str(),
-                beta.qualified_name.as_str(),
-                alpha.file_path.as_str(),
-            ),
-            depends_edge(
-                alpha.id.as_str(),
-                gamma.qualified_name.as_str(),
-                alpha.file_path.as_str(),
-            ),
+            proven_edge(&alpha, &beta, EdgeKind::Calls),
+            proven_edge(&alpha, &gamma, EdgeKind::DependsOn),
         ])
         .expect("upsert mixed edges");
     store
@@ -297,11 +284,7 @@ fn mark_removed_cleans_reverse_symbol_neighbors() {
     store.upsert_symbol(alpha.clone()).expect("upsert alpha");
     store.upsert_symbol(beta.clone()).expect("upsert beta");
     store
-        .upsert_edges(&[calls_edge(
-            alpha.id.as_str(),
-            beta.qualified_name.as_str(),
-            alpha.file_path.as_str(),
-        )])
+        .upsert_edges(&[proven_edge(&alpha, &beta, EdgeKind::Calls)])
         .expect("upsert edge");
     store
         .populate_symbol_neighbors(alpha.file_path.as_str())
@@ -331,11 +314,7 @@ fn reconcile_and_prune_cleans_stale_symbol_neighbors() {
     }
 
     store
-        .upsert_edges(&[calls_edge(
-            old_symbol.id.as_str(),
-            target.qualified_name.as_str(),
-            old_symbol.file_path.as_str(),
-        )])
+        .upsert_edges(&[proven_edge(&old_symbol, &target, EdgeKind::Calls)])
         .expect("upsert edge");
     store
         .populate_symbol_neighbors(old_symbol.file_path.as_str())
@@ -366,6 +345,8 @@ fn reverse_edge_query_filters_target_and_kind_without_dropping_structural_eviden
     let mut expected = kinds
         .into_iter()
         .map(|edge_kind| SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: "caller".to_owned(),
             target_qualified_name: "target".to_owned(),
             edge_kind,
@@ -375,6 +356,8 @@ fn reverse_edge_query_filters_target_and_kind_without_dropping_structural_eviden
     store.upsert_edges(&expected).expect("all structural kinds");
     store
         .upsert_edges(&[SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             target_qualified_name: "unrelated".to_owned(),
             ..expected[0].clone()
         }])

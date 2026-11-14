@@ -5,7 +5,7 @@ use std::path::Path;
 use aether_core::{EdgeKind, Position, SourceRange};
 use aether_parse::{ModuleRoots, SymbolExtractor, language_for_path};
 use aether_sir::SirAnnotation;
-use aether_store::{NameResolution, NameSite, SirStateStore, SqliteStore, SymbolRecord};
+use aether_store::{NameResolution, SirStateStore, SqliteStore, SymbolRecord};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -401,20 +401,19 @@ impl AetherMcpServer {
                     record.id.as_str(),
                     &[EdgeKind::Calls],
                 )? {
-                    let target = match store.resolve_call_edge(
-                        edge.target_qualified_name.as_str(),
-                        NameSite::of(&record),
-                        &mut |file_path| modules.module_of(file_path),
-                    )? {
-                        NameResolution::Found(mut overloads) => overloads.swap_remove(0),
-                        NameResolution::NotFound => continue,
-                        NameResolution::Ambiguous(_) => {
-                            if !ambiguous_callees.contains(&edge.target_qualified_name) {
-                                ambiguous_callees.push(edge.target_qualified_name);
+                    let target =
+                        match store.resolve_symbol_edge(&edge, &record, &mut |file_path| {
+                            modules.module_of(file_path)
+                        })? {
+                            NameResolution::Found(mut overloads) => overloads.swap_remove(0),
+                            NameResolution::NotFound => continue,
+                            NameResolution::Ambiguous(_) => {
+                                if !ambiguous_callees.contains(&edge.target_qualified_name) {
+                                    ambiguous_callees.push(edge.target_qualified_name);
+                                }
+                                continue;
                             }
-                            continue;
-                        }
-                    };
+                        };
                     if !visited.insert(target.id.clone()) {
                         continue;
                     }
@@ -618,6 +617,8 @@ vector_backend = "sqlite"
         let store = aether_store::SqliteStore::open(workspace).expect("open store");
         store
             .upsert_edges(&[SymbolEdge {
+                target_symbol_id: Some(target.id.clone()),
+                target_file_path: Some(target.file_path.clone()),
                 source_id: source.id.clone(),
                 target_qualified_name: target.qualified_name.clone(),
                 edge_kind: EdgeKind::Calls,

@@ -295,8 +295,8 @@ fn migration_v15_creates_and_backfills_symbol_neighbors() {
 
             INSERT INTO symbols (id, file_path, language, kind, qualified_name, signature_fingerprint, last_seen_at)
             VALUES
-                ('sym-alpha', 'src/a.rs', 'rust', 'function', 'alpha', 'sig-alpha', 1),
-                ('sym-beta', 'src/b.rs', 'rust', 'function', 'beta', 'sig-beta', 2);
+                ('sym-alpha', 'src/a.rs', 'python', 'function', 'alpha', 'sig-alpha', 1),
+                ('sym-beta', 'src/b.rs', 'python', 'function', 'beta', 'sig-beta', 2);
 
             INSERT INTO symbol_edges (source_id, target_qualified_name, edge_kind, file_path)
             VALUES ('sym-alpha', 'beta', 'calls', 'src/a.rs');

@@ -725,7 +725,7 @@ async fn build_graph_section(
     for (id, qname, _kind) in symbols.iter().take(5) {
         // Get dependencies
         let deps = graph.get_dependencies(id).await.unwrap_or_default();
-        let callers = graph.get_callers(qname).await.unwrap_or_default();
+        let callers = store.list_callers_for_symbol(id).unwrap_or_default();
 
         if deps.is_empty() && callers.is_empty() {
             continue;

@@ -61,12 +61,16 @@ pub fn save(&self, record: Record) {
     store
         .upsert_edges(&[
             SymbolEdge {
+                target_symbol_id: None,
+                target_file_path: None,
                 source_id: load_symbol.id.clone(),
                 target_qualified_name: "StaleLoader".to_owned(),
                 edge_kind: EdgeKind::Calls,
                 file_path: "src/lib.rs".to_owned(),
             },
             SymbolEdge {
+                target_symbol_id: None,
+                target_file_path: None,
                 source_id: save_symbol.id.clone(),
                 target_qualified_name: "StaleRecord".to_owned(),
                 edge_kind: EdgeKind::TypeRef,
@@ -688,6 +692,8 @@ fn inference_only_no_removal_events_preserve_pending_graph_cleanup() {
         // the compatibility alias, which skips only the external graph.
         store
             .upsert_edges(&[SymbolEdge {
+                target_symbol_id: None,
+                target_file_path: None,
                 source_id: "file:src/unrelated.rs".to_owned(),
                 target_qualified_name: "StaleDependency".to_owned(),
                 edge_kind: EdgeKind::DependsOn,

@@ -40,12 +40,11 @@ pub(crate) async fn symbol_detail_fragment(
     .unwrap_or_default();
 
     let callers_shared = state.shared.clone();
-    let qualified_name = symbol.qualified_name.clone();
+    let caller_symbol_id = symbol.id.clone();
     let callers = support::run_async_with_timeout(move || async move {
         callers_shared
-            .graph
-            .get_callers(&qualified_name)
-            .await
+            .store
+            .list_callers_for_symbol(&caller_symbol_id)
             .map_err(|err| err.to_string())
     })
     .await

@@ -27,6 +27,7 @@ mod fingerprint_history;
 mod freshness;
 mod graph;
 mod graph_coverage;
+mod graph_resolution;
 mod history;
 mod language_family;
 mod lexical;
@@ -91,6 +92,7 @@ pub use language_family::{
 pub use name_resolution::{
     NameResolution, NameSite, ambiguity_label, ambiguity_note, call_target_candidates,
     call_targets_of, narrow_call_edge_candidates, narrow_name_candidates,
+    narrow_symbol_edge_candidates,
 };
 pub use project_notes::{
     ProjectEntityRefRecord, ProjectNoteEmbeddingRecord, ProjectNoteRecord,
@@ -117,6 +119,9 @@ pub use thresholds::{CalibrationEmbeddingRecord, ThresholdCalibrationRecord};
 pub use write_intents::{BatchCompleteResult, IntentOperation, WriteIntent, WriteIntentStatus};
 
 pub(crate) use graph::STRUCTURAL_EDGE_KINDS;
+pub(crate) use graph_resolution::{
+    edge_target_candidate_matches_sql, edge_target_matches_sql, require_graph_provenance_schema,
+};
 pub(crate) use lexical::project_note_lexical_terms;
 pub(crate) use schema::run_migrations;
 pub(crate) use sir_history::{
@@ -131,7 +136,7 @@ pub(crate) use symbols::{
 const SYMBOL_ACCESS_COUNTER_MAX: i64 = i64::MAX;
 /// Highest core schema supported by this build. Read-only clients may open older
 /// schemas; writable opening performs transactional forward migrations.
-pub const CORE_SCHEMA_VERSION: u32 = 23;
+pub const CORE_SCHEMA_VERSION: u32 = 24;
 /// First core schema with explicit per-incarnation history archives.
 pub const SYMBOL_HISTORY_SCHEMA_VERSION: u32 = 22;
 /// First core schema with durable retirement projection cleanup receipts.

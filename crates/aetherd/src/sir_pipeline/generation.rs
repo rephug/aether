@@ -55,13 +55,22 @@ impl SirPipeline {
             });
 
             for candidate in candidates {
-                let implements_trait = store
-                    .list_symbol_edges_for_source_and_kinds(
-                        candidate.id.as_str(),
-                        &[EdgeKind::Implements],
-                    )?
-                    .iter()
-                    .any(|edge| edge.target_qualified_name == symbol.qualified_name);
+                let mut implements_trait = false;
+                for edge in store.list_symbol_edges_for_source_and_kinds(
+                    candidate.id.as_str(),
+                    &[EdgeKind::Implements],
+                )? {
+                    if store
+                        .resolve_symbol_edge(&edge, &candidate, &mut |file_path| {
+                            packages.module_of(file_path)
+                        })?
+                        .found()
+                        .is_some_and(|target| target.id == symbol.id)
+                    {
+                        implements_trait = true;
+                        break;
+                    }
+                }
                 if !implements_trait {
                     continue;
                 }

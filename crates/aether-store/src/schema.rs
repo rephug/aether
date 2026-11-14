@@ -791,6 +791,51 @@ pub(crate) fn apply_migrations(tx: &Transaction<'_>, version: i32) -> Result<(),
         )?;
     }
 
+    if version < 24 {
+        // Legacy Rust/ECMAScript references have no target proof. Keep their raw
+        // spelling, but discard their fabricated projections until re-extraction.
+        if table_exists(conn, "symbol_edges")? {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE symbol_edges RENAME TO symbol_edges_without_provenance;
+                CREATE TABLE symbol_edges (
+                    source_id TEXT NOT NULL,
+                    target_qualified_name TEXT NOT NULL,
+                    edge_kind TEXT NOT NULL CHECK (edge_kind IN ('calls', 'depends_on', 'type_ref', 'implements')),
+                    file_path TEXT NOT NULL,
+                    target_symbol_id TEXT,
+                    target_file_path TEXT
+                );
+                INSERT INTO symbol_edges (source_id, target_qualified_name, edge_kind, file_path)
+                SELECT source_id, target_qualified_name, edge_kind, file_path
+                FROM symbol_edges_without_provenance;
+                DROP TABLE symbol_edges_without_provenance;
+                "#,
+            )?;
+        }
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS symbol_edges (
+                source_id TEXT NOT NULL,
+                target_qualified_name TEXT NOT NULL,
+                edge_kind TEXT NOT NULL CHECK (edge_kind IN ('calls', 'depends_on', 'type_ref', 'implements')),
+                file_path TEXT NOT NULL,
+                target_symbol_id TEXT,
+                target_file_path TEXT
+            );
+            CREATE UNIQUE INDEX idx_edges_identity ON symbol_edges(
+                source_id, target_qualified_name, edge_kind,
+                COALESCE(target_symbol_id, ''), COALESCE(target_file_path, '')
+            );
+            CREATE INDEX idx_edges_target ON symbol_edges(target_qualified_name);
+            CREATE INDEX idx_edges_file ON symbol_edges(file_path);
+            CREATE INDEX idx_edges_target_file ON symbol_edges(target_file_path);
+            PRAGMA user_version = 24;
+            "#,
+        )?;
+        rebuild_symbol_neighbors(conn)?;
+    }
+
     // Additive indexes also apply to stores already at the current schema. These
     // are the lookup keys used when resolving an edge and refreshing one file's
     // neighbors; without them a small graph update scans the symbol catalog.
@@ -829,6 +874,12 @@ pub(crate) fn apply_migrations(tx: &Transaction<'_>, version: i32) -> Result<(),
         );
         "#,
     )?;
+    if version < 24 {
+        conn.execute(
+            "INSERT INTO schema_version (component, version, migrated_at) VALUES ('graph_target_provenance', 0, unixepoch()) ON CONFLICT(component) DO UPDATE SET version = 0, migrated_at = unixepoch()",
+            [],
+        )?;
+    }
     // When the indexer last started reading each file (unix milliseconds), so freshness
     // can tell an edit made after that read from one made before it; `symbols.last_seen_at`
     // has whole seconds and, after a full sync, the time the sync wrote rather than read.
@@ -863,12 +914,13 @@ pub(crate) fn rebuild_symbol_neighbors(conn: &Connection) -> Result<(), StoreErr
     if !table_exists(conn, "symbol_neighbors")?
         || !table_exists(conn, "symbol_edges")?
         || !table_exists(conn, "symbols")?
+        || !table_has_column(conn, "symbol_edges", "target_symbol_id")?
     {
         return Ok(());
     }
 
     conn.execute("DELETE FROM symbol_neighbors", [])?;
-    let family = same_language_family_sql("s_source.language", "s_target.language");
+    let resolution = edge_target_matches_sql("e", "s_source.language", "s_target");
     conn.execute_batch(&format!(
         r#"
         INSERT OR REPLACE INTO symbol_neighbors (
@@ -883,8 +935,7 @@ pub(crate) fn rebuild_symbol_neighbors(conn: &Connection) -> Result<(), StoreErr
         FROM symbol_edges e
         JOIN symbols s_source ON s_source.id = e.source_id
         JOIN symbols s_target
-          ON s_target.qualified_name = e.target_qualified_name
-         AND {family};
+          ON {resolution};
 
         INSERT OR REPLACE INTO symbol_neighbors (
             symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file
@@ -904,8 +955,7 @@ pub(crate) fn rebuild_symbol_neighbors(conn: &Connection) -> Result<(), StoreErr
         FROM symbol_edges e
         JOIN symbols s_source ON s_source.id = e.source_id
         JOIN symbols s_target
-          ON s_target.qualified_name = e.target_qualified_name
-         AND {family};
+          ON {resolution};
         "#
     ))?;
 

@@ -22,7 +22,7 @@ use aether_infer::{EmbeddingProviderOverrides, load_embedding_provider_from_conf
 use aether_sir::{SirAnnotation, validate_sir};
 use aether_store::{
     DriftStore, SirStateStore, SqliteStore, SurrealGraphStore, SymbolCatalogStore, SymbolRecord,
-    SymbolRelationStore, TestIntentStore, VectorStore, open_vector_store,
+    TestIntentStore, VectorStore, open_vector_store,
 };
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
@@ -74,7 +74,17 @@ impl HealthCommandStores {
             config.storage.graph_backend,
             GraphBackend::Surreal | GraphBackend::Cozo
         ) {
-            if let Some(daemon) = crate::daemon_detect::detect_running_daemon(config, workspace) {
+            let external_daemon = crate::daemon_detect::detect_running_daemon(config, workspace)
+                .filter(|daemon| {
+                    if daemon.source != crate::daemon_detect::DaemonSource::LockFile {
+                        return true;
+                    }
+                    // A fresh lock probe also conflicts with this process's own
+                    // native handle. This hint only exempts a proven local cache
+                    // entry; a failed hint keeps the conservative lock result.
+                    !SurrealGraphStore::has_cached_handle(workspace).unwrap_or(false)
+                });
+            if let Some(daemon) = external_daemon {
                 crate::daemon_detect::warn_daemon_detected(&daemon, "health-score");
                 None
             } else {
@@ -931,25 +941,10 @@ fn build_trait_consumer_matrix(
 
     for method in child_methods {
         let method_name = symbol_leaf_name(method.qualified_name.as_str()).to_owned();
-        let mut seen_source_ids = HashSet::<String>::new();
         let mut edges = Vec::new();
-
-        for edge in store.get_callers(method.qualified_name.as_str())? {
-            if !seen_source_ids.insert(edge.source_id.clone()) {
-                continue;
-            }
-            caller_symbol_ids.insert(edge.source_id.clone());
-            edges.push((edge.source_id, edge.file_path));
-        }
-
-        if method_name != method.qualified_name {
-            for edge in store.get_callers(method_name.as_str())? {
-                if !seen_source_ids.insert(edge.source_id.clone()) {
-                    continue;
-                }
-                caller_symbol_ids.insert(edge.source_id.clone());
-                edges.push((edge.source_id, edge.file_path));
-            }
+        for caller in store.list_callers_for_symbol(&method.id)? {
+            caller_symbol_ids.insert(caller.id.clone());
+            edges.push((caller.id, caller.file_path));
         }
 
         method_edges.insert(method_name, edges);
@@ -1531,10 +1526,9 @@ mod tests {
     use aether_graph_algo::GraphAlgorithmEdge;
     use aether_sir::SirAnnotation;
     use aether_store::{
-        CommunitySnapshotRecord, DriftResultRecord, DriftStore, GraphStore, ResolvedEdge,
-        SemanticIndexStore, SirStateStore, SqliteStore, SurrealGraphStore, SymbolCatalogStore,
-        SymbolEmbeddingRecord, SymbolRecord, SymbolRelationStore, TestIntentRecord,
-        TestIntentStore, open_vector_store,
+        CommunitySnapshotRecord, DriftResultRecord, DriftStore, SemanticIndexStore, SirStateStore,
+        SqliteStore, SurrealGraphStore, SymbolCatalogStore, SymbolEmbeddingRecord, SymbolRecord,
+        SymbolRelationStore, TestIntentRecord, TestIntentStore, open_vector_store,
     };
     use rusqlite::Connection;
     use tempfile::tempdir;
@@ -1725,26 +1719,34 @@ model = "qwen3-embeddings-4B"
         store
             .upsert_edges(&[
                 aether_core::SymbolEdge {
+                    target_symbol_id: Some("trait-alpha".to_owned()),
+                    target_file_path: None,
                     source_id: "consumer-a".to_owned(),
-                    target_qualified_name: "alpha".to_owned(),
+                    target_qualified_name: "Store::alpha".to_owned(),
                     edge_kind: EdgeKind::Calls,
                     file_path: "crates/example/src/consumer_a.rs".to_owned(),
                 },
                 aether_core::SymbolEdge {
+                    target_symbol_id: Some("trait-beta".to_owned()),
+                    target_file_path: None,
                     source_id: "consumer-a".to_owned(),
-                    target_qualified_name: "beta".to_owned(),
+                    target_qualified_name: "Store::beta".to_owned(),
                     edge_kind: EdgeKind::Calls,
                     file_path: "crates/example/src/consumer_a.rs".to_owned(),
                 },
                 aether_core::SymbolEdge {
+                    target_symbol_id: Some("trait-gamma".to_owned()),
+                    target_file_path: None,
                     source_id: "consumer-b".to_owned(),
-                    target_qualified_name: "gamma".to_owned(),
+                    target_qualified_name: "Store::gamma".to_owned(),
                     edge_kind: EdgeKind::Calls,
                     file_path: "crates/example/src/consumer_b.rs".to_owned(),
                 },
                 aether_core::SymbolEdge {
+                    target_symbol_id: Some("trait-delta".to_owned()),
+                    target_file_path: None,
                     source_id: "consumer-b".to_owned(),
-                    target_qualified_name: "delta".to_owned(),
+                    target_qualified_name: "Store::delta".to_owned(),
                     edge_kind: EdgeKind::Calls,
                     file_path: "crates/example/src/consumer_b.rs".to_owned(),
                 },
@@ -1789,50 +1791,57 @@ model = "qwen3-embeddings-4B"
         workspace: &Path,
         symbols: &[SymbolRecord],
         edges: &[(&str, &str)],
-    ) {
-        let seed_workspace = tempdir().expect("seed workspace");
-        write_file(&seed_workspace.path().join("Cargo.toml"), "[workspace]\n");
-        fs::create_dir_all(seed_workspace.path().join(".aether")).expect("create seed .aether");
-
+    ) -> SurrealGraphStore {
+        // These fixtures supply known identities directly. Seed the canonical
+        // evidence too, so opening the graph can replay its provenance snapshot.
+        let store = SqliteStore::open(workspace).expect("open canonical fixture store");
+        for symbol in symbols {
+            store
+                .upsert_symbol(symbol.clone())
+                .expect("canonical symbol");
+        }
+        let edges = edges
+            .iter()
+            .map(|(source, target)| {
+                let source = symbols
+                    .iter()
+                    .find(|symbol| symbol.id == *source)
+                    .expect("fixture caller");
+                let target = symbols
+                    .iter()
+                    .find(|symbol| symbol.id == *target)
+                    .expect("fixture target");
+                aether_core::SymbolEdge {
+                    source_id: source.id.clone(),
+                    target_qualified_name: target.qualified_name.clone(),
+                    target_symbol_id: Some(target.id.clone()),
+                    target_file_path: Some(target.file_path.clone()),
+                    edge_kind: EdgeKind::Calls,
+                    file_path: source.file_path.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        store.upsert_edges(&edges).expect("canonical fixture edges");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("runtime");
         runtime.block_on(async {
-            let graph = SurrealGraphStore::open(seed_workspace.path())
+            let graph = SurrealGraphStore::open(workspace)
                 .await
                 .expect("open surreal graph");
-            for symbol in symbols {
-                graph
-                    .upsert_symbol_node(symbol)
+            for file in symbols
+                .iter()
+                .map(|symbol| symbol.file_path.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+            {
+                store
+                    .sync_graph_for_file(&graph, file)
                     .await
-                    .expect("upsert symbol node");
+                    .expect("project canonical fixture graph");
             }
-            for (source, target) in edges {
-                graph
-                    .upsert_edge(&ResolvedEdge {
-                        source_id: (*source).to_owned(),
-                        target_id: (*target).to_owned(),
-                        edge_kind: EdgeKind::Calls,
-                        file_path: "crates/example/src/lib.rs".to_owned(),
-                    })
-                    .await
-                    .expect("upsert edge");
-            }
-        });
-        drop(runtime);
-
-        let source_graph = seed_workspace.path().join(".aether/graph");
-        let target_graph = workspace.join(".aether/graph");
-        fs::create_dir_all(workspace.join(".aether")).expect("create workspace .aether");
-        if target_graph.exists() {
-            fs::remove_dir_all(&target_graph).expect("remove existing graph dir");
-        }
-        fs::rename(&source_graph, &target_graph).expect("move surreal graph dir");
-        let lock_file = target_graph.join("LOCK");
-        if lock_file.exists() {
-            fs::remove_file(lock_file).expect("remove stale surreal lock");
-        }
+            graph
+        })
     }
 
     fn default_args() -> HealthScoreArgs {
@@ -2054,7 +2063,8 @@ model = "qwen3-embeddings-4B"
             )
             .expect("seed test intents");
 
-        seed_surreal_graph_snapshot(workspace.path(), &symbols, &[("sym-a", "sym-b")]);
+        let _graph_guard =
+            seed_surreal_graph_snapshot(workspace.path(), &symbols, &[("sym-a", "sym-b")]);
 
         let mut args = default_args();
         args.semantic = true;
@@ -2116,7 +2126,7 @@ model = "qwen3-embeddings-4B"
             .expect("seed communities");
         // The production functions call each other; the inline tests form their own
         // cluster, which the unfiltered global Louvain would count as a second community.
-        seed_surreal_graph_snapshot(
+        let _graph_guard = seed_surreal_graph_snapshot(
             workspace.path(),
             &symbols,
             &[
@@ -2295,7 +2305,7 @@ model = "qwen3-embeddings-4B"
             .upsert_symbol_embedding(embedding_record("sym-note-d", vec![0.1, 0.9]))
             .expect("seed note-d embedding");
 
-        seed_surreal_graph_snapshot(
+        let _graph_guard = seed_surreal_graph_snapshot(
             workspace.path(),
             &symbols,
             &[
@@ -2619,5 +2629,26 @@ model = "qwen3-embeddings-4B"
                 .and_then(serde_json::Value::as_str),
             Some("Store")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn semantic_health_does_not_open_an_uncached_externally_locked_graph() {
+        use fs2::FileExt;
+        let workspace = create_workspace();
+        let store = SqliteStore::open(workspace.path()).expect("store");
+        drop(store);
+        let graph_dir = workspace.path().join(".aether/graph");
+        fs::create_dir_all(&graph_dir).expect("graph directory");
+        let lock = fs::File::create(graph_dir.join("LOCK")).expect("lock file");
+        lock.lock_exclusive().expect("hold native graph lock");
+        let mut config = AetherConfig::default();
+        config.storage.graph_backend = GraphBackend::Surreal;
+        let stores = super::HealthCommandStores::open_if_available(workspace.path(), &config)
+            .expect("graceful graph unavailability")
+            .expect("indexed workspace");
+        assert!(stores.graph.is_none());
+        assert!(!SurrealGraphStore::has_cached_handle(workspace.path()).expect("cache presence"));
+        lock.unlock().expect("unlock graph fixture");
     }
 }

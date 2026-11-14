@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -6,7 +7,6 @@ use serde::Serialize;
 use serde_json::Value;
 
 use aether_config::GraphBackend;
-use aether_store::{EDGE_FILE_LANGUAGE_CTE, edge_source_family_matches_sql};
 
 use crate::state::SharedState;
 use crate::support::{self, DashboardState};
@@ -227,34 +227,32 @@ fn load_sqlite_metrics(shared: &SharedState) -> Result<(i64, i64, f64, i64, f64)
         Err(_) => 0.0,
     };
 
-    // Orphan count: symbols with no edges (neither as source nor target). An edge
-    // reaches a symbol only from the symbol's own language family.
-    let orphan_count = match conn.query_row(
-        &format!(
-            r#"
-            WITH {EDGE_FILE_LANGUAGE_CTE}
-            SELECT COUNT(*)
-            FROM symbols s
-            WHERE NOT EXISTS (
-                SELECT 1 FROM symbol_edges e
-                WHERE e.source_id = s.id
+    // Keep the existing outgoing-reference definition, but count an incoming
+    // reference only when the canonical graph proves that exact target identity.
+    let incoming_targets = shared
+        .store
+        .list_graph_dependency_edges()
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .map(|edge| edge.target_symbol_id)
+        .collect::<HashSet<_>>();
+    let orphan_count = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.id FROM symbols s WHERE NOT EXISTS (SELECT 1 FROM symbol_edges e WHERE e.source_id = s.id)",
             )
-            AND NOT EXISTS (
-                SELECT 1 FROM symbol_edges e2
-                LEFT JOIN edge_file_language source_file
-                  ON source_file.file_path = e2.file_path
-                WHERE e2.target_qualified_name = s.qualified_name
-                  AND {family}
-            )
-            "#,
-            family = edge_source_family_matches_sql("source_file.language", "s.language"),
-        ),
-        [],
-        |row| row.get::<_, i64>(0),
-    ) {
-        Ok(count) => count.max(0),
-        Err(err) if support::is_missing_table(&err) => 0,
-        Err(_) => 0,
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        let mut count = 0i64;
+        for row in rows {
+            let id = row.map_err(|err| err.to_string())?;
+            if !incoming_targets.contains(&id) {
+                count += 1;
+            }
+        }
+        count
     };
 
     // Index freshness

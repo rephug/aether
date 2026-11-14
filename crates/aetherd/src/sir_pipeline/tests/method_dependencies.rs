@@ -12,6 +12,8 @@ fn write_cargo_manifest(workspace: &Path, dir: &str) {
 
 fn calls(source_id: &str, target: &str, file_path: &str) -> SymbolEdge {
     SymbolEdge {
+        target_symbol_id: None,
+        target_file_path: None,
         source_id: source_id.to_owned(),
         target_qualified_name: target.to_owned(),
         edge_kind: EdgeKind::Calls,
@@ -415,6 +417,8 @@ fn trait_implementor_fallback_requires_an_implements_edge() {
         calls("alpha-run", "AlphaDep", "src/lib.rs"),
         calls("beta-run", "BetaDep", "src/lib.rs"),
         SymbolEdge {
+            target_symbol_id: Some("trait".to_owned()),
+            target_file_path: Some("src/lib.rs".to_owned()),
             source_id: "beta".to_owned(),
             target_qualified_name: "Store".to_owned(),
             edge_kind: EdgeKind::Implements,
@@ -485,6 +489,8 @@ fn trait_implementor_fallback_ignores_implements_edges_to_other_traits() {
     let edges = [
         calls("beta-run", "BetaDep", "src/lib.rs"),
         SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: "beta".to_owned(),
             target_qualified_name: "Loader".to_owned(),
             edge_kind: EdgeKind::Implements,

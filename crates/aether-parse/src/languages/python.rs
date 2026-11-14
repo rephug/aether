@@ -1047,6 +1047,8 @@ fn import_edges(node: Node<'_>, source: &[u8], file_path: &str) -> Vec<SymbolEdg
     python_import_targets(node, source, file_path)
         .into_iter()
         .map(|target| SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: file_source_id(file_path),
             target_qualified_name: target,
             edge_kind: EdgeKind::DependsOn,
@@ -1125,6 +1127,8 @@ impl<'a, 'tree> Resolver<'a, 'tree> {
                 |id| (*id).to_owned(),
             );
         Some(SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id,
             target_qualified_name: target,
             edge_kind: EdgeKind::Calls,

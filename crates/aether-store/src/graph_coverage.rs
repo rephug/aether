@@ -2,11 +2,11 @@
 //! from "calls things the graph can't name".
 //!
 //! The counts use the rule the stored graph itself uses (`symbol_neighbors`, graph sync,
-//! `get_call_chain`): an edge's target text matches a workspace symbol by exact qualified
-//! name, in the caller's language family.
+//! `get_call_chain`): explicit symbol/file proof for Rust and ECMAScript, and legacy
+//! qualified-name matching for other languages, always within the language family.
 
 use super::*;
-use crate::language_family::{EDGE_FILE_LANGUAGE_CTE, same_language_family_sql};
+use crate::language_family::EDGE_FILE_LANGUAGE_CTE;
 
 /// Most source ids bound in one statement.
 const SOURCE_ID_CHUNK: usize = 500;
@@ -15,14 +15,13 @@ const SOURCE_ID_CHUNK: usize = 500;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CallEdgeCoverage {
     pub call_edges: u64,
-    /// The target names exactly one symbol.
+    /// Exactly one symbol satisfies the recorded target evidence.
     pub resolved: u64,
-    /// The target names several symbols; the graph links every one of them.
+    /// Several symbols satisfy the target evidence. Proven-file ambiguity is not linked.
     pub ambiguous: u64,
-    /// No workspace symbol has the target's exact qualified name, so the graph drops the
-    /// edge. Many are external or standard-library calls, but they may be internal: the
-    /// Rust parser records method calls by their bare method name, and a call through a
-    /// path or alias doesn't spell the qualified name.
+    /// No symbol satisfies sufficient target evidence, so the graph omits the edge.
+    /// A matching spelling alone does not prove Rust or ECMAScript provenance.
+    /// Unresolved references may be internal, external or standard-library calls.
     pub unresolved: u64,
 }
 
@@ -51,70 +50,45 @@ pub struct LanguageCallEdgeCoverage {
 /// One row per (language, caller is a symbol) of the call edges `filter` selects.
 fn coverage_sql(filter: &str) -> String {
     let source_language = "COALESCE(src.language, fl.language)";
-    let family = same_language_family_sql(source_language, "nc.language");
+    let candidates = edge_target_candidate_matches_sql("e", source_language, "target");
     format!(
         r#"
-        WITH name_counts AS MATERIALIZED (
-            SELECT qualified_name, language, COUNT(*) AS n
-            FROM symbols
-            GROUP BY qualified_name, language
-        ),
-        {EDGE_FILE_LANGUAGE_CTE},
+        WITH {EDGE_FILE_LANGUAGE_CTE},
         edges AS (
-            SELECT
+            SELECT e.rowid,
                 {source_language} AS language,
                 src.id IS NOT NULL AS from_symbol,
-                COALESCE(SUM(CASE WHEN {family} THEN nc.n ELSE 0 END), 0) AS candidates
+                COUNT(target.id) AS candidates
             FROM symbol_edges e
             LEFT JOIN symbols src ON src.id = e.source_id
             LEFT JOIN edge_file_language fl ON fl.file_path = e.file_path
-            LEFT JOIN name_counts nc ON nc.qualified_name = e.target_qualified_name
+            LEFT JOIN symbols target ON {candidates}
             WHERE e.edge_kind = 'calls' {filter}
             GROUP BY e.rowid
         )
-        SELECT
-            COALESCE(language, ''),
-            from_symbol,
+        SELECT COALESCE(language, ''), from_symbol,
             SUM(CASE WHEN candidates = 1 THEN 1 ELSE 0 END),
             SUM(CASE WHEN candidates > 1 THEN 1 ELSE 0 END),
             SUM(CASE WHEN candidates = 0 THEN 1 ELSE 0 END)
-        FROM edges
-        GROUP BY 1, 2
-        ORDER BY 1, 2
+        FROM edges GROUP BY 1, 2 ORDER BY 1, 2
         "#
     )
 }
 
-/// The call edges out of the sources bound as `?1..?n`, as one row in the same shape as
-/// [`coverage_sql`]'s. Only the target names those edges use are counted, so the cost
-/// follows the edges selected, not the size of the index.
+/// Only selected callers are joined to candidates; no global name census is needed.
 fn source_coverage_sql(placeholders: &str) -> String {
-    let family = same_language_family_sql("selected.language", "nc.language");
+    let candidates = edge_target_candidate_matches_sql("e", "src.language", "target");
     format!(
         r#"
-        WITH selected AS MATERIALIZED (
-            SELECT e.rowid AS edge_id, e.target_qualified_name, src.language
+        WITH edges AS (
+            SELECT e.rowid, COUNT(target.id) AS candidates
             FROM symbol_edges e
             JOIN symbols src ON src.id = e.source_id
+            LEFT JOIN symbols target ON {candidates}
             WHERE e.edge_kind = 'calls' AND e.source_id IN ({placeholders})
-        ),
-        name_counts AS MATERIALIZED (
-            SELECT qualified_name, language, COUNT(*) AS n
-            FROM symbols
-            WHERE qualified_name IN (SELECT target_qualified_name FROM selected)
-            GROUP BY qualified_name, language
-        ),
-        edges AS (
-            SELECT
-                selected.edge_id,
-                COALESCE(SUM(CASE WHEN {family} THEN nc.n ELSE 0 END), 0) AS candidates
-            FROM selected
-            LEFT JOIN name_counts nc ON nc.qualified_name = selected.target_qualified_name
-            GROUP BY selected.edge_id
+            GROUP BY e.rowid
         )
-        SELECT
-            '',
-            1,
+        SELECT '', 1,
             SUM(CASE WHEN candidates = 1 THEN 1 ELSE 0 END),
             SUM(CASE WHEN candidates > 1 THEN 1 ELSE 0 END),
             SUM(CASE WHEN candidates = 0 THEN 1 ELSE 0 END)
@@ -152,6 +126,7 @@ impl SqliteStore {
         &self,
     ) -> Result<Vec<LanguageCallEdgeCoverage>, StoreError> {
         let conn = self.lock_connection()?;
+        require_graph_provenance_schema(&conn)?;
         let mut by_language = Vec::<LanguageCallEdgeCoverage>::new();
         for (language, from_symbol, resolved, ambiguous, unresolved) in
             coverage_rows(&conn, &coverage_sql(""), &[])?
@@ -194,6 +169,7 @@ impl SqliteStore {
         source_ids.dedup();
 
         let conn = self.lock_connection()?;
+        require_graph_provenance_schema(&conn)?;
         let mut coverage = CallEdgeCoverage::default();
         for chunk in source_ids.chunks(SOURCE_ID_CHUNK) {
             let placeholders = (1..=chunk.len())
@@ -237,6 +213,8 @@ mod tests {
         SymbolEdge {
             source_id: source_id.to_owned(),
             target_qualified_name: target.to_owned(),
+            target_symbol_id: None,
+            target_file_path: (target == "helper").then(|| file_path.to_owned()),
             edge_kind: EdgeKind::Calls,
             file_path: file_path.to_owned(),
         }
@@ -276,8 +254,8 @@ mod tests {
             CallEdgeCoverage {
                 call_edges: 4,
                 resolved: 1,
-                ambiguous: 1,
-                unresolved: 2,
+                ambiguous: 0,
+                unresolved: 3,
             }
         );
         assert_eq!(

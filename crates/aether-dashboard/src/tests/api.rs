@@ -717,6 +717,8 @@ async fn blast_radius_follows_call_edges_only() {
     SqliteStore::open(tmp.path())
         .unwrap()
         .upsert_edges(&[SymbolEdge {
+            target_symbol_id: Some("sym-demo-main".to_owned()),
+            target_file_path: None,
             source_id: "sym-demo-helper".to_owned(),
             target_qualified_name: "demo::main".to_owned(),
             edge_kind: EdgeKind::TypeRef,

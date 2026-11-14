@@ -55,49 +55,15 @@ fn symbol_access_count(workspace: &Path, symbol_id: &str) -> Result<i64> {
 }
 
 fn rebuild_symbol_neighbors(workspace: &Path) -> Result<()> {
-    let conn = Connection::open(workspace.join(".aether/meta.sqlite"))?;
-    conn.execute("DELETE FROM symbol_neighbors", [])?;
-    // The same rows the store writes: edges resolve within the source's language family.
-    let family = aether_store::same_language_family_sql("s_source.language", "s_target.language");
-    conn.execute_batch(&format!(
-        r#"
-        INSERT OR REPLACE INTO symbol_neighbors (
-            symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file
-        )
-        SELECT
-            e.source_id,
-            s_target.id,
-            e.edge_kind,
-            s_target.qualified_name,
-            s_target.file_path
-        FROM symbol_edges e
-        JOIN symbols s_source ON s_source.id = e.source_id
-        JOIN symbols s_target
-          ON s_target.qualified_name = e.target_qualified_name
-         AND {family};
-
-        INSERT OR REPLACE INTO symbol_neighbors (
-            symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file
-        )
-        SELECT
-            s_target.id,
-            e.source_id,
-            CASE e.edge_kind
-                WHEN 'calls' THEN 'called_by'
-                WHEN 'depends_on' THEN 'depended_on_by'
-                WHEN 'implements' THEN 'implemented_by'
-                WHEN 'type_ref' THEN 'type_ref_by'
-                ELSE e.edge_kind || '_reverse'
-            END,
-            s_source.qualified_name,
-            s_source.file_path
-        FROM symbol_edges e
-        JOIN symbols s_source ON s_source.id = e.source_id
-        JOIN symbols s_target
-          ON s_target.qualified_name = e.target_qualified_name
-         AND {family};
-        "#
-    ))?;
+    let store = SqliteStore::open(workspace)?;
+    for file in store
+        .list_symbol_names_and_paths()?
+        .into_iter()
+        .map(|(_, _, file)| file)
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        store.populate_symbol_neighbors(&file)?;
+    }
     Ok(())
 }
 

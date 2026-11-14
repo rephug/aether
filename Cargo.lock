@@ -304,6 +304,7 @@ dependencies = [
  "aether-core",
  "aether-document",
  "aether-graph-algo",
+ "aether-parse",
  "arrow-array",
  "arrow-schema",
  "async-trait",

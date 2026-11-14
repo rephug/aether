@@ -220,11 +220,10 @@ fn seed_live_symbol_cleanup_state(store: &SqliteStore, symbol_id: &str) {
         ))
         .expect("upsert cleanup embedding");
     store
-        .upsert_edges(&[calls_edge(
-            symbol_id,
-            neighbor.qualified_name.as_str(),
-            record.file_path.as_str(),
-        )])
+        .upsert_edges(&[SymbolEdge {
+            target_symbol_id: Some(neighbor.id.clone()),
+            ..calls_edge(symbol_id, &neighbor.qualified_name, &record.file_path)
+        }])
         .expect("upsert cleanup edge");
     store
         .populate_symbol_neighbors(record.file_path.as_str())
@@ -443,6 +442,8 @@ fn assert_preserved_symbol_history_retained(store: &SqliteStore, symbol_id: &str
 
 fn calls_edge(source_id: &str, target: &str, file_path: &str) -> SymbolEdge {
     SymbolEdge {
+        target_symbol_id: None,
+        target_file_path: None,
         source_id: source_id.to_owned(),
         target_qualified_name: target.to_owned(),
         edge_kind: EdgeKind::Calls,
@@ -452,6 +453,8 @@ fn calls_edge(source_id: &str, target: &str, file_path: &str) -> SymbolEdge {
 
 fn depends_edge(source_id: &str, target: &str, file_path: &str) -> SymbolEdge {
     SymbolEdge {
+        target_symbol_id: None,
+        target_file_path: None,
         source_id: source_id.to_owned(),
         target_qualified_name: target.to_owned(),
         edge_kind: EdgeKind::DependsOn,
@@ -461,6 +464,8 @@ fn depends_edge(source_id: &str, target: &str, file_path: &str) -> SymbolEdge {
 
 fn type_ref_edge(source_id: &str, target: &str, file_path: &str) -> SymbolEdge {
     SymbolEdge {
+        target_symbol_id: None,
+        target_file_path: None,
         source_id: source_id.to_owned(),
         target_qualified_name: target.to_owned(),
         edge_kind: EdgeKind::TypeRef,
@@ -470,6 +475,8 @@ fn type_ref_edge(source_id: &str, target: &str, file_path: &str) -> SymbolEdge {
 
 fn implements_edge(source_id: &str, target: &str, file_path: &str) -> SymbolEdge {
     SymbolEdge {
+        target_symbol_id: None,
+        target_file_path: None,
         source_id: source_id.to_owned(),
         target_qualified_name: target.to_owned(),
         edge_kind: EdgeKind::Implements,

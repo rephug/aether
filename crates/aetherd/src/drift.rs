@@ -271,12 +271,12 @@ mod tests {
             format: CommunitiesFormat::Table,
         };
 
-        let err = load_communities_result(workspace.path(), &config, &args)
-            .expect_err("missing daemon should fall through to local graph path");
-        let rendered = format!("{err:#}");
+        let output = load_communities_result(workspace.path(), &config, &args)
+            .expect("missing daemon should initialize the empty local graph");
 
-        assert!(rendered.contains("failed"));
-        assert!(!rendered.contains("failed to fetch communities from running daemon"));
+        assert_eq!(output.daemon_port, None);
+        assert_eq!(output.result.result_count, 0);
+        assert!(output.result.communities.is_empty());
 
         Ok(())
     }

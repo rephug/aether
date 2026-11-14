@@ -741,6 +741,8 @@ fn embeddings_only_does_not_mutate_non_embedding_state() {
     }
     store
         .upsert_edges(&[SymbolEdge {
+            target_symbol_id: Some("sym-b".to_owned()),
+            target_file_path: None,
             source_id: "sym-a".to_owned(),
             target_qualified_name: "demo::b".to_owned(),
             edge_kind: EdgeKind::Calls,

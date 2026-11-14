@@ -334,6 +334,8 @@ impl LanguageHooks for GoHooks {
                 .node("source")
                 .and_then(|path| import_path(path, source))
                 .map(|target| SymbolEdge {
+                    target_symbol_id: None,
+                    target_file_path: None,
                     source_id: file_source_id(file_path),
                     target_qualified_name: target,
                     edge_kind: EdgeKind::DependsOn,
@@ -466,6 +468,8 @@ fn call_edge(
     let source_id = enclosing_function_symbol_id(symbols, call)?;
     let target = call_target(call, source, &FileScope::of(call, source))?;
     Some(SymbolEdge {
+        target_symbol_id: None,
+        target_file_path: None,
         source_id,
         target_qualified_name: target,
         edge_kind: EdgeKind::Calls,
@@ -755,6 +759,8 @@ fn type_ref_edges(
     targets
         .into_iter()
         .map(|target| SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: source_symbol.id.clone(),
             target_qualified_name: target,
             edge_kind: EdgeKind::TypeRef,

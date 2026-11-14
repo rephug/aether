@@ -91,7 +91,7 @@ pub fn build_enrichment_context(
     );
 
     let caller_contract_clauses = if contracts_enabled {
-        lookup_caller_contracts(store, symbol.qualified_name.as_str())
+        lookup_caller_contracts(store, symbol.id.as_str())
     } else {
         Vec::new()
     };
@@ -107,36 +107,26 @@ pub fn build_enrichment_context(
 
 /// Look up contract clauses from callers of the given symbol.
 ///
-/// For each symbol that calls `qualified_name` and has active contracts,
+/// For each proven caller of `symbol_id` that has active contracts,
 /// collect (caller_qualified_name, clause_type, clause_text) triples.
 pub(super) fn lookup_caller_contracts(
     store: &SqliteStore,
-    qualified_name: &str,
+    symbol_id: &str,
 ) -> Vec<(String, String, String)> {
-    let callers = match store.get_callers(qualified_name) {
-        Ok(edges) => edges,
+    let callers = match store.list_callers_for_symbol(symbol_id) {
+        Ok(callers) => callers,
         Err(_) => return Vec::new(),
     };
 
     let mut result = Vec::new();
-    for edge in callers {
-        let contracts = match store.list_active_contracts_for_symbol(edge.source_id.as_str()) {
-            Ok(c) => c,
+    for caller in callers {
+        let contracts = match store.list_active_contracts_for_symbol(&caller.id) {
+            Ok(contracts) => contracts,
             Err(_) => continue,
         };
-        if contracts.is_empty() {
-            continue;
-        }
-        // Resolve caller qualified name from symbol record
-        let caller_name = store
-            .get_symbol_record(edge.source_id.as_str())
-            .ok()
-            .flatten()
-            .map(|s| s.qualified_name)
-            .unwrap_or_else(|| edge.source_id.clone());
         for contract in contracts {
             result.push((
-                caller_name.clone(),
+                caller.qualified_name.clone(),
                 contract.clause_type,
                 contract.clause_text,
             ));

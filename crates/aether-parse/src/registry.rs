@@ -26,6 +26,23 @@ pub trait LanguageHooks: Send + Sync {
         None
     }
 
+    /// Per-file hooks which may resolve explicit imports within this workspace.
+    fn for_extraction_at(
+        &self,
+        root: Node<'_>,
+        source: &[u8],
+        _file_path: &str,
+        _workspace_root: Option<&Path>,
+    ) -> Option<Box<dyn LanguageHooks>> {
+        self.for_extraction(root, source)
+    }
+
+    /// Files consulted while proving imported targets, including absent candidates.
+    /// The extractor invalidates the caller when one of these paths changes.
+    fn resolution_dependencies(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     fn qualify_name(
         &self,
         _file_path: &str,

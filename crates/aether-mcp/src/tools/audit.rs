@@ -1284,6 +1284,8 @@ vector_backend = "sqlite"
         let store = aether_store::SqliteStore::open(workspace).expect("open store");
         store
             .upsert_edges(&[SymbolEdge {
+                target_symbol_id: None,
+                target_file_path: None,
                 source_id: source_id.to_owned(),
                 target_qualified_name: target_qualified_name.to_owned(),
                 edge_kind: EdgeKind::Calls,
