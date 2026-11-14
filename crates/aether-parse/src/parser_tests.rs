@@ -1077,3 +1077,28 @@ fn javascript_class_constructors_keep_static_targets_without_crossing_shadow_bin
     );
     assert!(edge_targets_for_source(&extracted, "shadow", EdgeKind::Calls).is_empty());
 }
+
+#[test]
+fn commonjs_assigned_object_methods_have_distinct_stable_owners() {
+    let source = "exports.left = { run() { leftWork(); } }; exports.right = { run() { rightWork(); } }; function unrelated() {}";
+    let first = extract_with_edges(Language::JavaScript, "exports.cjs", source);
+    assert_eq!(first.symbols.len(), 3);
+    assert_eq!(
+        edge_targets_for_source(&first, "$assign(exports.left)::run", EdgeKind::Calls),
+        vec!["leftWork"]
+    );
+    assert_eq!(
+        edge_targets_for_source(&first, "$assign(exports.right)::run", EdgeKind::Calls),
+        vec!["rightWork"]
+    );
+    let second = extract_with_edges(
+        Language::JavaScript,
+        "exports.cjs",
+        &source
+            .replace("exports.left", "exports /*note*/ . left")
+            .replace("leftWork();", "leftWork(); moreWork();"),
+    );
+    for symbol in &first.symbols {
+        assert!(second.symbols.iter().any(|next| next.id == symbol.id));
+    }
+}

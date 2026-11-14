@@ -114,6 +114,15 @@ fn collect_typescript_context(
                     context.push(name);
                 }
             }
+            "assignment_expression" => {
+                if cursor
+                    .child_by_field_name("right")
+                    .is_some_and(|right| right.id() == child.id())
+                    && let Some(left) = cursor.child_by_field_name("left")
+                {
+                    context.push(format!("$assign({})", typescript_owner_text(left, source)));
+                }
+            }
             "pair" => {
                 if let Some(name) = named_child_text(cursor, "key", source) {
                     context.push(name);
