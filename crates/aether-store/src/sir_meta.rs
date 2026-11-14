@@ -855,6 +855,22 @@ impl SqliteStore {
         } else {
             "0"
         };
+        let (has_source_hash, has_write_generation): (bool, bool) = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sir') WHERE name = 'source_hash'),
+                    EXISTS(SELECT 1 FROM pragma_table_info('sir') WHERE name = 'write_generation')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let source_hash_expression = if has_source_hash {
+            "source_hash"
+        } else {
+            "NULL"
+        };
+        let write_generation_expression = if has_write_generation {
+            "write_generation"
+        } else {
+            "0"
+        };
         let sql = format!(
             r#"
             SELECT
@@ -872,8 +888,8 @@ impl SqliteStore {
                 last_error,
                 last_attempt_at,
                 sir_json,
-                write_generation,
-                source_hash,
+                {write_generation_expression},
+                {source_hash_expression},
                 {retirement_expression}
             FROM sir
             WHERE id = ?1

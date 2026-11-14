@@ -1203,3 +1203,50 @@ fn sir_snapshot_blocks_retired_mirrors_but_allows_explicit_publication() {
         );
     }
 }
+
+#[test]
+fn sir_snapshot_reads_legacy_readonly_schemas_with_unknown_source_hash() {
+    for version in [17, 18, 19, 20] {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("store");
+        store.upsert_sir_meta(sir_meta_record()).expect("metadata");
+        fs::write(
+            temp.path().join(".aether/sir/sym-1.json"),
+            r#"{"intent":"legacy mirror"}"#,
+        )
+        .expect("mirror");
+        store.conn.lock().expect("lock").execute_batch(&format!(
+            "ALTER TABLE sir DROP COLUMN source_hash; DROP TABLE retirement_cleanup; DROP TABLE symbol_lineage; DROP TABLE symbol_retirements; PRAGMA user_version = {version}; UPDATE schema_version SET version = {version} WHERE component = 'core';"
+        )).expect("legacy schema fixture");
+        if version < 19 {
+            store
+                .conn
+                .lock()
+                .expect("lock")
+                .execute_batch("ALTER TABLE sir DROP COLUMN write_generation;")
+                .expect("pre-write-generation schema");
+        }
+        let readonly = SqliteStore::open_readonly(temp.path()).expect("readonly legacy store");
+        let snapshot = readonly
+            .get_sir_meta_with_blob("sym-1")
+            .expect("legacy snapshot")
+            .expect("row");
+        assert_eq!(
+            snapshot.blob.as_deref(),
+            Some(r#"{"intent":"legacy mirror"}"#)
+        );
+        assert_eq!(snapshot.source_hash, None);
+        let conn = readonly.conn.lock().expect("lock");
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("version"),
+            version
+        );
+        assert_eq!(
+            conn.query_row("SELECT sir_json FROM sir WHERE id = 'sym-1'", [], |row| row
+                .get::<_, Option<String>>(0))
+                .expect("unmodified row"),
+            None
+        );
+    }
+}
