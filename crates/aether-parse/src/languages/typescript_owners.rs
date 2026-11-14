@@ -114,6 +114,20 @@ fn collect_typescript_context(
                     context.push(name);
                 }
             }
+            "public_field_definition" => {
+                if let Some(name) = cursor.child_by_field_name("name") {
+                    let name = typescript_owner_text(name, source);
+                    let mut walk = cursor.walk();
+                    let is_static = cursor
+                        .children(&mut walk)
+                        .any(|child| child.kind() == "static");
+                    context.push(if is_static {
+                        format!("$static({name})")
+                    } else {
+                        name
+                    });
+                }
+            }
             "assignment_expression" => {
                 if cursor
                     .child_by_field_name("right")

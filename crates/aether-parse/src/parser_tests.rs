@@ -1102,3 +1102,81 @@ fn commonjs_assigned_object_methods_have_distinct_stable_owners() {
         assert!(second.symbols.iter().any(|next| next.id == symbol.id));
     }
 }
+
+#[test]
+fn typescript_class_fields_own_nested_object_methods() {
+    let source = "class C { left = { run() { leftWork(); } }; right = { run() { rightWork(); } }; } function unrelated() {}";
+    let first = extract_with_edges(Language::TypeScript, "fields.ts", source);
+    assert_eq!(first.symbols.len(), 4);
+    assert_eq!(
+        edge_targets_for_source(&first, "C::left::run", EdgeKind::Calls),
+        vec!["leftWork"]
+    );
+    assert_eq!(
+        edge_targets_for_source(&first, "C::right::run", EdgeKind::Calls),
+        vec!["rightWork"]
+    );
+    let second = extract_with_edges(
+        Language::TypeScript,
+        "fields.ts",
+        &source
+            .replace("left =", "/*note*/ left =")
+            .replace("leftWork();", "leftWork(); moreWork();"),
+    );
+    assert!(
+        first
+            .symbols
+            .iter()
+            .all(|symbol| second.symbols.iter().any(|next| next.id == symbol.id))
+    );
+}
+
+#[test]
+fn typescript_static_private_and_computed_fields_remain_distinct() {
+    let source = r#"class C { static x={run(){}}; x={run(){}}; #x={run(){}}; ["a b"]={run(){}}; ["ab"]={run(){}}; }"#;
+    let first = extract_with_edges(Language::TypeScript, "fields.ts", source);
+    assert_eq!(first.symbols.len(), 6);
+    let names = first
+        .symbols
+        .iter()
+        .map(|symbol| symbol.qualified_name.as_str())
+        .collect::<Vec<_>>();
+    for expected in [
+        "C::$static(x)::run",
+        "C::x::run",
+        "C::#x::run",
+        "C::[\"a b\"]::run",
+        "C::[\"ab\"]::run",
+    ] {
+        assert!(names.contains(&expected), "missing {expected}: {names:?}");
+    }
+    let second = extract_with_edges(
+        Language::TypeScript,
+        "fields.ts",
+        &source
+            .replace("[\"a b\"]", "[ /* key */ \"a b\" ]")
+            .replace("run(){}", "run(){ work(); }"),
+    );
+    // Class body hash changes, but declaration and contained method identities do not.
+    assert!(
+        first
+            .symbols
+            .iter()
+            .all(|symbol| second.symbols.iter().any(|next| next.id == symbol.id))
+    );
+}
+
+#[test]
+fn repeated_same_assignment_owner_still_fails_closed_without_overwriting() {
+    let mut extractor = SymbolExtractor::new().expect("extractor");
+    let result = extractor.extract_from_source(
+        Language::JavaScript,
+        "repeat.cjs",
+        "exports.same={run(){first();}}; exports.same={run(){second();}};",
+    );
+    assert!(
+        result
+            .err()
+            .is_some_and(|error| error.downcast_ref::<DuplicateSymbolIdentity>().is_some())
+    );
+}
