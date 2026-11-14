@@ -193,3 +193,55 @@ fn plain_summary_and_uncertainty_precede_technical_details() {
     assert!(!hover.contains("(none)"));
     assert!(hover.contains("not a correctness check"));
 }
+
+#[test]
+fn python_decorator_only_edit_warns_and_decorator_line_resolves() {
+    let temp = tempfile::tempdir().expect("workspace");
+    let file = temp.path().join("fixture.py");
+    let source = "@limit(2)\ndef adjust(value: int) -> int:\n    return value + 1\n";
+    std::fs::write(&file, source).expect("source");
+    let store = SqliteStore::open(temp.path()).expect("store");
+    let mut extractor = aether_parse::SymbolExtractor::new().expect("extractor");
+    let symbol = extractor
+        .extract_from_source(Language::Python, "fixture.py", source)
+        .expect("parse")
+        .remove(0);
+    store
+        .persist_sir_state_atomically_with_source(
+            SirMetaRecord {
+                id: symbol.id.clone(),
+                sir_hash: aether_core::content_hash(EXPLANATION),
+                sir_version: 1,
+                provider: "test-fixture".into(),
+                model: "test-fixture".into(),
+                generation_pass: "single".into(),
+                reasoning_trace: None,
+                prompt_hash: None,
+                staleness_score: None,
+                updated_at: 1_700_000_000,
+                sir_status: "fresh".into(),
+                last_error: None,
+                last_attempt_at: 1_700_000_000,
+            },
+            EXPLANATION,
+            None,
+            None,
+            Some(&symbol.content_hash),
+        )
+        .expect("persist");
+    let before = resolve_hover_markdown_for_path(temp.path(), &store, &file, Position::new(1, 5))
+        .expect("fresh hover")
+        .expect("explanation");
+    assert!(!before.contains("may be out of date"));
+    std::fs::write(&file, source.replace("limit(2)", "limit(3)")).expect("decorator edit");
+    let after = resolve_hover_markdown_for_path(temp.path(), &store, &file, Position::new(1, 5))
+        .expect("edited hover")
+        .expect("explanation");
+    assert!(after.contains("saved code has changed"), "{after}");
+    let decorator =
+        resolve_hover_markdown_for_path(temp.path(), &store, &file, Position::new(0, 2))
+            .expect("decorator hover")
+            .expect("explanation on decorator");
+    assert!(decorator.contains("fixture::adjust"), "{decorator}");
+    assert!(decorator.contains("saved code has changed"), "{decorator}");
+}
