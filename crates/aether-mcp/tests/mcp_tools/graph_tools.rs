@@ -131,6 +131,10 @@ fn mcp_usage_matrix_reports_consumers_clusters_and_uncalled_methods() -> Result<
     let temp = tempdir()?;
     let workspace = temp.path();
     write_test_config(workspace);
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[package]\nname = \"usage-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )?;
 
     fs::create_dir_all(workspace.join("src"))?;
     fs::write(
@@ -164,15 +168,14 @@ fn mcp_usage_matrix_reports_consumers_clusters_and_uncalled_methods() -> Result<
         .expect("ExampleStore symbol should exist")
         .id;
     let alpha_qualified_callers = store.get_callers("ExampleStore::alpha")?;
-    assert!(alpha_qualified_callers.is_empty());
-
-    let alpha_bare_callers = store.get_callers("alpha")?;
-    assert_eq!(alpha_bare_callers.len(), 2);
+    assert_eq!(alpha_qualified_callers.len(), 2);
     assert!(
-        alpha_bare_callers
+        alpha_qualified_callers
             .iter()
-            .all(|edge| edge.target_qualified_name == "alpha")
+            .all(|edge| edge.target_symbol_id.is_some()
+                || edge.target_file_path.as_deref() == Some("src/store.rs"))
     );
+    assert!(store.get_callers("alpha")?.is_empty());
 
     let server = AetherMcpServer::new(workspace, false)?;
     let rt = Runtime::new()?;
@@ -316,60 +319,80 @@ fn mcp_suggest_trait_split_returns_clusters() -> Result<()> {
 
     store.upsert_edges(&[
         SymbolEdge {
+            target_symbol_id: Some("trait-method-alpha".to_owned()),
+            target_file_path: None,
             source_id: "consumer-a".to_owned(),
-            target_qualified_name: "alpha".to_owned(),
+            target_qualified_name: "ExampleStore::alpha".to_owned(),
             edge_kind: EdgeKind::Calls,
             file_path: "src/consumer_a.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: Some("trait-method-beta".to_owned()),
+            target_file_path: None,
             source_id: "consumer-a".to_owned(),
-            target_qualified_name: "beta".to_owned(),
+            target_qualified_name: "ExampleStore::beta".to_owned(),
             edge_kind: EdgeKind::Calls,
             file_path: "src/consumer_a.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: Some("trait-method-gamma".to_owned()),
+            target_file_path: None,
             source_id: "consumer-b".to_owned(),
-            target_qualified_name: "gamma".to_owned(),
+            target_qualified_name: "ExampleStore::gamma".to_owned(),
             edge_kind: EdgeKind::Calls,
             file_path: "src/consumer_b.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: Some("trait-method-delta".to_owned()),
+            target_file_path: None,
             source_id: "consumer-b".to_owned(),
-            target_qualified_name: "delta".to_owned(),
+            target_qualified_name: "ExampleStore::delta".to_owned(),
             edge_kind: EdgeKind::Calls,
             file_path: "src/consumer_b.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: "trait-method-alpha".to_owned(),
             target_qualified_name: "SirMetaRecord".to_owned(),
             edge_kind: EdgeKind::TypeRef,
             file_path: "src/store.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: "trait-method-alpha".to_owned(),
             target_qualified_name: "SirBlob".to_owned(),
             edge_kind: EdgeKind::TypeRef,
             file_path: "src/store.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: "trait-method-beta".to_owned(),
             target_qualified_name: "SirMetaRecord".to_owned(),
             edge_kind: EdgeKind::TypeRef,
             file_path: "src/store.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: "trait-method-beta".to_owned(),
             target_qualified_name: "SirBlob".to_owned(),
             edge_kind: EdgeKind::TypeRef,
             file_path: "src/store.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: "trait-method-gamma".to_owned(),
             target_qualified_name: "SymbolRecord".to_owned(),
             edge_kind: EdgeKind::TypeRef,
             file_path: "src/store.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: "trait-method-delta".to_owned(),
             target_qualified_name: "SymbolRecord".to_owned(),
             edge_kind: EdgeKind::TypeRef,
@@ -483,60 +506,80 @@ fn mcp_suggest_trait_split_accepts_struct_targets() -> Result<()> {
 
     store.upsert_edges(&[
         SymbolEdge {
+            target_symbol_id: Some("struct-method-alpha".to_owned()),
+            target_file_path: None,
             source_id: "consumer-a".to_owned(),
-            target_qualified_name: "alpha".to_owned(),
+            target_qualified_name: "ExampleStore::alpha".to_owned(),
             edge_kind: EdgeKind::Calls,
             file_path: "src/consumer_a.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: Some("struct-method-beta".to_owned()),
+            target_file_path: None,
             source_id: "consumer-a".to_owned(),
-            target_qualified_name: "beta".to_owned(),
+            target_qualified_name: "ExampleStore::beta".to_owned(),
             edge_kind: EdgeKind::Calls,
             file_path: "src/consumer_a.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: Some("struct-method-gamma".to_owned()),
+            target_file_path: None,
             source_id: "consumer-b".to_owned(),
-            target_qualified_name: "gamma".to_owned(),
+            target_qualified_name: "ExampleStore::gamma".to_owned(),
             edge_kind: EdgeKind::Calls,
             file_path: "src/consumer_b.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: Some("struct-method-delta".to_owned()),
+            target_file_path: None,
             source_id: "consumer-b".to_owned(),
-            target_qualified_name: "delta".to_owned(),
+            target_qualified_name: "ExampleStore::delta".to_owned(),
             edge_kind: EdgeKind::Calls,
             file_path: "src/consumer_b.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: "struct-method-alpha".to_owned(),
             target_qualified_name: "SirMetaRecord".to_owned(),
             edge_kind: EdgeKind::TypeRef,
             file_path: "src/store.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: "struct-method-alpha".to_owned(),
             target_qualified_name: "SirBlob".to_owned(),
             edge_kind: EdgeKind::TypeRef,
             file_path: "src/store.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: "struct-method-beta".to_owned(),
             target_qualified_name: "SirMetaRecord".to_owned(),
             edge_kind: EdgeKind::TypeRef,
             file_path: "src/store.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: "struct-method-beta".to_owned(),
             target_qualified_name: "SirBlob".to_owned(),
             edge_kind: EdgeKind::TypeRef,
             file_path: "src/store.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: "struct-method-gamma".to_owned(),
             target_qualified_name: "SymbolRecord".to_owned(),
             edge_kind: EdgeKind::TypeRef,
             file_path: "src/store.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: "struct-method-delta".to_owned(),
             target_qualified_name: "SymbolRecord".to_owned(),
             edge_kind: EdgeKind::TypeRef,
@@ -646,66 +689,88 @@ fn mcp_suggest_trait_split_falls_back_to_same_file_implementor_methods() -> Resu
 
     store.upsert_edges(&[
         SymbolEdge {
+            target_symbol_id: Some("trait-store".to_owned()),
+            target_file_path: Some("src/lib.rs".to_owned()),
             source_id: "struct-sqlite-store".to_owned(),
             target_qualified_name: "Store".to_owned(),
             edge_kind: EdgeKind::Implements,
             file_path: "src/lib.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: Some("sqlite-method-alpha".to_owned()),
+            target_file_path: None,
             source_id: "consumer-a".to_owned(),
-            target_qualified_name: "alpha".to_owned(),
+            target_qualified_name: "SqliteStore::alpha".to_owned(),
             edge_kind: EdgeKind::Calls,
             file_path: "src/consumer_a.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: Some("sqlite-method-beta".to_owned()),
+            target_file_path: None,
             source_id: "consumer-a".to_owned(),
-            target_qualified_name: "beta".to_owned(),
+            target_qualified_name: "SqliteStore::beta".to_owned(),
             edge_kind: EdgeKind::Calls,
             file_path: "src/consumer_a.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: Some("sqlite-method-gamma".to_owned()),
+            target_file_path: None,
             source_id: "consumer-b".to_owned(),
-            target_qualified_name: "gamma".to_owned(),
+            target_qualified_name: "SqliteStore::gamma".to_owned(),
             edge_kind: EdgeKind::Calls,
             file_path: "src/consumer_b.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: Some("sqlite-method-delta".to_owned()),
+            target_file_path: None,
             source_id: "consumer-b".to_owned(),
-            target_qualified_name: "delta".to_owned(),
+            target_qualified_name: "SqliteStore::delta".to_owned(),
             edge_kind: EdgeKind::Calls,
             file_path: "src/consumer_b.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: "sqlite-method-alpha".to_owned(),
             target_qualified_name: "SirMetaRecord".to_owned(),
             edge_kind: EdgeKind::TypeRef,
             file_path: "src/lib.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: "sqlite-method-alpha".to_owned(),
             target_qualified_name: "SirBlob".to_owned(),
             edge_kind: EdgeKind::TypeRef,
             file_path: "src/lib.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: "sqlite-method-beta".to_owned(),
             target_qualified_name: "SirMetaRecord".to_owned(),
             edge_kind: EdgeKind::TypeRef,
             file_path: "src/lib.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: "sqlite-method-beta".to_owned(),
             target_qualified_name: "SirBlob".to_owned(),
             edge_kind: EdgeKind::TypeRef,
             file_path: "src/lib.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: "sqlite-method-gamma".to_owned(),
             target_qualified_name: "SymbolRecord".to_owned(),
             edge_kind: EdgeKind::TypeRef,
             file_path: "src/lib.rs".to_owned(),
         },
         SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: "sqlite-method-delta".to_owned(),
             target_qualified_name: "SymbolRecord".to_owned(),
             edge_kind: EdgeKind::TypeRef,
@@ -837,6 +902,10 @@ fn mcp_usage_matrix_resolves_exact_qualified_name_before_fuzzy_search_limit() ->
     let temp = tempdir()?;
     let workspace = temp.path();
     write_test_config(workspace);
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[package]\nname = \"usage-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )?;
 
     fs::create_dir_all(workspace.join("src"))?;
     fs::write(
@@ -997,7 +1066,8 @@ fn mcp_dependencies_attribute_callers_to_the_selected_symbol_only() -> Result<()
 
 fn assert_callers_attributed_to_selected_symbol(graph_backend: &str) -> Result<()> {
     // Three `alpha`s: a method of `Calc`, a free function, and a method of a second
-    // `Calc` in another file. Every call is recorded with the bare target `alpha`.
+    // `Calc` in another file. Receiver and lexical evidence must keep the callers
+    // attached to the declaration they actually name.
     let temp = index_workspace(
         graph_backend,
         &[
@@ -1059,14 +1129,19 @@ fn assert_callers_attributed_to_selected_symbol(graph_backend: &str) -> Result<(
 
 #[test]
 fn mcp_dependencies_narrow_cross_file_callers_to_their_package() -> Result<()> {
-    // The callers live in files with no `alpha` of their own, so each call narrows to
-    // the `Calc::alpha` in its own package. `run_root` sits outside both packages, so
-    // its call stays ambiguous and is attributed to neither.
-    let calc = "pub struct Calc;\n\nimpl Calc {\n    pub fn alpha(&self) -> i32 { 1 }\n}\n";
+    // Each caller explicitly imports its package's Calc through a declared module.
+    // run_root has no import or declaration evidence, so its raw method reference
+    // cannot become a caller of either package's same-named Calc::alpha.
+    let calc =
+        "mod run;\npub struct Calc;\n\nimpl Calc {\n    pub fn alpha(&self) -> i32 { 1 }\n}\n";
     let run = |name: &str| {
         format!("pub fn {name}() -> i32 {{\n    let calc = Calc;\n    calc.alpha()\n}}\n")
     };
-    let (run_a, run_b, run_root) = (run("run_a"), run("run_b"), run("run_root"));
+    let (run_a, run_b, run_root) = (
+        format!("use crate::Calc;\n{}", run("run_a")),
+        format!("use crate::Calc;\n{}", run("run_b")),
+        run("run_root"),
+    );
     let temp = index_workspace(
         "sqlite",
         &[
@@ -1255,6 +1330,8 @@ fn mcp_dependencies_list_the_callers_of_every_overload() -> Result<()> {
         ..custom_symbol_record(id, qualified_name, file_path, "method")
     };
     let call = |source_id: &str, target: &str, file_path: &str| SymbolEdge {
+        target_symbol_id: None,
+        target_file_path: None,
         source_id: source_id.to_owned(),
         target_qualified_name: target.to_owned(),
         edge_kind: EdgeKind::Calls,
@@ -1300,21 +1377,25 @@ fn mcp_dependencies_list_the_callers_of_every_overload() -> Result<()> {
 }
 
 #[test]
-fn mcp_dependencies_count_a_call_to_overloaded_methods_once() -> Result<()> {
-    // `Wrap` implements `From` twice, so two impl blocks declare `Wrap::from`. The call
-    // to `Wrap::from` reaches one of them without saying which, so both list `run` as a
-    // caller and `Wrap` counts it as one method called. Each `Wrap::from` calls `Wrap`
-    // itself, which makes it a caller of `Wrap` that calls none of its methods.
+fn mcp_dependencies_keep_trait_overload_calls_unresolved_without_type_selection() -> Result<()> {
+    // The type import proves Wrap's module, but selecting one of its From trait
+    // implementations requires trait/type analysis. Neither overload gets a guessed
+    // caller. Direct tuple-struct construction still identifies the Wrap type.
     let temp = index_workspace(
         "sqlite",
         &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"wrap-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            ("src/lib.rs", "mod wrap;\nmod run;\n"),
             (
                 "src/wrap.rs",
                 "pub struct Wrap(pub u32);\n\nimpl From<u8> for Wrap {\n    fn from(value: u8) -> Self { Wrap(value.into()) }\n}\n\nimpl From<u16> for Wrap {\n    fn from(value: u16) -> Self { Wrap(value.into()) }\n}\n",
             ),
             (
                 "src/run.rs",
-                "pub fn run() -> u32 {\n    Wrap::from(1u8).0\n}\n",
+                "use crate::wrap::Wrap;\npub fn run() -> u32 {\n    Wrap::from(1u8).0\n}\n",
             ),
         ],
     )?;
@@ -1331,20 +1412,17 @@ fn mcp_dependencies_count_a_call_to_overloaded_methods_once() -> Result<()> {
     for overload in overloads {
         assert_eq!(
             caller_counts(&dependencies_for(&server, overload)?),
-            BTreeMap::from([("run".to_owned(), None)])
+            BTreeMap::new()
         );
     }
 
     let wrap = dependencies_for(&server, symbol_id_in(workspace, "src/wrap.rs", "Wrap")?)?;
     assert!(wrap.aggregated);
     assert_eq!(wrap.child_method_count, 2);
-    assert_eq!(wrap.caller_count, 3);
+    assert_eq!(wrap.caller_count, 2);
     assert_eq!(
         caller_counts(&wrap),
-        BTreeMap::from([
-            ("Wrap::from".to_owned(), Some(0)),
-            ("run".to_owned(), Some(1)),
-        ])
+        BTreeMap::from([("Wrap::from".to_owned(), Some(0))])
     );
     Ok(())
 }
@@ -1406,6 +1484,8 @@ fn mcp_dependencies_aggregate_java_classes_and_interfaces() -> Result<()> {
         ..custom_symbol_record(id, qualified_name, file_path, kind)
     };
     let call = |source_id: &str, target: &str, file_path: &str| SymbolEdge {
+        target_symbol_id: None,
+        target_file_path: None,
         source_id: source_id.to_owned(),
         target_qualified_name: target.to_owned(),
         edge_kind: EdgeKind::Calls,

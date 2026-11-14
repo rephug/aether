@@ -19,6 +19,7 @@ use crate::{SharedState, dashboard_router};
 
 mod api;
 mod fragments;
+mod graph_provenance;
 mod language_family;
 mod operations;
 
@@ -159,12 +160,16 @@ fn seed_workspace(workspace: &std::path::Path) {
     store
         .upsert_edges(&[
             SymbolEdge {
+                target_symbol_id: Some("sym-demo-helper".to_owned()),
+                target_file_path: None,
                 source_id: "sym-demo-run".to_owned(),
                 target_qualified_name: "demo::helper".to_owned(),
                 edge_kind: EdgeKind::Calls,
                 file_path: "src/lib.rs".to_owned(),
             },
             SymbolEdge {
+                target_symbol_id: Some("sym-demo-run".to_owned()),
+                target_file_path: None,
                 source_id: "sym-demo-main".to_owned(),
                 target_qualified_name: "demo::run".to_owned(),
                 edge_kind: EdgeKind::Calls,

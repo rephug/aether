@@ -1,8 +1,6 @@
 //! The structural indexer: symbol, edge and test-intent rows written from parsed
 //! symbol change events, with symbol removal under the inject lock.
 
-use aether_core::Language;
-
 use super::*;
 
 pub(super) struct StructuralIndexer {
@@ -12,7 +10,7 @@ pub(super) struct StructuralIndexer {
     pub(super) graph_runtime: tokio::runtime::Runtime,
     pub(super) graph_store: Box<dyn aether_store::GraphStore>,
     pub(super) surreal_graph_store: Option<SurrealGraphStore>,
-    /// Files whose edges took Python call targets from files that changed since, for
+    /// Files whose edges took call targets from files that changed since, for
     /// [`Self::reindex_stale_files`].
     stale_files: BTreeSet<String>,
 }
@@ -45,11 +43,9 @@ impl StructuralIndexer {
         })
     }
 
-    /// Re-reads a changed workspace path (a file or a directory) for the Python call targets
-    /// resolved through it, and notes the files whose stored edges took their targets from
-    /// what it held before, when the change may move them. A pure re-export `__init__.py`
-    /// has no symbols, so a change to it makes no symbol change event: this needs every
-    /// changed path.
+    /// Refreshes workspace paths used to prove imported call targets, and notes the
+    /// extractions whose prior evidence may have changed. Import/export or module
+    /// edits can change edges without a symbol event, so every changed path matters.
     pub(super) fn refresh_file(&mut self, file_path: &str) {
         self.stale_files
             .extend(self.extractor.refresh_workspace_file(file_path));
@@ -60,9 +56,12 @@ impl StructuralIndexer {
     /// batch.
     pub(super) fn reindex_stale_files(&mut self, store: &SqliteStore) {
         for file_path in std::mem::take(&mut self.stale_files) {
+            let Some(language) = aether_parse::language_for_path(Path::new(&file_path)) else {
+                continue;
+            };
             let reader = SymbolChangeEvent {
                 file_path: file_path.clone(),
-                language: Language::Python,
+                language,
                 added: Vec::new(),
                 removed: Vec::new(),
                 updated: Vec::new(),
@@ -71,7 +70,7 @@ impl StructuralIndexer {
                 tracing::warn!(
                     file_path = %file_path,
                     error = %err,
-                    "failed to re-extract edges resolved through a changed Python file; retrying with the next batch"
+                    "failed to re-extract edges resolved through a changed workspace file; retrying with the next batch"
                 );
                 self.stale_files.insert(file_path);
             }

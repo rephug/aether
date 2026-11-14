@@ -377,11 +377,12 @@ fn gather_catalog_evidence(
                 EdgeKind::Implements,
             ],
         )? {
-            let candidates = store
-                .list_symbols_for_call_target(&edge.target_qualified_name)?
-                .into_iter()
-                .filter(|candidate| same_language_family(&record.language, &candidate.language))
-                .collect::<Vec<_>>();
+            let resolution = store.resolve_symbol_edge(&edge, record, &mut |_| None)?;
+            let (candidates, ambiguous) = match resolution {
+                aether_store::NameResolution::Found(candidates) => (candidates, false),
+                aether_store::NameResolution::Ambiguous(candidates) => (candidates, true),
+                aether_store::NameResolution::NotFound => (Vec::new(), false),
+            };
             if candidates.is_empty() {
                 relationships.insert(format!(
                     "Dependency: `{}` → `{}` ({}, unresolved/external unknown); source [{}]({}).",
@@ -392,8 +393,10 @@ fn gather_catalog_evidence(
                     edge.file_path
                 ));
             }
-            let label = if candidates.len() > 1 {
+            let label = if ambiguous {
                 "ambiguous name candidate"
+            } else if edge.target_symbol_id.is_some() || edge.target_file_path.is_some() {
+                "parser-resolved target"
             } else {
                 "heuristic name match"
             };
@@ -411,7 +414,9 @@ fn gather_catalog_evidence(
             ],
         )? {
             if let Some(caller) = store.get_symbol_record(&edge.source_id)?
-                && same_language_family(&record.language, &caller.language)
+                && store
+                    .resolve_symbol_edge(&edge, &caller, &mut |_| None)?
+                    .reaches(record)
             {
                 relationships.insert(format!("Dependent: `{}` ← `{}` ({}, heuristic name match); inspect [{}]({}) for regressions when changing [{}]({}).", record.qualified_name, caller.qualified_name, edge.edge_kind.as_str(), caller.file_path, caller.file_path, record.file_path, record.file_path));
                 if aether_core::is_test_symbol(&caller.qualified_name, &caller.file_path) {
@@ -684,6 +689,8 @@ mod tests {
         store.upsert_symbol(symbol("cache", "cache.rs"))?;
         store.upsert_symbol(symbol("disk", "disk.rs"))?;
         store.upsert_edges(&[SymbolEdge {
+            target_symbol_id: Some("disk".to_owned()),
+            target_file_path: None,
             source_id: "cache".to_owned(),
             target_qualified_name: "disk".to_owned(),
             edge_kind: EdgeKind::Calls,
@@ -777,12 +784,16 @@ mod tests {
         }
         store.upsert_edges(&[
             SymbolEdge {
+                target_symbol_id: Some("disk".to_owned()),
+                target_file_path: None,
                 source_id: "cache".to_owned(),
                 target_qualified_name: "disk".to_owned(),
                 edge_kind: EdgeKind::Calls,
                 file_path: "src/cache.rs".to_owned(),
             },
             SymbolEdge {
+                target_symbol_id: Some("cache".to_owned()),
+                target_file_path: None,
                 source_id: "client".to_owned(),
                 target_qualified_name: "cache".to_owned(),
                 edge_kind: EdgeKind::Calls,
@@ -790,6 +801,8 @@ mod tests {
             },
         ])?;
         store.upsert_edges(&[SymbolEdge {
+            target_symbol_id: Some("schema".to_owned()),
+            target_file_path: None,
             source_id: "cache".to_owned(),
             target_qualified_name: "schema".to_owned(),
             edge_kind: EdgeKind::TypeRef,
@@ -798,12 +811,16 @@ mod tests {
         for edge_kind in [EdgeKind::DependsOn, EdgeKind::TypeRef, EdgeKind::Implements] {
             store.upsert_edges(&[
                 SymbolEdge {
+                    target_symbol_id: Some("disk".to_owned()),
+                    target_file_path: None,
                     source_id: "cache".to_owned(),
                     target_qualified_name: "disk".to_owned(),
                     edge_kind,
                     file_path: "src/cache.rs".to_owned(),
                 },
                 SymbolEdge {
+                    target_symbol_id: Some("cache".to_owned()),
+                    target_file_path: None,
                     source_id: "client".to_owned(),
                     target_qualified_name: "cache".to_owned(),
                     edge_kind,
@@ -984,6 +1001,8 @@ mod tests {
         store.upsert_symbol(symbol("cache", "src/cache.rs"))?;
         store.upsert_symbol(symbol("test_cache", "tests/cache_test.rs"))?;
         store.upsert_edges(&[SymbolEdge {
+            target_symbol_id: Some("cache".to_owned()),
+            target_file_path: None,
             source_id: "test_cache".to_owned(),
             target_qualified_name: "cache".to_owned(),
             edge_kind: EdgeKind::Calls,

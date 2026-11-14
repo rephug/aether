@@ -3,7 +3,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use aether_core::{GitContext, Language, normalize_path};
+use aether_core::{GitContext, Language, SymbolEdge, normalize_path};
 use aether_health::{ScoreReport, workspace_health_config_or_default};
 use aether_parse::ModuleRoots;
 use aether_sir::{FileSir, SirAnnotation, canonicalize_file_sir_json, synthetic_file_sir_id};
@@ -11,7 +11,7 @@ use aether_store::{
     CouplingEdgeRecord, DriftStore, NameResolution, NameSite, ProjectNoteStore, SirStateStore,
     SqliteStore, SurrealGraphStore, SymbolCatalogStore, SymbolRecord, SymbolRelationStore,
     TaskContextHistoryRecord, TestIntentStore, ambiguity_label, ambiguity_note,
-    block_on_store_future, call_targets_of, narrow_call_edge_candidates, narrow_name_candidates,
+    block_on_store_future, call_targets_of, narrow_symbol_edge_candidates,
     open_surreal_graph_store_readonly,
 };
 use anyhow::{Context, Result, anyhow};
@@ -1241,7 +1241,7 @@ fn collect_same_file_slice_neighbors(
                 .with_context(|| format!("failed to list dependencies for {}", source.id))?;
             for edge in edges {
                 let Some(target) = names
-                    .resolve(edge.target_qualified_name.as_str(), &source)
+                    .resolve(&edge, &source)
                     .with_context(|| {
                         format!(
                             "failed to resolve dependency '{}'",
@@ -2584,13 +2584,12 @@ fn prepare_test_guards(
         .collect())
 }
 
-/// Resolves qualified names written in the store's workspace from the file of the
-/// symbol that wrote them (see [`narrow_name_candidates`]).
+/// Resolves stored edges from parser-recorded target proof while reusing candidate
+/// reads for repeated target names.
 struct NameResolver<'a> {
     store: &'a SqliteStore,
     modules: ModuleRoots,
-    candidates_by_name: HashMap<String, Vec<SymbolRecord>>,
-    call_candidates_by_target: HashMap<String, Vec<SymbolRecord>>,
+    candidates_by_target: HashMap<String, Vec<SymbolRecord>>,
 }
 
 impl<'a> NameResolver<'a> {
@@ -2598,30 +2597,31 @@ impl<'a> NameResolver<'a> {
         Self {
             store,
             modules: ModuleRoots::new(store.workspace_root().unwrap_or_default()),
-            candidates_by_name: HashMap::new(),
-            call_candidates_by_target: HashMap::new(),
+            candidates_by_target: HashMap::new(),
         }
     }
 
-    /// What `qualified_name` names when `site` writes it.
-    fn resolve(&mut self, qualified_name: &str, site: &SymbolRecord) -> Result<NameResolution> {
-        if !self.candidates_by_name.contains_key(qualified_name) {
-            let candidates = self.store.list_symbols_by_qualified_name(qualified_name)?;
-            self.candidates_by_name
-                .insert(qualified_name.to_owned(), candidates);
+    /// Filters cached candidates using this individual edge's target proof.
+    fn resolve(&mut self, edge: &SymbolEdge, site: &SymbolRecord) -> Result<NameResolution> {
+        let target = edge.target_qualified_name.as_str();
+        if !self.candidates_by_target.contains_key(target) {
+            self.candidates_by_target.insert(
+                target.to_owned(),
+                self.store.list_symbols_for_call_target(target)?,
+            );
         }
-        let modules = &mut self.modules;
-        Ok(narrow_name_candidates(
-            self.candidates_by_name[qualified_name].clone(),
-            Some(NameSite::of(site)),
-            &mut |file_path| modules.module_of(file_path),
+        Ok(narrow_symbol_edge_candidates(
+            &self.candidates_by_target[target],
+            edge,
+            NameSite::of(site),
+            &mut |file_path| self.modules.module_of(file_path),
         ))
     }
 
     /// The callers whose call edges resolve to `symbol` or one of its overloads, each
     /// once: an edge to the symbol's qualified name or, for a Rust method, its bare name
     /// counts when it resolves from the caller to `symbol` by the rule for call edges
-    /// ([`narrow_call_edge_candidates`]), as MCP context views do.
+    /// (using its parser-recorded provenance), as MCP context views do.
     fn callers_of(&mut self, symbol: &SymbolRecord) -> Result<Vec<SymbolRecord>> {
         let mut seen = HashSet::new();
         let mut callers = Vec::new();
@@ -2641,32 +2641,13 @@ impl<'a> NameResolver<'a> {
                 else {
                     continue;
                 };
-                if self
-                    .resolve_call(edge.target_qualified_name.as_str(), &caller)?
-                    .reaches(symbol)
-                {
+                if self.resolve(&edge, &caller)?.reaches(symbol) {
                     seen.insert(caller.id.clone());
                     callers.push(caller);
                 }
             }
         }
         Ok(callers)
-    }
-
-    /// What the call target `target` names when `site` calls it.
-    fn resolve_call(&mut self, target: &str, site: &SymbolRecord) -> Result<NameResolution> {
-        if !self.call_candidates_by_target.contains_key(target) {
-            let candidates = self.store.list_symbols_for_call_target(target)?;
-            self.call_candidates_by_target
-                .insert(target.to_owned(), candidates);
-        }
-        let modules = &mut self.modules;
-        Ok(narrow_call_edge_candidates(
-            &self.call_candidates_by_target[target],
-            target,
-            NameSite::of(site),
-            &mut |file_path| modules.module_of(file_path),
-        ))
     }
 }
 
@@ -2681,20 +2662,22 @@ fn prepare_dependencies(
     let mut prepared = Vec::new();
     let mut seen = HashSet::new();
     for edge in edges {
-        if !seen.insert(edge.target_qualified_name.clone()) {
-            continue;
-        }
-        let target = match names
-            .resolve(edge.target_qualified_name.as_str(), record)
-            .with_context(|| {
-                format!(
-                    "failed to resolve dependency '{}'",
-                    edge.target_qualified_name
-                )
-            })? {
+        let target = match names.resolve(&edge, record).with_context(|| {
+            format!(
+                "failed to resolve dependency '{}'",
+                edge.target_qualified_name
+            )
+        })? {
             NameResolution::Found(mut overloads) => overloads.swap_remove(0),
             NameResolution::NotFound => continue,
             NameResolution::Ambiguous(candidates) => {
+                let key = format!(
+                    "ambiguous::{:?}:{:?}:{}",
+                    edge.target_symbol_id, edge.target_file_path, edge.target_qualified_name
+                );
+                if !seen.insert(key) {
+                    continue;
+                }
                 let note = ambiguity_note(&candidates);
                 prepared.push(PreparedItem {
                     cost_text: format!("{}\n{}", edge.target_qualified_name, note),
@@ -2707,6 +2690,9 @@ fn prepare_dependencies(
                 continue;
             }
         };
+        if !seen.insert(format!("symbol::{}", target.id)) {
+            continue;
+        }
         let summary = read_intent_summary(store, target.id.as_str())
             .unwrap_or_else(|| "No SIR recorded.".to_owned());
         prepared.push(PreparedItem {
@@ -2884,14 +2870,12 @@ fn prepare_transitive_dependencies(
                 .get_dependencies(source.id.as_str())
                 .with_context(|| format!("failed to list dependencies for {}", source.id))?;
             for edge in edges {
-                let target = match names
-                    .resolve(edge.target_qualified_name.as_str(), &source)
-                    .with_context(|| {
-                        format!(
-                            "failed to resolve transitive dependency '{}'",
-                            edge.target_qualified_name
-                        )
-                    })? {
+                let target = match names.resolve(&edge, &source).with_context(|| {
+                    format!(
+                        "failed to resolve transitive dependency '{}'",
+                        edge.target_qualified_name
+                    )
+                })? {
                     NameResolution::Found(mut overloads) => overloads.swap_remove(0),
                     NameResolution::NotFound => continue,
                     NameResolution::Ambiguous(candidates) => {
@@ -3804,6 +3788,8 @@ vector_backend = "sqlite"
         let gamma = symbols.get(2).expect("gamma");
         store
             .upsert_edges(&[aether_core::SymbolEdge {
+                target_symbol_id: Some(alpha.id.clone()),
+                target_file_path: Some(alpha.file_path.clone()),
                 source_id: beta.id.clone(),
                 target_qualified_name: alpha.qualified_name.clone(),
                 edge_kind: aether_core::EdgeKind::DependsOn,
@@ -3812,6 +3798,8 @@ vector_backend = "sqlite"
             .expect("upsert deps");
         store
             .upsert_edges(&[aether_core::SymbolEdge {
+                target_symbol_id: Some(beta.id.clone()),
+                target_file_path: Some(beta.file_path.clone()),
                 source_id: gamma.id.clone(),
                 target_qualified_name: beta.qualified_name.clone(),
                 edge_kind: aether_core::EdgeKind::Calls,
@@ -3919,6 +3907,8 @@ vector_backend = "sqlite"
         for source in [&job_run, &app_run] {
             for edge_kind in [EdgeKind::Calls, EdgeKind::DependsOn] {
                 edges.push(SymbolEdge {
+                    target_symbol_id: None,
+                    target_file_path: None,
                     source_id: source.id.clone(),
                     target_qualified_name: "Config::load".to_owned(),
                     edge_kind,
@@ -4264,5 +4254,47 @@ vector_backend = "sqlite"
         assert!(summary.is_none());
         assert!(logs.contains("failed to load SIR summary for dependency context"));
         assert!(logs.contains("sym-invalid"));
+    }
+
+    #[test]
+    fn dependencies_keep_distinct_proven_targets_with_one_spelling() {
+        let temp = tempdir().expect("workspace");
+        let store = SqliteStore::open(temp.path()).expect("store");
+        let record = |id: &str, file: &str, name: &str| SymbolRecord {
+            id: id.to_owned(),
+            file_path: file.to_owned(),
+            language: "typescript".to_owned(),
+            kind: "function".to_owned(),
+            qualified_name: name.to_owned(),
+            signature_fingerprint: id.to_owned(),
+            last_seen_at: 1,
+        };
+        let caller = record("caller", "app.ts", "caller");
+        for symbol in [
+            caller.clone(),
+            record("a", "a/helper.ts", "helper"),
+            record("b", "b/helper.ts", "helper"),
+        ] {
+            store.upsert_symbol(symbol).expect("symbol");
+        }
+        let edges = [(None, None), (Some("a"), None), (None, Some("b/helper.ts"))]
+            .into_iter()
+            .map(|(id, file)| SymbolEdge {
+                source_id: caller.id.clone(),
+                target_qualified_name: "helper".to_owned(),
+                target_symbol_id: id.map(str::to_owned),
+                target_file_path: file.map(str::to_owned),
+                edge_kind: EdgeKind::DependsOn,
+                file_path: caller.file_path.clone(),
+            })
+            .collect::<Vec<_>>();
+        store.upsert_edges(&edges).expect("edges");
+        let mut files = super::prepare_dependencies(&store, &caller)
+            .expect("dependencies")
+            .into_iter()
+            .map(|item| item.value.file_path)
+            .collect::<Vec<_>>();
+        files.sort();
+        assert_eq!(files, ["a/helper.ts", "b/helper.ts"]);
     }
 }

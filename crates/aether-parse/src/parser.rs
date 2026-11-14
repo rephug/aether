@@ -49,6 +49,9 @@ pub struct SymbolExtractor {
     registry: LanguageRegistry,
     parsers: HashMap<&'static str, Parser>,
     python_workspace: Option<PythonWorkspace>,
+    rust_workspace: Option<crate::languages::rust::RustWorkspace>,
+    workspace_root: Option<PathBuf>,
+    resolution_reads: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,9 +85,16 @@ impl SymbolExtractor {
             registry,
             parsers,
             python_workspace: None,
+            rust_workspace: None,
+            workspace_root: None,
+            resolution_reads: HashMap::new(),
         })
     }
 
+    /// Enables bounded Rust and ECMAScript import proofs in files read from `root`.
+    /// Imported references retain exact defining-file provenance; unsupported or ambiguous
+    /// imports remain unresolved. Paths passed to extraction must be relative to `root`.
+    ///
     /// Resolves Python call targets through the workspace's other files, read from `root`,
     /// to which the paths of extracted files are relative. A call of a name that a package's
     /// `__init__.py` (or any module) imports from another module targets the module that
@@ -92,26 +102,52 @@ impl SymbolExtractor {
     /// `src/`-layout package from outside its `src/` directory gains the `src` prefix its
     /// symbols have. Targets that can't be followed to a definition keep their spelling.
     ///
+    /// The same workspace root supplies bounded Rust and ECMAScript import target
+    /// evidence. Unsupported import shapes remain raw references.
     /// The extractor keeps what it read; [`Self::refresh_workspace_file`] tells it about
     /// changes.
     pub fn with_workspace_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.python_workspace = Some(PythonWorkspace::new(root.into()));
+        let root = root.into();
+        self.python_workspace = Some(PythonWorkspace::new(root.clone()));
+        self.rust_workspace = Some(crate::languages::rust::RustWorkspace::new(root.clone()));
+        self.workspace_root = Some(root);
         self
     }
 
     /// Re-reads a workspace path (a file or a directory) after it changed, appeared or went
-    /// away. Returns the files whose Python call targets were resolved through what it held
+    /// away. Returns the files whose import targets were resolved through what it held
     /// before and may resolve differently now: their extracted edges are stale, so extract
-    /// them again. Edits that rebind no name those files looked up return none. Empty
-    /// without a workspace root.
+    /// them again. Rust and ECMAScript readers track candidate module paths as well as
+    /// successful imports, including missing or ambiguous files. Empty without a root.
     pub fn refresh_workspace_file(&mut self, file_path: &str) -> Vec<String> {
-        match (
+        let path = normalize_path(file_path);
+        let path = path.trim_matches('/');
+        let mut stale = self
+            .resolution_reads
+            .iter()
+            .filter(|(_, reads)| {
+                reads.iter().any(|read| {
+                    path.is_empty()
+                        || read == path
+                        || read
+                            .strip_prefix(path)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+            })
+            .map(|(caller, _)| caller.clone())
+            .collect::<Vec<_>>();
+        if let (Some(workspace), Some(parser)) = (
             self.python_workspace.as_mut(),
             self.parsers.get_mut(PYTHON_CONFIG_ID),
         ) {
-            (Some(workspace), Some(parser)) => workspace.refresh(parser, file_path),
-            _ => Vec::new(),
+            stale.extend(workspace.refresh(parser, file_path));
         }
+        if let Some(workspace) = self.rust_workspace.as_mut() {
+            stale.extend(workspace.refresh(file_path));
+        }
+        stale.sort();
+        stale.dedup();
+        stale
     }
 
     pub fn extract_from_path(&mut self, path: &Path, source: &str) -> Result<Vec<Symbol>> {
@@ -146,7 +182,12 @@ impl SymbolExtractor {
         extract_with_config(
             &self.registry,
             &mut self.parsers,
-            self.python_workspace.as_mut(),
+            WorkspaceResolution {
+                python: self.python_workspace.as_mut(),
+                rust: self.rust_workspace.as_mut(),
+                root: self.workspace_root.as_deref(),
+                reads: &mut self.resolution_reads,
+            },
             language,
             &file_path,
             source,
@@ -169,7 +210,12 @@ impl SymbolExtractor {
         extract_with_config(
             &self.registry,
             &mut self.parsers,
-            self.python_workspace.as_mut(),
+            WorkspaceResolution {
+                python: self.python_workspace.as_mut(),
+                rust: self.rust_workspace.as_mut(),
+                root: self.workspace_root.as_deref(),
+                reads: &mut self.resolution_reads,
+            },
             language,
             &normalized_file_path,
             source,
@@ -203,10 +249,17 @@ impl SymbolExtractor {
 /// The id of the language config whose call targets [`PythonWorkspace`] resolves.
 const PYTHON_CONFIG_ID: &str = "python";
 
+struct WorkspaceResolution<'a> {
+    python: Option<&'a mut PythonWorkspace>,
+    rust: Option<&'a mut crate::languages::rust::RustWorkspace>,
+    root: Option<&'a Path>,
+    reads: &'a mut HashMap<String, Vec<String>>,
+}
+
 fn extract_with_config(
     registry: &LanguageRegistry,
     parsers: &mut HashMap<&'static str, Parser>,
-    python_workspace: Option<&mut PythonWorkspace>,
+    workspace: WorkspaceResolution<'_>,
     language: Language,
     file_path: &str,
     source: &str,
@@ -228,7 +281,14 @@ fn extract_with_config(
     let prepared_hooks = config
         .hooks
         .as_ref()
-        .and_then(|hooks| hooks.for_extraction(root, source_bytes));
+        .and_then(|hooks| hooks.for_extraction_at(root, source_bytes, file_path, workspace.root));
+    workspace.reads.insert(
+        file_path.to_owned(),
+        prepared_hooks
+            .as_ref()
+            .map(|hooks| hooks.resolution_dependencies())
+            .unwrap_or_default(),
+    );
     let extraction_config = ExtractionConfig {
         config,
         hooks: prepared_hooks.as_deref().or(config.hooks.as_deref()),
@@ -266,10 +326,15 @@ fn extract_with_config(
     let mut edges = extract_edges(language, file_path, source_bytes, root, config, &symbols);
     if language == Language::Python
         && config.id == PYTHON_CONFIG_ID
-        && let Some(workspace) = python_workspace
+        && let Some(workspace) = workspace.python
     {
         // The tree stays valid while the parser reads the modules the targets name.
         workspace.resolve_calls(parser, file_path, &mut edges);
+    }
+    if language == Language::Rust
+        && let Some(workspace) = workspace.rust
+    {
+        workspace.resolve_calls(file_path, source, &mut edges);
     }
     sort_and_dedupe_edges(&mut edges);
 
@@ -510,6 +575,8 @@ fn default_map_edge(
         .unwrap_or_else(|| file_source_id(file_path));
 
     Some(vec![SymbolEdge {
+        target_symbol_id: None,
+        target_file_path: None,
         source_id,
         target_qualified_name: target,
         edge_kind,
@@ -768,6 +835,8 @@ pub(crate) fn sort_and_dedupe_edges(edges: &mut Vec<SymbolEdge>) {
             .then_with(|| left.target_qualified_name.cmp(&right.target_qualified_name))
             .then_with(|| left.edge_kind.cmp(&right.edge_kind))
             .then_with(|| left.file_path.cmp(&right.file_path))
+            .then_with(|| left.target_symbol_id.cmp(&right.target_symbol_id))
+            .then_with(|| left.target_file_path.cmp(&right.target_file_path))
     });
 
     edges.dedup_by(|left, right| {
@@ -775,6 +844,8 @@ pub(crate) fn sort_and_dedupe_edges(edges: &mut Vec<SymbolEdge>) {
             && left.target_qualified_name == right.target_qualified_name
             && left.edge_kind == right.edge_kind
             && left.file_path == right.file_path
+            && left.target_symbol_id == right.target_symbol_id
+            && left.target_file_path == right.target_file_path
     });
 }
 

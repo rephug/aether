@@ -220,11 +220,7 @@ pub(crate) async fn load_graph_data(
             }
         }
 
-        let callers = match shared
-            .graph
-            .get_callers(current.qualified_name.as_str())
-            .await
-        {
+        let callers = match shared.store.list_callers_for_symbol(current.id.as_str()) {
             Ok(rows) => rows,
             Err(err) => {
                 tracing::warn!(error = %err, symbol = %current.qualified_name, "dashboard: get_callers failed");

@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use rusqlite::{Connection, OpenFlags, params};
 
 use super::{
-    GraphStore, ResolvedEdge, StoreError, SymbolRecord, run_migrations, same_language_family_sql,
+    GraphStore, ResolvedEdge, StoreError, SymbolRecord, edge_target_matches_sql,
+    require_graph_provenance_schema, run_migrations,
 };
 
 pub struct SqliteGraphStore {
@@ -60,6 +61,7 @@ impl SqliteGraphStore {
             Connection::open(&self.sqlite_path)?
         };
         conn.busy_timeout(Duration::from_secs(5))?;
+        require_graph_provenance_schema(&conn)?;
         Ok(conn)
     }
     fn call_chain_sync(
@@ -99,12 +101,11 @@ impl SqliteGraphStore {
                     FROM symbol_edges e
                     JOIN symbols source ON source.id = e.source_id
                     JOIN symbols target
-                      ON target.qualified_name = e.target_qualified_name
-                     AND {family}
+                      ON {resolution}
                     WHERE e.edge_kind = 'calls'
                       AND e.source_id IN ({placeholders})
                     "#,
-                    family = same_language_family_sql("source.language", "target.language"),
+                    resolution = edge_target_matches_sql("e", "source.language", "target"),
                 ))?;
                 let rows = stmt.query_map(rusqlite::params_from_iter(sources), |row| {
                     Ok(SymbolRecord {
@@ -159,46 +160,19 @@ impl GraphStore for SqliteGraphStore {
             return Ok(Vec::new());
         }
 
-        // A call edge to the name counts unless every symbol with that name is outside
-        // the caller's language family. The languages of those symbols are read once.
         let conn = self.connection()?;
         let mut stmt = conn.prepare(&format!(
             r#"
-            WITH target_languages(language) AS MATERIALIZED (
-                SELECT DISTINCT language FROM symbols WHERE qualified_name = ?1
-            )
             SELECT DISTINCT
-                s.id,
-                s.file_path,
-                s.language,
-                s.kind,
-                s.qualified_name,
-                s.signature_fingerprint,
-                s.last_seen_at
-            FROM (
-                SELECT n.neighbor_id AS caller_id
-                FROM symbols target
-                JOIN symbol_neighbors n ON n.symbol_id = target.id
-                WHERE target.qualified_name = ?1
-                  AND n.edge_type = 'called_by'
-                UNION
-                SELECT e.source_id AS caller_id
-                FROM symbol_edges e
-                JOIN symbols caller ON caller.id = e.source_id
-                WHERE e.edge_kind = 'calls'
-                  AND e.target_qualified_name = ?1
-                  AND (
-                      NOT EXISTS (SELECT 1 FROM target_languages)
-                      OR EXISTS (
-                          SELECT 1 FROM target_languages target
-                          WHERE {family}
-                      )
-                  )
-            ) callers
-            JOIN symbols s ON s.id = callers.caller_id
-            ORDER BY s.qualified_name ASC, s.id ASC
+                caller.id, caller.file_path, caller.language, caller.kind,
+                caller.qualified_name, caller.signature_fingerprint, caller.last_seen_at
+            FROM symbol_edges e
+            JOIN symbols caller ON caller.id = e.source_id
+            JOIN symbols target ON {resolution}
+            WHERE e.edge_kind = 'calls' AND target.qualified_name = ?1
+            ORDER BY caller.qualified_name ASC, caller.id ASC
             "#,
-            family = same_language_family_sql("caller.language", "target.language"),
+            resolution = edge_target_matches_sql("e", "caller.language", "target"),
         ))?;
         let rows = stmt.query_map(params![qualified_name], |row| {
             Ok(SymbolRecord {
@@ -351,6 +325,8 @@ mod tests {
         store.upsert_edges(&[SymbolEdge {
             source_id: "root".to_owned(),
             target_qualified_name: "callee".to_owned(),
+            target_symbol_id: None,
+            target_file_path: Some("src/lib.rs".to_owned()),
             edge_kind: EdgeKind::Calls,
             file_path: "src/lib.rs".to_owned(),
         }])?;
@@ -377,12 +353,16 @@ mod tests {
                 SymbolEdge {
                     source_id: alpha.id.clone(),
                     target_qualified_name: "beta".to_owned(),
+                    target_symbol_id: None,
+                    target_file_path: Some("src/lib.rs".to_owned()),
                     edge_kind: EdgeKind::Calls,
                     file_path: "src/lib.rs".to_owned(),
                 },
                 SymbolEdge {
                     source_id: alpha.id.clone(),
                     target_qualified_name: "external::thing".to_owned(),
+                    target_symbol_id: None,
+                    target_file_path: Some("src/lib.rs".to_owned()),
                     edge_kind: EdgeKind::Calls,
                     file_path: "src/lib.rs".to_owned(),
                 },
@@ -423,18 +403,24 @@ mod tests {
                 SymbolEdge {
                     source_id: alpha.id.clone(),
                     target_qualified_name: "beta".to_owned(),
+                    target_symbol_id: None,
+                    target_file_path: Some("src/lib.rs".to_owned()),
                     edge_kind: EdgeKind::Calls,
                     file_path: "src/lib.rs".to_owned(),
                 },
                 SymbolEdge {
                     source_id: beta.id.clone(),
                     target_qualified_name: "gamma".to_owned(),
+                    target_symbol_id: None,
+                    target_file_path: Some("src/lib.rs".to_owned()),
                     edge_kind: EdgeKind::Calls,
                     file_path: "src/lib.rs".to_owned(),
                 },
                 SymbolEdge {
                     source_id: gamma.id.clone(),
                     target_qualified_name: "delta".to_owned(),
+                    target_symbol_id: None,
+                    target_file_path: Some("src/lib.rs".to_owned()),
                     edge_kind: EdgeKind::Calls,
                     file_path: "src/lib.rs".to_owned(),
                 },
@@ -476,6 +462,8 @@ mod tests {
         .map(|(source, target)| SymbolEdge {
             source_id: source.to_owned(),
             target_qualified_name: target.to_owned(),
+            target_symbol_id: None,
+            target_file_path: Some("src/lib.rs".to_owned()),
             edge_kind: EdgeKind::Calls,
             file_path: "src/lib.rs".to_owned(),
         });
@@ -526,12 +514,16 @@ mod tests {
             edges.push(SymbolEdge {
                 source_id: "root".to_owned(),
                 target_qualified_name: name.clone(),
+                target_symbol_id: None,
+                target_file_path: Some("src/lib.rs".to_owned()),
                 edge_kind: EdgeKind::Calls,
                 file_path: "src/lib.rs".to_owned(),
             });
             edges.push(SymbolEdge {
                 source_id: name,
                 target_qualified_name: "leaf".to_owned(),
+                target_symbol_id: None,
+                target_file_path: Some("src/lib.rs".to_owned()),
                 edge_kind: EdgeKind::Calls,
                 file_path: "src/lib.rs".to_owned(),
             });

@@ -1,5 +1,25 @@
 use super::*;
 
+fn proven_targets_for_source(
+    extracted: &ExtractedFile,
+    source_qualified_name: &str,
+) -> Vec<String> {
+    let source = extracted
+        .symbols
+        .iter()
+        .find(|symbol| symbol.qualified_name == source_qualified_name)
+        .expect("source symbol");
+    let mut targets = extracted
+        .edges
+        .iter()
+        .filter(|edge| edge.edge_kind == EdgeKind::Calls && edge.source_id == source.id)
+        .filter(|edge| edge.target_symbol_id.is_some() || edge.target_file_path.is_some())
+        .map(|edge| edge.target_qualified_name.clone())
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets
+}
+
 #[test]
 fn javascript_nested_function_calls_resolve_lexically_not_to_global_namesakes() {
     let source = r#"
@@ -60,7 +80,8 @@ fn javascript_dynamic_bindings_do_not_link_to_outer_function_namesakes() {
             !extracted
                 .edges
                 .iter()
-                .any(|edge| edge.target_qualified_name == "helper"),
+                .any(|edge| edge.target_qualified_name == "helper"
+                    && (edge.target_symbol_id.is_some() || edge.target_file_path.is_some())),
             "must not resolve dynamic shadow binding to global helper: {body}"
         );
     }
@@ -94,7 +115,11 @@ fn javascript_identifier_constructors_resolve_lexically() {
         edge_targets_for_source(&extracted, "other", EdgeKind::Calls),
         vec!["Local"]
     );
-    assert!(edge_targets_for_source(&extracted, "shadow", EdgeKind::Calls).is_empty());
+    assert!(proven_targets_for_source(&extracted, "shadow").is_empty());
+    assert_eq!(
+        edge_targets_for_source(&extracted, "shadow", EdgeKind::Calls),
+        vec!["Local"]
+    );
 }
 
 #[test]
@@ -112,7 +137,11 @@ fn javascript_class_constructors_keep_static_targets_without_crossing_shadow_bin
         edge_targets_for_source(&extracted, "outer", EdgeKind::Calls),
         vec!["outer::Widget"]
     );
-    assert!(edge_targets_for_source(&extracted, "shadow", EdgeKind::Calls).is_empty());
+    assert!(proven_targets_for_source(&extracted, "shadow").is_empty());
+    assert_eq!(
+        edge_targets_for_source(&extracted, "shadow", EdgeKind::Calls),
+        vec!["Widget"]
+    );
 }
 
 #[test]
@@ -386,7 +415,8 @@ fn unindexed_generator_names_shadow_outer_function_namesakes() {
             !extracted
                 .edges
                 .iter()
-                .any(|edge| edge.target_qualified_name == "helper")
+                .any(|edge| edge.target_qualified_name == "helper"
+                    && (edge.target_symbol_id.is_some() || edge.target_file_path.is_some()))
         );
     }
 }
@@ -399,7 +429,7 @@ fn parameter_initializers_cannot_see_body_var_bindings() {
         "function helper() {} function caller(arg=helper()) { var helper; helper(); }",
     );
     assert_eq!(
-        edge_targets_for_source(&extracted, "caller", EdgeKind::Calls),
+        proven_targets_for_source(&extracted, "caller"),
         vec!["helper"]
     );
     let extracted = extract_with_edges(
@@ -407,7 +437,11 @@ fn parameter_initializers_cannot_see_body_var_bindings() {
         "params.mjs",
         "function helper() {} function caller(helper,arg=helper()) { var helper; }",
     );
-    assert!(edge_targets_for_source(&extracted, "caller", EdgeKind::Calls).is_empty());
+    assert!(proven_targets_for_source(&extracted, "caller").is_empty());
+    assert_eq!(
+        edge_targets_for_source(&extracted, "caller", EdgeKind::Calls),
+        vec!["helper"]
+    );
     let extracted = extract_with_edges(
         Language::JavaScript,
         "params.mjs",
@@ -438,7 +472,11 @@ fn nested_closures_still_see_enclosing_body_var_shadow() {
         "closure.mjs",
         "function helper() {} function caller() { var helper; function inner(){ helper(); } }",
     );
-    assert!(edge_targets_for_source(&extracted, "caller::inner", EdgeKind::Calls).is_empty());
+    assert!(proven_targets_for_source(&extracted, "caller::inner").is_empty());
+    assert_eq!(
+        edge_targets_for_source(&extracted, "caller::inner", EdgeKind::Calls),
+        vec!["helper"]
+    );
 }
 
 #[test]
@@ -596,6 +634,7 @@ fn named_class_expression_self_binding_does_not_resolve_outer_constructor() {
         !extracted
             .edges
             .iter()
-            .any(|edge| edge.target_qualified_name == "Local")
+            .any(|edge| edge.target_qualified_name == "Local"
+                && (edge.target_symbol_id.is_some() || edge.target_file_path.is_some()))
     );
 }

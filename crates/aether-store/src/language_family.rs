@@ -1,8 +1,8 @@
 //! SQL for resolving edges within a language family.
 //!
-//! An edge names its target by qualified name alone, and different languages can declare
-//! the same qualified name: a Java class and a TypeScript class can both declare
-//! `UserService::getUser`. An edge therefore resolves only to symbols of its source's
+//! Different languages can declare the same qualified name: a Java class and a
+//! TypeScript class can both declare `UserService::getUser`. Target provenance does
+//! not replace this constraint: resolved edges must also stay within the source's
 //! language family ([`aether_core::language_family`]).
 
 use aether_core::ECMASCRIPT_LANGUAGES;

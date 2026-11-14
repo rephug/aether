@@ -25,24 +25,32 @@ fn commit_successful_generation_injects_method_dependencies_from_symbol_edges_ac
     store
         .upsert_edges(&[
             SymbolEdge {
+                target_symbol_id: None,
+                target_file_path: None,
                 source_id: "sym-load".to_owned(),
                 target_qualified_name: "Helper".to_owned(),
                 edge_kind: EdgeKind::Calls,
                 file_path: "src/load.rs".to_owned(),
             },
             SymbolEdge {
+                target_symbol_id: None,
+                target_file_path: None,
                 source_id: "sym-load".to_owned(),
                 target_qualified_name: "Record".to_owned(),
                 edge_kind: EdgeKind::TypeRef,
                 file_path: "src/load.rs".to_owned(),
             },
             SymbolEdge {
+                target_symbol_id: None,
+                target_file_path: None,
                 source_id: "sym-load".to_owned(),
                 target_qualified_name: "StoreError".to_owned(),
                 edge_kind: EdgeKind::TypeRef,
                 file_path: "src/load.rs".to_owned(),
             },
             SymbolEdge {
+                target_symbol_id: None,
+                target_file_path: None,
                 source_id: "sym-save".to_owned(),
                 target_qualified_name: "Record".to_owned(),
                 edge_kind: EdgeKind::TypeRef,

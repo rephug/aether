@@ -357,7 +357,7 @@ fn expand_known_descendants(
     expanded.into_iter().collect()
 }
 
-/// Re-reads a batch of changed paths for the Python call targets resolved through them,
+/// Refreshes a batch of changed paths used by workspace import resolution,
 /// symbols or not (a package's `__init__.py` that only re-exports has none), before any
 /// file of the batch is re-extracted. The files whose targets they may move are
 /// re-extracted once the batch is done (`StructuralIndexer::reindex_stale_files`), also

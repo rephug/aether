@@ -111,21 +111,20 @@ pub struct AetherDependenciesResponse {
     pub coverage_note: String,
 }
 
-/// How a set of recorded call edges resolved. A call's target text matches workspace
-/// symbols by exact qualified name in the caller's language family, as the stored graph
-/// links them. Rust calls written inside macro arguments (`format!`, `assert!`, ...) are
-/// not recorded, so no count includes them.
+/// How recorded calls satisfy target evidence within the caller's language family.
+/// Rust and ECMAScript require parser-proven identity or a unique target in a proven
+/// file; other languages retain qualified-name lookup. Rust macro-argument calls
+/// (`format!`, `assert!`, ...) are not recorded, so no count includes them.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
 pub struct AetherCallEdgeCoverage {
     pub call_edges: u64,
-    /// Calls whose target names exactly one symbol.
+    /// Calls whose target evidence identifies exactly one symbol.
     pub resolved: u64,
-    /// Calls whose target names several symbols; every candidate is listed.
+    /// Calls with several candidate targets. Proven-file ambiguity is not linked.
     pub ambiguous: u64,
-    /// Calls whose target matches no workspace symbol's qualified name exactly. Not
-    /// listed. Many are external or standard-library calls, but they may be internal:
-    /// Rust method calls are recorded by their bare method name, and a call through a
-    /// module path or alias doesn't spell the qualified name.
+    /// Calls without sufficient target evidence, omitted from the graph. They may
+    /// be internal, external or standard-library calls; an unresolved name does not
+    /// establish which kind.
     pub unresolved: u64,
 }
 
@@ -147,15 +146,13 @@ pub struct AetherCallerCoverage {
     pub name_matches: u32,
     /// Listed in `callers`.
     pub attributed: u32,
-    /// Of `attributed`, callers matched by a heuristic rather than an exact, unique name:
-    /// a Rust call recorded by bare method name (`x.alpha()` may call another type's
-    /// `alpha`, a standard-library one included), or a name other symbols also carry that
-    /// the caller's file or module narrowed to this one. They may not really call it.
+    /// Of `attributed`, legacy-language callers matched by file/module name
+    /// narrowing without parser-recorded proof. They may not really call it.
     pub heuristic: u32,
     /// The name also fits other symbols that the caller's file and module don't rule
     /// out, so the call isn't attributed: the symbol may have more callers than listed.
     pub ambiguous: u32,
-    /// The caller's file or module resolves the name to another symbol.
+    /// The reference lacks proof for this symbol or resolves to another symbol.
     pub resolved_elsewhere: u32,
 }
 
@@ -182,15 +179,13 @@ fn dependency_coverage_clauses(coverage: &AetherCallEdgeCoverage) -> String {
     )];
     if coverage.ambiguous > 0 {
         clauses.push(format!(
-            "{} name several symbols and list every candidate",
+            "{} have several candidate targets; proven-file ambiguity is not linked",
             coverage.ambiguous
         ));
     }
     if coverage.unresolved > 0 {
         clauses.push(format!(
-            "{} match no qualified name exactly and are not listed; many are external or \
-             standard-library calls, but they may be internal (Rust method calls are \
-             recorded by bare name)",
+            "{} lack sufficient target evidence and are not listed; they may be internal, external or standard-library calls",
             coverage.unresolved
         ));
     }
@@ -212,8 +207,7 @@ fn dependencies_coverage_note(
     };
     if callers.heuristic > 0 {
         caller_clauses.push(format!(
-            "{} of those by heuristic (a bare method name, or a shared name narrowed by the \
-             caller's file or module), so they may not really call it",
+            "{} of those by legacy file/module name narrowing, so they may not really call it",
             callers.heuristic
         ));
     }
@@ -222,6 +216,12 @@ fn dependencies_coverage_note(
             "{} more could be calling it but the name also fits other symbols, so they are \
              not listed",
             callers.ambiguous
+        ));
+    }
+    if callers.resolved_elsewhere > 0 {
+        caller_clauses.push(format!(
+            "{} lack proof for this symbol or resolve elsewhere and are not listed",
+            callers.resolved_elsewhere
         ));
     }
     format!(

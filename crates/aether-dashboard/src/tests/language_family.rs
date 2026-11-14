@@ -56,18 +56,24 @@ async fn mixed_language_state() -> (TempDir, Arc<SharedState>) {
     store
         .upsert_edges(&[
             SymbolEdge {
+                target_symbol_id: None,
+                target_file_path: None,
                 source_id: "java-show".to_owned(),
                 target_qualified_name: "UserService::getUser".to_owned(),
                 edge_kind: EdgeKind::Calls,
                 file_path: "src/main/java/UserController.java".to_owned(),
             },
             SymbolEdge {
+                target_symbol_id: None,
+                target_file_path: None,
                 source_id: "java-page".to_owned(),
                 target_qualified_name: "Widget::render".to_owned(),
                 edge_kind: EdgeKind::Calls,
                 file_path: "src/main/java/UserController.java".to_owned(),
             },
             SymbolEdge {
+                target_symbol_id: Some("ts-get-user".to_owned()),
+                target_file_path: None,
                 source_id: aether_core::file_source_id("web/main.js"),
                 target_qualified_name: "UserService::getUser".to_owned(),
                 edge_kind: EdgeKind::Calls,

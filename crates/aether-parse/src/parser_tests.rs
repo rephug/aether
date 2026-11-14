@@ -510,7 +510,29 @@ fn example(obj: Worker) {
         .collect::<Vec<_>>();
 
     assert!(targets.iter().any(|target| target == "run_free"));
-    assert!(targets.iter().any(|target| target == "process"));
+    assert!(targets.iter().any(|target| target == "Worker::process"));
+    let process = extracted
+        .symbols
+        .iter()
+        .find(|symbol| symbol.qualified_name == "Worker::process")
+        .expect("process method");
+    let method_call = extracted
+        .edges
+        .iter()
+        .find(|edge| {
+            edge.source_id == example.id && edge.target_qualified_name == "Worker::process"
+        })
+        .expect("nominal receiver proof");
+    assert_eq!(
+        method_call.target_symbol_id.as_deref(),
+        Some(process.id.as_str())
+    );
+    let external_call = extracted
+        .edges
+        .iter()
+        .find(|edge| edge.source_id == example.id && edge.target_qualified_name == "String::from")
+        .expect("unresolved external call is retained");
+    assert!(external_call.target_symbol_id.is_none() && external_call.target_file_path.is_none());
     assert!(targets.iter().any(|target| target == "String::from"));
 }
 
@@ -633,7 +655,7 @@ mod models {
     pub struct MyStruct {}
 }
 
-use models::MyStruct as ImportedStruct;
+use self::models::MyStruct as ImportedStruct;
 
 fn foo(value: ImportedStruct) {}
 "#;

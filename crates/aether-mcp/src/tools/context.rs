@@ -8,7 +8,7 @@ use aether_core::{EdgeKind, Position, SourceRange, SymbolEdge};
 use aether_parse::{ModuleRoots, SymbolExtractor, language_for_path};
 use aether_sir::SirAnnotation;
 use aether_store::{
-    NameResolution, NameSite, SirStateStore, SymbolRecord, TestIntentRecord, TestIntentStore,
+    NameResolution, SirStateStore, SymbolRecord, TestIntentRecord, TestIntentStore,
     ambiguity_label, ambiguity_note,
 };
 use aetherd::freshness::symbol_freshness_note;
@@ -520,8 +520,8 @@ fn build_tests_layer(
     lines.join("\n")
 }
 
-/// A graph entry for a dependency whose name several symbols share, which neither the
-/// referring file nor its module narrows to one.
+/// A graph entry for a reference whose available target evidence still fits several
+/// declarations. The candidates are disclosed without following an ambiguous link.
 fn ambiguous_graph_entry(
     section: &'static str,
     edge_kind: EdgeKind,
@@ -539,31 +539,22 @@ fn ambiguous_graph_entry(
     }
 }
 
-/// What the target of `edge`, written by `source`, names: a call by the rule for call
-/// edges ([`narrow_call_edge_candidates`](aether_store::narrow_call_edge_candidates)),
-/// any other edge by its exact qualified name.
+/// Resolves the individual edge's recorded target proof. Legacy languages retain
+/// their existing name narrowing when no parser proof was recorded.
 fn resolve_dependency(
     store: &aether_store::SqliteStore,
     edge: &SymbolEdge,
     source: &SymbolRecord,
     modules: &mut ModuleRoots,
 ) -> Result<NameResolution, AetherMcpError> {
-    let target = edge.target_qualified_name.as_str();
-    let site = NameSite::of(source);
-    let mut module_of = |file_path: &str| modules.module_of(file_path);
-    Ok(if edge.edge_kind == EdgeKind::Calls {
-        store.resolve_call_edge(target, site, &mut module_of)?
-    } else {
-        store.resolve_qualified_name(target, Some(site), &mut module_of)?
-    })
+    Ok(store.resolve_symbol_edge(edge, source, &mut |file_path| modules.module_of(file_path))?)
 }
 
 /// The callers of `record`, its dependencies and, from depth 2, their dependencies.
 ///
-/// A dependency's name resolves from the file of the symbol that wrote it (see
-/// [`narrow_name_candidates`](aether_store::narrow_name_candidates)); a name that stays
-/// ambiguous is listed as such and not followed. Callers are those whose call edges
-/// resolve to `record` or its overloads.
+/// Parser proof determines each dependency target. A reference that stays ambiguous
+/// is listed as such and not followed. Callers must reach this selected record;
+/// legacy languages can retain name-based overload groups.
 fn build_graph_entries(
     store: &aether_store::SqliteStore,
     workspace: &Path,
@@ -1233,12 +1224,16 @@ vector_backend = "sqlite"
         store
             .upsert_edges(&[
                 SymbolEdge {
+                    target_symbol_id: Some(target.id.clone()),
+                    target_file_path: Some(target.file_path.clone()),
                     source_id: caller.id.clone(),
                     target_qualified_name: target.qualified_name.clone(),
                     edge_kind: EdgeKind::Calls,
                     file_path: caller.file_path.clone(),
                 },
                 SymbolEdge {
+                    target_symbol_id: Some(callee.id.clone()),
+                    target_file_path: Some(callee.file_path.clone()),
                     source_id: target.id.clone(),
                     target_qualified_name: callee.qualified_name.clone(),
                     edge_kind: EdgeKind::Calls,
@@ -1393,6 +1388,8 @@ vector_backend = "sqlite"
             store.upsert_symbol(record).expect("upsert symbol");
         }
         let call = |source: &SymbolRecord| SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: source.id.clone(),
             target_qualified_name: "Config::load".to_owned(),
             edge_kind: EdgeKind::Calls,
@@ -1438,10 +1435,10 @@ vector_backend = "sqlite"
     }
 
     #[test]
-    fn graph_context_resolves_rust_method_calls_within_the_callers_file() {
-        // `S::run` calls `self.helper()`, recorded as the bare name `helper`. `S::helper`
-        // is in the same file, so that is the callee; the free `helper` in another file
-        // of the crate is not, and `main`'s `v.len()` doesn't reach `Buf::len`.
+    fn graph_context_requires_proof_for_rust_method_calls() {
+        // Bare method spellings prove no receiver type, even when a matching method
+        // is in the same file. Exact parser evidence can establish S::helper; neither
+        // the unrelated free helper nor main's untyped v.len() becomes a caller link.
         let temp = tempdir().expect("tempdir");
         let workspace = temp.path();
         let store = SqliteStore::open(workspace).expect("open store");
@@ -1463,6 +1460,8 @@ vector_backend = "sqlite"
             store.upsert_symbol(record.clone()).expect("upsert symbol");
         }
         let call = |source: &SymbolRecord, target: &str| SymbolEdge {
+            target_symbol_id: None,
+            target_file_path: None,
             source_id: source.id.clone(),
             target_qualified_name: target.to_owned(),
             edge_kind: EdgeKind::Calls,
@@ -1480,6 +1479,18 @@ vector_backend = "sqlite"
                 .map(|entry| entry.qualified_name)
                 .collect::<Vec<_>>()
         };
+        assert!(section(&run, "callees").is_empty());
+        assert!(section(&method_helper, "callers").is_empty());
+        store
+            .upsert_edges(&[SymbolEdge {
+                source_id: run.id.clone(),
+                target_qualified_name: method_helper.qualified_name.clone(),
+                target_symbol_id: Some(method_helper.id.clone()),
+                target_file_path: Some(method_helper.file_path.clone()),
+                edge_kind: EdgeKind::Calls,
+                file_path: run.file_path.clone(),
+            }])
+            .expect("explicit receiver proof");
         assert_eq!(section(&run, "callees"), vec!["S::helper".to_owned()]);
         assert_eq!(
             section(&method_helper, "callers"),
@@ -1511,18 +1522,24 @@ vector_backend = "sqlite"
         store
             .upsert_edges(&[
                 SymbolEdge {
+                    target_symbol_id: Some(helper.id.clone()),
+                    target_file_path: Some(helper.file_path.clone()),
                     source_id: target.id.clone(),
                     target_qualified_name: helper.qualified_name.clone(),
                     edge_kind: EdgeKind::TypeRef,
                     file_path: target.file_path.clone(),
                 },
                 SymbolEdge {
+                    target_symbol_id: Some(caller.id.clone()),
+                    target_file_path: Some(caller.file_path.clone()),
                     source_id: callee.id.clone(),
                     target_qualified_name: caller.qualified_name.clone(),
                     edge_kind: EdgeKind::Calls,
                     file_path: callee.file_path.clone(),
                 },
                 SymbolEdge {
+                    target_symbol_id: None,
+                    target_file_path: None,
                     source_id: target.id.clone(),
                     target_qualified_name: "unresolved_external".to_owned(),
                     edge_kind: EdgeKind::Calls,

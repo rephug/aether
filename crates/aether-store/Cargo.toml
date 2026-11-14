@@ -29,5 +29,6 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] 
 tracing.workspace = true
 
 [dev-dependencies]
+aether-parse = { path = "../aether-parse" }
 tempfile.workspace = true
 tracing-subscriber.workspace = true

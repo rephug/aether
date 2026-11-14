@@ -1366,3 +1366,88 @@ fn watcher_does_not_index_or_watch_gitignored_generated_sources() {
     );
     assert!(classified.watch_dirs.is_empty());
 }
+
+#[test]
+fn import_only_edit_replaces_proven_call_target_without_a_symbol_event() {
+    let temp = tempdir().expect("workspace");
+    let workspace = temp.path();
+    crate::indexer::tests::write_default_config(workspace);
+    fs::create_dir_all(workspace.join("src")).expect("src");
+    for (file, source) in [
+        (
+            "src/a.ts",
+            "export function helper(): number { return 1; }\n",
+        ),
+        (
+            "src/b.ts",
+            "export function helper(): number { return 2; }\n",
+        ),
+        (
+            "src/caller.ts",
+            "import { helper } from './a';\nexport function call(): number { return helper(); }\n",
+        ),
+    ] {
+        fs::write(workspace.join(file), source).expect("source");
+    }
+    let config = mock_config(workspace);
+    crate::freshness::let_writes_settle();
+    run_initial_index_once(&config).expect("initial index");
+    let store = SqliteStore::open(workspace).expect("store");
+    let caller = store
+        .list_symbols_for_file("src/caller.ts")
+        .expect("caller")
+        .remove(0);
+    let helper_a = store
+        .list_symbols_for_file("src/a.ts")
+        .expect("a")
+        .remove(0);
+    let helper_b = store
+        .list_symbols_for_file("src/b.ts")
+        .expect("b")
+        .remove(0);
+    let targets = |store: &SqliteStore| {
+        store
+            .list_graph_dependency_edges()
+            .expect("resolved graph")
+            .into_iter()
+            .filter(|edge| edge.source_symbol_id == caller.id && edge.edge_kind == "calls")
+            .map(|edge| edge.target_symbol_id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(targets(&store), [helper_a.id]);
+    let mut observer = ObserverState::new(workspace.to_path_buf()).expect("observer");
+    observer.seed_from_disk().expect("seed");
+    let mut structural = StructuralIndexer::new(workspace.to_path_buf()).expect("structural");
+    let queue = SharedQueueState::new(HashMap::new());
+    let path = workspace.join("src/caller.ts");
+    fs::write(
+        &path,
+        "import { helper } from './b';\nexport function call(): number { return helper(); }\n",
+    )
+    .expect("import-only edit");
+    assert!(
+        observer
+            .process_path(&path)
+            .expect("observe import edit")
+            .is_none(),
+        "the symbol itself is unchanged"
+    );
+    crate::freshness::let_writes_settle();
+    process_reindex_paths(
+        &config,
+        &mut observer,
+        &mut structural,
+        &store,
+        &queue,
+        vec![path],
+    )
+    .expect("watch import edit");
+    assert_eq!(targets(&store), [helper_b.id]);
+    assert_eq!(
+        store
+            .list_symbols_for_file("src/caller.ts")
+            .expect("unchanged caller")[0]
+            .id,
+        caller.id
+    );
+}

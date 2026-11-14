@@ -94,12 +94,18 @@ fn seed_mixed_workspace(store: &SqliteStore) -> MixedWorkspace {
                 "UserService::getUser",
                 JAVA_CONTROLLER,
             ),
-            calls_edge(&workspace.js_render.id, "UserService::getUser", JS_RENDER),
-            calls_edge(
-                &aether_core::file_source_id(JS_MAIN),
-                "UserService::getUser",
-                JS_MAIN,
-            ),
+            SymbolEdge {
+                target_file_path: Some(TS_SERVICE.to_owned()),
+                ..calls_edge(&workspace.js_render.id, "UserService::getUser", JS_RENDER)
+            },
+            SymbolEdge {
+                target_file_path: Some(TS_SERVICE.to_owned()),
+                ..calls_edge(
+                    &aether_core::file_source_id(JS_MAIN),
+                    "UserService::getUser",
+                    JS_MAIN,
+                )
+            },
             calls_edge(&workspace.python_main.id, "config::load", PY_APP),
             calls_edge(&workspace.go_init.id, "config::load", GO_INIT),
             calls_edge(&workspace.java_page.id, "Widget::render", JAVA_CONTROLLER),

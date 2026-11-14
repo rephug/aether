@@ -143,7 +143,9 @@ impl SqliteStore {
                 s.last_seen_at,
                 e.target_qualified_name,
                 e.edge_kind,
-                e.file_path
+                e.file_path,
+                e.target_symbol_id,
+                e.target_file_path
             FROM symbol_edges e
             JOIN symbols s ON s.id = e.source_id
             WHERE instr(s.qualified_name, ?1) = 1
@@ -158,6 +160,7 @@ impl SqliteStore {
             .collect::<Vec<_>>();
 
         let conn = self.conn.lock().unwrap();
+        require_graph_provenance_schema(&conn)?;
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(params), |row| {
             Ok((
@@ -173,12 +176,21 @@ impl SqliteStore {
                 row.get::<_, String>(7)?,
                 row.get::<_, String>(8)?,
                 row.get::<_, String>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
             ))
         })?;
 
         let mut records = Vec::new();
         for row in rows {
-            let (source_symbol, target_qualified_name, edge_kind, file_path) = row?;
+            let (
+                source_symbol,
+                target_qualified_name,
+                edge_kind,
+                file_path,
+                target_symbol_id,
+                target_file_path,
+            ) = row?;
             let edge_kind = edge_kind_from_str(edge_kind.as_str()).ok_or_else(|| {
                 StoreError::Compatibility(format!(
                     "unsupported edge kind while reading method dependency edges: {edge_kind}"
@@ -189,6 +201,8 @@ impl SqliteStore {
                 SymbolEdge {
                     source_id: source_symbol.id,
                     target_qualified_name,
+                    target_symbol_id,
+                    target_file_path,
                     edge_kind,
                     file_path,
                 },
@@ -198,24 +212,67 @@ impl SqliteStore {
         Ok(records)
     }
 
+    /// Callers of this exact symbol, rather than every declaration sharing its
+    /// qualified name. Dashboard and selected-symbol views must keep that identity.
+    pub fn list_callers_for_symbol(
+        &self,
+        symbol_id: &str,
+    ) -> Result<Vec<SymbolRecord>, StoreError> {
+        let symbol_id = symbol_id.trim();
+        if symbol_id.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock_connection()?;
+        require_graph_provenance_schema(&conn)?;
+        let resolution = edge_target_matches_sql("e", "source.language", "target");
+        let mut stmt = conn.prepare(&format!(
+            r#"
+            SELECT DISTINCT source.id, source.file_path, source.language, source.kind,
+                source.qualified_name, source.signature_fingerprint, source.last_seen_at
+            FROM symbol_edges e
+            JOIN symbols source ON source.id = e.source_id
+            JOIN symbols target ON {resolution}
+            WHERE e.edge_kind = 'calls' AND target.id = ?1
+            ORDER BY source.qualified_name, source.id
+            "#
+        ))?;
+        let rows = stmt.query_map(params![symbol_id], |row| {
+            Ok(SymbolRecord {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                language: row.get(2)?,
+                kind: row.get(3)?,
+                qualified_name: row.get(4)?,
+                signature_fingerprint: row.get(5)?,
+                last_seen_at: row.get(6)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn list_graph_dependency_edges(
         &self,
     ) -> Result<Vec<GraphDependencyEdgeRecord>, StoreError> {
         let sql = format!(
             r#"
             WITH {EDGE_FILE_LANGUAGE_CTE}
-            SELECT e.source_id, target.id, e.edge_kind
+            SELECT DISTINCT e.source_id, target.id, e.edge_kind
             FROM symbol_edges e
+            LEFT JOIN symbols source ON source.id = e.source_id
             LEFT JOIN edge_file_language source_file ON source_file.file_path = e.file_path
             JOIN symbols target
-              ON target.qualified_name = e.target_qualified_name
-             AND {family}
+              ON {resolution}
             WHERE e.edge_kind IN ('calls', 'depends_on', 'type_ref', 'implements')
             ORDER BY e.source_id ASC, target.id ASC, e.edge_kind ASC
             "#,
-            family = edge_source_family_matches_sql("source_file.language", "target.language"),
+            resolution = edge_target_matches_sql(
+                "e",
+                "COALESCE(source.language, source_file.language)",
+                "target"
+            ),
         );
         let conn = self.conn.lock().unwrap();
+        require_graph_provenance_schema(&conn)?;
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], |row| {
             Ok(GraphDependencyEdgeRecord {
@@ -243,11 +300,11 @@ impl SqliteStore {
             .join(", ");
         let sql = format!(
             r#"
-            SELECT source_id, target_qualified_name, edge_kind, file_path
+            SELECT source_id, target_qualified_name, edge_kind, file_path, target_symbol_id, target_file_path
             FROM symbol_edges
             WHERE source_id = ?1
               AND edge_kind IN ({placeholders})
-            ORDER BY source_id ASC, target_qualified_name ASC, edge_kind ASC, file_path ASC
+            ORDER BY source_id ASC, target_qualified_name ASC, edge_kind ASC, file_path ASC, target_symbol_id, target_file_path
             "#
         );
 
@@ -256,6 +313,7 @@ impl SqliteStore {
             .collect::<Vec<_>>();
 
         let conn = self.conn.lock().unwrap();
+        require_graph_provenance_schema(&conn)?;
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(params), |row| {
             Ok((
@@ -263,12 +321,21 @@ impl SqliteStore {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?;
 
         let mut records = Vec::new();
         for row in rows {
-            let (source_id, target_qualified_name, edge_kind, file_path) = row?;
+            let (
+                source_id,
+                target_qualified_name,
+                edge_kind,
+                file_path,
+                target_symbol_id,
+                target_file_path,
+            ) = row?;
             let edge_kind = edge_kind_from_str(edge_kind.as_str()).ok_or_else(|| {
                 StoreError::Compatibility(format!(
                     "unsupported edge kind while reading symbol edges: {edge_kind}"
@@ -277,6 +344,8 @@ impl SqliteStore {
             records.push(SymbolEdge {
                 source_id,
                 target_qualified_name,
+                target_symbol_id,
+                target_file_path,
                 edge_kind,
                 file_path,
             });
@@ -302,10 +371,10 @@ impl SqliteStore {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
-            "SELECT source_id, target_qualified_name, edge_kind, file_path
+            "SELECT source_id, target_qualified_name, edge_kind, file_path, target_symbol_id, target_file_path
              FROM symbol_edges
              WHERE target_qualified_name = ?1 AND edge_kind IN ({placeholders})
-             ORDER BY source_id, target_qualified_name, edge_kind, file_path"
+             ORDER BY source_id, target_qualified_name, edge_kind, file_path, target_symbol_id, target_file_path"
         );
         let parameters = std::iter::once(target_qualified_name.to_owned())
             .chain(edge_kinds.iter().map(|kind| kind.as_str().to_owned()))
@@ -313,6 +382,7 @@ impl SqliteStore {
         let connection = self.conn.lock().map_err(|_| {
             StoreError::Graph("SQLite reverse-edge connection lock is poisoned".to_owned())
         })?;
+        require_graph_provenance_schema(&connection)?;
         let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map(params_from_iter(parameters), |row| {
             Ok((
@@ -320,11 +390,20 @@ impl SqliteStore {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?;
         let mut edges = Vec::new();
         for row in rows {
-            let (source_id, target_qualified_name, kind, file_path) = row?;
+            let (
+                source_id,
+                target_qualified_name,
+                kind,
+                file_path,
+                target_symbol_id,
+                target_file_path,
+            ) = row?;
             let edge_kind = edge_kind_from_str(&kind).ok_or_else(|| {
                 StoreError::Compatibility(format!(
                     "unsupported reverse structural edge kind: {kind}"
@@ -333,6 +412,8 @@ impl SqliteStore {
             edges.push(SymbolEdge {
                 source_id,
                 target_qualified_name,
+                target_symbol_id,
+                target_file_path,
                 edge_kind,
                 file_path,
             });
@@ -351,6 +432,16 @@ impl SqliteStore {
             .map(|symbol| symbol.qualified_name)
             .collect::<Vec<_>>();
         let mut files = self.list_graph_referring_files(&names)?;
+        {
+            let conn = self.lock_connection()?;
+            require_graph_provenance_schema(&conn)?;
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT file_path FROM symbol_edges WHERE target_file_path = ?1",
+            )?;
+            for referring in stmt.query_map(params![file_path], |row| row.get::<_, String>(0))? {
+                files.push(referring?);
+            }
+        }
         files.push(file_path.to_owned());
         files.sort();
         files.dedup();
@@ -380,6 +471,10 @@ impl SqliteStore {
             });
         }
 
+        {
+            let conn = self.lock_connection()?;
+            require_graph_provenance_schema(&conn)?;
+        }
         graph_store.delete_edges_for_file(file_path).await?;
 
         let symbols = self.list_symbols_for_file(file_path)?;
@@ -387,9 +482,10 @@ impl SqliteStore {
             graph_store.upsert_symbol_node(symbol).await?;
         }
 
-        let family = same_language_family_sql("source.language", "target.language");
+        let resolution = edge_target_matches_sql("e", "source.language", "target");
         let (unresolved_edges, resolved) = {
             let conn = self.conn.lock().unwrap();
+            require_graph_provenance_schema(&conn)?;
             let mut unresolved_edges = 0usize;
             let mut unresolved_stmt = conn.prepare(&format!(
                 r#"
@@ -397,8 +493,7 @@ impl SqliteStore {
                 FROM symbol_edges e
                 JOIN symbols source ON source.id = e.source_id
                 LEFT JOIN symbols target
-                  ON target.qualified_name = e.target_qualified_name
-                 AND {family}
+                  ON {resolution}
                 WHERE e.file_path = ?1
                   AND e.edge_kind IN ('calls', 'depends_on', 'type_ref', 'implements')
                   AND target.id IS NULL
@@ -426,12 +521,11 @@ impl SqliteStore {
 
             let mut resolved_stmt = conn.prepare(&format!(
                 r#"
-                SELECT e.source_id, target.id, e.edge_kind, e.file_path
+                SELECT DISTINCT e.source_id, target.id, e.edge_kind, e.file_path
                 FROM symbol_edges e
                 JOIN symbols source ON source.id = e.source_id
                 JOIN symbols target
-                  ON target.qualified_name = e.target_qualified_name
-                 AND {family}
+                  ON {resolution}
                 WHERE e.file_path = ?1
                   AND e.edge_kind IN ('calls', 'depends_on', 'type_ref', 'implements')
                 ORDER BY e.source_id ASC, target.id ASC, e.edge_kind ASC
@@ -480,15 +574,16 @@ impl SqliteStore {
         }
 
         let conn = self.conn.lock().unwrap();
+        require_graph_provenance_schema(&conn)?;
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
         {
             let mut stmt = tx.prepare(
                 r#"
                 INSERT INTO symbol_edges (
-                    source_id, target_qualified_name, edge_kind, file_path
+                    source_id, target_qualified_name, edge_kind, file_path, target_symbol_id, target_file_path
                 )
-                VALUES (?1, ?2, ?3, ?4)
-                ON CONFLICT(source_id, target_qualified_name, edge_kind) DO UPDATE SET
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT DO UPDATE SET
                     file_path = excluded.file_path
                 "#,
             )?;
@@ -499,6 +594,8 @@ impl SqliteStore {
                     edge.target_qualified_name,
                     edge.edge_kind.as_str(),
                     edge.file_path,
+                    edge.target_symbol_id,
+                    edge.target_file_path,
                 ])?;
             }
         }
@@ -512,6 +609,7 @@ impl SqliteStore {
         }
 
         let conn = self.conn.lock().unwrap();
+        require_graph_provenance_schema(&conn)?;
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
         tx.execute(
             r#"
@@ -531,7 +629,7 @@ impl SqliteStore {
             "#,
             params![file_path],
         )?;
-        let family = same_language_family_sql("s_source.language", "s_target.language");
+        let resolution = edge_target_matches_sql("e", "s_source.language", "s_target");
         // Both directions touching this file were removed above. Restore edges
         // from other files as well: refreshing only the callee must preserve its
         // callers and can resolve calls indexed before the callee was discovered.
@@ -550,8 +648,7 @@ impl SqliteStore {
                 FROM symbol_edges e
                 JOIN symbols s_source ON s_source.id = e.source_id
                 JOIN symbols s_target
-                  ON s_target.qualified_name = e.target_qualified_name
-                 AND {family}
+                  ON {resolution}
                 WHERE e.source_id IN (SELECT id FROM symbols WHERE file_path = ?1)
                    OR e.target_qualified_name IN (
                        SELECT qualified_name FROM symbols WHERE file_path = ?1
@@ -581,8 +678,7 @@ impl SqliteStore {
                 FROM symbol_edges e
                 JOIN symbols s_source ON s_source.id = e.source_id
                 JOIN symbols s_target
-                  ON s_target.qualified_name = e.target_qualified_name
-                 AND {family}
+                  ON {resolution}
                 WHERE e.source_id IN (SELECT id FROM symbols WHERE file_path = ?1)
                    OR e.target_qualified_name IN (
                        SELECT qualified_name FROM symbols WHERE file_path = ?1
@@ -605,6 +701,7 @@ impl SqliteStore {
         }
 
         let conn = self.conn.lock().unwrap();
+        require_graph_provenance_schema(&conn)?;
         let mut stmt = conn.prepare(
             r#"
             SELECT symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file
@@ -638,6 +735,7 @@ impl SqliteStore {
         }
 
         let conn = self.conn.lock().unwrap();
+        require_graph_provenance_schema(&conn)?;
         let mut stmt = conn.prepare(
             r#"
             SELECT symbol_id, neighbor_id, edge_type, neighbor_name, neighbor_file
@@ -669,13 +767,14 @@ impl SqliteStore {
         }
 
         let conn = self.conn.lock().unwrap();
+        require_graph_provenance_schema(&conn)?;
         let mut stmt = conn.prepare(
             r#"
-            SELECT source_id, target_qualified_name, file_path
+            SELECT source_id, target_qualified_name, file_path, target_symbol_id, target_file_path
             FROM symbol_edges
             WHERE edge_kind = 'calls'
               AND target_qualified_name = ?1
-            ORDER BY source_id ASC, target_qualified_name ASC, file_path ASC
+            ORDER BY source_id ASC, target_qualified_name ASC, file_path ASC, target_symbol_id, target_file_path
             "#,
         )?;
 
@@ -685,6 +784,8 @@ impl SqliteStore {
                 target_qualified_name: row.get(1)?,
                 edge_kind: EdgeKind::Calls,
                 file_path: row.get(2)?,
+                target_symbol_id: row.get(3)?,
+                target_file_path: row.get(4)?,
             })
         })?;
 
@@ -701,13 +802,14 @@ impl SqliteStore {
         }
 
         let conn = self.conn.lock().unwrap();
+        require_graph_provenance_schema(&conn)?;
         let mut stmt = conn.prepare(
             r#"
-            SELECT source_id, target_qualified_name, file_path
+            SELECT source_id, target_qualified_name, file_path, target_symbol_id, target_file_path
             FROM symbol_edges
             WHERE edge_kind = 'depends_on'
               AND source_id = ?1
-            ORDER BY source_id ASC, target_qualified_name ASC, file_path ASC
+            ORDER BY source_id ASC, target_qualified_name ASC, file_path ASC, target_symbol_id, target_file_path
             "#,
         )?;
 
@@ -717,6 +819,8 @@ impl SqliteStore {
                 target_qualified_name: row.get(1)?,
                 edge_kind: EdgeKind::DependsOn,
                 file_path: row.get(2)?,
+                target_symbol_id: row.get(3)?,
+                target_file_path: row.get(4)?,
             })
         })?;
 
@@ -741,8 +845,10 @@ impl SqliteStore {
             return Ok(false);
         }
 
-        let family = same_language_family_sql("s_source.language", "s_target.language");
-        let exists = self.conn.lock().unwrap().query_row(
+        let resolution = edge_target_matches_sql("e", "s_source.language", "s_target");
+        let conn = self.lock_connection()?;
+        require_graph_provenance_schema(&conn)?;
+        let exists = conn.query_row(
             &format!(
                 r#"
                 SELECT EXISTS (
@@ -750,8 +856,7 @@ impl SqliteStore {
                     FROM symbol_edges e
                     JOIN symbols s_source ON s_source.id = e.source_id
                     JOIN symbols s_target
-                      ON s_target.qualified_name = e.target_qualified_name
-                     AND {family}
+                      ON {resolution}
                     WHERE e.edge_kind IN ('calls', 'depends_on', 'type_ref', 'implements')
                       AND (
                           (s_source.file_path = ?1 AND s_target.file_path = ?2)

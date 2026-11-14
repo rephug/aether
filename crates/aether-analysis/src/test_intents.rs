@@ -845,12 +845,16 @@ mod tests {
         store
             .upsert_edges(&[
                 SymbolEdge {
+                    target_symbol_id: None,
+                    target_file_path: None,
                     source_id: file_source_id("tests/payment.test.ts"),
                     target_qualified_name: "../src/payment".to_owned(),
                     edge_kind: EdgeKind::DependsOn,
                     file_path: "tests/payment.test.ts".to_owned(),
                 },
                 SymbolEdge {
+                    target_symbol_id: None,
+                    target_file_path: None,
                     source_id: file_source_id("tests/payment.test.ts"),
                     target_qualified_name: "../src/ledger".to_owned(),
                     edge_kind: EdgeKind::DependsOn,

@@ -12,8 +12,8 @@ use aether_memory::{EntityRef, NoteSourceType, ProjectMemoryService, RememberReq
 use aether_store::{
     CommunitySnapshotRecord, DriftAnalysisStateRecord, DriftResultRecord, DriftStore,
     SirHistoryBaselineSelector, SirHistoryStore, SirStateStore, SqliteStore, SurrealGraphStore,
-    SymbolCatalogStore, SymbolRelationStore, TestIntentStore, block_on_store_future,
-    open_surreal_graph_store_readonly, open_vector_store,
+    SymbolCatalogStore, TestIntentStore, block_on_store_future, open_surreal_graph_store_readonly,
+    open_vector_store,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1005,6 +1005,7 @@ impl DriftAnalyzer {
         let mut records = Vec::new();
         let mut snapshot_records = Vec::new();
 
+        let dependency_edges = store.list_graph_dependency_edges()?;
         let pagerank = block_on_store_future(graph.list_pagerank())??;
         if !pagerank.is_empty() {
             let threshold = percentile(
@@ -1052,7 +1053,12 @@ impl DriftAnalyzer {
                     continue;
                 }
                 let symbol = load_symbol_view(store, symbol_id.as_str())?;
-                let dependents_count = store.get_callers(symbol.symbol_name.as_str())?.len() as u32;
+                let dependents_count = dependency_edges
+                    .iter()
+                    .filter(|edge| edge.edge_kind == "calls" && edge.target_symbol_id == *symbol_id)
+                    .map(|edge| edge.source_symbol_id.as_str())
+                    .collect::<HashSet<_>>()
+                    .len() as u32;
                 let note = format!(
                     "PageRank increased {:.0}% above previous analysis",
                     increase_ratio * 100.0

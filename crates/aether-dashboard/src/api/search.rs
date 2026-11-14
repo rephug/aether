@@ -210,13 +210,7 @@ async fn load_search_data(
             .map(|value| value.qualified_name.clone())
             .unwrap_or_else(|| row.qualified_name.clone());
 
-        let related = related_symbols(
-            shared,
-            symbol_id.as_str(),
-            qualified_name.as_str(),
-            &pagerank,
-        )
-        .await;
+        let related = related_symbols(shared, symbol_id.as_str(), &pagerank).await;
 
         let sir_excerpt = support::sir_excerpt_for_symbol(shared, symbol_id.as_str());
         let sir_summary = sir_excerpt
@@ -269,7 +263,6 @@ async fn load_search_data(
 async fn related_symbols(
     shared: &crate::state::SharedState,
     symbol_id: &str,
-    qualified_name: &str,
     pagerank: &HashMap<String, f64>,
 ) -> Vec<RelatedSymbol> {
     let mut candidates = Vec::<(String, String, f64)>::new();
@@ -284,9 +277,8 @@ async fn related_symbols(
         candidates.push((dep.id, dep.qualified_name, score));
     }
     for caller in shared
-        .graph
-        .get_callers(qualified_name)
-        .await
+        .store
+        .list_callers_for_symbol(symbol_id)
         .unwrap_or_default()
     {
         let score = pagerank.get(caller.id.as_str()).copied().unwrap_or(0.0);

@@ -11,6 +11,9 @@ use crate::parser::{
 };
 use crate::registry::{LanguageConfig, LanguageHooks, QueryCaptures};
 
+mod provenance;
+pub(crate) use provenance::RustWorkspace;
+
 pub fn config() -> LanguageConfig {
     let ts_language = tree_sitter_rust::LANGUAGE.into();
     let symbol_query = Query::new(&ts_language, include_str!("../queries/rust_symbols.scm"))
@@ -90,9 +93,7 @@ struct TypeCandidate {
 }
 
 struct RustTypeResolver<'a> {
-    leaf_to_symbols: HashMap<String, Vec<&'a Symbol>>,
     type_symbols: Vec<&'a Symbol>,
-    use_paths_by_visible: HashMap<String, Vec<Vec<String>>>,
 }
 
 impl LanguageHooks for RustHooks {
@@ -156,6 +157,8 @@ impl LanguageHooks for RustHooks {
                 Some(vec![SymbolEdge {
                     source_id,
                     target_qualified_name: target,
+                    target_symbol_id: None,
+                    target_file_path: None,
                     edge_kind: EdgeKind::Calls,
                     file_path: file_path.to_owned(),
                 }])
@@ -165,6 +168,8 @@ impl LanguageHooks for RustHooks {
                 Some(vec![SymbolEdge {
                     source_id: file_source_id(file_path),
                     target_qualified_name: target,
+                    target_symbol_id: None,
+                    target_file_path: None,
                     edge_kind: EdgeKind::DependsOn,
                     file_path: file_path.to_owned(),
                 }])
@@ -227,19 +232,8 @@ impl<'a> RustTypeResolver<'a> {
                 )
             })
             .collect::<Vec<_>>();
-        let mut leaf_to_symbols = HashMap::<String, Vec<&'a Symbol>>::new();
-        for symbol in &type_symbols {
-            leaf_to_symbols
-                .entry(symbol.name.clone())
-                .or_default()
-                .push(*symbol);
-        }
-
-        Self {
-            leaf_to_symbols,
-            type_symbols,
-            use_paths_by_visible: collect_use_paths(root, source),
-        }
+        let _ = (root, source);
+        Self { type_symbols }
     }
 
     fn resolve_type_targets(&self, node: Node<'_>, source: &[u8]) -> Vec<&'a Symbol> {
@@ -250,7 +244,7 @@ impl<'a> RustTypeResolver<'a> {
         let mut resolved = Vec::new();
         let mut seen_symbols = HashSet::<String>::new();
         for candidate in candidates {
-            let Some(symbol) = self.resolve_candidate(&candidate) else {
+            let Some(symbol) = self.resolve_candidate(&candidate, node, source) else {
                 continue;
             };
             if seen_symbols.insert(symbol.id.clone()) {
@@ -262,55 +256,20 @@ impl<'a> RustTypeResolver<'a> {
 
     fn resolve_endpoint_symbol(&self, node: Node<'_>, source: &[u8]) -> Option<&'a Symbol> {
         let candidate = primary_type_candidate(node, source)?;
-        self.resolve_candidate(&candidate)
+        self.resolve_candidate(&candidate, node, source)
     }
 
-    fn resolve_candidate(&self, candidate: &TypeCandidate) -> Option<&'a Symbol> {
+    fn resolve_candidate(
+        &self,
+        candidate: &TypeCandidate,
+        node: Node<'_>,
+        source: &[u8],
+    ) -> Option<&'a Symbol> {
         if candidate.leaf.is_empty() || STDLIB_TYPES.contains(&candidate.leaf.as_str()) {
             return None;
         }
 
-        let mut explicit_matches = Vec::<&'a Symbol>::new();
-        let mut seen = HashSet::<String>::new();
-
-        if let Some(paths) = self.use_paths_by_visible.get(candidate.leaf.as_str()) {
-            for path in paths {
-                self.push_path_matches(path.as_slice(), &mut explicit_matches, &mut seen);
-            }
-        }
-        if !candidate.path_segments.is_empty() {
-            let normalized = normalize_path_segments(candidate.path_segments.as_slice());
-            self.push_path_matches(normalized.as_slice(), &mut explicit_matches, &mut seen);
-        }
-
-        match explicit_matches.len() {
-            1 => return explicit_matches.into_iter().next(),
-            len if len > 1 => return None,
-            _ => {}
-        }
-
-        let symbols = self.leaf_to_symbols.get(candidate.leaf.as_str())?;
-        (symbols.len() == 1).then_some(symbols[0])
-    }
-
-    fn push_path_matches(
-        &self,
-        path: &[String],
-        resolved: &mut Vec<&'a Symbol>,
-        seen: &mut HashSet<String>,
-    ) {
-        if path.is_empty() {
-            return;
-        }
-
-        for symbol in &self.type_symbols {
-            if !qualified_name_matches_path(symbol.qualified_name.as_str(), path) {
-                continue;
-            }
-            if seen.insert(symbol.id.clone()) {
-                resolved.push(*symbol);
-            }
-        }
+        provenance::local_type_target(node, &candidate.path_segments, source, &self.type_symbols)
     }
 }
 
@@ -349,9 +308,13 @@ pub(crate) fn extract_rust_edges(
                 else {
                     continue;
                 };
+                let local = provenance::local_call_target(node, source, symbols);
                 edges.push(SymbolEdge {
                     source_id,
-                    target_qualified_name: target,
+                    target_qualified_name: local
+                        .map_or(target, |symbol| symbol.qualified_name.clone()),
+                    target_symbol_id: local.map(|symbol| symbol.id.clone()),
+                    target_file_path: None,
                     edge_kind: EdgeKind::Calls,
                     file_path: file_path.to_owned(),
                 });
@@ -366,6 +329,8 @@ pub(crate) fn extract_rust_edges(
                 edges.push(SymbolEdge {
                     source_id: file_source_id(file_path),
                     target_qualified_name: target,
+                    target_symbol_id: None,
+                    target_file_path: None,
                     edge_kind: EdgeKind::DependsOn,
                     file_path: file_path.to_owned(),
                 });
@@ -382,6 +347,8 @@ pub(crate) fn extract_rust_edges(
                     edges.push(SymbolEdge {
                         source_id: source_id.clone(),
                         target_qualified_name: symbol.qualified_name.clone(),
+                        target_symbol_id: Some(symbol.id.clone()),
+                        target_file_path: None,
                         edge_kind: EdgeKind::TypeRef,
                         file_path: file_path.to_owned(),
                     });
@@ -405,6 +372,8 @@ pub(crate) fn extract_rust_edges(
                 edges.push(SymbolEdge {
                     source_id: source_symbol.id.clone(),
                     target_qualified_name: target_symbol.qualified_name.clone(),
+                    target_symbol_id: Some(target_symbol.id.clone()),
+                    target_file_path: None,
                     edge_kind: EdgeKind::Implements,
                     file_path: file_path.to_owned(),
                 });
@@ -448,6 +417,9 @@ fn collect_type_candidates(
                     });
                 }
             }
+            // The leaf of an unresolved scoped name is not an independent
+            // unqualified reference (external::Buf must not become local Buf).
+            return;
         }
         _ => {}
     }
@@ -526,51 +498,6 @@ fn collect_type_path_segments(node: Node<'_>, source: &[u8]) -> Vec<String> {
         }
         _ => Vec::new(),
     }
-}
-
-fn normalize_path_segments(path: &[String]) -> Vec<String> {
-    let mut segments = path.to_vec();
-    while matches!(
-        segments.first().map(String::as_str),
-        Some("crate" | "self" | "super")
-    ) {
-        segments.remove(0);
-    }
-    segments
-}
-
-fn qualified_name_matches_path(qualified_name: &str, path: &[String]) -> bool {
-    let symbol_segments = qualified_name.split("::").collect::<Vec<_>>();
-    let path_len = path.len();
-    if path_len == 0 || path_len > symbol_segments.len() {
-        return false;
-    }
-
-    symbol_segments[symbol_segments.len() - path_len..]
-        .iter()
-        .zip(path.iter())
-        .all(|(left, right)| *left == right)
-}
-
-fn collect_use_paths(root: Node<'_>, source: &[u8]) -> HashMap<String, Vec<Vec<String>>> {
-    let mut paths = HashMap::<String, Vec<Vec<String>>>::new();
-    let mut stack = vec![root];
-
-    while let Some(node) = stack.pop() {
-        if node.kind() == "use_declaration" {
-            if let Some(argument) = node.child_by_field_name("argument") {
-                collect_use_path_entries(argument, &[], source, &mut paths);
-            }
-            continue;
-        }
-
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            stack.push(child);
-        }
-    }
-
-    paths
 }
 
 fn collect_use_path_entries(

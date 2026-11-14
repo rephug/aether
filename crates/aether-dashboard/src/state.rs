@@ -214,6 +214,8 @@ vector_backend = "sqlite"
         store.upsert_symbol(beta.clone()).expect("upsert beta");
         store
             .upsert_edges(&[SymbolEdge {
+                target_symbol_id: Some(beta.id.clone()),
+                target_file_path: None,
                 source_id: alpha.id.clone(),
                 target_qualified_name: beta.qualified_name.clone(),
                 edge_kind: EdgeKind::Calls,

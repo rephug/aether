@@ -1,11 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
-use aether_store::{
-    SqliteStore, SymbolCatalogStore, SymbolRecord, SymbolRelationStore, SymbolSearchResult,
-};
+use aether_store::{SqliteStore, SymbolCatalogStore, SymbolRecord, SymbolSearchResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::callers::CallerAttribution;
 use super::{
     AetherMcpServer, MEMORY_SCHEMA_VERSION, child_method_symbols,
     normalize_workspace_relative_path, symbol_leaf_name,
@@ -188,32 +187,14 @@ impl AetherMcpServer {
         let mut method_edges = HashMap::<String, Vec<(String, String)>>::new();
         let mut caller_symbol_ids = HashSet::<String>::new();
 
+        let mut attribution = CallerAttribution::new(store, self.workspace());
         for method in &child_methods {
             let method_name = symbol_leaf_name(method.qualified_name.as_str()).to_owned();
-            let mut seen_source_ids = HashSet::<String>::new();
             let mut edges = Vec::new();
 
-            for edge in store.get_callers(method.qualified_name.as_str())? {
-                if !seen_source_ids.insert(edge.source_id.clone()) {
-                    continue;
-                }
-                caller_symbol_ids.insert(edge.source_id.clone());
-                edges.push((edge.source_id, edge.file_path));
-            }
-
-            // Java and C# spell every call whose receiver type is known `Type::method`, so a
-            // bare name there is a call on a value of unknown type (`c -> c.getName()`), not
-            // evidence that this type's method is used.
-            if method_name != method.qualified_name
-                && !matches!(method.language.as_str(), "java" | "csharp")
-            {
-                for edge in store.get_callers(method_name.as_str())? {
-                    if !seen_source_ids.insert(edge.source_id.clone()) {
-                        continue;
-                    }
-                    caller_symbol_ids.insert(edge.source_id.clone());
-                    edges.push((edge.source_id, edge.file_path));
-                }
+            for caller in attribution.callers_of(method)? {
+                caller_symbol_ids.insert(caller.id.clone());
+                edges.push((caller.id, caller.file_path));
             }
 
             method_edges.insert(method_name, edges);

@@ -12,7 +12,7 @@ use aether_sir::{
     file_sir_hash, sir_hash, synthetic_file_sir_id, synthetic_module_sir_id, validate_sir,
 };
 use aether_store::{
-    SirHistoryStore, SirMetaRecord, SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord,
+    SirHistoryStore, SirMetaRecord, SirStateStore, SqliteStore, SymbolCatalogStore,
     SymbolRelationStore,
 };
 use schemars::JsonSchema;
@@ -868,6 +868,12 @@ fn build_structural_view(
     let Some(symbol) = store.get_symbol_record(symbol_id)? else {
         return Ok(None);
     };
+    // Structural context is optional when the catalog predates target proof.
+    // Keep the missing-payload response readable without querying legacy edges
+    // or migrating a read-only catalog. Other database errors still propagate.
+    if !store.has_graph_provenance_schema()? {
+        return Ok(None);
+    }
 
     let mut dependencies = store
         .get_dependencies(symbol_id)?
@@ -876,12 +882,12 @@ fn build_structural_view(
         .collect::<Vec<_>>();
     sort_and_dedup(&mut dependencies);
 
-    let mut callers = Vec::new();
-    for edge in store.get_callers(symbol.qualified_name.as_str())? {
-        if let Some(caller) = resolve_caller_name(store, edge.source_id.as_str())? {
-            callers.push(caller);
-        }
-    }
+    let workspace = store.workspace_root().unwrap_or_default();
+    let mut callers = super::callers::CallerAttribution::for_context(store, &workspace)
+        .callers_of(&symbol)?
+        .into_iter()
+        .map(|caller| caller.qualified_name)
+        .collect::<Vec<_>>();
     sort_and_dedup(&mut callers);
 
     Ok(Some(SirStructuralView {
@@ -891,21 +897,6 @@ fn build_structural_view(
         dependencies,
         callers,
     }))
-}
-
-fn resolve_caller_name(
-    store: &SqliteStore,
-    caller_symbol_id: &str,
-) -> Result<Option<String>, AetherMcpError> {
-    let caller_symbol_id = caller_symbol_id.trim();
-    if caller_symbol_id.is_empty() {
-        return Ok(None);
-    }
-    let display = store
-        .get_symbol_record(caller_symbol_id)?
-        .map(|record: SymbolRecord| record.qualified_name)
-        .unwrap_or_else(|| caller_symbol_id.to_owned());
-    Ok(Some(display))
 }
 
 fn position_in_range(range: SourceRange, line: usize, column: usize) -> bool {

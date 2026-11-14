@@ -3,7 +3,7 @@ use aether_health::{
     ConsumerMethodUsage, CrossCuttingMethod, SplitConfidence, SuggestedSubTrait, TraitMethod,
     TraitSplitSuggestion, suggest_trait_split,
 };
-use aether_store::{SqliteStore, SymbolCatalogStore, SymbolRecord, SymbolRelationStore};
+use aether_store::{SqliteStore, SymbolCatalogStore, SymbolRecord};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -176,36 +176,29 @@ impl AetherMcpServer {
                 .then_with(|| left.id.cmp(&right.id))
         });
 
-        let mut fallback = None;
         for candidate in candidates {
             if child_method_symbols(store, &candidate)?.is_empty() {
                 continue;
             }
 
-            let implements_target = store
-                .get_dependencies(candidate.id.as_str())?
-                .into_iter()
-                .any(|edge| {
-                    matches!(edge.edge_kind, EdgeKind::Implements)
-                        && edge.target_qualified_name == target_record.qualified_name
-                });
+            let mut implements_target = false;
+            for edge in store
+                .list_symbol_edges_for_source_and_kinds(&candidate.id, &[EdgeKind::Implements])?
+            {
+                if store
+                    .resolve_symbol_edge(&edge, &candidate, &mut |_| None)?
+                    .reaches(target_record)
+                {
+                    implements_target = true;
+                    break;
+                }
+            }
             if implements_target {
                 return Ok((
                     candidate.clone(),
                     trait_split_resolution(&candidate, AetherTraitSplitResolutionMode::Implementor),
                 ));
             }
-
-            if fallback.is_none() {
-                fallback = Some(candidate);
-            }
-        }
-
-        if let Some(candidate) = fallback {
-            return Ok((
-                candidate.clone(),
-                trait_split_resolution(&candidate, AetherTraitSplitResolutionMode::Implementor),
-            ));
         }
 
         Ok((

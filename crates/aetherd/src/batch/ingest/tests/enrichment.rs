@@ -612,6 +612,8 @@ fn changed_neighbor_summary_still_requires_a_request() {
     fixture
         .store
         .upsert_edges(&[aether_core::SymbolEdge {
+            target_symbol_id: Some(peer.id.clone()),
+            target_file_path: None,
             source_id: fixture.id.clone(),
             target_qualified_name: peer.qualified_name.clone(),
             edge_kind: aether_core::EdgeKind::Calls,

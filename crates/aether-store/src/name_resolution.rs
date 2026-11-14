@@ -6,7 +6,7 @@
 //! the candidates the way a reader of the referring file would, and say so when that
 //! leaves more than one instead of picking one.
 
-use aether_core::same_language_family;
+use aether_core::{ECMASCRIPT_LANGUAGES, SymbolEdge, same_language_family};
 
 use super::*;
 
@@ -145,9 +145,9 @@ pub fn narrow_name_candidates(
     }
 }
 
-/// The targets a call to `symbol` can be recorded under: its qualified name and, for a
-/// Rust method or function with a qualified name, its bare name, since the Rust parser
-/// records a method call such as `x.alpha()` by the method name alone.
+/// Target spellings to search for `symbol`: its qualified name and, for a Rust
+/// method or function, its bare name. Unresolved receiver calls can retain a bare
+/// spelling; finding that spelling does not establish a relationship.
 pub fn call_targets_of(symbol: &SymbolRecord) -> Vec<String> {
     let mut targets = vec![symbol.qualified_name.clone()];
     if symbol.language == "rust"
@@ -177,13 +177,14 @@ pub fn call_target_candidates(
         .collect()
 }
 
-/// Narrows the symbols a call edge's target can name when `site` writes it, for context
-/// views. The Rust parser records a method call by the method name alone
+/// Heuristically narrows candidates for call-shaped text without target provenance.
+/// Stored edges use [`narrow_symbol_edge_candidates`] to honor parser evidence.
+/// The legacy Rust method spelling uses the method name alone
 /// (`self.alpha()` → `alpha`), so for a Rust site a bare target names the symbols with
 /// that name declared in the site's own file, `Type::alpha` included, when there are
 /// any. Otherwise, and in other languages, it names exactly the symbols with that
-/// qualified name. Unlike [`call_target_candidates`], which `aether_dependencies` uses,
-/// a bare target never reaches a method in another file, so a call such as `v.len()`
+/// qualified name. Unlike [`call_target_candidates`], this heuristic keeps bare
+/// method candidates in the referring file, so a call such as `v.len()`
 /// on a library type doesn't count for a workspace `MyBuf::len`.
 ///
 /// `candidates` come from [`SqliteStore::list_symbols_for_call_target`].
@@ -215,7 +216,89 @@ pub fn narrow_call_edge_candidates(
     narrow_name_candidates(exact, Some(site), module_of)
 }
 
+/// Resolves an actual stored edge against cached target candidates. Cached names
+/// only collect possible declarations: this edge's own provenance decides which
+/// declaration, if any, is established by the reference.
+///
+/// Rust and ECMAScript names omit file/module identity, so a raw name alone never
+/// establishes a relationship. An ID must still exist under the same name and
+/// language family; a file hint must identify exactly one declaration. Other
+/// languages retain their existing lookup when no proof was recorded.
+pub fn narrow_symbol_edge_candidates(
+    candidates: &[SymbolRecord],
+    edge: &SymbolEdge,
+    site: NameSite<'_>,
+    module_of: &mut dyn FnMut(&str) -> Option<PathBuf>,
+) -> NameResolution {
+    if edge.target_symbol_id.is_some() || edge.target_file_path.is_some() {
+        let mut candidates = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.qualified_name == edge.target_qualified_name
+                    && same_language_family(&candidate.language, site.language)
+                    && edge
+                        .target_symbol_id
+                        .as_ref()
+                        .is_none_or(|id| candidate.id == *id)
+                    && edge
+                        .target_file_path
+                        .as_ref()
+                        .is_none_or(|path| candidate.file_path == *path)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.file_path
+                .cmp(&right.file_path)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        candidates.dedup_by(|left, right| left.id == right.id);
+        return match candidates.len() {
+            0 => NameResolution::NotFound,
+            1 => NameResolution::Found(candidates),
+            _ => NameResolution::Ambiguous(candidates),
+        };
+    }
+    if site.language == "rust" || ECMASCRIPT_LANGUAGES.contains(&site.language) {
+        return NameResolution::NotFound;
+    }
+    if edge.edge_kind == EdgeKind::Calls {
+        narrow_call_edge_candidates(candidates, &edge.target_qualified_name, site, module_of)
+    } else {
+        narrow_name_candidates(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.qualified_name == edge.target_qualified_name)
+                .cloned()
+                .collect(),
+            Some(site),
+            module_of,
+        )
+    }
+}
+
 impl SqliteStore {
+    /// Resolves a stored reference using the parser's evidence of its target.
+    /// Name-only selector lookups deliberately keep their separate semantics.
+    pub fn resolve_symbol_edge(
+        &self,
+        edge: &SymbolEdge,
+        source: &SymbolRecord,
+        module_of: &mut dyn FnMut(&str) -> Option<PathBuf>,
+    ) -> Result<NameResolution, StoreError> {
+        let candidates = if let Some(id) = edge.target_symbol_id.as_deref() {
+            self.get_symbol_record(id)?.into_iter().collect()
+        } else {
+            self.list_symbols_for_call_target(&edge.target_qualified_name)?
+        };
+        Ok(narrow_symbol_edge_candidates(
+            &candidates,
+            edge,
+            NameSite::of(source),
+            module_of,
+        ))
+    }
+
     /// Every symbol with exactly this qualified name, ordered by file and ID.
     pub fn list_symbols_by_qualified_name(
         &self,
@@ -249,8 +332,8 @@ impl SqliteStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Resolves the target of a call edge written at `site`, for context views (see
-    /// [`narrow_call_edge_candidates`]).
+    /// Heuristic lookup of call-shaped text at `site`.
+    /// Stored references use [`Self::resolve_symbol_edge`] to honor parser evidence.
     pub fn resolve_call_edge(
         &self,
         target: &str,
@@ -484,6 +567,107 @@ mod tests {
             ambiguity_note(&candidates),
             "Ambiguous: 7 symbols share this name (m0/A.java, m1/A.java, m2/A.java, m3/A.java, \
              m4/A.java and 2 more files)."
+        );
+    }
+
+    #[test]
+    fn stored_edge_proof_filters_cached_names_and_never_falls_back() {
+        let candidates = vec![
+            symbol("a", "project-a/helper.ts", "typescript", "helper"),
+            symbol("b", "project-b/helper.ts", "tsx", "helper"),
+            symbol("py", "project-a/helper.py", "python", "helper"),
+        ];
+        let site = NameSite {
+            file_path: "project-a/app.jsx",
+            language: "jsx",
+        };
+        let mut edge = SymbolEdge {
+            source_id: "caller".to_owned(),
+            target_qualified_name: "helper".to_owned(),
+            target_symbol_id: None,
+            target_file_path: None,
+            edge_kind: EdgeKind::Calls,
+            file_path: site.file_path.to_owned(),
+        };
+        let resolve = |edge: &SymbolEdge| {
+            narrow_symbol_edge_candidates(&candidates, edge, site, &mut first_segment)
+        };
+        assert_eq!(resolve(&edge), NameResolution::NotFound);
+        edge.target_file_path = Some("project-a/helper.ts".to_owned());
+        assert_eq!(
+            resolve(&edge),
+            NameResolution::Found(vec![candidates[0].clone()])
+        );
+        edge.target_file_path = Some("project-b/helper.ts".to_owned());
+        assert_eq!(
+            resolve(&edge),
+            NameResolution::Found(vec![candidates[1].clone()])
+        );
+        edge.target_symbol_id = Some("a".to_owned());
+        assert_eq!(
+            resolve(&edge),
+            NameResolution::NotFound,
+            "contradictory file proof"
+        );
+        edge.target_file_path = Some("project-a/helper.ts".to_owned());
+        assert_eq!(
+            resolve(&edge),
+            NameResolution::Found(vec![candidates[0].clone()])
+        );
+        edge.target_symbol_id = Some("removed".to_owned());
+        assert_eq!(
+            resolve(&edge),
+            NameResolution::NotFound,
+            "a stale ID must not fall back to its file"
+        );
+        edge.target_symbol_id = Some("py".to_owned());
+        edge.target_file_path = None;
+        assert_eq!(
+            resolve(&edge),
+            NameResolution::NotFound,
+            "proof never crosses language families"
+        );
+        edge.target_symbol_id = Some("a".to_owned());
+        edge.target_qualified_name = "renamed".to_owned();
+        assert_eq!(
+            resolve(&edge),
+            NameResolution::NotFound,
+            "proof must agree with the target name"
+        );
+    }
+
+    #[test]
+    fn file_proof_rejects_ambiguous_declarations_and_raw_rust_stays_unresolved() {
+        let candidates = vec![
+            symbol("first", "src/helper.rs", "rust", "Buf::new"),
+            symbol("second", "src/helper.rs", "rust", "Buf::new"),
+        ];
+        let site = NameSite {
+            file_path: "src/app.rs",
+            language: "rust",
+        };
+        let mut edge = SymbolEdge {
+            source_id: "caller".to_owned(),
+            target_qualified_name: "Buf::new".to_owned(),
+            target_symbol_id: None,
+            target_file_path: Some("src/helper.rs".to_owned()),
+            edge_kind: EdgeKind::Calls,
+            file_path: site.file_path.to_owned(),
+        };
+        assert!(
+            matches!(narrow_symbol_edge_candidates(&candidates, &edge, site, &mut first_segment), NameResolution::Ambiguous(found) if found.len() == 2)
+        );
+        edge.target_symbol_id = Some("second".to_owned());
+        assert_eq!(
+            narrow_symbol_edge_candidates(&candidates, &edge, site, &mut first_segment),
+            NameResolution::Found(vec![candidates[1].clone()])
+        );
+        edge.target_symbol_id = None;
+        edge.target_file_path = None;
+        assert_eq!(
+            narrow_symbol_edge_candidates(&candidates[..1], &edge, site, &mut first_segment),
+            NameResolution::NotFound,
+            "a unique global name proves nothing"
         );
     }
 }

@@ -217,10 +217,21 @@ async fn sync_graph_for_file_syncs_all_structural_edge_kinds() {
     }
     store
         .upsert_edges(&[
-            type_ref_edge(&alpha.id, "Target", "src/lib.rs"),
-            implements_edge(&impl_type.id, "Store", "src/lib.rs"),
-            calls_edge(&alpha.id, "Store", "src/lib.rs"),
             SymbolEdge {
+                target_file_path: Some("src/lib.rs".to_owned()),
+                ..type_ref_edge(&alpha.id, "Target", "src/lib.rs")
+            },
+            SymbolEdge {
+                target_symbol_id: Some(store_trait.id.clone()),
+                ..implements_edge(&impl_type.id, "Store", "src/lib.rs")
+            },
+            SymbolEdge {
+                target_symbol_id: Some(store_trait.id.clone()),
+                ..calls_edge(&alpha.id, "Store", "src/lib.rs")
+            },
+            SymbolEdge {
+                target_symbol_id: None,
+                target_file_path: Some("src/lib.rs".to_owned()),
                 source_id: alpha.id.clone(),
                 target_qualified_name: "Target".to_owned(),
                 edge_kind: EdgeKind::DependsOn,

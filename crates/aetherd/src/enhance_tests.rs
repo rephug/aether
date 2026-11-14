@@ -336,12 +336,16 @@ fn seed_workspace(workspace: &Path) -> SqliteStore {
     store
         .upsert_edges(&[
             SymbolEdge {
+                target_symbol_id: Some("sym_helper".to_owned()),
+                target_file_path: None,
                 source_id: "sym_login".to_owned(),
                 target_qualified_name: "demo::auth_helper".to_owned(),
                 edge_kind: EdgeKind::DependsOn,
                 file_path: "src/lib.rs".to_owned(),
             },
             SymbolEdge {
+                target_symbol_id: Some("sym_login".to_owned()),
+                target_file_path: None,
                 source_id: "sym_helper".to_owned(),
                 target_qualified_name: "demo::login".to_owned(),
                 edge_kind: EdgeKind::Calls,

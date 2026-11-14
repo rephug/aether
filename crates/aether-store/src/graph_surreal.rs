@@ -62,6 +62,22 @@ pub struct SurrealGraphStore {
 }
 
 impl SurrealGraphStore {
+    /// Whether this exact existing workspace graph has a process-owned handle.
+    /// This read-only hint distinguishes our own lock from another process's;
+    /// callers must still use normal protected opening before graph operations.
+    pub fn has_cached_handle(workspace_root: impl AsRef<Path>) -> Result<bool, StoreError> {
+        let graph_dir = workspace_root.as_ref().join(".aether").join("graph");
+        let graph_dir = match fs::canonicalize(graph_dir) {
+            Ok(path) => path,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err.into()),
+        };
+        let cache = surreal_handle_cache()
+            .lock()
+            .map_err(|_| StoreError::Graph("SurrealDB handle cache lock poisoned".to_owned()))?;
+        Ok(cache.contains_key(&graph_dir))
+    }
+
     /// Opens the workspace's graph store, waiting up to `[storage] graph_open_timeout_secs`
     /// (60 s by default) when this process has no handle to it yet.
     pub async fn open(workspace_root: impl AsRef<Path>) -> Result<Self, StoreError> {
@@ -82,11 +98,62 @@ impl SurrealGraphStore {
         open_timeout: Option<Duration>,
     ) -> Result<Self, StoreError> {
         let workspace_root = workspace_root.to_path_buf();
-        let graph_dir = workspace_root.join(".aether").join("graph");
-        fs::create_dir_all(&graph_dir)?;
-        // A process shares one handle per store, so `.` and an absolute spelling of the
-        // same workspace must find the same cache entry.
-        let graph_dir = fs::canonicalize(&graph_dir).unwrap_or(graph_dir);
+        let prepare_root = workspace_root.clone();
+        let graph_dir =
+            tokio::task::spawn_blocking(move || -> Result<std::path::PathBuf, StoreError> {
+                // Resolve aliases through the parent without creating native graph
+                // artifacts. Every opener must use one key before probing fresh state.
+                let aether_dir = prepare_root.join(".aether");
+                fs::create_dir_all(&aether_dir)?;
+                let graph_dir = fs::canonicalize(aether_dir)?.join("graph");
+                if graph_dir.try_exists()? {
+                    Ok(fs::canonicalize(graph_dir)?)
+                } else {
+                    Ok(graph_dir)
+                }
+            })
+            .await
+            .map_err(|err| {
+                StoreError::Graph(format!("graph setup path preparation failed: {err}"))
+            })??;
+        // Probe/reset, native initialization, schema setup and proof replay share
+        // the same lock. A later opener must not act on a stale fresh-store probe
+        // and clear edges after the first opener has returned a live handle.
+        let setup_lock = store_setup_lock(&graph_dir)?;
+        let setup_wait_started = std::time::Instant::now();
+        let _setup = match open_timeout {
+            Some(budget) => tokio::time::timeout(budget, setup_lock.lock())
+                .await
+                .map_err(|_| StoreError::Graph(format!(
+                    "SurrealDB setup lock timed out after {}ms while another opener initialized this graph",
+                    budget.as_millis()
+                )))?,
+            None => setup_lock.lock().await,
+        };
+        // Explicit callers keep one waiting budget across setup-lock contention
+        // and native handle opening. Normal opens retain configured wait behavior.
+        let open_timeout =
+            open_timeout.map(|budget| budget.saturating_sub(setup_wait_started.elapsed()));
+        let probe_dir = graph_dir.clone();
+        let probe_root = workspace_root.clone();
+        let new_graph = tokio::task::spawn_blocking(move || -> Result<bool, StoreError> {
+            let new_graph = !probe_dir.try_exists()?
+                || fs::read_dir(&probe_dir)?.next().transpose()?.is_none();
+            if new_graph {
+                // Publish the pending receipt before native initialization can
+                // create artifacts or fail. A later open must still replay a
+                // catalog restored without its previous graph directory.
+                let catalog = super::SqliteStore::open(probe_root)?;
+                catalog.lock_connection()?.execute(
+                    "UPDATE schema_version SET version = 0, migrated_at = unixepoch() WHERE component = 'graph_target_provenance'",
+                    [],
+                )?;
+            }
+            fs::create_dir_all(&probe_dir)?;
+            Ok(new_graph)
+        })
+        .await
+        .map_err(|err| StoreError::Graph(format!("graph initialization probe failed: {err}")))??;
 
         let db = if let Some(existing) = cached_surreal_handle(&graph_dir)? {
             existing
@@ -152,11 +219,6 @@ impl SurrealGraphStore {
             cache_surreal_handle(graph_dir.clone(), db.clone())?;
             db
         };
-        // Opens that share a handle (aetherd's dashboard and indexer) must not set up a new
-        // store's namespace and schema at the same time: SurrealKV rejects the overlapping
-        // writes with a transaction conflict. One open sets them up; the others wait.
-        let setup_lock = store_setup_lock(&graph_dir)?;
-        let _setup = setup_lock.lock().await;
         retry_until_session_registered(|| db.use_ns("aether").use_db("graph"))
             .await
             .map_err(|err| StoreError::Graph(format!("SurrealDB namespace setup failed: {err}")))?;
@@ -166,10 +228,25 @@ impl SurrealGraphStore {
             store.ensure_schema().await?;
             mark_schema_initialized(graph_dir.clone())?;
         }
+        super::graph_resolution::rebuild_graph_projection_provenance(
+            &workspace_root,
+            &store,
+            new_graph,
+        )
+        .await?;
         Ok(store)
     }
 
     pub async fn open_readonly(workspace_root: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let workspace_root = workspace_root.as_ref().to_path_buf();
+        let task_root = workspace_root.clone();
+        tokio::task::spawn_blocking(move || {
+            super::graph_resolution::require_graph_projection_provenance(&task_root)
+        })
+        .await
+        .map_err(|err| {
+            StoreError::Graph(format!("graph provenance read check worker failed: {err}"))
+        })??;
         Self::open(workspace_root).await
     }
 
@@ -1653,6 +1730,153 @@ mod tests {
                 .expect("read through the second handle"),
             vec!["sym-a".to_owned()]
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_fresh_opens_preserve_writes_after_the_first_handle_returns()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{SqliteStore, SymbolCatalogStore, SymbolRelationStore};
+        let temp = tempdir()?;
+        let catalog = SqliteStore::open(temp.path())?;
+        for row in [
+            symbol("caller", "caller", "src/main.rs"),
+            symbol("helper", "helper", "src/helper.rs"),
+        ] {
+            catalog.upsert_symbol(row)?;
+        }
+        catalog.upsert_edges(&[aether_core::SymbolEdge {
+            source_id: "caller".to_owned(),
+            target_qualified_name: "helper".to_owned(),
+            target_symbol_id: Some("helper".to_owned()),
+            target_file_path: None,
+            edge_kind: EdgeKind::Calls,
+            file_path: "src/main.rs".to_owned(),
+        }])?;
+        catalog.lock_connection()?.execute(
+            "UPDATE schema_version SET version = 1 WHERE component = 'graph_target_provenance'",
+            [],
+        )?;
+        let graph_dir = fs::canonicalize(temp.path().join(".aether"))?.join("graph");
+        let setup = store_setup_lock(&graph_dir)?;
+        let initial_pause = setup.lock().await;
+        let first_root = temp.path().to_path_buf();
+        let first = tokio::spawn(async move { SurrealGraphStore::open(first_root).await });
+        // The lock map and this test own two Arc refs. A third proves the first
+        // real opener reached the setup lock; it cannot progress while held.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&setup) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let between = setup.lock();
+        tokio::pin!(between);
+        assert!(futures::poll!(between.as_mut()).is_pending());
+        let second_root = temp.path().to_path_buf();
+        let second = tokio::spawn(async move { SurrealGraphStore::open(second_root).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&setup) < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(
+            !graph_dir.exists(),
+            "native initialization must wait for the setup lock"
+        );
+        assert!(
+            crate::graph_resolution::graph_projection_provenance_ready(temp.path())?,
+            "a waiting opener must not reset the receipt"
+        );
+        drop(initial_pause);
+        // Tokio's FIFO mutex grants this test the lock between the openers.
+        // The first has returned; the second cannot initialize until we release it.
+        let between_guard = between.await;
+        let first = first.await??;
+        for row in [
+            symbol("live-source", "live_source", "src/live.rs"),
+            symbol("live-target", "live_target", "src/live.rs"),
+        ] {
+            first.upsert_symbol_node(&row).await?;
+        }
+        first
+            .upsert_edge(&ResolvedEdge {
+                source_id: "live-source".to_owned(),
+                target_id: "live-target".to_owned(),
+                edge_kind: EdgeKind::Calls,
+                file_path: "src/live.rs".to_owned(),
+            })
+            .await?;
+        drop(between_guard);
+        let second = second.await??;
+        assert_eq!(
+            second.get_dependencies("live-source").await?[0].id,
+            "live-target"
+        );
+        assert_eq!(second.get_dependencies("caller").await?[0].id, "helper");
+        assert!(crate::graph_resolution::graph_projection_provenance_ready(
+            temp.path()
+        )?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_open_budget_bounds_setup_wait_without_starting_native_initialization()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let catalog = crate::SqliteStore::open(temp.path())?;
+        catalog.lock_connection()?.execute(
+            "UPDATE schema_version SET version = 1 WHERE component = 'graph_target_provenance'",
+            [],
+        )?;
+        let graph_dir = fs::canonicalize(temp.path().join(".aether"))?.join("graph");
+        let setup = store_setup_lock(&graph_dir)?;
+        let _held = setup.lock().await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            SurrealGraphStore::open_with_timeout(temp.path(), Duration::from_millis(25)),
+        )
+        .await?;
+        assert!(
+            matches!(result, Err(StoreError::Graph(message)) if message.contains("setup lock timed out"))
+        );
+        assert!(
+            !graph_dir.exists(),
+            "timed-out wait must not create native graph artifacts"
+        );
+        assert!(
+            crate::graph_resolution::graph_projection_provenance_ready(temp.path())?,
+            "timed-out wait must not reset the completed receipt"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cached_handle_hint_is_readonly_and_exact_to_the_workspace()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let unrelated = temp.path().join("unopened");
+        fs::create_dir_all(&unrelated)?;
+        assert!(!SurrealGraphStore::has_cached_handle(&unrelated)?);
+        assert!(
+            !unrelated.join(".aether").exists(),
+            "a cache hint must not create storage"
+        );
+        let workspace = temp.path().join("opened");
+        fs::create_dir_all(workspace.join("sub"))?;
+        let graph = SurrealGraphStore::open(&workspace).await?;
+        assert!(SurrealGraphStore::has_cached_handle(&workspace)?);
+        assert!(SurrealGraphStore::has_cached_handle(
+            workspace.join("sub").join("..")
+        )?);
+        assert!(!SurrealGraphStore::has_cached_handle(&unrelated)?);
+        drop(graph);
+        assert!(
+            SurrealGraphStore::has_cached_handle(&workspace)?,
+            "the process cache keeps its graph handle and lock alive"
+        );
+        assert!(!unrelated.join(".aether").exists());
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
