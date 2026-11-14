@@ -656,27 +656,34 @@ impl SqliteStore {
         let rust_suffix = format!("%::{escaped}");
         let dotted_suffix = format!("%.{escaped}");
 
+        // SQLite's built-in LIKE already folds ASCII case, like its LOWER.
+        // Avoid allocating lowercase strings for every field of every row.
+        // Gate exact comparisons with a literal LIKE, but retain equality to
+        // distinguish strings past embedded NULs (LIKE stops at a NUL).
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"
             SELECT id, qualified_name, file_path, language, kind, access_count, last_accessed_at
             FROM symbols
-            WHERE LOWER(id) LIKE LOWER(?1) ESCAPE '\'
-               OR LOWER(qualified_name) LIKE LOWER(?1) ESCAPE '\'
-               OR LOWER(file_path) LIKE LOWER(?1) ESCAPE '\'
-               OR LOWER(language) LIKE LOWER(?1) ESCAPE '\'
-               OR LOWER(kind) LIKE LOWER(?1) ESCAPE '\'
+            WHERE id LIKE ?1 ESCAPE '\'
+               OR qualified_name LIKE ?1 ESCAPE '\'
+               OR file_path LIKE ?1 ESCAPE '\'
+               OR language LIKE ?1 ESCAPE '\'
+               OR kind LIKE ?1 ESCAPE '\'
             ORDER BY CASE
-                WHEN LOWER(id) = LOWER(?3) THEN 0
-                WHEN LOWER(qualified_name) = LOWER(?3) THEN 1
-                WHEN LOWER(file_path) = LOWER(?3) THEN 2
-                WHEN LOWER(qualified_name) LIKE LOWER(?5) ESCAPE '\'
-                  OR LOWER(qualified_name) LIKE LOWER(?6) ESCAPE '\' THEN 3
-                WHEN LOWER(qualified_name) LIKE LOWER(?4) ESCAPE '\' THEN 4
-                WHEN LOWER(qualified_name) LIKE LOWER(?1) ESCAPE '\' THEN 5
-                WHEN LOWER(file_path) LIKE LOWER(?1) ESCAPE '\' THEN 6
-                WHEN LOWER(language) LIKE LOWER(?1) ESCAPE '\'
-                  OR LOWER(kind) LIKE LOWER(?1) ESCAPE '\' THEN 7
+                WHEN id LIKE ?7 ESCAPE '\' AND LOWER(id) = LOWER(?3) THEN 0
+                WHEN qualified_name LIKE ?7 ESCAPE '\'
+                  AND LOWER(qualified_name) = LOWER(?3) THEN 1
+                WHEN file_path LIKE ?7 ESCAPE '\'
+                  AND LOWER(file_path) = LOWER(?3) THEN 2
+                WHEN qualified_name LIKE ?1 ESCAPE '\' THEN CASE
+                    WHEN qualified_name LIKE ?5 ESCAPE '\'
+                      OR qualified_name LIKE ?6 ESCAPE '\' THEN 3
+                    WHEN qualified_name LIKE ?4 ESCAPE '\' THEN 4
+                    ELSE 5 END
+                WHEN file_path LIKE ?1 ESCAPE '\' THEN 6
+                WHEN language LIKE ?1 ESCAPE '\'
+                  OR kind LIKE ?1 ESCAPE '\' THEN 7
                 ELSE 8
             END, qualified_name ASC, id ASC
             LIMIT ?2
@@ -690,7 +697,8 @@ impl SqliteStore {
                 query,
                 prefix,
                 rust_suffix,
-                dotted_suffix
+                dotted_suffix,
+                escaped
             ],
             |row| {
                 Ok(SymbolSearchResult {

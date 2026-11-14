@@ -591,6 +591,91 @@ fn search_symbols_by_terms_prefers_exact_names_within_match_tiers() {
 }
 
 #[test]
+fn search_symbols_preserves_ascii_folding_and_exact_ids_with_nuls() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    for (id, name) in [
+        ("ABC\0X", "Alpha::noise"),
+        ("abc\0y", "Zulu::target"),
+        ("upper", "Zulu::Éclair"),
+        ("lower", "Zulu::éclair"),
+        ("ascii", "Zulu::MiXeD"),
+    ] {
+        let mut record = symbol_record();
+        record.id = id.to_owned();
+        record.qualified_name = name.to_owned();
+        store.upsert_symbol(record).expect("upsert symbol");
+    }
+    let hits = store.search_symbols("ABC\0y", 20).expect("NUL selector");
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].symbol_id, "abc\0y");
+    let hits = store.search_symbols("éclair", 20).expect("Unicode search");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].symbol_id, "lower");
+    let hits = store.search_symbols("mIxEd", 1).expect("ASCII search");
+    assert_eq!(hits[0].symbol_id, "ascii");
+}
+
+#[test]
+fn search_symbols_by_terms_escapes_exact_suffix_scores() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    for (index, term) in ["_", "%", "\\"].into_iter().enumerate() {
+        let exact_id = format!("exact-{index}");
+        for (id, name) in [
+            (exact_id.clone(), format!("Zulu::{term}")),
+            (format!("noise-{index}"), format!("Alpha{term}noise::X")),
+        ] {
+            let mut record = symbol_record();
+            record.id = id;
+            record.qualified_name = name;
+            store.upsert_symbol(record).expect("upsert symbol");
+        }
+        let hits = store
+            .search_symbols_by_terms(&[term.to_owned()], 1)
+            .expect("literal suffix search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].symbol_id, exact_id);
+    }
+}
+
+#[test]
+fn search_symbols_by_terms_caps_normalized_terms_at_sixteen() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("open store");
+    let all_terms = (0..16)
+        .map(|index| format!("t{index:02}"))
+        .collect::<Vec<_>>();
+    for (id, name) in [
+        ("all", format!("Zulu::{}", all_terms.join("::"))),
+        ("one", "Beta::t00".to_owned()),
+        ("ignored", "Alpha::t16".to_owned()),
+    ] {
+        let mut record = symbol_record();
+        record.id = id.to_owned();
+        record.qualified_name = name;
+        store.upsert_symbol(record).expect("upsert symbol");
+    }
+    let mut terms = vec!["  ".to_owned(), " T00 ".to_owned(), "t00".to_owned()];
+    terms.extend((1..=16).map(|index| format!("t{index:02}")));
+    let hits = store
+        .search_symbols_by_terms(&terms, 200)
+        .expect("term cap");
+    let ids = hits
+        .iter()
+        .map(|hit| hit.symbol_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["all", "one"]);
+    assert_eq!(
+        store
+            .search_symbols_by_terms(&terms, 1)
+            .expect("limited term cap")[0]
+            .symbol_id,
+        "all"
+    );
+}
+
+#[test]
 fn search_symbols_by_terms_ranks_by_matched_terms_over_the_whole_table() {
     let temp = tempdir().expect("tempdir");
     let store = SqliteStore::open(temp.path()).expect("open store");
