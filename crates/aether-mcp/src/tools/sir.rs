@@ -12,8 +12,8 @@ use aether_sir::{
     file_sir_hash, sir_hash, synthetic_file_sir_id, synthetic_module_sir_id, validate_sir,
 };
 use aether_store::{
-    SirHistoryStore, SirMetaRecord, SirRowSnapshot, SirStateStore, SqliteStore, SymbolCatalogStore,
-    SymbolRecord, SymbolRelationStore,
+    SirHistoryStore, SirMetaRecord, SirStateStore, SqliteStore, SymbolCatalogStore, SymbolRecord,
+    SymbolRelationStore,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -50,6 +50,13 @@ pub struct AetherGetSirResponse {
     pub structural: Option<SirStructuralView>,
     pub last_error: Option<String>,
     pub last_attempt_at: Option<i64>,
+}
+
+#[derive(Default)]
+struct LiveLeafSir {
+    meta: Option<SirMetaRecord>,
+    blob: Option<String>,
+    freshness: Option<SirFreshness>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -225,10 +232,11 @@ impl AetherMcpServer {
                 current_unix_timestamp_millis(),
             )?;
         }
-        let (snapshot, freshness) = self.live_leaf_sir_meta(symbol_id)?;
-        let meta = snapshot.as_ref().map(|row| row.meta.clone());
+        let live = self.live_leaf_sir_meta(symbol_id)?;
+        let meta = live.meta;
+        let freshness = live.freshness;
         let (sir_status, last_error, last_attempt_at) = meta_status_fields(meta.as_ref());
-        let sir_blob = snapshot.and_then(|row| row.blob);
+        let sir_blob = live.blob;
 
         let Some(sir_blob) = sir_blob else {
             let structural = build_structural_view(store, symbol_id)?;
@@ -560,16 +568,28 @@ impl AetherMcpServer {
 
     /// A persisted freshness label is not proof that the workspace still holds the
     /// source used for inference. Validate on read, without rewriting stored metadata.
-    fn live_leaf_sir_meta(
-        &self,
-        symbol_id: &str,
-    ) -> Result<(Option<SirRowSnapshot>, Option<SirFreshness>), AetherMcpError> {
+    fn live_leaf_sir_meta(&self, symbol_id: &str) -> Result<LiveLeafSir, AetherMcpError> {
         if !self.sqlite_path().exists() {
-            return Ok((None, None));
+            return Ok(LiveLeafSir::default());
         }
         let store = self.state.store.as_ref();
-        let Some(mut snapshot) = store.get_sir_meta_with_blob(symbol_id)? else {
-            return Ok((None, None));
+        let mut snapshot = match store.get_sir_meta_with_blob(symbol_id)? {
+            Some(snapshot) => snapshot,
+            None => {
+                // Preserve mirror-only legacy annotations, using the store's retirement
+                // guard and read-only behavior. A concurrent publication (or writable
+                // hydration) may create a row, so prefer a new coherent snapshot.
+                let legacy_blob = store.read_sir_blob(symbol_id)?;
+                match store.get_sir_meta_with_blob(symbol_id)? {
+                    Some(snapshot) => snapshot,
+                    None => {
+                        return Ok(LiveLeafSir {
+                            blob: legacy_blob,
+                            ..LiveLeafSir::default()
+                        });
+                    }
+                }
+            }
         };
         let meta = &mut snapshot.meta;
         let recorded = snapshot
@@ -596,7 +616,11 @@ impl AetherMcpServer {
             is_mock: meta.provider.eq_ignore_ascii_case("mock"),
             generation_pass: meta.generation_pass.clone(),
         };
-        Ok((Some(snapshot), Some(freshness)))
+        Ok(LiveLeafSir {
+            meta: Some(snapshot.meta),
+            blob: snapshot.blob,
+            freshness: Some(freshness),
+        })
     }
 
     pub fn aether_explain_logic(
@@ -670,12 +694,13 @@ impl AetherMcpServer {
             )?;
         }
 
-        let (snapshot, freshness) = self.live_leaf_sir_meta(&symbol_id)?;
-        let meta = snapshot.as_ref().map(|row| row.meta.clone());
+        let live = self.live_leaf_sir_meta(&symbol_id)?;
+        let meta = live.meta;
+        let freshness = live.freshness;
         let (sir_status, last_error, last_attempt_at) = meta_status_fields(meta.as_ref());
         let stale_warning = stale_warning_message(sir_status.as_deref(), last_error.as_deref());
-        let sir = snapshot
-            .and_then(|row| row.blob)
+        let sir = live
+            .blob
             .map(|blob| -> Result<SirAnnotation, AetherMcpError> {
                 let sir: SirAnnotation = serde_json::from_str(&blob)?;
                 validate_sir(&sir)?;
