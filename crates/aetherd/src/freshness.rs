@@ -27,7 +27,7 @@ use fs2::FileExt;
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 
-use crate::observer::{is_ignored_path, relative_workspace_path};
+use crate::observer::{is_ignored_workspace_path, relative_workspace_path};
 
 pub const INDEX_SYNC_FILE: &str = "index_sync.json";
 pub const WATCHER_LOCK_FILE: &str = "watcher.lock";
@@ -533,7 +533,7 @@ fn source_files(workspace: &Path) -> SourceWalk {
             continue;
         }
         let path = entry.path();
-        if is_ignored_path(path) || language_for_path(path).is_none() {
+        if is_ignored_workspace_path(workspace, path) || language_for_path(path).is_none() {
             continue;
         }
         let Some(metadata) = entry.metadata().ok() else {

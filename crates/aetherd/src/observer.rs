@@ -206,7 +206,7 @@ impl ObserverState {
             }
 
             let full_path = entry.path();
-            if is_ignored_path(full_path) {
+            if is_ignored_workspace_path(&self.workspace, full_path) {
                 continue;
             }
 
@@ -299,7 +299,7 @@ impl ObserverState {
     }
 
     pub fn process_path(&mut self, path: &Path) -> Result<Option<SymbolChangeEvent>> {
-        if is_ignored_path(path) {
+        if is_ignored_workspace_path(&self.workspace, path) {
             return Ok(None);
         }
 
@@ -498,6 +498,11 @@ pub fn relative_workspace_path(workspace: &Path, path: &Path) -> PathBuf {
         return relative.to_path_buf();
     }
     path.to_path_buf()
+}
+
+/// Match built-in exclusions below the workspace, not against its parent directories.
+pub fn is_ignored_workspace_path(workspace: &Path, path: &Path) -> bool {
+    is_ignored_path(&relative_workspace_path(workspace, path))
 }
 
 pub fn is_ignored_path(path: &Path) -> bool {
