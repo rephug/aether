@@ -43,7 +43,7 @@ vector_backend = "sqlite"
         "def compute_total(x: int, y: int) -> int:\n    return x + y\n",
     )?;
 
-    run_index_and_seed_sir(workspace)?;
+    run_index_and_seed_sir_with_source(workspace, true)?;
 
     let server = AetherMcpServer::new(workspace, false)?;
 
@@ -66,6 +66,11 @@ vector_backend = "sqlite"
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
     assert_eq!(health.schema_version, "1.0");
+    assert!(!health.analysis_available);
+    assert_eq!(
+        health.unavailable_reason.as_deref(),
+        Some("unsupported_backend")
+    );
     assert!(health.analysis.analyzed_at > 0);
     assert!(health.critical_symbols.len() <= 10);
     let lookup = rt
@@ -205,7 +210,111 @@ vector_backend = "sqlite"
     assert!(sir.last_attempt_at.unwrap_or_default() > 0);
     assert!(symbol_access_count(workspace, &explain.symbol_id)? >= 2);
 
+    // Editing without an index pass must not serve the old summary as fresh.
+    fs::write(
+        &rust_file,
+        "fn alpha() -> i32 { 99 }\nfn beta() -> i32 { 2 }\n",
+    )?;
+    let changed = server.aether_get_sir_logic(AetherGetSirRequest {
+        level: None,
+        symbol_id: Some(explain.symbol_id.clone()),
+        file_path: None,
+        module_path: None,
+        language: None,
+    })?;
+    assert_eq!(changed.sir_status.as_deref(), Some("stale"));
+    assert_eq!(
+        changed
+            .freshness
+            .as_ref()
+            .and_then(|f| f.source_hash_matches),
+        Some(false)
+    );
+    let changed_hover = server.aether_explain_logic(AetherExplainRequest {
+        file_path: "src/lib.rs".to_owned(),
+        line: 1,
+        column: 4,
+    })?;
+    assert_eq!(changed_hover.sir_status.as_deref(), Some("stale"));
+    // Restoring the exact source restores freshness without changing the stored SIR.
+    fs::write(
+        &rust_file,
+        "fn alpha() -> i32 { 1 }\nfn beta() -> i32 { 2 }\n",
+    )?;
+
     let store = SqliteStore::open(workspace)?;
+    let request = AetherGetSirRequest {
+        level: None,
+        symbol_id: Some(explain.symbol_id.clone()),
+        file_path: None,
+        module_path: None,
+        language: None,
+    };
+    let restored = server.aether_get_sir_logic(request.clone())?;
+    assert_eq!(restored.sir_status.as_deref(), Some("fresh"));
+    assert_eq!(
+        restored
+            .freshness
+            .as_ref()
+            .and_then(|f| f.source_hash_matches),
+        Some(true)
+    );
+    fs::remove_file(&rust_file)?;
+    let removed = server.aether_get_sir_logic(request.clone())?;
+    assert_eq!(removed.sir_status.as_deref(), Some("stale"));
+    assert_eq!(
+        removed
+            .freshness
+            .as_ref()
+            .and_then(|f| f.source_hash_matches),
+        Some(false)
+    );
+    fs::write(
+        &rust_file,
+        "fn alpha() -> i32 { 1 }\nfn beta() -> i32 { 2 }\n",
+    )?;
+    let saved_meta = store.get_sir_meta(&explain.symbol_id)?.expect("metadata");
+    let saved_hash = store.get_sir_source_hash(&explain.symbol_id)?;
+    let saved_blob = store.read_sir_blob(&explain.symbol_id)?.expect("SIR");
+    let mut ready = saved_meta.clone();
+    ready.sir_status = "ready".to_owned();
+    store.persist_sir_state_atomically_with_source(
+        ready,
+        &saved_blob,
+        None,
+        None,
+        saved_hash.as_deref(),
+    )?;
+    fs::write(
+        &rust_file,
+        "fn alpha() -> i32 { 99 }\nfn beta() -> i32 { 2 }\n",
+    )?;
+    assert_eq!(
+        server
+            .aether_get_sir_logic(request.clone())?
+            .sir_status
+            .as_deref(),
+        Some("stale")
+    );
+    fs::write(
+        &rust_file,
+        "fn alpha() -> i32 { 1 }\nfn beta() -> i32 { 2 }\n",
+    )?;
+    let mut legacy = saved_meta.clone();
+    legacy.provider = "mock".to_owned();
+    store.persist_sir_state_atomically_with_source(legacy, &saved_blob, None, None, None)?;
+    let unknown = server.aether_get_sir_logic(request)?;
+    assert_eq!(unknown.sir_status.as_deref(), Some("stale"));
+    let freshness = unknown.freshness.expect("provenance");
+    assert_eq!(freshness.source_hash_matches, None);
+    assert!(freshness.is_mock);
+    store.persist_sir_state_atomically_with_source(
+        saved_meta,
+        &saved_blob,
+        None,
+        None,
+        saved_hash.as_deref(),
+    )?;
     let existing_meta = store
         .get_sir_meta(&explain.symbol_id)?
         .expect("symbol should have metadata");
@@ -726,5 +835,88 @@ vector_backend = "sqlite"
         stale.notes
     );
 
+    Ok(())
+}
+
+#[test]
+fn mirror_only_sirs_remain_readable_without_claiming_verified_freshness() -> Result<()> {
+    let temp = tempdir()?;
+    let workspace = temp.path();
+    fs::create_dir_all(workspace.join(".aether"))?;
+    fs::write(
+        workspace.join(".aether/config.toml"),
+        r#"
+[inference]
+provider = "mock"
+[storage]
+graph_backend = "sqlite"
+mirror_sir_files = true
+[embeddings]
+enabled = false
+vector_backend = "sqlite"
+"#,
+    )?;
+    fs::create_dir_all(workspace.join("src"))?;
+    fs::write(workspace.join("src/lib.rs"), "fn alpha() -> i32 { 1 }\n")?;
+    run_index_and_seed_sir_with_source(workspace, true)?;
+    let store = SqliteStore::open(workspace)?;
+    let symbol = store
+        .list_all_symbol_ids()?
+        .into_iter()
+        .next()
+        .expect("symbol");
+    let conn = Connection::open(workspace.join(".aether/meta.sqlite"))?;
+    conn.execute("DELETE FROM sir WHERE id=?1", [&symbol])?;
+    let request = AetherGetSirRequest {
+        level: None,
+        symbol_id: Some(symbol.clone()),
+        file_path: None,
+        module_path: None,
+        language: None,
+    };
+    let explain_request = AetherExplainRequest {
+        file_path: "src/lib.rs".to_owned(),
+        line: 1,
+        column: 4,
+    };
+    let readonly = AetherMcpServer::from_state(
+        std::sync::Arc::new(SharedState::open_readonly(workspace)?),
+        false,
+    );
+    let read = readonly.aether_get_sir_logic(request.clone())?;
+    assert!(read.found);
+    assert!(read.freshness.is_none());
+    assert!(read.sir_status.is_none());
+    assert!(
+        readonly
+            .aether_explain_logic(explain_request.clone())?
+            .found
+    );
+    assert!(
+        store.get_sir_meta(&symbol)?.is_none(),
+        "readonly must not hydrate"
+    );
+    assert!(
+        store.list_sir_request_symbol_ids(10)?.is_empty(),
+        "existing mirror must not be regenerated"
+    );
+
+    let writable = AetherMcpServer::new(workspace, false)?;
+    let read = writable.aether_get_sir_logic(request)?;
+    assert!(read.found);
+    assert_ne!(read.sir_status.as_deref(), Some("fresh"));
+    assert_eq!(
+        read.freshness.and_then(|value| value.source_hash_matches),
+        None
+    );
+    assert!(
+        store.get_sir_meta(&symbol)?.is_some(),
+        "writable legacy read hydrates"
+    );
+    conn.execute("DELETE FROM sir WHERE id=?1", [&symbol])?;
+    let explanation = writable.aether_explain_logic(explain_request)?;
+    assert!(explanation.found);
+    assert_ne!(explanation.sir_status.as_deref(), Some("fresh"));
+    assert!(store.list_sir_request_symbol_ids(10)?.is_empty());
     Ok(())
 }

@@ -27,7 +27,9 @@ pub struct SirIdentity {
 pub struct SirRowSnapshot {
     pub meta: SirMetaRecord,
     pub identity: SirIdentity,
+    pub source_hash: Option<String>,
     pub blob: Option<String>,
+    legacy_mirror_blocked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -794,7 +796,7 @@ impl SqliteStore {
         // identity is unchanged do the two belong together; otherwise the newer row is
         // taken (and, once it holds its JSON itself, returned as is).
         for _ in 0..3 {
-            if snapshot.blob.is_some() {
+            if snapshot.blob.is_some() || snapshot.legacy_mirror_blocked {
                 return Ok(Some(snapshot));
             }
             let Some(mirrored) = self.read_legacy_mirror(symbol_id)? else {
@@ -802,7 +804,9 @@ impl SqliteStore {
             };
             match self.read_sir_row(symbol_id)? {
                 None => return Ok(None),
-                Some(again) if again.identity == snapshot.identity => {
+                Some(again)
+                    if again.identity == snapshot.identity && !again.legacy_mirror_blocked =>
+                {
                     snapshot.blob = Some(mirrored).filter(|value| !value.trim().is_empty());
                     return Ok(Some(snapshot));
                 }
@@ -844,7 +848,30 @@ impl SqliteStore {
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut stmt = conn.prepare(
+        // Capture retirement eligibility in the same SQLite snapshot as the row.
+        // Older read-only databases may predate the retirement table.
+        let retirement_expression = if schema::table_exists(&conn, "symbol_retirements")? {
+            "EXISTS(SELECT 1 FROM symbol_retirements WHERE symbol_id = sir.id)"
+        } else {
+            "0"
+        };
+        let (has_source_hash, has_write_generation): (bool, bool) = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sir') WHERE name = 'source_hash'),
+                    EXISTS(SELECT 1 FROM pragma_table_info('sir') WHERE name = 'write_generation')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let source_hash_expression = if has_source_hash {
+            "source_hash"
+        } else {
+            "NULL"
+        };
+        let write_generation_expression = if has_write_generation {
+            "write_generation"
+        } else {
+            "0"
+        };
+        let sql = format!(
             r#"
             SELECT
                 id,
@@ -861,11 +888,14 @@ impl SqliteStore {
                 last_error,
                 last_attempt_at,
                 sir_json,
-                write_generation
+                {write_generation_expression},
+                {source_hash_expression},
+                {retirement_expression}
             FROM sir
             WHERE id = ?1
             "#,
-        )?;
+        );
+        let mut stmt = conn.prepare(&sql)?;
 
         let snapshot = stmt
             .query_row(params![symbol_id], |row| {
@@ -878,6 +908,8 @@ impl SqliteStore {
                 Ok(SirRowSnapshot {
                     meta,
                     identity,
+                    source_hash: row.get(15)?,
+                    legacy_mirror_blocked: row.get(16)?,
                     blob: row
                         .get::<_, Option<String>>(13)?
                         .filter(|value| !value.trim().is_empty()),

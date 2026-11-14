@@ -1088,3 +1088,165 @@ fn mark_sir_stale_moves_only_fresh_rows() {
             .is_none()
     );
 }
+
+#[test]
+fn sir_snapshot_keeps_source_hash_and_blob_together_across_publication() {
+    let temp = tempdir().expect("tempdir");
+    let store = std::sync::Arc::new(SqliteStore::open(temp.path()).expect("store"));
+    let meta = |value: &str| SirMetaRecord {
+        id: "snapshot".to_owned(),
+        sir_hash: value.to_owned(),
+        sir_version: 1,
+        provider: "mock".to_owned(),
+        model: "mock".to_owned(),
+        generation_pass: "scan".to_owned(),
+        reasoning_trace: None,
+        prompt_hash: None,
+        staleness_score: None,
+        updated_at: 1,
+        sir_status: "fresh".to_owned(),
+        last_error: None,
+        last_attempt_at: 1,
+    };
+    store
+        .persist_sir_state_atomically_with_source(
+            meta("old"),
+            "old",
+            None,
+            None,
+            Some("old-source"),
+        )
+        .expect("initial write");
+    let before = store
+        .get_sir_meta_with_blob("snapshot")
+        .expect("snapshot")
+        .expect("row");
+    let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+    std::thread::scope(|scope| {
+        let writer = store.clone();
+        let writer_gate = gate.clone();
+        let task = scope.spawn(move || {
+            writer_gate.wait();
+            writer
+                .persist_sir_state_atomically_with_source(
+                    meta("new"),
+                    "new",
+                    None,
+                    None,
+                    Some("new-source"),
+                )
+                .expect("concurrent publication");
+        });
+        gate.wait();
+        task.join().expect("writer");
+    });
+    // A later writer must never replace the blob or source in an already-read row.
+    assert_eq!(before.meta.sir_hash, "old");
+    assert_eq!(before.blob.as_deref(), Some("old"));
+    assert_eq!(before.source_hash.as_deref(), Some("old-source"));
+    let after = store
+        .get_sir_meta_with_blob("snapshot")
+        .expect("snapshot")
+        .expect("row");
+    assert_eq!(after.meta.sir_hash, "new");
+    assert_eq!(after.blob.as_deref(), Some("new"));
+    assert_eq!(after.source_hash.as_deref(), Some("new-source"));
+    assert_ne!(before.identity, after.identity);
+}
+
+#[test]
+fn sir_snapshot_blocks_retired_mirrors_but_allows_explicit_publication() {
+    let temp = tempdir().expect("tempdir");
+    let store = SqliteStore::open(temp.path()).expect("store");
+    let id = "returning-snapshot";
+    store
+        .upsert_sir_meta(SirMetaRecord {
+            id: id.to_owned(),
+            sir_status: "error".to_owned(),
+            ..sir_meta_record()
+        })
+        .expect("metadata-only failed generation");
+    fs::create_dir_all(temp.path().join(".aether/sir")).expect("mirror directory");
+    fs::write(
+        temp.path().join(".aether/sir/returning-snapshot.json"),
+        r#"{"intent":"previous incarnation"}"#,
+    )
+    .expect("surviving mirror");
+    store.conn.lock().expect("lock").execute(
+        "INSERT INTO symbol_retirements (symbol_id, retired_at, reason, evidence_json) VALUES (?1, 1, 'fixture', '{}')",
+        [id],
+    ).expect("retirement tombstone");
+    let readonly = SqliteStore::open_readonly(temp.path()).expect("readonly");
+    for reader in [&store, &readonly] {
+        let snapshot = reader
+            .get_sir_meta_with_blob(id)
+            .expect("snapshot")
+            .expect("metadata row");
+        assert!(
+            snapshot.blob.is_none(),
+            "retired mirror must not be resurrected"
+        );
+        assert!(reader.read_sir_blob(id).expect("blob").is_none());
+    }
+    store
+        .write_sir_blob(id, r#"{"intent":"new incarnation"}"#)
+        .expect("explicit publication");
+    for reader in [&store, &readonly] {
+        assert_eq!(
+            reader
+                .get_sir_meta_with_blob(id)
+                .expect("snapshot")
+                .expect("row")
+                .blob
+                .as_deref(),
+            Some(r#"{"intent":"new incarnation"}"#)
+        );
+    }
+}
+
+#[test]
+fn sir_snapshot_reads_legacy_readonly_schemas_with_unknown_source_hash() {
+    for version in [17, 18, 19, 20] {
+        let temp = tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("store");
+        store.upsert_sir_meta(sir_meta_record()).expect("metadata");
+        fs::write(
+            temp.path().join(".aether/sir/sym-1.json"),
+            r#"{"intent":"legacy mirror"}"#,
+        )
+        .expect("mirror");
+        store.conn.lock().expect("lock").execute_batch(&format!(
+            "ALTER TABLE sir DROP COLUMN source_hash; DROP TABLE retirement_cleanup; DROP TABLE symbol_lineage; DROP TABLE symbol_retirements; PRAGMA user_version = {version}; UPDATE schema_version SET version = {version} WHERE component = 'core';"
+        )).expect("legacy schema fixture");
+        if version < 19 {
+            store
+                .conn
+                .lock()
+                .expect("lock")
+                .execute_batch("ALTER TABLE sir DROP COLUMN write_generation;")
+                .expect("pre-write-generation schema");
+        }
+        let readonly = SqliteStore::open_readonly(temp.path()).expect("readonly legacy store");
+        let snapshot = readonly
+            .get_sir_meta_with_blob("sym-1")
+            .expect("legacy snapshot")
+            .expect("row");
+        assert_eq!(
+            snapshot.blob.as_deref(),
+            Some(r#"{"intent":"legacy mirror"}"#)
+        );
+        assert_eq!(snapshot.source_hash, None);
+        let conn = readonly.conn.lock().expect("lock");
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("version"),
+            version
+        );
+        assert_eq!(
+            conn.query_row("SELECT sir_json FROM sir WHERE id = 'sym-1'", [], |row| row
+                .get::<_, Option<String>>(0))
+                .expect("unmodified row"),
+            None
+        );
+    }
+}

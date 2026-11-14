@@ -141,6 +141,9 @@ pub struct AetherRiskHotspotEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherHealthResponse {
+    /// False means zero-valued metrics must not be interpreted as a healthy graph.
+    pub analysis_available: bool,
+    pub unavailable_reason: Option<String>,
     pub schema_version: String,
     pub analysis: AetherHealthAnalysisSummary,
     pub critical_symbols: Vec<AetherSymbolHealthEntry>,
@@ -179,7 +182,15 @@ impl AetherMcpServer {
                         .analyze_with_graph(&analysis_request, graph.as_ref())
                         .await?
                 }
-                Err(_) => analyzer.analyze(&analysis_request).await?,
+                Err(err) => {
+                    let mut unavailable = analyzer
+                        .analyze_with_handles(&analysis_request, self.state.store.as_ref(), None)
+                        .await?;
+                    unavailable
+                        .notes
+                        .push(format!("Graph initialization failed: {err}"));
+                    unavailable
+                }
             }
         } else {
             analyzer.analyze(&analysis_request).await?
@@ -190,6 +201,25 @@ impl AetherMcpServer {
         }
 
         Ok(AetherHealthResponse {
+            analysis_available: report.analysis_available,
+            unavailable_reason: report.unavailable_reason.map(|reason| {
+                match reason {
+                    aether_analysis::HealthUnavailableReason::Disabled => "disabled",
+                    aether_analysis::HealthUnavailableReason::UnsupportedBackend => {
+                        "unsupported_backend"
+                    }
+                    aether_analysis::HealthUnavailableReason::MetadataUnavailable => {
+                        "metadata_unavailable"
+                    }
+                    aether_analysis::HealthUnavailableReason::GraphUnavailable => {
+                        "graph_unavailable"
+                    }
+                    aether_analysis::HealthUnavailableReason::GraphQueryFailed => {
+                        "graph_query_failed"
+                    }
+                }
+                .to_owned()
+            }),
             schema_version: report.schema_version,
             analysis: AetherHealthAnalysisSummary {
                 total_symbols: report.analysis.total_symbols,
