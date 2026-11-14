@@ -39,6 +39,28 @@ pub(crate) fn typescript_source_function_id(
     ))
 }
 
+/// Resolve hoisted lexical function declarations before falling back to a raw
+/// external/member target. Only enclosing blocks are visible, never sibling scopes.
+pub(crate) fn lexical_call_target(
+    call: Node<'_>,
+    source: &[u8],
+    occurrences: &CallOccurrences,
+) -> Option<Option<String>> {
+    let callee = call.child_by_field_name("function")?;
+    if callee.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(callee, source);
+    let mut current = call.parent();
+    while let Some(scope) = current {
+        if let Some(target) = occurrences.declarations.get(&(scope.id(), name.clone())) {
+            return Some(target.clone());
+        }
+        current = scope.parent();
+    }
+    None
+}
+
 fn nearest_typescript_function_ancestor(node: Node<'_>) -> Option<Node<'_>> {
     let mut current = Some(node);
     while let Some(cursor) = current {
@@ -226,6 +248,7 @@ fn header(node: Node<'_>, source: &[u8]) -> String {
 #[derive(Default)]
 pub(crate) struct CallOccurrences {
     suffixes: HashMap<usize, String>,
+    declarations: HashMap<(usize, String), Option<String>>,
     #[cfg(test)]
     scope_scans: usize,
     #[cfg(test)]
@@ -235,8 +258,14 @@ pub(crate) struct CallOccurrences {
 impl CallOccurrences {
     pub(crate) fn new(root: Node<'_>, source: &[u8]) -> Self {
         let mut scopes = HashMap::new();
+        let mut declarations = Vec::new();
+        let mut bindings = Vec::new();
         let mut pending = vec![root];
         while let Some(node) = pending.pop() {
+            bindings.push(node);
+            if node.kind() == "function_declaration" {
+                declarations.push(node);
+            }
             if matches!(node.kind(), "call_expression" | "new_expression") {
                 let scope = call_scope(node);
                 scopes.insert(scope.id(), scope);
@@ -287,11 +316,138 @@ impl CallOccurrences {
                 }
             }
         }
+        for declaration in declarations {
+            if let Some(scope) = binding_scope(declaration, false)
+                && let Some(name) = named_child_text(declaration, "name", source)
+            {
+                let target = typescript_qualified_name(declaration, &name, source, &result);
+                result
+                    .declarations
+                    .entry((scope.id(), name))
+                    .and_modify(|existing| *existing = None)
+                    .or_insert(Some(target));
+            }
+        }
+        for node in bindings {
+            if let Some(parameters) = node.child_by_field_name("parameters") {
+                add_shadow_bindings(&mut result, node, parameters, source);
+            }
+            if node.kind() == "arrow_function"
+                && let Some(parameter) = node.child_by_field_name("parameter")
+            {
+                add_shadow_bindings(&mut result, node, parameter, source);
+            }
+            if node.kind() == "variable_declarator"
+                && let Some(name) = node.child_by_field_name("name")
+            {
+                let is_var = node
+                    .parent()
+                    .is_some_and(|p| p.kind() == "variable_declaration");
+                if let Some(scope) = binding_scope(node, is_var) {
+                    add_shadow_bindings(&mut result, scope, name, source);
+                }
+            }
+            if node.kind() == "for_in_statement"
+                && let Some(left) = node.child_by_field_name("left")
+            {
+                let mut walk = node.walk();
+                let kind = node
+                    .children(&mut walk)
+                    .find(|child| matches!(child.kind(), "var" | "let" | "const"));
+                if let Some(kind) = kind {
+                    let scope = if kind.kind() == "var" {
+                        binding_scope(node, true)
+                    } else {
+                        Some(node)
+                    };
+                    if let Some(scope) = scope {
+                        add_shadow_bindings(&mut result, scope, left, source);
+                    }
+                }
+            }
+            if node.kind() == "catch_clause"
+                && let Some(parameter) = node.child_by_field_name("parameter")
+            {
+                add_shadow_bindings(&mut result, node, parameter, source);
+            }
+            if matches!(node.kind(), "class_declaration" | "function_expression")
+                && let Some(name) = node.child_by_field_name("name")
+            {
+                let scope = if node.kind() == "function_expression" {
+                    Some(node)
+                } else {
+                    binding_scope(node, false)
+                };
+                if let Some(scope) = scope {
+                    add_shadow_bindings(&mut result, scope, name, source);
+                }
+            }
+        }
         result
     }
 
     fn get(&self, call: Node<'_>) -> String {
         self.suffixes.get(&call.id()).cloned().unwrap_or_default()
+    }
+}
+
+fn binding_scope(mut node: Node<'_>, function_scoped: bool) -> Option<Node<'_>> {
+    while let Some(parent) = node.parent() {
+        node = parent;
+        if matches!(
+            node.kind(),
+            "program"
+                | "function_declaration"
+                | "function_expression"
+                | "arrow_function"
+                | "method_definition"
+        ) || (!function_scoped
+            && matches!(
+                node.kind(),
+                "statement_block" | "for_statement" | "for_in_statement" | "switch_body"
+            ))
+        {
+            return Some(node);
+        }
+    }
+    None
+}
+
+fn add_shadow_bindings(
+    cache: &mut CallOccurrences,
+    scope: Node<'_>,
+    pattern: Node<'_>,
+    source: &[u8],
+) {
+    match pattern.kind() {
+        "identifier" | "type_identifier" | "shorthand_property_identifier_pattern" => {
+            cache
+                .declarations
+                .entry((scope.id(), node_text(pattern, source)))
+                .or_insert(None);
+        }
+        "pair_pattern" => {
+            if let Some(value) = pattern.child_by_field_name("value") {
+                add_shadow_bindings(cache, scope, value, source);
+            }
+        }
+        "assignment_pattern" | "object_assignment_pattern" => {
+            if let Some(left) = pattern.child_by_field_name("left") {
+                add_shadow_bindings(cache, scope, left, source);
+            }
+        }
+        "required_parameter" | "optional_parameter" => {
+            if let Some(pattern) = pattern.child_by_field_name("pattern") {
+                add_shadow_bindings(cache, scope, pattern, source);
+            }
+        }
+        "formal_parameters" | "array_pattern" | "object_pattern" | "rest_pattern" => {
+            let mut walk = pattern.walk();
+            for child in pattern.named_children(&mut walk) {
+                add_shadow_bindings(cache, scope, child, source);
+            }
+        }
+        _ => {}
     }
 }
 

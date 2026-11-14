@@ -2,7 +2,7 @@ use aether_core::{EdgeKind, Language, Symbol, SymbolEdge, SymbolKind, file_sourc
 use tree_sitter::{Node, Query};
 
 use super::typescript_owners::{
-    CallOccurrences, typescript_qualified_name, typescript_source_function_id,
+    CallOccurrences, lexical_call_target, typescript_qualified_name, typescript_source_function_id,
 };
 use crate::parser::{TestIntent, build_symbol, normalize_intent_text, typescript_call_target};
 use crate::registry::{LanguageConfig, LanguageHooks, QueryCaptures};
@@ -127,7 +127,11 @@ impl LanguageHooks for TypeScriptHooks {
 
         match capture_name {
             "edge.call" => {
-                let target = typescript_call_target(node, source)?;
+                let target = match lexical_call_target(node, source, &self.occurrences) {
+                    Some(Some(target)) => target,
+                    Some(None) => return Some(Vec::new()),
+                    None => typescript_call_target(node, source)?,
+                };
                 let source_id = typescript_source_function_id(
                     language,
                     file_path,

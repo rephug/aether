@@ -962,3 +962,82 @@ fn rust_use_path_at_cursor_ignores_external_crate_imports() {
     let source = "use serde::Deserialize;\n";
     assert!(rust_use_path_at_cursor(source, 0, 8).is_none());
 }
+
+#[test]
+fn javascript_nested_function_calls_resolve_lexically_not_to_global_namesakes() {
+    let source = r#"
+function helper() {}
+function outer() {
+    helper();
+    function helper() { helper(); }
+    function sibling() { helper(); }
+}
+function other() { helper(); }
+"#;
+    let extracted = extract_with_edges(Language::JavaScript, "scope.mjs", source);
+    assert_eq!(
+        edge_targets_for_source(&extracted, "outer", EdgeKind::Calls),
+        vec!["outer::helper"]
+    );
+    assert_eq!(
+        edge_targets_for_source(&extracted, "outer::helper", EdgeKind::Calls),
+        vec!["outer::helper"]
+    );
+    assert_eq!(
+        edge_targets_for_source(&extracted, "outer::sibling", EdgeKind::Calls),
+        vec!["outer::helper"]
+    );
+    assert_eq!(
+        edge_targets_for_source(&extracted, "other", EdgeKind::Calls),
+        vec!["helper"]
+    );
+    for edge in &extracted.edges {
+        assert!(
+            extracted
+                .symbols
+                .iter()
+                .any(|s| s.qualified_name == edge.target_qualified_name)
+        );
+    }
+}
+
+#[test]
+fn javascript_dynamic_bindings_do_not_link_to_outer_function_namesakes() {
+    for body in [
+        "function caller(helper) { helper(); }",
+        "function caller({helper}) { helper(); }",
+        "function caller(...helper) { helper(); }",
+        "function caller(helper = fallback) { helper(); }",
+        "function caller() { helper(); let helper = dynamic; }",
+        "function caller() { const helper = dynamic; helper(); }",
+        "function caller() { helper(); if (flag) { var helper = dynamic; } }",
+        "function caller() { try {} catch(helper) { helper(); } }",
+        "function caller() { { class helper {} helper(); } }",
+        "function caller() { for (const helper of helpers) { helper(); } }",
+        "function caller() { for (let helper in helpers) { helper(); } }",
+        "function caller() { helper(); for (var helper of helpers) {} }",
+    ] {
+        let source = format!("function helper() {{}} {body}");
+        let extracted = extract_with_edges(Language::JavaScript, "shadow.mjs", &source);
+        assert!(
+            !extracted
+                .edges
+                .iter()
+                .any(|edge| edge.target_qualified_name == "helper"),
+            "must not resolve dynamic shadow binding to global helper: {body}"
+        );
+    }
+}
+
+#[test]
+fn javascript_switch_case_function_target_matches_qualified_declaration() {
+    let extracted = extract_with_edges(
+        Language::JavaScript,
+        "switch.mjs",
+        "function helper() {} function caller() { switch(flag) { case 0: function helper() {} helper(); break; } }",
+    );
+    assert_eq!(
+        edge_targets_for_source(&extracted, "caller", EdgeKind::Calls),
+        vec!["caller::helper"]
+    );
+}
