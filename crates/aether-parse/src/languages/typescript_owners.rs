@@ -94,6 +94,8 @@ fn typescript_owner_text(node: Node<'_>, source: &[u8]) -> String {
             | "generator_function"
             | "arrow_function"
             | "method_definition"
+            | "class"
+            | "class_declaration"
     ) {
         node.child_by_field_name("body")
     } else {
@@ -129,9 +131,14 @@ fn collect_typescript_context(
             | "generator_function_declaration"
             | "function_expression"
             | "generator_function"
-            | "variable_declarator" => {
+            | "class" => {
                 if let Some(name) = named_child_text(cursor, "name", source) {
                     context.push(name);
+                }
+            }
+            "variable_declarator" => {
+                if let Some(name) = cursor.child_by_field_name("name") {
+                    context.push(typescript_owner_text(name, source));
                 }
             }
             "public_field_definition" | "method_definition" => {
@@ -176,7 +183,7 @@ fn collect_typescript_context(
                     context.push(format!("$default({})", typescript_owner_text(left, source)));
                 }
             }
-            "assignment_expression" => {
+            "assignment_expression" | "augmented_assignment_expression" => {
                 if cursor
                     .child_by_field_name("right")
                     .is_some_and(|right| right.id() == child.id())
@@ -256,6 +263,48 @@ fn collect_typescript_context(
                     format!("$arg({call},{ordinal};{labels}{site})")
                 });
             }
+            "try_statement" => {
+                let role = if cursor
+                    .child_by_field_name("handler")
+                    .is_some_and(|node| node.id() == child.id())
+                {
+                    "catch"
+                } else if cursor
+                    .child_by_field_name("finalizer")
+                    .is_some_and(|node| node.id() == child.id())
+                {
+                    "finally"
+                } else {
+                    "try"
+                };
+                context.push(format!("$try({role})"));
+            }
+            "for_statement" | "for_in_statement" | "while_statement" | "do_statement" => {
+                let body = cursor.child_by_field_name("body");
+                let mut walk = cursor.walk();
+                let header = cursor
+                    .children(&mut walk)
+                    .filter(|node| !body.is_some_and(|body| body.id() == node.id()))
+                    .map(|node| typescript_owner_text(node, source))
+                    .collect::<String>();
+                context.push(format!("$loop({header})"));
+            }
+            "switch_statement" => {
+                let value = cursor
+                    .child_by_field_name("value")
+                    .or_else(|| cursor.child_by_field_name("condition"))
+                    .map(|value| typescript_owner_text(value, source))
+                    .unwrap_or_default();
+                context.push(format!("$switch({value})"));
+            }
+            "switch_case" => {
+                let value = cursor
+                    .child_by_field_name("value")
+                    .map(|value| typescript_owner_text(value, source))
+                    .unwrap_or_default();
+                context.push(format!("$case({value})"));
+            }
+            "switch_default" => context.push("$default_case".to_owned()),
             "if_statement" | "ternary_expression" => {
                 let condition = cursor
                     .child_by_field_name("condition")
@@ -448,12 +497,16 @@ impl CallOccurrences {
             if matches!(
                 node.kind(),
                 "class_declaration"
+                    | "class"
                     | "function_expression"
                     | "generator_function"
                     | "generator_function_declaration"
             ) && let Some(name) = node.child_by_field_name("name")
             {
-                let scope = if matches!(node.kind(), "function_expression" | "generator_function") {
+                let scope = if matches!(
+                    node.kind(),
+                    "function_expression" | "generator_function" | "class"
+                ) {
                     Some(node)
                 } else {
                     binding_scope(node, false)
