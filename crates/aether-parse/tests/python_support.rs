@@ -225,6 +225,8 @@ fn spells_python_call_targets_like_python_qualified_names() {
                 ("~process", "~process::inner"),
                 ("~process", "shop.orders.helpers::late"),
                 ("~factory", "~factory::Local"),
+                ("~factory::Local::go", "~factory::Local::go"),
+                ("~Handler::run", "~Handler::handle"),
                 // A default value is evaluated outside the function, where `normalize` is the
                 // module's.
                 ("~configured", "~normalize"),
@@ -300,10 +302,6 @@ fn python_calls_without_a_static_target_have_no_edge() {
             "a method can't see its class body's names",
         ),
         (
-            "Local::go",
-            "methods of a class declared in a function share names with other classes'",
-        ),
-        (
             "shadows",
             "parameters, loop, except, with, walrus, match and comprehension targets, plain, \
              annotated, augmented and chained assignments, type aliases, del and lambda \
@@ -331,11 +329,6 @@ fn python_calls_without_a_static_target_have_no_edge() {
         (
             "calls_later",
             "a walrus in a default value rebinds the name in the enclosing scope",
-        ),
-        (
-            "Handler::run",
-            "a method's name is shared with a method of a class declared in a function, \
-             which the symbol mapper names the same",
         ),
         (
             "Toggle::flip",
