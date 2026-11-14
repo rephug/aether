@@ -1180,3 +1180,100 @@ fn repeated_same_assignment_owner_still_fails_closed_without_overwriting() {
             .is_some_and(|error| error.downcast_ref::<DuplicateSymbolIdentity>().is_some())
     );
 }
+
+#[test]
+fn typescript_static_and_accessor_method_owners_are_distinct() {
+    let extracted = extract_with_edges(
+        Language::TypeScript,
+        "methods.ts",
+        "class C { static make() { return {run(){staticWork();}}; } make() { return {run(){instanceWork();}}; } get value() { return {run(){getWork();}}; } set value(v) { const x={run(){setWork();}}; } }",
+    );
+    for (owner, target) in [
+        ("C::$static(make)::$return::run", "staticWork"),
+        ("C::make::$return::run", "instanceWork"),
+        ("C::$get(value)::$return::run", "getWork"),
+        ("C::$set(value)::x::run", "setWork"),
+    ] {
+        assert_eq!(
+            edge_targets_for_source(&extracted, owner, EdgeKind::Calls),
+            vec![target]
+        );
+    }
+}
+
+#[test]
+fn quoted_property_owners_preserve_semantic_whitespace() {
+    let source = r#"const handlers = { " a ": {run(){spaceWork();}}, a: {run(){plainWork();}}, ["a b"]: {run(){computedWork();}} };"#;
+    let first = extract_with_edges(Language::JavaScript, "keys.mjs", source);
+    assert_eq!(first.symbols.len(), 3);
+    for (owner, target) in [
+        ("handlers::\" a \"::run", "spaceWork"),
+        ("handlers::a::run", "plainWork"),
+        ("handlers::[\"a b\"]::run", "computedWork"),
+    ] {
+        assert_eq!(
+            edge_targets_for_source(&first, owner, EdgeKind::Calls),
+            vec![target]
+        );
+    }
+    let second = extract_with_edges(
+        Language::JavaScript,
+        "keys.mjs",
+        &source
+            .replace("[\"a b\"]", "[ /*key*/ \"a b\" ]")
+            .replace("spaceWork();", "spaceWork(); moreWork();"),
+    );
+    assert!(
+        first
+            .symbols
+            .iter()
+            .all(|symbol| second.symbols.iter().any(|next| next.id == symbol.id))
+    );
+}
+
+#[test]
+fn dynamic_computed_owner_expressions_are_syntactically_distinct_not_runtime_resolved() {
+    let extracted = extract_with_edges(
+        Language::JavaScript,
+        "dynamic.mjs",
+        "const table = { [keyA]: {run(){aWork();}}, [keyB]: {run(){bWork();}} };",
+    );
+    assert_eq!(
+        edge_targets_for_source(&extracted, "table::[keyA]::run", EdgeKind::Calls),
+        vec!["aWork"]
+    );
+    assert_eq!(
+        edge_targets_for_source(&extracted, "table::[keyB]::run", EdgeKind::Calls),
+        vec!["bWork"]
+    );
+}
+
+#[test]
+fn unsupported_ambiguous_owner_forms_are_explicitly_rejected() {
+    for (language, path, source) in [
+        (
+            Language::JavaScript,
+            "dynamic.mjs",
+            "exports[key]={run(){first();}}; exports[key]={run(){second();}};",
+        ),
+        (
+            Language::JavaScript,
+            "blocks.mjs",
+            "function outer(){ {const x={run(){first();}};} {const x={run(){second();}};} }",
+        ),
+        (
+            Language::TypeScript,
+            "namespaces.ts",
+            "namespace A { function work() {} } namespace B { function work() {} }",
+        ),
+    ] {
+        let mut extractor = SymbolExtractor::new().expect("extractor");
+        let result = extractor.extract_from_source(language, path, source);
+        assert!(
+            result
+                .err()
+                .is_some_and(|error| error.downcast_ref::<DuplicateSymbolIdentity>().is_some()),
+            "must reject ambiguous identities rather than overwrite: {path}"
+        );
+    }
+}

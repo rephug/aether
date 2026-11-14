@@ -108,15 +108,21 @@ fn collect_typescript_context(
             | "interface_declaration"
             | "function_declaration"
             | "function_expression"
-            | "method_definition"
             | "variable_declarator" => {
                 if let Some(name) = named_child_text(cursor, "name", source) {
                     context.push(name);
                 }
             }
-            "public_field_definition" => {
+            "public_field_definition" | "method_definition" => {
                 if let Some(name) = cursor.child_by_field_name("name") {
-                    let name = typescript_owner_text(name, source);
+                    let mut name = typescript_owner_text(name, source);
+                    let mut walk = cursor.walk();
+                    if let Some(accessor) = cursor
+                        .children(&mut walk)
+                        .find(|child| matches!(child.kind(), "get" | "set"))
+                    {
+                        name = format!("{}{}({name})", "$", accessor.kind());
+                    }
                     let mut walk = cursor.walk();
                     let is_static = cursor
                         .children(&mut walk)
@@ -138,8 +144,8 @@ fn collect_typescript_context(
                 }
             }
             "pair" => {
-                if let Some(name) = named_child_text(cursor, "key", source) {
-                    context.push(name);
+                if let Some(key) = cursor.child_by_field_name("key") {
+                    context.push(typescript_owner_text(key, source));
                 }
             }
             "object"
