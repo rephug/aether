@@ -48,7 +48,16 @@ impl ReconciliationPlan {
             .collect::<Vec<_>>();
         let (migrated, pruned) = store
             .publish_and_reconcile_symbols(records, &migrations, &prunes)
-            .context("failed to atomically publish and reconcile declarations")?;
+            .with_context(|| {
+                let mut seen = HashSet::new();
+                let conflicts = records.iter().filter(|record|
+                    record.id.trim().is_empty() || !seen.insert(record.id.as_str())
+                    || migrations.iter().any(|(old, _)| old == &record.id)
+                    || prunes.contains(&record.id)
+                ).map(|record| format!("{}:{} ({})", record.file_path, record.qualified_name, record.id))
+                .collect::<Vec<_>>();
+                format!("failed to atomically publish and reconcile declarations; conflicting records: {}", conflicts.join(", "))
+            })?;
         for entry in &self.migrations {
             tracing::info!(qualified_name = %entry.old_symbol.qualified_name,
                 file_path = %entry.old_symbol.file_path, old_id = %entry.old_symbol.id,
