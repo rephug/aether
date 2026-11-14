@@ -494,6 +494,15 @@ pub(super) async fn generate_sir_with_retries(
 
         match timeout_result {
             Ok(Ok(sir)) => return Ok(sir),
+            Ok(Err(err @ InferError::ParseValidationExhausted(_))) => {
+                // The provider already spent its parse/validation retry budget. Starting
+                // that budget again multiplies model calls and delays tiered fallback.
+                return Err(anyhow::Error::new(err).context(format!(
+                    "attempt {}/{} exhausted provider validation retries",
+                    attempt + 1,
+                    total_attempts
+                )));
+            }
             Ok(Err(err)) => {
                 last_error = Some(anyhow::Error::new(err).context(format!(
                     "attempt {}/{} failed",
@@ -539,6 +548,15 @@ async fn generate_sir_from_prompt_with_retries(
 
         match timeout_result {
             Ok(Ok(sir)) => return Ok(sir),
+            Ok(Err(err @ InferError::ParseValidationExhausted(_))) => {
+                // The provider already spent its parse/validation retry budget. Starting
+                // that budget again multiplies model calls and delays tiered fallback.
+                return Err(anyhow::Error::new(err).context(format!(
+                    "attempt {}/{} exhausted provider validation retries",
+                    attempt + 1,
+                    total_attempts
+                )));
+            }
             Ok(Err(err)) => {
                 last_error = Some(anyhow::Error::new(err).context(format!(
                     "attempt {}/{} failed",
@@ -563,4 +581,103 @@ async fn generate_sir_from_prompt_with_retries(
     }
 
     Err(last_error.unwrap_or_else(|| anyhow!("inference failed without an error message")))
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FailingProvider {
+        calls: AtomicUsize,
+        exhausted: bool,
+    }
+
+    #[async_trait]
+    impl InferenceProvider for FailingProvider {
+        fn provider_name(&self) -> String {
+            "scripted".into()
+        }
+        fn model_name(&self) -> String {
+            "scripted".into()
+        }
+        async fn generate_sir(
+            &self,
+            _: &str,
+            _: &SirContext,
+        ) -> std::result::Result<SirAnnotation, InferError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(if self.exhausted {
+                InferError::ParseValidationExhausted("invalid JSON after provider retries".into())
+            } else {
+                InferError::InvalidResponse("temporary empty response".into())
+            })
+        }
+        async fn generate_sir_from_prompt(
+            &self,
+            prompt: &str,
+            context: &SirContext,
+            _: bool,
+        ) -> std::result::Result<SirAnnotation, InferError> {
+            self.generate_sir(prompt, context).await
+        }
+    }
+
+    fn context() -> SirContext {
+        SirContext {
+            language: "rust".into(),
+            file_path: "lib.rs".into(),
+            qualified_name: "target".into(),
+            priority_score: None,
+            kind: "function".into(),
+            is_public: true,
+            line_count: 1,
+        }
+    }
+
+    #[test]
+    fn provider_validation_budget_is_not_multiplied_by_pipeline_retries() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        for exhausted in [true, false] {
+            for custom in [false, true] {
+                let provider = Arc::new(FailingProvider {
+                    calls: AtomicUsize::new(0),
+                    exhausted,
+                });
+                let error = runtime
+                    .block_on(async {
+                        if custom {
+                            generate_sir_from_prompt_with_retries(
+                                provider.clone(),
+                                "prompt".into(),
+                                context(),
+                                true,
+                                1,
+                            )
+                            .await
+                        } else {
+                            generate_sir_with_retries(
+                                provider.clone(),
+                                "source".into(),
+                                context(),
+                                1,
+                            )
+                            .await
+                        }
+                    })
+                    .expect_err("scripted failure");
+                assert_eq!(
+                    provider.calls.load(Ordering::SeqCst),
+                    if exhausted {
+                        1
+                    } else {
+                        INFERENCE_MAX_RETRIES + 1
+                    }
+                );
+                // Preserve the typed cause so tiered fallback still recognizes it.
+                assert_eq!(is_parse_validation_exhausted_error(&error), exhausted);
+            }
+        }
+    }
 }
