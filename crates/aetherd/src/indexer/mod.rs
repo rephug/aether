@@ -32,7 +32,8 @@ use crate::batch::hash::compute_prompt_hash;
 use crate::batch::write_fingerprint_row;
 use crate::continuous::cosine_distance_from_embeddings;
 use crate::observer::{
-    DebounceQueue, ObserverState, SeededHead, is_ignored_path, relative_workspace_path,
+    DebounceQueue, ObserverState, SeededHead, is_ignored_path, is_ignored_workspace_path,
+    relative_workspace_path,
 };
 use crate::priority_queue::{compute_priority_score, kind_priority_score, size_inverse_score};
 use crate::sir_pipeline::{
@@ -573,7 +574,7 @@ pub fn run_indexing_loop(config: IndexerConfig) -> Result<()> {
         .build()
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
-        .filter(|entry| !is_ignored_path(entry.path()))
+        .filter(|entry| !is_ignored_workspace_path(&config.workspace, entry.path()))
     {
         watcher
             .watch(entry.path(), RecursiveMode::NonRecursive)

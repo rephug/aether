@@ -79,24 +79,38 @@ pub(super) fn handle_watch_result(
 pub(super) fn classify_watch_event(
     workspace: &Path,
     git_watch_dir: Option<&Path>,
-    event: Event,
+    mut event: Event,
 ) -> ClassifiedWatchEvent {
     let mut classified = ClassifiedWatchEvent::default();
+    // Backend overflow can arrive without paths. Reconcile the root so both new
+    // files and prior tracked descendants (including deletions) are processed.
+    if event.need_rescan() {
+        event.paths.push(workspace.to_path_buf());
+    }
     for path in event.paths {
         if git_watch_dir.is_some_and(|git_dir| path.starts_with(git_dir)) {
             classified.git_event = true;
             continue;
         }
 
+        // Files are filtered together after debounce; only directories need an
+        // immediate check before registering watches or walking their contents.
+        if path.is_dir() && !visibility::is_visible(workspace, &path) {
+            continue;
+        }
+
         if path.is_dir() {
-            if !is_ignored_path(&path) {
+            if !is_ignored_workspace_path(workspace, &path) {
                 // A rename into this workspace emits a directory event, without
                 // create events for the files already below it. Watch every nested
                 // directory and index its existing sources before waiting for edits.
                 classified.source_paths.push(path.clone());
                 for entry in WalkBuilder::new(&path)
                     .standard_filters(true)
-                    .filter_entry(|entry| !is_ignored_path(entry.path()))
+                    .filter_entry({
+                        let root = workspace.to_path_buf();
+                        move |entry| !is_ignored_workspace_path(&root, entry.path())
+                    })
                     .build()
                 {
                     match entry {
@@ -118,7 +132,7 @@ pub(super) fn classify_watch_event(
             continue;
         }
 
-        if is_ignored_path(&path) {
+        if is_ignored_workspace_path(workspace, &path) {
             continue;
         }
         if let Ok(relative) = path.strip_prefix(workspace)
@@ -241,6 +255,8 @@ pub(super) fn process_reindex_paths(
     paths: Vec<PathBuf>,
 ) -> Result<()> {
     let paths = expand_directory_event_paths(config, observer, store, paths);
+    let paths = visibility::retain_visible_paths(&config.workspace, paths)
+        .context("failed to evaluate source visibility")?;
     refresh_paths(config, structural, &paths);
     let mut first_error = None;
     for path in &paths {
@@ -276,6 +292,13 @@ pub(super) fn process_debounced_paths(
     paths: Vec<PathBuf>,
 ) {
     let paths = expand_directory_event_paths(config, observer, store, paths);
+    let paths = match visibility::retain_visible_paths(&config.workspace, paths) {
+        Ok(paths) => paths,
+        Err(error) => {
+            tracing::error!(error = %error, "could not evaluate watcher source visibility; retaining prior index");
+            return;
+        }
+    };
     refresh_paths(config, structural, &paths);
     for path in &paths {
         if let Err(err) =
@@ -771,7 +794,9 @@ pub(super) fn collect_full_reindex_paths(
         {
             continue;
         }
-        if is_ignored_path(entry.path()) || language_for_path(entry.path()).is_none() {
+        if is_ignored_workspace_path(workspace, entry.path())
+            || language_for_path(entry.path()).is_none()
+        {
             continue;
         }
         paths.insert(entry.path().to_path_buf());
@@ -783,3 +808,5 @@ pub(super) fn collect_full_reindex_paths(
 mod directory_tests;
 #[cfg(test)]
 mod tests;
+
+mod visibility;

@@ -1311,3 +1311,58 @@ fn an_unwatched_edit_in_an_index_of_symbol_free_files_alone_reads_as_modified() 
     );
     assert_eq!(freshness.changed_file_samples, ["M src/main.ts"]);
 }
+
+#[test]
+fn rescan_without_paths_reconciles_workspace_below_ignored_parent() {
+    use notify::event::Flag;
+    let temp = tempdir().expect("temp");
+    let workspace = temp.path().join("build").join("project");
+    fs::create_dir_all(workspace.join("src")).expect("dirs");
+    let file = workspace.join("src/lib.rs");
+    fs::write(&file, "pub fn current() {}").expect("source");
+    let mut observer = ObserverState::new(workspace.clone()).expect("observer");
+    observer.seed_from_disk().expect("seed");
+    assert!(observer.symbols_of(&file).is_some());
+    fs::write(&file, "pub fn updated() {}").expect("edit");
+    assert!(observer.process_path(&file).expect("process").is_some());
+    let (paths, complete) = collect_full_reindex_paths(&workspace, &observer);
+    assert!(complete);
+    assert!(paths.contains(&file));
+    let event = Event::new(notify::EventKind::Other).set_flag(Flag::Rescan);
+    let classified = classify_watch_event(&workspace, None, event);
+    assert!(classified.source_paths.contains(&workspace));
+    assert!(classified.source_paths.contains(&file));
+    assert!(classified.watch_dirs.contains(&workspace.join("src")));
+    fs::remove_file(&file).expect("delete source during overflow");
+    let expanded = expand_known_descendants(classified.source_paths, observer.tracked_paths());
+    assert!(
+        expanded.contains(&file),
+        "overflow must also reconcile deleted files"
+    );
+    assert!(is_ignored_workspace_path(
+        &workspace,
+        &workspace.join("target/lib.rs")
+    ));
+}
+
+#[test]
+fn watcher_does_not_index_or_watch_gitignored_generated_sources() {
+    let temp = tempdir().expect("temp");
+    let root = temp.path();
+    fs::create_dir_all(root.join(".git")).expect("git");
+    fs::create_dir_all(root.join("generated")).expect("dir");
+    fs::write(root.join(".gitignore"), "generated/\ncompiled.js\n").expect("ignore");
+    fs::write(root.join("generated/lib.js"), "function generated() {}").expect("generated");
+    fs::write(root.join("compiled.js"), "function compiled() {}").expect("compiled");
+    fs::write(root.join("real.js"), "function real() {}").expect("real");
+    let event = Event::new(notify::EventKind::Any)
+        .add_path(root.join("generated"))
+        .add_path(root.join("compiled.js"))
+        .add_path(root.join("real.js"));
+    let classified = classify_watch_event(root, None, event);
+    assert_eq!(
+        visibility::retain_visible_paths(root, classified.source_paths).expect("visibility"),
+        vec![root.join("real.js")]
+    );
+    assert!(classified.watch_dirs.is_empty());
+}
