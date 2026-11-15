@@ -7,7 +7,10 @@ use aether_store::{SqliteStore, SymbolCatalogStore, SymbolRecord};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::{AetherMcpServer, MEMORY_SCHEMA_VERSION, child_method_symbols, symbol_leaf_name};
+use super::{
+    AetherIncomingCompleteness, AetherMcpServer, GRAPH_OBSERVATION_SCHEMA_VERSION,
+    child_method_symbols, symbol_leaf_name,
+};
 use crate::AetherMcpError;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -22,6 +25,8 @@ pub struct AetherSuggestTraitSplitResponse {
     pub resolved_via: AetherTraitSplitResolvedVia,
     pub suggestion: Option<AetherTraitSplitSuggestion>,
     pub message: Option<String>,
+    #[serde(default)]
+    pub incoming_completeness: AetherIncomingCompleteness,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
@@ -55,7 +60,9 @@ pub struct AetherTraitSplitSuggestion {
     pub method_count: usize,
     pub suggested_traits: Vec<AetherSuggestedSubTrait>,
     pub cross_cutting_methods: Vec<AetherCrossCuttingMethod>,
-    pub uncalled_methods: Vec<String>,
+    /// No attributed consumer in the observed graph, not an unused-code verdict.
+    #[serde(alias = "uncalled_methods")]
+    pub methods_without_attributed_callers: Vec<String>,
     pub confidence: AetherSplitConfidence,
 }
 
@@ -64,6 +71,7 @@ pub struct AetherSuggestedSubTrait {
     pub name: String,
     pub methods: Vec<String>,
     pub consumer_files: Vec<String>,
+    /// Isolation within attributed observations; incoming completeness is unknown.
     pub consumer_isolation: f32,
     pub dominant_dependencies: Vec<String>,
     pub reason: String,
@@ -145,10 +153,11 @@ impl AetherMcpServer {
         };
 
         Ok(AetherSuggestTraitSplitResponse {
-            schema_version: MEMORY_SCHEMA_VERSION.to_owned(),
+            schema_version: GRAPH_OBSERVATION_SCHEMA_VERSION.to_owned(),
             resolved_via,
             suggestion: suggestion.map(Into::into),
             message,
+            incoming_completeness: AetherIncomingCompleteness::Unknown,
         })
     }
 
@@ -230,7 +239,7 @@ impl From<TraitSplitSuggestion> for AetherTraitSplitSuggestion {
                 .into_iter()
                 .map(Into::into)
                 .collect(),
-            uncalled_methods: value.uncalled_methods,
+            methods_without_attributed_callers: value.methods_without_attributed_callers,
             confidence: value.confidence.into(),
         }
     }

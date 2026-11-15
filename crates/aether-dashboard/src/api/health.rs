@@ -6,7 +6,7 @@ use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use aether_analysis::{HealthAnalyzer, HealthInclude, HealthRequest};
+use aether_analysis::{HealthAnalyzer, HealthInclude, HealthRequest, ObservedGraphCoverage};
 use aether_config::GraphBackend;
 
 use crate::state::SharedState;
@@ -25,7 +25,7 @@ pub(crate) struct HealthQuery {
 pub(crate) struct HealthDimensions {
     pub sir_coverage: f64,
     pub test_coverage: f64,
-    pub graph_connectivity: f64,
+    pub graph_connectivity: Option<f64>,
     pub coupling_health: f64,
     pub drift_health: f64,
 }
@@ -56,6 +56,7 @@ pub(crate) struct HealthOrphan {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct HealthData {
+    pub graph_coverage: ObservedGraphCoverage,
     pub analysis_available: bool,
     pub overall_score: Option<f64>,
     pub notes: Vec<String>,
@@ -125,13 +126,14 @@ pub(crate) async fn load_health_data(shared: &SharedState, query: &HealthQuery) 
             min_risk,
         };
 
-        match shared.surreal_graph_store().await {
+        match shared.surreal_dependency_graph_store().await {
             Ok(graph) => match analyzer
                 .analyze_with_handles(&request, shared.store.as_ref(), Some(graph.as_ref()))
                 .await
             {
                 Ok(report) => {
-                    analysis_available = report.analysis.total_symbols > 0;
+                    analysis_available =
+                        report.analysis_available && report.analysis.total_symbols > 0;
                     for note in &report.notes {
                         push_note(&mut notes, note);
                     }
@@ -226,7 +228,7 @@ async fn health_data_with_dimensions(
     orphans: Vec<HealthOrphan>,
 ) -> HealthData {
     let (sir_coverage, test_coverage) = compute_sir_test_dimensions(shared, &mut notes);
-    let graph_connectivity = compute_graph_connectivity(shared, &mut notes).await;
+    let (graph_connectivity, graph_coverage) = compute_graph_connectivity(shared, &mut notes).await;
     let coupling_health = compute_coupling_health(shared, &mut notes).await;
     let drift_health = compute_drift_health(shared, &mut notes);
 
@@ -238,12 +240,7 @@ async fn health_data_with_dimensions(
         drift_health,
     };
 
-    let base_score = (dimensions.sir_coverage
-        + dimensions.test_coverage
-        + dimensions.graph_connectivity
-        + dimensions.coupling_health
-        + dimensions.drift_health)
-        / 5.0;
+    let base_score = composite_health_score(&dimensions);
     let overall_score = if analysis_available {
         Some(base_score.clamp(0.0, 1.0))
     } else {
@@ -251,6 +248,7 @@ async fn health_data_with_dimensions(
     };
 
     HealthData {
+        graph_coverage,
         analysis_available,
         overall_score,
         notes,
@@ -364,7 +362,11 @@ async fn compute_coupling_health(shared: &SharedState, notes: &mut Vec<String>) 
     }
 }
 
-async fn compute_graph_connectivity(shared: &SharedState, notes: &mut Vec<String>) -> f64 {
+async fn compute_graph_connectivity(
+    shared: &SharedState,
+    notes: &mut Vec<String>,
+) -> (Option<f64>, ObservedGraphCoverage) {
+    let coverage = ObservedGraphCoverage::from_store_async(shared.store.as_ref()).await;
     let symbols = match crate::api::common::load_symbols(shared) {
         Ok(symbols) => symbols,
         Err(err) => {
@@ -372,13 +374,12 @@ async fn compute_graph_connectivity(shared: &SharedState, notes: &mut Vec<String
                 notes,
                 format!("Failed to load symbols for graph connectivity: {err}"),
             );
-            return 0.0;
+            return (None, ObservedGraphCoverage::unavailable(err));
         }
     };
     if symbols.is_empty() {
-        return 0.0;
+        return (None, coverage);
     }
-
     let edges = match crate::api::common::load_dependency_algo_edges(shared) {
         Ok(edges) => edges,
         Err(err) => {
@@ -386,13 +387,15 @@ async fn compute_graph_connectivity(shared: &SharedState, notes: &mut Vec<String
                 notes,
                 format!("Failed to load graph edges for connectivity: {err}"),
             );
-            return 0.0;
+            return (None, ObservedGraphCoverage::unavailable(err));
         }
     };
-
     let components = crate::api::common::connected_components_vec(shared, &edges).await;
     let largest_component = components.iter().map(Vec::len).max().unwrap_or(0);
-    (largest_component as f64 / symbols.len() as f64).clamp(0.0, 1.0)
+    (
+        Some((largest_component as f64 / symbols.len() as f64).clamp(0.0, 1.0)),
+        coverage,
+    )
 }
 
 fn compute_drift_health(shared: &SharedState, notes: &mut Vec<String>) -> f64 {
@@ -462,5 +465,35 @@ fn push_note(notes: &mut Vec<String>, note: impl Into<String>) {
     let note = note.into();
     if !notes.iter().any(|existing| existing == &note) {
         notes.push(note);
+    }
+}
+
+// Connectivity is descriptive: missing proofs cannot justify a health penalty.
+fn composite_health_score(dimensions: &HealthDimensions) -> f64 {
+    (dimensions.sir_coverage
+        + dimensions.test_coverage
+        + dimensions.coupling_health
+        + dimensions.drift_health)
+        / 4.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observed_disconnection_and_unavailable_graph_do_not_reduce_health_score() {
+        let mut dimensions = HealthDimensions {
+            sir_coverage: 1.0,
+            test_coverage: 1.0,
+            graph_connectivity: Some(0.01),
+            coupling_health: 1.0,
+            drift_health: 1.0,
+        };
+        assert_eq!(composite_health_score(&dimensions), 1.0);
+        dimensions.graph_connectivity = None;
+        assert_eq!(composite_health_score(&dimensions), 1.0);
+        dimensions.drift_health = 0.0;
+        assert_eq!(composite_health_score(&dimensions), 0.75);
     }
 }

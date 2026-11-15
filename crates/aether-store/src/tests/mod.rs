@@ -522,3 +522,33 @@ fn sqlite_store_implements_split_store_traits() {
 }
 
 mod legacy_retirement;
+
+mod rust_proof_upgrade;
+
+/// A historical v21/v22 catalog has no target columns or proof-policy triggers.
+/// Lowering only its version would leave current guards attached to `symbols`.
+fn restore_pre_provenance_edge_fixture(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS reject_legacy_rust_target_proof_insert;
+         DROP TRIGGER IF EXISTS reject_legacy_rust_target_proof_update;
+         DROP TRIGGER IF EXISTS reject_legacy_rust_source_insert;
+         DROP TRIGGER IF EXISTS reject_legacy_rust_source_update;
+         ALTER TABLE symbol_edges RENAME TO current_edge_fixture;
+         CREATE TABLE symbol_edges (
+             source_id TEXT NOT NULL,
+             target_qualified_name TEXT NOT NULL,
+             edge_kind TEXT NOT NULL CHECK (edge_kind IN ('calls', 'depends_on', 'type_ref', 'implements')),
+             file_path TEXT NOT NULL,
+             PRIMARY KEY (source_id, target_qualified_name, edge_kind)
+         );
+         INSERT OR IGNORE INTO symbol_edges (source_id, target_qualified_name, edge_kind, file_path)
+         SELECT source_id, target_qualified_name, edge_kind, file_path FROM current_edge_fixture;
+         DROP TABLE current_edge_fixture;
+         CREATE INDEX idx_edges_target ON symbol_edges(target_qualified_name);
+         CREATE INDEX idx_edges_file ON symbol_edges(file_path);
+         DELETE FROM schema_version WHERE component IN ('graph_target_provenance', 'rust_target_provenance');",
+    )?;
+    Ok(())
+}
+
+mod rust_proof_policy;

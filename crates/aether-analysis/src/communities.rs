@@ -8,6 +8,9 @@ pub use aether_core::is_test_symbol;
 use aether_store::{SqliteStore, SurrealGraphStore, SymbolRecord};
 
 use crate::coupling::AnalysisError;
+use crate::graph_coverage::{
+    graph_store_workspace, require_native_graph_projection, with_readonly_graph_store,
+};
 
 /// Ids of every indexed symbol that [`is_test_symbol`] classifies as test code.
 pub fn test_symbol_ids(store: &SqliteStore) -> Result<HashSet<String>, AnalysisError> {
@@ -26,7 +29,11 @@ pub async fn production_community_assignments(
     graph: &SurrealGraphStore,
     resolution: f64,
 ) -> Result<Vec<(String, i64)>, AnalysisError> {
-    let exclude = test_symbol_ids(store)?;
+    let exclude = with_readonly_graph_store(graph_store_workspace(store)?, |store| {
+        require_native_graph_projection(store)?;
+        test_symbol_ids(store)
+    })
+    .await?;
     Ok(graph
         .list_louvain_communities_filtered(resolution, &exclude)
         .await?)

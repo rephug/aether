@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::coupling::AnalysisError;
+use crate::graph_coverage::{OBSERVED_DISCONNECTION_NOTE, require_native_graph_projection};
 
 const DRIFT_SCHEMA_VERSION: &str = "1.0";
 const DRIFT_SUMMARY_SYSTEM_PROMPT: &str = "Summarize how this function's behavior changed given the before/after SIR fields. One sentence, developer audience.";
@@ -272,6 +273,9 @@ impl DriftAnalyzer {
         }
 
         let store = SqliteStore::open(&self.workspace)?;
+        if graph.is_some() {
+            require_native_graph_projection(&store)?;
+        }
         let previous_state = store.get_drift_analysis_state()?;
         let changed_symbols =
             self.collect_changed_symbols(&store, resolved_window.commits.as_slice())?;
@@ -506,6 +510,7 @@ impl DriftAnalyzer {
         _request: CommunitiesRequest,
     ) -> Result<CommunitiesResult, AnalysisError> {
         let store = SqliteStore::open_readonly(&self.workspace)?;
+        require_native_graph_projection(&store)?;
         let mut entries = block_on_store_future(graph.list_louvain_communities())??
             .into_iter()
             .map(|(symbol_id, community_id)| {
@@ -1168,8 +1173,7 @@ impl DriftAnalyzer {
                 let result_id = content_hash(
                     format!("orphaned\n{}\n{}", component.join(","), window.to_commit).as_str(),
                 );
-                let note =
-                    "No dependency edges to main component; orphaned code candidate".to_owned();
+                let note = OBSERVED_DISCONNECTION_NOTE.to_owned();
                 records.push(DriftResultRecord {
                     result_id,
                     symbol_id: component.first().cloned().unwrap_or_default(),
@@ -1784,11 +1788,9 @@ fn push_structural_entry(
                     .unwrap_or_default(),
                 total_symbols: symbols.len() as u32,
                 symbols,
-                note: detail
-                    .get("note")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
+                // Legacy notes asserted code was orphaned. Present the current
+                // observational meaning without rewriting stored records.
+                note: OBSERVED_DISCONNECTION_NOTE.to_owned(),
             });
         }
         _ => {}
@@ -1838,6 +1840,41 @@ mod tests {
         AcknowledgeDriftRequest, DriftAnalyzer, DriftInclude, DriftReportRequest,
         normalize_rename_path, now_millis, parse_window_spec,
     };
+
+    #[test]
+    fn legacy_orphan_records_are_presented_as_observed_disconnection() {
+        let mut anomalies = super::StructuralAnomalies::default();
+        super::push_structural_entry(
+            &mut anomalies,
+            DriftResultRecord {
+                result_id: "legacy-orphan".to_owned(),
+                symbol_id: "helper".to_owned(),
+                file_path: "src/lib.rs".to_owned(),
+                symbol_name: "helper".to_owned(),
+                drift_type: "orphaned".to_owned(),
+                drift_magnitude: None,
+                current_sir_hash: None,
+                baseline_sir_hash: None,
+                commit_range_start: None,
+                commit_range_end: None,
+                drift_summary: Some("orphaned code candidate".to_owned()),
+                detail_json: serde_json::json!({
+                    "symbols": ["helper"], "files": ["src/lib.rs"],
+                    "note": "No dependency edges to main component; orphaned code candidate",
+                })
+                .to_string(),
+                detected_at: 1,
+                is_acknowledged: true,
+            },
+        )
+        .expect("legacy entry");
+        let entry = &anomalies.orphaned_subgraphs[0];
+        assert_eq!(entry.result_id, "legacy-orphan");
+        assert_eq!(entry.symbols, ["helper"]);
+        assert_eq!(entry.files, ["src/lib.rs"]);
+        assert_eq!(entry.note, super::OBSERVED_DISCONNECTION_NOTE);
+        assert!(!entry.note.contains("orphaned code candidate"));
+    }
 
     #[test]
     fn parse_window_spec_supports_commits_days_and_since_commit() {

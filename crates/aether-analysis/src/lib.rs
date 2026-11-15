@@ -3,6 +3,7 @@ mod communities;
 mod coupling;
 mod drift;
 mod graph_algorithms;
+mod graph_coverage;
 mod health;
 mod refactor;
 mod sir_quality_signals;
@@ -30,6 +31,7 @@ pub use graph_algorithms::{
     GraphAlgorithmEdge, betweenness_centrality, bfs_shortest_path, connected_components,
     cross_community_edges, louvain_communities, page_rank, strongly_connected_components,
 };
+pub use graph_coverage::{ObservedGraphCoverage, ObservedGraphStatus};
 pub use health::*;
 pub use refactor::*;
 pub use sir_quality_signals::{

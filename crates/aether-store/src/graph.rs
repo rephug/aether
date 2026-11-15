@@ -580,11 +580,14 @@ impl SqliteStore {
             let mut stmt = tx.prepare(
                 r#"
                 INSERT INTO symbol_edges (
-                    source_id, target_qualified_name, edge_kind, file_path, target_symbol_id, target_file_path
+                    source_id, target_qualified_name, edge_kind, file_path, target_symbol_id, target_file_path,
+                    rust_proof_version, rust_proof_generation
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)
                 ON CONFLICT DO UPDATE SET
-                    file_path = excluded.file_path
+                    file_path = excluded.file_path,
+                    rust_proof_version = excluded.rust_proof_version,
+                    rust_proof_generation = symbol_edges.rust_proof_generation + 1
                 "#,
             )?;
 
@@ -596,6 +599,7 @@ impl SqliteStore {
                     edge.file_path,
                     edge.target_symbol_id,
                     edge.target_file_path,
+                    super::graph_resolution::RUST_TARGET_PROOF_VERSION,
                 ])?;
             }
         }
@@ -828,7 +832,9 @@ impl SqliteStore {
         Ok(records)
     }
     pub(crate) fn store_delete_edges_for_file(&self, file_path: &str) -> Result<(), StoreError> {
-        self.conn.lock().unwrap().execute(
+        let conn = self.lock_connection()?;
+        require_graph_provenance_schema(&conn)?;
+        conn.execute(
             "DELETE FROM symbol_edges WHERE file_path = ?1",
             params![file_path],
         )?;

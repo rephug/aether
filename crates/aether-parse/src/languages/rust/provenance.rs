@@ -233,9 +233,174 @@ fn shadowed(at: Node<'_>, wanted: &str, source: &[u8], type_name: bool) -> bool 
     false
 }
 
+fn use_tree_has_glob(node: Node<'_>) -> bool {
+    node.kind() == "use_wildcard" || children(node).into_iter().any(use_tree_has_glob)
+}
+
+fn attribute_node(item: Node<'_>) -> Option<Node<'_>> {
+    children(item)
+        .into_iter()
+        .find(|node| node.kind() == "attribute")
+}
+
+fn attribute_path(item: Node<'_>) -> Option<Node<'_>> {
+    children(attribute_node(item)?)
+        .into_iter()
+        .find(|node| !matches!(node.kind(), "line_comment" | "block_comment"))
+}
+
+fn attached_attributes(item: Node<'_>) -> Vec<Node<'_>> {
+    let mut attributes = Vec::new();
+    let mut previous = item.prev_named_sibling();
+    while let Some(node) = previous {
+        match node.kind() {
+            "line_comment" | "block_comment" => {}
+            "attribute_item" => attributes.push(node),
+            _ => break,
+        }
+        previous = node.prev_named_sibling();
+    }
+    attributes
+}
+
+/// Only these unqualified built-ins are known to gate or annotate a `use`
+/// without replacing it with arbitrary new declarations. In particular,
+/// `cfg_attr` may activate a procedural attribute, so it is not in this list.
+fn binding_preserving_use_attribute(item: Node<'_>, source: &[u8]) -> bool {
+    let Some(path) = attribute_path(item) else {
+        return false;
+    };
+    path.kind() == "identifier"
+        && matches!(
+            node_text(path, source).as_str(),
+            "cfg" | "allow" | "warn" | "deny" | "forbid" | "expect" | "doc"
+        )
+}
+
+fn binding_preserving_use_attributes(item: Node<'_>, source: &[u8]) -> bool {
+    let attributes = attached_attributes(item);
+    !attributes.is_empty()
+        && attributes
+            .into_iter()
+            .all(|attribute| binding_preserving_use_attribute(attribute, source))
+}
+
+fn binding_preserving_unsafe_attribute(item: Node<'_>, source: &[u8]) -> bool {
+    let Some(arguments) =
+        attribute_node(item).and_then(|attribute| attribute.child_by_field_name("arguments"))
+    else {
+        return false;
+    };
+    let mut cursor = arguments.walk();
+    let tokens = arguments
+        .children(&mut cursor)
+        .filter(|node| !matches!(node.kind(), "line_comment" | "block_comment"))
+        .collect::<Vec<_>>();
+    match tokens.as_slice() {
+        [open, name, close] => {
+            open.kind() == "("
+                && close.kind() == ")"
+                && name.kind() == "identifier"
+                && matches!(node_text(*name, source).as_str(), "no_mangle" | "naked")
+        }
+        [open, name, equals, value, close] => {
+            open.kind() == "("
+                && close.kind() == ")"
+                && equals.kind() == "="
+                && name.kind() == "identifier"
+                && matches!(
+                    node_text(*name, source).as_str(),
+                    "export_name" | "link_section"
+                )
+                && matches!(value.kind(), "string_literal" | "raw_string_literal")
+        }
+        _ => false,
+    }
+}
+
+/// These built-ins affect diagnostics, layout or code generation, not sibling
+/// Rust bindings. This classifier does not relax attributed caller/target rules.
+/// Derive names can be shadowed by custom macros; derive/path/cfg_attr/macro_use
+/// and every unrecognized/scoped/raw attribute therefore remain expanders.
+fn item_attribute_preserves_bindings(item: Node<'_>, source: &[u8]) -> bool {
+    if binding_preserving_use_attribute(item, source) {
+        return true;
+    }
+    let Some(path) = attribute_path(item) else {
+        return false;
+    };
+    if path.kind() != "identifier" {
+        return false;
+    }
+    match node_text(path, source).as_str() {
+        "inline"
+        | "cold"
+        | "must_use"
+        | "deprecated"
+        | "repr"
+        | "non_exhaustive"
+        | "track_caller"
+        | "target_feature"
+        | "instruction_set"
+        | "optimize"
+        | "no_mangle"
+        | "export_name"
+        | "link_section"
+        | "naked"
+        | "used"
+        | "automatically_derived" => true,
+        "unsafe" => binding_preserving_unsafe_attribute(item, source),
+        _ => false,
+    }
+}
+
+pub(super) fn scope_has_unmodelled_item_expansion(scope: Node<'_>, source: &[u8]) -> bool {
+    children(scope).into_iter().any(|item| {
+        !matches!(
+            item.kind(),
+            "attribute_item" | "inner_attribute_item" | "line_comment" | "block_comment"
+        ) && attached_attributes(item)
+            .into_iter()
+            .any(|attribute| !item_attribute_preserves_bindings(attribute, source))
+    })
+}
+
+/// In blocks, expansion can introduce a let that shadows even an explicit
+/// sibling function. Module items cannot do that in a valid Rust program:
+/// duplicating a known same-scope free binding is a compiler error. Preserve
+/// those direct module proofs; receiver dispatch separately accounts for hidden
+/// trait/impl expansion in module scopes as well as blocks.
+fn block_bindings_uncertain(scope: Node<'_>, source: &[u8]) -> bool {
+    scope.kind() == "block" && scope_has_unmodelled_item_expansion(scope, source)
+}
+
+/// Known gating/inert attributes make their imported names uncertain. Unknown
+/// attributes (including cfg_attr) can replace the use with arbitrary bindings,
+/// so every name in that scope becomes uncertain. Skipping either kind could
+/// fabricate a farther declaration; globs can likewise introduce any name.
+fn uncertain_import_binding(scope: Node<'_>, wanted: &str, source: &[u8]) -> bool {
+    children(scope).into_iter().any(|item| {
+        if item.kind() != "use_declaration" || !attributed(item) {
+            return false;
+        }
+        if !binding_preserving_use_attributes(item, source) || use_tree_has_glob(item) {
+            return true;
+        }
+        let mut bindings = HashMap::new();
+        if let Some(argument) = item.child_by_field_name("argument") {
+            collect_use_path_entries(argument, &[], source, &mut bindings);
+        }
+        bindings.contains_key(wanted)
+    })
+}
+
 fn visible_import(at: Node<'_>, wanted: &str, source: &[u8]) -> Option<Vec<String>> {
     for scope in lexical_scopes(at) {
-        if scope_macros(scope) || extern_binding(scope, wanted, source) {
+        if scope_macros(scope)
+            || block_bindings_uncertain(scope, source)
+            || extern_binding(scope, wanted, source)
+            || uncertain_import_binding(scope, wanted, source)
+        {
             return None;
         }
         let mut bindings = HashMap::new();
@@ -260,8 +425,7 @@ fn visible_import(at: Node<'_>, wanted: &str, source: &[u8]) -> Option<Vec<Strin
             .into_iter()
             .filter(|item| item.kind() == "use_declaration")
         {
-            let text = node_text(item, source);
-            has_glob |= text.contains('*');
+            has_glob |= use_tree_has_glob(item);
             if let Some(argument) = item.child_by_field_name("argument") {
                 collect_use_path_entries(argument, &[], source, &mut bindings);
             }
@@ -334,7 +498,11 @@ fn local_item<'tree>(
     }
     let first = remaining.first()?;
     for scope in visible {
-        if scope_macros(scope) || extern_binding(scope, first, source) {
+        if scope_macros(scope)
+            || block_bindings_uncertain(scope, source)
+            || extern_binding(scope, first, source)
+            || uncertain_import_binding(scope, first, source)
+        {
             return None;
         }
         let items = children(scope);
@@ -402,7 +570,7 @@ fn local_item<'tree>(
             .into_iter()
             .filter(|item| item.kind() == "use_declaration")
         {
-            glob |= node_text(item, source).contains('*');
+            glob |= use_tree_has_glob(item);
             if let Some(argument) = item.child_by_field_name("argument") {
                 collect_use_path_entries(argument, &[], source, &mut imports);
             }
@@ -438,15 +606,7 @@ fn local_item<'tree>(
 }
 
 fn has_attached_attribute(item: Node<'_>) -> bool {
-    let mut previous = item.prev_named_sibling();
-    while let Some(node) = previous {
-        match node.kind() {
-            "line_comment" | "block_comment" => previous = node.prev_named_sibling(),
-            "attribute_item" => return true,
-            _ => return false,
-        }
-    }
-    false
+    !attached_attributes(item).is_empty()
 }
 
 fn attributed(item: Node<'_>) -> bool {
@@ -485,10 +645,13 @@ fn descend<'tree>(
     source: &[u8],
     type_name: bool,
 ) -> Option<Node<'tree>> {
-    if scope_macros(scope) {
+    if scope_macros(scope) || block_bindings_uncertain(scope, source) {
         return None;
     }
     let first = path.first()?;
+    if uncertain_import_binding(scope, first, source) {
+        return None;
+    }
     let matches = children(scope)
         .into_iter()
         .filter(|item| name(*item, source).as_deref() == Some(first.as_str()))

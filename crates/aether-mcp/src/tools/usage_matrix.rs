@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use super::callers::CallerAttribution;
 use super::{
-    AetherMcpServer, MEMORY_SCHEMA_VERSION, child_method_symbols,
-    normalize_workspace_relative_path, symbol_leaf_name,
+    AetherCallerCoverage, AetherIncomingCompleteness, AetherMcpServer,
+    GRAPH_OBSERVATION_SCHEMA_VERSION, child_method_symbols, normalize_workspace_relative_path,
+    symbol_leaf_name,
 };
 use crate::AetherMcpError;
 
@@ -33,7 +34,13 @@ pub struct AetherUsageMatrixResponse {
     pub consumer_count: u32,
     pub matrix: Vec<ConsumerRow>,
     pub method_consumers: Vec<MethodConsumers>,
-    pub uncalled_methods: Vec<String>,
+    /// Methods with no attributed callers in this observed matrix; not unused methods.
+    #[serde(alias = "uncalled_methods")]
+    pub methods_without_attributed_callers: Vec<String>,
+    #[serde(default)]
+    pub incoming_completeness: AetherIncomingCompleteness,
+    #[serde(default)]
+    pub caller_coverage: AetherCallerCoverage,
     pub suggested_clusters: Vec<MethodCluster>,
 }
 
@@ -74,7 +81,8 @@ pub(crate) struct UsageMatrixData {
     pub(crate) child_methods: Vec<SymbolRecord>,
     pub(crate) matrix: Vec<ConsumerRow>,
     pub(crate) method_consumers: Vec<MethodConsumers>,
-    pub(crate) uncalled_methods: Vec<String>,
+    pub(crate) methods_without_attributed_callers: Vec<String>,
+    pub(crate) caller_coverage: AetherCallerCoverage,
     pub(crate) suggested_clusters: Vec<MethodCluster>,
 }
 
@@ -141,14 +149,16 @@ impl AetherMcpServer {
         let data = self.build_usage_matrix_data(store, &target_record)?;
 
         Ok(AetherUsageMatrixResponse {
-            schema_version: MEMORY_SCHEMA_VERSION.to_owned(),
+            schema_version: GRAPH_OBSERVATION_SCHEMA_VERSION.to_owned(),
             target: data.target,
             target_file: data.target_file,
             method_count: data.child_methods.len() as u32,
             consumer_count: data.matrix.len() as u32,
             matrix: data.matrix,
             method_consumers: data.method_consumers,
-            uncalled_methods: data.uncalled_methods,
+            methods_without_attributed_callers: data.methods_without_attributed_callers,
+            incoming_completeness: AetherIncomingCompleteness::Unknown,
+            caller_coverage: data.caller_coverage,
             suggested_clusters: data.suggested_clusters,
         })
     }
@@ -267,7 +277,7 @@ impl AetherMcpServer {
                 .then_with(|| left.method.cmp(&right.method))
         });
 
-        let mut uncalled_methods = child_methods
+        let mut methods_without_attributed_callers = child_methods
             .iter()
             .map(|method| symbol_leaf_name(method.qualified_name.as_str()).to_owned())
             .filter(|method_name| {
@@ -277,7 +287,7 @@ impl AetherMcpServer {
                     .unwrap_or(true)
             })
             .collect::<Vec<_>>();
-        uncalled_methods.sort();
+        methods_without_attributed_callers.sort();
 
         let mut clusters_by_consumers = HashMap::<Vec<String>, Vec<String>>::new();
         for (method_name, consumer_files) in &method_to_consumers {
@@ -301,7 +311,10 @@ impl AetherMcpServer {
                 methods.sort();
                 Some(MethodCluster {
                     cluster_name: derive_cluster_name(methods.as_slice()),
-                    reason: format!("Always co-consumed by: {}", shared_consumers.join(", ")),
+                    reason: format!(
+                        "Share observed attributed consumers: {}",
+                        shared_consumers.join(", ")
+                    ),
                     methods,
                     shared_consumers,
                 })
@@ -321,7 +334,8 @@ impl AetherMcpServer {
             child_methods,
             matrix,
             method_consumers,
-            uncalled_methods,
+            methods_without_attributed_callers,
+            caller_coverage: attribution.coverage().into(),
             suggested_clusters,
         })
     }

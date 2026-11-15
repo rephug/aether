@@ -334,7 +334,11 @@ fn schema22_upgrade_retains_unknown_cleanup_provenance_without_guessing() {
     let (store, temp) = cleanup_fixture(GraphBackend::Surreal, EmbeddingVectorBackend::Lancedb);
     let retirement_id = seed_retirement(&store, "legacy");
     let original = store.list_symbol_retirements("legacy").expect("archive");
-    store.conn.lock().expect("lock").execute_batch("DROP TABLE retirement_cleanup; PRAGMA user_version = 22; UPDATE schema_version SET version = 22 WHERE component = 'core';").expect("schema22 fixture");
+    {
+        let conn = store.conn.lock().expect("lock");
+        restore_pre_provenance_edge_fixture(&conn).expect("historical graph fixture");
+        conn.execute_batch("DROP TABLE retirement_cleanup; PRAGMA user_version = 22; UPDATE schema_version SET version = 22 WHERE component = 'core';").expect("schema22 fixture");
+    }
     drop(store);
     let store = SqliteStore::open(temp.path()).expect("upgrade");
     assert!(
@@ -383,7 +387,11 @@ fn schema22_upgrade_retains_unknown_cleanup_provenance_without_guessing() {
 #[test]
 fn read_only_schema22_reports_queue_unavailable_without_migrating() {
     let (store, temp) = cleanup_fixture(GraphBackend::Sqlite, EmbeddingVectorBackend::Sqlite);
-    store.conn.lock().expect("lock").execute_batch("DROP TABLE retirement_cleanup; PRAGMA user_version = 22; UPDATE schema_version SET version = 22 WHERE component = 'core';").expect("schema22 fixture");
+    {
+        let conn = store.conn.lock().expect("lock");
+        restore_pre_provenance_edge_fixture(&conn).expect("historical graph fixture");
+        conn.execute_batch("DROP TABLE retirement_cleanup; PRAGMA user_version = 22; UPDATE schema_version SET version = 22 WHERE component = 'core';").expect("schema22 fixture");
+    }
     drop(store);
     let store = SqliteStore::open_readonly(temp.path()).expect("read-only schema22");
     assert!(

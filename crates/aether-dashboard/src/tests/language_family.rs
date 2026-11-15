@@ -114,8 +114,8 @@ async fn orphan_count_ignores_calls_from_another_language() {
     let (_temp, state) = mixed_language_state().await;
     let app = dashboard_router(state);
 
-    // A Java call doesn't reach the TypeScript `Widget::render`, so it is an orphan
-    // along with `boot`.
+    // The unresolved Java call is not an observed link: its caller, the
+    // TypeScript `Widget::render`, and `boot` have no observed incident edges.
     let (status, json) = send_json(&app, "GET", "/api/v1/health-scorecard", None).await;
     assert_eq!(status, StatusCode::OK, "{json}");
     let orphans = json["data"]["metrics"]
@@ -124,5 +124,5 @@ async fn orphan_count_ignores_calls_from_another_language() {
         .iter()
         .find(|metric| metric["name"] == "orphan_count")
         .expect("orphan_count metric");
-    assert_eq!(orphans["value"].as_f64(), Some(2.0), "{json}");
+    assert_eq!(orphans["value"].as_f64(), Some(3.0), "{json}");
 }

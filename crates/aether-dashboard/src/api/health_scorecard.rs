@@ -6,6 +6,7 @@ use axum::response::IntoResponse;
 use serde::Serialize;
 use serde_json::Value;
 
+use aether_analysis::ObservedGraphCoverage;
 use aether_config::GraphBackend;
 
 use crate::state::SharedState;
@@ -23,6 +24,7 @@ struct ScorecardMetric {
 
 #[derive(Debug, Serialize)]
 struct HealthScorecardData {
+    graph_coverage: ObservedGraphCoverage,
     metrics: Vec<ScorecardMetric>,
     overall_status: String,
 }
@@ -100,18 +102,11 @@ async fn load_health_scorecard(shared: &SharedState) -> Result<HealthScorecardDa
     // orphan_count
     metrics.push(ScorecardMetric {
         name: "orphan_count".to_owned(),
-        label: "Orphan Symbols".to_owned(),
+        label: "Symbols without observed links".to_owned(),
         value: orphan_count as f64,
         unit: "count".to_owned(),
-        status: if orphan_count < 5 {
-            "good"
-        } else if orphan_count < 20 {
-            "warn"
-        } else {
-            "critical"
-        }
-        .to_owned(),
-        trend: super::common::sparkline_placeholder((orphan_count as f64 / 50.0).min(1.0), 8),
+        status: "unknown".to_owned(),
+        trend: Vec::new(),
     });
 
     // avg_drift_score
@@ -132,21 +127,14 @@ async fn load_health_scorecard(shared: &SharedState) -> Result<HealthScorecardDa
     });
 
     // graph_connectivity
-    let graph_connectivity = compute_graph_connectivity(shared).await;
+    let graph_connectivity = compute_graph_connectivity(shared).await?;
     metrics.push(ScorecardMetric {
         name: "graph_connectivity".to_owned(),
-        label: "Graph Connectivity".to_owned(),
+        label: "Observed graph connectivity".to_owned(),
         value: graph_connectivity,
         unit: "ratio".to_owned(),
-        status: if graph_connectivity > 0.9 {
-            "good"
-        } else if graph_connectivity > 0.7 {
-            "warn"
-        } else {
-            "critical"
-        }
-        .to_owned(),
-        trend: super::common::sparkline_placeholder(graph_connectivity, 8),
+        status: "unknown".to_owned(),
+        trend: Vec::new(),
     });
 
     // high_coupling_pairs (> 0.7)
@@ -198,6 +186,7 @@ async fn load_health_scorecard(shared: &SharedState) -> Result<HealthScorecardDa
     .to_owned();
 
     Ok(HealthScorecardData {
+        graph_coverage: ObservedGraphCoverage::from_store_async(shared.store.as_ref()).await,
         metrics,
         overall_status,
     })
@@ -227,20 +216,17 @@ fn load_sqlite_metrics(shared: &SharedState) -> Result<(i64, i64, f64, i64, f64)
         Err(_) => 0.0,
     };
 
-    // Keep the existing outgoing-reference definition, but count an incoming
-    // reference only when the canonical graph proves that exact target identity.
-    let incoming_targets = shared
+    // Count only observed graph links; unresolved raw spellings are not links.
+    let incident_symbols = shared
         .store
         .list_graph_dependency_edges()
         .map_err(|err| err.to_string())?
         .into_iter()
-        .map(|edge| edge.target_symbol_id)
+        .flat_map(|edge| [edge.source_symbol_id, edge.target_symbol_id])
         .collect::<HashSet<_>>();
     let orphan_count = {
         let mut stmt = conn
-            .prepare(
-                "SELECT s.id FROM symbols s WHERE NOT EXISTS (SELECT 1 FROM symbol_edges e WHERE e.source_id = s.id)",
-            )
+            .prepare("SELECT id FROM symbols")
             .map_err(|err| err.to_string())?;
         let rows = stmt
             .query_map([], |row| row.get::<_, String>(0))
@@ -248,7 +234,7 @@ fn load_sqlite_metrics(shared: &SharedState) -> Result<(i64, i64, f64, i64, f64)
         let mut count = 0i64;
         for row in rows {
             let id = row.map_err(|err| err.to_string())?;
-            if !incoming_targets.contains(&id) {
+            if !incident_symbols.contains(&id) {
                 count += 1;
             }
         }
@@ -271,23 +257,16 @@ fn load_sqlite_metrics(shared: &SharedState) -> Result<(i64, i64, f64, i64, f64)
     ))
 }
 
-async fn compute_graph_connectivity(shared: &SharedState) -> f64 {
-    let symbols = match super::common::load_symbols(shared) {
-        Ok(symbols) => symbols,
-        Err(_) => return 0.0,
-    };
+async fn compute_graph_connectivity(shared: &SharedState) -> Result<f64, String> {
+    let symbols = super::common::load_symbols(shared)?;
     if symbols.is_empty() {
-        return 0.0;
+        return Ok(0.0);
     }
-
-    let edges = match super::common::load_dependency_algo_edges(shared) {
-        Ok(edges) => edges,
-        Err(_) => return 0.0,
-    };
+    let edges = super::common::load_dependency_algo_edges(shared)?;
 
     let components = super::common::connected_components_vec(shared, &edges).await;
     let largest_component = components.iter().map(Vec::len).max().unwrap_or(0);
-    (largest_component as f64 / symbols.len() as f64).clamp(0.0, 1.0)
+    Ok((largest_component as f64 / symbols.len() as f64).clamp(0.0, 1.0))
 }
 
 async fn count_high_coupling_pairs(shared: &SharedState) -> i64 {

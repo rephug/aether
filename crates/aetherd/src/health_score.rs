@@ -360,6 +360,10 @@ fn render_health_report_json(
         ),
     );
     object.insert(
+        "trait_split_suggestions_schema_version".to_owned(),
+        serde_json::json!(2),
+    );
+    object.insert(
         "trait_split_suggestions".to_owned(),
         serde_json::Value::Array(
             trait_entries
@@ -400,6 +404,13 @@ fn split_entry_to_json_value(entry: &SplitSuggestionEntry) -> serde_json::Value 
     if let Some(diagnostics) = entry.diagnostics.as_ref()
         && let Ok(value) = serde_json::to_value(diagnostics)
     {
+        let mut value = value;
+        if let Some(observed) = value.as_object_mut() {
+            observed.insert(
+                "evidence_scope".to_owned(),
+                serde_json::json!("observed_clustering"),
+            );
+        }
         object.insert("diagnostics".to_owned(), value);
     }
     serde_json::Value::Object(object)
@@ -1216,7 +1227,10 @@ fn render_split_suggestions(entries: &[SplitSuggestionEntry]) -> Option<String> 
         return None;
     }
 
-    let mut lines = vec!["Split suggestions:".to_owned()];
+    let mut lines = vec![
+        "Split suggestions:".to_owned(),
+        "  Basis: observed clustering; incoming caller completeness is unknown.".to_owned(),
+    ];
     for entry in entries {
         lines.push(format!("{} - {}/100", entry.crate_name, entry.crate_score));
         lines.push(format!("  status: {}", entry.status));
@@ -1225,9 +1239,17 @@ fn render_split_suggestions(entries: &[SplitSuggestionEntry]) -> Option<String> 
         }
         if let Some(suggestion) = &entry.suggestion {
             lines.push(format!("  target_file: {}", suggestion.target_file));
+            lines.push(format!(
+                "  recommendation_confidence: {}",
+                match suggestion.confidence {
+                    aether_health::SplitConfidence::High => "high",
+                    aether_health::SplitConfidence::Medium => "medium",
+                    aether_health::SplitConfidence::Low => "low",
+                }
+            ));
             if let Some(diagnostics) = &entry.diagnostics {
                 lines.push(format!(
-                    "  confidence: {} ({:.2})",
+                    "  observed_clustering_confidence: {} ({:.2})",
                     diagnostics.confidence_label, diagnostics.confidence
                 ));
                 lines.push(format!("  stability: {:.2}", diagnostics.stability_score));
@@ -1263,7 +1285,11 @@ fn render_trait_split_suggestions(entries: &[TraitSplitSuggestionEntry]) -> Opti
         return None;
     }
 
-    let mut lines = vec!["Trait split suggestions:".to_owned()];
+    let mut lines = vec![
+        "Trait split suggestions:".to_owned(),
+        "  Basis: attributed graph observations; incoming caller completeness is unknown."
+            .to_owned(),
+    ];
     for entry in entries {
         if let Some(suggestion) = entry.suggestion.as_ref() {
             lines.push(format!(
@@ -1275,7 +1301,7 @@ fn render_trait_split_suggestions(entries: &[TraitSplitSuggestionEntry]) -> Opti
             ));
             for sub_trait in &suggestion.suggested_traits {
                 lines.push(format!(
-                    "    {} ({} methods, {:.0}% isolation): {}",
+                    "    {} ({} methods, {:.0}% observed isolation): {}",
                     sub_trait.name,
                     sub_trait.methods.len(),
                     sub_trait.consumer_isolation * 100.0,
@@ -1289,10 +1315,10 @@ fn render_trait_split_suggestions(entries: &[TraitSplitSuggestionEntry]) -> Opti
                     cross_cutting.overlapping_clusters.len()
                 ));
             }
-            if !suggestion.uncalled_methods.is_empty() {
+            if !suggestion.methods_without_attributed_callers.is_empty() {
                 lines.push(format!(
-                    "    Uncalled: {}",
-                    suggestion.uncalled_methods.join(", ")
+                    "    No attributed callers found: {}",
+                    suggestion.methods_without_attributed_callers.join(", ")
                 ));
             }
         } else {
@@ -1338,9 +1364,12 @@ fn append_planner_diagnostics(lines: &mut Vec<String>, diagnostics: &PlannerDiag
         "    embedding_coverage_pct: {:.2}",
         diagnostics.embedding_coverage_pct
     ));
-    lines.push(format!("    confidence: {:.2}", diagnostics.confidence));
     lines.push(format!(
-        "    confidence_label: {}",
+        "    observed_clustering_confidence: {:.2}",
+        diagnostics.confidence
+    ));
+    lines.push(format!(
+        "    observed_clustering_confidence_label: {}",
         diagnostics.confidence_label
     ));
     lines.push(format!(
@@ -2598,6 +2627,12 @@ model = "qwen3-embeddings-4B"
         assert!(
             execution
                 .rendered
+                .contains("incoming caller completeness is unknown")
+        );
+        assert!(!execution.rendered.contains("    Uncalled:"));
+        assert!(
+            execution
+                .rendered
                 .contains("Store (crates/example/src/lib.rs) - 4 methods -> 2 clusters")
         );
         assert!(execution.rendered.contains("alpha, beta"));
@@ -2617,11 +2652,23 @@ model = "qwen3-embeddings-4B"
 
         let rendered: serde_json::Value =
             serde_json::from_str(&execution.rendered).expect("json output");
+        assert_eq!(rendered["trait_split_suggestions_schema_version"], 2);
         let trait_entries = rendered
             .get("trait_split_suggestions")
             .and_then(serde_json::Value::as_array)
             .expect("trait split suggestions array");
         assert!(!trait_entries.is_empty());
+        assert!(
+            trait_entries[0]["suggestion"]
+                .get("uncalled_methods")
+                .is_none()
+        );
+        assert!(
+            trait_entries[0]["suggestion"]
+                .get("methods_without_attributed_callers")
+                .is_some()
+        );
+        assert_eq!(trait_entries[0]["suggestion"]["confidence"], "low");
         assert_eq!(
             trait_entries[0]
                 .get("suggestion")

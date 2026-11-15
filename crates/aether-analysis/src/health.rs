@@ -14,6 +14,9 @@ use crate::graph_algorithms::{
     GraphAlgorithmEdge, betweenness_centrality, connected_components, louvain_communities,
     page_rank, strongly_connected_components,
 };
+use crate::graph_coverage::{
+    OBSERVED_DISCONNECTION_NOTE, ObservedGraphCoverage, require_native_graph_projection_async,
+};
 
 const HEALTH_SCHEMA_VERSION: &str = "1.0";
 const DEFAULT_LIMIT: u32 = 10;
@@ -68,6 +71,8 @@ pub struct HealthReport {
     pub analysis_available: bool,
     #[serde(default)]
     pub unavailable_reason: Option<HealthUnavailableReason>,
+    #[serde(default)]
+    pub graph_coverage: ObservedGraphCoverage,
     pub schema_version: String,
     pub analysis: HealthAnalysisSummary,
     pub critical_symbols: Vec<SymbolHealthEntry>,
@@ -372,6 +377,15 @@ impl HealthAnalyzer {
             });
         }
 
+        if let Some(note) = graph_policy_unavailable_note(store).await {
+            notes.push(note);
+            return Ok(FileCentralityReport {
+                workspace_max_pagerank: 0.0,
+                files: Vec::new(),
+                notes,
+            });
+        }
+
         let dependency_edges = match query_dependency_edges(graph).await {
             Ok(edges) => edges,
             Err(err) => {
@@ -398,6 +412,9 @@ impl HealthAnalyzer {
                 });
             }
         };
+
+        let graph_coverage = ObservedGraphCoverage::from_store_async(store).await;
+        notes.push(graph_coverage.note.clone());
 
         let algo_edges = dependency_edges.clone();
         let pagerank_scores = tokio::task::spawn_blocking(move || page_rank(&algo_edges, 0.85, 25))
@@ -559,6 +576,15 @@ impl HealthAnalyzer {
             ));
         };
 
+        if let Some(note) = graph_policy_unavailable_note(store).await {
+            notes.push(note);
+            return Ok(empty_report(
+                HealthUnavailableReason::GraphUnavailable,
+                analyzed_at,
+                notes,
+            ));
+        }
+
         let dependency_edges = match query_dependency_edges(graph).await {
             Ok(edges) => edges,
             Err(err) => {
@@ -600,6 +626,8 @@ impl HealthAnalyzer {
         if dependency_edges.is_empty() {
             notes.push("No dependency edges found in SurrealDB".to_owned());
         }
+
+        let graph_coverage = ObservedGraphCoverage::from_store_async(store).await;
 
         let algo_edges = dependency_edges.clone();
         let (pagerank_scores, betweenness_scores, scc, cc, communities) =
@@ -864,8 +892,7 @@ impl HealthAnalyzer {
                 OrphanEntry {
                     subgraph_id: (idx + 1) as u32,
                     symbols,
-                    note: "No dependency edges to main component; orphaned code candidate"
-                        .to_owned(),
+                    note: OBSERVED_DISCONNECTION_NOTE.to_owned(),
                 }
             })
             .collect::<Vec<_>>();
@@ -888,7 +915,7 @@ impl HealthAnalyzer {
                 betweenness: row.betweenness,
                 pagerank: row.pagerank,
                 note: format!(
-                    "{:.0}% of shortest dependency paths pass through this symbol",
+                    "{:.0}% of observed shortest dependency paths pass through this symbol",
                     row.betweenness * 100.0
                 ),
             })
@@ -998,6 +1025,7 @@ impl HealthAnalyzer {
         Ok(HealthReport {
             analysis_available: true,
             unavailable_reason: None,
+            graph_coverage,
             schema_version: HEALTH_SCHEMA_VERSION.to_owned(),
             analysis,
             critical_symbols,
@@ -1008,6 +1036,14 @@ impl HealthAnalyzer {
             notes,
         })
     }
+}
+
+// A handle opened before a proof-policy change must not expose its cached edges.
+async fn graph_policy_unavailable_note(store: &SqliteStore) -> Option<String> {
+    require_native_graph_projection_async(store)
+        .await
+        .err()
+        .map(|err| format!("Graph target-proof projection unavailable: {err}"))
 }
 
 fn default_health_limit() -> u32 {
@@ -1046,6 +1082,10 @@ fn empty_report(
     HealthReport {
         analysis_available: false,
         unavailable_reason: Some(reason),
+        graph_coverage: ObservedGraphCoverage::unavailable(format!(
+            "{reason:?}: {}",
+            notes.join("; ")
+        )),
         schema_version: HEALTH_SCHEMA_VERSION.to_owned(),
         analysis: HealthAnalysisSummary {
             total_symbols: 0,
@@ -1254,6 +1294,10 @@ mod tests {
             vec!["graph locked".to_owned()],
         );
         assert!(!report.analysis_available);
+        assert_eq!(
+            report.graph_coverage.status,
+            crate::ObservedGraphStatus::Unavailable
+        );
         assert_eq!(report.analysis.total_symbols, 0);
         assert_eq!(report.notes, vec!["graph locked"]);
     }
@@ -1534,6 +1578,57 @@ vector_backend = "sqlite"
         assert!(report.bottlenecks.is_empty());
         assert!(report.orphans.is_empty());
         assert!(report.risk_hotspots.is_empty());
+    }
+
+    #[test]
+    fn observed_disconnected_components_do_not_establish_dead_code_and_keep_cycles() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_test_config(workspace);
+        let store = SqliteStore::open(workspace).expect("store");
+        let symbols = vec![
+            symbol("a", "a", "src/a.rs"),
+            symbol("b", "b", "src/b.rs"),
+            symbol("c", "c", "src/c.rs"),
+            symbol("d", "d", "src/d.rs"),
+            symbol("e", "e", "src/e.rs"),
+        ];
+        for entry in &symbols {
+            store.upsert_symbol(entry.clone()).expect("symbol");
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(seed_surreal_graph(
+            workspace,
+            &symbols,
+            &[("a", "b"), ("b", "c"), ("c", "a"), ("d", "e")],
+        ));
+        let analyzer = HealthAnalyzer::new(workspace).expect("analyzer");
+        let report = runtime
+            .block_on(analyzer.analyze(&HealthRequest::default()))
+            .expect("report");
+        assert!(report.analysis_available);
+        assert_eq!(report.cycles.len(), 1);
+        assert_eq!(report.cycles[0].symbols.len(), 3);
+        assert_eq!(report.orphans.len(), 1);
+        assert_eq!(report.orphans[0].symbols.len(), 2);
+        assert!(
+            report.orphans[0]
+                .note
+                .contains("observed dependency component")
+        );
+        assert!(
+            report.orphans[0]
+                .note
+                .contains("does not establish unused or dead code")
+        );
+        assert_eq!(report.graph_coverage.whole_program_completeness, "unknown");
+        assert_eq!(
+            report.graph_coverage.status,
+            crate::ObservedGraphStatus::Unknown
+        );
     }
 
     #[test]

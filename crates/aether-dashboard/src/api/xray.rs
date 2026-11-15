@@ -1,6 +1,8 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+use aether_analysis::ObservedGraphCoverage;
+
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
@@ -50,6 +52,7 @@ pub(crate) struct XrayHotspot {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct XrayData {
+    pub graph_coverage: ObservedGraphCoverage,
     pub metrics: XrayMetrics,
     pub hotspots: Vec<XrayHotspot>,
 }
@@ -82,9 +85,11 @@ pub(crate) async fn load_xray_data(
 ) -> Result<XrayData, String> {
     let _cutoff = common::cutoff_millis_for_days(common::parse_window_days(window));
 
+    let graph_coverage = ObservedGraphCoverage::from_store_async(shared.store.as_ref()).await;
     let symbols = common::load_symbols(shared)?;
     if symbols.is_empty() {
         return Ok(XrayData {
+            graph_coverage,
             metrics: XrayMetrics {
                 sir_coverage: metric_unavailable(),
                 orphan_count: metric_unavailable(),
@@ -255,7 +260,11 @@ pub(crate) async fn load_xray_data(
         },
     };
 
-    Ok(XrayData { metrics, hotspots })
+    Ok(XrayData {
+        graph_coverage,
+        metrics,
+        hotspots,
+    })
 }
 
 fn metric_num(value: f64, available: bool) -> XrayMetric {

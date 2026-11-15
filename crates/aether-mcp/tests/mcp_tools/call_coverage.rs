@@ -27,7 +27,7 @@ vector_backend = "sqlite"
     fs::create_dir_all(workspace.join("src"))?;
     fs::write(
         workspace.join("src/lib.rs"),
-        "fn leaf() -> i32 { 1 }\nfn helper() -> i32 { 2 }\nfn uses() -> i32 { helper() + leaf() }\nfn external() -> String { String::new() }\nfn calls_dup() -> i32 { dup() }\n",
+        "fn leaf() -> i32 { 1 }\nfn helper() -> i32 { 2 }\nfn uses() -> i32 { helper() + leaf() }\nfn external() -> String { String::new() }\nfn calls_dup() -> i32 { dup() }\nfn calls_other() -> i32 { 0 }\nfn hidden_leaf() -> i32 { 7 }\nfn pointer_call() -> i32 { let callback = hidden_leaf; callback() }\nstruct PointerTarget;\nimpl PointerTarget { fn hidden(&self) -> i32 { 1 } }\nfn method_pointer(value: &PointerTarget) -> i32 { let callback = PointerTarget::hidden; callback(value) }\n",
     )?;
     fs::write(workspace.join("src/a.rs"), "fn dup() -> i32 { 1 }\n")?;
     fs::write(workspace.join("src/b.rs"), "fn dup() -> i32 { 2 }\n")?;
@@ -76,7 +76,7 @@ vector_backend = "sqlite"
             .0)
     };
 
-    // Calls nothing: the empty list is complete.
+    // No outgoing calls are recorded; this does not certify complete program coverage.
     let leaf = dependencies(id_of("src/lib.rs", "leaf")?)?;
     assert!(leaf.dependencies.is_empty());
     assert_eq!(leaf.dependency_coverage.call_edges, 0);
@@ -166,21 +166,58 @@ vector_backend = "sqlite"
     assert_eq!(calls_dup.dependency_coverage.unresolved, 1);
     assert_eq!(calls_dup.dependency_coverage.ambiguous, 0);
 
+    // A proved different identity is separate from a missing-proof reference.
+    store.upsert_edges(&[SymbolEdge {
+        source_id: id_of("src/lib.rs", "calls_other")?,
+        target_qualified_name: "dup".to_owned(),
+        target_symbol_id: Some(id_of("src/b.rs", "dup")?),
+        target_file_path: Some("src/b.rs".to_owned()),
+        edge_kind: EdgeKind::Calls,
+        file_path: "src/lib.rs".to_owned(),
+    }])?;
     // Neither unrelated declaration receives the unproved caller.
     let dup = dependencies(id_of("src/a.rs", "dup")?)?;
     assert!(dup.callers.is_empty());
     assert_eq!(
         (
             dup.caller_coverage.name_matches,
+            dup.caller_coverage.unresolved,
             dup.caller_coverage.resolved_elsewhere
         ),
-        (1, 1)
+        (2, 1, 1)
     );
     assert!(
-        dup.coverage_note.contains("lack proof for this symbol"),
+        dup.coverage_note.contains("lack target proof"),
         "{}",
         dup.coverage_note
     );
+
+    // A genuine function-pointer caller need not even match the selected name.
+    let hidden = dependencies(id_of("src/lib.rs", "hidden_leaf")?)?;
+    assert!(hidden.callers.is_empty());
+    assert_eq!(hidden.caller_coverage.name_matches, 0);
+    assert_eq!(
+        serde_json::to_value(hidden.caller_coverage)?["incoming_completeness"],
+        "unknown"
+    );
+    assert!(
+        hidden
+            .coverage_note
+            .contains("incoming completeness is unknown")
+    );
+    let pointer = dependencies(id_of("src/lib.rs", "pointer_call")?)?;
+    assert_eq!(pointer.dependency_coverage.unresolved, 1);
+    let matrix = server.aether_usage_matrix_logic(AetherUsageMatrixRequest {
+        symbol: "PointerTarget".to_owned(),
+        symbol_id: None,
+        file: Some("src/lib.rs".to_owned()),
+        kind: Some("struct".to_owned()),
+    })?;
+    assert_eq!(matrix.methods_without_attributed_callers, ["hidden"]);
+    assert_eq!(matrix.caller_coverage.name_matches, 0);
+    let encoded = serde_json::to_value(&matrix)?;
+    assert_eq!(encoded["incoming_completeness"], "unknown");
+    assert!(encoded.get("uncalled_methods").is_none());
 
     let call_chain = |symbol_id: String| -> Result<_> {
         Ok(rt
@@ -201,7 +238,7 @@ vector_backend = "sqlite"
     assert!(
         external_chain
             .coverage_note
-            .contains("None of the recorded calls reach a workspace symbol."),
+            .contains("No unique workspace target was resolved for the recorded calls."),
         "{}",
         external_chain.coverage_note
     );
@@ -223,11 +260,109 @@ vector_backend = "sqlite"
             rust.ambiguous,
             rust.unresolved
         ),
-        (5, 3, 0, 2)
+        (8, 4, 0, 4)
     );
     assert!(status.call_graph.rule.contains("exact qualified name"));
     assert!(status.call_graph.rule.contains("may be internal"));
     assert!(status.call_graph.rule.contains("macro arguments"));
 
+    Ok(())
+}
+
+#[test]
+fn cached_native_health_requires_current_projection_but_coupling_checkout_remains_available()
+-> Result<()> {
+    let temp = tempdir()?;
+    write_test_config(temp.path());
+    let mut config = AetherConfig::default();
+    config.storage.graph_backend = GraphBackend::Surreal;
+    config.embeddings.enabled = false;
+    save_workspace_config(temp.path(), &config)?;
+    let runtime = Runtime::new()?;
+    let state = runtime.block_on(SharedState::open_readwrite_async(temp.path()))?;
+    let cached = runtime.block_on(state.surreal_graph())?;
+    assert!(state.store.has_graph_projection_provenance()?);
+    let connection = Connection::open(temp.path().join(".aether/meta.sqlite"))?;
+    let installed: i64 = connection.query_row(
+        "SELECT version FROM schema_version WHERE component = 'graph_target_provenance'",
+        [],
+        |row| row.get(0),
+    )?;
+    connection.execute(
+        "UPDATE schema_version SET version = 0 WHERE component = 'graph_target_provenance'",
+        [],
+    )?;
+    let pending = runtime
+        .block_on(state.surreal_graph_for_health())
+        .err()
+        .expect("stale cached structural checkout rejected");
+    assert!(matches!(
+        pending,
+        aether_mcp::AetherMcpError::Store(aether_store::StoreError::Compatibility(_))
+    ));
+    let server = AetherMcpServer::from_state(std::sync::Arc::new(state.clone()), false);
+    let health = runtime.block_on(server.aether_health_logic(AetherHealthRequest {
+        include: None,
+        limit: None,
+        min_risk: None,
+    }))?;
+    assert!(!health.analysis_available);
+    assert_eq!(health.graph_coverage.status, "unavailable");
+    assert_eq!(health.graph_coverage.call_edges, None);
+    assert_eq!(health.graph_coverage.whole_program_completeness, "unknown");
+    assert!(health.notes.iter().any(|note| note.contains("projection")));
+    let score = runtime
+        .block_on(
+            server.aether_health_explain_logic(AetherHealthExplainRequest {
+                crate_name: "unselected".to_owned(),
+                semantic: Some(true),
+            }),
+        )
+        .expect_err("pending projection must not silently produce a base-only semantic score");
+    assert!(matches!(
+        score,
+        aether_mcp::AetherMcpError::Store(aether_store::StoreError::Compatibility(_))
+    ));
+    let independent = runtime.block_on(state.surreal_graph())?;
+    assert!(std::sync::Arc::ptr_eq(&cached, &independent));
+    connection.execute(
+        "UPDATE schema_version SET version = ?1 WHERE component = 'graph_target_provenance'",
+        [installed],
+    )?;
+    let current = runtime.block_on(state.surreal_graph_for_health())?;
+    assert!(std::sync::Arc::ptr_eq(&cached, &current));
+
+    // A blocking-task boundary must preserve a real SQLite failure instead of
+    // treating it as pending projection state or a base-only semantic score.
+    connection.execute(
+        "ALTER TABLE schema_version RENAME TO unavailable_schema_version",
+        [],
+    )?;
+    let metadata_error = runtime
+        .block_on(state.surreal_graph_for_health())
+        .err()
+        .expect("cached checkout must propagate catalog read failure");
+    assert!(matches!(
+        metadata_error,
+        aether_mcp::AetherMcpError::Store(aether_store::StoreError::Sqlite(_))
+    ));
+    let score_error = runtime
+        .block_on(
+            server.aether_health_explain_logic(AetherHealthExplainRequest {
+                crate_name: "unselected".to_owned(),
+                semantic: Some(true),
+            }),
+        )
+        .expect_err("semantic score must propagate catalog read failure");
+    assert!(matches!(
+        score_error,
+        aether_mcp::AetherMcpError::Store(aether_store::StoreError::Sqlite(_))
+    ));
+    connection.execute(
+        "ALTER TABLE unavailable_schema_version RENAME TO schema_version",
+        [],
+    )?;
+    let restored = runtime.block_on(state.surreal_graph_for_health())?;
+    assert!(std::sync::Arc::ptr_eq(&cached, &restored));
     Ok(())
 }

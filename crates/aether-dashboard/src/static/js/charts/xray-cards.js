@@ -36,6 +36,8 @@
       .then((json) => {
         const metrics = json?.data?.metrics || {};
         window.__AETHER_XRAY = json?.data || null;
+        const coverageEl = document.getElementById('xray-graph-coverage');
+        if (coverageEl) coverageEl.textContent = json?.data?.graph_coverage?.note || 'Graph completeness is unknown.';
 
         Object.entries(metrics).forEach(([name, metric]) => {
           const valueEl = document.getElementById(`metric-value-${name}`);
@@ -44,7 +46,20 @@
           const card = document.getElementById(`metric-card-${name}`);
           if (!valueEl || !trendEl || !sparkEl || !card) return;
 
-          valueEl.textContent = formatValue(metric?.value);
+          if (metric?.not_computed || metric?.value == null) {
+            valueEl.textContent = 'Not computed';
+            trendEl.textContent = '\u2014';
+            sparkEl.innerHTML = '';
+            card.style.borderColor = '#94a3b8';
+            return;
+          }
+          valueEl.textContent = formatValue(metric.value);
+          if (name === 'orphan_count' || name === 'graph_connectivity') {
+            trendEl.textContent = 'Observed';
+            sparkEl.innerHTML = '';
+            card.style.borderColor = '#94a3b8';
+            return;
+          }
           const trend = Number(metric?.trend || 0);
           trendEl.textContent = trend > 0 ? `↑ ${trend.toFixed(2)}` : trend < 0 ? `↓ ${Math.abs(trend).toFixed(2)}` : '─';
 

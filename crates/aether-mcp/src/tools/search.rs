@@ -139,10 +139,33 @@ impl From<CallEdgeCoverage> for AetherCallEdgeCoverage {
     }
 }
 
-/// How the recorded calls naming a symbol (for an aggregated type, it or one of its
-/// methods) resolved, each caller counted once per callee.
+/// Incoming caller completeness cannot be inferred from extracted spellings, even
+/// when every recorded candidate resolves. Aliases, callbacks and omitted syntax
+/// can contain additional callers.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AetherIncomingCompleteness {
+    #[default]
+    Unknown,
+}
+
+/// The candidate census is scoped to matching recorded target spellings, not all
+/// calls in the program and not a recall estimate.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AetherCallerCoverageScope {
+    #[default]
+    RecordedMatchingTargetNames,
+}
+
+/// How recorded calls naming a symbol (or its methods) resolved, each caller
+/// counted once per callee. These candidates do not establish complete callers.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
 pub struct AetherCallerCoverage {
+    #[serde(default)]
+    pub scope: AetherCallerCoverageScope,
+    #[serde(default)]
+    pub incoming_completeness: AetherIncomingCompleteness,
     pub name_matches: u32,
     /// Listed in `callers`.
     pub attributed: u32,
@@ -152,17 +175,23 @@ pub struct AetherCallerCoverage {
     /// The name also fits other symbols that the caller's file and module don't rule
     /// out, so the call isn't attributed: the symbol may have more callers than listed.
     pub ambiguous: u32,
-    /// The reference lacks proof for this symbol or resolves to another symbol.
+    /// Matching references without sufficient target evidence.
+    #[serde(default)]
+    pub unresolved: u32,
+    /// Target evidence identifies other symbols, excluding this selection.
     pub resolved_elsewhere: u32,
 }
 
 impl From<CallerCoverage> for AetherCallerCoverage {
     fn from(coverage: CallerCoverage) -> Self {
         Self {
+            scope: AetherCallerCoverageScope::RecordedMatchingTargetNames,
+            incoming_completeness: AetherIncomingCompleteness::Unknown,
             name_matches: coverage.name_matches,
             attributed: coverage.attributed,
             heuristic: coverage.heuristic,
             ambiguous: coverage.ambiguous,
+            unresolved: coverage.unresolved,
             resolved_elsewhere: coverage.resolved_elsewhere,
         }
     }
@@ -218,12 +247,19 @@ fn dependencies_coverage_note(
             callers.ambiguous
         ));
     }
+    if callers.unresolved > 0 {
+        caller_clauses.push(format!(
+            "{} lack target proof and are not listed",
+            callers.unresolved
+        ));
+    }
     if callers.resolved_elsewhere > 0 {
         caller_clauses.push(format!(
-            "{} lack proof for this symbol or resolve elsewhere and are not listed",
+            "{} resolve outside this selection and are not listed",
             callers.resolved_elsewhere
         ));
     }
+    caller_clauses.push("incoming completeness is unknown beyond these recorded names".to_owned());
     format!(
         "Callers: {}. Dependencies: {}.{}",
         caller_clauses.join("; "),
@@ -242,7 +278,7 @@ fn call_chain_coverage_note(
         dependency_coverage_clauses(coverage)
     );
     if levels_empty && coverage.call_edges > 0 {
-        note.push_str(" None of the recorded calls reach a workspace symbol.");
+        note.push_str(" No unique workspace target was resolved for the recorded calls.");
     }
     note.push_str(macro_calls_caveat(language));
     note

@@ -58,6 +58,30 @@ impl SharedState {
         })
     }
 
+    /// Structural readers must validate proof readiness even for a cached handle.
+    pub(crate) async fn surreal_dependency_graph_store(
+        &self,
+    ) -> Result<Arc<SurrealGraphStore>, DashboardStateError> {
+        // A fresh opening may initialize/replay the projection. An existing
+        // cached handle still needs a readiness check before any consumer query.
+        let graph = self.surreal_graph_store().await?;
+        let store = Arc::clone(&self.store);
+        let projection_ready =
+            tokio::task::spawn_blocking(move || store.has_graph_projection_provenance())
+                .await
+                .map_err(|err| {
+                    std::io::Error::other(format!("dependency graph readiness task failed: {err}"))
+                })??;
+        if !projection_ready {
+            return Err(aether_store::StoreError::Compatibility(
+                "Persistent dependency graph proof is unavailable; run writable indexing/startup and structural reindex before reading graph relationships".to_owned(),
+            ).into());
+        }
+        Ok(graph)
+    }
+
+    /// Generic native checkout, including co-change data that does not depend on
+    /// structural target-proof readiness.
     pub async fn surreal_graph_store(&self) -> Result<Arc<SurrealGraphStore>, DashboardStateError> {
         if self.config.storage.graph_backend != GraphBackend::Surreal {
             return Err(std::io::Error::other(
@@ -264,5 +288,76 @@ vector_backend = "sqlite"
             .expect("load dependencies");
         assert_eq!(dependencies.len(), 1);
         assert_eq!(dependencies[0].id, "sym-beta");
+    }
+    #[tokio::test]
+    async fn cached_native_dependency_checkout_checks_receipts_without_blocking_canonical_or_cochange_reads()
+     {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path();
+        write_test_config(workspace, "surreal");
+        seed_sqlite_neighbors(workspace);
+        let state = SharedState::open_readonly_async(workspace)
+            .await
+            .expect("state");
+        assert!(state.surreal_graph.lock().expect("cache").is_some());
+        state
+            .surreal_dependency_graph_store()
+            .await
+            .expect("ready native graph");
+
+        let conn = Connection::open(workspace.join(".aether/meta.sqlite")).expect("catalog");
+        let current_proof: i64 = conn
+            .query_row(
+                "SELECT version FROM schema_version WHERE component = 'rust_target_provenance'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("proof policy");
+        conn.execute(
+            "UPDATE schema_version SET version = 0 WHERE component = 'graph_target_provenance'",
+            [],
+        )
+        .expect("pending projection");
+        let err = state
+            .surreal_dependency_graph_store()
+            .await
+            .err()
+            .expect("reject cached native graph");
+        assert!(err.to_string().contains("reindex"), "{err}");
+        assert!(err.downcast_ref::<aether_store::StoreError>().is_some());
+        // Co-change storage remains independently available.
+        state.surreal_graph_store().await.expect("co-change handle");
+
+        // A pending native projection does not invalidate current canonical SQL.
+        let edges =
+            crate::api::common::load_dependency_algo_edges(&state).expect("canonical edges");
+        assert_eq!(edges.len(), 1);
+        let ranks = crate::api::common::pagerank_map(&state, &edges).await;
+        assert!(ranks.contains_key("sym-alpha"));
+        assert!(ranks.contains_key("sym-beta"));
+        let communities = crate::api::common::louvain_map(&state, &edges).await;
+        assert_eq!(communities.len(), 2);
+        let components = crate::api::common::connected_components_vec(&state, &edges).await;
+        assert_eq!(components.len(), 1);
+        assert_eq!(components[0].len(), 2);
+
+        // Future policy errors retain their actual reason and cannot become an
+        // empty canonical fallback.
+        conn.execute(
+            "UPDATE schema_version SET version = ?1 WHERE component = 'rust_target_provenance'",
+            [current_proof + 1],
+        )
+        .expect("future policy");
+        let err = state
+            .surreal_dependency_graph_store()
+            .await
+            .err()
+            .expect("future policy rejection");
+        assert!(
+            err.to_string()
+                .contains("unsupported Rust target-proof version"),
+            "{err}"
+        );
+        assert!(crate::api::common::load_dependency_algo_edges(&state).is_err());
     }
 }

@@ -24,7 +24,8 @@ use aether_mcp::{
     AetherSymbolTimelineRequest, AetherTestIntentsRequest, AetherTraitSplitResolutionMode,
     AetherUsageMatrixRequest, AetherVerifyIntentRequest, AetherWhyChangedReason,
     AetherWhyChangedRequest, AetherWhySelectorMode, AuditCategory, AuditCertainty, AuditSeverity,
-    AuditStatus, MCP_SCHEMA_VERSION, MEMORY_SCHEMA_VERSION, SharedState, SirLevelRequest,
+    AuditStatus, GRAPH_OBSERVATION_SCHEMA_VERSION, MCP_SCHEMA_VERSION, MEMORY_SCHEMA_VERSION,
+    SharedState, SirLevelRequest,
 };
 #[cfg(feature = "verification")]
 use aether_mcp::{AetherVerifyMode, AetherVerifyRequest};

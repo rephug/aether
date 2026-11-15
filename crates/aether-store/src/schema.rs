@@ -33,6 +33,11 @@ pub(crate) fn apply_migrations(tx: &Transaction<'_>, version: i32) -> Result<(),
     // unknown shapes before even additive indexes or schema-version receipts.
     ensure_supported_core_version(version)?;
     let conn: &Connection = tx;
+    // A future proof policy is not safe to rewrite even when the physical core
+    // schema is understood. Check it before any additive or data migration.
+    if table_exists(conn, "schema_version")? {
+        let _ = super::graph_resolution::rust_target_provenance_ready(conn)?;
+    }
 
     if version < 1 {
         conn.execute_batch(
@@ -836,6 +841,16 @@ pub(crate) fn apply_migrations(tx: &Transaction<'_>, version: i32) -> Result<(),
         rebuild_symbol_neighbors(conn)?;
     }
 
+    if version < 25 {
+        // Layout and semantic proof policy have separate version boundaries.
+        // Existing schema-25 stores can need a policy upgrade without new columns.
+        conn.execute_batch(
+            "ALTER TABLE symbol_edges ADD COLUMN rust_proof_version INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE symbol_edges ADD COLUMN rust_proof_generation INTEGER NOT NULL DEFAULT 0 CHECK (rust_proof_generation >= 0);
+             PRAGMA user_version = 25;",
+        )?;
+    }
+
     // Additive indexes also apply to stores already at the current schema. These
     // are the lookup keys used when resolving an edge and refreshing one file's
     // neighbors; without them a small graph update scans the symbol catalog.
@@ -880,6 +895,7 @@ pub(crate) fn apply_migrations(tx: &Transaction<'_>, version: i32) -> Result<(),
             [],
         )?;
     }
+    upgrade_rust_target_proof_policy(conn, version < 25)?;
     // When the indexer last started reading each file (unix milliseconds), so freshness
     // can tell an edit made after that read from one made before it; `symbols.last_seen_at`
     // has whole seconds and, after a full sync, the time the sync wrote rather than read.
@@ -910,6 +926,118 @@ pub(crate) fn apply_migrations(tx: &Transaction<'_>, version: i32) -> Result<(),
 
     Ok(())
 }
+/// The caller holds the migration writer transaction. A policy upgrade changes
+/// evidence and writer fences atomically without changing symbol/SIR identity or
+/// the core-25 layout. A physical upgrade always refreshes proof, even if restored
+/// metadata claims the current semantic policy for an older table shape.
+fn upgrade_rust_target_proof_policy(conn: &Connection, force: bool) -> Result<(), StoreError> {
+    let current = super::graph_resolution::rust_target_provenance_ready(conn)?;
+    if current && !force {
+        return Ok(());
+    }
+    let proof_version = super::graph_resolution::RUST_TARGET_PROOF_VERSION;
+    // These are owned policy fences. Replacing their definitions is intentional:
+    // accepting an existing policy-1 trigger would leave old writers unfenced.
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS reject_legacy_rust_target_proof_insert;
+         DROP TRIGGER IF EXISTS reject_legacy_rust_target_proof_update;
+         DROP TRIGGER IF EXISTS reject_legacy_rust_source_insert;
+         DROP TRIGGER IF EXISTS reject_legacy_rust_source_update;",
+    )?;
+    // Older supported partial catalogs may have edges but no declarations.
+    // Treat every proof in such a catalog as unclassified; do not invent the
+    // missing foundational tables just to run this migration.
+    let has_symbols = table_exists(conn, "symbols")?;
+    let rust_or_unknown = |edge: &str| {
+        if has_symbols {
+            format!(
+                "(LOWER(TRIM({edge}.file_path)) LIKE '%.rs' OR NOT EXISTS (                     SELECT 1 FROM symbols s WHERE s.id = {edge}.source_id                      AND LOWER(TRIM(s.language)) NOT IN ('rust', '')))"
+            )
+        } else {
+            "1".to_owned()
+        }
+    };
+    // Keep historical target spellings, but remove old Rust/unknown-source
+    // evidence until a structural scan extracts it again. Capture references
+    // before deletion: an empty target hint shares the unique key of a NULL
+    // hint, so inserting its unproved copy first would conflict with itself.
+    conn.execute_batch(&format!(
+        r#"
+        CREATE TEMP TABLE aether_rust_proof_references_v25 AS
+        SELECT DISTINCT e.source_id, e.target_qualified_name, e.edge_kind, e.file_path
+        FROM symbol_edges e
+        WHERE (e.target_symbol_id IS NOT NULL OR e.target_file_path IS NOT NULL)
+          AND {copied_scope};
+        DELETE FROM symbol_edges
+        WHERE (target_symbol_id IS NOT NULL OR target_file_path IS NOT NULL)
+          AND {stored_scope};
+        INSERT OR IGNORE INTO symbol_edges (
+            source_id, target_qualified_name, edge_kind, file_path,
+            target_symbol_id, target_file_path
+        )
+        SELECT source_id, target_qualified_name, edge_kind, file_path, NULL, NULL
+        FROM aether_rust_proof_references_v25;
+        DROP TABLE aether_rust_proof_references_v25;
+        CREATE TRIGGER reject_legacy_rust_target_proof_insert
+        BEFORE INSERT ON symbol_edges
+        WHEN (NEW.target_symbol_id IS NOT NULL OR NEW.target_file_path IS NOT NULL)
+         AND (NEW.rust_proof_version <> {proof_version} OR NEW.rust_proof_generation <= 0)
+         AND {new_scope}
+        BEGIN
+            SELECT RAISE(ABORT, 'Rust target proof requires a current writer; restart older Aether processes and reindex');
+        END;
+        CREATE TRIGGER reject_legacy_rust_target_proof_update
+        BEFORE UPDATE ON symbol_edges
+        WHEN (NEW.target_symbol_id IS NOT NULL OR NEW.target_file_path IS NOT NULL)
+         AND (NEW.rust_proof_version <> {proof_version} OR NEW.rust_proof_generation <= OLD.rust_proof_generation)
+         AND {new_scope}
+        BEGIN
+            SELECT RAISE(ABORT, 'Rust target proof requires a fresh write generation; restart older Aether processes and reindex');
+        END;
+        "#,
+        copied_scope = rust_or_unknown("e"),
+        stored_scope = rust_or_unknown("symbol_edges"),
+        new_scope = rust_or_unknown("NEW"),
+    ))?;
+    if has_symbols {
+        conn.execute_batch(&format!(
+            r#"
+            CREATE TRIGGER reject_legacy_rust_source_insert
+            BEFORE INSERT ON symbols
+            WHEN LOWER(TRIM(NEW.language)) = 'rust' AND EXISTS (
+                SELECT 1 FROM symbol_edges e WHERE e.source_id = NEW.id
+                  AND (e.target_symbol_id IS NOT NULL OR e.target_file_path IS NOT NULL)
+                  AND (e.rust_proof_version <> {proof_version} OR e.rust_proof_generation <= 0)
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'Rust source has legacy target proof; reindex its edges before changing language');
+            END;
+            CREATE TRIGGER reject_legacy_rust_source_update
+            BEFORE UPDATE OF id, language ON symbols
+            WHEN LOWER(TRIM(NEW.language)) = 'rust' AND EXISTS (
+                SELECT 1 FROM symbol_edges e WHERE e.source_id = NEW.id
+                  AND (e.target_symbol_id IS NOT NULL OR e.target_file_path IS NOT NULL)
+                  AND (e.rust_proof_version <> {proof_version} OR e.rust_proof_generation <= 0)
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'Rust source has legacy target proof; reindex its edges before changing language');
+            END;
+            "#,
+        ))?;
+    }
+    rebuild_symbol_neighbors(conn)?;
+    // This is a safety receipt, not a claim that all sources were re-extracted.
+    conn.execute(
+        "INSERT INTO schema_version (component, version, migrated_at) VALUES ('graph_target_provenance', 0, unixepoch()) ON CONFLICT(component) DO UPDATE SET version = 0, migrated_at = unixepoch()",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO schema_version (component, version, migrated_at) VALUES ('rust_target_provenance', ?1, unixepoch()) ON CONFLICT(component) DO UPDATE SET version = excluded.version, migrated_at = unixepoch()",
+        params![proof_version],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn rebuild_symbol_neighbors(conn: &Connection) -> Result<(), StoreError> {
     if !table_exists(conn, "symbol_neighbors")?
         || !table_exists(conn, "symbol_edges")?

@@ -103,7 +103,7 @@ pub(crate) async fn pagerank_map(
     fallback_edges: &[GraphAlgorithmEdge],
 ) -> HashMap<String, f64> {
     if shared.config.storage.graph_backend == GraphBackend::Surreal
-        && let Ok(graph) = shared.surreal_graph_store().await
+        && let Ok(graph) = shared.surreal_dependency_graph_store().await
         && let Ok(scores) = graph.list_pagerank().await
     {
         return scores
@@ -112,6 +112,7 @@ pub(crate) async fn pagerank_map(
             .collect();
     }
 
+    // Callers load these canonical SQL edges with provenance checks before any native fallback.
     let edges = fallback_edges.to_vec();
     tokio::task::spawn_blocking(move || page_rank(&edges, 0.85, 25))
         .await
@@ -123,12 +124,13 @@ pub(crate) async fn louvain_map(
     fallback_edges: &[GraphAlgorithmEdge],
 ) -> HashMap<String, i64> {
     if shared.config.storage.graph_backend == GraphBackend::Surreal
-        && let Ok(graph) = shared.surreal_graph_store().await
+        && let Ok(graph) = shared.surreal_dependency_graph_store().await
         && let Ok(values) = graph.list_louvain_communities().await
     {
         return values.into_iter().collect();
     }
 
+    // Callers load these canonical SQL edges with provenance checks before any native fallback.
     let edges = fallback_edges.to_vec();
     tokio::task::spawn_blocking(move || {
         louvain_communities(&edges)
@@ -145,12 +147,13 @@ pub(crate) async fn connected_components_vec(
     fallback_edges: &[GraphAlgorithmEdge],
 ) -> Vec<Vec<String>> {
     if shared.config.storage.graph_backend == GraphBackend::Surreal
-        && let Ok(graph) = shared.surreal_graph_store().await
+        && let Ok(graph) = shared.surreal_dependency_graph_store().await
         && let Ok(values) = graph.list_connected_components().await
     {
         return values;
     }
 
+    // Callers load these canonical SQL edges with provenance checks before any native fallback.
     let edges = fallback_edges.to_vec();
     tokio::task::spawn_blocking(move || connected_components(&edges))
         .await
