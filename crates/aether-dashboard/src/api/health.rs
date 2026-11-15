@@ -132,7 +132,8 @@ pub(crate) async fn load_health_data(shared: &SharedState, query: &HealthQuery) 
                 .await
             {
                 Ok(report) => {
-                    analysis_available = report.analysis_available;
+                    analysis_available =
+                        report.analysis_available && report.analysis.total_symbols > 0;
                     for note in &report.notes {
                         push_note(&mut notes, note);
                     }
@@ -365,7 +366,7 @@ async fn compute_graph_connectivity(
     shared: &SharedState,
     notes: &mut Vec<String>,
 ) -> (Option<f64>, ObservedGraphCoverage) {
-    let coverage = ObservedGraphCoverage::from_store(shared.store.as_ref());
+    let coverage = ObservedGraphCoverage::from_store_async(shared.store.as_ref()).await;
     let symbols = match crate::api::common::load_symbols(shared) {
         Ok(symbols) => symbols,
         Err(err) => {

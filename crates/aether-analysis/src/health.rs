@@ -15,7 +15,7 @@ use crate::graph_algorithms::{
     page_rank, strongly_connected_components,
 };
 use crate::graph_coverage::{
-    OBSERVED_DISCONNECTION_NOTE, ObservedGraphCoverage, require_native_graph_projection,
+    OBSERVED_DISCONNECTION_NOTE, ObservedGraphCoverage, require_native_graph_projection_async,
 };
 
 const HEALTH_SCHEMA_VERSION: &str = "1.0";
@@ -377,7 +377,7 @@ impl HealthAnalyzer {
             });
         }
 
-        if let Some(note) = graph_policy_unavailable_note(store) {
+        if let Some(note) = graph_policy_unavailable_note(store).await {
             notes.push(note);
             return Ok(FileCentralityReport {
                 workspace_max_pagerank: 0.0,
@@ -413,7 +413,7 @@ impl HealthAnalyzer {
             }
         };
 
-        let graph_coverage = ObservedGraphCoverage::from_store(store);
+        let graph_coverage = ObservedGraphCoverage::from_store_async(store).await;
         notes.push(graph_coverage.note.clone());
 
         let algo_edges = dependency_edges.clone();
@@ -576,7 +576,7 @@ impl HealthAnalyzer {
             ));
         };
 
-        if let Some(note) = graph_policy_unavailable_note(store) {
+        if let Some(note) = graph_policy_unavailable_note(store).await {
             notes.push(note);
             return Ok(empty_report(
                 HealthUnavailableReason::GraphUnavailable,
@@ -627,7 +627,7 @@ impl HealthAnalyzer {
             notes.push("No dependency edges found in SurrealDB".to_owned());
         }
 
-        let graph_coverage = ObservedGraphCoverage::from_store(store);
+        let graph_coverage = ObservedGraphCoverage::from_store_async(store).await;
 
         let algo_edges = dependency_edges.clone();
         let (pagerank_scores, betweenness_scores, scc, cc, communities) =
@@ -1039,8 +1039,9 @@ impl HealthAnalyzer {
 }
 
 // A handle opened before a proof-policy change must not expose its cached edges.
-fn graph_policy_unavailable_note(store: &SqliteStore) -> Option<String> {
-    require_native_graph_projection(store)
+async fn graph_policy_unavailable_note(store: &SqliteStore) -> Option<String> {
+    require_native_graph_projection_async(store)
+        .await
         .err()
         .map(|err| format!("Graph target-proof projection unavailable: {err}"))
 }

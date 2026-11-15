@@ -85,7 +85,7 @@ pub(crate) async fn load_xray_data(
 ) -> Result<XrayData, String> {
     let _cutoff = common::cutoff_millis_for_days(common::parse_window_days(window));
 
-    let graph_coverage = ObservedGraphCoverage::from_store(shared.store.as_ref());
+    let graph_coverage = ObservedGraphCoverage::from_store_async(shared.store.as_ref()).await;
     let symbols = common::load_symbols(shared)?;
     if symbols.is_empty() {
         return Ok(XrayData {

@@ -32,6 +32,7 @@ dependencies = [
  "aether-store",
  "gix",
  "petgraph 0.6.5",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

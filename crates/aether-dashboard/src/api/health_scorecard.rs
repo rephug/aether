@@ -186,7 +186,7 @@ async fn load_health_scorecard(shared: &SharedState) -> Result<HealthScorecardDa
     .to_owned();
 
     Ok(HealthScorecardData {
-        graph_coverage: ObservedGraphCoverage::from_store(shared.store.as_ref()),
+        graph_coverage: ObservedGraphCoverage::from_store_async(shared.store.as_ref()).await,
         metrics,
         overall_status,
     })

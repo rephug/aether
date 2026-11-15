@@ -65,7 +65,14 @@ impl SharedState {
         // A fresh opening may initialize/replay the projection. An existing
         // cached handle still needs a readiness check before any consumer query.
         let graph = self.surreal_graph_store().await?;
-        if !self.store.has_graph_projection_provenance()? {
+        let store = Arc::clone(&self.store);
+        let projection_ready =
+            tokio::task::spawn_blocking(move || store.has_graph_projection_provenance())
+                .await
+                .map_err(|err| {
+                    std::io::Error::other(format!("dependency graph readiness task failed: {err}"))
+                })??;
+        if !projection_ready {
             return Err(aether_store::StoreError::Compatibility(
                 "Persistent dependency graph proof is unavailable; run writable indexing/startup and structural reindex before reading graph relationships".to_owned(),
             ).into());

@@ -331,5 +331,38 @@ fn cached_native_health_requires_current_projection_but_coupling_checkout_remain
     )?;
     let current = runtime.block_on(state.surreal_graph_for_health())?;
     assert!(std::sync::Arc::ptr_eq(&cached, &current));
+
+    // A blocking-task boundary must preserve a real SQLite failure instead of
+    // treating it as pending projection state or a base-only semantic score.
+    connection.execute(
+        "ALTER TABLE schema_version RENAME TO unavailable_schema_version",
+        [],
+    )?;
+    let metadata_error = runtime
+        .block_on(state.surreal_graph_for_health())
+        .err()
+        .expect("cached checkout must propagate catalog read failure");
+    assert!(matches!(
+        metadata_error,
+        aether_mcp::AetherMcpError::Store(aether_store::StoreError::Sqlite(_))
+    ));
+    let score_error = runtime
+        .block_on(
+            server.aether_health_explain_logic(AetherHealthExplainRequest {
+                crate_name: "unselected".to_owned(),
+                semantic: Some(true),
+            }),
+        )
+        .expect_err("semantic score must propagate catalog read failure");
+    assert!(matches!(
+        score_error,
+        aether_mcp::AetherMcpError::Store(aether_store::StoreError::Sqlite(_))
+    ));
+    connection.execute(
+        "ALTER TABLE unavailable_schema_version RENAME TO schema_version",
+        [],
+    )?;
+    let restored = runtime.block_on(state.surreal_graph_for_health())?;
+    assert!(std::sync::Arc::ptr_eq(&cached, &restored));
     Ok(())
 }

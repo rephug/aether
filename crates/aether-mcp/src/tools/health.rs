@@ -434,7 +434,7 @@ impl AetherMcpServer {
                     self.state.config.storage.graph_backend,
                     GraphBackend::Surreal | GraphBackend::Cozo
                 )
-                && !self.state.store.has_graph_projection_provenance()?
+                && !self.state.graph_projection_provenance_ready().await?
             {
                 // Let a fresh native open perform safe initialization/replay;
                 // a stale cached projection must not become a base-only score.

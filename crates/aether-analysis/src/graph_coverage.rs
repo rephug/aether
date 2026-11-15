@@ -1,5 +1,7 @@
 //! Resolution counts describe recorded call references, never whole-program recall.
-use aether_store::SqliteStore;
+use std::path::PathBuf;
+
+use aether_store::{SqliteStore, StoreError};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const OBSERVED_DISCONNECTION_NOTE: &str = "Disconnected from the largest observed dependency component; unresolved relationships may connect it. This does not establish unused or dead code";
@@ -44,6 +46,28 @@ impl Default for ObservedGraphCoverage {
 }
 
 impl ObservedGraphCoverage {
+    /// Async callers must not lock or query SQLite on their executor thread.
+    /// Reopen the same committed catalog read-only on a blocking worker: the
+    /// borrowed handle cannot be moved into a static blocking task.
+    pub async fn from_store_async(store: &SqliteStore) -> Self {
+        let workspace = match graph_store_workspace(store) {
+            Ok(workspace) => workspace,
+            Err(err) => return Self::unavailable(err),
+        };
+        Self::from_workspace_async(workspace).await
+    }
+
+    async fn from_workspace_async(workspace: PathBuf) -> Self {
+        match with_readonly_graph_store(workspace, |store| {
+            Ok::<_, StoreError>(Self::from_store(store))
+        })
+        .await
+        {
+            Ok(coverage) => coverage,
+            Err(err) => Self::unavailable(format!("call-reference coverage worker failed: {err}")),
+        }
+    }
+
     /// Graph data may remain usable when the separate count query is unavailable.
     pub fn from_store(store: &SqliteStore) -> Self {
         match store.call_edge_coverage_by_language() {
@@ -86,6 +110,44 @@ impl ObservedGraphCoverage {
             ..Self::default()
         }
     }
+}
+
+/// Own the catalog path before dispatch so neither opening nor SQLite work can
+/// block the async executor. Read-only opening never upgrades catalog data.
+pub(crate) async fn with_readonly_graph_store<T, E>(
+    workspace: PathBuf,
+    operation: impl FnOnce(&SqliteStore) -> Result<T, E> + Send + 'static,
+) -> Result<T, E>
+where
+    T: Send + 'static,
+    E: From<StoreError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let store = SqliteStore::open_readonly(workspace).map_err(E::from)?;
+        operation(&store)
+    })
+    .await
+    .map_err(|err| {
+        E::from(StoreError::Graph(format!(
+            "read-only graph metadata worker failed: {err}"
+        )))
+    })?
+}
+
+pub(crate) fn graph_store_workspace(store: &SqliteStore) -> Result<PathBuf, StoreError> {
+    store.workspace_root().ok_or_else(|| {
+        StoreError::Compatibility("Graph metadata workspace path unavailable".to_owned())
+    })
+}
+
+pub(crate) async fn require_native_graph_projection_async(
+    store: &SqliteStore,
+) -> Result<(), StoreError> {
+    with_readonly_graph_store(
+        graph_store_workspace(store)?,
+        require_native_graph_projection,
+    )
+    .await
 }
 
 /// Entry-point check for native analyses handed an already-open graph.
@@ -158,6 +220,141 @@ mod tests {
         assert_eq!(partial.status, ObservedGraphStatus::Incomplete);
         assert_eq!(partial.resolved, Some(1));
         assert_eq!(partial.unresolved, Some(1));
+    }
+
+    #[test]
+    fn sqlite_contention_does_not_block_the_current_thread_executor() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("store");
+        store
+            .upsert_symbol(SymbolRecord {
+                id: "caller".to_owned(),
+                file_path: "src/lib.rs".to_owned(),
+                language: "rust".to_owned(),
+                kind: "function".to_owned(),
+                qualified_name: "caller".to_owned(),
+                signature_fingerprint: "caller".to_owned(),
+                last_seen_at: 1,
+            })
+            .expect("symbol");
+        store
+            .upsert_edges(&[SymbolEdge {
+                source_id: "caller".to_owned(),
+                target_qualified_name: "callback".to_owned(),
+                target_symbol_id: None,
+                target_file_path: None,
+                edge_kind: EdgeKind::Calls,
+                file_path: "src/lib.rs".to_owned(),
+            }])
+            .expect("raw call");
+        let expected = ObservedGraphCoverage::from_store(&store);
+        let workspace = store.workspace_root().expect("workspace");
+        let catalog = store.aether_dir().join("meta.sqlite");
+        drop(store);
+
+        // DELETE mode makes an exclusive transaction block an actual read-only
+        // catalog open/query. No connection remains open before changing mode.
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let locker = std::thread::spawn(move || {
+            let connection = rusqlite::Connection::open(catalog).expect("catalog");
+            connection
+                .execute_batch("PRAGMA journal_mode = DELETE; BEGIN EXCLUSIVE;")
+                .expect("exclusive catalog lock");
+            locked_tx.send(()).expect("locked signal");
+            // A broken inline implementation must fail, not deadlock the suite.
+            let released = release_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+            connection.execute_batch("ROLLBACK").expect("release lock");
+            released
+        });
+        locked_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("database locked");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let actual = runtime.block_on(async move {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let collection = tokio::spawn(async move {
+                started_tx.send(()).expect("collection started");
+                ObservedGraphCoverage::from_workspace_async(workspace).await
+            });
+            started_rx.await.expect("collection scheduled");
+            // If opening/querying ran inline, this executor could not poll the
+            // signal until the query timed out or the locker watchdog released.
+            assert!(
+                !collection.is_finished(),
+                "SQLite contention must not occupy the async executor"
+            );
+            release_tx.send(()).expect("executor releases database");
+            tokio::time::timeout(Duration::from_secs(10), collection)
+                .await
+                .expect("collection completes after release")
+                .expect("collection task")
+        });
+        assert!(
+            locker.join().expect("locker"),
+            "watchdog must not release lock"
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(actual.unresolved, Some(1));
+        assert_eq!(actual.whole_program_completeness, "unknown");
+    }
+
+    #[test]
+    fn async_coverage_preserves_counts_and_metadata_failures() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(temp.path()).expect("store");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        assert_eq!(
+            runtime.block_on(ObservedGraphCoverage::from_store_async(&store)),
+            ObservedGraphCoverage::from_store(&store)
+        );
+        let connection =
+            rusqlite::Connection::open(store.aether_dir().join("meta.sqlite")).expect("connection");
+        connection
+            .execute(
+                "UPDATE schema_version SET version = 3 WHERE component = 'rust_target_provenance'",
+                [],
+            )
+            .expect("future proof policy");
+        let future = runtime.block_on(ObservedGraphCoverage::from_store_async(&store));
+        assert_eq!(future.status, ObservedGraphStatus::Unavailable);
+        assert_eq!(future.call_edges, None);
+        assert!(
+            future
+                .note
+                .contains("unsupported Rust target-proof version 3")
+        );
+        let guard_error = runtime
+            .block_on(require_native_graph_projection_async(&store))
+            .expect_err("future policy rejected");
+        assert!(
+            guard_error
+                .to_string()
+                .contains("unsupported Rust target-proof version 3")
+        );
+        let receipt: i64 = connection
+            .query_row(
+                "SELECT version FROM schema_version WHERE component = 'rust_target_provenance'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("receipt unchanged");
+        assert_eq!(receipt, 3, "read-only helper must not migrate metadata");
+        let absent = temp.path().join("absent");
+        let missing = runtime.block_on(ObservedGraphCoverage::from_workspace_async(absent.clone()));
+        assert_eq!(missing.status, ObservedGraphStatus::Unavailable);
+        assert_eq!(missing.call_edges, None);
+        assert!(!absent.join(".aether/meta.sqlite").exists());
     }
 
     #[test]

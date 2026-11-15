@@ -332,11 +332,23 @@ impl SharedState {
         Ok(graph)
     }
 
+    /// The catalog mutex and SQLite reads may block even when the native handle
+    /// is cached, so readiness is checked on the blocking pool as well.
+    pub(crate) async fn graph_projection_provenance_ready(&self) -> Result<bool, AetherMcpError> {
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || store.has_graph_projection_provenance())
+            .await
+            .map_err(|err| {
+                AetherMcpError::Message(format!("native graph projection readiness join: {err}"))
+            })?
+            .map_err(AetherMcpError::Store)
+    }
+
     pub async fn surreal_graph_for_health(&self) -> Result<Arc<SurrealGraphStore>, AetherMcpError> {
         // A fresh open may safely initialize/replay the projection. A cached
         // handle must still pass the installed policy before structural reads.
         let graph = self.surreal_graph().await?;
-        if !self.store.has_graph_projection_provenance()? {
+        if !self.graph_projection_provenance_ready().await? {
             return Err(aether_store::StoreError::Compatibility(
                 "native dependency projection needs a writable refresh/reindex before health analysis".to_owned(),
             ).into());

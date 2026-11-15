@@ -463,3 +463,189 @@ async fn warm_health_score_cache_does_not_hide_pending_native_projection() {
         "restoring readiness keeps the valid warm score unchanged"
     );
 }
+
+#[tokio::test]
+async fn empty_surreal_health_has_no_overall_score_after_successful_analysis() {
+    use aether_analysis::{HealthAnalyzer, HealthRequest};
+    use aether_store::SurrealGraphStore;
+
+    let temp = TempDir::new().unwrap();
+    let mut config = AetherConfig::default();
+    config.storage.graph_backend = GraphBackend::Surreal;
+    config.embeddings.enabled = false;
+    save_workspace_config(temp.path(), &config).unwrap();
+    drop(SqliteStore::open(temp.path()).unwrap());
+    drop(SurrealGraphStore::open(temp.path()).await.unwrap());
+    let state = Arc::new(SharedState::open_readonly_async(temp.path()).await.unwrap());
+    let graph = state.surreal_dependency_graph_store().await.unwrap();
+    let analyzer = HealthAnalyzer::new(temp.path()).unwrap();
+    let report = analyzer
+        .analyze_with_handles(
+            &HealthRequest::default(),
+            state.store.as_ref(),
+            Some(graph.as_ref()),
+        )
+        .await
+        .unwrap();
+    // A successful query of an empty index is not enough input for a health score.
+    assert!(report.analysis_available, "{report:?}");
+    assert_eq!(report.analysis.total_symbols, 0);
+
+    let app = dashboard_router(state);
+    let (status, json) = send_json(&app, "GET", "/api/v1/health", None).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"]["analysis_available"], false, "{json}");
+    assert!(json["data"]["overall_score"].is_null(), "{json}");
+    assert_eq!(
+        json["data"]["graph_coverage"]["status"], "unknown",
+        "{json}"
+    );
+    assert_eq!(json["data"]["graph_coverage"]["call_edges"], 0, "{json}");
+    assert!(
+        json["data"]["dimensions"]["graph_connectivity"].is_null(),
+        "{json}"
+    );
+    assert!(
+        json["data"]["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|note| { note.as_str().unwrap().contains("No symbols available") }),
+        "{json}"
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/frag/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("No overall score"), "{text}");
+    assert!(!text.contains("Overall "), "{text}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dashboard_coverage_waiting_for_sqlite_keeps_the_executor_responsive() {
+    use std::time::Duration;
+
+    let temp = TempDir::new().unwrap();
+    let mut config = AetherConfig::default();
+    config.storage.graph_backend = GraphBackend::Sqlite;
+    config.embeddings.enabled = false;
+    save_workspace_config(temp.path(), &config).unwrap();
+    drop(SqliteStore::open(temp.path()).unwrap());
+    let blocker = Connection::open(temp.path().join(".aether/meta.sqlite")).unwrap();
+    // Rollback journal exclusive locks block independent readonly connections,
+    // including the coverage helper's connection. WAL writers do not block reads.
+    blocker
+        .pragma_update(None, "journal_mode", "DELETE")
+        .unwrap();
+    let state = Arc::new(SharedState::open_readonly_async(temp.path()).await.unwrap());
+    let app = dashboard_router(state);
+    blocker.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let reader = tokio::spawn(async move {
+        started.send(()).unwrap();
+        send_json(&app, "GET", "/api/v1/xray", None).await
+    });
+    ready.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    // This timer must run before the SQLite read completes. A synchronous read
+    // on this current-thread executor instead blocks until SQLite's busy timeout.
+    let waiting_at_heartbeat = !reader.is_finished();
+    blocker.execute_batch("COMMIT;").unwrap();
+    let result = reader.await.unwrap();
+    assert!(
+        waiting_at_heartbeat,
+        "SQLite blocked the executor until its read failed: {result:?}"
+    );
+    let (status, json) = result;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let coverage = &json["data"]["graph_coverage"];
+    assert_eq!(coverage["status"], "unknown", "{json}");
+    assert_eq!(coverage["call_edges"], 0, "{json}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dashboard_cached_native_readiness_waiting_for_sqlite_keeps_the_executor_responsive() {
+    use aether_store::SurrealGraphStore;
+    use std::time::Duration;
+
+    let temp = TempDir::new().unwrap();
+    let mut config = AetherConfig::default();
+    config.storage.graph_backend = GraphBackend::Surreal;
+    config.embeddings.enabled = false;
+    save_workspace_config(temp.path(), &config).unwrap();
+    drop(SqliteStore::open(temp.path()).unwrap());
+    drop(SurrealGraphStore::open(temp.path()).await.unwrap());
+    let blocker = Connection::open(temp.path().join(".aether/meta.sqlite")).unwrap();
+    blocker
+        .pragma_update(None, "journal_mode", "DELETE")
+        .unwrap();
+    let state = Arc::new(SharedState::open_readonly_async(temp.path()).await.unwrap());
+    state.surreal_dependency_graph_store().await.unwrap();
+    blocker.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let reader = tokio::spawn(async move {
+        started.send(()).unwrap();
+        state.surreal_dependency_graph_store().await
+    });
+    ready.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let waiting_at_heartbeat = !reader.is_finished();
+    blocker.execute_batch("COMMIT;").unwrap();
+    let result = reader.await.unwrap();
+    assert!(
+        waiting_at_heartbeat,
+        "Readiness check blocked the executor until its read failed"
+    );
+    result.unwrap();
+}
+
+#[tokio::test]
+async fn nonempty_surreal_health_keeps_zero_edge_analysis_available() {
+    use aether_store::{GraphStore, SurrealGraphStore};
+
+    let temp = TempDir::new().unwrap();
+    let mut config = AetherConfig::default();
+    config.storage.graph_backend = GraphBackend::Surreal;
+    config.embeddings.enabled = false;
+    save_workspace_config(temp.path(), &config).unwrap();
+    let store = SqliteStore::open(temp.path()).unwrap();
+    let graph = SurrealGraphStore::open(temp.path()).await.unwrap();
+    let symbol = SymbolRecord {
+        id: "only-symbol".to_owned(),
+        file_path: "src/lib.rs".to_owned(),
+        language: "rust".to_owned(),
+        kind: "function".to_owned(),
+        qualified_name: "only_symbol".to_owned(),
+        signature_fingerprint: "only-symbol".to_owned(),
+        last_seen_at: 1,
+    };
+    store.upsert_symbol(symbol.clone()).unwrap();
+    graph.upsert_symbol_node(&symbol).await.unwrap();
+    drop(graph);
+    drop(store);
+    let state = Arc::new(SharedState::open_readonly_async(temp.path()).await.unwrap());
+    let app = dashboard_router(state);
+    let (status, json) = send_json(&app, "GET", "/api/v1/health", None).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"]["analysis_available"], true, "{json}");
+    assert!(json["data"]["overall_score"].is_number(), "{json}");
+    assert_eq!(
+        json["data"]["graph_coverage"]["status"], "unknown",
+        "{json}"
+    );
+    assert_eq!(json["data"]["graph_coverage"]["call_edges"], 0, "{json}");
+    assert_eq!(
+        json["data"]["graph_coverage"]["whole_program_completeness"], "unknown",
+        "{json}"
+    );
+}
