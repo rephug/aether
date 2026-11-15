@@ -127,7 +127,8 @@ vector_backend = "sqlite"
 }
 
 #[test]
-fn mcp_usage_matrix_reports_consumers_clusters_and_uncalled_methods() -> Result<()> {
+fn mcp_usage_matrix_reports_consumers_clusters_and_methods_without_attributed_callers() -> Result<()>
+{
     let temp = tempdir()?;
     let workspace = temp.path();
     write_test_config(workspace);
@@ -191,11 +192,27 @@ fn mcp_usage_matrix_reports_consumers_clusters_and_uncalled_methods() -> Result<
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
 
-    assert_eq!(response.schema_version, MEMORY_SCHEMA_VERSION);
+    assert_eq!(response.schema_version, GRAPH_OBSERVATION_SCHEMA_VERSION);
     assert_eq!(response.target_file, "src/store.rs");
     assert_eq!(response.method_count, 4);
     assert_eq!(response.consumer_count, 3);
-    assert_eq!(response.uncalled_methods, vec!["delta".to_owned()]);
+    assert_eq!(
+        response.methods_without_attributed_callers,
+        vec!["delta".to_owned()]
+    );
+    let encoded = serde_json::to_value(&response)?;
+    assert!(encoded.get("uncalled_methods").is_none());
+    assert_eq!(encoded["incoming_completeness"], "unknown");
+    assert_eq!(
+        encoded["caller_coverage"]["scope"],
+        "recorded_matching_target_names"
+    );
+    assert!(
+        response
+            .suggested_clusters
+            .iter()
+            .all(|cluster| cluster.reason.contains("observed attributed consumers"))
+    );
 
     let matrix_by_file = response
         .matrix
@@ -431,7 +448,7 @@ fn mcp_suggest_trait_split_returns_clusters() -> Result<()> {
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
 
-    assert_eq!(response.schema_version, MEMORY_SCHEMA_VERSION);
+    assert_eq!(response.schema_version, GRAPH_OBSERVATION_SCHEMA_VERSION);
     assert_eq!(response.message, None);
     assert_eq!(
         response.resolved_via.mode,
@@ -439,6 +456,13 @@ fn mcp_suggest_trait_split_returns_clusters() -> Result<()> {
     );
     assert_eq!(response.resolved_via.qualified_name, "ExampleStore");
     assert_eq!(response.resolved_via.kind, "trait");
+    assert_eq!(
+        serde_json::to_value(&response)?["incoming_completeness"],
+        "unknown"
+    );
+    let encoded = serde_json::to_value(&response)?;
+    assert!(encoded["suggestion"].get("uncalled_methods").is_none());
+    assert_eq!(encoded["suggestion"]["confidence"], "low");
     let suggestion = response.suggestion.expect("trait split suggestion");
     assert_eq!(suggestion.trait_name, "ExampleStore");
     assert_eq!(suggestion.trait_file, "src/store.rs");
@@ -618,7 +642,7 @@ fn mcp_suggest_trait_split_accepts_struct_targets() -> Result<()> {
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
 
-    assert_eq!(response.schema_version, MEMORY_SCHEMA_VERSION);
+    assert_eq!(response.schema_version, GRAPH_OBSERVATION_SCHEMA_VERSION);
     assert_eq!(response.message, None);
     assert_eq!(
         response.resolved_via.mode,
@@ -626,6 +650,13 @@ fn mcp_suggest_trait_split_accepts_struct_targets() -> Result<()> {
     );
     assert_eq!(response.resolved_via.qualified_name, "ExampleStore");
     assert_eq!(response.resolved_via.kind, "struct");
+    assert_eq!(
+        serde_json::to_value(&response)?["incoming_completeness"],
+        "unknown"
+    );
+    let encoded = serde_json::to_value(&response)?;
+    assert!(encoded["suggestion"].get("uncalled_methods").is_none());
+    assert_eq!(encoded["suggestion"]["confidence"], "low");
     let suggestion = response.suggestion.expect("trait split suggestion");
     assert_eq!(suggestion.trait_name, "ExampleStore");
     assert_eq!(suggestion.trait_file, "src/store.rs");
@@ -809,7 +840,7 @@ fn mcp_suggest_trait_split_falls_back_to_same_file_implementor_methods() -> Resu
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .0;
 
-    assert_eq!(response.schema_version, MEMORY_SCHEMA_VERSION);
+    assert_eq!(response.schema_version, GRAPH_OBSERVATION_SCHEMA_VERSION);
     assert_eq!(response.message, None);
     assert_eq!(
         response.resolved_via.mode,
@@ -817,6 +848,13 @@ fn mcp_suggest_trait_split_falls_back_to_same_file_implementor_methods() -> Resu
     );
     assert_eq!(response.resolved_via.qualified_name, "SqliteStore");
     assert_eq!(response.resolved_via.kind, "struct");
+    assert_eq!(
+        serde_json::to_value(&response)?["incoming_completeness"],
+        "unknown"
+    );
+    let encoded = serde_json::to_value(&response)?;
+    assert!(encoded["suggestion"].get("uncalled_methods").is_none());
+    assert_eq!(encoded["suggestion"]["confidence"], "low");
     let suggestion = response.suggestion.expect("trait split suggestion");
     assert_eq!(suggestion.trait_name, "Store");
     assert_eq!(suggestion.trait_file, "src/lib.rs");
@@ -881,7 +919,10 @@ fn mcp_usage_matrix_ignores_bare_name_calls_for_java_classes() -> Result<()> {
 
     assert_eq!(response.method_count, 2);
     assert_eq!(response.consumer_count, 1);
-    assert_eq!(response.uncalled_methods, vec!["getName".to_owned()]);
+    assert_eq!(
+        response.methods_without_attributed_callers,
+        vec!["getName".to_owned()]
+    );
     let consumers = response
         .matrix
         .iter()

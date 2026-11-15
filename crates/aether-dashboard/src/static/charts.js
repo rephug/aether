@@ -393,7 +393,6 @@
       const entries = [
         ['Understanding Coverage', Number(d.dimensions.sir_coverage || 0)],
         ['Test Coverage', Number(d.dimensions.test_coverage || 0)],
-        ['Graph Connectivity', Number(d.dimensions.graph_connectivity || 0)],
         ['Coupling Health', Number(d.dimensions.coupling_health || 0)],
         ['Change Risk Health', Number(d.dimensions.drift_health || 0)],
       ];

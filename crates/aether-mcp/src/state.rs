@@ -333,7 +333,15 @@ impl SharedState {
     }
 
     pub async fn surreal_graph_for_health(&self) -> Result<Arc<SurrealGraphStore>, AetherMcpError> {
-        self.surreal_graph().await
+        // A fresh open may safely initialize/replay the projection. A cached
+        // handle must still pass the installed policy before structural reads.
+        let graph = self.surreal_graph().await?;
+        if !self.store.has_graph_projection_provenance()? {
+            return Err(aether_store::StoreError::Compatibility(
+                "native dependency projection needs a writable refresh/reindex before health analysis".to_owned(),
+            ).into());
+        }
+        Ok(graph)
     }
 
     /// Opens the SurrealDB graph in the background, so the first tool that needs it does not

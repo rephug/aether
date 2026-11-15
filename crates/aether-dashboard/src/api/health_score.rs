@@ -132,6 +132,14 @@ pub(crate) async fn load_health_score_data(
 }
 
 pub(crate) async fn load_health_score_report(shared: &SharedState) -> Result<ScoreReport, String> {
+    // Proof readiness can change while a score remains inside its TTL. Do not
+    // serve a cached native score or silently downgrade it to a base-only score.
+    if shared.config.storage.graph_backend == aether_config::GraphBackend::Surreal {
+        shared
+            .surreal_dependency_graph_store()
+            .await
+            .map_err(|err| format!("Health score native graph unavailable: {err}"))?;
+    }
     if let Ok(guard) = shared.caches.health_score_report.read()
         && let Some((captured_at, report)) = guard.as_ref()
         && captured_at.elapsed() < HEALTH_SCORE_CACHE_TTL
@@ -173,7 +181,7 @@ async fn compute_health_score_report(shared: &SharedState) -> Result<ScoreReport
 async fn load_semantic_input(shared: &SharedState) -> Result<Option<SemanticInput>, String> {
     let analyzer = HealthAnalyzer::new(shared.workspace.as_path())
         .map_err(|err| format!("failed to initialize health analyzer: {err}"))?;
-    let graph = match shared.surreal_graph_store().await {
+    let graph = match shared.surreal_dependency_graph_store().await {
         Ok(graph) => graph,
         Err(err) => {
             warn!("health-score semantic graph unavailable: {err}");

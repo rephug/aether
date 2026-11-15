@@ -41,12 +41,14 @@ pub(crate) async fn xray_fragment(
                 }
             }
 
+            p id="xray-graph-coverage" class="text-xs text-text-secondary" { "Graph completeness is unknown." }
+
             div id="xray-metrics-grid" class="grid gap-3 md:grid-cols-2 xl:grid-cols-4" {
                 @for metric in [
                     ("sir_coverage", "Understanding Coverage", "How much of your code has SIR understanding records."),
-                    ("orphan_count", "Isolated Components", "Components that are disconnected from the largest project graph."),
+                    ("orphan_count", "Outside Largest Observed Component", "Indexed symbols outside the largest observed dependency component. Unresolved relationships may connect them; this does not establish unused code."),
                     ("avg_drift", "Average Change Risk", "Mean semantic drift level across analyzed components."),
-                    ("graph_connectivity", "Connected Components", "How connected the code graph is. Higher usually means fewer isolated areas."),
+                    ("graph_connectivity", "Observed Connectivity", "Share of indexed symbols in the largest observed dependency component. Graph coverage is incomplete or unknown; this is not a health grade."),
                     ("high_coupling_pairs", "Strong Connections", "File pairs with high coupling scores that likely change together."),
                     ("sir_coverage_pct", "Understanding Coverage %", "Coverage ratio from 0 to 1 for SIR understanding."),
                     ("index_freshness_secs", "Analysis Freshness", "How recent the current analysis is."),

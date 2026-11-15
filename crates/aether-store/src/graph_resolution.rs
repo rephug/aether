@@ -7,7 +7,8 @@ use super::{StoreError, same_language_family_sql};
 use aether_core::ECMASCRIPT_LANGUAGES;
 use rusqlite::Connection;
 
-const GRAPH_PROVENANCE_SCHEMA_VERSION: u32 = 24;
+const GRAPH_PROVENANCE_SCHEMA_VERSION: u32 = 25;
+pub(crate) const RUST_TARGET_PROOF_VERSION: u32 = 2;
 
 fn supported_graph_schema_version(conn: &Connection) -> Result<u32, StoreError> {
     let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -15,13 +16,49 @@ fn supported_graph_schema_version(conn: &Connection) -> Result<u32, StoreError> 
     Ok(version as u32)
 }
 
+pub(crate) fn rust_target_provenance_ready(conn: &Connection) -> Result<bool, StoreError> {
+    use rusqlite::OptionalExtension;
+    let version = conn
+        .query_row(
+            "SELECT version FROM schema_version WHERE component = 'rust_target_provenance'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    match version {
+        Some(value) if value < 0 || value > i64::from(RUST_TARGET_PROOF_VERSION) => {
+            Err(StoreError::Compatibility(format!(
+                "unsupported Rust target-proof version {value}; this build supports {RUST_TARGET_PROOF_VERSION}"
+            )))
+        }
+        Some(value) => Ok(value == i64::from(RUST_TARGET_PROOF_VERSION)),
+        None => Ok(false),
+    }
+}
+
+fn graph_provenance_schema_ready(conn: &Connection) -> Result<bool, StoreError> {
+    Ok(
+        supported_graph_schema_version(conn)? >= GRAPH_PROVENANCE_SCHEMA_VERSION
+            && rust_target_provenance_ready(conn)?,
+    )
+}
+
 impl super::SqliteStore {
-    /// Whether the actual catalog schema can express graph target provenance.
-    /// This read-only capability check does not consult migration receipt metadata
-    /// or turn unsupported future schemas and database errors into missing features.
+    /// Whether the actual catalog schema and installed proof policy can safely
+    /// expose graph relationships. Unsupported future versions and database
+    /// errors propagate rather than becoming missing-feature answers.
     pub fn has_graph_provenance_schema(&self) -> Result<bool, StoreError> {
         let conn = self.lock_connection()?;
-        Ok(supported_graph_schema_version(&conn)? >= GRAPH_PROVENANCE_SCHEMA_VERSION)
+        graph_provenance_schema_ready(&conn)
+    }
+
+    /// Whether the catalog marks its native structural graph projection current
+    /// for the installed target-proof policy. Callers holding a native handle
+    /// must check this separately from canonical SQL graph capability. This does
+    /// not open the native backend or promise atomic cross-database freshness.
+    pub fn has_graph_projection_provenance(&self) -> Result<bool, StoreError> {
+        let conn = self.lock_connection()?;
+        graph_projection_provenance_for_connection(&conn)
     }
 }
 
@@ -33,6 +70,11 @@ pub(crate) fn require_graph_provenance_schema(conn: &Connection) -> Result<(), S
         return Err(StoreError::Compatibility(format!(
             "graph target provenance requires core schema {GRAPH_PROVENANCE_SCHEMA_VERSION} (found {version}); open the workspace writable and reindex before reading graph relationships"
         )));
+    }
+    if !rust_target_provenance_ready(conn)? {
+        return Err(StoreError::Compatibility(
+            "Rust target-proof policy needs a writable upgrade and structural reindex before reading graph relationships".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -48,8 +90,11 @@ pub(crate) fn graph_projection_provenance_ready(
     }
     let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    let version: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version < 24 {
+    graph_projection_provenance_for_connection(&conn)
+}
+
+fn graph_projection_provenance_for_connection(conn: &Connection) -> Result<bool, StoreError> {
+    if !graph_provenance_schema_ready(conn)? {
         return Ok(false);
     }
     use rusqlite::OptionalExtension;
@@ -531,7 +576,7 @@ mod tests {
         drop(conn);
         let result = crate::SurrealGraphStore::open_readonly(temp.path()).await;
         assert!(
-            matches!(result, Err(crate::StoreError::Compatibility(message)) if message.contains("core schema 24"))
+            matches!(result, Err(crate::StoreError::Compatibility(message)) if message.contains("core schema 25"))
         );
         assert!(!temp.path().join(".aether/graph").exists());
         let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -584,7 +629,7 @@ mod tests {
         let conn = Connection::open(temp.path().join(".aether/meta.sqlite"))?;
         // The metadata receipt deliberately stays current while the actual schema
         // version varies, as legacy readonly consumers must use the actual shape.
-        for version in [0, 23] {
+        for version in [0, 23, 24] {
             conn.pragma_update(None, "user_version", version)?;
             assert!(!store.has_graph_provenance_schema()?);
             let actual: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;

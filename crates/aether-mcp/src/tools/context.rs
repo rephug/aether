@@ -695,8 +695,18 @@ fn build_graph_layer(
         Err(err) => return format!("Unavailable: failed to build graph context: {err}"),
     };
 
+    let coverage = match store.call_edge_coverage_for_sources(std::slice::from_ref(&record.id)) {
+        Ok(coverage) => coverage,
+        Err(err) => return format!("Unavailable: failed to count recorded graph calls: {err}"),
+    };
+    let coverage_note = format!(
+        "Recorded outgoing calls for this symbol: {}; {} resolved, {} ambiguous, {} unresolved. Incoming caller completeness: unknown.",
+        coverage.call_edges, coverage.resolved, coverage.ambiguous, coverage.unresolved
+    );
     if entries.is_empty() {
-        return "No callers or dependencies recorded.".to_owned();
+        return format!(
+            "{coverage_note}\nNo attributed callers or resolved dependency targets are listed."
+        );
     }
 
     let callers = entries
@@ -712,10 +722,10 @@ fn build_graph_layer(
         .filter(|entry| entry.section == "transitive_dependencies")
         .collect::<Vec<_>>();
 
-    let mut sections = Vec::<String>::new();
+    let mut sections = vec![coverage_note];
     sections.push(format!("### Callers ({})", callers.len()));
     if callers.is_empty() {
-        sections.push("- none".to_owned());
+        sections.push("- no attributed callers listed; completeness is unknown".to_owned());
     } else {
         sections.extend(callers.into_iter().map(|entry| {
             format!(
@@ -728,7 +738,7 @@ fn build_graph_layer(
     sections.push(String::new());
     sections.push(format!("### Callees ({})", callees.len()));
     if callees.is_empty() {
-        sections.push("- none".to_owned());
+        sections.push("- no resolved dependency targets listed".to_owned());
     } else {
         sections.extend(callees.into_iter().map(|entry| {
             format!(
@@ -1579,7 +1589,90 @@ vector_backend = "sqlite"
 
         let graph = super::build_graph_layer(store, temp.path(), &record, 1);
         assert!(graph.contains("### Callees (2)"), "{graph}");
+        assert!(
+            graph.contains("2; 1 resolved, 0 ambiguous, 1 unresolved"),
+            "{graph}"
+        );
         assert!(graph.contains("`callee` (src/lib.rs) [calls]"), "{graph}");
+    }
+
+    #[test]
+    fn graph_layer_keeps_unresolved_calls_visible_when_no_target_is_listed() {
+        let temp = tempdir().expect("tempdir");
+        let symbols = seed_workspace(temp.path(), false);
+        let helper = symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "helper")
+            .expect("helper");
+        let server = AetherMcpServer::new(temp.path(), false).expect("server");
+        let store = server.state.store.as_ref();
+        store
+            .upsert_edges(&[SymbolEdge {
+                source_id: helper.id.clone(),
+                target_qualified_name: "callback".to_owned(),
+                target_symbol_id: None,
+                target_file_path: None,
+                edge_kind: EdgeKind::Calls,
+                file_path: helper.file_path.clone(),
+            }])
+            .expect("raw reference");
+        let graph = super::build_graph_layer(store, temp.path(), &symbol_record(helper), 1);
+        assert!(
+            graph.contains("1; 0 resolved, 0 ambiguous, 1 unresolved"),
+            "{graph}"
+        );
+        assert!(
+            graph.contains("Incoming caller completeness: unknown"),
+            "{graph}"
+        );
+        assert!(
+            graph.contains("No attributed callers or resolved dependency targets are listed"),
+            "{graph}"
+        );
+        assert!(
+            !graph.contains("No callers or dependencies recorded"),
+            "{graph}"
+        );
+    }
+
+    #[test]
+    fn graph_layer_reports_failed_or_pending_graphs_as_unavailable() {
+        let temp = tempdir().expect("tempdir");
+        let symbols = seed_workspace(temp.path(), false);
+        let record = symbol_record(&symbols[0]);
+        let server = AetherMcpServer::new(temp.path(), false).expect("server");
+        let connection = rusqlite::Connection::open(temp.path().join(".aether/meta.sqlite"))
+            .expect("connection");
+        let proof_version: i64 = connection
+            .query_row(
+                "SELECT version FROM schema_version WHERE component = 'rust_target_provenance'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("installed proof version");
+        connection
+            .execute(
+                "UPDATE schema_version SET version = 0 WHERE component = 'rust_target_provenance'",
+                [],
+            )
+            .expect("pending proof policy");
+        let pending =
+            super::build_graph_layer(server.state.store.as_ref(), temp.path(), &record, 1);
+        assert!(pending.starts_with("Unavailable:"), "{pending}");
+        assert!(pending.contains("reindex"), "{pending}");
+        connection
+            .execute(
+                "UPDATE schema_version SET version = ?1 WHERE component = 'rust_target_provenance'",
+                [proof_version],
+            )
+            .expect("restore proof policy before independent SQL failure");
+        connection
+            .execute("DROP TABLE symbol_edges", [])
+            .expect("failed graph table");
+        let failed = super::build_graph_layer(server.state.store.as_ref(), temp.path(), &record, 1);
+        assert!(failed.starts_with("Unavailable:"), "{failed}");
+        assert!(!failed.contains("0 unresolved"), "{failed}");
+        assert!(failed.contains("symbol_edges"), "{failed}");
     }
 
     #[test]

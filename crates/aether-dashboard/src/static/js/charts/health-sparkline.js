@@ -35,9 +35,14 @@
       .attr('r', 3).attr('fill', color);
   }
 
-  function renderCards(container, metrics) {
+  function renderCards(container, metrics, coverage) {
     container.innerHTML = '';
     if (!metrics || !metrics.length) { empty(container, 'No health metrics available'); return; }
+
+    const note = document.createElement('p');
+    note.className = 'text-xs text-text-secondary col-span-full';
+    note.textContent = coverage?.note || 'Graph completeness is unknown.';
+    container.appendChild(note);
 
     metrics.forEach((m) => {
       const color = STATUS_COLORS[m.status] || '#94a3b8';
@@ -73,7 +78,10 @@
 
     fetch('/api/v1/health-scorecard', { headers: { Accept: 'application/json' } })
       .then((r) => r.json())
-      .then((json) => renderCards(container, (json.data || json).metrics))
+      .then((json) => {
+        const data = json.data || json;
+        renderCards(container, data.metrics, data.graph_coverage);
+      })
       .catch(() => empty(container, 'Failed to load health scorecard'));
   };
 })();

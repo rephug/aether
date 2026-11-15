@@ -240,7 +240,11 @@ fn schema21_upgrade_retains_existing_evidence_and_adds_retirement_tables() {
     let temp = tempdir().expect("tempdir");
     let store = SqliteStore::open(temp.path()).expect("open store");
     seed_live_symbol_cleanup_state(&store, "upgrade");
-    store.conn.lock().expect("lock").execute_batch("DROP TABLE retirement_cleanup; DROP TABLE symbol_lineage; DROP TABLE symbol_retirements; PRAGMA user_version = 21; UPDATE schema_version SET version = 21 WHERE component = 'core';").expect("schema21 fixture");
+    {
+        let conn = store.conn.lock().expect("lock");
+        restore_pre_provenance_edge_fixture(&conn).expect("historical graph fixture");
+        conn.execute_batch("DROP TABLE retirement_cleanup; DROP TABLE symbol_lineage; DROP TABLE symbol_retirements; PRAGMA user_version = 21; UPDATE schema_version SET version = 21 WHERE component = 'core';").expect("schema21 fixture");
+    }
     drop(store);
     let store = SqliteStore::open(temp.path()).expect("upgrade fixture");
     assert_eq!(

@@ -79,6 +79,49 @@ such as `Store::create()` and the same bounded nominal receiver forms on importe
 concrete struct types. The defining files are tracked so their changes can invalidate
 callers' extracted proof.
 
+An attribute on a Rust `use` makes its introduced names uncertain. Enabled and
+disabled `cfg` conditions are both conservative because the extractor does not
+evaluate build context. Exact, unqualified `cfg`, `allow`, `warn`, `deny`,
+`forbid`, `expect` and `doc` attributes use name-specific uncertainty: those names
+cannot provide ID/file evidence or fall through to an outer declaration, while
+unrelated free-function bindings can retain proof. Aliases and grouped imports,
+including `dep::{self}`, obey the same rule. An attributed wildcard import can
+make any imported name uncertain.
+
+Unknown attributes and `cfg_attr` can expand into additional bindings, so lookups
+through their affected scope remain uncertain even for names absent from the
+written import. A procedural attribute on `use dep::helper` could instead create
+a function that shadows an outer `stable`; simply blocking `helper` is insufficient.
+Comments are neither attributes nor wildcard imports. Unsupported attributed
+call/import references remain recorded for later re-extraction rather than becoming
+graph relationships. The existing extractor can omit unresolved type-reference and
+implementation edges. General dot-call dispatch retains its broader competing-trait
+checks, so an unrelated unmodelled import may still withhold receiver proof.
+
+Non-`use` items also affect binding proof. An unknown procedural attribute or
+`cfg_attr` on a function, struct, constant or other sibling item in a block can
+introduce a new binding, including a `let` that shadows an existing same-block
+function. Unqualified binding lookups through that block therefore withhold
+ID/file proof. Calls retain raw references; existing unresolved type-reference and
+implementation endpoints can still be omitted. Explicit qualified paths can retain
+their supported proof. Custom derives are treated as possible expansion, including
+derive spellings such
+as `Debug` and `Clone` that can be shadowed by imported procedural macros. A separate
+unaffected block can still prove its supported calls.
+
+Known inert, unqualified built-in item attributes, such as `inline`, `repr` and
+diagnostic attributes, do not suppress unrelated sibling binding proof. This does
+not relax the conservative policy for an attributed caller or target declaration.
+Scoped, raw or unrecognized attribute forms remain uncertain.
+
+At module scope, supported direct free-function and static-member proofs can remain:
+expansion cannot replace an existing same-scope written binding with another item
+of that name in a valid Rust program without a duplicate-definition error. However,
+item or derive expansion can supply competing trait implementations. Dot-call proof
+is withheld when those candidates are unmodelled, including in a verified external
+target file; an otherwise supported explicit static/UFCS call can retain proof.
+These are bounded syntax rules, not a complete Rust macro or attribute evaluator.
+
 Direct statement/item macro invocations in a lookup scope, including trait and implementation
 member macros, withhold Rust target proof because they can introduce hidden bindings.
 Macros nested inside another expression or a separate method body do not by themselves
@@ -134,13 +177,45 @@ After manifest or layout changes involving such unobserved metadata, a full rein
 is required. Automatic stale-reader refresh applies to observed changes; this slice
 does not bypass workspace ignore rules to watch metadata.
 
-Schema 24 preserves legacy raw edges and rebuilds SQLite neighbors without unproven
-Rust and ECMAScript links. Readonly graph operations on an older schema report that a
-writable migration is needed. SurrealDB uses a durable provenance receipt: readonly
-opens refuse a pending rebuild; writable opens clear structural projections and replay
-a consistent snapshot of canonical nodes and proved edges before completing the receipt.
-A normal index/startup re-extracts source files to populate target evidence for legacy
-rows; the migration cannot reconstruct lexical bindings from old names.
+Schema 24 introduced explicit edge evidence. Core schema 25 supplies the internal
+writer-version and per-write-generation layout. The semantic Rust target-proof
+receipt is versioned separately: policy 2 covers the non-`use` item expansion rules
+above as well as attributed imports. A writable open upgrades an older or missing
+Rust-proof receipt to 2 even when core schema 25 is already installed, invalidating
+historical Rust ID/file hints again. Core schema remains 25.
+
+Invalidation preserves historical target spelling, symbol identities, SIR payloads,
+history and contracts, rebuilds SQLite neighbors, and marks native projections for
+replay. The historical spelling is not necessarily the original call literal: an
+earlier import proof may already have rewritten it. A normal index/startup
+re-extracts accepted source files, including unchanged files, to restore supported
+evidence and current raw references. Until then, cleared Rust hints remain unresolved.
+Neither a layout upgrade nor proof invalidation can reconstruct lexical bindings
+from stored names.
+
+Stop older Aether processes **before** a writable upgrade, then restart them with
+the corrected build. SQLite triggers reject proof-bearing writes using an older
+writer version or an invalid per-write generation, including those from an
+already-open old connection. Unclassified legacy proof writes are also fenced so
+publishing a Rust source cannot activate an unchecked orphan edge. Raw references
+remain writable, and positively identified non-Rust sources retain their existing
+resolution policy. This is a proof-write fence, not a general write fence: an old
+compiled policy-1 `DELETE` can still remove edges and is not rejected by these
+triggers. The fence does not make in-flight older processes or arbitrary SQL safe.
+
+Readonly graph operations require core schema 25 and Rust-proof receipt 2. Symbol
+and SIR reads remain available on supported older catalogs. SurrealDB also uses a
+durable projection receipt: readonly opens refuse a pending rebuild; writable
+opens clear structural projections and replay a consistent snapshot of canonical
+nodes and proved edges before completing the receipt. Older native graph handles
+cannot be retroactively replaced by a SQLite upgrade. These receipts do not provide
+an atomic transaction across the SQLite and native databases. Replaying the native
+projection alone does not re-extract source or restore cleared Rust evidence.
+
+An absent proved edge is not evidence that a call does not exist. In particular,
+attributes, unsupported dispatch and missing indexed declarations can leave real
+calls unresolved. This correction preserves conservative graph resolution; it
+does not establish whole-program caller completeness.
 
 Symbol-free file-level references remain raw evidence rather than traversable symbol
 nodes. Rust raw identifiers, generic implementation dispatch, and generic/turbofish call
@@ -165,3 +240,21 @@ constructor positives alongside mutable, shadowed, generic and trait-ambiguous
 negatives. MCP regressions preserve parsed usage-matrix and selected-symbol callers;
 context regressions keep distinct proved targets that share a spelling, and watcher
 regressions move imported targets after an edit outside the caller's symbol body.
+
+The attributed-import regressions cover disabled and enabled conditions, local
+IDs and cross-file hints, aliases, grouped `self`, comments, and type/implementation
+endpoints. `crates/aether-parse/tests/rust_attribute_provenance.rs` adds block
+function/struct/constant expansion, conditional attributes, custom and shadowed
+derives, inert built-in controls, module free/static proofs and competing receiver
+dispatch. Store upgrade tests reconstruct schema 24 and policy-1 schema-25 catalogs,
+keep an old writer open across upgrade, and check repeated invalidation, proof-write
+rejection and preservation of non-graph data.
+
+Daemon regressions seed stale proof content and verify a normal unchanged-source
+index refreshes it without replacing SIR or contracts. The non-`use` lifecycle cases
+in `crates/aetherd/src/indexer/attribute_expansion_tests.rs` cover local ID and
+external file proofs for attributed sibling functions, structs and constants.
+They retain a separate unaffected control call, remove and restore the attribute,
+and check proof restoration/withdrawal while preserving written identities, SIR
+payloads and history, mirrors and contracts. Source edits may update freshness
+metadata; they do not regenerate the retained explanations.

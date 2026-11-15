@@ -19,13 +19,16 @@ pub(crate) async fn health_fragment(
     .unwrap_or_else(|err| {
         tracing::warn!(error = %err, "dashboard: failed to load health fragment data");
         health::HealthData {
+            graph_coverage: aether_analysis::ObservedGraphCoverage::unavailable(
+                "Health analysis timed out or failed to load",
+            ),
             analysis_available: false,
             overall_score: None,
             notes: vec!["Health analysis timed out or failed to load.".to_owned()],
             dimensions: health::HealthDimensions {
                 sir_coverage: 0.0,
                 test_coverage: 0.0,
-                graph_connectivity: 0.0,
+                graph_connectivity: None,
                 coupling_health: 0.0,
                 drift_health: 0.0,
             },
@@ -42,8 +45,8 @@ pub(crate) async fn health_fragment(
             (support::explanation_header(
                 "Project Health Check",
                 "AETHER measures your codebase across several dimensions. Higher scores are better.",
-                "These scores summarize quality, test coverage, connectivity, and freshness.",
-                "Composite health dimensions across SIR, testing, connectivity, coupling, and drift."
+                "These scores summarize quality, test coverage, coupling, and freshness. Observed connectivity is informational.",
+                "Composite health dimensions across SIR, testing, coupling, and drift; observed connectivity is excluded from the score."
             ))
 
             div class="flex items-center justify-between gap-3" {
@@ -70,8 +73,13 @@ pub(crate) async fn health_fragment(
                         (support::help_icon("Share of components linked to tests. Low coverage means more unverified behavior."))
                     }
                     span class="badge badge-purple inline-flex gap-1 items-center" {
-                        "Connected Components " (format!("{:.0}%", data.dimensions.graph_connectivity * 100.0))
-                        (support::help_icon("How much of the code graph is connected to the main component network. Low values may indicate isolated or dead code."))
+                        "Observed Connectivity "
+                        @if let Some(value) = data.dimensions.graph_connectivity {
+                            (format!("{:.0}%", value * 100.0))
+                        } @else {
+                            "Unavailable"
+                        }
+                        (support::help_icon("Share of indexed symbols in the largest observed dependency component. Missing relationships can split components; this is not a health penalty or dead-code finding."))
                     }
                     span class="badge badge-yellow inline-flex gap-1 items-center" {
                         "Connection Health " (format!("{:.0}%", data.dimensions.coupling_health * 100.0))
@@ -84,6 +92,9 @@ pub(crate) async fn health_fragment(
                     @if !data.analysis_available {
                         span class="badge badge-red" { "Analysis unavailable" }
                     }
+                }
+                p class="mt-3 text-xs text-text-secondary" data-graph-coverage="observed" {
+                    (data.graph_coverage.note.as_str())
                 }
                 @if !data.notes.is_empty() {
                     ul class="mt-3 space-y-1 text-xs text-text-secondary" {
@@ -141,8 +152,10 @@ pub(crate) async fn health_fragment(
                 div class="space-y-4" {
                     div class="rounded-xl border border-surface-3/40 bg-surface-1/40 p-4" {
                         h3 class="text-sm font-semibold mb-2" { "Cycles" }
-                        @if data.cycles.is_empty() {
-                            (support::html_empty_state("No cycles detected", None))
+                        @if !data.analysis_available {
+                            (support::html_empty_state("Cycle analysis unavailable", None))
+                        } @else if data.cycles.is_empty() {
+                            (support::html_empty_state("No cycles observed in the available subgraph", None))
                         } @else {
                             ul class="space-y-2 text-xs" {
                                 @for cycle in data.cycles.iter().take(12) {
@@ -156,15 +169,18 @@ pub(crate) async fn health_fragment(
                     }
 
                     div class="rounded-xl border border-surface-3/40 bg-surface-1/40 p-4" {
-                        h3 class="text-sm font-semibold mb-2" { "Orphans" }
-                        @if data.orphans.is_empty() {
-                            (support::html_empty_state("No orphan subgraphs detected", None))
+                        h3 class="text-sm font-semibold mb-2" { "Observed Disconnected Components" }
+                        @if !data.analysis_available {
+                            (support::html_empty_state("Disconnected component analysis unavailable", None))
+                        } @else if data.orphans.is_empty() {
+                            (support::html_empty_state("No disconnected components observed in the available subgraph", None))
                         } @else {
                             ul class="space-y-2 text-xs" {
                                 @for orphan in data.orphans.iter().take(12) {
                                     li class="rounded-md border border-surface-3/30 p-2" {
                                         div class="font-medium" { "Subgraph #" (orphan.subgraph_id) }
                                         div class="text-text-secondary" { (orphan.symbols.join(", ")) }
+                                        div class="text-text-muted" { (orphan.note.as_str()) }
                                     }
                                 }
                             }
@@ -191,13 +207,6 @@ fn primary_recommendation(data: &health::HealthData, index_age_seconds: Option<i
             "test_coverage",
             data.dimensions.test_coverage,
             "🧪 Less than half your components have tests.",
-        ));
-    }
-    if data.dimensions.graph_connectivity < 0.60 {
-        candidates.push((
-            "graph_connectivity",
-            data.dimensions.graph_connectivity,
-            "🔗 Some components are isolated. May indicate dead code.",
         ));
     }
     if index_age_seconds.unwrap_or(0) > 24 * 60 * 60 {

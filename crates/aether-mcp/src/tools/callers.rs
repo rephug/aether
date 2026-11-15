@@ -30,7 +30,9 @@ pub(crate) struct CallerCoverage {
     /// Those whose call also fits other symbols the caller's file and module don't rule
     /// out: not attributed, so the symbol may have more callers than listed.
     pub(crate) ambiguous: u32,
-    /// Those whose call resolves to another symbol of the same name.
+    /// Matching recorded references without sufficient target evidence.
+    pub(crate) unresolved: u32,
+    /// Target evidence rules out this selection in favor of other symbols.
     pub(crate) resolved_elsewhere: u32,
 }
 
@@ -73,6 +75,7 @@ impl<'a> CallerAttribution<'a> {
         // Callers left out, by why; a caller attributed through another edge is not.
         let mut ambiguous = HashSet::<String>::new();
         let mut elsewhere = HashSet::<String>::new();
+        let mut unresolved = HashSet::<String>::new();
         let mut heuristic = 0;
         for target in &call_targets_of(symbol) {
             for edge in SymbolRelationStore::get_callers(self.store, target)? {
@@ -86,6 +89,7 @@ impl<'a> CallerAttribution<'a> {
                 if resolution.reaches(symbol) {
                     ambiguous.remove(&caller.id);
                     elsewhere.remove(&caller.id);
+                    unresolved.remove(&caller.id);
                     if edge.target_symbol_id.is_none()
                         && edge.target_file_path.is_none()
                         && heuristic_attribution(
@@ -104,8 +108,14 @@ impl<'a> CallerAttribution<'a> {
                         if candidates.iter().any(|candidate| candidate.id == symbol.id)
                 ) {
                     elsewhere.remove(&caller.id);
+                    unresolved.remove(&caller.id);
                     ambiguous.insert(caller.id);
-                } else if !ambiguous.contains(&caller.id) {
+                } else if matches!(resolution, NameResolution::NotFound) {
+                    if !ambiguous.contains(&caller.id) {
+                        elsewhere.remove(&caller.id);
+                        unresolved.insert(caller.id);
+                    }
+                } else if !ambiguous.contains(&caller.id) && !unresolved.contains(&caller.id) {
                     elsewhere.insert(caller.id);
                 }
             }
@@ -114,8 +124,10 @@ impl<'a> CallerAttribution<'a> {
         self.coverage.attributed += count(callers.len());
         self.coverage.heuristic += heuristic;
         self.coverage.ambiguous += count(ambiguous.len());
+        self.coverage.unresolved += count(unresolved.len());
         self.coverage.resolved_elsewhere += count(elsewhere.len());
-        self.coverage.name_matches += count(callers.len() + ambiguous.len() + elsewhere.len());
+        self.coverage.name_matches +=
+            count(callers.len() + ambiguous.len() + unresolved.len() + elsewhere.len());
 
         let mut callers = callers.into_values().collect::<Vec<_>>();
         callers.sort_by(|left, right| {

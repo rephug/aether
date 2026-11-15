@@ -527,6 +527,7 @@ fn collect_use_path_entries(
 
             let mut path = prefix.to_vec();
             path.extend(collect_type_path_segments(path_node, source));
+            let path = normalize_use_self_path(path);
             if path.is_empty() {
                 return;
             }
@@ -557,7 +558,17 @@ fn collect_use_path_entries(
     }
 }
 
+/// A grouped `dep::{self}` introduces `dep`, and `dep::{self as alias}`
+/// refers to that module rather than a child named `self`.
+fn normalize_use_self_path(mut path: Vec<String>) -> Vec<String> {
+    if path.len() > 1 && path.last().is_some_and(|part| part == "self") {
+        path.pop();
+    }
+    path
+}
+
 fn insert_use_path(path: Vec<String>, out: &mut HashMap<String, Vec<Vec<String>>>) {
+    let path = normalize_use_self_path(path);
     let Some(visible_name) = path.last().cloned() else {
         return;
     };

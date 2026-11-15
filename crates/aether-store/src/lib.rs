@@ -136,7 +136,7 @@ pub(crate) use symbols::{
 const SYMBOL_ACCESS_COUNTER_MAX: i64 = i64::MAX;
 /// Highest core schema supported by this build. Read-only clients may open older
 /// schemas; writable opening performs transactional forward migrations.
-pub const CORE_SCHEMA_VERSION: u32 = 24;
+pub const CORE_SCHEMA_VERSION: u32 = 25;
 /// First core schema with explicit per-incarnation history archives.
 pub const SYMBOL_HISTORY_SCHEMA_VERSION: u32 = 22;
 /// First core schema with durable retirement projection cleanup receipts.

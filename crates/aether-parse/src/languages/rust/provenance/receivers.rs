@@ -6,8 +6,8 @@ use tree_sitter::Node;
 
 use super::{
     attributed, children, collect_use_path_entries, contains_identifier, extern_binding,
-    lexical_scopes, local_item, name, node_text, scope_macros, shadowed, simple_path,
-    symbol_for_node,
+    lexical_scopes, local_item, name, node_text, scope_has_unmodelled_item_expansion, scope_macros,
+    shadowed, simple_path, symbol_for_node, use_tree_has_glob,
 };
 
 pub(super) struct Receiver<'tree> {
@@ -60,7 +60,12 @@ pub(super) fn inherent_method<'tree>(
     source: &[u8],
     receiver_call: bool,
 ) -> Option<Node<'tree>> {
-    if !nominal_struct(nominal, false) {
+    if !nominal_struct(nominal, false)
+        || (receiver_call
+            && nominal
+                .parent()
+                .is_some_and(|scope| scope_has_unmodelled_item_expansion(scope, source)))
+    {
         return None;
     }
     let type_name = name(nominal, source)?;
@@ -80,7 +85,9 @@ pub(super) fn inherent_method<'tree>(
         let Some(body) = implementation.child_by_field_name("body") else {
             continue;
         };
-        if scope_macros(body) {
+        if scope_macros(body)
+            || (receiver_call && scope_has_unmodelled_item_expansion(body, source))
+        {
             return None;
         }
         for method in children(body).into_iter().filter(|item| {
@@ -192,7 +199,7 @@ pub(super) fn dispatch_scope_safe(
         return false;
     }
     for scope in lexical_scopes(call) {
-        if scope_macros(scope) {
+        if scope_macros(scope) || scope_has_unmodelled_item_expansion(scope, source) {
             return false;
         }
         for item in children(scope) {
@@ -202,6 +209,7 @@ pub(super) fn dispatch_scope_safe(
             if item.kind() == "trait_item"
                 && item.child_by_field_name("body").is_some_and(|body| {
                     scope_macros(body)
+                        || scope_has_unmodelled_item_expansion(body, source)
                         || children(body)
                             .into_iter()
                             .any(|member| name(member, source).as_deref() == Some(method))
@@ -212,7 +220,7 @@ pub(super) fn dispatch_scope_safe(
             if item.kind() != "use_declaration" {
                 continue;
             }
-            if node_text(item, source).contains('*') || attributed(item) {
+            if use_tree_has_glob(item) || attributed(item) {
                 return false;
             }
             let mut imports = HashMap::new();

@@ -42,6 +42,10 @@ use crate::sir_pipeline::{
     SirPipeline, acquire_inject_write_lock, build_job,
 };
 
+#[cfg(test)]
+mod attribute_expansion_tests;
+#[cfg(test)]
+mod attributed_import_tests;
 mod enrichment;
 mod git_watch;
 #[cfg(test)]

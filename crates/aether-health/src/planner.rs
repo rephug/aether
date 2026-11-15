@@ -59,7 +59,9 @@ pub struct TraitSplitSuggestion {
     pub method_count: usize,
     pub suggested_traits: Vec<SuggestedSubTrait>,
     pub cross_cutting_methods: Vec<CrossCuttingMethod>,
-    pub uncalled_methods: Vec<String>,
+    /// No observed attributed consumers; this does not establish an unused method.
+    #[serde(alias = "uncalled_methods")]
+    pub methods_without_attributed_callers: Vec<String>,
     pub confidence: SplitConfidence,
 }
 
@@ -68,6 +70,7 @@ pub struct SuggestedSubTrait {
     pub name: String,
     pub methods: Vec<String>,
     pub consumer_files: Vec<String>,
+    /// Isolation within the supplied observations, not all program callers.
     pub consumer_isolation: f32,
     pub dominant_dependencies: Vec<String>,
     pub reason: String,
@@ -168,7 +171,7 @@ pub fn suggest_split(
                 name: module_name,
                 symbols: unique_symbol_names(plan.symbol_names.as_slice()),
                 reason: format!(
-                    "These {} symbols cluster around {} responsibilities",
+                    "These {} observed symbols cluster around {} responsibilities",
                     plan.symbols.len(),
                     reason_token,
                 ),
@@ -195,7 +198,9 @@ pub fn suggest_split(
             target_file,
             suggested_modules,
             expected_score_impact,
-            confidence: split_confidence(diagnostics.confidence),
+            // Cluster fit is an observation, not proof that omitted callers cannot
+            // change the architectural split. Preserve diagnostics separately.
+            confidence: SplitConfidence::Low,
         },
         diagnostics,
     ))
@@ -243,13 +248,13 @@ pub fn suggest_trait_split(
         consumer_method_sets.push(used_methods);
     }
 
-    let mut uncalled_methods = method_consumers
+    let mut methods_without_attributed_callers = method_consumers
         .iter()
         .enumerate()
         .filter(|(_, consumers)| consumers.is_empty())
         .map(|(index, _)| method_names[index].clone())
         .collect::<Vec<_>>();
-    uncalled_methods.sort();
+    methods_without_attributed_callers.sort();
 
     let called_methods = method_consumers
         .iter()
@@ -288,7 +293,8 @@ pub fn suggest_trait_split(
             .then_with(|| right.len().cmp(&left.len()))
     });
 
-    if clusters.is_empty() || (clusters.len() < 2 && uncalled_methods.is_empty()) {
+    // Missing attributed callers alone must not create an architectural split.
+    if clusters.len() < 2 {
         return None;
     }
 
@@ -349,13 +355,13 @@ pub fn suggest_trait_split(
 
         let reason = if dominant_dependencies[index].is_empty() {
             format!(
-                "Co-consumed by {} files with {:.0}% isolated usage",
+                "Observed in {} attributed consumer files with {:.0}% isolation in that matrix",
                 consumer_files.len(),
                 consumer_isolation * 100.0
             )
         } else {
             format!(
-                "Co-consumed by {} files with {:.0}% isolated usage; dominant deps: {}",
+                "Observed in {} attributed consumer files with {:.0}% isolation in that matrix; dominant deps: {}",
                 consumer_files.len(),
                 consumer_isolation * 100.0,
                 dominant_dependencies[index].join(", ")
@@ -400,12 +406,12 @@ pub fn suggest_trait_split(
                         .map(|(index, _)| cluster_names[index].as_str())
                         .unwrap_or("unknown");
                     format!(
-                        "Structurally belongs in {} due to shared dependency types, but usage heavily overlaps with {}.",
+                        "Observed shared dependency types associate this method with {}, while attributed usage overlaps {}.",
                         home_cluster,
                         overlapping_clusters.join(", ")
                     )
                 } else {
-                    format!("Consumers overlap {} clusters", overlapping_clusters.len())
+                    format!("Observed consumers overlap {} clusters", overlapping_clusters.len())
                 },
                 overlapping_clusters,
             });
@@ -413,27 +419,9 @@ pub fn suggest_trait_split(
     }
     cross_cutting_methods.sort_by(|left, right| left.method.cmp(&right.method));
 
-    let low_isolation_count = suggested_traits
-        .iter()
-        .filter(|suggestion| suggestion.consumer_isolation < 0.3)
-        .count();
-    let confidence = if !use_dependency_clustering {
-        SplitConfidence::Low
-    } else if !suggested_traits.is_empty()
-        && suggested_traits
-            .iter()
-            .all(|suggestion| suggestion.consumer_isolation >= 0.6)
-        && cross_cutting_methods.is_empty()
-    {
-        SplitConfidence::High
-    } else if cross_cutting_methods.len() >= 3
-        || low_isolation_count >= 2
-        || low_isolation_count * 2 >= suggested_traits.len().max(1)
-    {
-        SplitConfidence::Low
-    } else {
-        SplitConfidence::Medium
-    };
+    // Consumer observations have no proof of incoming completeness. Aligned SIR
+    // dependencies and apparently isolated usage cannot upgrade that uncertainty.
+    let confidence = SplitConfidence::Low;
 
     Some(TraitSplitSuggestion {
         trait_name,
@@ -441,7 +429,7 @@ pub fn suggest_trait_split(
         method_count: methods.len(),
         suggested_traits,
         cross_cutting_methods,
-        uncalled_methods,
+        methods_without_attributed_callers,
         confidence,
     })
 }
@@ -587,16 +575,6 @@ fn suggested_file_path(file_path: &str, module_name: &str) -> String {
         format!("{dir}/{file_name}")
     } else {
         file_name
-    }
-}
-
-fn split_confidence(confidence: f32) -> SplitConfidence {
-    if confidence >= 0.7 {
-        SplitConfidence::High
-    } else if confidence >= 0.4 {
-        SplitConfidence::Medium
-    } else {
-        SplitConfidence::Low
     }
 }
 
@@ -1161,7 +1139,7 @@ mod tests {
         ConsumerMethodUsage, FileCommunityConfig, FileSymbol, SplitConfidence, TraitMethod,
         agglomerative_trait_clusters, build_filtered_dep_sets, disambiguated_module_names,
         fallback_module_name, module_name_for_tokens, normalize_token, ranked_tokens,
-        split_confidence, suggest_split, suggest_trait_split, suggested_file_path,
+        suggest_split, suggest_trait_split, suggested_file_path,
     };
     use crate::planner_communities::detect_file_communities;
     use aether_core::SymbolKind;
@@ -1361,13 +1339,10 @@ mod tests {
                 .iter()
                 .any(|module| module.suggested_file_path.ends_with("/notes.rs"))
         );
-        assert!(matches!(
-            suggestion.confidence,
-            SplitConfidence::High | SplitConfidence::Medium | SplitConfidence::Low
-        ));
-        assert_eq!(
-            split_confidence(diagnostics.confidence),
-            suggestion.confidence
+        assert_eq!(suggestion.confidence, SplitConfidence::Low);
+        assert!(
+            diagnostics.confidence >= 0.7,
+            "strong observed fit is retained separately: {diagnostics:?}"
         );
     }
 
@@ -1515,7 +1490,7 @@ mod tests {
     }
 
     #[test]
-    fn trait_split_reports_uncalled_methods_separately() {
+    fn trait_split_reports_methods_without_attributed_callers_separately() {
         let methods = vec![
             trait_method("alpha"),
             trait_method("beta"),
@@ -1531,8 +1506,74 @@ mod tests {
         let suggestion = suggest_trait_split("Store", "src/store.rs", &methods, &consumers, None)
             .expect("trait split suggestion");
 
-        assert_eq!(suggestion.uncalled_methods, vec!["omega".to_owned()]);
+        assert_eq!(
+            suggestion.methods_without_attributed_callers,
+            vec!["omega".to_owned()]
+        );
         assert_eq!(suggestion.suggested_traits.len(), 2);
+    }
+
+    #[test]
+    fn missing_observations_alone_do_not_create_a_trait_split() {
+        let methods = vec![
+            trait_method("alpha"),
+            trait_method("beta"),
+            trait_method("callback_only"),
+        ];
+        let consumers = vec![consumer_usage("src/observed.rs", &["alpha", "beta"])];
+        assert!(suggest_trait_split("Store", "src/store.rs", &methods, &consumers, None).is_none());
+    }
+
+    #[test]
+    fn partial_usage_and_aligned_sir_never_establish_complete_or_high_confidence_use() {
+        let methods = vec![
+            trait_method("alpha"),
+            trait_method("beta"),
+            trait_method("gamma"),
+            trait_method("delta"),
+            trait_method("callback_only"),
+        ];
+        let consumers = vec![
+            consumer_usage("src/a.rs", &["alpha", "beta"]),
+            consumer_usage("src/b.rs", &["gamma", "delta"]),
+        ];
+        let deps = HashMap::from([
+            ("alpha".to_owned(), vec!["AlphaRecord".to_owned()]),
+            ("beta".to_owned(), vec!["AlphaRecord".to_owned()]),
+            ("gamma".to_owned(), vec!["GammaRecord".to_owned()]),
+            ("delta".to_owned(), vec!["GammaRecord".to_owned()]),
+        ]);
+        let suggestion =
+            suggest_trait_split("Store", "src/store.rs", &methods, &consumers, Some(&deps))
+                .expect("observed clusters");
+        assert_eq!(suggestion.confidence, SplitConfidence::Low);
+        assert_eq!(
+            suggestion.methods_without_attributed_callers,
+            ["callback_only"]
+        );
+        assert_eq!(suggestion.suggested_traits.len(), 2);
+        assert!(
+            suggestion
+                .suggested_traits
+                .iter()
+                .all(|cluster| cluster.reason.contains("Observed"))
+        );
+        let value = serde_json::to_value(&suggestion).expect("serialized observations");
+        assert!(value.get("uncalled_methods").is_none());
+        assert!(value.get("methods_without_attributed_callers").is_some());
+        let mut legacy = value;
+        let absent = legacy
+            .as_object_mut()
+            .expect("object")
+            .remove("methods_without_attributed_callers")
+            .expect("field");
+        legacy["uncalled_methods"] = absent;
+        let decoded: super::TraitSplitSuggestion =
+            serde_json::from_value(legacy).expect("legacy observations deserialize");
+        assert_eq!(
+            decoded.methods_without_attributed_callers,
+            ["callback_only"]
+        );
     }
 
     #[test]
@@ -1662,10 +1703,7 @@ mod tests {
                 vec!["load_sir".to_owned(), "save_sir".to_owned()],
             ]
         );
-        assert!(matches!(
-            suggestion.confidence,
-            SplitConfidence::High | SplitConfidence::Medium
-        ));
+        assert!(matches!(suggestion.confidence, SplitConfidence::Low));
     }
 
     #[test]

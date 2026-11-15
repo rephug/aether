@@ -110,7 +110,7 @@ impl AetherMcpServer {
 
     #[tool(
         name = "aether_usage_matrix",
-        description = "Get a consumer-by-method usage matrix for a trait or struct, showing which files call which methods and suggesting method clusters for trait decomposition"
+        description = "Get an observed consumer-by-method matrix and tentative method groups; incoming caller completeness is unknown"
     )]
     pub async fn aether_usage_matrix(
         &self,
@@ -127,7 +127,7 @@ impl AetherMcpServer {
 
     #[tool(
         name = "aether_suggest_trait_split",
-        description = "Suggest how to decompose a large trait or struct into smaller capability groups based on consumer usage patterns"
+        description = "Suggest tentative capability groups from attributed consumer observations; missing callers do not establish unused methods"
     )]
     pub async fn aether_suggest_trait_split(
         &self,
@@ -534,7 +534,7 @@ impl AetherMcpServer {
 
     #[tool(
         name = "aether_health",
-        description = "Get codebase health metrics including critical symbols, bottlenecks, dependency cycles, orphaned code, and risk hotspots."
+        description = "Get observed graph metrics, critical symbols, bottlenecks, detected cycles, disconnected observed components, and risk hotspots; graph completeness is unknown."
     )]
     pub async fn aether_health(
         &self,

@@ -74,6 +74,8 @@ pub const SERVER_VERSION: &str = "0.1.0";
 pub const SERVER_DESCRIPTION: &str = "AETHER local symbol/SIR lookup from .aether store";
 pub const MCP_SCHEMA_VERSION: u32 = 1;
 pub const MEMORY_SCHEMA_VERSION: &str = "1.0";
+/// Versioned observed-usage response contracts; unrelated memory tools stay at 1.0.
+pub const GRAPH_OBSERVATION_SCHEMA_VERSION: &str = "2.0";
 pub(crate) const SIR_STATUS_GENERATING: &str = "generating";
 
 #[derive(Clone)]

@@ -139,11 +139,53 @@ pub struct AetherRiskHotspotEntry {
     pub risk_factors: Vec<String>,
 }
 
+/// Counts and status of observed persisted call references. Neither successful
+/// resolution nor an empty graph establishes complete program relationships.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AetherObservedGraphCoverage {
+    pub status: String,
+    pub whole_program_completeness: String,
+    pub call_edges: Option<u64>,
+    pub resolved: Option<u64>,
+    pub ambiguous: Option<u64>,
+    pub unresolved: Option<u64>,
+    pub file_level_calls: Option<u64>,
+    pub note: String,
+}
+
+impl Default for AetherObservedGraphCoverage {
+    fn default() -> Self {
+        aether_analysis::ObservedGraphCoverage::default().into()
+    }
+}
+
+impl From<aether_analysis::ObservedGraphCoverage> for AetherObservedGraphCoverage {
+    fn from(coverage: aether_analysis::ObservedGraphCoverage) -> Self {
+        Self {
+            status: match coverage.status {
+                aether_analysis::ObservedGraphStatus::Unknown => "unknown",
+                aether_analysis::ObservedGraphStatus::Incomplete => "incomplete",
+                aether_analysis::ObservedGraphStatus::Unavailable => "unavailable",
+            }
+            .to_owned(),
+            whole_program_completeness: coverage.whole_program_completeness,
+            call_edges: coverage.call_edges,
+            resolved: coverage.resolved,
+            ambiguous: coverage.ambiguous,
+            unresolved: coverage.unresolved,
+            file_level_calls: coverage.file_level_calls,
+            note: coverage.note,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AetherHealthResponse {
     /// False means zero-valued metrics must not be interpreted as a healthy graph.
     pub analysis_available: bool,
     pub unavailable_reason: Option<String>,
+    #[serde(default)]
+    pub graph_coverage: AetherObservedGraphCoverage,
     pub schema_version: String,
     pub analysis: AetherHealthAnalysisSummary,
     pub critical_symbols: Vec<AetherSymbolHealthEntry>,
@@ -220,6 +262,7 @@ impl AetherMcpServer {
                 }
                 .to_owned()
             }),
+            graph_coverage: report.graph_coverage.into(),
             schema_version: report.schema_version,
             analysis: AetherHealthAnalysisSummary {
                 total_symbols: report.analysis.total_symbols,
@@ -386,6 +429,17 @@ impl AetherMcpServer {
         crate_filter: &[String],
     ) -> Result<ScoreReport, AetherMcpError> {
         if semantic {
+            if !self.state.read_only
+                && matches!(
+                    self.state.config.storage.graph_backend,
+                    GraphBackend::Surreal | GraphBackend::Cozo
+                )
+                && !self.state.store.has_graph_projection_provenance()?
+            {
+                // Let a fresh native open perform safe initialization/replay;
+                // a stale cached projection must not become a base-only score.
+                self.state.surreal_graph_for_health().await?;
+            }
             let git = GitContext::open(self.workspace());
             let semantic_input = match self.load_health_semantic_input().await {
                 Ok(input) => input,
@@ -781,7 +835,9 @@ fn append_split_outcome_text(rendered: &mut String, outcome: &HealthExplainSplit
                 }
             }
             if let Some(diagnostics) = outcome.diagnostics.as_ref() {
-                rendered.push_str("\n\nSplit diagnostics:");
+                rendered.push_str(
+                    "\n\nObserved clustering diagnostics (incoming completeness unknown):",
+                );
                 append_planner_diagnostics_text(rendered, diagnostics);
             }
         }
@@ -793,7 +849,9 @@ fn append_split_outcome_text(rendered: &mut String, outcome: &HealthExplainSplit
                 rendered.push_str(&format!("\n  message: {message}"));
             }
             if let Some(diagnostics) = outcome.diagnostics.as_ref() {
-                rendered.push_str("\n\nSplit diagnostics:");
+                rendered.push_str(
+                    "\n\nObserved clustering diagnostics (incoming completeness unknown):",
+                );
                 append_planner_diagnostics_text(rendered, diagnostics);
             }
         }
@@ -802,7 +860,7 @@ fn append_split_outcome_text(rendered: &mut String, outcome: &HealthExplainSplit
 
 fn append_planner_diagnostics_text(rendered: &mut String, diagnostics: &PlannerDiagnostics) {
     rendered.push_str(&format!(
-        "\n  confidence: {} ({:.2})",
+        "\n  observed_clustering_confidence: {} ({:.2})",
         diagnostics.confidence_label, diagnostics.confidence
     ));
     rendered.push_str(&format!(
@@ -1037,7 +1095,10 @@ trait_method_fail = 2
         assert!(rendered.contains("Split suggestion:"));
         assert!(rendered.contains("sir_ops"));
         assert!(rendered.contains("note_ops"));
-        assert!(rendered.contains("Split diagnostics:"));
+        assert!(
+            rendered.contains("Observed clustering diagnostics (incoming completeness unknown):")
+        );
+        assert!(!rendered.contains("Split diagnostics:"));
         assert!(rendered.contains("stability:"));
         assert!(rendered.contains("Suggested module files:"));
     }
