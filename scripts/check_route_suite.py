@@ -74,10 +74,14 @@ def origin(value):
 
 
 def address(value, base, site):
-    if (not isinstance(value, str) or not value or value != value.strip()
-            or "\\" in unquote(value) or any(ord(char) <= 32 for char in value)
-            or ".." in PurePosixPath(urlsplit(unquote(value)).path).parts):
+    if not isinstance(value, str) or not value or value != value.strip():
         raise ValueError("unsupported URL spelling or traversal")
+    decoded = unquote(value)
+    raw_path = urlsplit(value).path
+    if ("\\" in decoded or any(ord(char) <= 32 or ord(char) == 127 for char in value + decoded)
+            or ".." in PurePosixPath(unquote(raw_path)).parts
+            or re.search(r"%(?:2f|5c)", raw_path, re.IGNORECASE)):
+        raise ValueError("unsupported URL spelling, control, encoded separator or traversal")
     parsed = urlsplit(urljoin(site + base, value))
     site_origin = origin(parsed.scheme + "://" + parsed.netloc)
     path = unquote(parsed.path) or "/"
